@@ -2,8 +2,16 @@ name: Check
 
 on:
   push:
+    branches-ignore:
+      - "release-allocations/**"
+      - "release-recoveries/**"
   pull_request:
   workflow_dispatch:
+    inputs:
+      allocated_mirror:
+        description: Exact lowercase allocated mirror commit to recover
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -62,67 +70,70 @@ jobs:
           cargo check --locked --workspace --all-targets --all-features \
             --target aarch64-apple-darwin
 
-  plan_release:
-    name: Plan release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  verify_release:
+    name: Verify managed allocation
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs:
       - check
       - check_macos
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
-      release: ${{ steps.plan.outputs.release }}
-      reason: ${{ steps.plan.outputs.reason }}
-      impact: ${{ steps.plan.outputs.impact }}
-      series: ${{ steps.plan.outputs.series }}
-      version: ${{ steps.plan.outputs.version }}
-      tag: ${{ steps.plan.outputs.tag }}
-      latest_tag: ${{ steps.plan.outputs.latest_tag }}
-      latest_stable_version: ${{ steps.plan.outputs.latest_stable_version }}
-      mirror_commit: ${{ steps.plan.outputs.mirror_commit }}
-      source_revision: ${{ steps.plan.outputs.source_revision }}
-      changelog_sha256: ${{ steps.plan.outputs.changelog_sha256 }}
-      plan_digest: ${{ steps.plan.outputs.plan_digest }}
-      approved_digest: ${{ steps.plan.outputs.approved_digest }}
+      allocated_mirror: ${{ steps.verify.outputs.allocated_mirror }}
+      complete: ${{ steps.verify.outputs.complete }}
+      execute: ${{ steps.verify.outputs.execute }}
+      source_revision: ${{ steps.verify.outputs.source_revision }}
+      tag: ${{ steps.verify.outputs.tag }}
+      version: ${{ steps.verify.outputs.version }}
     steps:
-      - name: Check out release history
+      - name: Check out current workflow source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          fetch-tags: true
+          fetch-tags: false
           persist-credentials: false
-      - name: Plan release
-        id: plan
+      - name: Fetch managed release records
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          remote_main=$(git rev-parse refs/remotes/origin/main)
-          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
-            {
-              echo "release=false"
-              echo "reason=mirror-advanced"
-              echo "impact=none"
-              echo "series=none"
-              echo "version=none"
-              echo "tag=none"
-              echo "latest_tag=none"
-              echo "latest_stable_version=none"
-              echo "mirror_commit=$GITHUB_SHA"
-              echo "source_revision=none"
-              echo "changelog_sha256=none"
-              echo "plan_digest=none"
-              echo "approved_digest=none"
-            } >>"$GITHUB_OUTPUT"
-            echo "Public main advanced to $remote_main; this workflow will not release $GITHUB_SHA."
-            exit 0
+          git fetch --force --no-tags origin \
+            main:refs/remotes/origin/main \
+            '+refs/heads/release-allocations/*:refs/heads/release-allocations/*' \
+            '+refs/heads/release-recoveries/*:refs/heads/release-recoveries/*'
+          git fetch --force --tags origin
+      - name: Verify exact allocation and recovery chain
+        id: verify
+        shell: bash
+        env:
+          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          allocated=auto
+          event=push
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            allocated=$DISPATCHED_ALLOCATION
+            event=recovery
           fi
-          ./scripts/plan-release | tee -a "$GITHUB_OUTPUT"
+          ./scripts/verify-release-allocation \
+            --repository . \
+            --allocated-mirror "$allocated" \
+            --workflow-commit "$GITHUB_SHA" \
+            --event "$event" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/verified-allocation" \
+            --github-output "$GITHUB_OUTPUT"
 
   build_release:
     name: Build ${{ matrix.target }}
-    if: needs.plan_release.outputs.release == 'true'
-    needs: plan_release
+    if: >-
+      needs.verify_release.outputs.execute == 'true' &&
+      needs.verify_release.outputs.complete == 'false'
+    needs: verify_release
     permissions:
       contents: read
     strategy:
@@ -140,10 +151,20 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
-      - name: Check out source
+      - name: Check out allocated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.verify_release.outputs.allocated_mirror }}
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
+      - name: Verify allocated checkout
+        shell: bash
+        env:
+          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ALLOCATED_MIRROR"
       - name: Install pinned Rust toolchain
         shell: bash
         run: |
@@ -160,8 +181,8 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          SCHERZO_CLOUD_VERSION: ${{ needs.plan_release.outputs.version }}
-          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.plan_release.outputs.source_revision }}
+          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
@@ -169,8 +190,8 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
-          SCHERZO_CLOUD_VERSION: ${{ needs.plan_release.outputs.version }}
-          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.plan_release.outputs.source_revision }}
+          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           cargo test --locked --release --target "${{ matrix.target }}" \
@@ -179,8 +200,8 @@ jobs:
       - name: Verify release identity
         shell: bash
         env:
-          EXPECTED_VERSION: ${{ needs.plan_release.outputs.version }}
-          EXPECTED_SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
+          EXPECTED_SOURCE_REVISION: ${{ needs.verify_release.outputs.source_revision }}
+          EXPECTED_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/scherzo-cloud"
@@ -191,36 +212,60 @@ jobs:
           import sys
 
           document = json.loads(sys.argv[1])
-          expected_version = sys.argv[2]
-          expected_source = sys.argv[3]
           expected = {
               "schemaVersion": 1,
               "command": "scherzo-cloud",
-              "version": expected_version,
-              "buildIdentity": expected_source,
+              "version": sys.argv[2],
+              "buildIdentity": sys.argv[3],
           }
           for key, value in expected.items():
               if document.get(key) != value:
-                  raise SystemExit(
-                      f"unexpected {key}: {document.get(key)!r}; expected {value!r}"
-                  )
+                  raise SystemExit(f"unexpected {key}: {document.get(key)!r}; expected {value!r}")
           if not document.get("executablePath"):
               raise SystemExit("release binary reported an empty executablePath")
           PY
-      - name: Package release archive
+      - name: Package deterministic release archive
         shell: bash
         env:
-          VERSION: ${{ needs.plan_release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          package="scherzo-cloud-$VERSION-${{ matrix.target }}"
-          mkdir -p "dist/$package"
-          install -m 0755 \
-            "target/${{ matrix.target }}/release/scherzo-cloud" \
-            "dist/$package/scherzo-cloud"
-          cp README.md LICENSE "dist/$package/"
-          tar -C dist -czf "dist/$package.tar.gz" "$package"
-          rm -rf "dist/$package"
+          python3 - <<'PY'
+          import gzip
+          import os
+          import tarfile
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          target = os.environ["TARGET"]
+          package = f"scherzo-cloud-{version}-{target}"
+          destination = Path("dist") / f"{package}.tar.gz"
+          destination.parent.mkdir()
+          files = (
+              ("LICENSE", Path("LICENSE"), 0o644),
+              ("README.md", Path("README.md"), 0o644),
+              ("scherzo-cloud", Path("target") / target / "release" / "scherzo-cloud", 0o755),
+          )
+          with destination.open("wb") as output:
+              with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+                      directory = tarfile.TarInfo(f"{package}/")
+                      directory.type = tarfile.DIRTYPE
+                      directory.mode = 0o755
+                      directory.mtime = directory.uid = directory.gid = 0
+                      directory.uname = directory.gname = ""
+                      archive.addfile(directory)
+                      for name, source, mode in files:
+                          value = source.read_bytes()
+                          member = tarfile.TarInfo(f"{package}/{name}")
+                          member.size = len(value)
+                          member.mode = mode
+                          member.mtime = member.uid = member.gid = 0
+                          member.uname = member.gname = ""
+                          import io
+                          archive.addfile(member, io.BytesIO(value))
+          PY
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -230,181 +275,104 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  publish_release:
-    name: Publish ${{ needs.plan_release.outputs.tag }}
-    if: needs.plan_release.outputs.release == 'true'
+  reconcile_release:
+    name: Reconcile ${{ needs.verify_release.outputs.tag }}
+    if: >-
+      needs.verify_release.outputs.execute == 'true' &&
+      needs.verify_release.outputs.complete == 'false'
     needs:
-      - plan_release
+      - verify_release
       - build_release
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - name: Check out release source
+      - name: Check out current workflow source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          fetch-tags: true
+          fetch-tags: false
           persist-credentials: false
+      - name: Fetch managed release records
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            main:refs/remotes/origin/main \
+            '+refs/heads/release-allocations/*:refs/heads/release-allocations/*' \
+            '+refs/heads/release-recoveries/*:refs/heads/release-recoveries/*'
+          git fetch --force --tags origin
       - name: Download release archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Recheck release plan
-        id: recheck
+      - name: Create exact checksums
         shell: bash
-        env:
-          EXPECTED_IMPACT: ${{ needs.plan_release.outputs.impact }}
-          EXPECTED_VERSION: ${{ needs.plan_release.outputs.version }}
-          EXPECTED_TAG: ${{ needs.plan_release.outputs.tag }}
-          EXPECTED_LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}
-          EXPECTED_SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
-          EXPECTED_CHANGELOG_SHA256: ${{ needs.plan_release.outputs.changelog_sha256 }}
-          EXPECTED_PLAN_DIGEST: ${{ needs.plan_release.outputs.plan_digest }}
-          EXPECTED_APPROVED_DIGEST: ${{ needs.plan_release.outputs.approved_digest }}
         run: |
           set -euo pipefail
-          git fetch --force --tags origin
-          git fetch --force --no-tags origin main:refs/remotes/origin/main
-          remote_main=$(git rev-parse refs/remotes/origin/main)
-          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
-            echo "publish=false" >>"$GITHUB_OUTPUT"
-            echo "reason=mirror-advanced" >>"$GITHUB_OUTPUT"
-            echo "Public main advanced to $remote_main; a later workflow will release it."
-            exit 0
-          fi
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
 
-          plan_file=$(mktemp)
-          trap 'rm -f "$plan_file"' EXIT
-          ./scripts/plan-release >"$plan_file"
-          planned_release=$(awk -F= '$1 == "release" { print $2 }' "$plan_file")
-          planned_reason=$(awk -F= '$1 == "reason" { print $2 }' "$plan_file")
-          planned_impact=$(awk -F= '$1 == "impact" { print $2 }' "$plan_file")
-          planned_version=$(awk -F= '$1 == "version" { print $2 }' "$plan_file")
-          planned_tag=$(awk -F= '$1 == "tag" { print $2 }' "$plan_file")
-          planned_latest_tag=$(awk -F= '$1 == "latest_tag" { print $2 }' "$plan_file")
-          planned_source=$(awk -F= '$1 == "source_revision" { print $2 }' "$plan_file")
-          planned_changelog=$(awk -F= '$1 == "changelog_sha256" { print $2 }' "$plan_file")
-          planned_digest=$(awk -F= '$1 == "plan_digest" { print $2 }' "$plan_file")
-          planned_approved=$(awk -F= '$1 == "approved_digest" { print $2 }' "$plan_file")
-
-          if [[ "$planned_release" == "false" && "$planned_reason" == "already-released" ]]; then
-            echo "publish=false" >>"$GITHUB_OUTPUT"
-            echo "reason=already-released" >>"$GITHUB_OUTPUT"
-            echo "$planned_tag already targets this mirror commit."
-            exit 0
-          fi
-          if [[ "$planned_release" != "true" \
-            || "$planned_impact" != "$EXPECTED_IMPACT" \
-            || "$planned_version" != "$EXPECTED_VERSION" \
-            || "$planned_tag" != "$EXPECTED_TAG" \
-            || "$planned_latest_tag" != "$EXPECTED_LATEST_TAG" \
-            || "$planned_source" != "$EXPECTED_SOURCE_REVISION" \
-            || "$planned_changelog" != "$EXPECTED_CHANGELOG_SHA256" \
-            || "$planned_digest" != "$EXPECTED_PLAN_DIGEST" \
-            || "$planned_approved" != "$EXPECTED_APPROVED_DIGEST" ]]; then
-            echo "Release plan changed between build and publication." >&2
-            cat "$plan_file" >&2
-            exit 1
-          fi
-          echo "publish=true" >>"$GITHUB_OUTPUT"
-          echo "reason=$planned_reason" >>"$GITHUB_OUTPUT"
-      - name: Validate archives and create checksums
-        if: steps.recheck.outputs.publish == 'true'
+          root = Path("dist")
+          archives = sorted(root.glob("*.tar.gz"), key=lambda path: os.fsencode(path.name))
+          if len(archives) != 4:
+              raise SystemExit(f"expected four native archives, found {len(archives)}")
+          lines = []
+          for archive in archives:
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {archive.name}\n")
+          (root / "SHA256SUMS").write_text("".join(lines), encoding="ascii")
+          PY
+      - name: Inspect exact reconciliation
         shell: bash
         env:
-          VERSION: ${{ needs.plan_release.outputs.version }}
+          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
+          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          targets=(
-            x86_64-unknown-linux-gnu
-            aarch64-unknown-linux-gnu
-            x86_64-apple-darwin
-            aarch64-apple-darwin
-          )
-          archive_count=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
-          if [[ "$archive_count" != "${#targets[@]}" ]]; then
-            echo "Expected ${#targets[@]} release archives, found $archive_count." >&2
-            find dist -maxdepth 1 -type f -print >&2
-            exit 1
+          event=push
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            event=recovery
+            test "$DISPATCHED_ALLOCATION" = "$ALLOCATED_MIRROR"
           fi
-
-          for target in "${targets[@]}"; do
-            package="scherzo-cloud-$VERSION-$target"
-            archive="dist/$package.tar.gz"
-            if [[ ! -f "$archive" ]]; then
-              echo "Missing release archive: $archive" >&2
-              exit 1
-            fi
-            expected_members=$(printf '%s\n' \
-              "$package/" \
-              "$package/LICENSE" \
-              "$package/README.md" \
-              "$package/scherzo-cloud" | LC_ALL=C sort)
-            actual_members=$(tar -tzf "$archive" | LC_ALL=C sort)
-            if [[ "$actual_members" != "$expected_members" ]]; then
-              echo "Unexpected members in $archive:" >&2
-              printf '%s\n' "$actual_members" >&2
-              exit 1
-            fi
-          done
-
-          (
-            cd dist
-            LC_ALL=C sha256sum -- *.tar.gz | LC_ALL=C sort -k2 >SHA256SUMS
-            sha256sum --check SHA256SUMS
-          )
-      - name: Write release notes
-        if: steps.recheck.outputs.publish == 'true'
-        shell: bash
-        env:
-          LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}
-          VERSION: ${{ needs.plan_release.outputs.version }}
-          SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
-        run: |
-          set -euo pipefail
-          rendered_notes=$RUNNER_TEMP/rendered-release-notes.md
-          release_notes=$RUNNER_TEMP/release-notes.md
-          render_args=(--candidate HEAD)
-          if [[ "$LATEST_TAG" != "none" ]]; then
-            render_args+=(--latest-tag "$LATEST_TAG")
-          fi
-          ./scripts/render-release-notes "${render_args[@]}" >"$rendered_notes"
-
-          {
-            printf 'Scherzo Cloud CLI v%s\n\n' "$VERSION"
-            if [[ -s "$rendered_notes" ]]; then
-              cat "$rendered_notes"
-              printf '\n'
-            else
-              printf '%s\n\n' 'Internal changes only; no user-visible changes.'
-            fi
-            printf "Mirror commit: \`%s\`\\n" "$GITHUB_SHA"
-            printf "Source revision: \`%s\`\\n\\n" "$SOURCE_REVISION"
-            printf '%s\n' \
-              'This release contains unsigned binaries, SHA-256 checksums, and GitHub build-provenance attestations.'
-          } >"$release_notes"
-      - name: Attest release artifacts
-        if: steps.recheck.outputs.publish == 'true'
+          ./scripts/reconcile-release inspect \
+            --repository . \
+            --allocated-mirror "$ALLOCATED_MIRROR" \
+            --workflow-commit "$GITHUB_SHA" \
+            --event "$event" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --dist dist
+      - name: Attest exact release assets
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: dist/*
-      - name: Publish GitHub Release
-        if: steps.recheck.outputs.publish == 'true'
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Reconcile exact GitHub Release
         shell: bash
         env:
+          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
+          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.plan_release.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Scherzo Cloud CLI $RELEASE_TAG" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            --latest
+          event=push
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            event=recovery
+            test "$DISPATCHED_ALLOCATION" = "$ALLOCATED_MIRROR"
+          fi
+          ./scripts/reconcile-release apply \
+            --repository . \
+            --allocated-mirror "$ALLOCATED_MIRROR" \
+            --workflow-commit "$GITHUB_SHA" \
+            --event "$event" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --dist dist

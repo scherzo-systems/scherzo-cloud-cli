@@ -12,15 +12,19 @@ use rustix::fs::{AtFlags, Mode, OFlags, fchmod, mkdirat, openat, unlinkat};
 use rustix::io::Errno;
 
 use super::admission::{
-    AdmittedExecutionContext, AdmittedWorkflow, CancellationReason, CancellationSource,
+    AdmittedExecutionContext, AdmittedHarness, AdmittedWorkflow, CancellationReason,
+    CancellationSource,
 };
 use super::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentObservationSink, AgentProcessContext,
-    AgentPrompt, AgentValueMode, StagedAgentAttachment,
+    AgentInvocationStaging, AgentObservationSink, AgentProcessContext, AgentPrompt, AgentValueMode,
+    MAXIMUM_INLINE_AGENT_INPUT_BYTES, StagedAgentAttachment,
 };
+use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
 use super::canonical_json;
+use super::claude_code::ClaudeCodeConfig;
+use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::document::Output;
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
 use super::pi::PiConfig;
@@ -42,10 +46,117 @@ use super::value::CapturedValue;
 const IDENTITY_ATTEMPTS: usize = 16;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const ATTACHMENT_DIRECTORY: &str = "attachments";
+const MESSAGE_FILE: &str = "message.md";
 const RESULT_ENDPOINT_DIRECTORY: &str = "result-endpoint";
 const STATIC_ATTACHMENT_MEDIA_TYPE: &str = "application/octet-stream";
 
 type PiJsonV1Invocation<Sink> = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>;
+type ClaudeCodeStreamJsonV1Invocation<Sink> =
+    AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>;
+
+pub(crate) enum ClosedAgentInvocation<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    Pi(PiJsonV1Invocation<Sink>),
+    ClaudeCode(ClaudeCodeStreamJsonV1Invocation<Sink>),
+}
+
+impl<Sink> ClosedAgentInvocation<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    pub(crate) fn profile(&self) -> AgentCompatibilityProfile {
+        match self {
+            Self::Pi(invocation) => invocation.adapter().profile(),
+            Self::ClaudeCode(invocation) => invocation.adapter().profile(),
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &AgentInvocationIdentity {
+        match self {
+            Self::Pi(invocation) => invocation.identity(),
+            Self::ClaudeCode(invocation) => invocation.identity(),
+        }
+    }
+
+    pub(crate) fn process(&self) -> &AgentProcessContext {
+        match self {
+            Self::Pi(invocation) => invocation.process(),
+            Self::ClaudeCode(invocation) => invocation.process(),
+        }
+    }
+
+    pub(crate) fn staging(&self) -> &AgentInvocationStaging {
+        match self {
+            Self::Pi(invocation) => invocation.staging(),
+            Self::ClaudeCode(invocation) => invocation.staging(),
+        }
+    }
+
+    pub(crate) fn diagnostic_session(&self) -> &super::agent_diagnostics::AgentDiagnosticSession {
+        match self {
+            Self::Pi(invocation) => invocation.diagnostic_session(),
+            Self::ClaudeCode(invocation) => invocation.diagnostic_session(),
+        }
+    }
+
+    pub(crate) fn prompt(&self) -> &AgentPrompt {
+        match self {
+            Self::Pi(invocation) => invocation.prompt(),
+            Self::ClaudeCode(invocation) => invocation.prompt(),
+        }
+    }
+
+    pub(crate) fn attachments(&self) -> &[StagedAgentAttachment] {
+        match self {
+            Self::Pi(invocation) => invocation.attachments(),
+            Self::ClaudeCode(invocation) => invocation.attachments(),
+        }
+    }
+
+    pub(crate) fn value_mode(&self) -> &AgentValueMode {
+        match self {
+            Self::Pi(invocation) => invocation.value_mode(),
+            Self::ClaudeCode(invocation) => invocation.value_mode(),
+        }
+    }
+
+    pub(crate) fn cancellation(&self) -> &CancellationSource {
+        match self {
+            Self::Pi(invocation) => invocation.cancellation(),
+            Self::ClaudeCode(invocation) => invocation.cancellation(),
+        }
+    }
+
+    pub(crate) fn observations(&self) -> &super::agent::OrderedAgentObservationSink<Sink> {
+        match self {
+            Self::Pi(invocation) => invocation.observations(),
+            Self::ClaudeCode(invocation) => invocation.observations(),
+        }
+    }
+
+    pub(crate) fn process_control(&self) -> &super::agent::AgentProcessControl {
+        match self {
+            Self::Pi(invocation) => invocation.process_control(),
+            Self::ClaudeCode(invocation) => invocation.process_control(),
+        }
+    }
+
+    pub(crate) fn maximum_response_bytes(&self) -> std::num::NonZeroU64 {
+        match self {
+            Self::Pi(invocation) => invocation.limits().maximum_response_bytes(),
+            Self::ClaudeCode(invocation) => invocation.limits().maximum_response_bytes(),
+        }
+    }
+
+    pub(crate) fn maximum_result_bytes(&self) -> std::num::NonZeroU64 {
+        match self {
+            Self::Pi(invocation) => invocation.limits().maximum_result_bytes(),
+            Self::ClaudeCode(invocation) => invocation.limits().maximum_result_bytes(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentInputStagingFailure {
@@ -195,7 +306,7 @@ pub(crate) struct MaterializedAgentInvocation<Sink>
 where
     Sink: AgentObservationSink,
 {
-    invocation: PiJsonV1Invocation<Sink>,
+    invocation: ClosedAgentInvocation<Sink>,
     staging: AgentInputStagingLease,
 }
 
@@ -203,7 +314,7 @@ impl<Sink> MaterializedAgentInvocation<Sink>
 where
     Sink: AgentObservationSink,
 {
-    pub(crate) fn invocation(&self) -> &PiJsonV1Invocation<Sink> {
+    pub(crate) fn invocation(&self) -> &ClosedAgentInvocation<Sink> {
         &self.invocation
     }
 
@@ -211,7 +322,7 @@ where
         self.staging.path()
     }
 
-    pub(crate) fn into_parts(self) -> (PiJsonV1Invocation<Sink>, AgentInputStagingLease) {
+    pub(crate) fn into_parts(self) -> (ClosedAgentInvocation<Sink>, AgentInputStagingLease) {
         (self.invocation, self.staging)
     }
 }
@@ -469,12 +580,12 @@ struct AttachmentBudget {
 }
 
 impl AttachmentBudget {
-    fn new(limits: &AgentInvocationLimits<PiJsonV1ProtocolLimits>) -> Self {
+    fn new(harness: &AdmittedHarness) -> Self {
         Self {
             count: 0,
             bytes: 0,
-            maximum_count: limits.maximum_attachments().get(),
-            maximum_bytes: limits.maximum_attachment_bytes().get(),
+            maximum_count: harness.maximum_attachments().get(),
+            maximum_bytes: harness.maximum_attachment_bytes().get(),
         }
     }
 
@@ -522,6 +633,7 @@ pub(crate) fn materialize_agent_invocation<Sink>(
     admitted: &AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     staging: &AgentInputStaging,
+    diagnostic_sessions: &AgentDiagnosticSessionStore,
     identity: AgentInvocationIdentity,
     upstream_outputs: &BTreeMap<ResolvedOutputSource, CapturedValue>,
     cancellation: CancellationSource,
@@ -557,13 +669,7 @@ where
         step.common.cwd.as_deref(),
     )
     .map_err(|failure| start_error(AgentInputStartFailure::WorkingDirectory(failure)))?;
-    let plan = build_plan(
-        admitted,
-        step_name,
-        step,
-        upstream_outputs,
-        admitted_step.limits(),
-    )?;
+    let plan = build_plan(admitted, step_name, step, upstream_outputs, admitted_step)?;
     check_cancellation(&cancellation)?;
     let lifecycle = staging
         .inner
@@ -582,6 +688,17 @@ where
                 return Err(abort_view(view, error));
             }
         };
+    let message_file = if plan.prompt.message().len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+        match stage_message(&view, plan.prompt.message(), &cancellation) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                drop(lifecycle);
+                return Err(abort_view(view, error));
+            }
+        }
+    } else {
+        None
+    };
     if fchmod(&view.attachment_directory, Mode::RUSR | Mode::XUSR).is_err() {
         drop(lifecycle);
         return Err(abort_view(view, staging_error()));
@@ -601,29 +718,74 @@ where
         ));
     }
 
-    let invocation_staging = AgentInvocationStaging::new(view.result_endpoint_path().to_owned());
-    let installation = admitted_step.installation();
-    let invocation = AgentInvocation::new(
-        identity,
-        AdmittedAgentAdapter::new(
-            AgentCompatibilityProfile::PiJsonV1,
-            installation.executable().to_owned(),
-            Arc::from(installation.version().as_str()),
-            admitted_step.configuration().clone(),
-        ),
-        AgentProcessContext::new(
-            working_directory,
-            admitted.execution().environment().clone(),
-        ),
-        invocation_staging,
-        plan.prompt,
-        Arc::from(staged_attachments),
-        plan.value_mode,
-        admitted_step.limits().clone(),
-        cancellation,
-        process_guards,
-        observation_sink,
-    );
+    let mut invocation_staging =
+        AgentInvocationStaging::new(view.result_endpoint_path().to_owned());
+    if let Some(message_file) = message_file {
+        invocation_staging = invocation_staging.with_message_file(message_file);
+    }
+    let harness_version = match admitted_step {
+        AdmittedHarness::Pi(admission) => admission.installation().version().as_str(),
+        AdmittedHarness::ClaudeCode(admission) => admission.installation().version().as_str(),
+    };
+    let diagnostic_session =
+        match diagnostic_sessions.allocate(&identity, admitted_step.profile(), harness_version) {
+            Ok(session) => session,
+            Err(_) => {
+                drop(lifecycle);
+                return Err(abort_view(
+                    view,
+                    start_error(AgentInputStartFailure::StagingUnavailable),
+                ));
+            }
+        };
+    let invocation = match admitted_step {
+        AdmittedHarness::Pi(admission) => ClosedAgentInvocation::Pi(AgentInvocation::new(
+            identity,
+            AdmittedAgentAdapter::new(
+                AgentCompatibilityProfile::PiJsonV1,
+                admission.installation().executable().to_owned(),
+                Arc::from(admission.installation().version().as_str()),
+                admission.configuration().clone(),
+            ),
+            AgentProcessContext::new(
+                working_directory,
+                admitted.execution().environment().clone(),
+            ),
+            invocation_staging,
+            diagnostic_session,
+            plan.prompt,
+            Arc::from(staged_attachments),
+            plan.value_mode,
+            admission.limits().clone(),
+            cancellation,
+            process_guards,
+            observation_sink,
+        )),
+        AdmittedHarness::ClaudeCode(admission) => {
+            ClosedAgentInvocation::ClaudeCode(AgentInvocation::new(
+                identity,
+                AdmittedAgentAdapter::new(
+                    AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+                    admission.installation().executable().to_owned(),
+                    Arc::from(admission.installation().version().as_str()),
+                    admission.configuration().clone(),
+                ),
+                AgentProcessContext::new(
+                    working_directory,
+                    admitted.execution().environment().clone(),
+                ),
+                invocation_staging,
+                diagnostic_session,
+                plan.prompt,
+                Arc::from(staged_attachments),
+                plan.value_mode,
+                admission.limits().clone(),
+                cancellation,
+                process_guards,
+                observation_sink,
+            ))
+        }
+    };
     drop(lifecycle);
     Ok(MaterializedAgentInvocation {
         invocation,
@@ -636,7 +798,7 @@ fn build_plan<'a>(
     step_name: &str,
     step: &'a ValidatedAgentStep,
     upstream_outputs: &'a BTreeMap<ResolvedOutputSource, CapturedValue>,
-    limits: &AgentInvocationLimits<PiJsonV1ProtocolLimits>,
+    harness: &AdmittedHarness,
 ) -> Result<AgentMaterializationPlan<'a>, AgentInputMaterializationError> {
     let system_prompt = retained_text(admitted, &step.agent.system_prompt)?;
     let mut message = String::new();
@@ -653,7 +815,7 @@ fn build_plan<'a>(
     }
 
     let mut attachments = Vec::new();
-    let mut attachment_budget = AttachmentBudget::new(limits);
+    let mut attachment_budget = AttachmentBudget::new(harness);
     for source in &step.agent.message.attachments {
         resolve_attachments(
             admitted,
@@ -877,6 +1039,19 @@ fn upstream_value<'a>(
     })
 }
 
+fn stage_message(
+    view: &AgentInputStagingLease,
+    message: &str,
+    cancellation: &CancellationSource,
+) -> Result<PathBuf, AgentInputMaterializationError> {
+    let path = view.path().join(MESSAGE_FILE);
+    let mut destination = create_payload_file(&view.directory, MESSAGE_FILE)?;
+    write_bytes(&mut destination, message.as_bytes(), cancellation)?;
+    check_cancellation(cancellation)?;
+    finish_payload_file(destination).map_err(|_| staging_error())?;
+    Ok(path)
+}
+
 fn stage_attachments(
     staging: &AgentInputStaging,
     artifacts: &ArtifactStaging,
@@ -895,7 +1070,7 @@ fn stage_attachments(
         )?;
         let payload_name = format!("{index:06}");
         let path = view.attachment_path().join(&payload_name);
-        let mut destination = create_attachment_file(&view.attachment_directory, &payload_name)?;
+        let mut destination = create_payload_file(&view.attachment_directory, &payload_name)?;
         let write_result = match &attachment.payload {
             PlannedAttachment::Bytes(bytes) => write_bytes(&mut destination, bytes, cancellation),
             PlannedAttachment::Json(value) => write_json(&mut destination, value, cancellation),
@@ -937,7 +1112,7 @@ fn create_private_directory(
     }
 }
 
-fn create_attachment_file(
+fn create_payload_file(
     directory: &OwnedFd,
     payload_name: &str,
 ) -> Result<File, AgentInputMaterializationError> {

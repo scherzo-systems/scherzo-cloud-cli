@@ -1,30 +1,33 @@
 use std::env;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::ops::Add;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use time::OffsetDateTime;
 use tokio::io::unix::AsyncFd;
 
 use crate::execution::pi::{PiInstallationFailure, discover_and_validate_pi_installation};
+use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
-    EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, ResolvedAttachment,
-    ResolvedImports, admit_workflow, default_execution_policy_limits,
+    EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, MAXIMUM_AGENT_PROMPT_BYTES,
+    ResolvedAttachment, ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
-use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStagingFailure};
+use crate::execution::workflow::agent::dispatch::{
+    ClosedAgentDispatcher, UnavailableClaudeCodeAdapter,
+};
+use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::ArtifactStaging;
 use crate::execution::workflow::coordinator::CoordinationError;
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -54,13 +57,14 @@ use crate::execution::workflow::run_timing::{
     ObservationClock, RunTimingObservation, RunTimingSnapshot,
 };
 use crate::execution::workflow::run_view_model::{
-    StepLogCapacity, WorkflowRunCleanupResult, WorkflowRunPublicationResult, WorkflowRunViewModel,
+    WorkflowRunCleanupResult, WorkflowRunPublicationResult, WorkflowRunViewModel,
 };
 use crate::execution::workflow::runtime::RunOutcome;
 use crate::execution::workflow::step_runtime::AgentExecution;
 use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
+use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Execute a local Workflow V1 command and agent DAG";
+pub(super) const ABOUT: &str = "Run a local command and agent workflow";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
   Automatic mode uses the terminal interface only when stdin and stdout are terminals,
   TERM is usable, and stdin is not reserved by --prompt-file -. Resize keeps the
@@ -69,8 +73,6 @@ pub(super) const AFTER_HELP: &str = "Interactive mode:
   Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
   After q, Scherzo restores the terminal and prints the standard plain summary.";
 
-const MAXIMUM_PARALLEL_STEPS: usize = 256;
-const MAXIMUM_PROMPT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
@@ -93,13 +95,13 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Nonexistent durable directory for exactly one workflow run"
+        help = "Directory to create for this run (must not already exist)"
     )]
     run_dir: PathBuf,
 
     #[arg(
         long,
-        value_name = "PATH|-",
+        value_name = "PATH",
         help = "UTF-8 prompt file, or - to read standard input"
     )]
     prompt_file: Option<PathBuf>,
@@ -127,16 +129,16 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         execute_with_runtime("start local workflow runtime", self.execute_async())
     }
 
-    async fn execute_async(self) -> ExitCode {
+    async fn execute_async(self) -> super::super::CommandResult {
         let presentation_config = self.presentation_config();
         let cancellation = CancellationSource::new();
         let signal_task = match start_signal_observation(cancellation.clone()) {
             Ok(task) => task,
-            Err(error) => return diagnose(error),
+            Err(error) => return Err(error.into()),
         };
 
         let imports =
@@ -146,7 +148,7 @@ impl Command {
                 Ok(imports) => imports,
                 Err(error) => {
                     signal_task.abort();
-                    return diagnose(error);
+                    return Err(error.into());
                 }
             };
         let workflow =
@@ -187,13 +189,18 @@ impl Command {
             || admitted.execution().root().to_str().is_none()
         {
             signal_task.abort();
-            return diagnose(LocalRunError::UnrepresentablePath);
+            return diagnose(
+                "prepare local workflow paths: an authoritative path is not valid UTF-8",
+            );
         }
-        let owned_run = match InitialLocalRun::create(&self.run_dir, &admitted) {
+        let owned_run = match InitialLocalRun::create(&self.run_dir, &admitted)
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("create workflow run {}", self.run_dir.display()))
+        {
             Ok(run) => run,
             Err(error) => {
                 signal_task.abort();
-                return diagnose(error);
+                return Err(error.into());
             }
         };
         execute_owned_attempt(
@@ -223,16 +230,13 @@ impl Command {
 
 pub(super) fn execute_with_runtime(
     failure_context: &str,
-    execution: impl Future<Output = ExitCode>,
-) -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    execution: impl Future<Output = super::super::CommandResult>,
+) -> super::super::CommandResult {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return diagnose(format_args!("{failure_context}: {error}")),
-    };
+        .with_context(|| failure_context.to_owned())?;
     runtime.block_on(execution)
 }
 
@@ -292,13 +296,15 @@ pub(super) async fn execute_owned_attempt(
     signal_task: tokio::task::JoinHandle<()>,
     presentation_config: PresentationConfig,
     leaf: ExecutionLeaf,
-) -> ExitCode {
+) -> super::super::CommandResult {
     let run_directory = match owned_run.run_directory().to_str() {
         Some(path) => path.to_owned(),
         None => {
             signal_task.abort();
             settle_before_execution_failure(&owned_run);
-            return diagnose(LocalRunError::UnrepresentablePath);
+            return diagnose(
+                "prepare local workflow paths: an authoritative path is not valid UTF-8",
+            );
         }
     };
     let destination = match prepare_attempt_result_destination(
@@ -319,7 +325,7 @@ pub(super) async fn execute_owned_attempt(
         Err(_) => {
             signal_task.abort();
             settle_before_execution_failure(&owned_run);
-            return diagnose(LocalRunError::PrivateStaging);
+            return diagnose("prepare private local workflow staging");
         }
     };
     let artifacts = match ArtifactStaging::create_bound(
@@ -358,7 +364,7 @@ pub(super) async fn execute_owned_attempt(
                 settle_before_execution_failure(&owned_run);
                 let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
                 record_private_cleanup_failure(&owned_run, cleanup_failed);
-                return diagnose(LocalRunError::AgentInputStaging(error));
+                return diagnose(format_args!("prepare private local agent staging: {error}"));
             }
         }
     };
@@ -374,7 +380,6 @@ pub(super) async fn execute_owned_attempt(
                     admitted.execution().limits().maximum_parallel_steps().get(),
                     timing_observation.clone(),
                     run_clock,
-                    StepLogCapacity::default(),
                 );
                 let terminal = WorkflowTerminalHost::start(
                     view.clone(),
@@ -438,10 +443,26 @@ pub(super) async fn execute_owned_attempt(
         return diagnose(failure);
     }
 
+    let agent_diagnostic_sessions = if agent_staging.is_some() {
+        match owned_run.create_agent_diagnostic_sessions() {
+            Ok(sessions) => Some(sessions),
+            Err(_) => {
+                signal_task.abort();
+                settle_before_execution_failure(&owned_run);
+                let cleanup_failed =
+                    release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                record_private_cleanup_failure(&owned_run, cleanup_failed);
+                host.stop_terminal().await;
+                return diagnose("prepare local agent diagnostic retention");
+            }
+        }
+    } else {
+        None
+    };
     let diagnostics = StepDiagnosticLog::default();
-    let agents = match &agent_staging {
-        Some(staging) => {
-            let adapter = match PiJsonV1Adapter::new(
+    let agents = match (&agent_staging, agent_diagnostic_sessions) {
+        (Some(staging), Some(diagnostic_sessions)) => {
+            let pi_adapter = match PiJsonV1Adapter::new(
                 diagnostics.clone(),
                 admitted.execution().limits().maximum_step_log_bytes(),
                 SystemExecutionClock,
@@ -455,16 +476,27 @@ pub(super) async fn execute_owned_attempt(
                         release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
                     record_private_cleanup_failure(&owned_run, cleanup_failed);
                     host.stop_terminal().await;
-                    return diagnose(LocalRunError::AgentRuntime);
+                    return diagnose("prepare local PiJsonV1 runtime");
                 }
             };
+            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, UnavailableClaudeCodeAdapter);
             AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_directory.as_str())),
                 staging.clone(),
-                adapter,
+                diagnostic_sessions,
+                dispatcher,
             )
         }
-        None => AgentExecution::Disabled,
+        (None, None) => AgentExecution::Disabled,
+        (Some(_), None) | (None, Some(_)) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose("prepare local agent diagnostic retention");
+        }
     };
     let execution = execute_workflow(
         admitted.clone(),
@@ -490,7 +522,7 @@ pub(super) async fn execute_owned_attempt(
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
             record_private_cleanup_failure(&owned_run, cleanup_failed);
             host.stop_terminal().await;
-            return diagnose(LocalRunError::Coordination(error));
+            return diagnose(format_args!("execute admitted local workflow: {error:?}"));
         }
     };
     let observed_timing = observer.snapshot();
@@ -501,7 +533,7 @@ pub(super) async fn execute_owned_attempt(
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
             record_private_cleanup_failure(&owned_run, cleanup_failed);
             host.stop_terminal().await;
-            return diagnose(LocalRunError::InvalidTerminalResult);
+            return diagnose("prepare authoritative local workflow terminal result");
         }
     };
     let run = match build_run_result(
@@ -519,14 +551,14 @@ pub(super) async fn execute_owned_attempt(
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
             record_private_cleanup_failure(&owned_run, cleanup_failed);
             host.stop_terminal().await;
-            return diagnose(error);
+            return Err(error.into());
         }
     };
     if let Err(error) = host.reconcile_and_mark_quiescent(&run) {
         let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
         record_private_cleanup_failure(&owned_run, cleanup_failed);
         host.stop_terminal().await;
-        return diagnose(error);
+        return Err(error.into());
     }
 
     host.begin_publication();
@@ -594,7 +626,7 @@ fn execution_output(
 fn rejection_output(
     config: PresentationConfig,
     render: impl FnOnce(WorkflowRunOutput<io::Stdout, io::Stderr>) -> WorkflowRunPresentationResult,
-) -> ExitCode {
+) -> super::super::CommandResult {
     rejection_exit(render(WorkflowRunOutput::new(
         config,
         io::stdout(),
@@ -602,23 +634,37 @@ fn rejection_output(
     )))
 }
 
-pub(super) fn rejection_exit(result: WorkflowRunPresentationResult) -> ExitCode {
+pub(super) fn rejection_exit(result: WorkflowRunPresentationResult) -> super::super::CommandResult {
     match result {
-        WorkflowRunPresentationResult::Rejected
-        | WorkflowRunPresentationResult::Failed(_)
-        | WorkflowRunPresentationResult::PublicationFailed
-        | WorkflowRunPresentationResult::Published { .. } => ExitCode::FAILURE,
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: Some(diagnostic),
+        } => Err(anyhow!(diagnostic).into()),
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: None,
+        } => Ok(ExitCode::GeneralFailure),
+        WorkflowRunPresentationResult::Failed(failure) => Err(anyhow::Error::new(failure).into()),
+        WorkflowRunPresentationResult::PublicationFailed(error) => {
+            Err(anyhow::Error::new(error).into())
+        }
+        WorkflowRunPresentationResult::Published { .. } => Ok(ExitCode::GeneralFailure),
     }
 }
 
-fn presentation_exit_code(result: WorkflowRunPresentationResult) -> ExitCode {
+fn presentation_exit_code(result: WorkflowRunPresentationResult) -> super::super::CommandResult {
     match result {
         WorkflowRunPresentationResult::Published { exit_status, .. } => {
-            u8::try_from(exit_status).map_or(ExitCode::FAILURE, ExitCode::from)
+            Ok(ExitCode::from_u16(exit_status).unwrap_or(ExitCode::GeneralFailure))
         }
-        WorkflowRunPresentationResult::Rejected
-        | WorkflowRunPresentationResult::PublicationFailed
-        | WorkflowRunPresentationResult::Failed(_) => ExitCode::FAILURE,
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: Some(diagnostic),
+        } => Err(anyhow!(diagnostic).into()),
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: None,
+        } => Ok(ExitCode::GeneralFailure),
+        WorkflowRunPresentationResult::PublicationFailed(error) => {
+            Err(anyhow::Error::new(error).into())
+        }
+        WorkflowRunPresentationResult::Failed(failure) => Err(anyhow::Error::new(failure).into()),
     }
 }
 
@@ -664,70 +710,54 @@ async fn acquire_imports(
     prompt_path: Option<&Path>,
     attachments: &[OsString],
     cancellation: &CancellationSource,
-) -> Result<ResolvedImports, LocalRunError> {
+) -> anyhow::Result<ResolvedImports> {
     let prompt = match prompt_path {
         None => None,
         Some(path) if path == Path::new("-") => {
-            let bytes = read_stdin_bounded(MAXIMUM_PROMPT_BYTES, cancellation)
+            let bytes = read_stdin_bounded(MAXIMUM_AGENT_PROMPT_BYTES, cancellation)
                 .await
-                .map_err(|kind| LocalRunError::Import { kind, path: None })?;
+                .map_err(|kind| import_error(kind, None))?;
             Some(decode_prompt(bytes, None)?)
         }
         Some(path) => {
-            let file = open_regular_import(path).map_err(|kind| LocalRunError::Import {
-                kind,
-                path: Some(path.to_owned()),
-            })?;
-            let bytes = read_bounded(file, MAXIMUM_PROMPT_BYTES, cancellation).map_err(|kind| {
-                LocalRunError::Import {
-                    kind,
-                    path: Some(path.to_owned()),
-                }
-            })?;
+            let file = open_regular_import(path).map_err(|kind| import_error(kind, Some(path)))?;
+            let bytes = read_bounded(file, MAXIMUM_AGENT_PROMPT_BYTES, cancellation)
+                .map_err(|kind| import_error(kind, Some(path)))?;
             Some(decode_prompt(bytes, Some(path))?)
         }
     };
 
     let pairs = attachments.chunks_exact(2);
     if !pairs.remainder().is_empty() || pairs.len() > MAXIMUM_ATTACHMENTS {
-        return Err(LocalRunError::AttachmentCount);
+        return Err(anyhow!(
+            "acquire local workflow imports: attachment count exceeds 256"
+        ));
     }
     let mut total = 0_u64;
     let mut resolved = Vec::with_capacity(pairs.len());
     for pair in pairs {
         if cancellation.is_cancelled() {
-            return Err(LocalRunError::Import {
-                kind: ImportFailureKind::Interrupted,
-                path: None,
-            });
+            return Err(import_error(ImportFailureKind::Interrupted, None));
         }
-        let media_type = pair[0]
-            .to_str()
-            .ok_or(LocalRunError::AttachmentMediaTypeEncoding)?;
-        let path = Path::new(&pair[1]);
-        let file = open_regular_import(path).map_err(|kind| LocalRunError::Import {
-            kind,
-            path: Some(path.to_owned()),
+        let media_type = pair[0].to_str().ok_or_else(|| {
+            anyhow!("acquire local workflow imports: an attachment media type is not valid UTF-8")
         })?;
+        let path = Path::new(&pair[1]);
+        let file = open_regular_import(path).map_err(|kind| import_error(kind, Some(path)))?;
         let remaining_total = MAXIMUM_TOTAL_ATTACHMENT_BYTES.saturating_sub(total);
         let maximum = MAXIMUM_ATTACHMENT_BYTES.min(remaining_total);
         let bytes = match read_bounded(file, maximum, cancellation) {
             Err(ImportFailureKind::TooLarge) if maximum < MAXIMUM_ATTACHMENT_BYTES => {
-                return Err(LocalRunError::AttachmentBytes);
+                return Err(attachment_bytes_error());
             }
-            Err(kind) => {
-                return Err(LocalRunError::Import {
-                    kind,
-                    path: Some(path.to_owned()),
-                });
-            }
+            Err(kind) => return Err(import_error(kind, Some(path))),
             Ok(bytes) => bytes,
         };
-        let size = u64::try_from(bytes.len()).map_err(|_| LocalRunError::AttachmentBytes)?;
+        let size = u64::try_from(bytes.len()).map_err(|_| attachment_bytes_error())?;
         total = total
             .checked_add(size)
             .filter(|total| *total <= MAXIMUM_TOTAL_ATTACHMENT_BYTES)
-            .ok_or(LocalRunError::AttachmentBytes)?;
+            .ok_or_else(attachment_bytes_error)?;
         let attachment = ResolvedAttachment::new(Arc::from(media_type), Arc::from(bytes));
         let attachment = if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             attachment.with_diagnostic_source_name(Arc::from(name))
@@ -739,13 +769,22 @@ async fn acquire_imports(
     Ok(ResolvedImports::new(prompt, Arc::from(resolved)))
 }
 
-fn decode_prompt(bytes: Vec<u8>, path: Option<&Path>) -> Result<Arc<str>, LocalRunError> {
+fn import_error(kind: ImportFailureKind, path: Option<&Path>) -> anyhow::Error {
+    let context = path.map_or_else(
+        || "acquire local workflow import".to_owned(),
+        |path| format!("acquire local workflow import {path:?}"),
+    );
+    anyhow!("{kind:?}").context(context)
+}
+
+fn attachment_bytes_error() -> anyhow::Error {
+    anyhow!("acquire local workflow imports: total attachment bytes exceed 268435456")
+}
+
+fn decode_prompt(bytes: Vec<u8>, path: Option<&Path>) -> anyhow::Result<Arc<str>> {
     String::from_utf8(bytes)
         .map(Arc::from)
-        .map_err(|_| LocalRunError::Import {
-            kind: ImportFailureKind::InvalidUtf8,
-            path: path.map(Path::to_owned),
-        })
+        .map_err(|_| import_error(ImportFailureKind::InvalidUtf8, path))
 }
 
 fn open_regular_import(path: &Path) -> Result<File, ImportFailureKind> {
@@ -854,11 +893,11 @@ async fn read_stdin_bounded(
 
 pub(super) fn start_signal_observation(
     cancellation: CancellationSource,
-) -> Result<tokio::task::JoinHandle<()>, LocalRunError> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|_| LocalRunError::SignalObservation)?;
+        .context("install local workflow interrupt observation")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|_| LocalRunError::SignalObservation)?;
+        .context("install local workflow termination observation")?;
     Ok(tokio::spawn(observe_first_signal(
         async move {
             let _ = interrupt.recv().await;
@@ -999,18 +1038,16 @@ impl ActiveRunHost {
         } = self
             && let Some(active) = terminal.take()
             && let Err(terminal_failure) = active.stop().await
+            && failure.is_none()
         {
-            if failure.is_none() {
-                *failure = Some(terminal_failure.clone());
-            }
-            write_diagnostic(format_args!("{terminal_failure}"));
+            *failure = Some(terminal_failure);
         }
     }
 
-    fn reconcile_and_mark_quiescent(&self, run: &WorkflowRunResult) -> Result<(), LocalRunError> {
+    fn reconcile_and_mark_quiescent(&self, run: &WorkflowRunResult) -> anyhow::Result<()> {
         if let Self::Tui { view, .. } = self {
             view.reconcile_terminal_result(run)
-                .map_err(|_| LocalRunError::InvalidTerminalResult)?;
+                .map_err(|_| anyhow!("prepare authoritative local workflow terminal result"))?;
             view.mark_quiescent();
         }
         Ok(())
@@ -1066,17 +1103,17 @@ impl ActiveRunHost {
         publication: &Result<WorkflowRunTerminalResultV1, LocalPublicationError>,
         cleanup_failed: bool,
         state_commit_failed: bool,
-    ) -> ExitCode {
+    ) -> super::super::CommandResult {
         match self {
             Self::Standard(presentation) => {
                 if cleanup_failed || state_commit_failed {
                     render_without_terminal_json(presentation, run, publication);
-                    if state_commit_failed {
-                        report_state_commit_failure();
+                    return Err(if state_commit_failed {
+                        state_commit_failure()
                     } else {
-                        report_cleanup_failure(publication);
+                        cleanup_failure(publication)
                     }
-                    return ExitCode::FAILURE;
+                    .into());
                 }
                 let presented = match publication {
                     Ok(terminal) => {
@@ -1117,16 +1154,16 @@ impl ActiveRunHost {
                         .as_ref()
                         .ok()
                         .map(|terminal| terminal.result_directory().to_owned());
-                    write_diagnostic(format_args!("{terminal_failure}"));
-                    if let Err(error) = publication {
-                        write_diagnostic(format_args!("{error}"));
+                    let mut error = anyhow::Error::new(terminal_failure);
+                    if let Err(publication_error) = publication {
+                        error = error.context(publication_error.to_string());
                     }
                     if state_commit_failed {
-                        report_state_commit_failure();
+                        error = error.context("commit terminal local run state");
                     } else if cleanup_failed {
-                        report_cleanup_failure(publication);
+                        error = error.context(cleanup_failure_message(publication));
                     }
-                    return ExitCode::FAILURE;
+                    return Err(error.into());
                 }
 
                 let output =
@@ -1148,11 +1185,9 @@ impl ActiveRunHost {
                     ),
                 };
                 if state_commit_failed {
-                    report_state_commit_failure();
-                    ExitCode::FAILURE
+                    Err(state_commit_failure().into())
                 } else if cleanup_failed {
-                    report_cleanup_failure(publication);
-                    ExitCode::FAILURE
+                    Err(cleanup_failure(publication).into())
                 } else {
                     presentation_exit_code(presented)
                 }
@@ -1178,21 +1213,28 @@ fn render_without_terminal_json(
     }
 }
 
-fn report_cleanup_failure(
+fn cleanup_failure(
     publication: &Result<WorkflowRunTerminalResultV1, LocalPublicationError>,
-) {
-    if let Ok(terminal) = publication {
-        write_diagnostic(format_args!(
-            "release private workflow staging; result published at {}",
-            terminal.result_directory()
-        ));
-    } else {
-        write_diagnostic(format_args!("release private workflow staging"));
-    }
+) -> anyhow::Error {
+    anyhow!(cleanup_failure_message(publication))
 }
 
-fn report_state_commit_failure() {
-    write_diagnostic(format_args!("commit terminal local run state"));
+fn cleanup_failure_message(
+    publication: &Result<WorkflowRunTerminalResultV1, LocalPublicationError>,
+) -> String {
+    publication.as_ref().map_or_else(
+        |_| "release private workflow staging".to_owned(),
+        |terminal| {
+            format!(
+                "release private workflow staging; result published at {}",
+                terminal.result_directory()
+            )
+        },
+    )
+}
+
+fn state_commit_failure() -> anyhow::Error {
+    anyhow!("commit terminal local run state")
 }
 
 trait PresentationFailureState: Clone + Send + Sync + 'static {
@@ -1275,18 +1317,12 @@ fn observed_run_timing(timing: &RunTimingSnapshot) -> Option<WorkflowRunTiming> 
 }
 
 fn settle_before_execution_failure(run: &InitialLocalRun) {
-    if let Err(error) = run.record_executor_fault_before_execution() {
-        write_diagnostic(format_args!(
-            "settle published local run before execution: {error}"
-        ));
-    }
+    let _ = run.record_executor_fault_before_execution();
 }
 
 fn record_private_cleanup_failure(run: &InitialLocalRun, cleanup_failed: bool) {
-    if cleanup_failed && let Err(error) = run.record_private_cleanup_failure() {
-        write_diagnostic(format_args!(
-            "record private local workflow cleanup failure: {error}"
-        ));
+    if cleanup_failed {
+        let _ = run.record_private_cleanup_failure();
     }
 }
 
@@ -1310,7 +1346,7 @@ fn build_run_result(
     timing: RunTimingSnapshot,
     run_timing: WorkflowRunTiming,
     local_run: &InitialLocalRun,
-) -> Result<WorkflowRunResult, LocalRunError> {
+) -> anyhow::Result<WorkflowRunResult> {
     let expected_cancellation = match &execution.outcome {
         RunOutcome::Succeeded => None,
         RunOutcome::Failed {
@@ -1326,20 +1362,18 @@ fn build_run_result(
                 force_stop_deadline: deadline,
             })
         }
-        _ => return Err(LocalRunError::InvalidTerminalResult),
+        _ => return Err(invalid_terminal_result_error()),
     };
     let mut states = execution.steps;
     let mut steps = Vec::with_capacity(states.len());
     for id in &workflow.definition.presentation_order {
         let state = states
             .remove(id)
-            .ok_or(LocalRunError::InvalidTerminalResult)?;
+            .ok_or_else(invalid_terminal_result_error)?;
         let timing = match timing.steps.get(id) {
             None => None,
             Some(timing) => {
-                let finished = timing
-                    .finished
-                    .ok_or(LocalRunError::InvalidTerminalResult)?;
+                let finished = timing.finished.ok_or_else(invalid_terminal_result_error)?;
                 Some(WorkflowStepTiming {
                     started_at: timing.started.utc,
                     duration: finished.saturating_duration_since(timing.started.monotonic),
@@ -1353,7 +1387,7 @@ fn build_run_result(
             Some(crate::execution::workflow::validated::ValidatedStep::Agent(_)) => {
                 WorkflowRunStepKind::Agent
             }
-            None => return Err(LocalRunError::InvalidTerminalResult),
+            None => return Err(invalid_terminal_result_error()),
         };
         steps.push(WorkflowRunStep {
             id: id.clone(),
@@ -1366,7 +1400,7 @@ fn build_run_result(
         });
     }
     if !states.is_empty() {
-        return Err(LocalRunError::InvalidTerminalResult);
+        return Err(invalid_terminal_result_error());
     }
     Ok(WorkflowRunResult {
         run_directory: local_run.run_directory().to_owned(),
@@ -1385,6 +1419,10 @@ fn build_run_result(
     })
 }
 
+fn invalid_terminal_result_error() -> anyhow::Error {
+    anyhow!("prepare authoritative local workflow terminal result")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ImportFailureKind {
     Unavailable,
@@ -1395,81 +1433,15 @@ pub(super) enum ImportFailureKind {
     InvalidUtf8,
 }
 
-#[derive(Debug)]
-pub(super) enum LocalRunError {
-    Import {
-        kind: ImportFailureKind,
-        path: Option<PathBuf>,
-    },
-    AttachmentCount,
-    AttachmentBytes,
-    AttachmentMediaTypeEncoding,
-    UnrepresentablePath,
-    PrivateStaging,
-    AgentInputStaging(AgentInputStagingFailure),
-    AgentRuntime,
-    SignalObservation,
-    Coordination(CoordinationError),
-    InvalidTerminalResult,
-}
-
-impl fmt::Display for LocalRunError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Import { kind, path } => {
-                write!(formatter, "acquire local workflow import")?;
-                if let Some(path) = path {
-                    write!(formatter, " {:?}", path)?;
-                }
-                write!(formatter, ": {kind:?}")
-            }
-            Self::AttachmentCount => {
-                formatter.write_str("acquire local workflow imports: attachment count exceeds 256")
-            }
-            Self::AttachmentBytes => formatter.write_str(
-                "acquire local workflow imports: total attachment bytes exceed 268435456",
-            ),
-            Self::AttachmentMediaTypeEncoding => formatter.write_str(
-                "acquire local workflow imports: an attachment media type is not valid UTF-8",
-            ),
-            Self::UnrepresentablePath => formatter.write_str(
-                "prepare local workflow paths: an authoritative path is not valid UTF-8",
-            ),
-            Self::PrivateStaging => formatter.write_str("prepare private local workflow staging"),
-            Self::AgentInputStaging(error) => {
-                write!(formatter, "prepare private local agent staging: {error}")
-            }
-            Self::AgentRuntime => formatter.write_str("prepare local PiJsonV1 runtime"),
-            Self::SignalObservation => {
-                formatter.write_str("install local workflow signal observation")
-            }
-            Self::Coordination(error) => {
-                write!(formatter, "execute admitted local workflow: {error:?}")
-            }
-            Self::InvalidTerminalResult => {
-                formatter.write_str("prepare authoritative local workflow terminal result")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LocalRunError {}
-
-pub(super) fn diagnose(error: impl fmt::Display) -> ExitCode {
-    write_diagnostic(format_args!("{error}"));
-    ExitCode::FAILURE
-}
-
-fn write_diagnostic(message: fmt::Arguments<'_>) {
-    let standard_error = io::stderr();
-    let mut standard_error = standard_error.lock();
-    let _ = writeln!(standard_error, "Error: {message}").and_then(|()| standard_error.flush());
+pub(super) fn diagnose(error: impl std::fmt::Display) -> super::super::CommandResult {
+    Err(anyhow!(error.to_string()).into())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
+    use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1666,7 +1638,6 @@ mod tests {
             1,
             RunTimingObservation::new(clock.sample()),
             clock,
-            StepLogCapacity::default(),
         );
         let host = ActiveRunHost::Tui {
             view: view.clone(),

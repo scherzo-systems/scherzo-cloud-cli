@@ -35,6 +35,7 @@ fn direct_compile_time_environment_read() -> &'static str {
 }
 
 fn main() {
+    ordinary_production::direct_operational_error_rendering();
     let _ = broadly_suppressed::timing_dependent_synchronization as fn();
     let _ = broadly_expected::timing_dependent_synchronization as fn();
     let _ = panic_shortcut as fn(Option<u8>) -> u8;

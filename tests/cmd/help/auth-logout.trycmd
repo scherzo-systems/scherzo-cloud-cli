@@ -1,0 +1,11 @@
+```console
+$ scherzo-cloud auth logout --help
+Sign out of Scherzo Cloud on this device
+
+Usage: scherzo-cloud auth logout [OPTIONS]
+
+Options:
+      --json  Print the sign-out result as JSON
+  -h, --help  Print help
+
+```

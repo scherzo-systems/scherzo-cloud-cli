@@ -1,10 +1,12 @@
 pub(crate) mod adapter;
+mod input_transport;
 mod result_bridge;
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use ring::digest::{SHA256, digest};
 use serde_json::{Map, Number, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -15,10 +17,14 @@ use super::agent::{
     AgentObservation, AgentToolCallPhase, AgentValueKind, BoundedAgentResponse,
     BoundedSchemaValidAgentResult, CompletedAgentInvocation,
 };
+use super::canonical_json;
+use super::schema_common::lowercase_hex;
 
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_RESPONSE_BYTES: u64 = 1024 * 1024;
+const COMPACT_UPDATE_PROPERTY: &str = "scherzoCompact";
+const RESULT_DIGEST_PROPERTY: &str = "scherzoResultSha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PiJsonV1ProtocolLimits {
@@ -184,6 +190,18 @@ impl PiJsonV1Parser {
         call_id: &str,
         arguments: &Value,
     ) -> Result<(), AgentFailureCause> {
+        if self.try_correlate_result_request(tool_name, call_id, arguments)? {
+            return Ok(());
+        }
+        self.fail_protocol()
+    }
+
+    pub(super) fn try_correlate_result_request(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        arguments: &Value,
+    ) -> Result<bool, AgentFailureCause> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -200,28 +218,29 @@ impl PiJsonV1Parser {
             .as_ref()
             .and_then(|attempt| attempt.turn.as_ref())
         else {
-            return self.fail_protocol();
+            return Ok(false);
         };
-        let Some(call) = turn
-            .assistant
-            .as_ref()
-            .and_then(AssistantMessage::only_tool_call)
-        else {
+        let Some(assistant) = turn.assistant.as_ref() else {
+            return Ok(false);
+        };
+        let Some(call) = assistant.only_tool_call() else {
             return self.fail_protocol();
         };
         let Some(call_state) = turn.calls.first() else {
-            return self.fail_protocol();
+            return Ok(false);
         };
-        if !call_state.started
-            || call_state.ended.is_some()
+        if !call_state.started {
+            return Ok(false);
+        }
+        if call_state.ended.is_some()
             || call.id != call_id
             || call.name != tool_name
-            || !semantically_equal_json(&call.arguments, arguments)
+            || !correlates_result_arguments(&call.arguments, arguments)
         {
             return self.fail_protocol();
         }
         self.active_validation_request = Some((Arc::from(call_id), Arc::from(tool_name)));
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn accept_result(
@@ -584,11 +603,8 @@ impl PiJsonV1Parser {
             .and_then(|message| message.assistant().cloned())
             .ok_or_else(|| self.protocol_failure())?;
         let event = required_object(object, "assistantMessageEvent")
-            .and_then(parse_assistant_event)
+            .and_then(|event| parse_assistant_event(event, &message))
             .ok_or_else(|| self.protocol_failure())?;
-        if event.partial != message {
-            return Err(self.protocol_failure());
-        }
         self.check_response_bound(&message)?;
 
         let Some(turn) = self.active_turn_mut() else {
@@ -602,11 +618,11 @@ impl PiJsonV1Parser {
         else {
             return Err(self.protocol_failure());
         };
-        if !last.stable_with(&message) || !event.valid_transition(last, open_block) {
+        if !last.stable_with(&message) || !event.valid_transition(last, &message, open_block) {
             return Err(self.protocol_failure());
         }
 
-        let observations = event.normalized_observations(&message);
+        let observations = event.normalized_observations(last, &message);
         *last = message;
         *had_update = true;
         self.observations.extend(observations);
@@ -614,6 +630,7 @@ impl PiJsonV1Parser {
     }
 
     fn message_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        let expected_result_tool_name = self.expected_result_tool_name.clone();
         let value = required_value(object, "message").ok_or_else(|| self.protocol_failure())?;
         let message = parse_message(value, true).ok_or_else(|| self.protocol_failure())?;
         if let ParsedMessage::Assistant(assistant) = &message {
@@ -651,9 +668,13 @@ impl PiJsonV1Parser {
                 },
                 ParsedMessage::Assistant(assistant),
             ) => {
-                if open_block.is_some()
+                if !valid_message_end_open_block(open_block, &last, assistant)
                     || !last.stable_with(assistant)
-                    || last.content != assistant.content
+                    || !finalized_content_correlates(
+                        &last.content,
+                        &assistant.content,
+                        expected_result_tool_name.as_deref(),
+                    )
                 {
                     return Err(self.protocol_failure());
                 }
@@ -822,7 +843,13 @@ impl PiJsonV1Parser {
         let Some(turn) = self.active_turn_mut() else {
             return Err(self.protocol_failure());
         };
-        if !turn.end_call(call_id, name, result.clone(), is_error) {
+        let truncated_call = turn
+            .assistant
+            .as_ref()
+            .is_some_and(|assistant| assistant.stop_reason == StopReason::Length);
+        if (truncated_call && (!is_error || result.terminate == Some(true)))
+            || !turn.end_call(call_id, name, result.clone(), is_error)
+        {
             return Err(self.protocol_failure());
         }
         turn.retained_tool_bytes = retained_tool_bytes;
@@ -1592,24 +1619,27 @@ enum CompactionReason {
 struct AssistantUpdateEvent {
     kind: AssistantUpdateKind,
     index: usize,
-    partial: AssistantMessage,
 }
 
 enum AssistantUpdateKind {
     TextStart,
-    TextDelta(String),
-    TextEnd(String),
+    TextDelta(Option<String>),
+    TextEnd(Option<String>),
     ThinkingStart,
-    ThinkingDelta(String),
-    ThinkingEnd(String),
+    ThinkingDelta(Option<String>),
+    ThinkingEnd(Option<String>),
     ToolCallStart,
     ToolCallDelta,
     ToolCallEnd(ToolCall),
 }
 
 impl AssistantUpdateEvent {
-    fn valid_transition(&self, previous: &AssistantMessage, open: &mut Option<OpenBlock>) -> bool {
-        let current = &self.partial;
+    fn valid_transition(
+        &self,
+        previous: &AssistantMessage,
+        current: &AssistantMessage,
+        open: &mut Option<OpenBlock>,
+    ) -> bool {
         match &self.kind {
             AssistantUpdateKind::TextStart => {
                 start_block(previous, current, self.index, BlockKind::Text)
@@ -1617,14 +1647,17 @@ impl AssistantUpdateEvent {
             }
             AssistantUpdateKind::TextDelta(delta) => {
                 *open == Some(OpenBlock::Text(self.index))
-                    && append_text(previous, current, self.index, delta, BlockKind::Text)
+                    && append_text(
+                        previous,
+                        current,
+                        self.index,
+                        delta.as_deref(),
+                        BlockKind::Text,
+                    )
             }
             AssistantUpdateKind::TextEnd(content) => {
-                let block = ContentBlock::Text(content.clone());
                 *open == Some(OpenBlock::Text(self.index))
-                    && previous.content.get(self.index) == Some(&block)
-                    && current.content.get(self.index) == Some(&block)
-                    && unchanged_except(previous, current, self.index)
+                    && finalize_text(previous, current, self.index, content.as_deref())
                     && clear_open(open)
             }
             AssistantUpdateKind::ThinkingStart => {
@@ -1633,11 +1666,17 @@ impl AssistantUpdateEvent {
             }
             AssistantUpdateKind::ThinkingDelta(delta) => {
                 *open == Some(OpenBlock::Thinking(self.index))
-                    && append_text(previous, current, self.index, delta, BlockKind::Thinking)
+                    && append_text(
+                        previous,
+                        current,
+                        self.index,
+                        delta.as_deref(),
+                        BlockKind::Thinking,
+                    )
             }
             AssistantUpdateKind::ThinkingEnd(content) => {
                 *open == Some(OpenBlock::Thinking(self.index))
-                    && finalize_thinking(previous, current, self.index, content)
+                    && finalize_thinking(previous, current, self.index, content.as_deref())
                     && clear_open(open)
             }
             AssistantUpdateKind::ToolCallStart => {
@@ -1662,14 +1701,28 @@ impl AssistantUpdateEvent {
         }
     }
 
-    fn normalized_observations(&self, message: &AssistantMessage) -> Vec<AgentObservation> {
+    fn normalized_observations(
+        &self,
+        previous: &AssistantMessage,
+        message: &AssistantMessage,
+    ) -> Vec<AgentObservation> {
         match &self.kind {
-            AssistantUpdateKind::TextDelta(delta) => vec![AgentObservation::AssistantText {
-                text: Arc::from(delta.as_str()),
-            }],
-            AssistantUpdateKind::ThinkingDelta(delta) => vec![AgentObservation::Reasoning {
-                text: Arc::from(delta.as_str()),
-            }],
+            AssistantUpdateKind::TextDelta(_) => {
+                appended_text(previous, message, self.index, BlockKind::Text)
+                    .map(|delta| AgentObservation::AssistantText {
+                        text: Arc::from(delta),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            AssistantUpdateKind::ThinkingDelta(_) => {
+                appended_text(previous, message, self.index, BlockKind::Thinking)
+                    .map(|delta| AgentObservation::Reasoning {
+                        text: Arc::from(delta),
+                    })
+                    .into_iter()
+                    .collect()
+            }
             AssistantUpdateKind::ToolCallStart => message
                 .content
                 .get(self.index)
@@ -2030,23 +2083,40 @@ fn parse_tool_execution_result(value: &Value) -> Option<ToolExecutionResult> {
     })
 }
 
-fn parse_assistant_event(object: &Map<String, Value>) -> Option<AssistantUpdateEvent> {
-    let partial = required_value(object, "partial")
+fn parse_assistant_event(
+    object: &Map<String, Value>,
+    current: &AssistantMessage,
+) -> Option<AssistantUpdateEvent> {
+    let compact = match object.get(COMPACT_UPDATE_PROPERTY) {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return None,
+    };
+    if compact {
+        if object.contains_key("partial") || object.contains_key("message") {
+            return None;
+        }
+    } else if required_value(object, "partial")
         .and_then(|value| parse_message(value, false))
-        .and_then(|message| message.assistant().cloned())?;
+        .and_then(|message| message.assistant().cloned())
+        .as_ref()
+        != Some(current)
+    {
+        return None;
+    }
     let index = usize::try_from(required_u64(object, "contentIndex")?).ok()?;
     let kind = match required_string(object, "type")? {
         "text_start" => AssistantUpdateKind::TextStart,
         "text_delta" => {
-            AssistantUpdateKind::TextDelta(required_string(object, "delta")?.to_owned())
+            AssistantUpdateKind::TextDelta(compactable_string(object, "delta", compact)?)
         }
-        "text_end" => AssistantUpdateKind::TextEnd(required_string(object, "content")?.to_owned()),
+        "text_end" => AssistantUpdateKind::TextEnd(compactable_string(object, "content", compact)?),
         "thinking_start" => AssistantUpdateKind::ThinkingStart,
         "thinking_delta" => {
-            AssistantUpdateKind::ThinkingDelta(required_string(object, "delta")?.to_owned())
+            AssistantUpdateKind::ThinkingDelta(compactable_string(object, "delta", compact)?)
         }
         "thinking_end" => {
-            AssistantUpdateKind::ThinkingEnd(required_string(object, "content")?.to_owned())
+            AssistantUpdateKind::ThinkingEnd(compactable_string(object, "content", compact)?)
         }
         "toolcall_start" => AssistantUpdateKind::ToolCallStart,
         "toolcall_delta" => {
@@ -2058,11 +2128,18 @@ fn parse_assistant_event(object: &Map<String, Value>) -> Option<AssistantUpdateE
         ),
         _ => return None,
     };
-    Some(AssistantUpdateEvent {
-        kind,
-        index,
-        partial,
-    })
+    Some(AssistantUpdateEvent { kind, index })
+}
+
+fn compactable_string(
+    object: &Map<String, Value>,
+    key: &str,
+    compact: bool,
+) -> Option<Option<String>> {
+    if compact {
+        return (!object.contains_key(key)).then_some(None);
+    }
+    required_string(object, key).map(|value| Some(value.to_owned()))
 }
 
 fn start_block(
@@ -2088,15 +2165,14 @@ fn start_block(
     expected && previous.content == current.content[..index]
 }
 
-fn append_text(
-    previous: &AssistantMessage,
-    current: &AssistantMessage,
+fn block_texts<'a>(
+    previous: &'a AssistantMessage,
+    current: &'a AssistantMessage,
     index: usize,
-    delta: &str,
     kind: BlockKind,
-) -> bool {
+) -> Option<(&'a str, &'a str)> {
     if !unchanged_except(previous, current, index) {
-        return false;
+        return None;
     }
     match (
         previous.content.get(index),
@@ -2108,32 +2184,55 @@ fn append_text(
             Some(ContentBlock::Thinking(before)),
             Some(ContentBlock::Thinking(after)),
             BlockKind::Thinking,
-        ) => after.strip_prefix(before) == Some(delta),
-        _ => false,
+        ) => Some((before, after)),
+        _ => None,
     }
+}
+
+fn appended_text<'a>(
+    previous: &'a AssistantMessage,
+    current: &'a AssistantMessage,
+    index: usize,
+    kind: BlockKind,
+) -> Option<&'a str> {
+    block_texts(previous, current, index, kind)
+        .and_then(|(before, after)| after.strip_prefix(before))
+}
+
+fn append_text(
+    previous: &AssistantMessage,
+    current: &AssistantMessage,
+    index: usize,
+    expected_delta: Option<&str>,
+    kind: BlockKind,
+) -> bool {
+    appended_text(previous, current, index, kind)
+        .is_some_and(|delta| expected_delta.is_none_or(|expected| delta == expected))
+}
+
+fn finalize_text(
+    previous: &AssistantMessage,
+    current: &AssistantMessage,
+    index: usize,
+    expected_finalized: Option<&str>,
+) -> bool {
+    block_texts(previous, current, index, BlockKind::Text).is_some_and(|(previous, current)| {
+        previous == current && expected_finalized.is_none_or(|expected| current == expected)
+    })
 }
 
 fn finalize_thinking(
     previous: &AssistantMessage,
     current: &AssistantMessage,
     index: usize,
-    finalized: &str,
+    expected_finalized: Option<&str>,
 ) -> bool {
-    if !unchanged_except(previous, current, index) {
-        return false;
-    }
-    matches!(
-        (previous.content.get(index), current.content.get(index)),
-        (
-            Some(ContentBlock::Thinking(streamed)),
-            Some(ContentBlock::Thinking(current))
-        ) if current == finalized
-            && streamed.strip_prefix(finalized).is_some_and(|removed| {
-                removed
-                    .bytes()
-                    .all(|byte| matches!(byte, b'\r' | b'\n'))
-            })
-    )
+    block_texts(previous, current, index, BlockKind::Thinking).is_some_and(|(streamed, current)| {
+        expected_finalized.is_none_or(|expected| current == expected)
+            && streamed
+                .strip_prefix(current)
+                .is_some_and(|removed| removed.bytes().all(|byte| matches!(byte, b'\r' | b'\n')))
+    })
 }
 
 fn unchanged_except(previous: &AssistantMessage, current: &AssistantMessage, index: usize) -> bool {
@@ -2144,6 +2243,25 @@ fn unchanged_except(previous: &AssistantMessage, current: &AssistantMessage, ind
             .zip(&current.content)
             .enumerate()
             .all(|(candidate, (before, after))| candidate == index || before == after)
+}
+
+fn valid_message_end_open_block(
+    open: Option<OpenBlock>,
+    streamed: &AssistantMessage,
+    completed: &AssistantMessage,
+) -> bool {
+    match open {
+        None => true,
+        Some(OpenBlock::ToolCall(index)) => {
+            streamed.stop_reason == StopReason::Pending
+                && completed.stop_reason == StopReason::Length
+                && matches!(
+                    completed.content.get(index),
+                    Some(ContentBlock::ToolCall(_))
+                )
+        }
+        Some(OpenBlock::Text(_) | OpenBlock::Thinking(_)) => false,
+    }
 }
 
 fn set_open(open: &mut Option<OpenBlock>, value: OpenBlock) -> bool {
@@ -2173,6 +2291,47 @@ fn json_bytes(value: &Value) -> Option<u64> {
     serde_json::to_vec(value)
         .ok()
         .and_then(|bytes| u64::try_from(bytes.len()).ok())
+}
+
+fn finalized_content_correlates(
+    streamed: &[ContentBlock],
+    finalized: &[ContentBlock],
+    expected_result_tool_name: Option<&str>,
+) -> bool {
+    streamed.len() == finalized.len()
+        && streamed
+            .iter()
+            .zip(finalized)
+            .all(|(streamed, finalized)| match (streamed, finalized) {
+                (ContentBlock::ToolCall(streamed), ContentBlock::ToolCall(finalized))
+                    if expected_result_tool_name == Some(streamed.name.as_str()) =>
+                {
+                    streamed.id == finalized.id
+                        && streamed.name == finalized.name
+                        && correlates_result_arguments(&streamed.arguments, &finalized.arguments)
+                }
+                _ => streamed == finalized,
+            })
+}
+
+fn correlates_result_arguments(transcript: &Value, request: &Value) -> bool {
+    if semantically_equal_json(transcript, request) {
+        return true;
+    }
+    let Some(transcript) = transcript.as_object() else {
+        return false;
+    };
+    let Some(Value::String(transcript_digest)) = transcript.get(RESULT_DIGEST_PROPERTY) else {
+        return false;
+    };
+    if transcript.len() != 1 {
+        return false;
+    }
+    let mut canonical = Vec::new();
+    if canonical_json::to_writer(&mut canonical, request).is_err() {
+        return false;
+    }
+    transcript_digest == &lowercase_hex(digest(&SHA256, &canonical).as_ref())
 }
 
 fn semantically_equal_json(left: &Value, right: &Value) -> bool {

@@ -8,11 +8,17 @@ cleanup() {
   rm -rf "$long_tmp_parent"
 }
 trap cleanup EXIT
-long_tmp="$long_tmp_parent/portable-workflow-test-temporary-directory/with-a-deliberately-long-path/to-detect-path-length-dependent-test-fixtures"
-mkdir -p "$long_tmp"
-chmod 700 "$long_tmp"
+long_tmp_physical="$long_tmp_parent/physical/portable-workflow-test-temporary-directory/with-a-deliberately-long-path/to-detect-path-length-dependent-test-fixtures"
+tmp_alias="$long_tmp_parent/t"
+mkdir -p "$long_tmp_physical"
+chmod 700 "$long_tmp_physical"
+# Exercise the lexical-versus-resolved path distinction on every platform,
+# including Linux where /tmp is ordinarily not an alias. Keep the lexical path
+# short enough for Unix-domain sockets while retaining a long physical target.
+ln -s "$long_tmp_physical" "$tmp_alias"
 
 "$public_root/scripts/check-structure"
+"$public_root/scripts/check-help-output-style"
 "$public_root/scripts/check-pi-json-v1-extension"
 
 cd "$public_root"
@@ -21,8 +27,8 @@ cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
-TMPDIR="$long_tmp" cargo test --locked --workspace --all-targets --all-features
-TMPDIR="$long_tmp" SCHERZO_CLOUD_VERSION=0.2.7 \
+TMPDIR="$tmp_alias" cargo test --locked --workspace --all-targets --all-features
+TMPDIR="$tmp_alias" SCHERZO_CLOUD_VERSION=0.2.7 \
   cargo test --locked --workspace --all-targets --all-features resolved_build_version
 cargo build --locked --workspace --all-features --release
 

@@ -1,26 +1,25 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::api::{CurrentPrincipalError, HttpClient, HttpClientError, UnreachableCategory};
-use crate::human_auth::cancellation::{Cancellation, CancellationError};
-use crate::human_auth::credentials::{CredentialError, CredentialStore};
+use crate::api::{HttpClient, UnreachableCategory};
+use crate::exit_code::ExitCode;
+use crate::human_auth::cancellation::Cancellation;
+use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::device_authorization::{
-    self, AuthorizationError, AuthorizationLocalError, DeviceAuthorization, IssuedToken, TokenPoll,
+    self, AuthorizationError, DeviceAuthorization, IssuedToken, TokenPoll,
 };
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
 
-use super::status::{HumanStatusError, StatusResult, write_human_status};
+use super::status::{StatusResult, write_human_status};
 
 pub(super) const ABOUT: &str = "Sign in to Scherzo Cloud";
-const CANCELLED_EXIT_CODE: u8 = 130;
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
@@ -39,21 +38,27 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
-        let result = self.run(deployment).map(|completion| match completion {
-            Completion::Success => ExitCode::SUCCESS,
-            Completion::Failure => ExitCode::FAILURE,
-            Completion::Cancelled => ExitCode::from(CANCELLED_EXIT_CODE),
-        });
-        super::super::finish_command(result)
+    pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
+        self.run(deployment)
+            .map(|completion| match completion {
+                Completion::Success => ExitCode::Success,
+                Completion::Failure => ExitCode::GeneralFailure,
+                Completion::Cancelled => ExitCode::Interrupted,
+            })
+            .map_err(Into::into)
     }
     // jscpd:ignore-end
 
-    fn run(self, deployment: &Deployment) -> Result<Completion, CommandError> {
-        let cancellation = Cancellation::install().map_err(CommandError::Cancellation)?;
-        let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
-        let client =
-            HttpClient::new(self.http.transport_policy()).map_err(CommandError::HttpClient)?;
+    fn run(self, deployment: &Deployment) -> anyhow::Result<Completion> {
+        let cancellation = Cancellation::install()
+            .map_err(|error| anyhow!(error))
+            .context("prepare sign-in cancellation")?;
+        let store = CredentialStore::from_environment()
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?;
+        let client = HttpClient::new(self.http.transport_policy())
+            .map_err(|error| anyhow!(error))
+            .context("prepare sign-in networking")?;
         let mut output = LoginOutput { json: self.json };
 
         if self.force {
@@ -61,7 +66,8 @@ impl Command {
             // before starting its replacement login.
             store
                 .selected(deployment.fingerprint(), crate::timing::utc_now())
-                .map_err(CommandError::CredentialStore)?;
+                .map_err(|error| anyhow!(error))
+                .context("access credential store")?;
         } else {
             let existing_status = status::check(&client, deployment);
             if cancellation.is_cancelled() {
@@ -77,13 +83,12 @@ impl Command {
                     }
                     AuthenticationState::Unauthenticated => {}
                     AuthenticationState::Unreachable(category) => {
-                        output.failed(
+                        return handle_unreachable(
+                            &mut output,
                             deployment,
-                            FailureOutcome::Unreachable,
                             Phase::ExistingCredentialCheck,
-                            Some(*category),
-                        )?;
-                        return Ok(Completion::Failure);
+                            *category,
+                        );
                     }
                 },
                 Err(error) => {
@@ -126,22 +131,20 @@ impl Command {
             authorization.interval(),
             authorization.expires_in(),
         ) else {
-            output.failed(
+            return handle_protocol_error(
+                &mut output,
                 deployment,
-                FailureOutcome::ProtocolError,
                 Phase::DeviceAuthorization,
-                None,
-            )?;
-            return Ok(Completion::Failure);
+                anyhow!("the device-authorization expiration is out of range"),
+            );
         };
         let Some(activation_expires_at) = expiration_after(authorization.expires_in()) else {
-            output.failed(
+            return handle_protocol_error(
+                &mut output,
                 deployment,
-                FailureOutcome::ProtocolError,
                 Phase::DeviceAuthorization,
-                None,
-            )?;
-            return Ok(Completion::Failure);
+                anyhow!("the device-authorization expiration is out of range"),
+            );
         };
         output.activation(deployment, &authorization, activation_expires_at)?;
 
@@ -234,7 +237,7 @@ fn polling_interruption(
     deployment: &Deployment,
     cancellation: &Cancellation,
     schedule: &PollSchedule,
-) -> Result<Option<Completion>, CommandError> {
+) -> anyhow::Result<Option<Completion>> {
     if cancellation.is_cancelled() {
         output.cancelled(deployment)?;
         return Ok(Some(Completion::Cancelled));
@@ -258,15 +261,14 @@ fn finish_login(
     store: &CredentialStore,
     cancellation: &Cancellation,
     token: IssuedToken,
-) -> Result<Completion, CommandError> {
+) -> anyhow::Result<Completion> {
     let Some(expires_at) = expiration_after(token.expires_in()) else {
-        output.failed(
+        return handle_protocol_error(
+            output,
             deployment,
-            FailureOutcome::ProtocolError,
             Phase::TokenPolling,
-            None,
-        )?;
-        return Ok(Completion::Failure);
+            anyhow!("the token expiration is out of range"),
+        );
     };
     if cancellation.is_cancelled() {
         output.cancelled(deployment)?;
@@ -277,7 +279,8 @@ fn finish_login(
     // cancelled result can never conceal a newly stored token.
     store
         .replace(deployment.fingerprint(), token.access_token(), expires_at)
-        .map_err(CommandError::CredentialStore)?;
+        .map_err(|error| anyhow!(error))
+        .context("access credential store")?;
 
     let status = status::check(client, deployment);
     match status {
@@ -291,13 +294,7 @@ fn finish_login(
                 Ok(Completion::Failure)
             }
             AuthenticationState::Unreachable(category) => {
-                output.failed(
-                    deployment,
-                    FailureOutcome::Unreachable,
-                    Phase::PrincipalConfirmation,
-                    Some(*category),
-                )?;
-                Ok(Completion::Failure)
+                handle_unreachable(output, deployment, Phase::PrincipalConfirmation, *category)
             }
         },
         Err(error) => handle_status_error(output, deployment, Phase::PrincipalConfirmation, error),
@@ -309,14 +306,59 @@ fn handle_status_error(
     deployment: &Deployment,
     phase: Phase,
     error: StatusError,
-) -> Result<Completion, CommandError> {
+) -> anyhow::Result<Completion> {
     match error {
-        StatusError::CredentialStore(error) => Err(CommandError::CredentialStore(error)),
-        StatusError::PublicApi(error) if error.is_local() => Err(CommandError::PublicApi(error)),
-        StatusError::PublicApi(_) => {
-            output.failed(deployment, FailureOutcome::ProtocolError, phase, None)?;
-            Ok(Completion::Failure)
+        StatusError::CredentialStore(error) => {
+            Err(anyhow!(error).context("access credential store"))
         }
+        StatusError::PublicApi(error) if error.is_local() => {
+            Err(anyhow!(error).context(phase.operation_context(deployment)))
+        }
+        StatusError::PublicApi(error) => {
+            handle_protocol_error(output, deployment, phase, anyhow!(error))
+        }
+    }
+}
+
+fn handle_unreachable(
+    output: &mut LoginOutput,
+    deployment: &Deployment,
+    phase: Phase,
+    category: UnreachableCategory,
+) -> anyhow::Result<Completion> {
+    if output.json {
+        output.failed(
+            deployment,
+            FailureOutcome::Unreachable,
+            phase,
+            Some(category),
+        )?;
+        Ok(Completion::Failure)
+    } else {
+        let error = match phase {
+            Phase::ExistingCredentialCheck | Phase::PrincipalConfirmation => {
+                anyhow!("Scherzo Cloud is unreachable ({})", category.as_str())
+            }
+            Phase::DeviceAuthorization | Phase::TokenPolling => anyhow!(
+                "authorization server is unreachable ({})",
+                category.as_str()
+            ),
+        };
+        Err(error.context(phase.operation_context(deployment)))
+    }
+}
+
+fn handle_protocol_error(
+    output: &mut LoginOutput,
+    deployment: &Deployment,
+    phase: Phase,
+    error: anyhow::Error,
+) -> anyhow::Result<Completion> {
+    if output.json {
+        output.failed(deployment, FailureOutcome::ProtocolError, phase, None)?;
+        Ok(Completion::Failure)
+    } else {
+        Err(error.context(phase.operation_context(deployment)))
     }
 }
 
@@ -325,21 +367,16 @@ fn handle_authorization_error(
     deployment: &Deployment,
     phase: Phase,
     error: AuthorizationError,
-) -> Result<Completion, CommandError> {
+) -> anyhow::Result<Completion> {
     match error {
-        AuthorizationError::Local(error) => Err(CommandError::Authorization(error)),
-        AuthorizationError::Unreachable(category) => {
-            output.failed(
-                deployment,
-                FailureOutcome::Unreachable,
-                phase,
-                Some(category),
-            )?;
-            Ok(Completion::Failure)
+        AuthorizationError::Local(error) => {
+            Err(anyhow!(error).context(phase.operation_context(deployment)))
         }
-        AuthorizationError::Protocol { .. } => {
-            output.failed(deployment, FailureOutcome::ProtocolError, phase, None)?;
-            Ok(Completion::Failure)
+        AuthorizationError::Unreachable(category) => {
+            handle_unreachable(output, deployment, phase, category)
+        }
+        error @ AuthorizationError::Protocol { .. } => {
+            handle_protocol_error(output, deployment, phase, anyhow!(error))
         }
     }
 }
@@ -422,6 +459,27 @@ impl Phase {
             Self::PrincipalConfirmation => "principal_confirmation",
         }
     }
+
+    fn operation_context(self, deployment: &Deployment) -> String {
+        match self {
+            Self::ExistingCredentialCheck => format!(
+                "check existing sign-in through public API {}",
+                deployment.fingerprint().api_url()
+            ),
+            Self::DeviceAuthorization => format!(
+                "request device authorization from OAuth issuer {}",
+                deployment.fingerprint().issuer()
+            ),
+            Self::TokenPolling => format!(
+                "request sign-in token from OAuth issuer {}",
+                deployment.fingerprint().issuer()
+            ),
+            Self::PrincipalConfirmation => format!(
+                "confirm sign-in through public API {}",
+                deployment.fingerprint().api_url()
+            ),
+        }
+    }
 }
 
 struct LoginOutput {
@@ -434,11 +492,11 @@ impl LoginOutput {
         deployment: &Deployment,
         authorization: &DeviceAuthorization,
         expires_at: OffsetDateTime,
-    ) -> Result<(), CommandError> {
+    ) -> anyhow::Result<()> {
         if self.json {
             let expires_at = expires_at
                 .format(&Rfc3339)
-                .map_err(CommandError::FormatTime)?;
+                .context("format sign-in expiration")?;
             self.json_line(&ActivationEvent {
                 schema_version: 1,
                 event: "activation_required",
@@ -454,17 +512,16 @@ impl LoginOutput {
             let activation_uri = authorization
                 .verification_uri_complete()
                 .unwrap_or_else(|| authorization.verification_uri());
-            writeln!(stdout, "Sign in to Scherzo Cloud\n").map_err(CommandError::WriteOutput)?;
-            writeln!(stdout, "  Open: {activation_uri}").map_err(CommandError::WriteOutput)?;
+            writeln!(stdout, "Sign in to Scherzo Cloud\n").context("write sign-in output")?;
+            writeln!(stdout, "  Open: {activation_uri}").context("write sign-in output")?;
             writeln!(stdout, "  Code: {}", authorization.user_code())
-                .map_err(CommandError::WriteOutput)?;
-            writeln!(stdout, "\nWaiting for authorization...\n")
-                .map_err(CommandError::WriteOutput)?;
-            stdout.flush().map_err(CommandError::WriteOutput)
+                .context("write sign-in output")?;
+            writeln!(stdout, "\nWaiting for authorization...\n").context("write sign-in output")?;
+            stdout.flush().context("write sign-in output")
         }
     }
 
-    fn status(&mut self, status: &AuthenticationStatus) -> Result<(), CommandError> {
+    fn status(&mut self, status: &AuthenticationStatus) -> anyhow::Result<()> {
         if self.json {
             self.json_line(&StatusEvent {
                 schema_version: 1,
@@ -472,7 +529,7 @@ impl LoginOutput {
                 status: StatusResult::from_status(status),
             })
         } else {
-            write_human_status(status).map_err(CommandError::from)
+            write_human_status(status).context("write sign-in status")
         }
     }
 
@@ -482,7 +539,7 @@ impl LoginOutput {
         outcome: FailureOutcome,
         phase: Phase,
         category: Option<UnreachableCategory>,
-    ) -> Result<(), CommandError> {
+    ) -> anyhow::Result<()> {
         if self.json {
             self.json_line(&FailedEvent {
                 schema_version: 1,
@@ -511,11 +568,11 @@ impl LoginOutput {
                     outcome.as_str()
                 )
             }
-            .map_err(CommandError::WriteOutput)
+            .context("write sign-in output")
         }
     }
 
-    fn cancelled(&mut self, deployment: &Deployment) -> Result<(), CommandError> {
+    fn cancelled(&mut self, deployment: &Deployment) -> anyhow::Result<()> {
         if self.json {
             self.json_line(&CancelledEvent {
                 schema_version: 1,
@@ -525,16 +582,16 @@ impl LoginOutput {
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            writeln!(stdout, "! Sign-in cancelled.").map_err(CommandError::WriteOutput)
+            writeln!(stdout, "! Sign-in cancelled.").context("write sign-in output")
         }
     }
 
-    fn json_line<T: Serialize>(&mut self, event: &T) -> Result<(), CommandError> {
+    fn json_line<T: Serialize>(&mut self, event: &T) -> anyhow::Result<()> {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        serde_json::to_writer(&mut stdout, event).map_err(CommandError::WriteJson)?;
-        writeln!(stdout).map_err(CommandError::WriteOutput)?;
-        stdout.flush().map_err(CommandError::WriteOutput)
+        serde_json::to_writer(&mut stdout, event).context("write JSON sign-in event")?;
+        writeln!(stdout).context("write sign-in output")?;
+        stdout.flush().context("write sign-in output")
     }
 }
 
@@ -577,42 +634,6 @@ struct CancelledEvent<'a> {
     schema_version: u8,
     event: &'static str,
     deployment: &'a str,
-}
-
-#[derive(Debug)]
-enum CommandError {
-    Cancellation(CancellationError),
-    CredentialStore(CredentialError),
-    HttpClient(HttpClientError),
-    Authorization(AuthorizationLocalError),
-    PublicApi(CurrentPrincipalError),
-    FormatTime(time::error::Format),
-    WriteJson(serde_json::Error),
-    WriteOutput(io::Error),
-}
-
-impl From<HumanStatusError> for CommandError {
-    fn from(error: HumanStatusError) -> Self {
-        match error {
-            HumanStatusError::Json(error) => Self::WriteJson(error),
-            HumanStatusError::Output(error) => Self::WriteOutput(error),
-        }
-    }
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cancellation(error) => write!(formatter, "prepare sign-in cancellation: {error}"),
-            Self::CredentialStore(error) => write!(formatter, "access credential store: {error}"),
-            Self::HttpClient(error) => write!(formatter, "prepare sign-in networking: {error}"),
-            Self::Authorization(error) => write!(formatter, "prepare OAuth request: {error}"),
-            Self::PublicApi(error) => write!(formatter, "confirm sign-in: {error}"),
-            Self::FormatTime(error) => write!(formatter, "format sign-in expiration: {error}"),
-            Self::WriteJson(error) => write!(formatter, "write JSON sign-in event: {error}"),
-            Self::WriteOutput(error) => write!(formatter, "write sign-in output: {error}"),
-        }
-    }
 }
 
 #[cfg(test)]

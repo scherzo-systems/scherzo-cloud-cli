@@ -1,11 +1,10 @@
-use std::process::ExitCode;
-
 use clap::{ArgGroup, Args};
 
 use crate::api::update_organization;
+use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 
-use super::{CommandError, LeafOptions, output};
+use super::{LeafOptions, output};
 
 pub(super) const ABOUT: &str = "Update a Scherzo Cloud organization";
 
@@ -33,7 +32,7 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
+    pub(super) fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self {
             organization_ref,
             display_name,
@@ -53,7 +52,6 @@ impl Command {
                     display_name.as_deref(),
                     slug.as_deref(),
                 )
-                .map_err(CommandError::Organization)
             },
             output::write_update,
         )

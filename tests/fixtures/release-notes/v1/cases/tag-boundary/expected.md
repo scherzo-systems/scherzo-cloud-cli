@@ -1,3 +1,0 @@
-## Changed
-
-- Change account output to show active profiles.

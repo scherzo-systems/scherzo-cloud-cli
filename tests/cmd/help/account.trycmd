@@ -1,0 +1,14 @@
+```console
+$ scherzo-cloud account --help
+Manage your Scherzo Cloud account
+
+Usage: scherzo-cloud account [COMMAND]
+
+Commands:
+  signup  Create your Scherzo Cloud account
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

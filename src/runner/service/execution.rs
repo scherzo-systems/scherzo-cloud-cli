@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Add;
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,13 @@ use super::assignment::{
     ObservationOutbox,
 };
 use crate::execution::workflow::admission::CancellationReason;
+use crate::execution::workflow::agent::dispatch::{
+    ClosedAgentDispatcher, UnavailableClaudeCodeAdapter,
+};
 use crate::execution::workflow::agent::{
     AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind, WorkflowRunId,
 };
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStartFailure};
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind};
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -348,6 +353,32 @@ impl ExecutionJob {
             }
         };
 
+        let agent_diagnostic_sessions = if agent_staging.is_some() {
+            let attempt_handle = std::fs::File::open(&self.accepted.root.private)
+                .map(OwnedFd::from)
+                .ok();
+            match attempt_handle.and_then(|attempt_handle| {
+                AgentDiagnosticSessionStore::create_transient(
+                    &attempt_handle,
+                    &self.accepted.root.private,
+                )
+                .ok()
+            }) {
+                Some(sessions) => Some(sessions),
+                None => {
+                    let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                    return ExecutionCompletion::ordinary(self.abort(
+                        assignment_id,
+                        attempt_id,
+                        0,
+                        "execution_environment_lost",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         if !self.has_execution_authority() {
             let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
             return ExecutionCompletion::without_report();
@@ -373,8 +404,10 @@ impl ExecutionJob {
             .accepted
             .process_guards
             .registry(self.accepted.guard_processes);
-        let execution = if let Some(agent_staging) = &agent_staging {
-            let adapter = match PiJsonV1Adapter::new(
+        let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
+            (&agent_staging, agent_diagnostic_sessions)
+        {
+            let pi_adapter = match PiJsonV1Adapter::new(
                 diagnostics.clone(),
                 self.accepted
                     .admitted
@@ -395,13 +428,15 @@ impl ExecutionJob {
                     ));
                 }
             };
+            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, UnavailableClaudeCodeAdapter);
             let agents = AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_id)),
                 agent_staging.clone(),
-                adapter,
+                diagnostic_sessions,
+                dispatcher,
             );
-            // Enabled and disabled execution carry distinct static adapter types; keeping
-            // each engine call explicit avoids a dynamic adapter boundary.
+            // Enabled and disabled execution carry distinct static dispatcher types;
+            // keeping each engine call explicit avoids a dynamic adapter boundary.
             // jscpd:ignore-start
             let result = run_under_lease(
                 execute_workflow(
@@ -428,7 +463,7 @@ impl ExecutionJob {
             // jscpd:ignore-end
             result
         } else {
-            // See the enabled branch: the no-agent adapter is intentionally a different type.
+            // See the enabled branch: the no-agent dispatcher is intentionally a different type.
             // jscpd:ignore-start
             let result = run_under_lease(
                 execute_workflow(
@@ -1397,8 +1432,23 @@ mod tests {
         _authority: tokio::sync::watch::Sender<LeaseAuthority>,
     }
 
-    fn supervised_lease_fixture() -> SupervisedLeaseFixture {
-        let (sleeper, sleeps) = controlled_sleeper();
+    struct SupervisedExecution<Output> {
+        task: tokio::task::JoinHandle<LeaseExecution<Output>>,
+        cancellation: crate::execution::workflow::admission::CancellationSource,
+        fence: PostStopFence,
+        guards: AssignmentProcessGuards,
+        authority: tokio::sync::watch::Sender<LeaseAuthority>,
+    }
+
+    fn supervise_execution<Execution, Output>(
+        sleeper: Arc<dyn Sleeper>,
+        authority: LeaseAuthority,
+        execution: Execution,
+    ) -> SupervisedExecution<Output>
+    where
+        Execution: Future<Output = Output> + Send + 'static,
+        Output: Send + 'static,
+    {
         let cancellation = crate::execution::workflow::admission::CancellationSource::new();
         let observed_cancellation = cancellation.clone();
         let outbox = ObservationOutbox::new();
@@ -1406,15 +1456,13 @@ mod tests {
         let observed_fence = fence.clone();
         let guards = AssignmentProcessGuards::new();
         let observed_guards = guards.clone();
-        let (authority_sender, authority) =
-            tokio::sync::watch::channel(lease_authority(sleeper.now()));
-        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let (authority_sender, authority_updates) = tokio::sync::watch::channel(authority);
         let task = tokio::spawn(async move {
             run_under_lease(
-                async { result.await.expect("fixture result") },
+                execution,
                 &cancellation,
                 sleeper.as_ref(),
-                authority,
+                authority_updates,
                 &outbox,
                 "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1423,15 +1471,79 @@ mod tests {
             )
             .await
         });
-        SupervisedLeaseFixture {
-            result: result_sender,
+        SupervisedExecution {
             task,
-            sleeps,
             cancellation: observed_cancellation,
             fence: observed_fence,
             guards: observed_guards,
-            _authority: authority_sender,
+            authority: authority_sender,
         }
+    }
+
+    fn supervised_lease_fixture() -> SupervisedLeaseFixture {
+        let (sleeper, sleeps) = controlled_sleeper();
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let supervised = supervise_execution(
+            Arc::clone(&sleeper),
+            lease_authority(sleeper.now()),
+            async { result.await.expect("fixture result") },
+        );
+        SupervisedLeaseFixture {
+            result: result_sender,
+            task: supervised.task,
+            sleeps,
+            cancellation: supervised.cancellation,
+            fence: supervised.fence,
+            guards: supervised.guards,
+            _authority: supervised.authority,
+        }
+    }
+
+    #[tokio::test]
+    async fn sixty_second_lease_grace_allows_clean_exit_after_thirty_seconds() {
+        let (sleeper, mut sleeps) = controlled_sleeper();
+        let now = sleeper.now();
+        let execution_sleeper = Arc::clone(&sleeper);
+        let supervised = supervise_execution(
+            Arc::clone(&sleeper),
+            LeaseAuthority {
+                sequence: 1,
+                renewal_deadline: now,
+                cancellation_deadline: now,
+                stop_deadline: now.checked_add(Duration::from_secs(60)).unwrap(),
+                force_stop_deadline: now.checked_add(Duration::from_secs(65)).unwrap(),
+                expires_deadline: now.checked_add(Duration::from_secs(72)).unwrap(),
+                terminal_report_delivery_budget: Duration::from_secs(7),
+                revoked: false,
+            },
+            async move {
+                execution_sleeper.sleep(Duration::from_secs(30)).await;
+                "clean-exit"
+            },
+        );
+
+        assert_eq!(
+            with_watchdog(supervised.cancellation.wait_for_cancellation())
+                .await
+                .expect("lease cancellation was not requested"),
+            CancellationReason::ExecutionLeaseExpired
+        );
+        sleep_request(&mut sleeps, Duration::from_secs(30))
+            .await
+            .release();
+
+        assert!(matches!(
+            with_watchdog(supervised.task)
+                .await
+                .expect("lease supervision timed out")
+                .expect("lease supervision task failed"),
+            LeaseExecution::Completed {
+                output: "clean-exit",
+                ..
+            }
+        ));
+        assert!(!supervised.fence.is_fenced());
+        assert!(!supervised.guards.forced_containment_started());
     }
 
     #[tokio::test]

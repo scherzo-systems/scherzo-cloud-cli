@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::execution::workflow::admission::MAXIMUM_AGENT_RESPONSE_BYTES;
 use crate::execution::workflow::agent::{
     AgentHarnessFailureDetail, AgentOutcome, BoundedSchemaValidAgentResult,
 };
@@ -164,6 +165,69 @@ fn terminal(outcome: AgentOutcome) -> RecordedReplay {
         observations: Vec::new(),
         outcome,
     }
+}
+
+fn unclosed_streamed_tool_call(reason: &str) -> Vec<u8> {
+    let usage = json!({
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+    });
+    let started = json!({
+        "role": "assistant",
+        "content": [{"type": "toolCall", "id": "call-open", "name": "inspect", "arguments": {}}],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": usage,
+        "stopReason": "pending",
+        "timestamp": 2
+    });
+    let mut updated = started.clone();
+    updated["content"][0]["arguments"] = json!({"path": "partial"});
+    let mut completed = updated.clone();
+    completed["stopReason"] = json!(reason);
+    encoded(&[
+        json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-000000000009", "timestamp": "2026-07-30T12:00:00Z", "cwd": CWD}),
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({
+            "type": "message_start",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "api": "test-api",
+                "provider": "test-provider",
+                "model": "test-model",
+                "usage": usage,
+                "stopReason": "pending",
+                "timestamp": 2
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "partial": started
+            },
+            "message": started
+        }),
+        json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_delta",
+                "contentIndex": 0,
+                "delta": "{\"path\":\"partial\"}",
+                "partial": updated
+            },
+            "message": updated
+        }),
+        json!({"type": "message_end", "message": completed}),
+    ])
 }
 
 fn reused_result_identity_then_correction_transcript() -> Vec<u8> {
@@ -569,6 +633,18 @@ fn pending_is_partial_only_and_recorded_streams_reach_terminal_reasons() {
 }
 
 #[test]
+fn non_length_terminal_reasons_cannot_close_a_streamed_tool_call() {
+    for reason in ["stop", "toolUse", "error", "aborted"] {
+        let mut parser = parser(AgentValueKind::None);
+        assert_eq!(
+            parser.push_ignoring(&unclosed_streamed_tool_call(reason)),
+            Err(AgentFailureCause::HarnessProtocolFailed),
+            "unexpected implicit close for {reason}"
+        );
+    }
+}
+
+#[test]
 fn terminal_stop_reasons_use_the_closed_mode_table() {
     let no_value = replay(&simple_transcript("stop", json!([])), AgentValueKind::None);
     assert_eq!(
@@ -781,6 +857,29 @@ fn result_identity_ambiguity_and_post_acceptance_work_are_protocol_failures() {
     assert_eq!(
         unvalidated_success.push_ignoring(TERMINAL_TOOL_USE),
         Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+}
+
+#[test]
+fn extension_digest_correlates_unicode_object_keys() {
+    let arguments = json!({
+        "result": {
+            "\u{1f600}": 1,
+            "\u{ff21}": 2
+        }
+    });
+    // The extension compares UTF-8 bytes, placing the BMP fullwidth key before
+    // the supplementary-plane emoji key just as Rust's canonical JSON does.
+    let extension_canonical = "{\"result\":{\"\u{ff21}\":2,\"\u{1f600}\":1}}";
+    let extension_digest = lowercase_hex(digest(&SHA256, extension_canonical.as_bytes()).as_ref());
+    let transcript = Value::Object(serde_json::Map::from_iter([(
+        RESULT_DIGEST_PROPERTY.to_owned(),
+        Value::String(extension_digest),
+    )]));
+
+    assert!(
+        correlates_result_arguments(&transcript, &arguments),
+        "Rust must accept the digest emitted by the checked JavaScript extension"
     );
 }
 
@@ -1006,6 +1105,58 @@ fn response_limit_accepts_below_and_exact_then_fails_on_first_excess_update() {
     parser.push_ignoring(&prefix).unwrap();
     assert_eq!(
         parser.push_ignoring(&excess),
+        Err(AgentFailureCause::CapturedValueTooLarge)
+    );
+}
+
+#[test]
+fn admitted_response_limit_accepts_exact_and_rejects_one_excess_byte() {
+    let parser = PiJsonV1Parser::new(
+        Arc::from(CWD),
+        AgentValueKind::Response,
+        NonZeroU64::new(MAXIMUM_AGENT_RESPONSE_BYTES).unwrap(),
+        PiJsonV1ProtocolLimits::profile(),
+        None,
+    );
+    let response = |bytes: u64| {
+        let value = json!({
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "x".repeat(usize::try_from(bytes).unwrap())
+            }],
+            "api": "test-api",
+            "provider": "test-provider",
+            "model": "test-model",
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 0,
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+        });
+        let ParsedMessage::Assistant(message) = parse_message(&value, true).unwrap() else {
+            panic!("the response fixture must parse as an assistant message");
+        };
+        message
+    };
+
+    assert_eq!(
+        parser.check_response_bound(&response(MAXIMUM_AGENT_RESPONSE_BYTES)),
+        Ok(())
+    );
+    assert_eq!(
+        parser.check_response_bound(&response(MAXIMUM_AGENT_RESPONSE_BYTES + 1)),
         Err(AgentFailureCause::CapturedValueTooLarge)
     );
 }

@@ -26,36 +26,44 @@ validation entrypoint. It must continue to run deterministic formatting checks, 
 unit and integration tests, dependency and import boundary validation, and a complete
 release build.
 
-## Release intent
+## Release policy
 
-Keep `release.toml` as the authoritative `MAJOR.MINOR` release series. Keep the Cargo
-package fallback at the matching `MAJOR.MINOR.0`; packaged builds inject their complete
-version. Select release intent with the fragment category in the same candidate:
-`internal`, `fixed`, and compatible `changed` mean patch; `added` means minor; and
-`breaking` means minor before `1.0` or major afterward. Use the highest impact since the
-latest stable tag, and do not advance an already-selected unreleased series again. Update
-`release.toml`, `Cargo.toml`, and `Cargo.lock` together when that impact changes the
-series. Run the release fixture suites when changing release logic. Do not duplicate
-impact, tag-selection, or releaseable-path rules in workflow YAML, Nix, or prompts.
+Keep `release.toml` at schema 2 with only the static initial version, development
+version, and pre-1.0 breaking-impact policy. Keep the Cargo package fallback permanently
+at `0.0.0-dev`; Nix development builds and allocated release builds inject their
+revision-bearing or exact authoritative versions. Source validation must not fetch,
+synchronize, or inspect public tags. Run the release fixture suites when changing this
+policy or its pure impact arithmetic.
 
-Minor and major transitions must be adjacent, and a major bump resets minor to zero.
-Automatic releases run only for a checked synthetic `main` push. Preserve read-only
-permissions for checks and builds, grant write only to the final release job, pin every
-action by commit, and keep pull requests and manual dispatch incapable of publication.
+Public release execution must consume only the exact managed allocation and, for
+recovery, its current allowlisted recovery chain. Never derive a version from public tags
+or the frozen archive. Preserve read-only permissions for checks, verification, and native
+builds; grant write only to the final reconcile job; pin every action by commit; and keep
+pull requests, ordinary checks, allocation or recovery refs, and recovery-mirror pushes
+incapable of publication. Exact manual dispatch is recovery-only and must build the
+original allocated mirror rather than current repaired source.
 
-## Release-note fragments
+## Release-note archive
 
-Follow [`changes/README.md`](changes/README.md) whenever CLI work needs release intent.
-Choose `added`, `changed`, `fixed`, or `breaking` by primary user impact; use the exact
-`internal` marker only for truly user-invisible work. Generate filenames with the
-README's `/dev/urandom`, `od`, and `tr` command and verify exactly 32 lowercase
-hexadecimal characters rather than using `uuidgen` or a pull request number.
+`changes/` is a frozen archive of legacy notes. Do not add, modify, move, or delete a
+fragment. In the canonical private repository, new release intent is an append-only
+record under `cli-release/` and becomes immutable on first admission to canonical
+`main`; follow that journal's README for notes, replacements, withdrawals, corrections,
+and the bounded legacy migration. The exported CLI tree intentionally contains neither
+new private intent nor a dependency on it.
 
 Describe user behavior, not implementation. Never publish credentials, private URLs,
 customer or incident details, or unsafe vulnerability details, and never use `internal`
-to disguise a user-visible security correction. A rejected, unreleased fragment may be
-edited, replaced, or removed. A fragment present in a stable public tag is immutable;
-correct it with a new fragment. Run `./scripts/check-change-fragments` after authoring.
+to disguise a user-visible security correction.
+
+## CLI output style
+
+Follow [`docs/output-style.md`](docs/output-style.md) for every human-facing string
+the CLI prints: help text, errors, warnings, progress, reports, and prompts. It
+defines the voice registers, the error diagnostic-plus-remedy format, stream
+discipline, report layout, the terminology glossary and banned vocabulary, and
+help-text conventions. Machine surfaces (JSON documents, schemas, protocol
+messages) follow their contracts instead.
 
 ## Generated source
 

@@ -217,7 +217,10 @@ fn plain_retry_streams_a_human_run_and_rejection() {
     ));
     assert_eq!(rejection.status.code(), Some(1));
     assert!(rejection.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rejection.stderr).contains("latest_attempt_succeeded"));
+    assert_eq!(
+        rejection.stderr,
+        b"Error: cannot retry run: attempt 2 succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>\n"
+    );
 }
 
 #[test]

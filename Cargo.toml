@@ -1,6 +1,6 @@
 [package]
 name = "scherzo-cloud"
-version = "0.11.0"
+version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.97"
 description = "Command-line interface and runner for Scherzo Cloud"
@@ -30,6 +30,7 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [dependencies]
+anyhow = "1.0.104"
 base64 = "0.22.1"
 clap = { version = "4.6.3", features = ["derive"] }
 ctrlc = "3.5.1"
@@ -65,6 +66,7 @@ yaml-rust2 = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 rustix = { version = "1.1.4", features = ["pty"] }
+trycmd = "1.2.1"
 tokio = { version = "1.53.1", features = ["sync"] }
 
 # Opaque dot-only path segments are valid API inputs but do not round-trip through

@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud runner rename --help
+Rename a Scherzo Cloud runner registration
+
+Usage: scherzo-cloud runner rename [OPTIONS] --name <NAME> <ORGANIZATION> <RUNNER>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUNNER>        Runner ID or exact name
+
+Options:
+      --name <NAME>          Set the exact runner name
+      --json                 Print the runner result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

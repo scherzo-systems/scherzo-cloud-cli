@@ -5,6 +5,7 @@ mod human_principal;
 mod idempotency;
 mod organizations;
 mod problem;
+mod runners;
 mod signup;
 
 #[cfg(test)]
@@ -14,7 +15,7 @@ pub(crate) use current_principal::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
     classify_reqwest_error, get_current_principal,
 };
-pub(crate) use http_client::{HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy};
+pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use idempotency::generate_idempotency_key;
 pub(crate) use organizations::{
@@ -23,6 +24,10 @@ pub(crate) use organizations::{
     OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome, create_organization, get_organization,
     list_organization_memberships, update_organization,
+};
+pub(crate) use runners::{
+    RunnerApi, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
+    RunnerRegistrationList,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

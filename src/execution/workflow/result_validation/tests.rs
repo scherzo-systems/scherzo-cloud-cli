@@ -298,6 +298,53 @@ async fn candidates_are_bounded_rejected_and_corrected_through_one_validator() {
 }
 
 #[tokio::test]
+async fn worker_candidate_limit_accepts_four_mib_and_exact_cap_then_rejects_excess() {
+    let schema = retained_schema(json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object"
+    }));
+    let worker = InlineWorker::new();
+    let validator = validator(
+        schema,
+        MAXIMUM_AGENT_RESULT_BYTES + 1,
+        NeverClock,
+        worker.clone(),
+    );
+    let cancellation = CancellationSource::new();
+    let json_overhead = u64::try_from(br#"{"payload":""}"#.len()).unwrap();
+    let candidate = |bytes: u64| {
+        Arc::new(json!({
+            "payload": "x".repeat(usize::try_from(bytes - json_overhead).unwrap())
+        }))
+    };
+
+    for bytes in [4 * 1024 * 1024, MAXIMUM_AGENT_RESULT_BYTES] {
+        let accepted = validator.validate(candidate(bytes), &cancellation).await;
+        let ResultValidationOutcome::Decided(ResultValidationDecision::Valid(accepted)) = accepted
+        else {
+            panic!("the four-MiB candidate and exact worker cap must be admitted");
+        };
+        assert_eq!(
+            u64::try_from(accepted.canonical_json().len()).unwrap(),
+            bytes
+        );
+    }
+
+    let oversized = validator
+        .validate(candidate(MAXIMUM_AGENT_RESULT_BYTES + 1), &cancellation)
+        .await;
+    assert_eq!(
+        oversized,
+        ResultValidationOutcome::Decided(ResultValidationDecision::Rejected {
+            feedback: Arc::from(format!(
+                "Result rejected: canonical JSON exceeds the {MAXIMUM_AGENT_RESULT_BYTES}-byte limit.\n"
+            ))
+        })
+    );
+    assert_eq!(worker.starts(), 2);
+}
+
+#[tokio::test]
 async fn rejection_feedback_stops_at_sixteen_failures_and_the_byte_bound() {
     let properties = (0..24)
         .map(|index| (format!("p{index:02}"), json!({"type": "integer"})))

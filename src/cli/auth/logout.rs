@@ -1,11 +1,11 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 
-use crate::human_auth::credentials::{CredentialError, CredentialStore};
+use crate::exit_code::ExitCode;
+use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "Sign out of Scherzo Cloud on this device";
@@ -17,21 +17,19 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
-        match self.run(deployment) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
-        }
+    pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
+        self.run(deployment)?;
+        Ok(ExitCode::Success)
     }
 
-    fn run(self, deployment: &Deployment) -> Result<(), LogoutError> {
-        let store = CredentialStore::from_environment().map_err(LogoutError::CredentialStore)?;
+    fn run(self, deployment: &Deployment) -> anyhow::Result<()> {
+        let store = CredentialStore::from_environment()
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?;
         let credential_removed = store
             .remove(deployment.fingerprint())
-            .map_err(LogoutError::CredentialStore)?;
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?;
 
         if self.json {
             write_json_result(deployment, credential_removed)
@@ -49,7 +47,7 @@ struct LogoutResult<'a> {
     credential_removed: bool,
 }
 
-fn write_json_result(deployment: &Deployment, credential_removed: bool) -> Result<(), LogoutError> {
+fn write_json_result(deployment: &Deployment, credential_removed: bool) -> anyhow::Result<()> {
     let result = LogoutResult {
         schema_version: 1,
         deployment: deployment.fingerprint().api_url(),
@@ -57,11 +55,11 @@ fn write_json_result(deployment: &Deployment, credential_removed: bool) -> Resul
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, &result).map_err(LogoutError::WriteJson)?;
-    writeln!(stdout).map_err(LogoutError::WriteOutput)
+    serde_json::to_writer_pretty(&mut stdout, &result).context("write JSON sign-out result")?;
+    writeln!(stdout).context("write sign-out result")
 }
 
-fn write_human_result(credential_removed: bool) -> Result<(), LogoutError> {
+fn write_human_result(credential_removed: bool) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if credential_removed {
@@ -72,22 +70,5 @@ fn write_human_result(credential_removed: bool) -> Result<(), LogoutError> {
             "You're already signed out of Scherzo Cloud on this device."
         )
     }
-    .map_err(LogoutError::WriteOutput)
-}
-
-#[derive(Debug)]
-enum LogoutError {
-    CredentialStore(CredentialError),
-    WriteJson(serde_json::Error),
-    WriteOutput(io::Error),
-}
-
-impl fmt::Display for LogoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CredentialStore(error) => write!(formatter, "access credential store: {error}"),
-            Self::WriteJson(error) => write!(formatter, "write JSON sign-out result: {error}"),
-            Self::WriteOutput(error) => write!(formatter, "write sign-out result: {error}"),
-        }
-    }
+    .context("write sign-out result")
 }

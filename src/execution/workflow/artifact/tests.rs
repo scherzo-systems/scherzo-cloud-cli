@@ -156,6 +156,10 @@ fn captures_a_regular_file_with_path_free_metadata_and_independent_bytes() {
     assert_eq!(captured.output_identity(), "report");
     assert_eq!(captured.size(), 14);
     assert_eq!(captured.media_type(), "application/octet-stream");
+    assert_eq!(
+        captured.sha256(),
+        lowercase_hex(ring::digest::digest(&SHA256, b"captured bytes").as_ref())
+    );
     assert!(captured.handle().opaque_id().starts_with("art_"));
     assert!(!format!("{captured:?}").contains(fixture.staging_path().to_str().unwrap()));
     assert!(!captured.handle().opaque_id().contains('/'));
@@ -296,7 +300,7 @@ struct GatedCopier {
 }
 
 impl StreamCopier for GatedCopier {
-    fn copy(&mut self, request: CopyRequest<'_>) -> Result<u64, CaptureAttemptFailure> {
+    fn copy(&mut self, request: CopyRequest<'_, '_>) -> Result<u64, CaptureAttemptFailure> {
         self.source_opened.wait();
         self.resume_copy.wait();
         copy_bounded(
@@ -470,6 +474,52 @@ fn mixed_candidates_commit_and_release_independent_typed_carriers() {
     let mut bytes = Vec::new();
     fixture.store.copy_to(carrier.handle(), &mut bytes).unwrap();
     assert_eq!(bytes, b"git!!");
+
+    let exported = fixture._temporary.path().join("exported");
+    fs::create_dir(&exported).unwrap();
+    let exported_handle = open_directory(&exported).unwrap();
+    assert_eq!(
+        fixture.store.expose_carrier(
+            file.carrier(),
+            "wrong-output",
+            &exported_handle,
+            OsStr::new("wrong"),
+        ),
+        Err(ArtifactExposeFailure::UnknownHandle)
+    );
+    assert_eq!(
+        fixture.store.expose_carrier(
+            file.carrier(),
+            "report",
+            &exported_handle,
+            OsStr::new("../escape"),
+        ),
+        Err(ArtifactExposeFailure::InvalidDestination)
+    );
+    assert!(!fixture._temporary.path().join("escape").exists());
+    for (name, expected_identity, staged) in [
+        ("file", "report", file.carrier()),
+        ("git", "changes", carrier.staged()),
+    ] {
+        let source = fixture.store.open_artifact(staged.handle()).unwrap();
+        let source_metadata = source.metadata().unwrap();
+        fixture
+            .store
+            .expose_carrier(
+                staged,
+                expected_identity,
+                &exported_handle,
+                OsStr::new(name),
+            )
+            .unwrap();
+        let exposed_metadata = fs::metadata(exported.join(name)).unwrap();
+        assert_eq!(
+            (exposed_metadata.dev(), exposed_metadata.ino()),
+            (source_metadata.dev(), source_metadata.ino()),
+            "{name} carrier bytes were copied instead of linked"
+        );
+        assert_eq!(exposed_metadata.nlink(), 3);
+    }
 
     drop(outputs.remove("report"));
     assert_eq!(fixture.store.budget_usage(), (0, 0));

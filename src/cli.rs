@@ -9,16 +9,51 @@ mod workflow;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::api::HttpTransportPolicy;
+use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+
+pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
+
+pub(crate) struct CommandFailure {
+    error: anyhow::Error,
+    exit_code: ExitCode,
+}
+
+impl CommandFailure {
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            exit_code: ExitCode::GeneralFailure,
+        }
+    }
+
+    pub(crate) fn with_exit_code(error: anyhow::Error, exit_code: ExitCode) -> Self {
+        Self { error, exit_code }
+    }
+
+    pub(crate) fn error(&self) -> &anyhow::Error {
+        &self.error
+    }
+
+    pub(crate) fn exit_code(&self) -> ExitCode {
+        self.exit_code
+    }
+}
+
+impl From<anyhow::Error> for CommandFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(error)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,7 +112,7 @@ where
 }
 
 impl Cli {
-    pub(crate) fn execute(self) -> ExitCode {
+    pub(crate) fn execute(self) -> CommandResult {
         match self.command {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
@@ -102,30 +137,21 @@ fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
 
 fn execute_read_only_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> ExitCode + Send + 'static,
-) -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
+) -> CommandResult {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("Error: start {context} runtime: {:?}", error.kind());
-            return ExitCode::FAILURE;
-        }
-    };
+        .with_context(|| format!("start {context} runtime"))?;
     let result = runtime.block_on(async move {
-        let signals = (|| -> io::Result<_> {
+        let (mut interrupt, mut terminate) = (|| -> io::Result<_> {
             let interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             Ok((interrupt, terminate))
-        })();
-        let Ok((mut interrupt, mut terminate)) = signals else {
-            eprintln!("Error: install {context} signal observation");
-            return ExitCode::FAILURE;
-        };
+        })()
+        .with_context(|| format!("install {context} signal observation"))?;
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -141,7 +167,7 @@ fn execute_read_only_with_signals(
                 if completed.load(Ordering::Acquire) {
                     finish_read_only_operation(context, running.await)
                 } else {
-                    ExitCode::from(signal)
+                    Ok(signal)
                 }
             }
             result = &mut running => finish_read_only_operation(context, result),
@@ -154,82 +180,61 @@ fn execute_read_only_with_signals(
 async fn first_read_only_signal(
     interrupt: &mut tokio::signal::unix::Signal,
     terminate: &mut tokio::signal::unix::Signal,
-) -> u8 {
+) -> ExitCode {
     tokio::select! {
         biased;
-        _ = interrupt.recv() => 130,
-        _ = terminate.recv() => 143,
+        _ = interrupt.recv() => ExitCode::Interrupted,
+        _ = terminate.recv() => ExitCode::Terminated,
     }
 }
 
 fn finish_read_only_operation(
     context: &str,
-    result: Result<ExitCode, tokio::task::JoinError>,
-) -> ExitCode {
-    match result {
-        Ok(exit) => exit,
-        Err(error) => {
-            eprintln!("Error: complete {context} operation: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    result: Result<CommandResult, tokio::task::JoinError>,
+) -> CommandResult {
+    result.with_context(|| format!("complete {context} operation"))?
 }
 
 fn execute_deployment_command<T>(
     command: Option<T>,
     command_path: &[&str],
     error_context: &'static str,
-    execute: impl FnOnce(T, &Deployment) -> ExitCode,
-) -> ExitCode {
+    execute: impl FnOnce(T, &Deployment) -> CommandResult,
+) -> CommandResult {
     let Some(command) = command else {
         return print_help(command_path);
     };
-    let deployment = match Deployment::load() {
-        Ok(deployment) => deployment,
-        Err(error) => {
-            eprintln!("Error: {error_context}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let deployment = Deployment::load()
+        .map_err(|error| anyhow!(error))
+        .context(error_context)?;
     execute(command, &deployment)
 }
 
-fn finish_command<E: std::fmt::Display>(result: Result<ExitCode, E>) -> ExitCode {
-    match result {
-        Ok(exit_code) => exit_code,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn print_help(command_path: &[&str]) -> ExitCode {
+fn print_help(command_path: &[&str]) -> CommandResult {
     let mut root = Cli::command();
     root.build();
     let mut command = &mut root;
 
     for name in command_path {
         let Some(subcommand) = command.find_subcommand_mut(name) else {
-            eprintln!("Error: command help metadata is unavailable for {name}");
-            return ExitCode::FAILURE;
+            return Err(anyhow!("command help metadata is unavailable for {name}").into());
         };
         command = subcommand;
     }
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    match command.write_help(&mut stdout) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("Error: failed to write command help: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    command
+        .write_help(&mut stdout)
+        .context("failed to write command help")?;
+    Ok(ExitCode::Success)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
     use clap::CommandFactory;
 
     use super::Cli;
@@ -266,12 +271,56 @@ mod tests {
         }
     }
 
+    fn customer_command_paths() -> Vec<String> {
+        let mut paths = Vec::new();
+        collect_command_paths(&Cli::command(), "", &mut paths);
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    fn help_snapshot_paths() -> Vec<String> {
+        let snapshot_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cmd/help");
+        let mut paths = snapshot_directory
+            .read_dir()
+            .expect("help snapshot directory should exist")
+            .filter_map(|entry| {
+                let path = entry
+                    .expect("help snapshot entry should be readable")
+                    .path();
+                path.extension()
+                    .is_some_and(|extension| extension == "trycmd")
+                    .then_some(path)
+            })
+            .map(|path| {
+                let snapshot =
+                    fs::read_to_string(path).expect("help snapshot should be readable as UTF-8");
+                snapshot
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("$ scherzo-cloud")
+                            .and_then(|invocation| invocation.strip_suffix(" --help"))
+                    })
+                    .expect("help snapshot should declare its command invocation")
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn every_customer_command_has_one_help_snapshot() {
+        let mut command_paths = vec![String::new()];
+        command_paths.extend(customer_command_paths());
+
+        assert_eq!(help_snapshot_paths(), command_paths);
+    }
+
     #[test]
     fn customer_command_surface_is_exact_and_has_no_operator_entrypoint() {
-        let mut actual = Vec::new();
-        collect_command_paths(&Cli::command(), "", &mut actual);
-        actual.sort();
-        actual.dedup();
+        let actual = customer_command_paths();
         let expected = [
             "account",
             "account signup",
@@ -289,7 +338,15 @@ mod tests {
             "organization update",
             "runner",
             "runner doctor",
+            "runner list",
+            "runner pool",
+            "runner pool create",
+            "runner pool list",
+            "runner pool rename",
+            "runner pool show",
+            "runner rename",
             "runner serve",
+            "runner show",
             "version",
             "workflow",
             "workflow retry",
@@ -307,14 +364,12 @@ mod tests {
         let help = command_help(&[]);
 
         assert!(help.contains("account       Manage your Scherzo Cloud account"));
-        assert!(help.contains("artifact      Inspect and validate portable workflow artifacts"));
+        assert!(help.contains("artifact      Work with portable workflow artifacts"));
         assert!(help.contains("auth          Manage your Scherzo Cloud sign-in"));
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
-        assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
-        assert!(help.contains(
-            "workflow      Validate, run, retry, and inspect local Workflow V1 definitions"
-        ));
+        assert!(help.contains("runner        Work with the Scherzo Cloud runner"));
+        assert!(help.contains("workflow      Work with local workflow definitions and runs"));
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -331,9 +386,7 @@ mod tests {
         let help = command_help(&["artifact"]);
         let validate = command_help(&["artifact", "validate"]);
 
-        assert!(
-            help.contains("validate  Validate one complete portable Artifact Set V1 directory")
-        );
+        assert!(help.contains("validate  Validate a portable workflow artifact directory"));
         assert!(validate.contains("[OPTIONS] <ARTIFACT_DIR>"));
         assert!(validate.contains("--json"));
         assert!(!validate.contains("--plain"));
@@ -370,7 +423,7 @@ mod tests {
         assert!(update.contains("--allow-insecure-http"));
 
         let members = command_help(&["organization", "members"]);
-        assert!(members.contains("list  List one page of organization members"));
+        assert!(members.contains("list  List organization members"));
         let list = command_help(&["organization", "members", "list"]);
         assert!(list.contains("--limit <LIMIT>"));
         assert!(list.contains("--cursor <CURSOR>"));
@@ -381,8 +434,20 @@ mod tests {
     fn runner_help_is_composed_from_leaf_metadata() {
         let help = command_help(&["runner"]);
 
-        assert!(help.contains("doctor  Inspect local runner prerequisites"));
+        assert!(help.contains("pool    Manage Scherzo Cloud runner pools"));
+        assert!(help.contains("list    List Scherzo Cloud runner registrations"));
+        assert!(help.contains("show    Show a Scherzo Cloud runner registration"));
+        assert!(help.contains("rename  Rename a Scherzo Cloud runner registration"));
+        assert!(help.contains("doctor  Check local runner prerequisites"));
         assert!(help.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
+
+        let pool = command_help(&["runner", "pool"]);
+        assert!(pool.contains("create  Create a Scherzo Cloud runner pool"));
+        assert!(pool.contains("list    List Scherzo Cloud runner pools"));
+        assert!(pool.contains("show    Show a Scherzo Cloud runner pool"));
+        assert!(pool.contains("rename  Rename a Scherzo Cloud runner pool"));
+        assert!(command_help(&["runner", "show"]).contains("<ORGANIZATION> <RUNNER>"));
+        assert!(command_help(&["runner", "rename"]).contains("--name <NAME>"));
     }
 
     #[test]
@@ -390,30 +455,22 @@ mod tests {
         let help = command_help(&["workflow"]);
         let validate = command_help(&["workflow", "validate"]);
 
-        assert!(
-            help.contains("retry     Retry every step of an eligible durable local workflow run")
-        );
-        assert!(help.contains("run       Execute a local Workflow V1 command and agent DAG"));
-        assert!(
-            help.contains("status    Inspect one durable local workflow run without changing it")
-        );
-        assert!(
-            help.contains("validate  Validate a local Workflow V1 bundle without executing it")
-        );
-        assert!(
-            help.contains("view      Inspect one published local workflow attempt interactively")
-        );
+        assert!(help.contains("retry     Retry a local workflow run"));
+        assert!(help.contains("run       Run a local command and agent workflow"));
+        assert!(help.contains("status    Show local workflow run status"));
+        assert!(help.contains("validate  Validate a local workflow definition"));
+        assert!(help.contains("view      View a published local workflow attempt"));
         let run = command_help(&["workflow", "run"]);
         for option in [
             "--source-root <ROOT>",
             "--execution-root <PATH>",
             "--run-dir <PATH>",
-            "--prompt-file <PATH|->",
+            "--prompt-file <PATH>",
             "--attachment <MEDIA_TYPE> <PATH>",
             "--max-parallel <COUNT>",
             "--plain",
             "--json",
-            "--color <auto|always|never>",
+            "--color <WHEN>",
             "<WORKFLOW_FILE>",
         ] {
             assert!(run.contains(option), "run help should contain {option}");
@@ -424,7 +481,7 @@ mod tests {
             "--execution-root <PATH>",
             "--plain",
             "--json",
-            "--color <auto|always|never>",
+            "--color <WHEN>",
         ] {
             assert!(retry.contains(option), "retry help should contain {option}");
         }
@@ -433,12 +490,7 @@ mod tests {
         assert!(!retry.contains("--prompt-file"));
         assert!(!retry.contains("--max-parallel"));
         let status = command_help(&["workflow", "status"]);
-        for option in [
-            "<RUN_DIR>",
-            "--plain",
-            "--json",
-            "--color <auto|always|never>",
-        ] {
+        for option in ["<RUN_DIR>", "--plain", "--json", "--color <WHEN>"] {
             assert!(
                 status.contains(option),
                 "status help should contain {option}"
@@ -448,11 +500,7 @@ mod tests {
         assert!(!status.contains("--source-root"));
         assert!(!status.contains("--execution-root"));
         let view = command_help(&["workflow", "view"]);
-        for option in [
-            "<RUN_DIR>",
-            "--attempt <NUMBER>",
-            "--color <auto|always|never>",
-        ] {
+        for option in ["<RUN_DIR>", "--attempt <NUMBER>", "--color <WHEN>"] {
             assert!(view.contains(option), "view help should contain {option}");
         }
         assert!(!view.contains("--run-dir"));

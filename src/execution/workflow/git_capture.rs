@@ -31,7 +31,7 @@ use super::artifact::{
 use super::execution_root::{AdmittedExecutionRoot, WorkingDirectorySelectionFailure};
 use super::schema_common::{is_lowercase_hex, lowercase_hex};
 
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAXIMUM_SMALL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAXIMUM_BUNDLE_HEADER_BYTES: usize = 1024 * 1024;
@@ -65,6 +65,12 @@ impl fmt::Display for GitWorkspaceAdmissionFailure {
 impl std::error::Error for GitWorkspaceAdmissionFailure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitCommandTimeout {
+    command: Arc<str>,
+    limit: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GitCaptureFailure {
     Cancelled,
     ExecutionRootRebound,
@@ -77,6 +83,7 @@ pub(crate) enum GitCaptureFailure {
     RequiredObjectsUnavailable,
     SourceAuthorityChanged,
     GitStructureLimitExceeded,
+    CommandTimedOut(Box<GitCommandTimeout>),
     BundleGenerationFailed,
     BundleProfileInvalid,
     BundleVerificationFailed,
@@ -87,7 +94,14 @@ pub(crate) enum GitCaptureFailure {
 
 impl fmt::Display for GitCaptureFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Git branch capture failure: {self:?}")
+        match self {
+            Self::CommandTimedOut(timeout) => write!(
+                formatter,
+                "Git branch capture command `{}` exceeded the {:?} timeout",
+                timeout.command, timeout.limit
+            ),
+            _ => write!(formatter, "Git branch capture failure: {self:?}"),
+        }
     }
 }
 
@@ -810,6 +824,7 @@ impl GitCaptureContext {
             })?;
         execute_process(
             command,
+            git_command_description(&arguments),
             input,
             maximum_stdout_bytes,
             cancellation,
@@ -826,6 +841,7 @@ impl GitCaptureContext {
     ) -> Result<ProcessOutput, ProcessFailure> {
         execute_process(
             self.git_command(arguments, true, None),
+            git_command_description(arguments),
             input,
             maximum_stdout_bytes,
             cancellation,
@@ -911,6 +927,7 @@ impl GitCaptureContext {
             .map_err(|_| PackStreamFailure::Process(ProcessFailure::ExecutionRootRebound))?;
         stream_process_stdout(
             command,
+            git_command_description(&arguments),
             input.as_bytes(),
             destination,
             cancellation,
@@ -1055,6 +1072,21 @@ fn contains_gitlink(bytes: &[u8]) -> bool {
         .any(|mode| mode == b"160000")
 }
 
+fn git_command_description(arguments: &[OsString]) -> Arc<str> {
+    let mut command = String::from("git");
+    for argument in arguments {
+        command.push(' ');
+        for character in argument.to_string_lossy().chars() {
+            if character == '`' {
+                command.push_str("\\`");
+            } else {
+                command.extend(character.escape_default());
+            }
+        }
+    }
+    Arc::from(command)
+}
+
 fn reserved_git_environment(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
     matches!(
@@ -1089,7 +1121,7 @@ fn admission_process_failure(failure: ProcessFailure) -> GitWorkspaceAdmissionFa
     match failure {
         ProcessFailure::Cancelled => GitWorkspaceAdmissionFailure::Cancelled,
         ProcessFailure::ExecutionRootRebound => GitWorkspaceAdmissionFailure::ExecutionRootRebound,
-        ProcessFailure::TimedOut => GitWorkspaceAdmissionFailure::GitTimedOut,
+        ProcessFailure::TimedOut { .. } => GitWorkspaceAdmissionFailure::GitTimedOut,
         ProcessFailure::Spawn
         | ProcessFailure::Wait
         | ProcessFailure::Io
@@ -1105,8 +1137,10 @@ fn capture_process_failure(
     match failure {
         ProcessFailure::Cancelled => GitCaptureFailure::Cancelled,
         ProcessFailure::ExecutionRootRebound => GitCaptureFailure::ExecutionRootRebound,
-        ProcessFailure::TimedOut
-        | ProcessFailure::Spawn
+        ProcessFailure::TimedOut { command, limit } => {
+            GitCaptureFailure::CommandTimedOut(Box::new(GitCommandTimeout { command, limit }))
+        }
+        ProcessFailure::Spawn
         | ProcessFailure::Wait
         | ProcessFailure::Io
         | ProcessFailure::Input
@@ -1132,11 +1166,11 @@ enum ProcessInput<'a> {
     File(File),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProcessFailure {
     Cancelled,
     ExecutionRootRebound,
-    TimedOut,
+    TimedOut { command: Arc<str>, limit: Duration },
     Spawn,
     Wait,
     Io,
@@ -1161,6 +1195,7 @@ struct ProcessOutput {
 
 fn execute_process(
     mut command: Command,
+    command_description: Arc<str>,
     input: ProcessInput<'_>,
     maximum_stdout_bytes: usize,
     cancellation: &CaptureCancellation,
@@ -1203,6 +1238,7 @@ fn execute_process(
         let status = child.wait(
             cancellation,
             timeout,
+            command_description,
             || false,
             || {
                 stdout.is_finished()
@@ -1237,6 +1273,7 @@ enum PackStreamFailure {
 
 fn stream_process_stdout(
     mut command: Command,
+    command_description: Arc<str>,
     input: &[u8],
     destination: &mut CarrierDestination<'_>,
     cancellation: &CaptureCancellation,
@@ -1279,6 +1316,7 @@ fn stream_process_stdout(
         let status = child.wait(
             cancellation,
             timeout,
+            command_description,
             || stream.is_finished(),
             || stream.is_finished() && input_writer.is_finished() && stderr.is_finished(),
         );
@@ -1291,21 +1329,24 @@ fn stream_process_stdout(
         let stderr = stderr
             .join()
             .map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
-        if let Err(failure) = status {
-            if failure == ProcessFailure::StreamClosed
-                && let Err(destination_failure) = stream
-            {
-                return Err(PackStreamFailure::Destination(destination_failure));
+        match status {
+            Err(ProcessFailure::StreamClosed) => match stream {
+                Err(destination_failure) => {
+                    Err(PackStreamFailure::Destination(destination_failure))
+                }
+                Ok(()) => Err(PackStreamFailure::Process(ProcessFailure::StreamClosed)),
+            },
+            Err(failure) => Err(PackStreamFailure::Process(failure)),
+            Ok(status) => {
+                stream.map_err(PackStreamFailure::Destination)?;
+                input.map_err(|_| PackStreamFailure::Process(ProcessFailure::Input))?;
+                stderr.map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(PackStreamFailure::Process(ProcessFailure::Io))
+                }
             }
-            return Err(PackStreamFailure::Process(failure));
-        }
-        stream.map_err(PackStreamFailure::Destination)?;
-        input.map_err(|_| PackStreamFailure::Process(ProcessFailure::Input))?;
-        stderr.map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
-        if status.map_err(PackStreamFailure::Process)?.success() {
-            Ok(())
-        } else {
-            Err(PackStreamFailure::Process(ProcessFailure::Io))
         }
     })
 }
@@ -1332,6 +1373,7 @@ impl ManagedChild {
         &mut self,
         cancellation: &CaptureCancellation,
         timeout: Duration,
+        command: Arc<str>,
         stream_finished: impl Fn() -> bool,
         workers_finished: impl Fn() -> bool,
     ) -> Result<ExitStatus, ProcessFailure> {
@@ -1373,7 +1415,10 @@ impl ManagedChild {
             }
             if crate::timing::elapsed(started) >= timeout {
                 self.terminate();
-                return Err(ProcessFailure::TimedOut);
+                return Err(ProcessFailure::TimedOut {
+                    command,
+                    limit: timeout,
+                });
             }
             crate::timing::sleep(PROCESS_POLL_INTERVAL);
         }

@@ -1,2 +1,4 @@
-schema = 1
-series = "0.11"
+schema = 2
+initial_version = "0.1.0"
+development_version = "0.0.0-dev"
+pre_1_0_breaking_impact = "minor"

@@ -7,168 +7,121 @@ fail() {
 }
 
 usage() {
-  echo "Usage: scripts/check-release [--series | --validate-tag TAG]" >&2
+  echo "Usage: scripts/check-release [--initial-version | --development-version | --breaking-impact | --validate-tag TAG]" >&2
 }
 
 mode=check
-latest_tag=
+tag=
 case $# in
-  0)
-    ;;
+  0) ;;
   1)
-    if [[ "$1" != "--series" ]]; then
-      usage
-      exit 2
-    fi
-    mode=series
+    case $1 in
+      --initial-version) mode=initial ;;
+      --development-version) mode=development ;;
+      --breaking-impact) mode=breaking ;;
+      *) usage; exit 2 ;;
+    esac
     ;;
   2)
-    if [[ "$1" != "--validate-tag" ]]; then
-      usage
-      exit 2
-    fi
-    mode=validate-tag
-    latest_tag=$2
+    [[ $1 == --validate-tag ]] || { usage; exit 2; }
+    mode=tag
+    tag=$2
     ;;
-  *)
-    usage
-    exit 2
-    ;;
+  *) usage; exit 2 ;;
 esac
 
-public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 release_file=$public_root/release.toml
 manifest_file=$public_root/Cargo.toml
-maximum_component=999999
-schema_pattern='^[[:space:]]*schema[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$'
-series_pattern='^[[:space:]]*series[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
-section_pattern='^[[:space:]]*\[([^]]+)\][[:space:]]*(#.*)?$'
-package_version_pattern='^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
-tag_pattern='^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$'
-
-if [[ ! -f "$release_file" ]]; then
-  fail "CLI release configuration is missing: release.toml"
-fi
-if [[ ! -f "$manifest_file" ]]; then
-  fail "CLI Cargo manifest is missing: Cargo.toml"
-fi
+[[ -f $release_file ]] || fail "CLI release configuration is missing: release.toml"
+[[ -f $manifest_file ]] || fail "CLI Cargo manifest is missing: Cargo.toml"
 
 schema=
-series=
+initial_version=
+development_version=
+breaking_impact=
 schema_count=0
-series_count=0
+initial_count=0
+development_count=0
+breaking_count=0
+schema_pattern='^[[:space:]]*schema[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$'
+initial_pattern='^[[:space:]]*initial_version[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
+development_pattern='^[[:space:]]*development_version[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
+breaking_pattern='^[[:space:]]*pre_1_0_breaking_impact[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
 line_number=0
-while IFS= read -r line || [[ -n "$line" ]]; do
+while IFS= read -r line || [[ -n $line ]]; do
   ((line_number += 1))
   line=${line%$'\r'}
-
-  if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
-    continue
+  [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
+  if [[ $line =~ $schema_pattern ]]; then
+    ((schema_count += 1)); schema=${BASH_REMATCH[1]}; continue
   fi
-
-  if [[ "$line" =~ $schema_pattern ]]; then
-    ((schema_count += 1))
-    schema=${BASH_REMATCH[1]}
-    continue
+  if [[ $line =~ $initial_pattern ]]; then
+    ((initial_count += 1)); initial_version=${BASH_REMATCH[1]}; continue
   fi
-
-  if [[ "$line" =~ $series_pattern ]]; then
-    ((series_count += 1))
-    series=${BASH_REMATCH[1]}
-    continue
+  if [[ $line =~ $development_pattern ]]; then
+    ((development_count += 1)); development_version=${BASH_REMATCH[1]}; continue
   fi
-
+  if [[ $line =~ $breaking_pattern ]]; then
+    ((breaking_count += 1)); breaking_impact=${BASH_REMATCH[1]}; continue
+  fi
   fail "Unknown or malformed CLI release configuration on line $line_number."
 done <"$release_file"
 
-if ((schema_count == 0)); then
-  fail "CLI release configuration is missing required field: schema"
-fi
-if ((schema_count > 1)); then
-  fail "CLI release configuration contains duplicate field: schema"
-fi
-if ((series_count == 0)); then
-  fail "CLI release configuration is missing required field: series"
-fi
-if ((series_count > 1)); then
-  fail "CLI release configuration contains duplicate field: series"
-fi
-if [[ "$schema" != "1" ]]; then
-  fail "Unsupported CLI release configuration schema: $schema"
-fi
-if [[ ! "$series" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
-  fail "CLI release series must use canonical MAJOR.MINOR syntax: $series"
-fi
-
-series_major=${BASH_REMATCH[1]}
-series_minor=${BASH_REMATCH[2]}
-if ((series_major > maximum_component || series_minor > maximum_component)); then
-  fail "CLI release series components must not exceed $maximum_component: $series"
-fi
+for field in schema initial_version development_version pre_1_0_breaking_impact; do
+  case $field in
+    schema) count=$schema_count ;;
+    initial_version) count=$initial_count ;;
+    development_version) count=$development_count ;;
+    pre_1_0_breaking_impact) count=$breaking_count ;;
+  esac
+  ((count == 1)) || fail "CLI release configuration must contain exactly one field: $field"
+done
+[[ $schema == 2 ]] || fail "Unsupported CLI release configuration schema: $schema"
+[[ $initial_version == 0.1.0 ]] \
+  || fail "CLI initial release version must be 0.1.0: $initial_version"
+[[ $development_version == 0.0.0-dev ]] \
+  || fail "CLI development version must be 0.0.0-dev: $development_version"
+[[ $breaking_impact == minor ]] \
+  || fail "CLI pre-1.0 breaking impact must be minor: $breaking_impact"
 
 package_version=
 package_version_count=0
 in_package=0
+section_pattern='^[[:space:]]*\[([^]]+)\][[:space:]]*(#.*)?$'
+version_pattern='^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*(#.*)?$'
 line_number=0
-while IFS= read -r line || [[ -n "$line" ]]; do
+while IFS= read -r line || [[ -n $line ]]; do
   ((line_number += 1))
   line=${line%$'\r'}
-
-  if [[ "$line" =~ $section_pattern ]]; then
-    if [[ "${BASH_REMATCH[1]}" == "package" ]]; then
-      in_package=1
-    else
-      in_package=0
-    fi
+  if [[ $line =~ $section_pattern ]]; then
+    [[ ${BASH_REMATCH[1]} == package ]] && in_package=1 || in_package=0
     continue
   fi
-
-  if ((in_package == 1)) && [[ "$line" =~ ^[[:space:]]*version[[:space:]]*= ]]; then
-    if [[ ! "$line" =~ $package_version_pattern ]]; then
-      fail "Malformed Cargo package version on line $line_number."
-    fi
+  if ((in_package == 1)) && [[ $line =~ ^[[:space:]]*version[[:space:]]*= ]]; then
+    [[ $line =~ $version_pattern ]] \
+      || fail "Malformed Cargo package version on line $line_number."
     ((package_version_count += 1))
     package_version=${BASH_REMATCH[1]}
   fi
 done <"$manifest_file"
+((package_version_count == 1)) \
+  || fail "Cargo.toml must contain exactly one package.version field."
+[[ $package_version == "$development_version" ]] \
+  || fail "Cargo package version must match development_version $development_version; found $package_version."
 
-if ((package_version_count == 0)); then
-  fail "Cargo.toml is missing package.version."
-fi
-if ((package_version_count > 1)); then
-  fail "Cargo.toml contains duplicate package.version fields."
-fi
-expected_package_version=${series}.0
-if [[ "$package_version" != "$expected_package_version" ]]; then
-  fail "Cargo package version must match the release-series fallback $expected_package_version; found $package_version."
-fi
-
-case "$mode" in
-  check)
-    printf 'CLI release configuration is valid for series %s.\n' "$series"
-    exit 0
-    ;;
-  series)
-    printf '%s\n' "$series"
-    exit 0
-    ;;
-  validate-tag)
-    ;;
-  *)
-    fail "Unsupported release-check mode: $mode"
+case $mode in
+  check) printf 'CLI static release policy is valid.\n' ;;
+  initial) printf '%s\n' "$initial_version" ;;
+  development) printf '%s\n' "$development_version" ;;
+  breaking) printf '%s\n' "$breaking_impact" ;;
+  tag)
+    [[ $tag =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]] \
+      || fail "CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $tag"
+    ((10#${BASH_REMATCH[1]} <= 999999 \
+      && 10#${BASH_REMATCH[2]} <= 999999 \
+      && 10#${BASH_REMATCH[3]} <= 999999)) \
+      || fail "CLI release tag components must not exceed 999999: $tag"
+    printf 'CLI release tag is valid: %s.\n' "$tag"
     ;;
 esac
-
-if [[ ! "$latest_tag" =~ $tag_pattern ]]; then
-  fail "CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $latest_tag"
-fi
-latest_major=${BASH_REMATCH[1]}
-latest_minor=${BASH_REMATCH[2]}
-latest_patch=${BASH_REMATCH[3]}
-if ((latest_major > maximum_component \
-  || latest_minor > maximum_component \
-  || latest_patch > maximum_component)); then
-  fail "CLI release tag components must not exceed $maximum_component: $latest_tag"
-fi
-
-printf 'CLI release tag is valid: %s.\n' "$latest_tag"

@@ -1,6 +1,7 @@
 pub(crate) mod archived;
 mod dag_layout;
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
@@ -50,7 +51,6 @@ use super::step_runtime::StepFailureCause;
 const MINIMUM_WIDTH: u16 = 64;
 const MINIMUM_HEIGHT: u16 = 20;
 const WIDE_LAYOUT_WIDTH: u16 = 100;
-const SPLIT_WORKFLOW_PERCENTAGE: u16 = 52;
 const WORKFLOW_SUMMARY_HEIGHT: u16 = 3;
 const FOOTER_HEIGHT: u16 = 2;
 const MINIMUM_INSPECTOR_HEIGHT: u16 = 8;
@@ -1427,6 +1427,7 @@ fn render(
             sections[1].y,
             interaction.help_visible,
             color,
+            wide_split_columns(sections[0]),
         );
     }
 
@@ -1480,12 +1481,12 @@ fn split_body_layout(
     area: Rect,
     summary_height: u16,
     desired_inspector_height: u16,
+    wide_columns: [Rect; 2],
 ) -> SplitBodyLayout {
     if area.width >= WIDE_LAYOUT_WIDTH {
-        let columns = wide_split_columns(area);
         let left = Layout::vertical([Constraint::Length(summary_height), Constraint::Min(0)])
-            .split(columns[0]);
-        let right = inspector_and_log_areas(columns[1], desired_inspector_height);
+            .split(wide_columns[0]);
+        let right = inspector_and_log_areas(wide_columns[1], desired_inspector_height);
         SplitBodyLayout {
             summary: left[0],
             dag: left[1],
@@ -1528,6 +1529,7 @@ fn render_split_body(
         area,
         WORKFLOW_SUMMARY_HEIGHT,
         inspector_desired_height(selected_step),
+        wide_split_columns(area),
     );
     render_workflow_summary(
         frame,
@@ -1582,19 +1584,22 @@ fn render_split_footer_junction(
     footer_y: u16,
     help_visible: bool,
     color: bool,
+    wide_columns: [Rect; 2],
 ) {
     if body.width >= WIDE_LAYOUT_WIDTH && !help_visible {
-        let columns = wide_split_columns(body);
-        render_junction(frame, columns[1].x.saturating_sub(1), footer_y, "┴", color);
+        render_junction(
+            frame,
+            wide_columns[1].x.saturating_sub(1),
+            footer_y,
+            "┴",
+            color,
+        );
     }
 }
 
 fn wide_split_columns(area: Rect) -> [Rect; 2] {
-    let columns = Layout::horizontal([
-        Constraint::Percentage(SPLIT_WORKFLOW_PERCENTAGE),
-        Constraint::Percentage(100 - SPLIT_WORKFLOW_PERCENTAGE),
-    ])
-    .split(area);
+    let columns =
+        Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)]).split(area);
     [columns[0], columns[1]]
 }
 
@@ -2341,6 +2346,11 @@ fn harness_description(harness: &AgentPresentationHarness) -> String {
             let thinking = format!("{thinking:?}").to_ascii_lowercase();
             format!("pi · {} · thinking={thinking}", visible_text(model))
         }
+        AgentPresentationHarness::ClaudeCode { model, effort } => format!(
+            "claude code · {} · effort={}",
+            visible_text(model),
+            effort.as_str()
+        ),
     }
 }
 
@@ -2965,6 +2975,7 @@ fn render_full_log(
         frame.render_widget(
             Paragraph::new(log_eviction_line(
                 step.log.discarded_records,
+                step.log.discarded_bytes,
                 interaction.anchor_clamped,
                 color,
             )),
@@ -3214,7 +3225,12 @@ fn log_tail_lines(
     let tail_rows = if step.log.discarded_records == 0 {
         available_rows
     } else {
-        lines.push(log_eviction_line(step.log.discarded_records, false, color));
+        lines.push(log_eviction_line(
+            step.log.discarded_records,
+            step.log.discarded_bytes,
+            false,
+            color,
+        ));
         available_rows.saturating_sub(1)
     };
     if tail_rows == 0 {
@@ -3229,21 +3245,37 @@ fn log_tail_lines(
         return lines;
     }
 
-    let record_lines = log
-        .records
-        .iter()
-        .flat_map(|record| log_record_lines(record, available_width, color))
-        .collect::<Vec<_>>();
-    let first_visible_line = record_lines.len().saturating_sub(tail_rows);
-    lines.extend(record_lines.into_iter().skip(first_visible_line));
+    let mut remaining_rows = tail_rows;
+    let mut newest_first_record_lines = Vec::new();
+    for record in log.records.iter().rev() {
+        let record_lines = log_record_tail_lines(record, available_width, remaining_rows, color);
+        remaining_rows = remaining_rows.saturating_sub(record_lines.len());
+        newest_first_record_lines.push(record_lines);
+        if remaining_rows == 0 {
+            break;
+        }
+    }
+    for record_lines in newest_first_record_lines.into_iter().rev() {
+        lines.extend(record_lines);
+    }
     lines
 }
 
-fn log_eviction_line(discarded_records: u64, anchor_clamped: bool, color: bool) -> Line<'static> {
+fn log_eviction_line(
+    discarded_records: u64,
+    discarded_bytes: u64,
+    anchor_clamped: bool,
+    color: bool,
+) -> Line<'static> {
     let line_label = if discarded_records == 1 {
         "line"
     } else {
         "lines"
+    };
+    let byte_label = if discarded_bytes == 1 {
+        "byte"
+    } else {
+        "bytes"
     };
     let clamp_notice = if anchor_clamped {
         " | clamped to retained top"
@@ -3251,7 +3283,9 @@ fn log_eviction_line(discarded_records: u64, anchor_clamped: bool, color: bool) 
         ""
     };
     Line::from(Span::styled(
-        format!("↑ {discarded_records} older {line_label} discarded{clamp_notice}"),
+        format!(
+            "↑ {discarded_records} older {line_label} / {discarded_bytes} {byte_label} discarded{clamp_notice}"
+        ),
         tone_style(color, Tone::Muted),
     ))
 }
@@ -3279,19 +3313,22 @@ fn empty_log_message(state: StepStateKind) -> &'static str {
     }
 }
 
-fn log_record_lines(
+fn log_record_tail_lines(
     record: &WorkflowRunLogRecord,
     available_width: usize,
+    maximum_rows: usize,
     color: bool,
 ) -> Vec<Line<'static>> {
     let gutter = LogGutter::for_width(available_width);
     let content_width = available_width.saturating_sub(gutter.width()).max(1);
-    wrap_log_payload(&record.payload, content_width)
+    wrap_log_payload_tail(&record.payload, content_width, maximum_rows)
         .into_iter()
         .enumerate()
-        .map(|(index, payload)| {
-            let row_kind = if index == 0 {
+        .map(|(visible_index, (is_first_line, payload))| {
+            let row_kind = if is_first_line {
                 LogRowKind::for_record(record)
+            } else if visible_index == 0 {
+                LogRowKind::ClippedVisualContinuation
             } else {
                 LogRowKind::VisualContinuation
             };
@@ -3330,26 +3367,56 @@ fn log_line(
 }
 
 fn wrap_log_payload(payload: &str, maximum_width: usize) -> Vec<String> {
-    if payload.is_empty() {
-        return vec![String::new()];
+    let mut lines = Vec::new();
+    for_each_wrapped_log_payload(payload, maximum_width, |_, line| lines.push(line));
+    lines
+}
+
+fn wrap_log_payload_tail(
+    payload: &str,
+    maximum_width: usize,
+    maximum_rows: usize,
+) -> VecDeque<(bool, String)> {
+    if maximum_rows == 0 {
+        return VecDeque::new();
     }
 
-    let mut lines = Vec::new();
+    let mut lines = VecDeque::with_capacity(maximum_rows);
+    for_each_wrapped_log_payload(payload, maximum_width, |is_first_line, line| {
+        if lines.len() == maximum_rows {
+            lines.pop_front();
+        }
+        lines.push_back((is_first_line, line));
+    });
+    lines
+}
+
+fn for_each_wrapped_log_payload(
+    payload: &str,
+    maximum_width: usize,
+    mut emit: impl FnMut(bool, String),
+) {
+    if payload.is_empty() {
+        emit(true, String::new());
+        return;
+    }
+
     let mut line = String::new();
     let mut line_width = 0_usize;
+    let mut is_first_line = true;
     for grapheme in payload.graphemes(true) {
         let grapheme_width = display_width(grapheme);
         if !line.is_empty() && line_width.saturating_add(grapheme_width) > maximum_width {
-            lines.push(std::mem::take(&mut line));
+            emit(is_first_line, std::mem::take(&mut line));
+            is_first_line = false;
             line_width = 0;
         }
         line.push_str(grapheme);
         line_width = line_width.saturating_add(grapheme_width);
     }
     if !line.is_empty() {
-        lines.push(line);
+        emit(is_first_line, line);
     }
-    lines
 }
 
 #[derive(Clone, Copy)]
@@ -3357,6 +3424,7 @@ enum LogRowKind {
     Record,
     SafetyContinuation,
     VisualContinuation,
+    ClippedVisualContinuation,
 }
 
 impl LogRowKind {
@@ -3466,8 +3534,12 @@ impl LogGutter {
         color: bool,
     ) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
+        let visual_continuation = matches!(
+            row_kind,
+            LogRowKind::VisualContinuation | LogRowKind::ClippedVisualContinuation
+        );
         if self.timestamp {
-            let timestamp = if matches!(row_kind, LogRowKind::VisualContinuation) {
+            let timestamp = if visual_continuation {
                 " ".repeat(LOG_TIMESTAMP_WIDTH)
             } else {
                 log_timestamp(record.observed_at)
@@ -3477,14 +3549,16 @@ impl LogGutter {
         }
         let source = log_source_presentation(record.source);
         let source_style = log_source_style(record.source, color);
-        spans.push(Span::styled(
-            format!("{:<LOG_SOURCE_WIDTH$}", source.label),
-            source_style,
-        ));
+        let source_label = if matches!(row_kind, LogRowKind::VisualContinuation) {
+            " ".repeat(LOG_SOURCE_WIDTH)
+        } else {
+            format!("{:<LOG_SOURCE_WIDTH$}", source.label)
+        };
+        spans.push(Span::styled(source_label, source_style));
         let marker = match row_kind {
             LogRowKind::Record => " │ ",
             LogRowKind::SafetyContinuation => " ↪ ",
-            LogRowKind::VisualContinuation => " ↳ ",
+            LogRowKind::VisualContinuation | LogRowKind::ClippedVisualContinuation => " ↳ ",
         };
         spans.push(Span::styled(marker, source_style));
         spans
@@ -4726,7 +4800,9 @@ mod tests {
         let rendered = buffer_text(&buffer);
         assert_eq!(full_log_top_order(&interaction, &snapshot), Some(9));
         assert!(interaction.full_log.anchor_clamped);
-        assert!(rendered.contains("↑ 8 older lines discarded | clamped to retained top"));
+        assert!(
+            rendered.contains("↑ 8 older lines / 400 bytes discarded | clamped to retained top")
+        );
         assert!(rendered.contains("30 retained / 38 total"));
         assert!(rendered.contains("12:34:56.000 stderr │ record 09"));
     }
@@ -5143,14 +5219,25 @@ mod tests {
     fn log_preview_rewraps_deterministically_and_keeps_the_visual_tail() {
         let step = long_log_step();
 
+        let complete = inner_buffer_rows(&render_direct_log(&step, 34, 8, false));
+        assert_eq!(
+            complete[2..],
+            [
+                "  stdout │ abcdefghijklmnopqrs",
+                "         ↳ tuvwxyzABCDEFGHIJKL",
+                "         ↳ MNOPQRSTUVWXYZ01234",
+                "         ↳ 56789",
+            ]
+        );
+
         let wide = inner_buffer_rows(&render_direct_log(&step, 34, 7, false));
         assert!(wide[0].trim_start().starts_with("LOG"));
         assert_eq!(
             wide[2..],
             [
                 "  stdout ↳ tuvwxyzABCDEFGHIJKL",
-                "  stdout ↳ MNOPQRSTUVWXYZ01234",
-                "  stdout ↳ 56789",
+                "         ↳ MNOPQRSTUVWXYZ01234",
+                "         ↳ 56789",
             ]
         );
 
@@ -5160,8 +5247,8 @@ mod tests {
             narrow[2..],
             [
                 "  stdout ↳ KLMNOPQRSTUV",
-                "  stdout ↳ WXYZ01234567",
-                "  stdout ↳ 89",
+                "         ↳ WXYZ01234567",
+                "         ↳ 89",
             ]
         );
         assert_eq!(
@@ -5171,8 +5258,40 @@ mod tests {
     }
 
     #[test]
+    fn large_history_preview_keeps_only_the_visible_visual_tail() {
+        use crate::execution::workflow::presentation_feed::MAX_NORMALIZED_CHILD_RECORD_BYTES;
+
+        let records = (1..=256)
+            .map(|order| {
+                let payload = if order == 256 {
+                    format!(
+                        "{}NEWEST",
+                        "z".repeat(MAX_NORMALIZED_CHILD_RECORD_BYTES - "NEWEST".len())
+                    )
+                } else {
+                    "x".repeat(MAX_NORMALIZED_CHILD_RECORD_BYTES)
+                };
+                direct_log_record(
+                    order,
+                    CommandOutputSource::StandardOutput,
+                    "2026-08-04T12:34:56Z",
+                    &payload,
+                    false,
+                )
+            })
+            .collect();
+        let step = direct_log_step(StepStateKind::Running, records, 256, 0);
+
+        let rows = inner_buffer_rows(&render_direct_log(&step, 34, 7, false));
+        assert_eq!(rows.len(), 5);
+        assert!(rows[4].ends_with("NEWEST"), "unexpected tail: {rows:#?}");
+        assert!(rows[2].contains("stdout"));
+        assert!(rows[3..].iter().all(|row| !row.contains("stdout")));
+    }
+
+    #[test]
     fn log_preview_reports_counts_following_and_evicted_history() {
-        let step = direct_log_step(
+        let mut step = direct_log_step(
             StepStateKind::Succeeded,
             vec![
                 direct_log_record(
@@ -5200,6 +5319,7 @@ mod tests {
             5,
             2,
         );
+        step.log.discarded_bytes = 37;
         let buffer = render_direct_log(&step, 100, 8, false);
         let rendered = buffer_text(&buffer);
         let rows = inner_buffer_rows(&buffer);
@@ -5208,7 +5328,7 @@ mod tests {
         assert!(rows[0].trim_start().starts_with("LOG"));
         assert!(rows[0].contains("● following · 3 retained / 5 total"));
         assert!(rows[1].trim().is_empty());
-        assert_eq!(rows[2].trim(), "↑ 2 older lines discarded");
+        assert_eq!(rows[2].trim(), "↑ 2 older lines / 37 bytes discarded");
         assert!(rows[3].ends_with("retained one"));
         assert!(rows[4].ends_with("retained two"));
         assert!(rows[5].ends_with("retained three"));
@@ -5216,7 +5336,10 @@ mod tests {
         let minimum_height = inner_buffer_rows(&render_direct_log(&step, 100, 6, false));
         assert!(minimum_height[0].trim_start().starts_with("LOG"));
         assert!(minimum_height[1].trim().is_empty());
-        assert_eq!(minimum_height[2].trim(), "↑ 2 older lines discarded");
+        assert_eq!(
+            minimum_height[2].trim(),
+            "↑ 2 older lines / 37 bytes discarded"
+        );
         assert!(minimum_height[3].ends_with("retained three"));
         assert!(
             !minimum_height
@@ -5887,7 +6010,6 @@ mod tests {
             1,
             RunTimingObservation::new(clock.sample()),
             clock,
-            super::super::run_view_model::StepLogCapacity::default(),
         );
         view.observe(ExecutionObservation::<time::OffsetDateTime>::CommandOutput(
             CommandOutputObservation {
@@ -5939,6 +6061,9 @@ mod tests {
         };
 
         let wide = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
+        let columns = wide_split_columns(Rect::new(0, 0, 120, 22));
+        assert_eq!((columns[0].width, columns[1].width), (40, 80));
+        let divider_x = columns[1].x.saturating_sub(1);
         let workflow = buffer_position(&wide, "workflow");
         let steps = buffer_position(&wide, "▏ ⠋ selected-second-step");
         let inspector = buffer_position(&wide, "⠋  selected-second-step   cmd");
@@ -5949,17 +6074,21 @@ mod tests {
         assert!(steps.0 < inspector.0);
         assert_eq!(inspector.0, log.0);
         assert!(inspector.1 < outputs.1 && outputs.1 < log.1);
-        assert!((60..=66).contains(&inspector.0));
-        assert_eq!(wide[(61, 0)].symbol(), "│");
-        assert_eq!(wide[(61, 1)].symbol(), "│");
-        assert_eq!(wide[(61, 2)].symbol(), "┼");
-        assert_eq!(wide[(61, outputs.1.saturating_sub(1))].symbol(), "├");
-        assert_eq!(wide[(61, log.1.saturating_sub(1))].symbol(), "├");
-        assert_eq!(wide[(61, 22)].symbol(), "┴");
-        assert_ne!(wide[(62, 1)].symbol(), "│");
-        assert!(wide[(60, steps.1)].modifier.contains(Modifier::REVERSED));
+        assert!((columns[1].x..=columns[1].x + 6).contains(&inspector.0));
+        assert_eq!(wide[(divider_x, 0)].symbol(), "│");
+        assert_eq!(wide[(divider_x, 1)].symbol(), "│");
+        assert_eq!(wide[(divider_x, 2)].symbol(), "┼");
+        assert_eq!(wide[(divider_x, outputs.1.saturating_sub(1))].symbol(), "├");
+        assert_eq!(wide[(divider_x, log.1.saturating_sub(1))].symbol(), "├");
+        assert_eq!(wide[(divider_x, 22)].symbol(), "┴");
+        assert_ne!(wide[(columns[1].x, 1)].symbol(), "│");
         assert!(
-            !wide[(60, steps.1 + 1)]
+            wide[(divider_x.saturating_sub(1), steps.1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !wide[(divider_x.saturating_sub(1), steps.1 + 1)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -6000,12 +6129,12 @@ mod tests {
         snapshot.timing.duration = Duration::from_secs(20_065);
         let mut interaction = HostInteraction::default();
 
-        let buffer = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
+        let buffer = render_snapshot(&snapshot, &mut interaction, 180, 24, false);
         let rows = buffer_rows(&buffer);
         let name = buffer_position(&buffer, "plan-implement-test");
         let status = buffer_position(&buffer, "running");
         let duration = buffer_position(&buffer, "5h34m25s");
-        let divider_x = wide_split_columns(Rect::new(0, 0, 120, 22))[1]
+        let divider_x = wide_split_columns(Rect::new(0, 0, 180, 22))[1]
             .x
             .saturating_sub(1);
 
@@ -6588,8 +6717,11 @@ mod tests {
         let snapshot = direct_snapshot(step);
         let mut interaction = HostInteraction::default();
         let buffer = render_snapshot(&snapshot, &mut interaction, 120, 24, true);
+        let divider_x = wide_split_columns(Rect::new(0, 0, 120, 22))[1]
+            .x
+            .saturating_sub(1);
 
-        assert_eq!(buffer[(61, 1)].fg, separator_style(true).fg.unwrap());
+        assert_eq!(buffer[(divider_x, 1)].fg, separator_style(true).fg.unwrap());
         let (title_x, title_y) = buffer_position(&buffer, "selected-command");
         assert_eq!(
             buffer[(title_x, title_y)].fg,
@@ -6622,7 +6754,7 @@ mod tests {
         );
         let selected_y = buffer_position(&buffer, "▏ ⠋ selected-command").1;
         assert_eq!(
-            buffer[(60, selected_y)].bg,
+            buffer[(divider_x.saturating_sub(1), selected_y)].bg,
             step_selection_style(true).bg.unwrap()
         );
         let step_row = &rows[usize::from(selected_y)];
@@ -6833,13 +6965,7 @@ mod tests {
             monotonic: crate::timing::monotonic_now(),
         };
         let clock = FixedClock { now };
-        let view = WorkflowRunViewModel::new(
-            &workflow,
-            1,
-            RunTimingObservation::new(now),
-            clock,
-            super::super::run_view_model::StepLogCapacity::default(),
-        );
+        let view = WorkflowRunViewModel::new(&workflow, 1, RunTimingObservation::new(now), clock);
         (temporary, workflow, view, now)
     }
 
@@ -6982,7 +7108,12 @@ mod tests {
             height,
             &[(KeyCode::Char('g'), KeyModifiers::NONE)],
         );
-        snapshot.steps[0].log.records.drain(0..8);
+        let discarded_bytes = snapshot.steps[0]
+            .log
+            .records
+            .drain(0..8)
+            .map(|record| u64::try_from(record.payload.len()).unwrap())
+            .sum();
         for order in 31..=38 {
             append_log_record(
                 &mut snapshot.steps[0].log,
@@ -6991,6 +7122,7 @@ mod tests {
             );
         }
         snapshot.steps[0].log.discarded_records = 8;
+        snapshot.steps[0].log.discarded_bytes = discarded_bytes;
         snapshot.steps[0].log.retained_records = 30;
         snapshot.steps[0].log.observed_records = 38;
         (snapshot, interaction)
@@ -7406,7 +7538,6 @@ mod tests {
             1,
             RunTimingObservation::new(clock.sample()),
             clock,
-            super::super::run_view_model::StepLogCapacity::default(),
         )
         .snapshot()
     }

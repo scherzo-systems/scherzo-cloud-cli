@@ -469,6 +469,26 @@ fn existing_status_protocol_error_emits_failure_without_device_authorization() {
 }
 
 #[test]
+fn human_existing_status_protocol_failure_uses_shared_renderer_with_reason() {
+    let server = ScriptedServer::respond(vec![json_http_response("200 OK", serde_json::json!({}))]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = login_environment(&server, credential_path_string);
+
+    let output = run_with_env(&["auth", "login", "--allow-insecure-http"], &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error: check existing sign-in through public API "));
+    assert!(stderr.contains(&server.api_url));
+    assert!(stderr.contains("current-principal response violates the public API contract"));
+    assert!(stderr.contains("current-principal response fields are invalid"));
+    server.finish();
+}
+
+#[test]
 fn denied_forced_login_preserves_the_previous_credential() {
     let server = ScriptedServer::respond(vec![
         json_http_response(
@@ -527,6 +547,61 @@ fn denied_forced_login_preserves_the_previous_credential() {
     );
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read(&credential_path).unwrap(), before);
+    server.finish();
+}
+
+#[test]
+fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let api_url = "http://api.fixture.test/api";
+    let issuer = format!("http://{address}/auth/");
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path = credential_path.to_str().unwrap();
+    let environment = [
+        (CREDENTIALS_FILE_VARIABLE, credential_path),
+        ("SCHERZO_CLOUD_API_URL", api_url),
+        ("SCHERZO_CLOUD_AUTH_ISSUER", issuer.as_str()),
+        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+    ];
+
+    let output = run_with_env(
+        &["auth", "login", "--force", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error: request device authorization from OAuth issuer "));
+    assert!(stderr.contains(&issuer));
+    assert!(!stderr.contains(api_url));
+    assert!(stderr.contains("authorization server is unreachable (connection)"));
+}
+
+#[test]
+fn human_login_protocol_failure_uses_shared_renderer_with_reason() {
+    let server = ScriptedServer::respond(vec![json_http_response("200 OK", serde_json::json!({}))]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = login_environment(&server, credential_path_string);
+
+    let output = run_with_env(
+        &["auth", "login", "--force", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error: request device authorization from OAuth issuer "));
+    assert!(stderr.contains(&server.issuer));
+    assert!(stderr.contains("authorization response violates the OAuth contract"));
+    assert!(stderr.contains("device-authorization body is invalid"));
     server.finish();
 }
 

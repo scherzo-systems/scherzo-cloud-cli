@@ -2,8 +2,6 @@ mod login;
 mod logout;
 mod status;
 
-use std::process::ExitCode;
-
 use clap::{Args, Subcommand};
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
@@ -26,7 +24,7 @@ enum AuthCommand {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::CommandResult {
         super::execute_deployment_command(
             self.command,
             &[NAME],

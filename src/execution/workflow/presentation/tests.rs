@@ -327,7 +327,7 @@ fn execution_context(root: PathBuf) -> ExecutionContext {
             2,
             CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
             InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
-            65_536,
+            super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         ),
         EnvironmentSnapshot::default(),
         CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
@@ -525,7 +525,12 @@ fn rejection_json_is_one_pretty_document_without_stderr_prose() {
     )
     .render_resolution_rejection(&failure);
 
-    assert_eq!(result, WorkflowRunPresentationResult::Rejected);
+    assert_eq!(
+        result,
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: None
+        }
+    );
     assert!(stderr.text().is_empty());
     let bytes = stdout.text();
     assert!(bytes.contains("\n  \"schemaVersion\""));
@@ -543,13 +548,19 @@ fn rejection_json_is_one_pretty_document_without_stderr_prose() {
         human_stderr.clone(),
     )
     .render_resolution_rejection(&failure);
-    assert_eq!(result, WorkflowRunPresentationResult::Rejected);
+    let WorkflowRunPresentationResult::Rejected {
+        human_diagnostic: Some(diagnostic),
+    } = result
+    else {
+        panic!("human rejection should return its diagnostic");
+    };
     assert!(human_stdout.text().is_empty());
-    assert!(human_stderr.text().contains("source_root_unavailable"));
+    assert!(human_stderr.text().is_empty());
+    assert!(diagnostic.contains("source_root_unavailable"));
 }
 
 #[test]
-fn rejection_json_writer_failure_is_diagnosed_on_stderr() {
+fn rejection_json_writer_failure_is_returned_without_local_rendering() {
     let temporary = tempfile::tempdir().unwrap();
     let failure = resolution::resolve(
         &temporary.path().join("missing"),
@@ -575,7 +586,7 @@ fn rejection_json_writer_failure_is_diagnosed_on_stderr() {
         PresentationFailureOperation::TerminalJsonWriter
     );
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
-    assert!(stderr.text().contains("workflow run output failure"));
+    assert!(stderr.text().is_empty());
 }
 
 #[test]
@@ -616,7 +627,12 @@ steps:
     )
     .render_admission_rejection(&workflow, &failure);
 
-    assert_eq!(result, WorkflowRunPresentationResult::Rejected);
+    assert_eq!(
+        result,
+        WorkflowRunPresentationResult::Rejected {
+            human_diagnostic: None
+        }
+    );
     assert!(stderr.text().is_empty());
     let value: Value = serde_json::from_str(&stdout.text()).unwrap();
     assert_eq!(value["diagnostics"][0]["code"], "missing_required_prompt");
@@ -1275,7 +1291,10 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
 
     let result = presentation.finish(&run, PublicationPresentation::Failed(&failure));
 
-    assert_eq!(result, WorkflowRunPresentationResult::PublicationFailed);
+    assert_eq!(
+        result,
+        WorkflowRunPresentationResult::PublicationFailed(failure)
+    );
     assert!(stdout.text().is_empty());
     assert!(stderr.text().contains("step  kind  state"));
     assert!(stderr.text().contains("workflow succeeded"));
@@ -1284,7 +1303,7 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
 }
 
 #[test]
-fn header_writer_failure_prevents_a_live_presentation_from_starting() {
+fn header_writer_failure_is_returned_without_local_rendering() {
     let fixture = Fixture::new(workflow_source());
     let stdout = SharedWriter::default();
     stdout.fail();
@@ -1308,7 +1327,7 @@ fn header_writer_failure_prevents_a_live_presentation_from_starting() {
         PresentationFailureOperation::HeaderWriter
     );
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
-    assert!(stderr.text().contains("workflow run output failure"));
+    assert!(stderr.text().is_empty());
 }
 
 #[tokio::test]

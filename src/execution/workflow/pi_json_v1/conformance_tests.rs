@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::future::{Future, pending, ready};
 use std::num::NonZeroU64;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::adapter::PiJsonV1Adapter;
+use super::adapter::{PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL, PiJsonV1Adapter};
 use super::*;
 use crate::execution::pi::{
     PI_JSON_V1_QUALIFICATION_VERSION, PiCompatibilityProfile, validate_pi_installation,
@@ -32,6 +33,7 @@ use crate::execution::workflow::agent::{
 // The black-box fixture intentionally owns its imports instead of depending on the
 // executable-stub fixture module solely to share test wiring.
 // jscpd:ignore-start
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
@@ -55,17 +57,23 @@ fn conformance_executable() -> Option<PathBuf> {
 }
 
 #[derive(Clone, Copy)]
-struct NeverClock;
+struct ConformanceClock;
 
-impl CoordinatorClock for NeverClock {
+impl CoordinatorClock for ConformanceClock {
     type Instant = Duration;
 
     fn now(&mut self) -> Self::Instant {
         Duration::ZERO
     }
 
-    async fn wait_until(&self, _deadline: Self::Instant) {
-        pending().await
+    async fn wait_until(&self, deadline: Self::Instant) {
+        if deadline == PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
+            // Keep the outer anti-hang watchdog schedulable between OS-state probes.
+            let probe = tokio::spawn(async {});
+            let _ = probe.await;
+        } else {
+            pending().await
+        }
     }
 }
 
@@ -226,6 +234,8 @@ struct RealPiFixture {
     trust_path: PathBuf,
     project_directory: PathBuf,
     attachment_contents: Vec<Vec<u8>>,
+    session_directory: PathBuf,
+    session_metadata: PathBuf,
 }
 
 impl RealPiFixture {
@@ -242,6 +252,7 @@ impl RealPiFixture {
         let xdg_cache = temporary.path().join("xdg-cache");
         let xdg_data = temporary.path().join("xdg-data");
         let xdg_state = temporary.path().join("xdg-state");
+        let attempt_directory = temporary.path().join("run/attempts/000001");
         for directory in [
             &project_directory,
             &staging,
@@ -252,6 +263,7 @@ impl RealPiFixture {
             &xdg_cache,
             &xdg_data,
             &xdg_state,
+            &attempt_directory,
         ] {
             fs::create_dir_all(directory).unwrap();
         }
@@ -331,22 +343,44 @@ impl RealPiFixture {
         );
         let (observation_sender, observations) = mpsc::unbounded_channel();
         let cancellation = CancellationSource::new();
+        let adapter = AdmittedAgentAdapter::new(
+            AgentCompatibilityProfile::PiJsonV1,
+            fs::canonicalize(executable).unwrap(),
+            Arc::from(PI_JSON_V1_QUALIFICATION_VERSION),
+            PiConfig {
+                model: MODEL_NAME.to_owned(),
+                thinking: Thinking::XHigh,
+            },
+        );
+        let attempt_handle: OwnedFd = fs::File::open(&attempt_directory).unwrap().into();
+        let diagnostic_sessions = AgentDiagnosticSessionStore::create(
+            &attempt_handle,
+            &attempt_directory,
+            Arc::from("00000000-0000-4000-8000-000000000001"),
+            1,
+        )
+        .unwrap();
+        let diagnostic_session = diagnostic_sessions
+            .allocate(
+                &identity,
+                AgentCompatibilityProfile::PiJsonV1,
+                PI_JSON_V1_QUALIFICATION_VERSION,
+            )
+            .unwrap();
+        let session_directory = diagnostic_session
+            .pi_native_session_directory()
+            .unwrap()
+            .to_owned();
+        let session_metadata = session_directory.parent().unwrap().join("metadata.json");
         let invocation = AgentInvocation::new(
             identity,
-            AdmittedAgentAdapter::new(
-                AgentCompatibilityProfile::PiJsonV1,
-                fs::canonicalize(executable).unwrap(),
-                Arc::from(PI_JSON_V1_QUALIFICATION_VERSION),
-                PiConfig {
-                    model: MODEL_NAME.to_owned(),
-                    thinking: Thinking::XHigh,
-                },
-            ),
+            adapter,
             crate::execution::workflow::agent::AgentProcessContext::new(
                 working_directory,
                 EnvironmentSnapshot::new(environment),
             ),
             AgentInvocationStaging::new(result_endpoint),
+            diagnostic_session,
             AgentPrompt::new(
                 Arc::from("WORKFLOW_SYSTEM_PROMPT_MARKER"),
                 Arc::from("@/caller-controlled/path\n--option-looking\nmessage tail"),
@@ -391,10 +425,32 @@ impl RealPiFixture {
             trust_path,
             project_directory,
             attachment_contents,
+            session_directory,
+            session_metadata,
         })
     }
 
     fn assert_configuration_unchanged(&self) {
+        self.assert_retained_diagnostic_state();
+        let native_sessions = self.native_sessions();
+        assert_eq!(
+            native_sessions.len(),
+            1,
+            "a completed assistant message must retain one native Pi session artifact"
+        );
+        assert!(native_sessions[0].is_file());
+        assert!(!fs::read(&native_sessions[0]).unwrap().is_empty());
+    }
+
+    fn assert_pre_response_cancellation_state(&self) {
+        self.assert_retained_diagnostic_state();
+        assert!(
+            self.native_sessions().is_empty(),
+            "Pi 0.83 must not synthesize a session file before an assistant message completes"
+        );
+    }
+
+    fn assert_retained_diagnostic_state(&self) {
         assert_eq!(
             fs::read(self.agent_directory.join("settings.json")).unwrap(),
             self.global_settings
@@ -409,8 +465,42 @@ impl RealPiFixture {
         );
         assert!(
             !self.agent_directory.join("sessions").exists(),
-            "--no-session must not persist a session"
+            "the profile-owned session directory must override ambient storage"
         );
+        assert!(self.session_directory.is_absolute());
+        assert_eq!(
+            fs::metadata(&self.session_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        let metadata: Value =
+            serde_json::from_slice(&fs::read(&self.session_metadata).unwrap()).unwrap();
+        assert_eq!(
+            metadata,
+            json!({
+                "schemaVersion": 1,
+                "localRunId": "00000000-0000-4000-8000-000000000001",
+                "attemptNumber": 1,
+                "stepId": "agent-step",
+                "invocationId": 0,
+                "profile": "PiJsonV1",
+                "piVersion": "0.83.0",
+                "nativeSession": {
+                    "relativeDirectory": "session",
+                    "formatVersion": 3
+                }
+            })
+        );
+    }
+
+    fn native_sessions(&self) -> Vec<PathBuf> {
+        fs::read_dir(&self.session_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
     }
 }
 
@@ -530,7 +620,7 @@ impl RunningRealPi {
         let adapter = PiJsonV1Adapter::with_validation_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(16 * 1024).unwrap(),
-            NeverClock,
+            ConformanceClock,
             NoopExecutionObserver,
             super::adapter_tests::InlineValidationWorker,
         );
@@ -564,27 +654,36 @@ impl RunningRealPi {
 }
 
 fn normalized_semantics(mut value: Value, isolation_root: &Path) -> Value {
-    fn normalize(value: &mut Value, isolation_root: &str) {
+    fn normalize(value: &mut Value, isolation_roots: &[&str]) {
         match value {
             Value::Object(object) => {
                 object.remove("timestamp");
                 for child in object.values_mut() {
-                    normalize(child, isolation_root);
+                    normalize(child, isolation_roots);
                 }
             }
             Value::Array(values) => {
                 for child in values {
-                    normalize(child, isolation_root);
+                    normalize(child, isolation_roots);
                 }
             }
             Value::String(text) => {
-                *text = text.replace(isolation_root, "<isolated-root>");
+                for isolation_root in isolation_roots {
+                    *text = text.replace(isolation_root, "<isolated-root>");
+                }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
 
-    normalize(&mut value, isolation_root.to_str().unwrap());
+    let resolved_isolation_root = std::fs::canonicalize(isolation_root).unwrap();
+    normalize(
+        &mut value,
+        &[
+            isolation_root.to_str().unwrap(),
+            resolved_isolation_root.to_str().unwrap(),
+        ],
+    );
     value
 }
 
@@ -615,6 +714,24 @@ async fn run_terminal_case(
     request.release(response);
     running.await_started().await;
     Some(running.finish().await)
+}
+
+async fn launch_result_case() -> (RunningRealPi, ControlledRequest, String) {
+    let fixture = RealPiFixture::new(result_mode(), false, false).unwrap();
+    let mut running = RunningRealPi::launch(fixture);
+    running.release_startup().await;
+    let first = running.fixture.controller.next("model").await;
+    let tool_name = result_tool_name(&first.value).to_owned();
+    (running, first, tool_name)
+}
+
+async fn assert_count_one_result(fixture: RealPiFixture, outcome: AgentOutcome) {
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+        panic!("corrected terminating result did not complete");
+    };
+    assert_eq!(result.value(), &json!({"count": 1}));
+    fixture.assert_configuration_unchanged();
+    fixture.controller.shutdown().await;
 }
 
 #[test]
@@ -772,6 +889,7 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
             json!({"startup": startup, "model": model_semantics}),
             fixture._temporary.path(),
         );
+        let first_session_directory = fixture.session_directory.clone();
         fixture.controller.shutdown().await;
 
         let repeated = RealPiFixture::new(
@@ -805,6 +923,7 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
             first_semantics
         );
         repeated.assert_configuration_unchanged();
+        assert_ne!(repeated.session_directory, first_session_directory);
         repeated.controller.shutdown().await;
     })
     .await
@@ -885,12 +1004,7 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
         return;
     }
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
-        let fixture = RealPiFixture::new(result_mode(), false, false).unwrap();
-        let mut running = RunningRealPi::launch(fixture);
-        running.release_startup().await;
-
-        let first = running.fixture.controller.next("model").await;
-        let tool_name = result_tool_name(&first.value).to_owned();
+        let (mut running, first, tool_name) = launch_result_case().await;
         first.release(json!({
             "kind": "toolCalls",
             "calls": [{"id": "call-invalid", "name": tool_name, "arguments": {"result": {"count": 0}}}]
@@ -953,15 +1067,71 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
 
         running.await_started().await;
         let (fixture, outcome) = running.finish().await;
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("corrected terminating result did not complete");
-        };
-        assert_eq!(result.value(), &json!({"count": 1}));
-        fixture.assert_configuration_unchanged();
-        fixture.controller.shutdown().await;
+        assert_count_one_result(fixture, outcome).await;
     })
     .await
     .expect("pinned real-Pi result conformance watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
+    if conformance_executable().is_none() {
+        return;
+    }
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let (mut running, first, tool_name) = launch_result_case().await;
+        first.release(json!({
+            "kind": "truncatedToolCall",
+            "call": {
+                "id": "call-truncated",
+                "name": tool_name,
+                "arguments": {"result": {"count": 1}}
+            }
+        }));
+        running.await_started().await;
+
+        let RunningRealPi {
+            mut fixture,
+            task,
+            started,
+            terminal,
+        } = running;
+        assert!(started.is_none());
+        let mut terminal = Box::pin(terminal.receive());
+        let corrected = tokio::select! {
+            request = fixture.controller.next("model") => request,
+            outcome = &mut terminal => {
+                panic!("PiJsonV1 rejected Pi's truncated-call recovery: {outcome:?}")
+            }
+        };
+        let messages = corrected.value["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "toolResult"
+                && message["toolCallId"] == "call-truncated"
+                && message["isError"] == true
+                && serde_json::to_string(message)
+                    .unwrap()
+                    .contains("output token limit")
+        }));
+        corrected.release(json!({
+            "kind": "toolCalls",
+            "calls": [{
+                "id": "call-corrected",
+                "name": tool_name,
+                "arguments": {"result": {"count": 1}}
+            }]
+        }));
+
+        let outcome = terminal.await.unwrap();
+        task.await.unwrap();
+        assert_count_one_result(fixture, outcome).await;
+    })
+    .await
+    .expect("pinned real-Pi truncated result recovery watchdog expired");
 }
 
 #[derive(Clone)]
@@ -990,7 +1160,7 @@ fn launch_with_blocking_validation(
     let adapter = PiJsonV1Adapter::with_validation_worker(
         fixture.diagnostics.clone(),
         NonZeroU64::new(16 * 1024).unwrap(),
-        NeverClock,
+        ConformanceClock,
         NoopExecutionObserver,
         worker,
     );
@@ -1032,15 +1202,17 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         return;
     }
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        // Keep each controlled request alive until cancellation settles so controller EOF
+        // cannot race the process interrupt and manufacture a different terminal phase.
         // Model phase: the provider request itself is the barrier.
         let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let blocked_model = running.fixture.controller.next("model").await;
         running.await_started().await;
-        drop(blocked_model);
         let fixture = cancel_and_finish(running).await;
-        fixture.assert_configuration_unchanged();
+        fixture.assert_pre_response_cancellation_state();
+        drop(blocked_model);
         fixture.controller.shutdown().await;
 
         // Tool phase: Pi must abort the exact in-flight extension tool.
@@ -1053,9 +1225,9 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
             "calls": [{"id": "call-blocked-tool", "name": "conformance_gate", "arguments": {"value": "blocked"}}]
         }));
         let blocked_tool = running.fixture.controller.next("tool").await;
-        drop(blocked_tool);
         let fixture = cancel_and_finish(running).await;
         fixture.assert_configuration_unchanged();
+        drop(blocked_tool);
         fixture.controller.shutdown().await;
 
         // Retry phase: cancellation wins after the native retry milestone and before its timer.
@@ -1113,9 +1285,9 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
             "calls": [{"id": "call-settlement", "name": tool_name, "arguments": {"result": {"count": 1}}}]
         }));
         let blocked_settlement = running.fixture.controller.next("settlement").await;
-        drop(blocked_settlement);
         let fixture = cancel_and_finish(running).await;
         fixture.assert_configuration_unchanged();
+        drop(blocked_settlement);
         fixture.controller.shutdown().await;
     })
     .await

@@ -1,112 +1,108 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-fail() {
-  echo "$1" >&2
-  exit 1
-}
-
-if [[ $# -ne 0 ]]; then
-  echo "Usage: scripts/test-release-impact" >&2
-  exit 2
-fi
-
+fail() { echo "$1" >&2; exit 1; }
+[[ $# -eq 0 ]] || { echo 'Usage: scripts/test-release-impact' >&2; exit 2; }
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 planner=$script_dir/release-impact
-source_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-changelog_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-
-field() {
-  local name=$1
-  awk -F= -v name="$name" '$1 == name { print $2 }'
-}
-
+policy=(--initial-version 0.1.0 --pre-1-breaking-impact minor)
+field() { local name=$1; awk -F= -v name="$name" '$1 == name { print $2 }'; }
 expect_transition() {
-  local latest_tag=$1
-  local category=$2
-  local series=$3
-  local expected_impact=$4
-  local expected_version=$5
-  local output actual
-  output=$(
-    "$planner" plan \
-      --series "$series" \
-      --latest-tag "$latest_tag" \
-      --release true \
-      --reason releaseable-changes \
-      --source-revision "$source_revision" \
-      --changelog-sha256 "$changelog_sha" \
-      "$category"
-  ) || fail "Expected $latest_tag / $category planning to succeed."
-  for expectation in \
-    "impact=$expected_impact" \
-    "version=$expected_version" \
-    "tag=v$expected_version"; do
-    name=${expectation%%=*}
-    expected=${expectation#*=}
-    actual=$(field "$name" <<<"$output")
-    [[ $actual == "$expected" ]] \
-      || fail "Expected $name=$expected for $latest_tag / $category; found $actual."
-  done
+  local latest=$1 explicit=$2 expected_impact=$3 expected_version=$4
+  local output latest_args=()
+  [[ $latest == none ]] || latest_args=(--latest-version "$latest")
+  output=$("$planner" validate "${policy[@]}" "${latest_args[@]}" "$explicit") \
+    || fail "transition $latest/$explicit failed"
+  [[ $(field impact <<<"$output") == "$expected_impact" ]] \
+    || fail "wrong impact for $latest/$explicit"
+  [[ $(field version <<<"$output") == "$expected_version" ]] \
+    || fail "wrong version for $latest/$explicit"
+  [[ $(field tag <<<"$output") == "v$expected_version" ]] \
+    || fail "wrong tag for $latest/$explicit"
 }
+expect_failure() { local description=$1; shift; "$@" >/dev/null 2>&1 && fail "$description"; return 0; }
 
-expect_failure() {
-  local description=$1
-  shift
-  if "$@" >/dev/null 2>&1; then
-    fail "$description: expected failure."
-  fi
-}
+expect_transition none patch patch 0.1.0
+expect_transition 0.2.7 patch patch 0.2.8
+expect_transition 0.2.7 minor minor 0.3.0
+expect_transition 0.2.7 breaking minor 0.3.0
+expect_transition 1.4.7 minor minor 1.5.0
+expect_transition 1.4.7 breaking major 2.0.0
 
-expect_transition v0.2.7 fixed 0.2 patch 0.2.8
-expect_transition v0.2.7 internal 0.2 patch 0.2.8
-expect_transition v0.2.7 changed 0.2 patch 0.2.8
-expect_transition v0.2.7 added 0.3 minor 0.3.0
-expect_transition v0.2.7 breaking 0.3 minor 0.3.0
-expect_transition v1.4.7 added 1.5 minor 1.5.0
-expect_transition v1.4.7 breaking 2.0 major 2.0.0
-
-accumulated=$(
-  "$planner" validate \
-    --series 0.3 \
-    --latest-tag v0.2.7 \
-    added fixed added
-)
+accumulated=$("$planner" validate "${policy[@]}" --latest-version 0.2.7 patch minor patch)
 [[ $(field impact <<<"$accumulated") == minor \
   && $(field version <<<"$accumulated") == 0.3.0 ]] \
-  || fail "Accumulated additions did not remain in the adjacent minor series."
+  || fail 'highest explicit impact was not stable'
 
-no_release=$(
-  "$planner" plan \
-    --series 0.2 \
-    --latest-tag v0.2.7 \
-    --release false \
-    --reason no-releaseable-changes \
-    --source-revision "$source_revision" \
-    --changelog-sha256 "$changelog_sha"
-)
-[[ $(field impact <<<"$no_release") == none \
-  && $(field version <<<"$no_release") == none \
-  && $(field tag <<<"$no_release") == none ]] \
-  || fail "A documentation-only range did not remain no-release."
+no_impact=$("$planner" validate "${policy[@]}" --latest-version 0.2.7)
+[[ $(field impact <<<"$no_impact") == none \
+  && $(field version <<<"$no_impact") == none \
+  && $(field tag <<<"$no_impact") == none ]] \
+  || fail 'empty explicit impact unexpectedly selected a release'
 
-expect_failure \
-  "addition without adjacent minor intent" \
-  "$planner" validate --series 0.2 --latest-tag v0.2.7 added
-expect_failure \
-  "patch with skipped intent" \
-  "$planner" validate --series 0.3 --latest-tag v0.2.7 fixed
-expect_failure \
-  "post-1.0 breaking minor intent" \
-  "$planner" validate --series 1.5 --latest-tag v1.4.7 breaking
-expect_failure \
-  "pre-1.0 breaking major intent" \
-  "$planner" validate --series 1.0 --latest-tag v0.2.7 breaking
-expect_failure \
-  "regressing intent" \
-  "$planner" validate --series 0.1 --latest-tag v0.2.7 fixed
-expect_failure \
-  "malformed stable tag" \
-  "$planner" validate --series 0.2 --latest-tag v0.02.7 fixed
+expect_failure 'removed planning mode passed' \
+  "$planner" plan "${policy[@]}" --latest-version 0.2.7 patch
+
+expect_failure 'malformed latest version passed' \
+  "$planner" validate "${policy[@]}" --latest-version 0.02.7 patch
+expect_failure 'pre-initial stable version passed' \
+  "$planner" validate "${policy[@]}" --latest-version 0.0.9 patch
+expect_failure 'unknown impact passed' \
+  "$planner" validate "${policy[@]}" --latest-version 0.2.7 added
+expect_failure 'wrong pre-1 policy passed' \
+  "$planner" validate --initial-version 0.1.0 --pre-1-breaking-impact major breaking
+
+# Build #804 ordering: approval binds the public snapshot, not source validity.
+fixture_git=$script_dir/fixture-git
+build_804_root=$($fixture_git new-root)
+trap 'rm -rf "$build_804_root"' EXIT
+candidate_repository=$build_804_root/candidate
+allocation_repository=$build_804_root/allocations.git
+mkdir -p "$candidate_repository"
+printf '%s\n' 'candidate-C-byte-identical' >"$candidate_repository/source"
+"$fixture_git" init-worktree "$build_804_root" "$candidate_repository"
+candidate_git() { "$fixture_git" worktree "$build_804_root" "$candidate_repository" "$@"; }
+candidate_git config user.name 'Build 804 Fixture'
+candidate_git config user.email build-804@scherzo.invalid
+candidate_git add source
+candidate_git commit --quiet --message 'Create candidate C'
+candidate_commit=$(candidate_git rev-parse HEAD)
+"$fixture_git" init-bare "$build_804_root" "$allocation_repository"
+candidate_git push --quiet "$allocation_repository" \
+  "$candidate_commit:refs/heads/candidates/C"
+
+write_approved_ref() {
+  local approved_latest=$1 current_latest=$2 version=$3
+  [[ $approved_latest == "$current_latest" ]] || return 75
+  "$fixture_git" bare "$build_804_root" "$allocation_repository" update-ref \
+    "refs/heads/release-allocations/$version" "$candidate_commit"
+}
+
+plan_804=$("$planner" validate "${policy[@]}" --latest-version 0.9.0 minor)
+[[ $(field version <<<"$plan_804") == 0.10.0 ]] \
+  || fail 'build-804 initial plan was not 0.10.0'
+if write_approved_ref 0.9.0 0.10.0 0.10.0; then
+  fail 'stale build-804 approval unexpectedly succeeded'
+fi
+if "$fixture_git" bare "$build_804_root" "$allocation_repository" rev-parse \
+  --verify refs/heads/release-allocations/0.10.0 >/dev/null 2>&1; then
+  fail 'stale build-804 approval wrote a ref'
+fi
+
+fresh_804=$("$planner" validate "${policy[@]}" --latest-version 0.10.0 minor)
+[[ $(field version <<<"$fresh_804") == 0.11.0 ]] \
+  || fail 'fresh build-804 approval did not allocate 0.11.0'
+write_approved_ref 0.10.0 0.10.0 0.11.0
+allocated_commit=$("$fixture_git" bare "$build_804_root" "$allocation_repository" \
+  rev-parse refs/heads/release-allocations/0.11.0)
+[[ $allocated_commit == "$candidate_commit" \
+  && $(candidate_git show HEAD:source) == 'candidate-C-byte-identical' ]] \
+  || fail 'fresh approval did not reserve byte-identical candidate C'
+
+# Canceled intermediate candidates do not enter either pure input.
+with_cancellations=$("$planner" validate "${policy[@]}" --latest-version 0.10.0 minor)
+without_cancellations=$("$planner" validate "${policy[@]}" --latest-version 0.10.0 minor)
+[[ $with_cancellations == "$without_cancellations" ]] \
+  || fail 'canceled candidates changed allocation arithmetic'
 
 printf 'CLI release-impact checks passed.\n'

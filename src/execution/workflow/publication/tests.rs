@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,9 @@ use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
-use crate::execution::workflow::artifact::{CaptureDeclaration, CapturedArtifact};
+use crate::execution::workflow::artifact::{
+    ArtifactReadFailure, CaptureDeclaration, CapturedArtifact,
+};
 use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::OutputSet;
@@ -59,7 +62,7 @@ impl PublicationFixture {
                     2,
                     CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
                     InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
-                    MAXIMUM_RETAINED_BYTES_PER_STREAM,
+                    super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
                 ),
                 EnvironmentSnapshot::default(),
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
@@ -281,6 +284,36 @@ fn staging_paths(parent: &Path) -> Vec<PathBuf> {
                 .is_some_and(|name| name.starts_with(".result-"))
         })
         .collect()
+}
+
+#[test]
+fn publishes_streams_within_live_tui_run_budget() {
+    const STEP_COUNT: usize = 12;
+    const STREAM_BYTES: usize = 4 * 1024 * 1024;
+
+    let fixture = PublicationFixture::new();
+    let retained = Arc::<[u8]>::from(vec![b'x'; STREAM_BYTES]);
+    let empty = Arc::<[u8]>::from([]);
+    let mut run = run_fixture(&fixture);
+    run.exports.clear();
+    run.export_sources.clear();
+    run.steps = (0..STEP_COUNT)
+        .map(|index| {
+            let mut step = succeeded_step(&format!("emit{index}"), BTreeMap::new());
+            step.command_output = Some(StepDiagnostic::from_streams(
+                CapturedDiagnosticStream::from_parts(Arc::clone(&retained), 0, true),
+                CapturedDiagnosticStream::from_parts(Arc::clone(&empty), 0, true),
+            ));
+            step
+        })
+        .collect();
+
+    publish_workflow_result(
+        &fixture.destination("tui-budgeted-streams"),
+        &fixture.artifacts,
+        &run,
+    )
+    .expect("all streams retained within the live TUI run budget must be publishable");
 }
 
 #[test]
@@ -610,6 +643,13 @@ fn distinct_equal_captures_keep_distinct_carriers() {
     );
     assert_eq!(fs::read(destination.join("exports/0001")).unwrap(), b"same");
     assert_eq!(fs::read(destination.join("exports/0002")).unwrap(), b"same");
+    let first_metadata = fs::metadata(destination.join("exports/0001")).unwrap();
+    let second_metadata = fs::metadata(destination.join("exports/0002")).unwrap();
+    assert_ne!(
+        (first_metadata.dev(), first_metadata.ino()),
+        (second_metadata.dev(), second_metadata.ino()),
+        "independent captures were coalesced by equal bytes"
+    );
 }
 
 #[test]
@@ -638,7 +678,7 @@ fn equivalent_results_have_deterministic_export_mappings_and_serialization_seman
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InjectedFailure {
-    CopyAfterFirstFile,
+    AfterFirstMaterialization,
     Serialization,
     Commit,
 }
@@ -656,8 +696,9 @@ impl PublicationObserver for BoundaryObserver {
         let stages = staging_paths(&self.parent);
         assert_eq!(stages.len(), 1);
         match boundary {
-            PublicationBoundary::AfterExportCopy { export }
-                if self.failure == InjectedFailure::CopyAfterFirstFile && export == "reportA" =>
+            PublicationBoundary::AfterExportMaterialization { export }
+                if self.failure == InjectedFailure::AfterFirstMaterialization
+                    && export == "reportA" =>
             {
                 Err(())
             }
@@ -681,22 +722,22 @@ impl PublicationObserver for BoundaryObserver {
                 }
             }
             PublicationBoundary::StagingCreated
-            | PublicationBoundary::BeforeExportCopy { .. }
-            | PublicationBoundary::AfterExportCopy { .. }
+            | PublicationBoundary::BeforeExportMaterialization { .. }
+            | PublicationBoundary::AfterExportMaterialization { .. }
             | PublicationBoundary::BeforeSerialization => Ok(()),
         }
     }
 }
 
 #[test]
-fn injected_copy_serialization_and_commit_failures_remove_private_staging() {
+fn injected_handoff_serialization_and_commit_failures_remove_result_staging() {
     let fixture = PublicationFixture::new();
     let run = run_fixture(&fixture);
 
     for (name, injected, expected_phase) in [
         (
-            "copy-failure",
-            InjectedFailure::CopyAfterFirstFile,
+            "handoff-failure",
+            InjectedFailure::AfterFirstMaterialization,
             LocalPublicationPhase::ExportCopy,
         ),
         (
@@ -743,6 +784,38 @@ fn injected_copy_serialization_and_commit_failures_remove_private_staging() {
     assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
 }
 
+#[test]
+fn failed_carrier_handoff_does_not_copy_or_destroy_private_staging() {
+    let fixture = PublicationFixture::new();
+    let run = run_fixture(&fixture);
+    let destination = fixture.destination("handoff-failure");
+    let ExportValue::Available { output } = &run.exports["reportA"] else {
+        panic!("reportA must remain available");
+    };
+    let handle = output.as_file().unwrap().handle().clone();
+    fixture.artifacts.block_artifact_links();
+
+    let failure = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap_err();
+
+    assert_eq!(failure.phase(), LocalPublicationPhase::ExportCopy);
+    assert_eq!(
+        failure.kind(),
+        LocalPublicationFailureKind::CarrierHandoffUnavailable
+    );
+    assert_eq!(failure.export(), Some("reportA"));
+    assert!(!destination.exists());
+    assert!(staging_paths(&fixture.results_parent).is_empty());
+    let mut retained = Vec::new();
+    fixture.artifacts.copy_to(&handle, &mut retained).unwrap();
+    assert_eq!(retained, b"upper report bytes");
+    fixture.artifacts.release().unwrap();
+    assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
+    assert!(matches!(
+        fixture.artifacts.copy_to(&handle, &mut Vec::new()),
+        Err(ArtifactReadFailure::Unavailable | ArtifactReadFailure::UnknownHandle)
+    ));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InjectedCloseFailure {
     Export,
@@ -773,7 +846,17 @@ impl PublicationObserver for CloseFailureObserver {
 #[test]
 fn close_failures_retain_a_distinct_publication_phase_and_remove_staging() {
     let fixture = PublicationFixture::new();
-    let run = run_fixture(&fixture);
+    let mut run = run_fixture(&fixture);
+    run.exports.insert(
+        "reportA".to_owned(),
+        ExportValue::Available {
+            output: CapturedValue::Text(Arc::from("in-memory text")),
+        },
+    );
+    run.export_sources.insert(
+        "reportA".to_owned(),
+        export_source("produce", "response", WorkflowValueType::Text),
+    );
 
     for (name, injected, expected_phase, expected_kind, expected_export) in [
         (
@@ -928,7 +1011,7 @@ fn existing_and_racing_destinations_are_never_replaced_or_merged() {
 }
 
 #[test]
-fn caller_releases_artifacts_only_after_publication_has_copied_them() {
+fn publication_links_carriers_until_successful_private_cleanup() {
     let fixture = PublicationFixture::new();
     let run = run_fixture(&fixture);
     let destination = fixture.destination("released");
@@ -938,15 +1021,23 @@ fn caller_releases_artifacts_only_after_publication_has_copied_them() {
     let handle = output.as_file().unwrap().handle().clone();
 
     publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let published_path = destination.join("exports/0001");
+    assert_eq!(fs::read(&published_path).unwrap(), b"upper report bytes");
     assert_eq!(
-        fs::read(destination.join("exports/0001")).unwrap(),
-        b"upper report bytes"
+        fs::metadata(&published_path).unwrap().nlink(),
+        3,
+        "publication allocated a copied carrier instead of linking private staging"
     );
     let mut retained = Vec::new();
     fixture.artifacts.copy_to(&handle, &mut retained).unwrap();
     assert_eq!(retained, b"upper report bytes");
 
     fixture.artifacts.release().unwrap();
+    assert_eq!(
+        fs::metadata(&published_path).unwrap().nlink(),
+        1,
+        "private carrier links remained after successful cleanup"
+    );
     assert!(matches!(
         fixture.artifacts.copy_to(&handle, &mut Vec::new()),
         Err(ArtifactReadFailure::Unavailable | ArtifactReadFailure::UnknownHandle)

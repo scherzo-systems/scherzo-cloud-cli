@@ -28,6 +28,8 @@ mod auth_login;
 mod organization;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
+#[path = "cli/runner_administration.rs"]
+mod runner_administration;
 #[path = "cli/workflow_retry.rs"]
 mod workflow_retry;
 #[path = "cli/workflow_run.rs"]
@@ -442,16 +444,12 @@ fn no_arguments_print_composed_root_help() {
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud [COMMAND]"));
     assert!(stdout.contains("account       Manage your Scherzo Cloud account"));
-    assert!(stdout.contains("artifact      Inspect and validate portable workflow artifacts"));
+    assert!(stdout.contains("artifact      Work with portable workflow artifacts"));
     assert!(stdout.contains("auth          Manage your Scherzo Cloud sign-in"));
     assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
     assert!(stdout.contains("version       Print version information"));
-    assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
-    assert!(
-        stdout.contains(
-            "workflow      Validate, run, retry, and inspect local Workflow V1 definitions"
-        )
-    );
+    assert!(stdout.contains("runner        Work with the Scherzo Cloud runner"));
+    assert!(stdout.contains("workflow      Work with local workflow definitions and runs"));
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }
@@ -463,7 +461,7 @@ fn artifact_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud artifact [COMMAND]"));
-    assert!(stdout.contains("validate  Validate one complete portable Artifact Set V1 directory"));
+    assert!(stdout.contains("validate  Validate a portable workflow artifact directory"));
     assert!(output.stderr.is_empty());
 }
 
@@ -490,7 +488,7 @@ fn runner_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud runner [COMMAND]"));
-    assert!(stdout.contains("doctor  Inspect local runner prerequisites"));
+    assert!(stdout.contains("doctor  Check local runner prerequisites"));
     assert!(stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
     assert!(output.stderr.is_empty());
 }
@@ -502,14 +500,11 @@ fn workflow_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud workflow [COMMAND]"));
-    assert!(stdout.contains("run       Execute a local Workflow V1 command and agent DAG"));
-    assert!(
-        stdout.contains("status    Inspect one durable local workflow run without changing it")
-    );
-    assert!(stdout.contains("validate  Validate a local Workflow V1 bundle without executing it"));
-    assert!(
-        stdout.contains("view      Inspect one published local workflow attempt interactively")
-    );
+    assert!(stdout.contains("retry     Retry a local workflow run"));
+    assert!(stdout.contains("run       Run a local command and agent workflow"));
+    assert!(stdout.contains("status    Show local workflow run status"));
+    assert!(stdout.contains("validate  Validate a local workflow definition"));
+    assert!(stdout.contains("view      View a published local workflow attempt"));
     assert!(output.stderr.is_empty());
 }
 
@@ -552,7 +547,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
 
     assert!(runner.status.success());
     let runner_stdout = String::from_utf8_lossy(&runner.stdout);
-    assert!(runner_stdout.contains("doctor  Inspect local runner prerequisites"));
+    assert!(runner_stdout.contains("doctor  Check local runner prerequisites"));
     assert!(runner_stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
     assert!(runner.stderr.is_empty());
 
@@ -587,7 +582,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(!workflow_status_stdout.contains("--run-dir"));
     assert!(workflow_status_stdout.contains("--plain"));
     assert!(workflow_status_stdout.contains("--json"));
-    assert!(workflow_status_stdout.contains("--color <auto|always|never>"));
+    assert!(workflow_status_stdout.contains("--color <WHEN>"));
     assert!(workflow_status.stderr.is_empty());
 
     assert!(workflow_validate.status.success());
@@ -597,7 +592,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     ));
     assert!(workflow_validate_stdout.contains("--source-root <ROOT>"));
     assert!(workflow_validate_stdout.contains("--json"));
-    assert!(workflow_validate_stdout.contains("without executing it"));
+    assert!(workflow_validate_stdout.contains("Validate a local workflow definition"));
     assert!(workflow_validate.stderr.is_empty());
 
     assert!(workflow_view.status.success());
@@ -607,7 +602,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     );
     assert!(!workflow_view_stdout.contains("--run-dir"));
     assert!(workflow_view_stdout.contains("--attempt <NUMBER>"));
-    assert!(workflow_view_stdout.contains("--color <auto|always|never>"));
+    assert!(workflow_view_stdout.contains("--color <WHEN>"));
     assert!(!workflow_view_stdout.contains("--plain"));
     assert!(!workflow_view_stdout.contains("--json"));
     assert!(workflow_view.stderr.is_empty());
@@ -679,7 +674,7 @@ fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
 
     let output = run_with_env(&["auth", "status", "--allow-insecure-http"], &environment);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert!(output.stderr.is_empty());
     server.finish();
 }
@@ -713,12 +708,14 @@ fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
 
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
-    assert_eq!(
-        rejected.stderr,
-        b"Error: check sign-in status: contact Scherzo Cloud: the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
-    );
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(rejected_stderr.starts_with("Error: check sign-in status through "));
+    assert!(rejected_stderr.contains(&server.api_url));
+    assert!(rejected_stderr.contains(
+        "contact Scherzo Cloud: the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it"
+    ));
 
-    assert_eq!(accepted.status.code(), Some(2));
+    assert_eq!(accepted.status.code(), Some(3));
     assert!(accepted.stderr.is_empty());
 
     assert!(local_logout.status.success());
@@ -742,7 +739,7 @@ fn status_does_not_apply_transport_policy_to_the_unused_issuer() {
 
     let output = run_with_env(&["auth", "status", "--json"], &environment);
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(4));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["state"],
         "unreachable"
@@ -965,7 +962,7 @@ fn status_without_a_credential_still_contacts_the_server_without_authorization()
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
@@ -1007,7 +1004,7 @@ fn rejected_or_expired_status_credentials_are_removed() {
             &environment,
         );
 
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(3));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["state"],
             "unauthenticated"
@@ -1025,7 +1022,7 @@ fn rejected_or_expired_status_credentials_are_removed() {
 }
 
 #[test]
-fn unreachable_status_exits_3() {
+fn unreachable_status_uses_unavailable_exit_code() {
     for (http_status, expected_category) in [
         ("429 Too Many Requests", "rate_limited"),
         ("503 Service Unavailable", "server"),
@@ -1041,7 +1038,7 @@ fn unreachable_status_exits_3() {
             &environment,
         );
 
-        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.status.code(), Some(4));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
             serde_json::json!({
@@ -1057,7 +1054,7 @@ fn unreachable_status_exits_3() {
 }
 
 #[test]
-fn connection_failure_exits_3_with_an_unreachable_status() {
+fn connection_failure_uses_unavailable_exit_code_and_status() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let api_url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
@@ -1071,7 +1068,7 @@ fn connection_failure_exits_3_with_an_unreachable_status() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(4));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
@@ -1190,7 +1187,7 @@ fn human_status_writes_the_recognized_result_to_stdout() {
 
     let output = run_with_env(&["auth", "status", "--allow-insecure-http"], &environment);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(output.stdout, b"! You're not signed in to Scherzo Cloud.\n");
     assert!(output.stderr.is_empty());
     server.finish();
@@ -1365,7 +1362,7 @@ fn runner_doctor_reports_git_success_in_human_form() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         stdout,
-        "Scherzo Cloud runner doctor\n\n✓ Git\n  Git 2.42.0 is available (minimum 0.0.1).\n\nSummary: 1 passed, 0 failed\nSelected checks passed.\n"
+        "Scherzo Cloud runner doctor\n\n✓ Git\n  Git 2.42.0 is available (minimum 0.0.1).\n\n── summary ──\npassed: 1\nfailed: 0\n"
     );
     assert!(!stdout.contains("unique-raw-command-output"));
     assert!(output.stderr.is_empty());
@@ -1433,9 +1430,11 @@ fn runner_doctor_reports_missing_git() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout.contains("✗ Git"));
-    assert!(stdout.contains("Code: command_not_found"));
-    assert!(stdout.contains("Summary: 0 passed, 1 failed"));
-    assert!(stdout.contains("Selected checks failed."));
+    assert!(stdout.contains("code: command_not_found"));
+    assert!(stdout.contains("── summary ──"));
+    assert!(stdout.contains("passed: 0"));
+    assert!(stdout.contains("failed: 1"));
+    assert!(!stdout.contains("Selected checks failed."));
     assert!(output.stderr.is_empty());
 }
 
@@ -1482,7 +1481,7 @@ fn runner_doctor_does_not_load_human_configuration() {
     );
 
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Selected checks passed."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("passed: 1"));
     assert!(output.stderr.is_empty());
 }
 
@@ -1557,11 +1556,11 @@ fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
         &environment,
     );
     assert_eq!(invalid_config.status.code(), Some(1));
-    assert!(
-        invalid_config
-            .stderr
-            .starts_with(b"Error: invalid runner gateway URL\n")
-    );
+    let invalid_stderr = String::from_utf8_lossy(&invalid_config.stderr);
+    assert!(invalid_stderr.starts_with(
+        "Error: configure runner gateway endpoint https://not-a-websocket.example.test: "
+    ));
+    assert!(invalid_stderr.contains("invalid runner gateway URL"));
 
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -1647,32 +1646,50 @@ fn runner_serve_requires_configuration_and_redacts_invalid_credentials() {
 
     let directory = tempfile::tempdir().expect("temporary runner credential directory");
     let credential_path = directory.path().join("runner.credential");
+    let resolved_credential_path = fs::canonicalize(directory.path())
+        .expect("temporary runner credential directory should resolve")
+        .join("runner.credential");
     let secret_marker = "RUNNER-CREDENTIAL-MUST-NOT-LEAK";
     fs::write(&credential_path, secret_marker).expect("write invalid runner credential");
     fs::set_permissions(&credential_path, Permissions::from_mode(0o600))
         .expect("set runner credential permissions");
-    let credential_path = credential_path.to_string_lossy().into_owned();
-    let output = run(&[
-        "runner",
-        "serve",
-        "--gateway-url",
-        "wss://gateway.example.test/v1/connect",
-        "--credential-file",
-        &credential_path,
-        "--workflow-id",
-        "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-        "--workflow-source-root",
-        "schemas",
-        "--workflow-path",
-        "workflow-v1.schema.json",
-        "--work-root",
-        "tests",
-    ]);
+    let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .current_dir(directory.path())
+        .env("PATH", empty_path.path())
+        .args([
+            "runner",
+            "serve",
+            "--gateway-url",
+            "wss://gateway.example.test/v1/connect",
+            "--credential-file",
+            "runner.credential",
+            "--workflow-id",
+            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+            "--workflow-source-root",
+            "schemas",
+            "--workflow-path",
+            "workflow-v1.schema.json",
+            "--work-root",
+            "tests",
+        ]);
+    for variable in RUNNER_TELEMETRY_VARIABLES {
+        command.env_remove(variable);
+    }
+    let output = command.output().expect("scherzo-cloud should run");
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid runner credential file"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret_marker));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        format!(
+            "Error: load runner credential file {}: content or permissions are invalid\n\nReplace it with a valid runner credential and make the file readable only by its owner.\n",
+            resolved_credential_path.display()
+        )
+    );
+    assert!(!stderr.contains(secret_marker));
 }
 
 #[test]

@@ -29,8 +29,8 @@ use super::runtime::{
 };
 use super::step_runtime::StepFailureCause;
 
-const DEFAULT_LOG_RECORDS_PER_STEP: usize = 1024;
-const DEFAULT_LOG_BYTES_PER_STEP: usize = 256 * 1024;
+const MAXIMUM_LOG_RECORDS_PER_STEP: usize = 4_096;
+const RUN_LOG_RECORD_BUDGET: usize = 262_144;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StepLogCapacity {
@@ -39,6 +39,7 @@ pub(crate) struct StepLogCapacity {
 }
 
 impl StepLogCapacity {
+    #[cfg(test)]
     pub(crate) fn new(maximum_records: usize, maximum_bytes: usize) -> Option<Self> {
         (maximum_records != 0 && maximum_bytes >= MAX_NORMALIZED_CHILD_RECORD_BYTES).then_some(
             Self {
@@ -48,21 +49,22 @@ impl StepLogCapacity {
         )
     }
 
+    fn for_step_count(step_count: usize) -> Self {
+        debug_assert!(step_count != 0);
+        let step_count = step_count.max(1);
+        Self {
+            maximum_records: MAXIMUM_LOG_RECORDS_PER_STEP.min(RUN_LOG_RECORD_BUDGET / step_count),
+            maximum_bytes: usize::try_from(super::maximum_retained_bytes_per_stream(step_count))
+                .unwrap_or(usize::MAX),
+        }
+    }
+
     pub(crate) const fn maximum_records(self) -> usize {
         self.maximum_records
     }
 
     pub(crate) const fn maximum_bytes(self) -> usize {
         self.maximum_bytes
-    }
-}
-
-impl Default for StepLogCapacity {
-    fn default() -> Self {
-        Self {
-            maximum_records: DEFAULT_LOG_RECORDS_PER_STEP,
-            maximum_bytes: DEFAULT_LOG_BYTES_PER_STEP,
-        }
     }
 }
 
@@ -220,6 +222,23 @@ where
     Clock: ObservationClock,
 {
     pub(crate) fn new(
+        workflow: &ResolvedWorkflow,
+        maximum_parallel_steps: usize,
+        timing: RunTimingObservation,
+        clock: Clock,
+    ) -> Self {
+        let log_capacity =
+            StepLogCapacity::for_step_count(workflow.definition.presentation_order.len());
+        Self::with_log_capacity(
+            workflow,
+            maximum_parallel_steps,
+            timing,
+            clock,
+            log_capacity,
+        )
+    }
+
+    fn with_log_capacity(
         workflow: &ResolvedWorkflow,
         maximum_parallel_steps: usize,
         timing: RunTimingObservation,

@@ -10,8 +10,11 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use super::agent::{AgentInvocationLimits, PositiveDuration};
+use super::agent::{AgentCompatibilityProfile, AgentInvocationLimits, PositiveDuration};
 use super::artifact::CaptureCancellation;
+use super::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE};
+use super::claude_code::ClaudeCodeConfig;
+use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{GitCaptureContext, GitWorkspaceAdmissionFailure};
 use super::pi::PiConfig;
@@ -20,9 +23,11 @@ use super::resolution::ResolvedWorkflow;
 #[cfg(test)]
 use super::test_support::SynchronousGate;
 use super::validated::{ValidatedHarness, ValidatedStep};
+use crate::execution::claude_code::{
+    ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation,
+};
 use crate::execution::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
 
-pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
 const MAXIMUM_CAPTURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
@@ -33,15 +38,13 @@ const MAXIMUM_INPUT_VALUES: usize = 1024;
 const MAXIMUM_INPUT_VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_LIVE_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_STEP_LOG_BYTES: u64 = 64 * 1024;
-const MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES: u64 = 64 * 1024;
-const MAXIMUM_AGENT_MESSAGE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAXIMUM_AGENT_PROMPT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_AGENT_ATTACHMENTS: usize = 256;
 const MAXIMUM_AGENT_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_AGENT_RESPONSE_BYTES: u64 = 1024 * 1024;
-const MAXIMUM_AGENT_RESULT_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAXIMUM_AGENT_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAXIMUM_AGENT_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 const MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES: u64 = 8 * 1024;
-const AGENT_RESULT_VALIDATION_DEADLINE: Duration = Duration::from_secs(5);
+const AGENT_RESULT_VALIDATION_DEADLINE: Duration = Duration::from_secs(60);
 const AGENT_RESULT_SETTLEMENT_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,7 +416,7 @@ pub(crate) fn default_execution_policy_limits(
             MAXIMUM_TOTAL_INPUT_BYTES,
             MAXIMUM_LIVE_INPUT_BYTES,
         ),
-        MAXIMUM_STEP_LOG_BYTES,
+        super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
     )
 }
 
@@ -425,6 +428,7 @@ pub(crate) struct ExecutionContext {
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
+    claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     local_git_capture: bool,
 }
 
@@ -443,6 +447,7 @@ impl ExecutionContext {
             environment,
             cancellation,
             pi_installation: None,
+            claude_code_installation: None,
             local_git_capture: false,
         }
     }
@@ -454,6 +459,15 @@ impl ExecutionContext {
 
     pub(crate) fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
         self.pi_installation = Some(installation);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_claude_code_installation(
+        mut self,
+        installation: ValidatedClaudeCodeInstallation,
+    ) -> Self {
+        self.claude_code_installation = Some(installation);
         self
     }
 }
@@ -565,14 +579,14 @@ pub(crate) enum ProjectTrustPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AdmittedAgentStep {
+pub(crate) struct PiJsonV1Admission {
     installation: Arc<ValidatedPiInstallation>,
     configuration: PiConfig,
     project_trust: ProjectTrustPolicy,
     limits: AgentInvocationLimits<PiJsonV1ProtocolLimits>,
 }
 
-impl AdmittedAgentStep {
+impl PiJsonV1Admission {
     pub(crate) fn installation(&self) -> &ValidatedPiInstallation {
         &self.installation
     }
@@ -590,12 +604,62 @@ impl AdmittedAgentStep {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClaudeCodeStreamJsonV1Admission {
+    installation: Arc<ValidatedClaudeCodeInstallation>,
+    configuration: ClaudeCodeConfig,
+    limits: AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits>,
+}
+
+impl ClaudeCodeStreamJsonV1Admission {
+    pub(crate) fn installation(&self) -> &ValidatedClaudeCodeInstallation {
+        &self.installation
+    }
+
+    pub(crate) fn configuration(&self) -> &ClaudeCodeConfig {
+        &self.configuration
+    }
+
+    pub(crate) fn limits(&self) -> &AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits> {
+        &self.limits
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AdmittedHarness {
+    Pi(PiJsonV1Admission),
+    ClaudeCode(ClaudeCodeStreamJsonV1Admission),
+}
+
+impl AdmittedHarness {
+    pub(crate) const fn profile(&self) -> AgentCompatibilityProfile {
+        match self {
+            Self::Pi(_) => AgentCompatibilityProfile::PiJsonV1,
+            Self::ClaudeCode(_) => AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+        }
+    }
+
+    pub(crate) fn maximum_attachments(&self) -> NonZeroUsize {
+        match self {
+            Self::Pi(admission) => admission.limits().maximum_attachments(),
+            Self::ClaudeCode(admission) => admission.limits().maximum_attachments(),
+        }
+    }
+
+    pub(crate) fn maximum_attachment_bytes(&self) -> NonZeroU64 {
+        match self {
+            Self::Pi(admission) => admission.limits().maximum_attachment_bytes(),
+            Self::ClaudeCode(admission) => admission.limits().maximum_attachment_bytes(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedWorkflow {
     workflow: Arc<ResolvedWorkflow>,
     imports: ResolvedImports,
     execution: AdmittedExecutionContext,
-    agent_steps: Arc<BTreeMap<String, AdmittedAgentStep>>,
+    agent_steps: Arc<BTreeMap<String, AdmittedHarness>>,
     git_capture: Option<Arc<GitCaptureContext>>,
 }
 
@@ -612,11 +676,11 @@ impl AdmittedWorkflow {
         &self.execution
     }
 
-    pub(crate) fn agent_step(&self, step: &str) -> Option<&AdmittedAgentStep> {
+    pub(crate) fn agent_step(&self, step: &str) -> Option<&AdmittedHarness> {
         self.agent_steps.get(step)
     }
 
-    pub(crate) fn agent_steps(&self) -> &BTreeMap<String, AdmittedAgentStep> {
+    pub(crate) fn agent_steps(&self) -> &BTreeMap<String, AdmittedHarness> {
         &self.agent_steps
     }
 
@@ -650,7 +714,7 @@ pub(crate) enum AdmissionFailureKind {
     NonPositiveTotalInputBytes,
     NonPositiveLiveInputBytes,
     NonPositiveStepLogBytes,
-    NonPositiveCancellationGrace,
+    CancellationGraceTooShort,
     CancellationGraceTooLong,
 }
 
@@ -694,7 +758,7 @@ impl AdmissionFailureKind {
         matches!(
             self,
             Self::NonPositiveParallelism
-                | Self::NonPositiveCancellationGrace
+                | Self::CancellationGraceTooShort
                 | Self::CancellationGraceTooLong
         )
     }
@@ -750,7 +814,11 @@ pub(crate) fn admit_workflow(
         ));
     }
 
-    let agent_steps = admit_agent_steps(&workflow, context.pi_installation.as_ref())?;
+    let agent_steps = admit_agent_steps(
+        &workflow,
+        context.pi_installation.as_ref(),
+        context.claude_code_installation.as_ref(),
+    )?;
 
     let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
         .ok_or_else(|| {
@@ -831,20 +899,29 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumLiveInputBytes,
             )
         })?;
-    let maximum_step_log_bytes = NonZeroU64::new(context.limits.maximum_step_log_bytes)
+    let configured_maximum_step_log_bytes = NonZeroU64::new(context.limits.maximum_step_log_bytes)
         .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveStepLogBytes,
                 AdmissionLocation::MaximumStepLogBytes,
             )
         })?;
-    if context.cancellation.grace().is_zero() {
+    let maximum_step_log_bytes = NonZeroU64::new(configured_maximum_step_log_bytes.get().min(
+        super::maximum_retained_bytes_per_stream(workflow.definition.presentation_order.len()),
+    ))
+    .ok_or_else(|| {
+        AdmissionFailure::new(
+            AdmissionFailureKind::NonPositiveStepLogBytes,
+            AdmissionLocation::MaximumStepLogBytes,
+        )
+    })?;
+    if context.cancellation.grace() < MINIMUM_CANCELLATION_GRACE {
         return Err(AdmissionFailure::new(
-            AdmissionFailureKind::NonPositiveCancellationGrace,
+            AdmissionFailureKind::CancellationGraceTooShort,
             AdmissionLocation::CancellationPolicy,
         ));
     }
-    if context.cancellation.grace() > MAX_CANCELLATION_GRACE {
+    if context.cancellation.grace() > MAXIMUM_CANCELLATION_GRACE {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::CancellationGraceTooLong,
             AdmissionLocation::CancellationPolicy,
@@ -920,9 +997,12 @@ fn git_admission_failure(failure: GitWorkspaceAdmissionFailure) -> AdmissionFail
 
 fn admit_agent_steps(
     workflow: &ResolvedWorkflow,
-    installation: Option<&ValidatedPiInstallation>,
-) -> Result<BTreeMap<String, AdmittedAgentStep>, AdmissionFailure> {
-    let installation = installation.map(|installation| Arc::new(installation.clone()));
+    pi_installation: Option<&ValidatedPiInstallation>,
+    claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
+) -> Result<BTreeMap<String, AdmittedHarness>, AdmissionFailure> {
+    let pi_installation = pi_installation.map(|installation| Arc::new(installation.clone()));
+    let claude_code_installation =
+        claude_code_installation.map(|installation| Arc::new(installation.clone()));
     workflow
         .definition
         .steps
@@ -934,35 +1014,58 @@ fn admit_agent_steps(
             Some((step_name, step))
         })
         .map(|(step_name, step)| {
-            let installation = installation.as_ref().ok_or_else(|| {
+            let missing_installation = || {
                 AdmissionFailure::new(
                     AdmissionFailureKind::AgentStepRuntimeUnsupported,
                     AdmissionLocation::Step {
                         step: step_name.clone(),
                     },
                 )
-            })?;
-            let PiCompatibilityProfile::PiJsonV1 = installation.profile();
-            let configuration = match &step.agent.harness {
-                ValidatedHarness::Pi(configuration) => configuration.clone(),
             };
-            Ok((
-                step_name.clone(),
-                AdmittedAgentStep {
-                    installation: Arc::clone(installation),
-                    configuration,
-                    project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
-                    limits: pi_json_v1_limits(),
-                },
-            ))
+            let admitted = match &step.agent.harness {
+                ValidatedHarness::Pi(configuration) => {
+                    let installation = pi_installation.as_ref().ok_or_else(missing_installation)?;
+                    let PiCompatibilityProfile::PiJsonV1 = installation.profile();
+                    AdmittedHarness::Pi(PiJsonV1Admission {
+                        installation: Arc::clone(installation),
+                        configuration: configuration.clone(),
+                        project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
+                        limits: pi_json_v1_limits(),
+                    })
+                }
+                ValidatedHarness::ClaudeCode(configuration) => {
+                    let installation = claude_code_installation
+                        .as_ref()
+                        .ok_or_else(missing_installation)?;
+                    let ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1 =
+                        installation.profile();
+                    AdmittedHarness::ClaudeCode(ClaudeCodeStreamJsonV1Admission {
+                        installation: Arc::clone(installation),
+                        configuration: configuration.clone(),
+                        limits: claude_code_stream_json_v1_limits(),
+                    })
+                }
+            };
+            Ok((step_name.clone(), admitted))
         })
         .collect()
 }
 
 fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
+    agent_invocation_limits(PiJsonV1ProtocolLimits::profile())
+}
+
+fn claude_code_stream_json_v1_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits>
+{
+    agent_invocation_limits(ClaudeCodeStreamJsonV1ProtocolLimits::profile())
+}
+
+fn agent_invocation_limits<ProtocolLimits>(
+    protocol: ProtocolLimits,
+) -> AgentInvocationLimits<ProtocolLimits> {
     AgentInvocationLimits::new(
-        positive_u64(MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES),
-        positive_u64(MAXIMUM_AGENT_MESSAGE_BYTES),
+        positive_u64(MAXIMUM_AGENT_PROMPT_BYTES),
+        positive_u64(MAXIMUM_AGENT_PROMPT_BYTES),
         positive_usize(MAXIMUM_AGENT_ATTACHMENTS),
         positive_u64(MAXIMUM_AGENT_ATTACHMENT_BYTES),
         positive_u64(MAXIMUM_AGENT_RESPONSE_BYTES),
@@ -970,27 +1073,27 @@ fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
         positive_u64(MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES),
         positive_duration(AGENT_RESULT_VALIDATION_DEADLINE),
         positive_duration(AGENT_RESULT_SETTLEMENT_GRACE),
-        PiJsonV1ProtocolLimits::profile(),
+        protocol,
     )
 }
 
 fn positive_u64(value: u64) -> NonZeroU64 {
     let Some(value) = NonZeroU64::new(value) else {
-        unreachable!("the fixed PiJsonV1 byte bounds are positive");
+        unreachable!("the fixed agent byte bounds are positive");
     };
     value
 }
 
 fn positive_usize(value: usize) -> NonZeroUsize {
     let Some(value) = NonZeroUsize::new(value) else {
-        unreachable!("the fixed PiJsonV1 count bounds are positive");
+        unreachable!("the fixed agent count bounds are positive");
     };
     value
 }
 
 fn positive_duration(value: Duration) -> PositiveDuration {
     let Some(value) = PositiveDuration::new(value) else {
-        unreachable!("the fixed PiJsonV1 duration bounds are positive");
+        unreachable!("the fixed agent duration bounds are positive");
     };
     value
 }

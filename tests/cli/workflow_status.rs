@@ -533,7 +533,9 @@ fn invalid_run_directory_is_structured_and_missing_lock_is_not_created() {
     let plain = status(&run_directory, &[]);
     assert_eq!(plain.status.code(), Some(1));
     assert!(plain.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&plain.stderr).contains("valid V1 state"));
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(plain_stderr.contains("valid V1 state"));
+    assert!(plain_stderr.contains(run_directory.to_str().unwrap()));
     assert!(!run_directory.join("run.lock").exists());
 
     let unavailable = status(&run_directory.join("absent"), &["--json"]);

@@ -4,6 +4,7 @@
 # document the canonical fallback and Cargo-provided test fixtures.
 disallowed-macros = [
   { path = "std::env", reason = "use the explicit compile-time environment boundary" },
+  { path = "std::eprintln", reason = "return operational failures to the shared top-level renderer" },
 ]
 
 # Timing primitives are denied by default across every CLI target. Production

@@ -66,11 +66,42 @@ impl DagLayout {
             .enumerate()
             .map(|(index, (id, _))| (*id, index))
             .collect::<BTreeMap<_, _>>();
+        let direct_parents = nodes
+            .iter()
+            .map(|(_, dependencies)| {
+                dependencies
+                    .iter()
+                    .filter_map(|dependency| indexes.get(dependency.as_str()).copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut ancestors = vec![vec![false; nodes.len()]; nodes.len()];
+        for (node, parents) in direct_parents.iter().enumerate() {
+            let (earlier, current_and_later) = ancestors.split_at_mut(node);
+            let current = &mut current_and_later[0];
+            for parent in parents {
+                debug_assert!(
+                    *parent < node,
+                    "DAG presentation order must place dependencies before dependents"
+                );
+                if let Some(parent_ancestors) = earlier.get(*parent) {
+                    for (reachable, parent_reachable) in
+                        current.iter_mut().zip(parent_ancestors.iter())
+                    {
+                        *reachable |= *parent_reachable;
+                    }
+                }
+                current[*parent] = true;
+            }
+        }
         let mut children = vec![Vec::new(); nodes.len()];
-        for (child, (_, dependencies)) in nodes.iter().enumerate() {
-            for dependency in *dependencies {
-                if let Some(parent) = indexes.get(dependency.as_str()).copied() {
-                    children[parent].push(child);
+        for (child, parents) in direct_parents.iter().enumerate() {
+            for parent in parents {
+                let redundant = parents
+                    .iter()
+                    .any(|other| other != parent && ancestors[*other].get(*parent) == Some(&true));
+                if !redundant {
+                    children[*parent].push(child);
                 }
             }
         }
@@ -416,6 +447,28 @@ mod tests {
     }
 
     #[test]
+    fn transitively_redundant_edges_do_not_open_lanes() {
+        let layout = layout(&[
+            ("prepare", &[]),
+            ("decompose", &["prepare"]),
+            ("validate", &["prepare", "decompose"]),
+            ("publish", &["prepare", "validate"]),
+        ]);
+
+        assert_eq!(layout.gutter_width, 1);
+        assert_eq!(
+            (0..4)
+                .map(|index| node_row(&layout, index))
+                .collect::<Vec<_>>(),
+            ["●", "●", "●", "●"]
+        );
+        assert_eq!(connector_row(&layout, 0), "│");
+        assert_eq!(connector_row(&layout, 1), "│");
+        assert_eq!(connector_row(&layout, 2), "│");
+        assert_eq!(connector_row(&layout, 3), " ");
+    }
+
+    #[test]
     fn fan_out_uses_presentation_order_for_lane_ties() {
         let layout = layout(&[
             ("root", &[]),
@@ -475,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_dense_graph_keeps_connector_rows_bounded() {
+    fn maximum_dense_graph_reduces_to_a_bounded_chain() {
         const STEP_COUNT: usize = 256;
 
         let nodes = (0..STEP_COUNT)
@@ -495,13 +548,17 @@ mod tests {
         );
 
         assert_eq!(layout.rows.len(), STEP_COUNT);
-        assert_eq!(layout.gutter_width, MAX_GRAPH_LANES * 2 - 1);
+        assert_eq!(layout.gutter_width, 1);
         assert!(layout.rows.iter().all(|graph_row| {
             graph_row.before_node.chars().count() + 1 + graph_row.after_node.chars().count()
                 == layout.gutter_width
                 && graph_row.below_node.chars().count() == layout.gutter_width
         }));
-        let middle = &layout.rows[STEP_COUNT / 2];
-        assert!(node_row(&layout, STEP_COUNT / 2).contains("…") || middle.below_node.contains("…"));
+        assert!(
+            layout.rows[..STEP_COUNT - 1]
+                .iter()
+                .all(|row| row.below_node == "│")
+        );
+        assert_eq!(layout.rows[STEP_COUNT - 1].below_node, " ");
     }
 }

@@ -1,7 +1,6 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::api::{
@@ -10,19 +9,17 @@ use crate::api::{
     OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome,
 };
-
-const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
-const UNREACHABLE_EXIT_CODE: u8 = 3;
+use crate::exit_code::ExitCode;
 
 pub(super) fn write_create(
     deployment: &str,
     outcome: &CreateOrganizationOutcome,
     json: bool,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     match outcome {
         CreateOrganizationOutcome::Created(organization) => {
             write_organization_success(deployment, "created", organization, json)?;
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::Success)
         }
         CreateOrganizationOutcome::Common(common) => write_common(
             deployment,
@@ -36,7 +33,7 @@ pub(super) fn write_create(
             None,
             None,
             "! Organization creation is not permitted for this account.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         CreateOrganizationOutcome::SlugUnavailable => write_failure(
@@ -45,7 +42,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The requested organization slug is unavailable.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         CreateOrganizationOutcome::QuantityLimitReached => write_failure(
@@ -54,7 +51,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The organization quantity limit has been reached.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         CreateOrganizationOutcome::RateLimited { retry_after } => write_failure(
@@ -65,7 +62,7 @@ pub(super) fn write_create(
             &format!(
                 "! Organization creation is rate limited. Try again in {retry_after} seconds."
             ),
-            ExitCode::from(UNREACHABLE_EXIT_CODE),
+            ExitCode::Unavailable,
             json,
         ),
         CreateOrganizationOutcome::IdempotencyConflict => write_failure(
@@ -74,7 +71,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The organization request identity conflicted with another request.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
     }
@@ -84,11 +81,11 @@ pub(super) fn write_show(
     deployment: &str,
     outcome: &GetOrganizationOutcome,
     json: bool,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     match outcome {
         GetOrganizationOutcome::Found(organization) => {
             write_organization_success(deployment, "found", organization, json)?;
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::Success)
         }
         GetOrganizationOutcome::Common(common) => write_common(
             deployment,
@@ -104,11 +101,11 @@ pub(super) fn write_update(
     deployment: &str,
     outcome: &UpdateOrganizationOutcome,
     json: bool,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     match outcome {
         UpdateOrganizationOutcome::Updated(organization) => {
             write_organization_success(deployment, "updated", organization, json)?;
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::Success)
         }
         UpdateOrganizationOutcome::Common(common) => write_common(
             deployment,
@@ -123,7 +120,7 @@ pub(super) fn write_update(
             None,
             None,
             "! The requested organization slug is unavailable.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         UpdateOrganizationOutcome::IdempotencyConflict => write_failure(
@@ -132,7 +129,7 @@ pub(super) fn write_update(
             None,
             None,
             "! The organization request identity conflicted with another request.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
     }
@@ -142,7 +139,7 @@ pub(super) fn write_members_list(
     deployment: &str,
     outcome: &ListOrganizationMembershipsOutcome,
     json: bool,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     match outcome {
         ListOrganizationMembershipsOutcome::Listed(page) => {
             if json {
@@ -156,7 +153,7 @@ pub(super) fn write_members_list(
             } else {
                 write_members_human(deployment, &page.items, page.next_cursor.as_deref())?;
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::Success)
         }
         ListOrganizationMembershipsOutcome::Common(common) => write_common(
             deployment,
@@ -168,14 +165,14 @@ pub(super) fn write_members_list(
     }
 }
 
-fn write_not_found(deployment: &str, json: bool) -> Result<ExitCode, OutputError> {
+fn write_not_found(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
     write_failure(
         deployment,
         "not_found",
         None,
         None,
         "! Organization not found or unavailable.",
-        ExitCode::FAILURE,
+        ExitCode::GeneralFailure,
         json,
     )
 }
@@ -185,7 +182,7 @@ fn write_common(
     outcome: &CommonOrganizationFailure,
     json: bool,
     unreachable_message: &'static str,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     match outcome {
         CommonOrganizationFailure::Unauthenticated => write_failure(
             deployment,
@@ -193,7 +190,7 @@ fn write_common(
             None,
             None,
             "! You must sign in before managing Scherzo Cloud organizations.\n\nRun:\n  scherzo-cloud auth login",
-            ExitCode::from(UNAUTHENTICATED_EXIT_CODE),
+            ExitCode::AuthenticationRequired,
             json,
         ),
         CommonOrganizationFailure::Forbidden => write_failure(
@@ -202,7 +199,7 @@ fn write_common(
             None,
             None,
             "! This account is not permitted to perform that organization operation.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         CommonOrganizationFailure::InvalidInput => write_failure(
@@ -211,7 +208,7 @@ fn write_common(
             None,
             None,
             "! The organization input was rejected by the deployment.",
-            ExitCode::FAILURE,
+            ExitCode::GeneralFailure,
             json,
         ),
         CommonOrganizationFailure::Unreachable(category) => write_failure(
@@ -220,7 +217,7 @@ fn write_common(
             Some(category.as_str()),
             None,
             &format!("! {unreachable_message} ({}).", category.as_str()),
-            ExitCode::from(UNREACHABLE_EXIT_CODE),
+            ExitCode::Unavailable,
             json,
         ),
     }
@@ -231,7 +228,7 @@ fn write_organization_success(
     outcome: &'static str,
     organization: &Organization,
     json: bool,
-) -> Result<(), OutputError> {
+) -> anyhow::Result<()> {
     if json {
         write_json(&OrganizationResult {
             schema_version: 1,
@@ -266,7 +263,7 @@ fn write_members_human(
     deployment: &str,
     items: &[OrganizationMembershipDirectoryEntry],
     next_cursor: Option<&str>,
-) -> Result<(), OutputError> {
+) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     writeln!(stdout, "✓ Organization members listed.\n")?;
@@ -302,7 +299,7 @@ fn write_failure(
     human: &str,
     exit_code: ExitCode,
     json: bool,
-) -> Result<ExitCode, OutputError> {
+) -> anyhow::Result<ExitCode> {
     if json {
         write_json(&FailureResult {
             schema_version: 1,
@@ -319,11 +316,12 @@ fn write_failure(
     Ok(exit_code)
 }
 
-fn write_json(value: &impl Serialize) -> Result<(), OutputError> {
+fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, value).map_err(OutputError::Json)?;
-    writeln!(stdout).map_err(OutputError::Io)
+    serde_json::to_writer_pretty(&mut stdout, value)
+        .context("serialize JSON organization result")?;
+    writeln!(stdout).context("write organization result")
 }
 
 const fn organization_state(state: OrganizationState) -> &'static str {
@@ -376,25 +374,4 @@ struct FailureResult<'a> {
     category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
-}
-
-#[derive(Debug)]
-pub(super) enum OutputError {
-    Json(serde_json::Error),
-    Io(io::Error),
-}
-
-impl From<io::Error> for OutputError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl fmt::Display for OutputError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json(error) => write!(formatter, "serialize JSON: {error}"),
-            Self::Io(error) => write!(formatter, "write output: {error}"),
-        }
-    }
 }

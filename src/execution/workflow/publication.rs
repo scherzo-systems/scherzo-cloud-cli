@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use super::admission::CancellationReason;
 use super::agent::AgentFailureCause;
 use super::agent_input::AgentInputStartFailure;
-use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind};
+use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind, StagedCarrier};
 use super::artifact_set;
 use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -52,7 +52,6 @@ const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;
-const MAXIMUM_RETAINED_BYTES_PER_STREAM: u64 = 65_536;
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkflowRunTiming {
@@ -122,7 +121,7 @@ pub(crate) enum LocalPublicationFailureKind {
     ParentUnavailable,
     DestinationExists,
     StagingUnavailable,
-    ArtifactUnavailable,
+    CarrierHandoffUnavailable,
     ExportWriteUnavailable,
     UnsupportedExport,
     InvalidRunResult,
@@ -483,6 +482,7 @@ pub(crate) enum FailureCodeV1 {
     GitRequiredObjectsUnavailable,
     GitSourceAuthorityChanged,
     GitStructureLimitExceeded,
+    GitCommandTimedOut,
     GitBundleGenerationFailed,
     GitBundleProfileInvalid,
     GitBundleVerificationFailed,
@@ -752,8 +752,8 @@ pub(crate) enum ExportUnavailableReasonV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PublicationBoundary {
     StagingCreated,
-    BeforeExportCopy { export: String },
-    AfterExportCopy { export: String },
+    BeforeExportMaterialization { export: String },
+    AfterExportMaterialization { export: String },
     BeforeSerialization,
     StagingComplete,
 }
@@ -1043,18 +1043,39 @@ fn write_available_export(
     if let CapturedValue::GitBranch(branch) = output {
         return write_git_branch_export(staging, observer, artifacts, name, ordinal, branch);
     }
+    let file_name = format!("{ordinal:04}");
+    if let CapturedValue::File(file) = output {
+        expose_staged_carrier(
+            staging,
+            observer,
+            artifacts,
+            name,
+            &file_name,
+            file.carrier(),
+            file.output_identity(),
+        )?;
+        return Ok(ExportV1::Available {
+            kind: "file".to_owned(),
+            media_type: file.media_type().to_owned(),
+            path: format!("{EXPORT_DIRECTORY}/{file_name}"),
+            size_bytes: file.size(),
+            digest: DigestV1 {
+                algorithm: "sha256".to_owned(),
+                value: file.sha256().to_owned(),
+            },
+        });
+    }
+
     observe(
         observer,
-        &PublicationBoundary::BeforeExportCopy {
+        &PublicationBoundary::BeforeExportMaterialization {
             export: name.to_owned(),
         },
         LocalPublicationPhase::ExportCopy,
-        LocalPublicationFailureKind::ArtifactUnavailable,
+        LocalPublicationFailureKind::ExportWriteUnavailable,
         Some(name),
     )?;
-    let file_name = format!("{ordinal:04}");
     let (kind, media_type, expected_size) = match output {
-        CapturedValue::File(file) => ("file", file.media_type().to_owned(), file.size()),
         CapturedValue::Text(text) => (
             "text",
             "text/plain; charset=utf-8".to_owned(),
@@ -1077,7 +1098,7 @@ fn write_available_export(
                 )
             })?,
         ),
-        CapturedValue::GitBranch(_) => {
+        CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
             return Err(LocalPublicationError::for_export(
                 LocalPublicationPhase::ExportCopy,
                 LocalPublicationFailureKind::UnsupportedExport,
@@ -1089,26 +1110,19 @@ fn write_available_export(
         LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
     })?;
     let mut digest = DigestContext::new(&SHA256);
-    let copied = {
+    let written = {
         let mut hashing = HashingWriter {
             destination: &mut destination,
             digest: &mut digest,
             bytes: 0,
         };
         match output {
-            CapturedValue::File(file) => {
-                artifacts
-                    .copy_to(file.handle(), &mut hashing)
-                    .map_err(|failure| copy_error(name, failure))?;
-            }
             CapturedValue::Text(text) => hashing
                 .write_all(text.as_bytes())
                 .map_err(|_| export_write_error(name))?,
-            CapturedValue::Json(value) => {
-                canonical_json::to_writer(&mut hashing, value)
-                    .map_err(|_| export_write_error(name))?;
-            }
-            CapturedValue::GitBranch(_) => {
+            CapturedValue::Json(value) => canonical_json::to_writer(&mut hashing, value)
+                .map_err(|_| export_write_error(name))?,
+            CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
                 return Err(LocalPublicationError::for_export(
                     LocalPublicationPhase::ExportCopy,
                     LocalPublicationFailureKind::UnsupportedExport,
@@ -1120,12 +1134,8 @@ fn write_available_export(
         hashing.bytes
     };
     destination.flush().map_err(|_| export_write_error(name))?;
-    if copied != expected_size {
-        return Err(LocalPublicationError::for_export(
-            LocalPublicationPhase::ExportCopy,
-            LocalPublicationFailureKind::ArtifactUnavailable,
-            name,
-        ));
+    if written != expected_size {
+        return Err(export_write_error(name));
     }
     observer
         .close_staged_file(
@@ -1145,7 +1155,7 @@ fn write_available_export(
         kind: kind.to_owned(),
         media_type,
         path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-        size_bytes: copied,
+        size_bytes: written,
         digest: DigestV1 {
             algorithm: "sha256".to_owned(),
             value: lowercase_hex(digest.finish().as_ref()),
@@ -1153,11 +1163,11 @@ fn write_available_export(
     };
     observe(
         observer,
-        &PublicationBoundary::AfterExportCopy {
+        &PublicationBoundary::AfterExportMaterialization {
             export: name.to_owned(),
         },
         LocalPublicationPhase::ExportCopy,
-        LocalPublicationFailureKind::ArtifactUnavailable,
+        LocalPublicationFailureKind::ExportWriteUnavailable,
         Some(name),
     )?;
     Ok(metadata)
@@ -1179,71 +1189,23 @@ fn write_git_branch_export(
     let carrier = match branch.carrier() {
         None => None,
         Some(carrier) => {
-            observe(
-                observer,
-                &PublicationBoundary::BeforeExportCopy {
-                    export: name.to_owned(),
-                },
-                LocalPublicationPhase::ExportCopy,
-                LocalPublicationFailureKind::ArtifactUnavailable,
-                Some(name),
-            )?;
             let file_name = format!("{ordinal:04}");
-            let mut destination = staging.create_export(&file_name).map_err(|kind| {
-                LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
-            })?;
-            let mut digest = DigestContext::new(&SHA256);
-            let copied = {
-                let mut hashing = HashingWriter {
-                    destination: &mut destination,
-                    digest: &mut digest,
-                    bytes: 0,
-                };
-                artifacts
-                    .copy_to(carrier.handle(), &mut hashing)
-                    .map_err(|failure| copy_error(name, failure))?;
-                hashing.flush().map_err(|_| export_write_error(name))?;
-                hashing.bytes
-            };
-            destination.flush().map_err(|_| export_write_error(name))?;
-            let observed_digest = lowercase_hex(digest.finish().as_ref());
-            if copied != carrier.size() || observed_digest != carrier.sha256() {
-                return Err(LocalPublicationError::for_export(
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::ArtifactUnavailable,
-                    name,
-                ));
-            }
-            observer
-                .close_staged_file(
-                    destination,
-                    &StagedFile::Export {
-                        export: name.to_owned(),
-                    },
-                )
-                .map_err(|_| {
-                    LocalPublicationError::for_export(
-                        LocalPublicationPhase::Close,
-                        LocalPublicationFailureKind::ExportWriteUnavailable,
-                        name,
-                    )
-                })?;
-            observe(
+            expose_staged_carrier(
+                staging,
                 observer,
-                &PublicationBoundary::AfterExportCopy {
-                    export: name.to_owned(),
-                },
-                LocalPublicationPhase::ExportCopy,
-                LocalPublicationFailureKind::ArtifactUnavailable,
-                Some(name),
+                artifacts,
+                name,
+                &file_name,
+                carrier.staged(),
+                branch.output_identity(),
             )?;
             Some(GitBranchCarrierV1 {
                 path: format!("{EXPORT_DIRECTORY}/{file_name}"),
                 media_type: carrier.media_type().to_owned(),
-                size_bytes: copied,
+                size_bytes: carrier.size(),
                 digest: DigestV1 {
                     algorithm: "sha256".to_owned(),
-                    value: observed_digest,
+                    value: carrier.sha256().to_owned(),
                 },
             })
         }
@@ -1273,6 +1235,38 @@ fn observe(
     })
 }
 
+fn expose_staged_carrier(
+    staging: &mut StagingDirectory<'_>,
+    observer: &mut impl PublicationObserver,
+    artifacts: &ArtifactStaging,
+    export: &str,
+    file_name: &str,
+    carrier: &StagedCarrier,
+    expected_output_identity: &str,
+) -> Result<(), LocalPublicationError> {
+    observe(
+        observer,
+        &PublicationBoundary::BeforeExportMaterialization {
+            export: export.to_owned(),
+        },
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::CarrierHandoffUnavailable,
+        Some(export),
+    )?;
+    staging
+        .expose_export(artifacts, carrier, expected_output_identity, file_name)
+        .map_err(|failure| carrier_handoff_error(export, failure))?;
+    observe(
+        observer,
+        &PublicationBoundary::AfterExportMaterialization {
+            export: export.to_owned(),
+        },
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::CarrierHandoffUnavailable,
+        Some(export),
+    )
+}
+
 fn export_write_error(export: &str) -> LocalPublicationError {
     LocalPublicationError::for_export(
         LocalPublicationPhase::ExportCopy,
@@ -1281,16 +1275,12 @@ fn export_write_error(export: &str) -> LocalPublicationError {
     )
 }
 
-fn copy_error(export: &str, failure: ArtifactReadFailure) -> LocalPublicationError {
-    let kind = match failure {
-        ArtifactReadFailure::UnknownHandle | ArtifactReadFailure::Unavailable => {
-            LocalPublicationFailureKind::ArtifactUnavailable
-        }
-        ArtifactReadFailure::DestinationWrite => {
-            LocalPublicationFailureKind::ExportWriteUnavailable
-        }
-    };
-    LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, export)
+fn carrier_handoff_error(export: &str, _failure: ArtifactExposeFailure) -> LocalPublicationError {
+    LocalPublicationError::for_export(
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::CarrierHandoffUnavailable,
+        export,
+    )
 }
 
 fn build_result(
@@ -1355,7 +1345,7 @@ fn build_result(
         },
         command_output_policy: CommandOutputPolicyV1 {
             encoding: "base64".to_owned(),
-            maximum_retained_bytes_per_stream: MAXIMUM_RETAINED_BYTES_PER_STREAM,
+            maximum_retained_bytes_per_stream: super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         },
         outcome,
         primary_failure,
@@ -1447,7 +1437,7 @@ fn diagnostic_stream_v1(
     stream: &CapturedDiagnosticStream,
 ) -> Result<DiagnosticStreamV1, LocalPublicationError> {
     let retained_bytes = u64::try_from(stream.bytes().len()).map_err(|_| invalid_run_result())?;
-    if retained_bytes > MAXIMUM_RETAINED_BYTES_PER_STREAM {
+    if retained_bytes > super::MAXIMUM_RETAINED_BYTES_PER_STREAM {
         return Err(invalid_run_result());
     }
     let discarded_bytes = stream
@@ -1698,6 +1688,7 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
                 GitCaptureFailure::GitStructureLimitExceeded => {
                     FailureCodeV1::GitStructureLimitExceeded
                 }
+                GitCaptureFailure::CommandTimedOut(_) => FailureCodeV1::GitCommandTimedOut,
                 GitCaptureFailure::BundleGenerationFailed => {
                     FailureCodeV1::GitBundleGenerationFailed
                 }
@@ -1775,23 +1766,25 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
 }
 
 fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
+    use crate::exit_code::ExitCode;
+
     if run.steps.iter().any(|step| {
         step.command_output.as_ref().is_some_and(|output| {
             !output.standard_output().fully_drained() || !output.standard_error().fully_drained()
         })
     }) {
-        return 1;
+        return ExitCode::GeneralFailure.as_u16();
     }
     match outcome {
-        WorkflowOutcomeV1::Succeeded => 0,
-        WorkflowOutcomeV1::Failed => 1,
+        WorkflowOutcomeV1::Succeeded => ExitCode::Success.as_u16(),
+        WorkflowOutcomeV1::Failed => ExitCode::GeneralFailure.as_u16(),
         WorkflowOutcomeV1::Cancelled => match &run.outcome {
             RunOutcome::Cancelled {
                 reason: CancellationReason::UserRequest,
-            } => 130,
+            } => ExitCode::Interrupted.as_u16(),
             RunOutcome::Cancelled {
                 reason: CancellationReason::TerminationRequest,
-            } => 143,
+            } => ExitCode::Terminated.as_u16(),
             RunOutcome::Cancelled {
                 reason:
                     CancellationReason::CallerOutputFailure
@@ -1799,7 +1792,7 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                     | CancellationReason::ExecutionLeaseExpired,
             }
             | RunOutcome::Succeeded
-            | RunOutcome::Failed { .. } => 1,
+            | RunOutcome::Failed { .. } => ExitCode::GeneralFailure.as_u16(),
         },
     }
 }
@@ -2026,6 +2019,21 @@ impl<'a> StagingDirectory<'a> {
         .map_err(|_| LocalPublicationFailureKind::ExportWriteUnavailable)?;
         self.export_files.push(name.to_owned());
         Ok(File::from(file))
+    }
+
+    fn expose_export(
+        &mut self,
+        artifacts: &ArtifactStaging,
+        carrier: &StagedCarrier,
+        expected_output_identity: &str,
+        name: &str,
+    ) -> Result<(), ArtifactExposeFailure> {
+        let exports = self
+            .exports
+            .as_ref()
+            .ok_or(ArtifactExposeFailure::Unavailable)?;
+        self.export_files.push(name.to_owned());
+        artifacts.expose_carrier(carrier, expected_output_identity, exports, OsStr::new(name))
     }
 
     fn write_result(&mut self, bytes: &[u8]) -> Result<File, LocalPublicationError> {

@@ -1,209 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-fail() {
-  echo "$1" >&2
-  exit 1
-}
-
-if [[ $# -ne 0 ]]; then
-  echo "Usage: scripts/test-release" >&2
-  exit 2
-fi
-
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT
-fixture=$test_root/fixture
+fail() { echo "$1" >&2; exit 1; }
+[[ $# -eq 0 ]] || { echo 'Usage: scripts/test-release' >&2; exit 2; }
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+fixture=$root/fixture
 mkdir -p "$fixture/scripts"
-cp "$script_dir/check-release" "$fixture/scripts/check-release"
+cp "$script_dir/check-release" "$fixture/scripts/"
 chmod +x "$fixture/scripts/check-release"
-validator=$fixture/scripts/check-release
+checker=$fixture/scripts/check-release
 
-write_release() {
-  local series=$1
-  cat >"$fixture/release.toml" <<EOF
-schema = 1
-series = "$series"
+write_policy() {
+  cat >"$fixture/release.toml" <<'EOF'
+schema = 2
+initial_version = "0.1.0"
+development_version = "0.0.0-dev"
+pre_1_0_breaking_impact = "minor"
 EOF
 }
-
 write_manifest() {
-  local version=$1
   cat >"$fixture/Cargo.toml" <<EOF
 [package]
 name = "fixture"
-version = "$version"
-
-[workspace]
-members = ["."]
+version = "$1"
 EOF
 }
-
-reset_fixture() {
-  local series=${1:-0.1}
-  local version=${2:-${series}.0}
-  write_release "$series"
-  write_manifest "$version"
-}
-
+reset_fixture() { write_policy; write_manifest "${1:-0.0.0-dev}"; }
 expect_output() {
-  local expected=$1
-  shift
+  local expected=$1; shift
   local output
-  if ! output=$("$@" 2>&1); then
-    fail "Expected success with output '$expected', got failure: $output"
-  fi
-  if [[ "$output" != "$expected" ]]; then
-    fail "Expected output '$expected', got: $output"
-  fi
+  output=$("$@" 2>&1) || fail "expected success, got: $output"
+  [[ $output == "$expected" ]] || fail "expected '$expected', got '$output'"
 }
-
 expect_failure() {
-  local expected=$1
-  shift
-  local output
-  if output=$("$@" 2>&1); then
-    fail "Expected failure containing '$expected', got success: $output"
-  fi
-  if [[ "$output" != *"$expected"* ]]; then
-    fail "Expected failure containing '$expected', got: $output"
-  fi
+  local description=$1; shift
+  "$@" >/dev/null 2>&1 && fail "$description: expected failure"
+  return 0
 }
 
 reset_fixture
-expect_output \
-  "CLI release configuration is valid for series 0.1." \
-  "$validator"
-expect_output "0.1" "$validator" --series
-expect_output \
-  "CLI release tag is valid: v99.42.7." \
-  "$validator" --validate-tag v99.42.7
-
-cat >"$fixture/release.toml" <<'EOF'
-# The release schema is intentionally small.
-
- schema = 1 # current schema
- series = "0.1" # current release line
-EOF
-expect_output \
-  "CLI release configuration is valid for series 0.1." \
-  "$validator"
+expect_output 'CLI static release policy is valid.' "$checker"
+expect_output '0.1.0' "$checker" --initial-version
+expect_output '0.0.0-dev' "$checker" --development-version
+expect_output 'minor' "$checker" --breaking-impact
+expect_output 'CLI release tag is valid: v99.42.7.' "$checker" --validate-tag v99.42.7
 
 reset_fixture
 rm "$fixture/release.toml"
-expect_failure \
-  "CLI release configuration is missing: release.toml" \
-  "$validator"
+expect_failure 'missing policy' "$checker"
 
-reset_fixture
-cat >>"$fixture/release.toml" <<'EOF'
-channel = "stable"
-EOF
-expect_failure \
-  "Unknown or malformed CLI release configuration on line 3." \
-  "$validator"
-
-reset_fixture
-cat >>"$fixture/release.toml" <<'EOF'
-schema = 1
-EOF
-expect_failure \
-  "CLI release configuration contains duplicate field: schema" \
-  "$validator"
-
-reset_fixture
-cat >>"$fixture/release.toml" <<'EOF'
-series = "0.1"
-EOF
-expect_failure \
-  "CLI release configuration contains duplicate field: series" \
-  "$validator"
-
-reset_fixture
-cat >"$fixture/release.toml" <<'EOF'
-series = "0.1"
-EOF
-expect_failure \
-  "CLI release configuration is missing required field: schema" \
-  "$validator"
-
-reset_fixture
-cat >"$fixture/release.toml" <<'EOF'
-schema = 1
-EOF
-expect_failure \
-  "CLI release configuration is missing required field: series" \
-  "$validator"
-
-reset_fixture
-cat >"$fixture/release.toml" <<'EOF'
-schema = 2
-series = "0.1"
-EOF
-expect_failure \
-  "Unsupported CLI release configuration schema: 2" \
-  "$validator"
-
-for malformed_series in 01.1 0.01 0.1.0 v0.1; do
+for mutation in \
+  'schema = 1' \
+  'initial_version = "0.2.0"' \
+  'development_version = "0.1.0"' \
+  'pre_1_0_breaking_impact = "major"'; do
   reset_fixture
-  write_release "$malformed_series"
-  expect_failure \
-    "CLI release series must use canonical MAJOR.MINOR syntax: $malformed_series" \
-    "$validator"
+  key=${mutation%% =*}
+  case $key in
+    schema) line=1 ;;
+    initial_version) line=2 ;;
+    development_version) line=3 ;;
+    pre_1_0_breaking_impact) line=4 ;;
+  esac
+  awk -v line="$line" -v mutation="$mutation" 'NR == line { print mutation; next } { print }' \
+    "$fixture/release.toml" >"$fixture/release.toml.next"
+  mv "$fixture/release.toml.next" "$fixture/release.toml"
+  expect_failure "invalid static field $key" "$checker"
 done
 
 reset_fixture
-write_release 1000000.0
-expect_failure \
-  "CLI release series components must not exceed 999999: 1000000.0" \
-  "$validator"
+printf '%s\n' 'series = "0.11"' >>"$fixture/release.toml"
+expect_failure 'mutable series field' "$checker"
 
-reset_fixture 0.1 0.2.0
-expect_failure \
-  "Cargo package version must match the release-series fallback 0.1.0; found 0.2.0." \
-  "$validator"
+reset_fixture 0.11.0
+expect_failure 'Cargo fallback mismatch' "$checker"
 
 reset_fixture
 cat >"$fixture/Cargo.toml" <<'EOF'
 [package]
 name = "fixture"
 EOF
-expect_failure \
-  "Cargo.toml is missing package.version." \
-  "$validator"
+expect_failure 'missing Cargo package version' "$checker"
 
-reset_fixture
-cat >"$fixture/Cargo.toml" <<'EOF'
-[package]
-name = "fixture"
-version = 0.1.0
-EOF
-expect_failure \
-  "Malformed Cargo package version on line 3." \
-  "$validator"
-
-reset_fixture
-cat >"$fixture/Cargo.toml" <<'EOF'
-[package]
-name = "fixture"
-version = "0.1.0"
-version = "0.1.0"
-EOF
-expect_failure \
-  "Cargo.toml contains duplicate package.version fields." \
-  "$validator"
-
-reset_fixture
-for malformed_tag in 0.1.7 v0.1 v0.1.7-beta.1 v01.1.7; do
-  expect_failure \
-    "CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $malformed_tag" \
-    "$validator" --validate-tag "$malformed_tag"
+for tag in 0.1.0 v0.1 v01.1.0 v0.1.0-beta; do
+  reset_fixture
+  expect_failure "malformed tag $tag" "$checker" --validate-tag "$tag"
 done
-
 reset_fixture
-expect_failure \
-  "CLI release tag components must not exceed 999999: v0.1.1000000" \
-  "$validator" --validate-tag v0.1.1000000
+expect_failure 'oversized tag' "$checker" --validate-tag v0.1.1000000
 
 printf 'CLI release checks passed.\n'

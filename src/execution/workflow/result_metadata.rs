@@ -8,6 +8,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::MAXIMUM_PARALLEL_STEPS;
 use super::publication::{
     DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1, StepReasonV1,
     WorkflowOutcomeV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
@@ -17,12 +18,19 @@ use super::schema_common::{
     utc_timestamp,
 };
 
-pub(crate) const MAXIMUM_RESULT_JSON_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_PARALLEL_STEPS: usize = 256;
 const MAXIMUM_STEPS: usize = 256;
 const MAXIMUM_EXPORTS: usize = 4_096;
 const MAXIMUM_CARRIERS: usize = 2_048;
-const MAXIMUM_RETAINED_BYTES_PER_STREAM: u64 = 65_536;
+const MAXIMUM_RESULT_STRUCTURE_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES: u64 = MAXIMUM_EXPORTS as u64 * 128 * 12;
+pub(super) const MAXIMUM_RESULT_NON_STREAM_JSON_BYTES: u64 =
+    MAXIMUM_RESULT_STRUCTURE_JSON_BYTES + MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES;
+// Durable capture reserves the live run byte budget independently for stdout and
+// stderr. Base64 expands their aggregate and may add one padded quartet per stream.
+pub(super) const MAXIMUM_ENCODED_RETAINED_STREAM_BYTES: u64 =
+    super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN.div_ceil(3) * 4 + 2 * MAXIMUM_STEPS as u64 * 4;
+pub(crate) const MAXIMUM_RESULT_JSON_BYTES: u64 =
+    MAXIMUM_ENCODED_RETAINED_STREAM_BYTES + MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
 const SHA256_ALGORITHM: &str = "sha256";
 const BASE64_ENCODING: &str = "base64";
 
@@ -90,7 +98,7 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
         || result
             .command_output_policy
             .maximum_retained_bytes_per_stream
-            != MAXIMUM_RETAINED_BYTES_PER_STREAM
+            != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         || result.steps.is_empty()
         || result.steps.len() > MAXIMUM_STEPS
         || result.exports.len() > MAXIMUM_EXPORTS
@@ -167,6 +175,7 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
 }
 
 fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
+    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(steps.len());
     let mut ids = BTreeSet::new();
     for step in steps {
         if !is_identifier(&step.id)
@@ -240,7 +249,8 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
             || !timing_valid
             || !output_valid
             || step.command_output.as_ref().is_some_and(|output| {
-                !valid_stream(&output.stdout) || !valid_stream(&output.stderr)
+                !valid_stream(&output.stdout, maximum_stream_bytes)
+                    || !valid_stream(&output.stderr, maximum_stream_bytes)
             })
         {
             return Err(ResultMetadataError);
@@ -328,6 +338,7 @@ pub(crate) fn is_output_failure_code(code: FailureCodeV1) -> bool {
             | FailureCodeV1::GitRequiredObjectsUnavailable
             | FailureCodeV1::GitSourceAuthorityChanged
             | FailureCodeV1::GitStructureLimitExceeded
+            | FailureCodeV1::GitCommandTimedOut
             | FailureCodeV1::GitBundleGenerationFailed
             | FailureCodeV1::GitBundleProfileInvalid
             | FailureCodeV1::GitBundleVerificationFailed
@@ -390,6 +401,7 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::GitRequiredObjectsUnavailable
         | FailureCodeV1::GitSourceAuthorityChanged
         | FailureCodeV1::GitStructureLimitExceeded
+        | FailureCodeV1::GitCommandTimedOut
         | FailureCodeV1::GitBundleGenerationFailed
         | FailureCodeV1::GitBundleProfileInvalid
         | FailureCodeV1::GitBundleVerificationFailed
@@ -429,12 +441,11 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
     }
 }
 
-fn valid_stream(stream: &DiagnosticStreamV1) -> bool {
+fn valid_stream(stream: &DiagnosticStreamV1, maximum_stream_bytes: u64) -> bool {
     if stream.encoding != BASE64_ENCODING
-        || stream.retained_bytes > MAXIMUM_RETAINED_BYTES_PER_STREAM
+        || stream.retained_bytes > maximum_stream_bytes
         || stream.truncated != (stream.discarded_bytes != 0)
-        || (stream.discarded_bytes != 0
-            && stream.retained_bytes != MAXIMUM_RETAINED_BYTES_PER_STREAM)
+        || (stream.discarded_bytes != 0 && stream.retained_bytes != maximum_stream_bytes)
     {
         return false;
     }

@@ -1,16 +1,18 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
-use crate::execution::workflow::rejection::RejectionDiagnostic as Diagnostic;
+use crate::execution::workflow::rejection::{
+    RejectionDiagnostic as Diagnostic, human_resolution_remedy,
+};
 use crate::execution::workflow::resolution::{
     ResolutionFailure, ResolvedWorkflow, resolve_workflow_file,
 };
+use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Validate a local Workflow V1 bundle without executing it";
+pub(super) const ABOUT: &str = "Validate a local workflow definition";
 const COMMAND_NAME: &str = "scherzo-cloud workflow validate";
 
 #[derive(Debug, Args)]
@@ -18,12 +20,12 @@ pub(super) struct Command {
     #[command(flatten)]
     source: super::LocalWorkflowSource,
 
-    #[arg(long, help = "Print the schema-version-1 validation result as JSON")]
+    #[arg(long, help = "Print the validation result as JSON")]
     json: bool,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
             Ok(workflow) => {
                 let result = if self.json {
@@ -31,7 +33,7 @@ impl Command {
                 } else {
                     write_human_valid(&workflow)
                 };
-                finish_output(result, ExitCode::SUCCESS)
+                finish_output(result, ExitCode::Success)
             }
             Err(failure) => {
                 let result = if self.json {
@@ -39,55 +41,50 @@ impl Command {
                 } else {
                     write_human_invalid(&failure)
                 };
-                finish_output(result, ExitCode::FAILURE)
+                finish_output(result, ExitCode::GeneralFailure)
             }
         }
     }
 }
 
-fn finish_output(result: Result<(), OutputError>, exit_code: ExitCode) -> ExitCode {
-    match result {
-        Ok(()) => exit_code,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            ExitCode::FAILURE
-        }
-    }
+fn finish_output(result: anyhow::Result<()>, exit_code: ExitCode) -> super::super::CommandResult {
+    result.context("write workflow validation result")?;
+    Ok(exit_code)
 }
 
-fn write_human_valid(workflow: &ResolvedWorkflow) -> Result<(), OutputError> {
+fn write_human_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    writeln!(stdout, "✓ Workflow V1 definition is valid.")?;
-    writeln!(stdout, "Workflow: {}", workflow.source.workflow_path)?;
+    writeln!(stdout, "✓ Workflow definition is valid.")?;
+    writeln!(stdout, "workflow: {}", workflow.source.workflow_path)?;
     writeln!(
         stdout,
-        "Digest: {}:{}",
+        "digest: {}:{}",
         workflow.content_digest.algorithm.as_str(),
         workflow.content_digest.value
     )?;
-    writeln!(stdout, "Steps: {}", workflow.definition.steps.len())?;
+    writeln!(stdout, "steps: {}", workflow.definition.steps.len())?;
     writeln!(
         stdout,
-        "Required optional imports: {}",
+        "optional imports: {}",
         human_required_imports(workflow)
     )?;
-    writeln!(stdout, "No workflow steps were executed.")?;
     Ok(())
 }
 
-fn write_human_invalid(failure: &ResolutionFailure) -> Result<(), OutputError> {
+fn write_human_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
     let diagnostic = Diagnostic::from_resolution(failure);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    writeln!(stdout, "✗ Workflow V1 definition is invalid.")?;
+    writeln!(stdout, "✗ Workflow definition is invalid.")?;
     if let Some(workflow_path) = failure.workflow_path() {
-        writeln!(stdout, "Workflow: {workflow_path}")?;
+        writeln!(stdout, "workflow: {workflow_path}")?;
     }
-    writeln!(stdout, "Code: {}", diagnostic.code)?;
-    writeln!(stdout, "Location: {}", diagnostic.location)?;
-    writeln!(stdout, "{}", diagnostic.message)?;
+    writeln!(stdout, "code: {}", diagnostic.code)?;
+    writeln!(stdout, "location: {}", diagnostic.location)?;
     writeln!(stdout, "No workflow steps were executed.")?;
+    writeln!(stdout)?;
+    writeln!(stdout, "{}", human_resolution_remedy(failure))?;
     Ok(())
 }
 
@@ -99,7 +96,7 @@ fn human_required_imports(workflow: &ResolvedWorkflow) -> &'static str {
     }
 }
 
-fn write_json_valid(workflow: &ResolvedWorkflow) -> Result<(), OutputError> {
+fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     let required_imports = if workflow.required_imports().prompt {
         vec!["prompt"]
     } else {
@@ -123,7 +120,7 @@ fn write_json_valid(workflow: &ResolvedWorkflow) -> Result<(), OutputError> {
     write_json(&report)
 }
 
-fn write_json_invalid(failure: &ResolutionFailure) -> Result<(), OutputError> {
+fn write_json_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
     let report = JsonReport {
         schema_version: 1,
         command: COMMAND_NAME,
@@ -137,8 +134,8 @@ fn write_json_invalid(failure: &ResolutionFailure) -> Result<(), OutputError> {
     write_json(&report)
 }
 
-fn write_json(report: &JsonReport<'_>) -> Result<(), OutputError> {
-    super::super::write_pretty_json(report).map_err(OutputError::WriteOutput)
+fn write_json(report: &JsonReport<'_>) -> anyhow::Result<()> {
+    super::super::write_pretty_json(report).context("write workflow validation result")
 }
 
 #[derive(Serialize)]
@@ -176,25 +173,4 @@ struct WorkflowIdentity<'a> {
 struct JsonDigest<'a> {
     algorithm: &'static str,
     value: &'a str,
-}
-
-#[derive(Debug)]
-enum OutputError {
-    WriteOutput(io::Error),
-}
-
-impl From<io::Error> for OutputError {
-    fn from(error: io::Error) -> Self {
-        Self::WriteOutput(error)
-    }
-}
-
-impl fmt::Display for OutputError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WriteOutput(error) => {
-                write!(formatter, "write workflow validation result: {error}")
-            }
-        }
-    }
 }

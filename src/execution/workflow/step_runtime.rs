@@ -15,15 +15,17 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot};
+use super::agent::dispatch::{AgentInvocationDispatcher, invoke_agent_dispatcher};
 use super::agent::{
-    AgentAdapter, AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope,
-    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentStartReceiveError,
-    AgentTerminalReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
-    agent_terminal_channel, invoke_agent_adapter,
+    AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope, AgentObservationSink,
+    AgentOutcome, AgentProcessControl, AgentStartReceiveError, AgentTerminalReceiveError,
+    CompletedAgentInvocation, WorkflowRunId, agent_start_channel, agent_terminal_channel,
 };
+use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
     AgentInputMaterializationError, AgentInputStaging, AgentInputStagingLease,
-    AgentInputStartFailure, MaterializedAgentInvocation, materialize_agent_invocation,
+    AgentInputStartFailure, ClosedAgentInvocation, MaterializedAgentInvocation,
+    materialize_agent_invocation,
 };
 #[cfg(test)]
 use super::artifact::CaptureBoundaryObserver;
@@ -46,8 +48,6 @@ use super::execution_root::{
 use super::git_capture::{GitAwareCaptureDeclaration, GitCaptureFailure};
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
 use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionObserver};
-use super::pi::PiConfig;
-use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::process_group::{
     AuthenticatedProcessGroup, ProcessGuardRegistration, ProcessGuardRegistry,
     capture_process_group_identity, interrupt_authenticated_process_group,
@@ -185,22 +185,15 @@ impl PartialEq for ProvisionalStepOutputs {
 impl Eq for ProvisionalStepOutputs {}
 
 #[derive(Clone, Copy)]
-pub(crate) struct NoAgentAdapter;
+pub(crate) struct NoAgentDispatcher;
 
-impl<Sink> AgentAdapter<Sink> for NoAgentAdapter
+impl<Sink> AgentInvocationDispatcher<Sink> for NoAgentDispatcher
 where
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = PiConfig;
-    type ProtocolLimits = PiJsonV1ProtocolLimits;
-
     async fn invoke(
         &self,
-        _invocation: super::agent::AgentInvocation<
-            Self::NativeConfiguration,
-            Self::ProtocolLimits,
-            Sink,
-        >,
+        _invocation: ClosedAgentInvocation<Sink>,
         _started: super::agent::AgentStartCallback,
         terminal: super::agent::AgentTerminalCallback,
     ) {
@@ -211,31 +204,34 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) enum AgentExecution<Adapter> {
+pub(crate) enum AgentExecution<Dispatcher> {
     Disabled,
     Enabled {
         run: WorkflowRunId,
         staging: AgentInputStaging,
-        adapter: Adapter,
+        diagnostic_sessions: AgentDiagnosticSessionStore,
+        dispatcher: Dispatcher,
     },
 }
 
-impl AgentExecution<NoAgentAdapter> {
+impl AgentExecution<NoAgentDispatcher> {
     pub(crate) fn disabled() -> Self {
         Self::Disabled
     }
 }
 
-impl<Adapter> AgentExecution<Adapter> {
+impl<Dispatcher> AgentExecution<Dispatcher> {
     pub(crate) fn enabled(
         run: WorkflowRunId,
         staging: AgentInputStaging,
-        adapter: Adapter,
+        diagnostic_sessions: AgentDiagnosticSessionStore,
+        dispatcher: Dispatcher,
     ) -> Self {
         Self::Enabled {
             run,
             staging,
-            adapter,
+            diagnostic_sessions,
+            dispatcher,
         }
     }
 }
@@ -268,27 +264,19 @@ where
     }
 }
 
-pub(crate) trait WorkflowAgentAdapter<Deadline, Observer>:
-    AgentAdapter<
-        AgentExecutionObservationSink<Deadline, Observer>,
-        NativeConfiguration = PiConfig,
-        ProtocolLimits = PiJsonV1ProtocolLimits,
-    >
+pub(crate) trait WorkflowAgentDispatcher<Deadline, Observer>:
+    AgentInvocationDispatcher<AgentExecutionObservationSink<Deadline, Observer>>
 where
     Deadline: Send + Sync + 'static,
     Observer: ExecutionObserver<Deadline>,
 {
 }
 
-impl<Deadline, Observer, Adapter> WorkflowAgentAdapter<Deadline, Observer> for Adapter
+impl<Deadline, Observer, Dispatcher> WorkflowAgentDispatcher<Deadline, Observer> for Dispatcher
 where
     Deadline: Send + Sync + 'static,
     Observer: ExecutionObserver<Deadline>,
-    Adapter: AgentAdapter<
-            AgentExecutionObservationSink<Deadline, Observer>,
-            NativeConfiguration = PiConfig,
-            ProtocolLimits = PiJsonV1ProtocolLimits,
-        >,
+    Dispatcher: AgentInvocationDispatcher<AgentExecutionObservationSink<Deadline, Observer>>,
 {
 }
 
@@ -334,18 +322,21 @@ impl OwnedTasks {
 }
 
 #[derive(Clone)]
-pub(crate) struct StepRuntime<Clock, Observer = NoopExecutionObserver, Adapter = NoAgentAdapter>
-where
+pub(crate) struct StepRuntime<
+    Clock,
+    Observer = NoopExecutionObserver,
+    Dispatcher = NoAgentDispatcher,
+> where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: Clone,
+    Dispatcher: Clone,
 {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
     diagnostics: StepDiagnosticLog,
     occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     inputs: InputStaging,
-    agents: AgentExecution<Adapter>,
+    agents: AgentExecution<Dispatcher>,
     clock: Clock,
     observer: Observer,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
@@ -424,12 +415,12 @@ where
     }
 }
 
-impl<Clock, Observer, Adapter> StepRuntime<Clock, Observer, Adapter>
+impl<Clock, Observer, Dispatcher> StepRuntime<Clock, Observer, Dispatcher>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
     #[expect(
         clippy::too_many_arguments,
@@ -443,7 +434,7 @@ where
         occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
         clock: Clock,
         observer: Observer,
-        agents: AgentExecution<Adapter>,
+        agents: AgentExecution<Dispatcher>,
         process_guards: ProcessGuardRegistry,
     ) -> Self {
         let capture_work = Arc::new(Mutex::new(CaptureWorkRegistry::new()));
@@ -738,8 +729,8 @@ where
         let (invocation, staging) = materialized.into_parts();
         let (started_callback, started) = agent_start_channel();
         let (terminal, outcome) = agent_terminal_channel(invocation.value_mode());
-        let adapter = match &self.agents {
-            AgentExecution::Enabled { adapter, .. } => adapter.clone(),
+        let dispatcher = match &self.agents {
+            AgentExecution::Enabled { dispatcher, .. } => dispatcher.clone(),
             AgentExecution::Disabled => {
                 drop(staging);
                 return self
@@ -752,7 +743,7 @@ where
             }
         };
         let mut invocation_task = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started_callback, terminal).await;
+            invoke_agent_dispatcher(&dispatcher, invocation, started_callback, terminal).await;
         });
         let started = started.receive();
         tokio::pin!(started);
@@ -1135,7 +1126,13 @@ where
                 PreparedStepBody::Command(prepared)
             }
             StepBody::Agent(agent) => {
-                let AgentExecution::Enabled { run, staging, .. } = &self.agents else {
+                let AgentExecution::Enabled {
+                    run,
+                    staging,
+                    diagnostic_sessions,
+                    ..
+                } = &self.agents
+                else {
                     return Err(StepStartFailure::AgentRuntimeUnavailable);
                 };
                 let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
@@ -1144,6 +1141,7 @@ where
                     &self.admitted,
                     &self.artifacts,
                     staging,
+                    diagnostic_sessions,
                     identity,
                     &upstream,
                     self.admitted.execution().cancellation().source().clone(),
@@ -2056,15 +2054,15 @@ fn lock_registry<Registry>(registry: &Mutex<Registry>) -> MutexGuard<'_, Registr
     }
 }
 
-impl<Clock, Observer, Adapter>
+impl<Clock, Observer, Dispatcher>
     ActionPort<
         RequestedAction<ProvisionalStepOutputs, StepFailureCause, CapturedValue, Clock::Instant>,
-    > for StepRuntime<Clock, Observer, Adapter>
+    > for StepRuntime<Clock, Observer, Dispatcher>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
     fn release(
         &mut self,
@@ -2201,7 +2199,7 @@ where
     clippy::too_many_arguments,
     reason = "the shared operation receives each adapter-owned resource explicitly"
 )]
-pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Adapter>(
+pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Dispatcher>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     inputs: &InputStaging,
@@ -2209,7 +2207,7 @@ pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Adapter>
     clock: Clock,
     commits: Commits,
     observer: Observer,
-    agents: AgentExecution<Adapter>,
+    agents: AgentExecution<Dispatcher>,
     process_guards: ProcessGuardRegistry,
 ) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
 where
@@ -2217,7 +2215,7 @@ where
     Clock::Instant: Sync,
     Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);

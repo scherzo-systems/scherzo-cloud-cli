@@ -84,12 +84,22 @@ steps:
 fn model(
     workflow: &ResolvedWorkflow,
     clock: ControlledClock,
+) -> WorkflowRunViewModel<ControlledClock> {
+    let opened_at = clock.sample();
+    let timing = RunTimingObservation::new(opened_at);
+    timing.mark_execution_started(opened_at);
+    WorkflowRunViewModel::new(workflow, 2, timing, clock)
+}
+
+fn model_with_capacity(
+    workflow: &ResolvedWorkflow,
+    clock: ControlledClock,
     capacity: StepLogCapacity,
 ) -> WorkflowRunViewModel<ControlledClock> {
     let opened_at = clock.sample();
     let timing = RunTimingObservation::new(opened_at);
     timing.mark_execution_started(opened_at);
-    WorkflowRunViewModel::new(workflow, 2, timing, clock, capacity)
+    WorkflowRunViewModel::with_log_capacity(workflow, 2, timing, clock, capacity)
 }
 
 fn step_transition(
@@ -155,6 +165,37 @@ fn step<'a>(snapshot: &'a WorkflowRunViewSnapshot, id: &str) -> &'a WorkflowRunS
     snapshot.steps.iter().find(|step| step.id == id).unwrap()
 }
 
+fn maximum_record(index: usize) -> Arc<[u8]> {
+    let label = format!("record-{index:03}");
+    let mut bytes = vec![b'x'; MAX_NORMALIZED_CHILD_RECORD_BYTES];
+    bytes[..label.len()].copy_from_slice(label.as_bytes());
+    Arc::from(bytes)
+}
+
+#[test]
+fn default_log_capacity_partitions_run_budgets_by_step_count() {
+    for (step_count, expected_records, expected_bytes) in [
+        (1, 4_096, 4 * 1024 * 1024),
+        (16, 4_096, 4 * 1024 * 1024),
+        (17, 4_096, 3_947_580),
+        (64, 4_096, 1024 * 1024),
+        (256, 1024, 256 * 1024),
+    ] {
+        let capacity = StepLogCapacity::for_step_count(step_count);
+        assert_eq!(capacity.maximum_records(), expected_records);
+        assert_eq!(capacity.maximum_bytes(), expected_bytes);
+    }
+
+    for step_count in 1..=256 {
+        let capacity = StepLogCapacity::for_step_count(step_count);
+        assert!(capacity.maximum_records() * step_count <= RUN_LOG_RECORD_BUDGET);
+        assert!(
+            u64::try_from(capacity.maximum_bytes()).unwrap() * u64::try_from(step_count).unwrap()
+                <= super::super::RUN_LOG_BYTE_BUDGET
+        );
+    }
+}
+
 #[test]
 fn execution_duration_excludes_time_spent_opening_the_view() {
     let (_temporary, workflow) = resolved_workflow();
@@ -162,13 +203,7 @@ fn execution_duration_excludes_time_spent_opening_the_view() {
     let opened_at = point(base, 0);
     let clock = ControlledClock::new(opened_at);
     let timing = RunTimingObservation::new(opened_at);
-    let view = WorkflowRunViewModel::new(
-        &workflow,
-        2,
-        timing.clone(),
-        clock.clone(),
-        StepLogCapacity::default(),
-    );
+    let view = WorkflowRunViewModel::new(&workflow, 2, timing.clone(), clock.clone());
 
     clock.set(point(base, 500));
     let opening = view.snapshot();
@@ -189,7 +224,7 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
-    let view = model(&workflow, clock.clone(), StepLogCapacity::default());
+    let view = model(&workflow, clock.clone());
     let changes = view.subscribe();
 
     clock.set(point(base, 10));
@@ -317,7 +352,7 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let capacity = StepLogCapacity::new(2, MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap();
-    let view = model(&workflow, clock.clone(), capacity);
+    let view = model_with_capacity(&workflow, clock.clone(), capacity);
 
     let mut long_line = vec![b'x'; MAX_NORMALIZED_CHILD_RECORD_BYTES + 3];
     long_line.push(b'\n');
@@ -383,12 +418,77 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     assert_eq!(consume.records[0].payload.as_ref(), "other");
 }
 
+#[tokio::test]
+async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suffix() {
+    let (_temporary, workflow) = resolved_workflow();
+    let base = crate::timing::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock);
+
+    view.observe(output(
+        "consume",
+        CommandOutputSource::StandardOutput,
+        SourceSequence::first(),
+        Arc::<[u8]>::from(b"isolated\n".as_slice()),
+    ))
+    .await;
+
+    let mut sequence = SourceSequence::first();
+    for index in 0..17 {
+        view.observe(output(
+            "prepare",
+            CommandOutputSource::StandardOutput,
+            sequence,
+            maximum_record(index),
+        ))
+        .await;
+        sequence = sequence.next();
+    }
+
+    let consume_before = {
+        let snapshot = view.snapshot();
+        let prepare = &step(&snapshot, "prepare").log;
+        assert_eq!(prepare.observed_records, 17);
+        assert_eq!(prepare.retained_records, 17);
+        assert!(prepare.retained_bytes > 256 * 1024);
+        assert_eq!(prepare.discarded_records, 0);
+        assert_eq!(prepare.discarded_bytes, 0);
+        assert!(prepare.records[0].payload.starts_with("record-000"));
+        step(&snapshot, "consume").log.clone()
+    };
+
+    for index in 17..257 {
+        view.observe(output(
+            "prepare",
+            CommandOutputSource::StandardOutput,
+            sequence,
+            maximum_record(index),
+        ))
+        .await;
+        sequence = sequence.next();
+    }
+
+    let snapshot = view.snapshot();
+    let prepare = &step(&snapshot, "prepare").log;
+    assert_eq!(prepare.observed_records, 257);
+    assert_eq!(prepare.retained_records, 256);
+    assert_eq!(prepare.retained_bytes, 4 * 1024 * 1024);
+    assert_eq!(prepare.discarded_records, 1);
+    assert_eq!(
+        prepare.discarded_bytes,
+        u64::try_from(MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap()
+    );
+    assert!(prepare.records[0].payload.starts_with("record-001"));
+    assert!(prepare.records[255].payload.starts_with("record-256"));
+    assert_eq!(&step(&snapshot, "consume").log, &consume_before);
+}
+
 #[test]
 fn lifecycle_completion_requires_matching_started_phase() {
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
-    let view = model(&workflow, clock, StepLogCapacity::default());
+    let view = model(&workflow, clock);
 
     view.reconcile_terminal_result(&succeeded_run_result(&workflow, base))
         .unwrap();
@@ -412,7 +512,7 @@ fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
-    let view = model(&workflow, clock, StepLogCapacity::default());
+    let view = model(&workflow, clock);
 
     view.reconcile_terminal_result(&succeeded_run_result(&workflow, base))
         .unwrap();
@@ -446,7 +546,7 @@ async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
-    let view = model(&workflow, clock.clone(), StepLogCapacity::default());
+    let view = model(&workflow, clock.clone());
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
         CommandExecutionFailure::UnsuccessfulExit { code: Some(17) },
     ));

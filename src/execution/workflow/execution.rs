@@ -16,7 +16,7 @@ use super::runtime::{
     ExportSet, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
 use super::step_runtime::{
-    AgentExecution, StepFailureCause, WorkflowAgentAdapter, WorkflowCommitPort,
+    AgentExecution, StepFailureCause, WorkflowAgentDispatcher, WorkflowCommitPort,
     execute_workflow_observed,
 };
 use super::value::CapturedValue;
@@ -121,12 +121,12 @@ fn observed_step_transition<Deadline>(
     clippy::too_many_arguments,
     reason = "the local adapter additionally supplies durable process-guard registration"
 )]
-pub(crate) async fn execute_workflow<Clock, Commits, Observer, Adapter>(
+pub(crate) async fn execute_workflow<Clock, Commits, Observer, Dispatcher>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     inputs: &InputStaging,
     diagnostics: &StepDiagnosticLog,
-    agents: AgentExecution<Adapter>,
+    agents: AgentExecution<Dispatcher>,
     clock: Clock,
     commits: Commits,
     observer: Observer,
@@ -140,7 +140,7 @@ where
     Clock::Instant: Sync,
     Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
     // jscpd:ignore-end
 {
     let provenance = admitted.workflow().source.clone();

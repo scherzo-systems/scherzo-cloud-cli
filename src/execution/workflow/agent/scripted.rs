@@ -3,14 +3,14 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use super::dispatch::AgentInvocationDispatcher;
 use super::{
-    AgentAdapter, AgentFailureCause, AgentInvocation, AgentInvocationIdentity, AgentObservation,
+    AgentCompatibilityProfile, AgentFailureCause, AgentInvocationIdentity, AgentObservation,
     AgentObservationEmissionError, AgentObservationSink, AgentOutcome, AgentStartCallback,
     AgentStartReportError, AgentTerminalCallback, AgentTerminalReportError, AgentValueKind,
     BoundedAgentResponse, BoundedSchemaValidAgentResult, CompletedAgentInvocation,
 };
-use crate::execution::workflow::pi::PiConfig;
-use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
+use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScriptedAgentValue {
@@ -30,6 +30,7 @@ impl ScriptedAgentValue {
 #[derive(Clone, Debug)]
 pub(crate) struct ScriptedInvocationStarted {
     identity: AgentInvocationIdentity,
+    profile: AgentCompatibilityProfile,
     message: Arc<str>,
     attachments: Arc<[super::StagedAgentAttachment]>,
     value_kind: AgentValueKind,
@@ -39,6 +40,10 @@ pub(crate) struct ScriptedInvocationStarted {
 impl ScriptedInvocationStarted {
     pub(crate) fn identity(&self) -> &AgentInvocationIdentity {
         &self.identity
+    }
+
+    pub(crate) fn profile(&self) -> AgentCompatibilityProfile {
+        self.profile
     }
 
     pub(crate) fn message(&self) -> &str {
@@ -282,16 +287,13 @@ async fn receive_acknowledgement(
         .map_err(|_| ScriptedAgentError::AdapterStopped)?
 }
 
-impl<Sink> AgentAdapter<Sink> for ScriptedAgentAdapter
+impl<Sink> AgentInvocationDispatcher<Sink> for ScriptedAgentAdapter
 where
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = PiConfig;
-    type ProtocolLimits = PiJsonV1ProtocolLimits;
-
     async fn invoke(
         &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
+        invocation: ClosedAgentInvocation<Sink>,
         started: AgentStartCallback,
         terminal: AgentTerminalCallback,
     ) {
@@ -305,6 +307,7 @@ where
             .started
             .send(ScriptedInvocationStarted {
                 identity: invocation.identity().clone(),
+                profile: invocation.profile(),
                 message: Arc::from(invocation.prompt().message()),
                 attachments: Arc::from(invocation.attachments()),
                 value_kind: invocation.value_mode().kind(),
@@ -427,7 +430,7 @@ where
 }
 
 fn propose_value<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    invocation: &ClosedAgentInvocation<Sink>,
     provisional: &mut Option<CompletedAgentInvocation>,
     value: ScriptedAgentValue,
 ) -> Result<(), ScriptedAgentError>
@@ -447,7 +450,7 @@ where
     let completed = match value {
         ScriptedAgentValue::Response(value) => {
             if u64::try_from(value.len()).map_or(true, |bytes| {
-                bytes > invocation.limits().maximum_response_bytes().get()
+                bytes > invocation.maximum_response_bytes().get()
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
@@ -457,7 +460,7 @@ where
             let bytes = serde_json::to_vec(value.as_ref())
                 .map_err(|_| ScriptedAgentError::WrongValueMode)?;
             if u64::try_from(bytes.len()).map_or(true, |bytes| {
-                bytes > invocation.limits().maximum_result_bytes().get()
+                bytes > invocation.maximum_result_bytes().get()
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
@@ -472,7 +475,7 @@ where
 }
 
 fn completed_outcome<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    invocation: &ClosedAgentInvocation<Sink>,
     provisional: Option<CompletedAgentInvocation>,
 ) -> AgentOutcome
 where
@@ -498,9 +501,7 @@ where
     }
 }
 
-fn cancellation_outcome<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-) -> Option<AgentOutcome>
+fn cancellation_outcome<Sink>(invocation: &ClosedAgentInvocation<Sink>) -> Option<AgentOutcome>
 where
     Sink: AgentObservationSink,
 {

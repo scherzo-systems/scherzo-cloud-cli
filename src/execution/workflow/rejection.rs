@@ -1,9 +1,11 @@
 use std::fmt;
+use std::os::unix::ffi::OsStrExt as _;
 
 use serde::Serialize;
 
 use super::DecodeFailureKind;
 use super::admission::{AdmissionFailure, AdmissionFailureKind, AdmissionLocation};
+use super::presentation_feed::normalize_terminal_scalar;
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolutionLocation};
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use crate::execution::pi::{PiIncompatibility, PiInstallationFailure, PiProbe};
@@ -197,6 +199,23 @@ impl fmt::Display for RejectionLocation<'_> {
     }
 }
 
+pub(crate) fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
+    let default = resolution_classification(failure.kind()).1;
+    let Some(source_path) = failure.source_path() else {
+        return default.to_owned();
+    };
+    let source_path = normalize_terminal_scalar(source_path.as_os_str().as_bytes());
+    match failure.kind() {
+        ResolutionFailureKind::SourceUnavailable => {
+            format!("Add or make readable the required workflow source file:\n  {source_path}")
+        }
+        ResolutionFailureKind::SourceNotRegularFile => {
+            format!("Replace the workflow source with a regular file:\n  {source_path}")
+        }
+        _ => default.to_owned(),
+    }
+}
+
 fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'static str) {
     match kind {
         ResolutionFailureKind::SourceRootUnavailable => (
@@ -276,7 +295,7 @@ fn decode_classification(kind: DecodeFailureKind) -> (&'static str, &'static str
         ),
         DecodeFailureKind::StructuralContract => (
             "invalid_workflow_structure",
-            "Correct the workflow fields and values to match the closed Workflow V1 contract.",
+            "Correct the workflow fields and values to match the workflow contract.",
         ),
     }
 }
@@ -309,7 +328,7 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::UnknownImport => (
             "unknown_import",
-            "Use a Workflow V1 import name or correct the value reference.",
+            "Use a workflow import name or correct the value reference.",
         ),
         ValidationFailureKind::UnknownOutputStep => (
             "unknown_output_step",
@@ -437,7 +456,7 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         | AdmissionFailureKind::NonPositiveTotalInputBytes
         | AdmissionFailureKind::NonPositiveLiveInputBytes
         | AdmissionFailureKind::NonPositiveStepLogBytes
-        | AdmissionFailureKind::NonPositiveCancellationGrace
+        | AdmissionFailureKind::CancellationGraceTooShort
         | AdmissionFailureKind::CancellationGraceTooLong => None,
     }
 }

@@ -1,0 +1,13 @@
+```console
+$ scherzo-cloud runner doctor --help
+Check local runner prerequisites
+
+Usage: scherzo-cloud runner doctor [OPTIONS]
+
+Options:
+      --check <ID>   Run only the named check
+      --list-checks  List registered checks without running them
+      --json         Print the report as JSON
+  -h, --help         Print help
+
+```

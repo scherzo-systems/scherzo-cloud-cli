@@ -116,9 +116,19 @@ First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable stat
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and import bytes, durable closed run and attempt
 state, and attempt 1's atomic result beneath
-`attempts/000001/result`. The run-directory path is the local run handle. Add `--json`
-for one terminal schema-version-1 object on stdout while the live presentation remains
-on stderr, or `--plain` to force the line presentation on stdout.
+`attempts/000001/result`. Every PiJsonV1 invocation also receives a fresh native session
+directory beneath `attempts/<attempt>/diagnostics/pi-json-v1/`; it remains after normal
+private-staging cleanup together with metadata identifying the attempt, step, invocation,
+profile, and exact Pi version. The run-directory path is the local run handle. Add
+`--json` for one terminal schema-version-1 object on stdout while the live presentation
+remains on stderr, or `--plain` to force the line presentation on stdout.
+
+Retained native sessions can contain sensitive prompts, model output, tool activity,
+paths, and extension or provider state. They may be incomplete or malformed after a
+failure or forced stop and are diagnostic only: workflow status, results, retry, and
+recovery never read them as authority. They are owner-private on Unix, are not included
+in published attempt results, have no stable viewer or download interface, and disappear
+when the owning run directory is removed.
 
 Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
 `--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
@@ -361,8 +371,8 @@ the captured inherited `PATH`, fresh temporary Pi state and working-directory pa
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
 canonical stable versions in the range `>=0.83.0 <0.84.0` with the JSON event,
-ephemeral-session, extension, system-prompt append, and invocation-scoped `--approve`
-capabilities required by `PiJsonV1`. It retains the exact observed release, never falls
+custom-session-directory, extension, system-prompt append, and invocation-scoped
+`--approve` capabilities required by `PiJsonV1`. It retains the exact observed release, never falls
 through to another candidate after selection, and does not inspect model metadata or
 credentials, execute the caller's project, or read or write saved Pi project-trust
 decisions. Missing, unexecutable, malformed, unsupported-version, and missing-capability
@@ -489,27 +499,31 @@ no Scherzo-owned endpoint, ingestion credential, Honeycomb behavior, or collecto
 requirement. Human and JSON output contracts for help, version, authentication, account,
 and `runner doctor` remain unchanged and do not initialize runner telemetry.
 
-## Release series
+## Release policy
 
-`release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.11`. Planning takes the highest fragment impact since the latest stable tag:
-`internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
-and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
-fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact
-planned version.
+`release.toml` schema 2 contains only static policy: the initial release is `0.1.0`, the
+source-development version is `0.0.0-dev`, and breaking impact before `1.0` is minor.
+Native Cargo builds always report the development fallback. Nix development packages
+inject a revision-bearing development version, while allocated release builds inject
+their exact approved version.
 
-Run `./scripts/check-release` to validate the declaration and Cargo fallback. Running
-`./scripts/plan-release` in a synthetic public mirror checkout binds the stable release,
-impact, exact proposed version and tag, source revision, and rendered-changelog digest
-into one deterministic plan. A series already advanced for an accumulated unreleased
-minor or major remains on that adjacent series.
+Run `./scripts/check-release` to validate the policy and Cargo fallback. Impact and
+version arithmetic in `./scripts/release-impact` is pure over this policy, explicit
+impact, and an optional latest stable version. Source checks never fetch or inspect
+public tags. The files in `changes/` are a frozen legacy archive; new intent is reviewed
+in the canonical private journal before this standalone tree is mirrored.
 
-After every releaseable mirror update passes the public check, GitHub Actions builds and
-runs native archives for x86-64 and ARM64 Linux and for Intel and Apple Silicon macOS.
-It then publishes the archives, `SHA256SUMS`, and GitHub build-provenance attestations on
-the [Releases](https://github.com/scherzo-systems/scherzo-cloud-cli/releases) page.
-Markdown, test, workflow, and development-environment-only changes do not increment the
-patch after the initial release.
+Managed publication allocates one exact version after review and mirrors an immutable
+allocation record with the source. Metadata-branch creation is ignored by workflow push
+triggers, and provider rules forbid updating or deleting those content-addressed refs.
+GitHub Actions verifies the allocation and any separately approved recovery chain from the
+accompanying public `main` push; it never chooses a version from mutable tags. The
+four native builds always check out the original allocated mirror for x86-64 and ARM64
+Linux and for Intel and Apple Silicon macOS. The final write-scoped job creates or
+reconciles only matching tag and draft state, then publishes the exact archives,
+`SHA256SUMS`, and GitHub build-provenance attestations on the
+[Releases](https://github.com/scherzo-systems/scherzo-cloud-cli/releases) page. Exact
+published state and repeated valid recovery are no-ops.
 
 Release binaries are not currently signed or notarized. Verify a downloaded archive
 with the attached checksums and GitHub attestation before running it:

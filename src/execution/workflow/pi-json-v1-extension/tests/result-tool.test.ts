@@ -6,6 +6,7 @@ import {
   createResultTool,
   decodeFrame,
   encodeFrame,
+  resultDigest,
   type PiJsonV1ExtensionConfig,
   type ValidatePiResultV1Request,
 } from "../fixtures/generated/pi-json-v1-extension.ts";
@@ -62,8 +63,9 @@ function loadResultExtension(
   let tool: RegisteredResultTool | undefined;
   const pi = {
     on(eventName: string, handler: unknown) {
-      assert.equal(eventName, "tool_call");
-      gate = handler as ToolCallGate;
+      if (eventName === "tool_call") {
+        gate = handler as ToolCallGate;
+      }
     },
     registerTool(registeredTool: unknown) {
       tool = registeredTool as RegisteredResultTool;
@@ -464,6 +466,13 @@ test("missing assistant correlation aborts before validation", async () => {
 
   assert.equal(aborted, true);
   assert.equal(validated, false);
+});
+
+test("result digests order object keys by UTF-8 bytes", () => {
+  assert.equal(
+    resultDigest({ result: { "\u{1f600}": 1, "\u{ff21}": 2 } }),
+    "839d53c4925bd46f7f2c9ef02954387ae076eb5e74b6c889e26ed568b018a62e",
+  );
 });
 
 test("protocol framing preserves a fixed request payload", () => {

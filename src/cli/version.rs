@@ -1,10 +1,11 @@
 use std::env;
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
+
+use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Print version information";
 const COMMAND_NAME: &str = "scherzo-cloud";
@@ -16,20 +17,13 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
-        let result = if self.json {
-            write_json_output()
+    pub(super) fn execute(self) -> super::CommandResult {
+        if self.json {
+            write_json_output()?;
         } else {
-            write_text_output()
-        };
-
-        match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
+            write_text_output()?;
         }
+        Ok(ExitCode::Success)
     }
 }
 
@@ -43,15 +37,15 @@ struct VersionOutput {
     build_identity: &'static str,
 }
 
-fn write_text_output() -> Result<(), VersionError> {
+fn write_text_output() -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     writeln!(stdout, "{COMMAND_NAME} {}", crate::build_info::VERSION)
-        .map_err(VersionError::WriteOutput)
+        .context("write version output")
 }
 
-fn write_json_output() -> Result<(), VersionError> {
-    let executable_path = env::current_exe().map_err(VersionError::LocateExecutable)?;
+fn write_json_output() -> anyhow::Result<()> {
+    let executable_path = env::current_exe().context("locate the current executable")?;
     let output = VersionOutput {
         schema_version: 1,
         command: COMMAND_NAME,
@@ -62,25 +56,6 @@ fn write_json_output() -> Result<(), VersionError> {
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, &output).map_err(VersionError::WriteJson)?;
-    writeln!(stdout).map_err(VersionError::WriteOutput)
-}
-
-#[derive(Debug)]
-enum VersionError {
-    LocateExecutable(io::Error),
-    WriteJson(serde_json::Error),
-    WriteOutput(io::Error),
-}
-
-impl fmt::Display for VersionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LocateExecutable(error) => {
-                write!(formatter, "locate the current executable: {error}")
-            }
-            Self::WriteJson(error) => write!(formatter, "write JSON version output: {error}"),
-            Self::WriteOutput(error) => write!(formatter, "write version output: {error}"),
-        }
-    }
+    serde_json::to_writer_pretty(&mut stdout, &output).context("write JSON version output")?;
+    writeln!(stdout).context("write version output")
 }

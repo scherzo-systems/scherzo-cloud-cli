@@ -1,9 +1,13 @@
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
 #[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -14,6 +18,8 @@ use std::process::{Command, Output, Stdio};
 use nix::pty::{Winsize, openpty};
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
+#[cfg(target_os = "linux")]
+use rustix::fs::inotify;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
@@ -22,6 +28,9 @@ use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
 use super::{CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES};
 
 const WORKFLOW_PATH: &str = "workflow.yaml";
+const OVERSIZED_AGENT_MESSAGE_BYTES: usize = 512 * 1024;
+const OVERSIZED_AGENT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const OVERSIZED_AGENT_SYSTEM_PROMPT_BYTES: usize = 256 * 1024;
 const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
 const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
@@ -47,6 +56,68 @@ fn process_state(process: Pid) -> Option<u8> {
             .rposition(|bytes| bytes == b") ")
             .and_then(|end| stat.get(end + 2).copied())
     })
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_child_guard_directories() -> OwnedFd {
+    let monitor = inotify::init(inotify::CreateFlags::CLOEXEC).unwrap();
+    inotify::add_watch(&monitor, "/tmp", inotify::WatchFlags::CREATE).unwrap();
+    monitor
+}
+
+#[cfg(target_os = "linux")]
+fn stop_owner_at_child_guard_manifest(
+    directory_monitor: &OwnedFd,
+    owner: Pid,
+    program: &Path,
+) -> (PathBuf, serde_json::Value) {
+    let mut directory_buffer = [std::mem::MaybeUninit::uninit(); 4096];
+    let mut directory_events = inotify::Reader::new(directory_monitor, &mut directory_buffer);
+
+    loop {
+        let event = directory_events.next().unwrap();
+        let Some(name) = event.file_name() else {
+            continue;
+        };
+        if !name.to_bytes().starts_with(b"scherzo-child-guard-v1-") {
+            continue;
+        }
+        let guard_root = Path::new("/tmp").join(OsStr::from_bytes(name.to_bytes()));
+        let manifest_monitor = inotify::init(inotify::CreateFlags::CLOEXEC).unwrap();
+        if inotify::add_watch(
+            &manifest_monitor,
+            &guard_root,
+            inotify::WatchFlags::CLOSE_WRITE,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let mut manifest_buffer = [std::mem::MaybeUninit::uninit(); 4096];
+        let mut manifest_events = inotify::Reader::new(&manifest_monitor, &mut manifest_buffer);
+        let manifest_path = guard_root.join("launch.json");
+        let manifest = loop {
+            if let Ok(bytes) = fs::read(&manifest_path)
+                && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                break manifest;
+            }
+            let _ = manifest_events.next().unwrap();
+        };
+        let matches_program = manifest["program"].as_array().is_some_and(|bytes| {
+            bytes.iter().map(|byte| byte.as_u64()).eq(program
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .copied()
+                .map(u64::from)
+                .map(Some))
+        });
+        if matches_program {
+            kill_process(owner, Signal::STOP).unwrap();
+            return (guard_root, manifest);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -261,11 +332,33 @@ fn fake_provider_response(request: &serde_json::Value) -> serde_json::Value {
                         }]
                     })
                 }
+            } else if system.contains("MODE_OVERSIZED_RESPONSE") {
+                serde_json::json!({
+                    "kind": "text",
+                    "blocks": ["r".repeat(OVERSIZED_AGENT_RESPONSE_BYTES)],
+                    "stopReason": "stop"
+                })
             } else if system.contains("MODE_RESPONSE") {
                 serde_json::json!({
                     "kind": "text",
                     "blocks": ["agent ", "response"],
                     "stopReason": "stop"
+                })
+            } else if system.contains("MODE_OVERSIZED_RESULT") {
+                let tool_name = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .find(|name| name.starts_with("scherzo_result_"))
+                    .unwrap();
+                serde_json::json!({
+                    "kind": "toolCalls",
+                    "calls": [{
+                        "id": "submit-oversized-result",
+                        "name": tool_name,
+                        "arguments": {"result": {"payload": "x".repeat(4 * 1024 * 1024 - 14)}}
+                    }]
                 })
             } else if system.contains("MODE_RESULT") {
                 let tool_name = request["tools"]
@@ -432,7 +525,7 @@ fn response_pi_execution() -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "cwd=$(pwd); printf '{{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-4000-8000-000000000001\",\"timestamp\":\"2026-07-30T12:00:00Z\",\"cwd\":\"%s\"}}\\n' \"$cwd\"; printf '%s\\n' {remaining}"
+        "session_dir=; while [ \"$#\" -gt 0 ]; do if [ \"$1\" = --session-dir ]; then shift; session_dir=$1; fi; shift; done; case \"$session_dir\" in /*) ;; *) exit 74 ;; esac; printf '{{partial' > \"$session_dir/retained-partial.jsonl\"; cwd=$(pwd); printf '{{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-4000-8000-000000000001\",\"timestamp\":\"2026-07-30T12:00:00Z\",\"cwd\":\"%s\"}}\\n' \"$cwd\"; printf '%s\\n' {remaining}"
     )
 }
 
@@ -692,6 +785,7 @@ exports:
 
     let carrier_path = artifact.join("exports/0001");
     let original = fs::read(&carrier_path).unwrap();
+    fs::set_permissions(&carrier_path, fs::Permissions::from_mode(0o600)).unwrap();
     let advertised_ref = b"refs/scherzo/head";
     let ref_offset = original
         .windows(advertised_ref.len())
@@ -875,6 +969,80 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
     assert!(!incompatible_destination.exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_pi_launch_rechecks_session_binding_before_releasing_the_process() {
+    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+    let bundle = RunBundle::new(response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("rebound-diagnostic-session");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let child_guard_monitor = monitor_child_guard_directories();
+    let child = isolated_command(&args)
+        .env("PATH", pi.path_directory())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let owner = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let resolved_pi_executable = fs::canonicalize(pi.executable()).unwrap();
+    let (guard_root, manifest) =
+        stop_owner_at_child_guard_manifest(&child_guard_monitor, owner, &resolved_pi_executable);
+    for _ in 0..500 {
+        if matches!(process_state(owner), Some(b'T' | b't')) {
+            break;
+        }
+        wait_for_process_poll();
+    }
+    assert!(matches!(process_state(owner), Some(b'T' | b't')));
+    let stopped_before_release = !guard_root.join("released").exists();
+
+    let arguments = manifest["arguments"].as_array().unwrap();
+    let session_index = arguments
+        .iter()
+        .position(|argument| {
+            argument.as_array().is_some_and(|bytes| {
+                bytes.iter().map(|byte| byte.as_u64()).eq(b"--session-dir"
+                    .iter()
+                    .copied()
+                    .map(|byte| Some(u64::from(byte))))
+            })
+        })
+        .unwrap();
+    let session_directory = PathBuf::from(OsString::from_vec(
+        arguments[session_index + 1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64().unwrap()).unwrap())
+            .collect(),
+    ));
+    if stopped_before_release {
+        let retained_directory = session_directory.with_file_name("descriptor-owned-session");
+        fs::rename(&session_directory, &retained_directory).unwrap();
+        fs::create_dir(&session_directory).unwrap();
+        fs::set_permissions(&session_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    kill_process(owner, Signal::CONT).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        stopped_before_release,
+        "the proof did not stop the owner before release; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rebound_marker = session_directory.join("retained-partial.jsonl");
+    assert!(
+        !rebound_marker.exists(),
+        "durable launch executed Pi against a rebound diagnostic-session path; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
     let replacement = PiFixture::new("0.83.0", COMPLETE_HELP, false);
@@ -930,7 +1098,21 @@ fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
         lines[1],
         "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help"
     );
-    assert!(lines[2].starts_with("--mode json --approve --no-session"));
+    assert!(lines[2].starts_with("--mode json --approve --session-dir /"));
+    for forbidden in [
+        "--continue",
+        "--resume",
+        "--session",
+        "--session-id",
+        "--fork",
+        "--no-session",
+    ] {
+        assert!(
+            !lines[2]
+                .split_whitespace()
+                .any(|argument| argument == forbidden)
+        );
+    }
     assert!(replacement.recorded_probes().is_empty());
 
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -945,6 +1127,43 @@ fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
         fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
         b"hello world"
     );
+    assert!(
+        fs::read_dir(destination.join(".private"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let diagnostic_root = destination.join("attempts/000001/diagnostics/pi-json-v1");
+    let invocation_directories = fs::read_dir(&diagnostic_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(invocation_directories.len(), 1);
+    let diagnostic = &invocation_directories[0];
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(diagnostic.join("metadata.json")).unwrap()).unwrap();
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("run.json")).unwrap()).unwrap();
+    assert_eq!(metadata["localRunId"], run["localRunId"]);
+    assert_eq!(metadata["attemptNumber"], 1);
+    assert_eq!(metadata["stepId"], "answer");
+    assert!(
+        metadata["invocationId"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert_eq!(metadata["profile"], "PiJsonV1");
+    assert_eq!(metadata["piVersion"], "0.83.0");
+    assert_eq!(
+        metadata["nativeSession"],
+        serde_json::json!({"relativeDirectory": "session", "formatVersion": 3})
+    );
+    assert!(metadata.get("environment").is_none());
+    assert_eq!(
+        fs::read(diagnostic.join("session/retained-partial.jsonl")).unwrap(),
+        b"{partial"
+    );
+    assert_eq!(result_json(&destination)["outcome"], "succeeded");
     let live = String::from_utf8(output.stderr).unwrap();
     assert!(live.contains("event       assistant · hello"));
     assert!(live.contains("event       usage · input 1 · output 2"));
@@ -1172,9 +1391,21 @@ steps:
     outputs:
       response:
         kind: agent_response
-  result:
+  oversizedResponse:
     kind: agent
     dependsOn: [response]
+    agent:
+      profile: local
+      systemPrompt: oversized-response-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+  result:
+    kind: agent
+    dependsOn: [oversizedResponse]
     agent:
       profile: local
       systemPrompt: result-system.md
@@ -1185,13 +1416,28 @@ steps:
       result:
         kind: agent_result
         schema: result.schema.json
+  oversized:
+    kind: agent
+    dependsOn: [result]
+    agent:
+      profile: local
+      systemPrompt: oversized-system.md
+      message:
+        text:
+          - file: oversized-message.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: oversized-result.schema.json
 exports:
   file:
     ref: outputs.noValue.file
   response:
-    ref: outputs.response.response
+    ref: outputs.oversizedResponse.response
   result:
     ref: outputs.result.result
+  oversized:
+    ref: outputs.oversized.result
   seed:
     ref: outputs.seed.seed
 "#
@@ -1224,14 +1470,29 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     for (path, text) in [
         ("none-system.md", "MODE_NONE"),
         ("response-system.md", "MODE_RESPONSE"),
+        ("oversized-response-system.md", "MODE_OVERSIZED_RESPONSE"),
         ("result-system.md", "MODE_RESULT"),
         ("message.md", "fixture message"),
     ] {
         bundle.write_source(path, text);
     }
+    let oversized_system_prefix = "MODE_OVERSIZED_RESULT\n";
+    let oversized_system_prompt = format!(
+        "{oversized_system_prefix}{}",
+        "s".repeat(OVERSIZED_AGENT_SYSTEM_PROMPT_BYTES - oversized_system_prefix.len())
+    );
+    bundle.write_source("oversized-system.md", &oversized_system_prompt);
+    bundle.write_source(
+        "oversized-message.md",
+        "m".repeat(OVERSIZED_AGENT_MESSAGE_BYTES),
+    );
     bundle.write_source(
         "result.schema.json",
         br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["answer","source"],"properties":{"answer":{"const":42},"source":{"const":"agent response"}},"additionalProperties":false}"#,
+    );
+    bundle.write_source(
+        "oversized-result.schema.json",
+        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["payload"],"properties":{"payload":{"type":"string"}},"additionalProperties":false}"#,
     );
     bundle.write_source(
         "../execution/.pi/extensions/fake-provider.ts",
@@ -1261,7 +1522,7 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
         fs::create_dir(directory).unwrap();
     }
     let socket_path = developer.path().join("provider.sock");
-    let provider = serve_fake_provider(&socket_path, 7);
+    let provider = serve_fake_provider(&socket_path, 11);
     let destination = bundle.result("mixed-agent");
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
@@ -1289,18 +1550,41 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
         String::from_utf8_lossy(&output.stderr)
     );
     let requests = provider.join().unwrap();
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 11);
     assert_eq!(
         requests
             .iter()
             .filter(|request| request["kind"] == "model")
             .count(),
-        4
+        6
     );
+    let oversized_start = requests
+        .iter()
+        .find(|request| {
+            request["kind"] == "before_agent_start"
+                && request["systemPrompt"]
+                    .as_str()
+                    .is_some_and(|system| system.contains("MODE_OVERSIZED_RESULT"))
+        })
+        .unwrap();
+    assert!(
+        oversized_start["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .contains(oversized_system_prompt.as_str()),
+        "Pi must receive the staged workflow system prompt without changing its text"
+    );
+    let oversized_prompt = oversized_start["prompt"].as_str().unwrap();
+    assert_eq!(
+        oversized_prompt.len(),
+        OVERSIZED_AGENT_MESSAGE_BYTES,
+        "Pi must receive the workflow message without transport wrapper text"
+    );
+    assert!(oversized_prompt.bytes().all(|byte| byte == b'm'));
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["result"]["steps"][0]["kind"], "cmd");
-    for index in 1..=3 {
+    for index in 1..=5 {
         assert_eq!(terminal["result"]["steps"][index]["kind"], "agent");
     }
     assert_eq!(
@@ -1308,15 +1592,20 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
         b"agent file\n"
     );
     assert_eq!(
-        fs::read(attempt_result(&destination).join("exports/0002")).unwrap(),
-        b"agent response"
+        fs::metadata(attempt_result(&destination).join("exports/0002"))
+            .unwrap()
+            .len(),
+        4 * 1024 * 1024
     );
+    let response = fs::read(attempt_result(&destination).join("exports/0003")).unwrap();
+    assert_eq!(response.len(), OVERSIZED_AGENT_RESPONSE_BYTES);
+    assert!(response.iter().all(|byte| *byte == b'r'));
     assert_eq!(
-        fs::read(attempt_result(&destination).join("exports/0003")).unwrap(),
+        fs::read(attempt_result(&destination).join("exports/0004")).unwrap(),
         br#"{"answer":42,"source":"agent response"}"#
     );
     assert_eq!(
-        fs::read(attempt_result(&destination).join("exports/0004")).unwrap(),
+        fs::read(attempt_result(&destination).join("exports/0005")).unwrap(),
         b"seed"
     );
     assert_eq!(terminal["result"]["exports"]["file"]["kind"], "file");
@@ -2737,7 +3026,8 @@ fn output_failure_after_a_signal_keeps_the_first_reason_but_forces_status_one() 
     assert_eq!(retained["cancellation"]["reason"], "user_request");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("workflow run output failure"));
-    assert!(stderr.contains(destination.to_str().unwrap()));
+    let resolved_destination = fs::canonicalize(&destination).unwrap();
+    assert!(stderr.contains(resolved_destination.to_str().unwrap()));
 }
 
 #[test]
@@ -2825,7 +3115,8 @@ fn live_presentation_failure_cancels_quiesces_and_reports_the_published_path() {
     assert_eq!(retained["cancellation"]["reason"], "caller_output_failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("workflow run output failure"));
-    assert!(stderr.contains(destination.to_str().unwrap()));
+    let resolved_destination = fs::canonicalize(&destination).unwrap();
+    assert!(stderr.contains(resolved_destination.to_str().unwrap()));
 }
 
 #[test]
@@ -2848,7 +3139,8 @@ fn terminal_json_failure_occurs_after_publication_and_forces_status_one() {
     assert_eq!(result_json(&destination)["outcome"], "succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("TerminalJsonWriter"));
-    assert!(stderr.contains(destination.to_str().unwrap()));
+    let resolved_destination = fs::canonicalize(&destination).unwrap();
+    assert!(stderr.contains(resolved_destination.to_str().unwrap()));
 }
 
 pub(super) fn signal_bundle() -> RunBundle {

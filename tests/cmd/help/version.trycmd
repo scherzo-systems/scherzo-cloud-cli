@@ -1,0 +1,11 @@
+```console
+$ scherzo-cloud version --help
+Print version information
+
+Usage: scherzo-cloud version [OPTIONS]
+
+Options:
+      --json  Print version information as JSON
+  -h, --help  Print help
+
+```

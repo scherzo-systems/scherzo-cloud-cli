@@ -18,7 +18,9 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
 use crate::runner::service::assignment::{WallClockHealth, WallClockHealthFailure};
 use crate::runner::service::connection::{ConnectionError, FrameSource, run_established};
-use crate::runner::service::{ConnectionAttempt, ConnectionFuture, Connector, Sleeper};
+use crate::runner::service::{
+    ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
+};
 
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
@@ -73,6 +75,26 @@ impl WallClockHealth for HealthyWallClock {
 
 pub(crate) fn healthy_wall_clock() -> Arc<dyn WallClockHealth> {
     Arc::new(HealthyWallClock)
+}
+
+struct ControlledShutdown {
+    notification: Arc<Notify>,
+}
+
+impl Shutdown for ControlledShutdown {
+    fn wait(&mut self) -> ShutdownFuture<'_> {
+        Box::pin(self.notification.notified())
+    }
+}
+
+pub(crate) fn controlled_shutdown() -> (Box<dyn Shutdown>, Arc<Notify>) {
+    let notification = Arc::new(Notify::new());
+    (
+        Box::new(ControlledShutdown {
+            notification: Arc::clone(&notification),
+        }),
+        notification,
+    )
 }
 
 #[derive(Clone, Default)]
@@ -501,7 +523,7 @@ pub(crate) fn welcome() -> Message {
                     "terminalReportDeliveryBudgetMilliseconds": 5000,
                     "startDeliveryBudgetMilliseconds": 5000,
                     "renewalDeliveryBudgetMilliseconds": 5000,
-                    "leaseDurationMilliseconds": 30000,
+                    "leaseDurationMilliseconds": 320000,
                     "fencingMarginMilliseconds": 11000
                 }
             }

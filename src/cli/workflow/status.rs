@@ -1,8 +1,7 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
@@ -14,8 +13,9 @@ use crate::execution::workflow::local_run::{
 use crate::execution::workflow::presentation::{
     ColorChoice, PresentationConfig, RequestedPresentationMode, TerminalCapabilities,
 };
+use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Inspect one durable local workflow run without changing it";
+pub(super) const ABOUT: &str = "Show local workflow run status";
 
 const COMMAND: &str = "scherzo-cloud workflow status";
 const STYLE_ACTIVE: &str = "38;2;137;180;250";
@@ -23,6 +23,8 @@ const STYLE_SUCCESS: &str = "38;2;166;227;161";
 const STYLE_FAILURE: &str = "38;2;243;139;168";
 const STYLE_BLOCKED: &str = "38;2;250;179;135";
 
+// Status composes read-only run identity and presentation options without execution inputs.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -31,34 +33,37 @@ pub(super) struct Command {
     #[command(flatten)]
     presentation: super::PresentationOptions,
 }
+// jscpd:ignore-end
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_read_only_with_signals(
             "workflow status",
             move |cancelled, completed| self.execute_blocking(cancelled, completed),
         )
     }
 
-    fn execute_blocking(&self, cancelled: &AtomicBool, completed: &AtomicBool) -> ExitCode {
+    fn execute_blocking(
+        &self,
+        cancelled: &AtomicBool,
+        completed: &AtomicBool,
+    ) -> super::super::CommandResult {
         debug_assert!(!(self.presentation.plain && self.presentation.json));
         let snapshot = read_local_run_status(&self.run.run_dir);
         if cancelled.load(Ordering::Acquire) {
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::GeneralFailure);
         }
-        let result = if self.presentation.json {
-            render_json(snapshot)
+        let exit = if self.presentation.json {
+            render_json(snapshot).context("write workflow status output")?
         } else {
+            let snapshot = snapshot
+                .map_err(|error| anyhow!(error.code.message()))
+                .with_context(|| format!("inspect workflow run {}", self.run.run_dir.display()))?;
             let color = self.plain_color_enabled();
-            render_plain(snapshot, color)
+            render_plain(&snapshot, color).context("write workflow status output")?
         };
-        match result {
-            Ok(exit) => {
-                completed.store(true, Ordering::Release);
-                exit
-            }
-            Err(error) => diagnose(format_args!("write workflow status output: {error}")),
-        }
+        completed.store(true, Ordering::Release);
+        Ok(exit)
     }
 
     fn plain_color_enabled(&self) -> bool {
@@ -170,21 +175,21 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
                 schema_version: 1,
                 command: COMMAND,
                 outcome: "status",
-                exit_status: 0,
+                exit_status: ExitCode::Success.as_u8(),
                 run_directory,
                 run: &snapshot.run,
                 state: &snapshot.state,
                 recovery: RecoveryOutput::from(&snapshot.recovery),
                 retry: snapshot.retry.into(),
             })?;
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::Success)
         }
         Err(error) => {
             write_json(&StatusErrorOutput {
                 schema_version: 1,
                 command: COMMAND,
                 outcome: "error",
-                exit_status: 1,
+                exit_status: ExitCode::GeneralFailure.as_u8(),
                 run_directory: error
                     .run_directory
                     .as_deref()
@@ -194,7 +199,7 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
                     message: error.code.message(),
                 },
             })?;
-            Ok(ExitCode::FAILURE)
+            Ok(ExitCode::GeneralFailure)
         }
     }
 }
@@ -203,26 +208,12 @@ fn write_json(value: &impl Serialize) -> io::Result<()> {
     super::super::write_pretty_json(value)
 }
 
-fn render_plain(
-    snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>,
-    color: bool,
-) -> io::Result<ExitCode> {
-    match snapshot {
-        Ok(snapshot) => {
-            let stdout = io::stdout();
-            let mut stdout = stdout.lock();
-            write_plain_snapshot(&mut stdout, &snapshot, color)?;
-            stdout.flush()?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(error) => {
-            let stderr = io::stderr();
-            let mut stderr = stderr.lock();
-            writeln!(stderr, "Error: workflow status: {}", error.code.message())?;
-            stderr.flush()?;
-            Ok(ExitCode::FAILURE)
-        }
-    }
+fn render_plain(snapshot: &LocalRunStatusSnapshot, color: bool) -> io::Result<ExitCode> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_plain_snapshot(&mut stdout, snapshot, color)?;
+    stdout.flush()?;
+    Ok(ExitCode::Success)
 }
 
 fn write_plain_snapshot(
@@ -251,7 +242,7 @@ fn write_plain_snapshot(
     if let LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } = &snapshot.recovery {
         writeln!(writer, "ownership reason: {}", reason.as_str())?;
         writeln!(writer, "remedy: {}", reason.remedy())?;
-        writeln!(writer, "guard IDs: {}", guard_ids.join(", "))?;
+        writeln!(writer, "guard ids: {}", guard_ids.join(", "))?;
     }
     writeln!(writer)?;
     writeln!(writer, "history:")?;
@@ -337,11 +328,4 @@ fn styled(value: &str, style: &str, color: bool) -> String {
     } else {
         value.to_owned()
     }
-}
-
-fn diagnose(message: fmt::Arguments<'_>) -> ExitCode {
-    let stderr = io::stderr();
-    let mut stderr = stderr.lock();
-    let _ = writeln!(stderr, "Error: {message}").and_then(|()| stderr.flush());
-    ExitCode::FAILURE
 }

@@ -83,7 +83,7 @@ impl PreparedResultBridge {
             let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
             return Err(());
         }
-        if write_extension(&extension_path, source.as_bytes()).is_err() {
+        if write_private_file(&extension_path, source.as_bytes()).is_err() {
             drop(listener);
             let _ = fs::remove_file(&socket_path);
             let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
@@ -524,7 +524,15 @@ struct ExtensionConfig<'a> {
 }
 
 fn materialize_extension(config: &ExtensionConfig<'_>) -> Result<String, ()> {
-    let mut markers = EXTENSION_TEMPLATE.match_indices(CONFIG_MARKER);
+    materialize_extension_config(EXTENSION_TEMPLATE, CONFIG_MARKER, config)
+}
+
+pub(super) fn materialize_extension_config(
+    template: &str,
+    marker: &str,
+    config: &impl Serialize,
+) -> Result<String, ()> {
+    let mut markers = template.match_indices(marker);
     let (marker_index, _) = markers.next().ok_or(())?;
     if markers.next().is_some() {
         return Err(());
@@ -532,14 +540,14 @@ fn materialize_extension(config: &ExtensionConfig<'_>) -> Result<String, ()> {
     let config_json = serde_json::to_string(config).map_err(|_| ())?;
     let encoded_config_json = serde_json::to_string(&config_json).map_err(|_| ())?;
     let mut source = String::with_capacity(
-        EXTENSION_TEMPLATE
+        template
             .len()
-            .saturating_sub(CONFIG_MARKER.len())
+            .saturating_sub(marker.len())
             .saturating_add(encoded_config_json.len()),
     );
-    source.push_str(&EXTENSION_TEMPLATE[..marker_index]);
+    source.push_str(&template[..marker_index]);
     source.push_str(&encoded_config_json);
-    source.push_str(&EXTENSION_TEMPLATE[marker_index + CONFIG_MARKER.len()..]);
+    source.push_str(&template[marker_index + marker.len()..]);
     Ok(source)
 }
 
@@ -697,7 +705,7 @@ fn map_schema_keywords() -> &'static [&'static str] {
     ]
 }
 
-fn validate_result_endpoint_directory(directory: &Path) -> Result<(), ()> {
+pub(super) fn validate_result_endpoint_directory(directory: &Path) -> Result<(), ()> {
     let metadata = fs::symlink_metadata(directory).map_err(|_| ())?;
     if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(());
@@ -744,7 +752,7 @@ fn make_socket_private(path: &Path) -> Result<(), ()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| ())
 }
 
-fn write_extension(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -1,4 +1,8 @@
 #[cfg(target_os = "linux")]
+use base64::Engine as _;
+#[cfg(target_os = "linux")]
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -134,9 +138,10 @@ fn view_capability_gate_checks_each_required_terminal_capability_before_run_read
         let output = run_with_terminal_arrangement(&args, stdin_terminal, stdout_terminal, term);
 
         assert_eq!(output.status.code(), Some(1));
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        assert!(diagnostic.contains("requires terminal stdin, terminal stdout, and a usable TERM"));
-        assert!(!diagnostic.contains("run_directory_unavailable"));
+        assert_eq!(
+            output.stderr,
+            b"Error: workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>\n"
+        );
     }
 }
 
@@ -151,9 +156,10 @@ fn view_capability_gate_precedes_durable_run_reads() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("requires terminal stdin, terminal stdout, and a usable TERM"));
-    assert!(!diagnostic.contains("run_directory_unavailable"));
+    assert_eq!(
+        output.stderr,
+        b"Error: workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>\n"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -226,6 +232,68 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
 
 #[cfg(target_os = "linux")]
 #[test]
+fn stream_at_live_tui_cap_is_published_validated_and_viewable() {
+    const STREAM_BYTES: usize = 4 * 1024 * 1024;
+
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  emit:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"cat retained.log\"]\n",
+    );
+    let emitted = vec![b'x'; STREAM_BYTES];
+    fs::write(bundle.execution_root().join("retained.log"), &emitted).unwrap();
+    let run_directory = bundle.result("durable-stream-cap");
+    let mut args = bundle.args(&run_directory);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let produced = run(&args);
+
+    assert!(
+        produced.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&produced.stdout).unwrap();
+    let result_directory = PathBuf::from(terminal["resultDirectory"].as_str().unwrap());
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs::read(result_directory.join("result.json")).unwrap()).unwrap();
+    let stream = &result["steps"][0]["commandOutput"]["stdout"];
+    assert_eq!(
+        result["commandOutputPolicy"]["maximumRetainedBytesPerStream"],
+        u64::try_from(STREAM_BYTES).unwrap()
+    );
+    assert_eq!(
+        stream["retainedBytes"],
+        u64::try_from(STREAM_BYTES).unwrap()
+    );
+    assert_eq!(stream["discardedBytes"], 0);
+    assert_eq!(stream["truncated"], false);
+    assert_eq!(
+        BASE64_STANDARD
+            .decode(stream["data"].as_str().unwrap())
+            .unwrap(),
+        emitted
+    );
+
+    let validation = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        result_directory.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        validation.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&validation.stdout),
+        String::from_utf8_lossy(&validation.stderr)
+    );
+
+    let view = TuiSession::start(&view_args(&run_directory, &[]));
+    let (view_status, transcript) = view.finish(b"q");
+    assert!(view_status.success());
+    assert!(terminal_writes(&transcript).contains("attemptstatesucceeded·outcomesucceeded"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     let bundle = signal_bundle();
     let run_directory = bundle.result("cancelled");
@@ -278,7 +346,7 @@ fn view_reports_unavailable_attempts_and_results_before_terminal_ownership() {
     let (unknown_status, unknown_transcript) =
         run_view_to_early_exit(&view_args(&run_directory, &["--attempt", "2"]));
     assert_eq!(unknown_status.code(), Some(1));
-    assert!(unknown_transcript.contains("attempt 2 (attempt_unknown)"));
+    assert!(unknown_transcript.contains("attempt 2: attempt_unknown"));
     assert!(!unknown_transcript.contains("\u{1b}[?1049h"));
 
     fs::remove_file(run_directory.join("attempts/000001/result/result.json")).unwrap();

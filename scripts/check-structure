@@ -23,6 +23,7 @@ required_files=(
   devenv.lock
   scripts/check
   scripts/check-change-fragments
+  scripts/check-help-output-style
   scripts/check-lint-policy
   scripts/check-msrv
   scripts/check-pi-json-v1-extension
@@ -30,13 +31,14 @@ required_files=(
   scripts/strict-devenv
   scripts/classify-release-path
   scripts/format-pi-json-v1-extension
+  scripts/reconcile-release
   scripts/release-impact
-  scripts/render-release-notes
   scripts/test-change-fragments
+  scripts/test-release-allocation
   scripts/test-release-impact
-  scripts/test-release-notes
   scripts/test-release-path-classifier
   scripts/test-strict-devenv
+  scripts/verify-release-allocation
   src/execution/workflow/pi-json-v1-extension/package.json
   src/execution/workflow/pi-json-v1-extension/package-lock.json
   src/execution/workflow/pi-json-v1-extension/tsconfig.json
@@ -47,8 +49,6 @@ required_files=(
   tests/fixtures/lint-policy/main.rs
   tests/fixtures/lint-policy/ordinary_production.rs
   tests/fixtures/lint-policy/ordinary_test.rs
-  tests/fixtures/release-notes/v1/README.md
-  tests/fixtures/release-notes/v1/contract-version
 )
 
 for required_file in "${required_files[@]}"; do
@@ -81,8 +81,23 @@ if [[ -n "$symbolic_link" ]]; then
 fi
 
 while IFS= read -r -d '' script_file; do
-  bash -n "$script_file"
+  IFS= read -r first_line <"$script_file" || true
+  if [[ $first_line =~ ^'#!'.*(ba|z|k)?sh([[:space:]]|$) ]]; then
+    bash -n "$script_file"
+  fi
 done < <(find "$public_root/scripts" -type f -print0)
+
+python3 - \
+  "$public_root/scripts/reconcile-release" \
+  "$public_root/scripts/test-release-allocation" \
+  "$public_root/scripts/verify-release-allocation" <<'PY'
+from pathlib import Path
+import sys
+
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    compile(path.read_text(), str(path), "exec")
+PY
 
 "$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/test-fixture-git"
@@ -90,11 +105,10 @@ done < <(find "$public_root/scripts" -type f -print0)
 "$public_root/scripts/check-test-git-isolation"
 "$public_root/scripts/test-change-fragments"
 "$public_root/scripts/check-change-fragments"
-"$public_root/scripts/test-release-notes"
 "$public_root/scripts/test-release"
+python3 "$public_root/scripts/test-release-allocation"
 "$public_root/scripts/test-release-impact"
 "$public_root/scripts/test-release-path-classifier"
-"$public_root/scripts/test-release-planner"
 "$public_root/scripts/check-release"
 
 if ! command -v actionlint >/dev/null 2>&1; then

@@ -21,7 +21,6 @@ use super::schema_common::{is_identifier, is_lowercase_hex, lowercase_hex};
 
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
-const MAXIMUM_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 const ROOT_OVERFLOW_ENTRY: usize = 4_097;
 const MAXIMUM_EXPORTS: usize = 4_096;
 const MAXIMUM_CARRIERS: usize = 2_048;
@@ -115,6 +114,15 @@ impl ArtifactDiagnostic {
         self.message
     }
 
+    pub(crate) fn missing_carrier_path(&self) -> Option<&str> {
+        match &self.location {
+            ArtifactDiagnosticLocation::Carrier { path } if self.code == "carrier_missing" => {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn human_location(&self) -> String {
         match &self.location {
             ArtifactDiagnosticLocation::ArtifactDirectory => "artifact directory".to_owned(),
@@ -162,7 +170,6 @@ impl PortableArtifactValidation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortableArtifactValidationFailure {
-    AccessBookkeepingUnavailable,
     CurrentDirectoryUnavailable,
     ScratchUnavailable,
     Interrupted,
@@ -378,19 +385,19 @@ fn diagnostic_message(code: &str) -> &'static str {
         "result_symbolic_link" => "result.json is a symbolic link.",
         "result_not_regular_file" => "result.json is not a regular file.",
         "result_unavailable" => "result.json could not be read safely.",
-        "result_limit_exceeded" => "result.json exceeds the Artifact Set V1 limit.",
+        "result_limit_exceeded" => "result.json exceeds the artifact set limit.",
         "result_encoding_invalid" => "result.json does not use the required UTF-8 encoding.",
         "result_json_invalid" => "result.json is not one complete unique-member JSON value.",
         "result_schema_unsupported" => "result.json uses an unsupported schema version.",
-        "result_schema_invalid" => "result.json violates Local Workflow Result Schema 1.",
+        "result_schema_invalid" => "result.json violates the local workflow result contract.",
         "exports_directory_missing" => "The artifact set does not contain exports.",
         "exports_directory_symbolic_link" => "exports is a symbolic link.",
         "exports_directory_not_directory" => "exports is not a directory.",
         "exports_directory_unavailable" => "The exports directory could not be read safely.",
         "export_limit_exceeded" => "result.json declares too many exports.",
-        "export_entry_invalid" => "The export entry violates the closed Artifact Set V1 shape.",
+        "export_entry_invalid" => "The export entry violates the closed artifact set shape.",
         "export_media_type_invalid" => "The export media type is invalid for its artifact kind.",
-        "export_path_invalid" => "The export carrier path is not a portable Artifact Set V1 path.",
+        "export_path_invalid" => "The export carrier path is not a portable artifact path.",
         "export_ordinal_invalid" => {
             "The export carrier path does not use its physical owner's ordinal."
         }
@@ -420,7 +427,7 @@ fn diagnostic_message(code: &str) -> &'static str {
         "git_content_invalid" => "The Git bundle content does not match its descriptor.",
         "git_structure_limit_exceeded" => "The Git artifact exceeds a structural validation limit.",
         "diagnostic_limit_exceeded" => {
-            "Additional artifact diagnostics were omitted at the V1 limit."
+            "Additional artifact diagnostics were omitted at the report limit."
         }
         _ => "The artifact set is invalid.",
     }
@@ -462,18 +469,12 @@ pub(crate) fn validate_portable_artifact_set(
         diagnostics.root("artifact_directory_invalid", None);
     }
 
-    ensure_access_bookkeeping_suppressed(&canonical)?;
     let root = match open(
         &canonical,
-        access_preserving_flags(
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        ),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         Ok(root) => root,
-        Err(error) if no_atime_open_failed(error) => {
-            return Err(PortableArtifactValidationFailure::AccessBookkeepingUnavailable);
-        }
         Err(Errno::NOTDIR) => {
             diagnostics.root("artifact_directory_not_directory", None);
             return Ok(finish_report(
@@ -606,67 +607,8 @@ fn lexical_absolute(initial: &Path, argument: &Path) -> PathBuf {
     normalized
 }
 
-#[cfg(target_os = "linux")]
-fn ensure_access_bookkeeping_suppressed(
-    _path: &Path,
-) -> Result<(), PortableArtifactValidationFailure> {
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_access_bookkeeping_suppressed(
-    path: &Path,
-) -> Result<(), PortableArtifactValidationFailure> {
-    use nix::mount::MntFlags;
-
-    let flags = nix::sys::statfs::statfs(path)
-        .map_err(|_| PortableArtifactValidationFailure::AccessBookkeepingUnavailable)?
-        .flags();
-    flags
-        .contains(MntFlags::MNT_NOATIME)
-        .then_some(())
-        .ok_or(PortableArtifactValidationFailure::AccessBookkeepingUnavailable)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn ensure_access_bookkeeping_suppressed(
-    _path: &Path,
-) -> Result<(), PortableArtifactValidationFailure> {
-    Err(PortableArtifactValidationFailure::AccessBookkeepingUnavailable)
-}
-
-fn access_preserving_flags(flags: OFlags) -> OFlags {
-    #[cfg(target_os = "linux")]
-    {
-        flags | OFlags::NOATIME
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        flags
-    }
-}
-
-fn no_atime_open_failed(error: Errno) -> bool {
-    cfg!(target_os = "linux") && matches!(error, Errno::PERM | Errno::INVAL)
-}
-
-fn openat_access_preserving(
-    directory: &OwnedFd,
-    name: &str,
-    flags: OFlags,
-) -> Result<Option<OwnedFd>, PortableArtifactValidationFailure> {
-    match openat(
-        directory,
-        name,
-        access_preserving_flags(flags),
-        Mode::empty(),
-    ) {
-        Ok(descriptor) => Ok(Some(descriptor)),
-        Err(error) if no_atime_open_failed(error) => {
-            Err(PortableArtifactValidationFailure::AccessBookkeepingUnavailable)
-        }
-        Err(_) => Ok(None),
-    }
+fn openat_read_only(directory: &OwnedFd, name: &str, flags: OFlags) -> Option<OwnedFd> {
+    openat(directory, name, flags, Mode::empty()).ok()
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), PortableArtifactValidationFailure> {
@@ -738,12 +680,11 @@ fn read_result(
     if !require_regular_result(&named, diagnostics) {
         return Ok(None);
     }
-    let Some(descriptor) = openat_access_preserving(
+    let Some(descriptor) = openat_read_only(
         root,
         RESULT_FILE,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    )?
-    else {
+    ) else {
         diagnostics.result("result_unavailable", None);
         return Ok(None);
     };
@@ -760,7 +701,11 @@ fn read_result(
     }
 
     let mut file = File::from(descriptor);
-    let bytes = match read_bounded(&mut file, MAXIMUM_RESULT_BYTES, cancelled) {
+    let bytes = match read_bounded(
+        &mut file,
+        result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+        cancelled,
+    ) {
         Ok(BoundedRead::Complete(bytes)) => bytes,
         Ok(BoundedRead::LimitExceeded) => {
             diagnostics.result("result_limit_exceeded", None);
@@ -1280,12 +1225,11 @@ fn open_exports_directory(
             return Ok(None);
         }
     }
-    let Some(directory) = openat_access_preserving(
+    let Some(directory) = openat_read_only(
         root,
         EXPORT_DIRECTORY,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    )?
-    else {
+    ) else {
         diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
         return Ok(None);
     };
@@ -1408,12 +1352,11 @@ fn validate_carrier(
     if !require_regular_carrier(&named, path, diagnostics) {
         return Ok(());
     }
-    let Some(descriptor) = openat_access_preserving(
+    let Some(descriptor) = openat_read_only(
         exports,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    )?
-    else {
+    ) else {
         diagnose_current_carrier(exports, name, path, diagnostics);
         return Ok(());
     };

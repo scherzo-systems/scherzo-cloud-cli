@@ -1,0 +1,14 @@
+```console
+$ scherzo-cloud artifact validate --help
+Validate a portable workflow artifact directory
+
+Usage: scherzo-cloud artifact validate [OPTIONS] <ARTIFACT_DIR>
+
+Arguments:
+  <ARTIFACT_DIR>  Portable workflow artifact directory
+
+Options:
+      --json  Print the artifact validation result as JSON
+  -h, --help  Print help
+
+```

@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::process::ExitCode;
 
 use clap::Args;
 
@@ -9,8 +8,14 @@ use crate::execution::workflow::local_run::{
 };
 use crate::execution::workflow::presentation::WorkflowRunOutput;
 
-pub(super) const ABOUT: &str = "Retry every step of an eligible durable local workflow run";
+pub(super) const ABOUT: &str = "Retry a local workflow run";
+pub(super) const AFTER_HELP: &str = "Retry eligibility:
+  Retry is available when the latest attempt did not succeed or end in rejection, no
+  execution owner holds the run, and prior process ownership can be proven safe. A retry
+  executes every workflow step as a new attempt.";
 
+// Run, retry, and status intentionally compose different subsets of shared workflow options.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -22,18 +27,19 @@ pub(super) struct Command {
     #[command(flatten)]
     presentation: super::PresentationOptions,
 }
+// jscpd:ignore-end
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         super::run::execute_with_runtime("start local workflow retry runtime", self.execute_async())
     }
 
-    async fn execute_async(self) -> ExitCode {
+    async fn execute_async(self) -> super::super::CommandResult {
         let presentation_config = super::run::presentation_config(&self.presentation);
         let cancellation = CancellationSource::new();
         let signal_task = match super::run::start_signal_observation(cancellation.clone()) {
             Ok(task) => task,
-            Err(error) => return super::run::diagnose(error),
+            Err(error) => return Err(error.into()),
         };
         let pending = match acquire_local_retry(&self.run.run_dir) {
             Ok(LocalRetryOpen::Acquired(pending)) => *pending,
@@ -127,7 +133,7 @@ impl Command {
 fn render_retry_rejection(
     config: crate::execution::workflow::presentation::PresentationConfig,
     rejection: &crate::execution::workflow::local_run::LocalRetryRejection,
-) -> ExitCode {
+) -> super::super::CommandResult {
     let output = WorkflowRunOutput::new(config, io::stdout(), io::stderr())
         .for_retry(rejection.run_directory());
     super::run::rejection_exit(output.render_retry_rejection(rejection))
@@ -143,7 +149,7 @@ fn write_reuse_warning(execution_root: &std::path::Path, attempts: &[u64]) -> io
         .join(", ");
     writeln!(
         standard_error,
-        "Warning: execution root {execution_root:?} was used by earlier attempt(s) {attempts} and may contain prior changes; Scherzo does not check cleanliness or mutations."
+        "! Execution root {execution_root:?} was used by earlier attempt(s) {attempts} and may contain prior changes; Scherzo does not check cleanliness or mutations."
     )?;
     standard_error.flush()
 }

@@ -8,11 +8,13 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use super::dispatch::invoke_agent_dispatcher;
 use super::scripted::{
     ScriptedAgentAdapter, ScriptedAgentControl, ScriptedAgentError, ScriptedAgentValue,
 };
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, EnvironmentSnapshot};
+use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
 use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
@@ -116,6 +118,9 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         ),
         AgentProcessContext::new(cwd, EnvironmentSnapshot::new([("PATH", "/runner/bin")])),
         AgentInvocationStaging::new("/staging/invocation/result-endpoint".into()),
+        crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession::fixture(
+            temporary.path().join("diagnostic-session"),
+        ),
         AgentPrompt::new(Arc::from("system"), Arc::from("message")),
         Arc::from([StagedAgentAttachment::new(
             "/staging/invocation/000000".into(),
@@ -176,9 +181,9 @@ async fn start_script(
     let terminal_probe = fixture.terminal_callback.clone();
     let (adapter, mut control) = ScriptedAgentAdapter::new();
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(
+        invoke_agent_dispatcher(
             &adapter,
-            fixture.invocation,
+            ClosedAgentInvocation::Pi(fixture.invocation),
             fixture.start_callback,
             fixture.terminal_callback,
         )
@@ -186,6 +191,7 @@ async fn start_script(
     });
     let invocation = control.wait_until_started().await.unwrap();
     assert_eq!(invocation.identity().run().as_ref(), "run-fixed");
+    assert_eq!(invocation.profile(), AgentCompatibilityProfile::PiJsonV1);
     assert_eq!(invocation.value_kind(), expected_value_kind);
     invocation.control().start().await.unwrap();
     fixture.started.receive().await.unwrap();
@@ -575,9 +581,9 @@ async fn scripted_adapter_observes_initial_and_idle_cancellation() {
     );
     let (adapter, mut initial_control) = ScriptedAgentAdapter::new();
     let initial_task = tokio::spawn(async move {
-        invoke_agent_adapter(
+        invoke_agent_dispatcher(
             &adapter,
-            initial.invocation,
+            ClosedAgentInvocation::Pi(initial.invocation),
             initial.start_callback,
             initial.terminal_callback,
         )

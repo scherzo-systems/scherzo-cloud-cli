@@ -298,37 +298,54 @@ calls. `output.rs` exhaustively maps the four route-specific outcomes to human t
 schema-version-1 JSON, and process status. The command modules never expose generated
 DTOs or map raw HTTP statuses independently.
 
-`release.toml` is the public release-intent contract. It selects the reviewed
-`MAJOR.MINOR` series, immutable public tags provide stable history, and fragment
-categories supply semantic impact. Patch categories retain the stable series, additions
-select the adjacent minor, and breaking changes select an adjacent minor before `1.0` or
-an adjacent major afterward. The highest unreleased impact is evaluated from the stable
-tag, so accumulated work shares one target series. The Cargo package version remains the
-matching `MAJOR.MINOR.0` fallback so source builds are coherent without pretending to
-know an automatically assigned patch.
+`release.toml` schema 2 is a static public policy contract: initial version `0.1.0`,
+development version `0.0.0-dev`, and minor impact for breaking changes before `1.0`.
+It contains no next-series declaration. `scripts/release-impact` is pure over that
+policy, explicit impact, and an optional latest stable version. Source validation uses
+only checked-in bytes and cannot become stale when public releases move. `changes/` is a
+frozen legacy archive; new append-only intent is reviewed outside this exported tree.
 
-Local builds report the package version from `Cargo.toml`. Reproducible release builds
-inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at compile time, and
-both `scherzo-cloud version` and `scherzo-cloud --version` read the same version.
-Structured version output also reports the resolved executable path and separately
-injected build identity. Packaging must verify the installed executable reports these
-exact values. `scripts/check-release` validates release-series syntax and Cargo fallback
-consistency, while `scripts/release-impact` is the shared semantic policy used by
-candidate validation and deterministic evidence. `scripts/plan-release` validates
-synthetic public history, selects the latest tag numerically, derives the cumulative
-impact, suppresses stale or non-releaseable work, and emits the digest-bound version plan
-consumed and independently rechecked by GitHub Actions. The version schema does not infer
-or advertise a release channel.
+Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix and
+release builds inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at
+compile time, and both `scherzo-cloud version` and `scherzo-cloud --version` read the same
+version. Structured version output also reports the resolved executable path and
+separately injected build identity. Packaging must verify the installed executable
+reports these exact values. `scripts/check-release` validates static policy and fallback
+consistency. Release-only planning may observe stable state after source validation, but
+a stale observation requires fresh approval rather than a source edit.
 
-Public GitHub Actions builds each supported target on its native architecture and grants
-write permission only to the final job after checks and builds pass. Managed mirror
-commits carry the approved deterministic plan digest alongside `Source-Revision`; the
-public planner independently reproduces it, while legacy commits without that trailer
-remain valid until mirror-authority cutover. Release tags point directly to exact
-synthetic mirror commits; automation never writes generated version commits to `main`.
-Archives contain the executable, public README, and license, and ship
-with aggregate checksums and GitHub provenance attestations. Signing, notarization,
-installers, package-manager metadata, and update channels remain separate decisions.
+Managed Buildkite is the sole allocator. An allocation mirror names an append-only
+`refs/heads/release-allocations/<plan-digest>` orphan record whose ordered contract 2 and
+`rendered-notes.md` bind the approved source revision and tree, parent public state,
+stable-ref and prior-release snapshots, policy, exact version and tag, and release body.
+Public GitHub Actions verifies those bytes and arithmetic without selecting a version.
+Push triggers ignore the `release-allocations/**` and `release-recoveries/**` metadata
+branches; only the accompanying public `main` push can start normal release execution.
+Pull requests, ordinary checks, metadata-ref creation, and a recovery-mirror push remain
+read-only. Provider rules permit each content-addressed metadata ref to be created once
+but forbid updates and deletion. Only the final reconcile job receives `contents: write`
+after exact verification and native builds pass.
+
+The four release builds check out the original allocated mirror, including during
+recovery, and build x86-64 and ARM64 Linux plus Intel and Apple Silicon macOS archives.
+Archives have a canonical inventory and metadata so a transient retry reproduces the
+same asset bytes. The reconcile job accepts only an absent release, an exact tag-only
+partial state, or a matching draft containing an unchanged subset of the five expected
+assets. It creates or completes the draft, verifies archive digests and `SHA256SUMS`,
+attests the five assets, and publishes. A tag at another commit, unrelated stable-tag
+movement, changed notes or identity, unexpected or changed assets, a conflicting draft,
+or a mismatched published release fails before a contents write. An exact published
+release is a successful no-op; stable tags and published releases are never moved or
+edited.
+
+A permanent verifier or reconciler defect is repaired without reallocating. Managed
+Buildkite may mirror only the workflow, verifier, reconciler, focused allocation test,
+and data fixtures named by recovery contract 1, after a separate approval. Each
+content-addressed recovery record names its exact predecessor and the original allocation.
+Exact `workflow_dispatch` recovery must run from current public `main`, verify the whole
+chain, accept the original allocated mirror as a lowercase commit input, and build and tag
+that original mirror rather than the repaired commit. Signing, notarization, installers,
+package-manager metadata, and update channels remain separate decisions.
 
 The runner and execution components should use owned state and explicit message passing
 rather than shared mutable global state. Protocol DTOs must be translated into domain

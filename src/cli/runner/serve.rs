@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::process::ExitCode;
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::execution::pi::discover_and_validate_pi_installation;
+use crate::exit_code::ExitCode;
 use crate::runner::credential::Credential;
 use crate::runner::service::{AssignmentConfig, Config};
 
@@ -12,11 +13,11 @@ pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignmen
 #[derive(Debug, Args)]
 pub(super) struct Command {
     /// WebSocket URL of the runner gateway.
-    #[arg(long)]
+    #[arg(long, value_name = "URL")]
     gateway_url: String,
 
     /// Path to the private development runner credential file.
-    #[arg(long)]
+    #[arg(long, value_name = "PATH")]
     credential_file: PathBuf,
 
     /// Permit ws:// only for an explicit loopback development gateway URL.
@@ -27,7 +28,7 @@ pub(super) struct Command {
     #[arg(long, value_name = "WORKFLOW_ID")]
     workflow_id: String,
 
-    /// Existing directory boundary for the registered workflow's local sources.
+    /// Directory boundary for the registered workflow's local sources (must already exist).
     #[arg(long, value_name = "ROOT")]
     workflow_source_root: PathBuf,
 
@@ -35,54 +36,52 @@ pub(super) struct Command {
     #[arg(long, value_name = "PATH")]
     workflow_path: PathBuf,
 
-    /// Existing directory under which runner-owned execution roots are created.
+    /// Directory for runner-owned execution roots (must already exist).
     #[arg(long, value_name = "ROOT")]
     work_root: PathBuf,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         let pi_installation = discover_and_validate_pi_installation().ok();
-        let credential = match Credential::load(&self.credential_file) {
-            Ok(credential) => credential,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let assignment = match AssignmentConfig::new(
+        let credential_file = std::path::absolute(&self.credential_file).with_context(|| {
+            format!(
+                "resolve runner credential file {}",
+                self.credential_file.display()
+            )
+        })?;
+        let credential = Credential::load(&credential_file).map_err(|error| {
+            anyhow!(
+                "load runner credential file {}: {error}\n\nReplace it with a valid runner credential and make the file readable only by its owner.",
+                credential_file.display()
+            )
+        })?;
+        let assignment = AssignmentConfig::new(
             self.workflow_id,
             &self.workflow_source_root,
             &self.workflow_path,
             &self.work_root,
-        ) {
-            Ok(assignment) => assignment,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let config = match Config::new(
+        )
+        .with_context(|| {
+            format!(
+                "configure runner workflow mapping from {} using work root {}",
+                self.workflow_source_root.display(),
+                self.work_root.display()
+            )
+        })?;
+        let config = Config::new(
             &self.gateway_url,
             credential,
             self.allow_insecure_http,
             assignment,
-        ) {
-            Ok(config) => match pi_installation {
-                Some(installation) => config.with_pi_installation(installation),
-                None => config,
-            },
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return ExitCode::FAILURE;
-            }
+        )
+        .with_context(|| format!("configure runner gateway endpoint {}", self.gateway_url))?;
+        let config = match pi_installation {
+            Some(installation) => config.with_pi_installation(installation),
+            None => config,
         };
-        match crate::runner::service::run(config) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
-        }
+        crate::runner::service::run(config)
+            .with_context(|| format!("serve runner assignments from {}", self.gateway_url))?;
+        Ok(ExitCode::Success)
     }
 }

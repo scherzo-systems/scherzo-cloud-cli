@@ -1,4 +1,3 @@
-use std::future::pending;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,11 +15,15 @@ use super::connection::{
 };
 use super::test_support::{
     DeterminismTranscript, ScriptedConnection, ScriptedInbound, ScriptedReader, ScriptedWriter,
-    SleepRelease, assignment_offer, controlled_sleeper_with_transcript, deterministic_frame_source,
-    effect_observation_acknowledgement, healthy_wall_clock, observation_acknowledgement,
-    scripted_connector, scripted_duplex, sleep_request, welcome, with_watchdog,
+    SleepRelease, assignment_offer, controlled_shutdown, controlled_sleeper_with_transcript,
+    deterministic_frame_source, effect_observation_acknowledgement, healthy_wall_clock,
+    observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
+    with_watchdog,
 };
-use super::{Config, ConnectionLoopDependencies, Sleeper, run_connection_loop};
+use super::{
+    Config, ConnectionLoopDependencies, Connector, ServiceError, Shutdown, Sleeper,
+    run_connection_loop,
+};
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
 
@@ -269,28 +272,8 @@ async fn run_reconnect_scenario() -> Vec<String> {
     let transcript = DeterminismTranscript::default();
     let (sleeper, mut sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
     let (connector, mut attempts) = scripted_connector(transcript.clone());
-    let (cancel, cancelled) = tokio::sync::oneshot::channel();
-    let config = deterministic_config();
-    let frame_source = deterministic_frame_source();
-    let boot_id = frame_source.public_id("rbt_");
-    let (recorder, _capture) = test_recorder(&boot_id);
-    let service = run_connection_loop(
-        ConnectionLoopDependencies::new(
-            config,
-            frame_source,
-            sleeper,
-            recorder,
-            healthy_wall_clock(),
-            boot_id,
-        ),
-        &connector,
-        Backoff::with_fixed_unit(1.0),
-        async {
-            cancelled
-                .await
-                .expect("scripted cancellation sender should remain open");
-        },
-    );
+    let (mut shutdown, cancel) = controlled_shutdown();
+    let service = run_deterministic_connection_loop(sleeper, &connector, shutdown.as_mut());
     let peer = async {
         let mut first = next_connection(&mut attempts).await;
         let first_hello = next_hello(&mut first).await;
@@ -376,9 +359,7 @@ async fn run_reconnect_scenario() -> Vec<String> {
         let final_backoff =
             request_backoff(&mut sleep_requests, &transcript, Duration::from_secs(1)).await;
         transcript.record("cancellation.released".to_owned());
-        cancel
-            .send(())
-            .expect("scripted service stopped before cancellation");
+        cancel.notify_one();
         drop(final_backoff);
     };
 
@@ -401,22 +382,8 @@ async fn run_terminal_close_scenario() -> Vec<String> {
     let transcript = DeterminismTranscript::default();
     let (sleeper, mut sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
     let (connector, mut attempts) = scripted_connector(transcript.clone());
-    let frame_source = deterministic_frame_source();
-    let boot_id = frame_source.public_id("rbt_");
-    let (recorder, _capture) = test_recorder(&boot_id);
-    let service = run_connection_loop(
-        ConnectionLoopDependencies::new(
-            deterministic_config(),
-            frame_source,
-            sleeper,
-            recorder,
-            healthy_wall_clock(),
-            boot_id,
-        ),
-        &connector,
-        Backoff::with_fixed_unit(1.0),
-        pending(),
-    );
+    let (mut shutdown, _shutdown_trigger) = controlled_shutdown();
+    let service = run_deterministic_connection_loop(sleeper, &connector, shutdown.as_mut());
     let peer = async {
         let mut attempt = next_connection(&mut attempts).await;
         let hello = next_hello(&mut attempt).await;
@@ -565,6 +532,36 @@ fn established_fixture(transcript: &DeterminismTranscript) -> EstablishedFixture
 fn deterministic_config() -> Config {
     Config::fixture("ws://127.0.0.1:1/v1/connect", test_credential(), true)
         .expect("configure deterministic gateway")
+}
+
+fn deterministic_connection_loop_dependencies(
+    sleeper: Arc<dyn Sleeper>,
+) -> ConnectionLoopDependencies {
+    let frame_source = deterministic_frame_source();
+    let boot_id = frame_source.public_id("rbt_");
+    let (recorder, _capture) = test_recorder(&boot_id);
+    ConnectionLoopDependencies::new(
+        deterministic_config(),
+        frame_source,
+        sleeper,
+        recorder,
+        healthy_wall_clock(),
+        boot_id,
+    )
+}
+
+async fn run_deterministic_connection_loop(
+    sleeper: Arc<dyn Sleeper>,
+    connector: &dyn Connector,
+    shutdown: &mut dyn Shutdown,
+) -> Result<(), ServiceError> {
+    run_connection_loop(
+        deterministic_connection_loop_dependencies(sleeper),
+        connector,
+        Backoff::with_fixed_unit(1.0),
+        shutdown,
+    )
+    .await
 }
 
 fn opening_frame(encoded: &[u8]) -> OpeningHello<'_> {

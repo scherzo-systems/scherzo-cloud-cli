@@ -29,13 +29,20 @@ interface TextResponse {
   stopReason: "stop" | "length";
 }
 
+interface ToolCallResponse {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
 interface ToolCallsResponse {
   kind: "toolCalls";
-  calls: Array<{
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-  }>;
+  calls: ToolCallResponse[];
+}
+
+interface TruncatedToolCallResponse {
+  kind: "truncatedToolCall";
+  call: ToolCallResponse;
 }
 
 interface FailureResponse {
@@ -44,7 +51,11 @@ interface FailureResponse {
   message: string;
 }
 
-type ProviderResponse = TextResponse | ToolCallsResponse | FailureResponse;
+type ProviderResponse =
+  | TextResponse
+  | ToolCallsResponse
+  | TruncatedToolCallResponse
+  | FailureResponse;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -82,6 +93,22 @@ function decodeResponse(value: unknown): ProviderResponse {
     return {
       kind: "toolCalls",
       calls: value.calls as ToolCallsResponse["calls"],
+    };
+  }
+  if (
+    value.kind === "truncatedToolCall" &&
+    isRecord(value.call) &&
+    typeof value.call.id === "string" &&
+    typeof value.call.name === "string" &&
+    isRecord(value.call.arguments)
+  ) {
+    return {
+      kind: "truncatedToolCall",
+      call: {
+        id: value.call.id,
+        name: value.call.name,
+        arguments: value.call.arguments,
+      },
     };
   }
   if (
@@ -259,13 +286,15 @@ function emitToolCalls(
       partial: snapshot(output),
     });
     const delta = JSON.stringify(call.arguments);
+    for (let offset = 0; offset < delta.length; offset += 64 * 1024) {
+      stream.push({
+        type: "toolcall_delta",
+        contentIndex,
+        delta: delta.slice(offset, offset + 64 * 1024),
+        partial: snapshot(output),
+      });
+    }
     toolCall.arguments = call.arguments;
-    stream.push({
-      type: "toolcall_delta",
-      contentIndex,
-      delta,
-      partial: snapshot(output),
-    });
     stream.push({
       type: "toolcall_end",
       contentIndex,
@@ -277,6 +306,42 @@ function emitToolCalls(
   stream.push({
     type: "done",
     reason: "toolUse",
+    message: snapshot(output),
+  });
+}
+
+function emitTruncatedToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  call: ToolCallResponse,
+): void {
+  const toolCall: ToolCall = {
+    type: "toolCall",
+    id: call.id,
+    name: call.name,
+    arguments: {},
+  };
+  output.content.push(toolCall);
+  stream.push({
+    type: "toolcall_start",
+    contentIndex: 0,
+    partial: snapshot(output),
+  });
+  const delta = JSON.stringify(call.arguments);
+  toolCall.arguments = call.arguments;
+  stream.push({
+    type: "toolcall_delta",
+    contentIndex: 0,
+    delta,
+    partial: snapshot(output),
+  });
+  // Pi 0.83 must receive the terminal length event while this tool-call
+  // block is still open; emitting toolcall_end would not reproduce its
+  // truncated-call recovery path.
+  output.stopReason = "length";
+  stream.push({
+    type: "done",
+    reason: "length",
     message: snapshot(output),
   });
 }
@@ -309,6 +374,8 @@ function streamFakeProvider(
         emitText(stream, output, response);
       } else if (response.kind === "toolCalls") {
         emitToolCalls(stream, output, response.calls);
+      } else if (response.kind === "truncatedToolCall") {
+        emitTruncatedToolCall(stream, output, response.call);
       } else {
         output.stopReason = response.stopReason;
         output.errorMessage = response.message;

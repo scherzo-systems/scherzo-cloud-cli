@@ -12,7 +12,7 @@ use std::time::Duration;
 use ring::digest::{SHA256, digest};
 use rustix::fs::{
     AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fcntl_lock, fstat,
-    mkdirat, open, openat, renameat_with, statat, unlinkat,
+    mkdirat, openat, renameat_with, statat, unlinkat,
 };
 use rustix::io::{Errno, dup};
 use rustix::process::{Flock, FlockOffsetType, FlockType, fcntl_getlk};
@@ -22,10 +22,12 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
+use super::agent_diagnostics::AgentDiagnosticSessionStore;
+use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use super::coordinator::{CommitPort, CommittedActionKind, CommittedReduction};
 use super::execution_root::AdmittedExecutionRoot;
 use super::private_staging::{
-    create_staging_root, directory_entry_names, remove_staging_root, same_file,
+    create_staging_root, directory_entry_names, open_directory_path, remove_staging_root, same_file,
 };
 use super::process_group::{
     AuthenticatedProcessGroup, AuthenticatedSignalResult, DurableProcessGuardStore,
@@ -55,10 +57,24 @@ const PRIVATE_STAGING_ATTEMPTS: usize = 16;
 const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
 pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = 321 * 1024 * 1024;
+const MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_RETAINED_PROMPT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_RETAINED_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_RETAINED_CAPTURED_FILE_BYTES: u64 = MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES
+    + MAXIMUM_RETAINED_PROMPT_BYTES
+    + MAXIMUM_RETAINED_ATTACHMENT_BYTES;
+const MAXIMUM_RETAINED_RUN_JSON_BYTES: u64 =
+    3 * MAXIMUM_DURABLE_JSON_BYTES + super::result_metadata::MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
+// An archived-attempt read covers the immutable workflow/import captures, the base64
+// representation of both bounded diagnostic streams, and the run, state, manifest,
+// and result JSON envelopes. Each term is independently enforced while it is read.
+const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = MAXIMUM_RETAINED_CAPTURED_FILE_BYTES
+    + super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+    + MAXIMUM_RETAINED_RUN_JSON_BYTES;
 const MAXIMUM_DIAGNOSTICS: usize = 256;
 const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const QUIESCENCE_POLL_ATTEMPTS: usize = 2_000;
+const QUIESCENCE_POLL_ATTEMPTS: usize =
+    (MAXIMUM_CANCELLATION_GRACE.as_millis() / QUIESCENCE_POLL_INTERVAL.as_millis()) as usize;
 const SHA256_ALGORITHM: &str = "sha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -708,6 +724,27 @@ impl LocalAttemptOwner {
 
     pub(crate) fn private_directory_handle(&self) -> &OwnedFd {
         &self.state.private
+    }
+
+    pub(crate) fn create_agent_diagnostic_sessions(
+        &self,
+    ) -> Result<AgentDiagnosticSessionStore, LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        if state.current_attempt_number != self.attempt_number {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let local_run_id = Arc::<str>::from(state.local_run_id.as_str());
+        drop(state);
+        let attempt_name = attempt_directory_name(self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt_path = self.normalized.join(ATTEMPTS_DIRECTORY).join(attempt_name);
+        AgentDiagnosticSessionStore::create(
+            &self.attempt_directory,
+            &attempt_path,
+            local_run_id,
+            self.attempt_number,
+        )
+        .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
     }
 
     pub(crate) fn create_private_staging(
@@ -1717,13 +1754,23 @@ fn verify_initial_staging(
 }
 
 fn read_run(root: &OwnedFd) -> Result<LocalRunV1, LocalRunDirectoryError> {
+    read_run_with_size(root).map(|(run, _)| run)
+}
+
+fn read_run_with_size(root: &OwnedFd) -> Result<(LocalRunV1, u64), LocalRunDirectoryError> {
     let bytes = read_regular_file(root, RUN_FILE)?;
-    decode_run(&bytes)
+    let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    Ok((decode_run(&bytes)?, size))
 }
 
 fn read_state(root: &OwnedFd) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
+    read_state_with_size(root).map(|(state, _)| state)
+}
+
+fn read_state_with_size(root: &OwnedFd) -> Result<(LocalRunStateV1, u64), LocalRunDirectoryError> {
     let bytes = read_regular_file(root, STATE_FILE)?;
-    decode_state(&bytes)
+    let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    Ok((decode_state(&bytes)?, size))
 }
 
 pub(crate) fn acquire_local_retry(
@@ -1857,6 +1904,14 @@ pub(super) fn load_retained_execution(
     root: &OwnedFd,
     run: &LocalRunV1,
 ) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
+    load_retained_execution_with_budget(root, run, &mut RetainedReadBudget::default())
+}
+
+pub(super) fn load_retained_execution_with_budget(
+    root: &OwnedFd,
+    run: &LocalRunV1,
+    budget: &mut RetainedReadBudget,
+) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
     let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
     let expected_workflow_entries = BTreeSet::from([
         WORKFLOW_MANIFEST_FILE.as_bytes().to_vec(),
@@ -1866,6 +1921,7 @@ pub(super) fn load_retained_execution(
         return Err(LocalRunDirectoryError::StateInvalid);
     }
     let manifest_bytes = read_regular_file(&workflow_directory, WORKFLOW_MANIFEST_FILE)?;
+    budget.account(&manifest_bytes)?;
     if DigestV1::sha256(&manifest_bytes) != run.workflow_manifest_digest {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
@@ -1882,15 +1938,17 @@ pub(super) fn load_retained_execution(
         return Err(LocalRunDirectoryError::StateInvalid);
     }
 
-    let mut total_bytes = 0_u64;
+    let mut captured_file_bytes = 0;
     let mut read_file = |file: &ManifestFileV1| {
         let name = retained_file_name(file.ordinal)?;
         let bytes = read_retained_file(&files, &name)?;
         let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-        total_bytes = total_bytes
-            .checked_add(size)
-            .filter(|total| *total <= MAXIMUM_RETAINED_TOTAL_BYTES)
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        account_retained_bytes(
+            &mut captured_file_bytes,
+            size,
+            MAXIMUM_RETAINED_CAPTURED_FILE_BYTES,
+        )?;
+        budget.account(&bytes)?;
         if size != file.size_bytes || DigestV1::sha256(&bytes) != file.digest {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
@@ -2002,11 +2060,42 @@ fn retry_rejection(
     }
 }
 
+#[derive(Default)]
+pub(super) struct RetainedReadBudget {
+    total_bytes: u64,
+}
+
+impl RetainedReadBudget {
+    pub(super) fn with_bytes(total_bytes: u64) -> Result<Self, LocalRunDirectoryError> {
+        (total_bytes <= MAXIMUM_RETAINED_TOTAL_BYTES)
+            .then_some(Self { total_bytes })
+            .ok_or(LocalRunDirectoryError::StateInvalid)
+    }
+
+    pub(super) fn account(&mut self, bytes: &[u8]) -> Result<(), LocalRunDirectoryError> {
+        let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        account_retained_bytes(&mut self.total_bytes, size, MAXIMUM_RETAINED_TOTAL_BYTES)
+    }
+}
+
+fn account_retained_bytes(
+    total_bytes: &mut u64,
+    size: u64,
+    maximum_bytes: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    *total_bytes = total_bytes
+        .checked_add(size)
+        .filter(|total| *total <= maximum_bytes)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    Ok(())
+}
+
 pub(super) struct StableLocalRunSnapshot {
     pub(super) run_directory: PathBuf,
     pub(super) root: OwnedFd,
     pub(super) run: LocalRunV1,
     pub(super) state: LocalRunStateV1,
+    pub(super) retained_json_bytes: u64,
     pub(super) lock_held: bool,
 }
 
@@ -2028,11 +2117,13 @@ pub(super) fn read_stable_local_run_snapshot(
         code: LocalStatusErrorCode::RunDirectoryUnavailable,
         run_directory: reported_directory.clone(),
     })?;
-    let run = read_run(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+    let (run, run_bytes) =
+        read_run_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
     let lock = open_status_lock(&root, &reported_directory)?;
 
     for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
-        let before = read_state(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+        let (before, _) =
+            read_state_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
         if before.local_run_id != run.local_run_id {
             return Err(invalid_status_error(&reported_directory));
         }
@@ -2040,7 +2131,8 @@ pub(super) fn read_stable_local_run_snapshot(
             code: LocalStatusErrorCode::LockQueryFailed,
             run_directory: reported_directory.clone(),
         })?;
-        let after = read_state(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+        let (after, state_bytes) =
+            read_state_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
         if after.local_run_id != run.local_run_id {
             return Err(invalid_status_error(&reported_directory));
         }
@@ -2048,11 +2140,17 @@ pub(super) fn read_stable_local_run_snapshot(
         if before.revision != after.revision {
             continue;
         }
+        let retained_json_bytes = run_bytes
+            .checked_add(state_bytes)
+            .ok_or_else(|| invalid_status_error(&reported_directory))?;
+        RetainedReadBudget::with_bytes(retained_json_bytes)
+            .map_err(|_| invalid_status_error(&reported_directory))?;
         return Ok(StableLocalRunSnapshot {
             run_directory: normalized,
             root,
             run,
             state: after,
+            retained_json_bytes,
             lock_held,
         });
     }
@@ -3026,14 +3124,6 @@ fn create_file(parent: &OwnedFd, name: &str, mode: Mode) -> Result<File, LocalRu
 
 fn mkdir(parent: &OwnedFd, name: impl rustix::path::Arg) -> Result<(), LocalRunDirectoryError> {
     mkdirat(parent, name, Mode::RWXU).map_err(|_| LocalRunDirectoryError::StagingUnavailable)
-}
-
-fn open_directory_path(path: &Path) -> Result<OwnedFd, Errno> {
-    open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
 }
 
 pub(super) fn open_directory_at(

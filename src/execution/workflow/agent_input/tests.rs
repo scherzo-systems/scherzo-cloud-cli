@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
+use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
@@ -15,9 +17,13 @@ use crate::execution::workflow::admission::{
     ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentValueKind, NoopAgentObservationSink, WorkflowRunId};
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
+use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
+use crate::execution::workflow::validated::ValidatedHarness;
 
 const SYSTEM_PROMPT: &str = "System @ exact.\n";
 const STATIC_MESSAGE: &str = "static - text\n";
@@ -40,15 +46,28 @@ struct Fixture {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
     staging: AgentInputStaging,
+    diagnostic_sessions: AgentDiagnosticSessionStore,
     upstream: BTreeMap<ResolvedOutputSource, CapturedValue>,
 }
 
 impl Fixture {
     fn new(mode: ConsumerValueMode) -> Self {
-        Self::with_attachment_splices(mode, 1)
+        Self::with_configuration(mode, 1, false)
     }
 
     fn with_attachment_splices(mode: ConsumerValueMode, attachment_splices: usize) -> Self {
+        Self::with_configuration(mode, attachment_splices, false)
+    }
+
+    fn with_claude_code_consumer(mode: ConsumerValueMode) -> Self {
+        Self::with_configuration(mode, 1, true)
+    }
+
+    fn with_configuration(
+        mode: ConsumerValueMode,
+        attachment_splices: usize,
+        claude_code_consumer: bool,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -78,7 +97,18 @@ impl Fixture {
         )
         .unwrap();
 
-        let resolved = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+        let mut resolved = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+        if claude_code_consumer {
+            let ValidatedStep::Agent(consumer) =
+                resolved.definition.steps.get_mut("consumer").unwrap()
+            else {
+                panic!("the fixture consumer must be an agent step");
+            };
+            consumer.agent.harness = ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+                model: "claude-opus-4-1".to_owned(),
+                effort: ClaudeCodeEffort::High,
+            });
+        }
 
         // This ordered mutation occurs after resolution and before materialization. The
         // invocation must continue to use only the retained closure and captured artifact.
@@ -111,8 +141,13 @@ impl Fixture {
                 .with_diagnostic_source_name(Arc::from("@notes.txt")),
             ]),
         );
-        let admitted =
-            admit_workflow(resolved, imports, execution_context(&execution_root)).unwrap();
+        let mut context = execution_context(&execution_root);
+        if claude_code_consumer {
+            context = context.with_claude_code_installation(
+                ValidatedClaudeCodeInstallation::fixture("/validated/claude".into()),
+            );
+        }
+        let admitted = admit_workflow(resolved, imports, context).unwrap();
         let artifacts = ArtifactStaging::create(admitted.execution(), &staging_parent).unwrap();
         let captured = artifacts
             .capture_files(&[CaptureDeclaration::new(
@@ -144,6 +179,16 @@ impl Fixture {
             ),
         ]);
         let staging = AgentInputStaging::create(admitted.execution(), &staging_parent).unwrap();
+        let attempt_directory = temporary.path().join("run/attempts/000001");
+        fs::create_dir_all(&attempt_directory).unwrap();
+        let attempt_handle: OwnedFd = fs::File::open(&attempt_directory).unwrap().into();
+        let diagnostic_sessions = AgentDiagnosticSessionStore::create(
+            &attempt_handle,
+            &attempt_directory,
+            Arc::from("00000000-0000-4000-8000-000000000001"),
+            1,
+        )
+        .unwrap();
         Self {
             _temporary: temporary,
             source_root,
@@ -152,6 +197,7 @@ impl Fixture {
             admitted,
             artifacts,
             staging,
+            diagnostic_sessions,
             upstream,
         }
     }
@@ -165,6 +211,7 @@ impl Fixture {
             &self.admitted,
             &self.artifacts,
             &self.staging,
+            &self.diagnostic_sessions,
             identity(),
             &self.upstream,
             cancellation,
@@ -410,6 +457,53 @@ fn each_declared_agent_value_mode_is_selected_without_file_outputs_affecting_it(
 }
 
 #[test]
+fn materialization_preserves_each_profiles_native_configuration_and_limits() {
+    let pi_fixture = Fixture::new(ConsumerValueMode::None);
+    let pi_materialized = pi_fixture.materialize(CancellationSource::new()).unwrap();
+    let ClosedAgentInvocation::Pi(pi) = pi_materialized.invocation() else {
+        panic!("the Pi fixture must materialize a Pi invocation");
+    };
+    assert_eq!(pi.adapter().native_configuration().model, "openai/gpt-5");
+    assert_eq!(
+        pi.adapter().native_configuration().thinking,
+        Thinking::XHigh
+    );
+    assert_eq!(
+        pi.limits().adapter_protocol(),
+        &PiJsonV1ProtocolLimits::profile()
+    );
+
+    let claude_fixture = Fixture::with_claude_code_consumer(ConsumerValueMode::None);
+    let claude_materialized = claude_fixture
+        .materialize(CancellationSource::new())
+        .unwrap();
+    let ClosedAgentInvocation::ClaudeCode(claude) = claude_materialized.invocation() else {
+        panic!("the Claude fixture must materialize a Claude invocation");
+    };
+    assert_eq!(
+        claude.adapter().native_configuration().model,
+        "claude-opus-4-1"
+    );
+    assert_eq!(
+        claude.adapter().native_configuration().effort,
+        ClaudeCodeEffort::High
+    );
+    assert_eq!(
+        claude.limits().adapter_protocol(),
+        &ClaudeCodeStreamJsonV1ProtocolLimits::profile()
+    );
+    assert_eq!(
+        claude
+            .diagnostic_session()
+            .directory()
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str()),
+        Some("claude-code-stream-json-v1")
+    );
+}
+
+#[test]
 fn expanded_attachment_splices_are_bounded_before_staging() {
     let fixture = Fixture::with_attachment_splices(ConsumerValueMode::None, 127);
 
@@ -540,12 +634,14 @@ fn cancellation_at_the_ready_barrier_removes_partial_staging_without_launch() {
     let cancellation = CancellationSource::new();
     let request_cancellation = cancellation.clone();
     let materializing_staging = staging.clone();
+    let diagnostic_sessions = fixture.diagnostic_sessions.clone();
     let (result_sender, result) = std::sync::mpsc::channel();
     let task = std::thread::spawn(move || {
         let result = materialize_agent_invocation(
             &admitted,
             &artifacts,
             &materializing_staging,
+            &diagnostic_sessions,
             identity(),
             &upstream,
             cancellation,
@@ -680,6 +776,7 @@ fn execution_root_rebinding_during_materialization_is_rejected_before_launch() {
         &fixture.admitted,
         &fixture.artifacts,
         &staging,
+        &fixture.diagnostic_sessions,
         identity(),
         &fixture.upstream,
         CancellationSource::new(),

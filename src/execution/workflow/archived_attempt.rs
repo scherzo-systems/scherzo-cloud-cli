@@ -18,8 +18,8 @@ use super::artifact_set;
 use super::document::Output;
 use super::local_run::{
     AttemptResultV1, AttemptStateV1, AttemptStepStateV1, AttemptTriggerV1, LocalAttemptV1,
-    LocalStatusError, LocalStatusErrorCode, StableLocalRunSnapshot, load_retained_execution,
-    open_directory_at, read_stable_local_run_snapshot,
+    LocalStatusError, LocalStatusErrorCode, RetainedReadBudget, StableLocalRunSnapshot,
+    load_retained_execution_with_budget, open_directory_at, read_stable_local_run_snapshot,
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
@@ -38,7 +38,6 @@ const RESULT_FILE: &str = "result.json";
 const SHA256_ALGORITHM: &str = "sha256";
 const BASE64_ENCODING: &str = "base64";
 const LOCAL_PROVENANCE: &str = "local";
-const MAXIMUM_RETAINED_BYTES_PER_STREAM: u64 = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedAttemptOperationalErrorCode {
@@ -305,13 +304,16 @@ fn load_local_archived_attempt_with(
         .join(Path::new(&relative_result_directory));
     let result_root = open_relative_directory(&snapshot.root, &relative_result_directory)
         .map_err(|()| result_unavailable(&snapshot.run_directory))?;
+    let mut retained_budget = RetainedReadBudget::with_bytes(snapshot.retained_json_bytes)
+        .map_err(|_| result_invalid(&snapshot.run_directory))?;
     let (workflow, _, maximum_parallel_steps) =
-        load_retained_execution(&snapshot.root, &snapshot.run).map_err(|_| {
-            ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
-                code: ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
-                run_directory: Some(snapshot.run_directory.clone()),
-            })
-        })?;
+        load_retained_execution_with_budget(&snapshot.root, &snapshot.run, &mut retained_budget)
+            .map_err(|_| {
+                ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
+                    code: ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
+                    run_directory: Some(snapshot.run_directory.clone()),
+                })
+            })?;
     let result_bytes = read_immutable_result(
         &result_root,
         observer,
@@ -319,6 +321,9 @@ fn load_local_archived_attempt_with(
         result_metadata::MAXIMUM_RESULT_JSON_BYTES,
     )
     .map_err(|()| result_unavailable(&snapshot.run_directory))?;
+    retained_budget
+        .account(&result_bytes)
+        .map_err(|_| result_invalid(&snapshot.run_directory))?;
     let result =
         decode_result(&result_bytes).map_err(|()| result_invalid(&snapshot.run_directory))?;
     artifact_set::validate(&result_root, &result)
@@ -536,7 +541,7 @@ fn validate_and_project_result(
         || result
             .command_output_policy
             .maximum_retained_bytes_per_stream
-            != MAXIMUM_RETAINED_BYTES_PER_STREAM
+            != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         || !is_canonical_relative_path(&result.workflow.path)
         || !is_canonical_absolute_path(&result.workflow.provenance.source_root)
         || !is_canonical_absolute_path(&result.execution.execution_root)
@@ -607,6 +612,7 @@ fn project_steps(
     {
         return Err(());
     }
+    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(result.steps.len());
     result
         .steps
         .iter()
@@ -621,7 +627,7 @@ fn project_steps(
             {
                 return Err(());
             }
-            project_step(step, definition)
+            project_step(step, definition, maximum_stream_bytes)
         })
         .collect()
 }
@@ -678,7 +684,11 @@ fn validate_terminal_step_facts(
     valid_outcome.then_some(()).ok_or(())
 }
 
-fn project_step(step: &WorkflowStepV1, definition: &ValidatedStep) -> Result<ArchivedStep, ()> {
+fn project_step(
+    step: &WorkflowStepV1,
+    definition: &ValidatedStep,
+    maximum_stream_bytes: u64,
+) -> Result<ArchivedStep, ()> {
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
         (Some(started_at), Some(duration)) => (
             Some(parse_timestamp(started_at).ok_or(())?),
@@ -729,7 +739,9 @@ fn project_step(step: &WorkflowStepV1, definition: &ValidatedStep) -> Result<Arc
         }
     };
     let command_output = match (&step.command_output, definition) {
-        (Some(output), ValidatedStep::Command(_)) => Some(project_command_output(output)?),
+        (Some(output), ValidatedStep::Command(_)) => {
+            Some(project_command_output(output, maximum_stream_bytes)?)
+        }
         (None, ValidatedStep::Command(_) | ValidatedStep::Agent(_)) => None,
         (Some(_), ValidatedStep::Agent(_)) => return Err(()),
     };
@@ -780,19 +792,24 @@ fn exact_step_fields(
     Ok(())
 }
 
-fn project_command_output(output: &CommandOutputV1) -> Result<ArchivedCommandOutput, ()> {
+fn project_command_output(
+    output: &CommandOutputV1,
+    maximum_stream_bytes: u64,
+) -> Result<ArchivedCommandOutput, ()> {
     Ok(ArchivedCommandOutput {
-        stdout: project_diagnostic_stream(&output.stdout)?,
-        stderr: project_diagnostic_stream(&output.stderr)?,
+        stdout: project_diagnostic_stream(&output.stdout, maximum_stream_bytes)?,
+        stderr: project_diagnostic_stream(&output.stderr, maximum_stream_bytes)?,
     })
 }
 
-fn project_diagnostic_stream(stream: &DiagnosticStreamV1) -> Result<ArchivedDiagnosticStream, ()> {
+fn project_diagnostic_stream(
+    stream: &DiagnosticStreamV1,
+    maximum_stream_bytes: u64,
+) -> Result<ArchivedDiagnosticStream, ()> {
     if stream.encoding != BASE64_ENCODING
-        || stream.retained_bytes > MAXIMUM_RETAINED_BYTES_PER_STREAM
+        || stream.retained_bytes > maximum_stream_bytes
         || stream.truncated != (stream.discarded_bytes != 0)
-        || (stream.discarded_bytes != 0
-            && stream.retained_bytes != MAXIMUM_RETAINED_BYTES_PER_STREAM)
+        || (stream.discarded_bytes != 0 && stream.retained_bytes != maximum_stream_bytes)
     {
         return Err(());
     }

@@ -34,7 +34,7 @@
           "leasePolicy": {
             "fencingMarginMilliseconds": 11000,
             "forceStopAndReapBudgetMilliseconds": 5000,
-            "leaseDurationMilliseconds": 30000,
+            "leaseDurationMilliseconds": 320000,
             "maxClockUncertaintyMilliseconds": 1000,
             "renewalDeliveryBudgetMilliseconds": 5000,
             "schemaVersion": 1,

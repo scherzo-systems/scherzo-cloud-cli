@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud organization --help
+Manage Scherzo Cloud organizations
+
+Usage: scherzo-cloud organization [COMMAND]
+
+Commands:
+  create   Create a Scherzo Cloud organization
+  show     Show a Scherzo Cloud organization
+  update   Update a Scherzo Cloud organization
+  members  Manage Scherzo Cloud organization members
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

@@ -33,7 +33,7 @@ const EXPORT_QUEUE_CAPACITY: usize = 128;
 const MAX_EXPORT_BATCH_SIZE: usize = 32;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_COUNT: usize = 64;
-const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+pub(super) const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 const DIAGNOSTIC_NAME: &str = "runner.telemetry_export";
 const DIAGNOSTIC_NAME_FIELD: &str = "diagnostic.name";

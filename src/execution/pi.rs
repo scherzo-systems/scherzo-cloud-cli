@@ -9,9 +9,9 @@ use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 use crate::process::{CommandOutput, CommandRequest, CommandRunner, SystemCommandRunner};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAXIMUM_VERSION_OUTPUT_BYTES: usize = 128;
-const MAXIMUM_CAPABILITY_OUTPUT_BYTES: usize = 16 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAXIMUM_VERSION_OUTPUT_BYTES: usize = 4 * 1024;
+const MAXIMUM_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
 pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.83.0 <0.84.0";
 pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.83.0";
 const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 83, 0);
@@ -28,7 +28,7 @@ const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
 
 const REQUIRED_CAPABILITIES: [PiCapability; 5] = [
     PiCapability::JsonEventStream,
-    PiCapability::EphemeralSession,
+    PiCapability::CustomSessionDirectory,
     PiCapability::ExtensionLoading,
     PiCapability::SystemPromptAppend,
     PiCapability::InvocationScopedProjectTrust,
@@ -84,7 +84,7 @@ impl PiVersion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiCapability {
     JsonEventStream,
-    EphemeralSession,
+    CustomSessionDirectory,
     ExtensionLoading,
     SystemPromptAppend,
     InvocationScopedProjectTrust,
@@ -94,7 +94,7 @@ impl PiCapability {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::JsonEventStream => "json_event_stream",
-            Self::EphemeralSession => "ephemeral_session",
+            Self::CustomSessionDirectory => "custom_session_directory",
             Self::ExtensionLoading => "extension_loading",
             Self::SystemPromptAppend => "system_prompt_append",
             Self::InvocationScopedProjectTrust => "invocation_scoped_project_trust",
@@ -104,7 +104,7 @@ impl PiCapability {
     fn is_advertised_by(self, help: &str) -> bool {
         help.lines().map(str::trim_start).any(|line| match self {
             Self::JsonEventStream => line.starts_with("--mode <mode>") && line.contains("json"),
-            Self::EphemeralSession => line.starts_with("--no-session "),
+            Self::CustomSessionDirectory => line.starts_with("--session-dir <dir> "),
             Self::ExtensionLoading => line.starts_with("--extension, -e <path> "),
             Self::SystemPromptAppend => line.starts_with("--append-system-prompt <text> "),
             Self::InvocationScopedProjectTrust => line.starts_with("--approve, -a "),
@@ -468,7 +468,7 @@ mod tests {
     use crate::process::CommandProbeError;
     use std::sync::Mutex;
 
-    const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+    const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
 
     struct FakeRunner {
         invocations: Mutex<Vec<Vec<String>>>,
@@ -479,7 +479,7 @@ mod tests {
     impl CommandRunner for FakeRunner {
         fn run(&self, command: CommandRequest<'_>) -> Result<CommandOutput, CommandProbeError> {
             assert!(command.program.is_absolute());
-            assert_eq!(command.timeout, Duration::from_secs(5));
+            assert_eq!(command.timeout, Duration::from_secs(30));
             assert!(command.clear_environment);
             assert_isolated(command.environment, command.current_directory);
             self.invocations.lock().unwrap().push(
@@ -491,11 +491,11 @@ mod tests {
             );
             match command.args {
                 ["--version"] => {
-                    assert_eq!(command.maximum_stdout_bytes, 128);
+                    assert_eq!(command.maximum_stdout_bytes, 4 * 1024);
                     Ok(self.version.clone())
                 }
                 args if args == CAPABILITY_PROBE_ARGUMENTS => {
-                    assert_eq!(command.maximum_stdout_bytes, 16 * 1024);
+                    assert_eq!(command.maximum_stdout_bytes, 64 * 1024);
                     Ok(self.capabilities.clone())
                 }
                 _ => Err(CommandProbeError::Spawn),
@@ -620,6 +620,26 @@ mod tests {
                 Err(PiInstallationFailure::Malformed(PiProbe::Version))
             );
         }
+
+        let missing_session_directory = FakeRunner {
+            invocations: Mutex::new(Vec::new()),
+            version: output(b"0.83.0\n"),
+            capabilities: output(
+                COMPLETE_HELP
+                    .replace("--session-dir <dir>", "--session-root <dir>")
+                    .as_bytes(),
+            ),
+        };
+        assert_eq!(
+            validate_pi_installation_with(
+                &executable,
+                OsStr::new("/controlled/bin"),
+                &missing_session_directory,
+            ),
+            Err(PiInstallationFailure::Unsupported(
+                PiIncompatibility::Capability(PiCapability::CustomSessionDirectory)
+            ))
+        );
 
         let missing_trust = FakeRunner {
             invocations: Mutex::new(Vec::new()),

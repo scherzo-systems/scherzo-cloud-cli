@@ -12,10 +12,14 @@ use tokio::sync::{Notify, mpsc};
 use super::Sleeper;
 use super::config::{AssignmentConfig, Config};
 use super::execution::{AssignmentProcessGuards, ExecutionJob};
+use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmittedWorkflow, CancellationPolicy, CancellationSource,
     EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
     default_execution_policy_limits,
+};
+use crate::execution::workflow::cancellation::{
+    MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
 };
 use crate::execution::workflow::command_contract::{
     ServeWorkflowContractFailure, ServeWorkflowContractFailureKind,
@@ -32,11 +36,6 @@ const MAXIMUM_RETAINED_DECISIONS: usize = 256;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 pub(super) const MAXIMUM_TRANSITIONS_PER_STEP: usize = 5;
-const MINIMUM_PARALLEL_STEPS: u64 = 1;
-const MAXIMUM_PARALLEL_STEPS: u64 = 64;
-const MINIMUM_CANCELLATION_GRACE_SECONDS: u64 = 1;
-const MAXIMUM_CANCELLATION_GRACE_SECONDS: u64 = 10;
-const MAXIMUM_CANCELLATION_GRACE_MILLISECONDS: u64 = MAXIMUM_CANCELLATION_GRACE_SECONDS * 1000;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
 
 pub(super) trait WallClockHealth: Send + Sync {
@@ -1514,10 +1513,13 @@ fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePol
     if policy.fencing_margin_milliseconds < fencing_required {
         return Err(WelcomePolicyFailure::Invalid);
     }
+    let maximum_cancellation_grace_milliseconds =
+        u64::try_from(MAXIMUM_CANCELLATION_GRACE.as_millis())
+            .map_err(|_| WelcomePolicyFailure::Invalid)?;
     for delivery_budget in [start_delivery, renewal_delivery] {
         let lease_required = policy
             .fencing_margin_milliseconds
-            .checked_add(MAXIMUM_CANCELLATION_GRACE_MILLISECONDS)
+            .checked_add(maximum_cancellation_grace_milliseconds)
             .and_then(|value| value.checked_add(delivery_budget))
             .ok_or(WelcomePolicyFailure::Invalid)?;
         if policy.lease_duration_milliseconds < lease_required {
@@ -1556,10 +1558,13 @@ fn validate_execution_spec(
             ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
         ));
     }
-    if !(MINIMUM_PARALLEL_STEPS..=MAXIMUM_PARALLEL_STEPS)
-        .contains(&execution_spec.execution_limits.maximum_parallel_steps)
-        || !(MINIMUM_CANCELLATION_GRACE_SECONDS..=MAXIMUM_CANCELLATION_GRACE_SECONDS)
-            .contains(&execution_spec.execution_limits.cancellation_grace_seconds)
+    let maximum_parallel_steps =
+        usize::try_from(execution_spec.execution_limits.maximum_parallel_steps)
+            .map_err(|_| invalid_execution_limits())?;
+    let cancellation_grace =
+        Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
+    if !(1..=MAXIMUM_PARALLEL_STEPS).contains(&maximum_parallel_steps)
+        || !(MINIMUM_CANCELLATION_GRACE..=MAXIMUM_CANCELLATION_GRACE).contains(&cancellation_grace)
     {
         return Err(invalid_execution_limits());
     }
@@ -1671,7 +1676,7 @@ printf '%s\n' '{"type":"agent_settled"}'
             terminal_report_delivery_budget_milliseconds: 5000,
             start_delivery_budget_milliseconds: 5000,
             renewal_delivery_budget_milliseconds: 5000,
-            lease_duration_milliseconds: 30_000,
+            lease_duration_milliseconds: 320_000,
             fencing_margin_milliseconds: 11_000,
         }
     }
@@ -1862,6 +1867,22 @@ printf '%s\n' '{"type":"agent_settled"}'
     }
 
     #[test]
+    fn execution_spec_accepts_maximum_cancellation_grace_and_rejects_above_it() {
+        let mut execution_spec = offer("bg").execution_spec;
+        execution_spec.execution_limits.cancellation_grace_seconds =
+            MAXIMUM_CANCELLATION_GRACE.as_secs();
+        assert_eq!(validate_execution_spec(&execution_spec), Ok(()));
+
+        execution_spec.execution_limits.cancellation_grace_seconds += 1;
+        assert_eq!(
+            validate_execution_spec(&execution_spec),
+            Err(AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::InvalidExecutionLimits
+            ))
+        );
+    }
+
+    #[test]
     fn rejects_file_and_git_branch_outputs_before_acceptance() {
         for output in [
             "        kind: file\n        path: value.txt\n        mediaType: text/plain\n",
@@ -1907,6 +1928,20 @@ printf '%s\n' '{"type":"agent_settled"}'
             })
         ));
         assert!(manager.slot.is_none());
+    }
+
+    #[test]
+    fn execution_spec_accepts_the_shared_parallelism_limit_and_declines_the_next_value() {
+        let mut execution_spec = offer("bg").execution_spec;
+        execution_spec.execution_limits.maximum_parallel_steps =
+            u64::try_from(MAXIMUM_PARALLEL_STEPS).unwrap();
+        assert_eq!(validate_execution_spec(&execution_spec), Ok(()));
+
+        execution_spec.execution_limits.maximum_parallel_steps += 1;
+        assert_eq!(
+            validate_execution_spec(&execution_spec),
+            Err(invalid_execution_limits())
+        );
     }
 
     #[test]
@@ -2596,9 +2631,20 @@ printf '%s\n' '{"type":"agent_settled"}'
                 })
                 .unwrap();
         }
-        assert_eq!(outbox.reserve(256), Ok(1_283));
+        let transition_entries = MAXIMUM_TRANSITIONS_PER_STEP * MAXIMUM_PARALLEL_STEPS;
+        assert_eq!(
+            transition_entries + OBSERVATION_RESERVE_BASE,
+            MAXIMUM_SERVICE_OBSERVATIONS
+        );
+        assert_eq!(
+            outbox.reserve(MAXIMUM_PARALLEL_STEPS),
+            Ok(transition_entries + 3)
+        );
         assert!(outbox.lock().entries.capacity() >= MAXIMUM_SERVICE_OBSERVATIONS);
-        assert_eq!(outbox.reserve(257), Err(environment_unavailable()));
+        assert_eq!(
+            outbox.reserve(MAXIMUM_PARALLEL_STEPS + 1),
+            Err(environment_unavailable())
+        );
         assert_eq!(outbox.len(), 32);
     }
 

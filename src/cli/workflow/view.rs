@@ -1,10 +1,8 @@
-use std::fmt;
-use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
-use std::process::ExitCode;
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::execution::workflow::archived_attempt::{
@@ -19,8 +17,12 @@ use crate::execution::workflow::presentation_feed::normalize_terminal_scalar;
 use crate::execution::workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
 };
+use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Inspect one published local workflow attempt interactively";
+pub(super) const ABOUT: &str = "View a published local workflow attempt";
+pub(super) const AFTER_HELP: &str = "Attempt selection:
+  When --attempt is omitted, the command selects the current attempt from a stable run
+  snapshot before opening the interactive view.";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -31,14 +33,14 @@ pub(super) struct Command {
         long,
         value_name = "NUMBER",
         value_parser = parse_attempt,
-        help = "Positive attempt number; defaults to the current attempt in one stable snapshot"
+        help = "Attempt number to view (defaults to the current attempt)"
     )]
     attempt: Option<NonZeroU64>,
 
     #[arg(
         long,
         value_enum,
-        value_name = "auto|always|never",
+        value_name = "WHEN",
         default_value_t = super::ColorArgument::Auto,
         help = "Select renderer color behavior"
     )]
@@ -46,20 +48,19 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         super::execute_with_abandonable_runtime("view", self.execute_async())
     }
 
-    async fn execute_async(self) -> ExitCode {
-        let Some((mut interrupt, mut terminate)) = super::observe_workflow_signals("view") else {
-            return ExitCode::FAILURE;
-        };
+    async fn execute_async(self) -> super::super::CommandResult {
+        let (mut interrupt, mut terminate) = super::observe_workflow_signals("view")?;
 
         let config = viewer_config(self.color, TerminalCapabilities::detect());
         if config.mode() != PresentationMode::Tui {
-            return diagnose(
-                "workflow view requires terminal stdin, terminal stdout, and a usable TERM",
-            );
+            return Err(anyhow!(
+                "workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>"
+            )
+            .into());
         }
 
         let requested = self.run.run_dir;
@@ -71,21 +72,24 @@ impl Command {
         let attempt = tokio::select! {
             biased;
             exit = first_view_signal(&mut interrupt, &mut terminate) => {
-                return viewer_exit_code(exit);
+                return Ok(viewer_exit_code(exit));
             }
             result = &mut load => {
                 match result {
                     Ok(Ok(attempt)) => attempt,
-                    Ok(Err(error)) => return diagnose_load_error(&requested, error),
-                    Err(_) => return diagnose("workflow view archive loader failed"),
+                    Ok(Err(error)) => return Err(load_error(&requested, error).into()),
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context("load workflow view archive")
+                            .into());
+                    }
                 }
             }
         };
 
-        let host = match ArchivedWorkflowTerminalHost::start(attempt, config.color_enabled()) {
-            Ok(host) => host,
-            Err(failure) => return diagnose_terminal_failure(&failure),
-        };
+        let host = ArchivedWorkflowTerminalHost::start(attempt, config.color_enabled())
+            .map_err(anyhow::Error::new)
+            .context("start workflow view terminal")?;
         let request = host.exit_request();
         let mut waiting = Box::pin(host.wait());
         let result = tokio::select! {
@@ -97,8 +101,8 @@ impl Command {
             result = &mut waiting => result,
         };
         match result {
-            Ok(exit) => viewer_exit_code(exit),
-            Err(failure) => diagnose_terminal_failure(&failure),
+            Ok(exit) => Ok(viewer_exit_code(exit)),
+            Err(failure) => Err(terminal_failure(&failure).into()),
         }
     }
 }
@@ -143,28 +147,27 @@ async fn first_view_signal(
 
 fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
     match exit {
-        ArchivedTerminalHostExit::Quit => ExitCode::SUCCESS,
-        ArchivedTerminalHostExit::Interrupted => ExitCode::from(130),
-        ArchivedTerminalHostExit::Terminated => ExitCode::from(143),
+        ArchivedTerminalHostExit::Quit => ExitCode::Success,
+        ArchivedTerminalHostExit::Interrupted => ExitCode::Interrupted,
+        ArchivedTerminalHostExit::Terminated => ExitCode::Terminated,
     }
 }
 
-fn diagnose_load_error(requested: &Path, error: ArchivedAttemptLoadError) -> ExitCode {
+fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Error {
     match error {
         ArchivedAttemptLoadError::Operational(error) => {
             let run_directory = error.run_directory.as_deref().unwrap_or(requested);
-            diagnose(format_args!(
-                "workflow view cannot load run {} ({})",
-                safe_path(run_directory),
-                operational_error_code(error.code),
+            anyhow!(operational_error_code(error.code)).context(format!(
+                "workflow view cannot load run {}",
+                safe_path(run_directory)
             ))
         }
-        ArchivedAttemptLoadError::Ineligible(error) => diagnose(format_args!(
-            "workflow view cannot open run {} attempt {} ({})",
-            safe_path(&error.run_directory),
-            error.attempt_number,
-            ineligibility_reason(error.reason),
-        )),
+        ArchivedAttemptLoadError::Ineligible(error) => anyhow!(ineligibility_reason(error.reason))
+            .context(format!(
+                "workflow view cannot open run {} attempt {}",
+                safe_path(&error.run_directory),
+                error.attempt_number
+            )),
     }
 }
 
@@ -193,32 +196,20 @@ fn ineligibility_reason(reason: ArchivedAttemptIneligibilityReason) -> &'static 
     }
 }
 
-fn diagnose_terminal_failure(failure: &PresentationFailure) -> ExitCode {
+fn terminal_failure(failure: &PresentationFailure) -> anyhow::Error {
     failure.error_kind.map_or_else(
-        || {
-            diagnose(format_args!(
-                "workflow view terminal failure: {:?}",
-                failure.operation
-            ))
-        },
+        || anyhow!("workflow view terminal failure: {:?}", failure.operation),
         |kind| {
-            diagnose(format_args!(
+            anyhow!(
                 "workflow view terminal failure: {:?} ({kind:?})",
                 failure.operation
-            ))
+            )
         },
     )
 }
 
 fn safe_path(path: &Path) -> String {
     normalize_terminal_scalar(path.as_os_str().as_bytes())
-}
-
-fn diagnose(message: impl fmt::Display) -> ExitCode {
-    let standard_error = io::stderr();
-    let mut standard_error = standard_error.lock();
-    let _ = writeln!(standard_error, "Error: {message}").and_then(|()| standard_error.flush());
-    ExitCode::FAILURE
 }
 
 #[cfg(test)]

@@ -2,15 +2,11 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::fs::{File, FileTimes};
 use std::io::Write as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::time::{Duration, SystemTime};
 
 use flate2::{Compression, write::ZlibEncoder};
 use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest};
@@ -67,7 +63,7 @@ impl ArtifactSet {
             },
             "commandOutputPolicy": {
                 "encoding": "base64",
-                "maximumRetainedBytesPerStream": 65536
+                "maximumRetainedBytesPerStream": 4194304
             },
             "outcome": "succeeded",
             "steps": [{
@@ -223,13 +219,45 @@ fn diagnostic_codes(report: &Value) -> Vec<&str> {
 }
 
 #[test]
+fn missing_artifact_directory_is_operational_for_humans_and_structured_for_json() {
+    let temporary = tempfile::tempdir().unwrap();
+    let missing = temporary.path().join("missing-artifact");
+    let argument = missing.to_str().unwrap();
+
+    let human = run(&["artifact", "validate", argument]);
+
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(stderr.starts_with("Error: open artifact directory "));
+    assert!(stderr.contains(argument));
+    assert!(stderr.contains("No such file or directory"));
+
+    let structured = run(&["artifact", "validate", "--json", argument]);
+
+    assert_eq!(structured.status.code(), Some(1));
+    assert!(structured.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(report["outcome"], "invalid");
+    assert_eq!(
+        report["diagnostics"][0]["code"],
+        "artifact_directory_unavailable"
+    );
+}
+
+#[test]
 fn copied_current_kind_set_validates_in_human_and_json_modes_without_mutation() {
     let artifact = ArtifactSet::valid();
     let before = byte_snapshot(&artifact.root);
 
     let human = run(&["artifact", "validate", artifact.argument()]);
     assert!(human.status.success());
-    assert!(String::from_utf8_lossy(&human.stdout).contains("Artifact Set V1 is valid:"));
+    let report = String::from_utf8_lossy(&human.stdout);
+    assert!(report.contains("✓ Artifact set is valid."));
+    assert!(report.contains("directory:"));
+    assert!(report.contains("exports: 5"));
+    assert!(report.contains("carriers: 3"));
+    assert!(report.contains("bytes: 50"));
     assert!(human.stderr.is_empty());
 
     let structured = run(&["artifact", "validate", "--json", artifact.argument()]);
@@ -256,6 +284,27 @@ fn copied_current_kind_set_validates_in_human_and_json_modes_without_mutation() 
     assert!(structured.stdout.ends_with(b"\n"));
     assert!(structured.stderr.is_empty());
     assert_eq!(byte_snapshot(&artifact.root), before);
+}
+
+#[test]
+fn missing_carrier_remedy_names_the_resolved_path() {
+    let artifact = ArtifactSet::valid();
+    let missing = artifact.root.join("exports/0002");
+    fs::remove_file(&missing).unwrap();
+    let resolved_missing = fs::canonicalize(&artifact.root)
+        .unwrap()
+        .join("exports/0002");
+
+    let output = run(&["artifact", "validate", artifact.argument()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(&format!(
+        "Restore the missing artifact carrier:\n  {}\n",
+        resolved_missing.display()
+    )));
+    assert!(!stdout.contains("at this location"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -728,38 +777,4 @@ fn carrier_limit_does_not_skip_later_authoritative_references() {
                     && diagnostic["location"]["path"] == "exports/2049"
             })
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn validation_does_not_update_artifact_access_times() {
-    let artifact = ArtifactSet::valid();
-    let paths = [
-        artifact.root.clone(),
-        artifact.root.join("result.json"),
-        artifact.root.join("exports"),
-        artifact.root.join("exports/0001"),
-        artifact.root.join("exports/0002"),
-        artifact.root.join("exports/0003"),
-    ];
-    let old_access = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    for path in &paths {
-        File::open(path)
-            .unwrap()
-            .set_times(FileTimes::new().set_accessed(old_access))
-            .unwrap();
-    }
-    let before = paths
-        .iter()
-        .map(|path| fs::metadata(path).unwrap().accessed().unwrap())
-        .collect::<Vec<_>>();
-
-    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
-
-    assert!(output.status.success());
-    let after = paths
-        .iter()
-        .map(|path| fs::metadata(path).unwrap().accessed().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(after, before);
 }

@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
+use super::agent_diagnostics::AgentDiagnosticSession;
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
 use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
@@ -62,6 +63,7 @@ impl AgentInvocationIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentCompatibilityProfile {
     PiJsonV1,
+    ClaudeCodeStreamJsonV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,19 +144,32 @@ impl AgentProcessContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AgentInvocationStaging {
     result_endpoint_directory: PathBuf,
+    message_file: Option<PathBuf>,
 }
 
 impl AgentInvocationStaging {
     pub(crate) fn new(result_endpoint_directory: PathBuf) -> Self {
         Self {
             result_endpoint_directory,
+            message_file: None,
         }
+    }
+
+    pub(crate) fn with_message_file(mut self, message_file: PathBuf) -> Self {
+        self.message_file = Some(message_file);
+        self
     }
 
     pub(crate) fn result_endpoint_directory(&self) -> &Path {
         &self.result_endpoint_directory
     }
+
+    pub(crate) fn message_file(&self) -> Option<&Path> {
+        self.message_file.as_deref()
+    }
 }
+
+pub(crate) const MAXIMUM_INLINE_AGENT_INPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AgentPrompt {
@@ -562,6 +577,7 @@ pub(crate) struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, Ob
     adapter: AdmittedAgentAdapter<NativeConfiguration>,
     process: AgentProcessContext,
     staging: AgentInvocationStaging,
+    diagnostic_session: AgentDiagnosticSession,
     prompt: AgentPrompt,
     attachments: Arc<[StagedAgentAttachment]>,
     value_mode: AgentValueMode,
@@ -587,6 +603,7 @@ where
         adapter: AdmittedAgentAdapter<NativeConfiguration>,
         process: AgentProcessContext,
         staging: AgentInvocationStaging,
+        diagnostic_session: AgentDiagnosticSession,
         prompt: AgentPrompt,
         attachments: Arc<[StagedAgentAttachment]>,
         value_mode: AgentValueMode,
@@ -602,6 +619,7 @@ where
             adapter,
             process,
             staging,
+            diagnostic_session,
             prompt,
             attachments,
             value_mode,
@@ -628,6 +646,10 @@ where
 
     pub(crate) fn staging(&self) -> &AgentInvocationStaging {
         &self.staging
+    }
+
+    pub(crate) fn diagnostic_session(&self) -> &AgentDiagnosticSession {
+        &self.diagnostic_session
     }
 
     pub(crate) fn prompt(&self) -> &AgentPrompt {
@@ -929,6 +951,7 @@ pub(crate) fn agent_terminal_channel(
     )
 }
 
+pub(crate) mod dispatch;
 #[cfg(test)]
 pub(crate) mod scripted;
 

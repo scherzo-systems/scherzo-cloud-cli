@@ -6,6 +6,7 @@ use super::agent::{
     AgentDiagnosticLevel, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
     AgentToolCallPhase, AgentValueKind,
 };
+use super::claude_code::ClaudeCodeEffort;
 use super::document::Output;
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
@@ -133,7 +134,14 @@ impl WorkflowPresentationStep {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentPresentationHarness {
-    Pi { model: String, thinking: Thinking },
+    Pi {
+        model: String,
+        thinking: Thinking,
+    },
+    ClaudeCode {
+        model: String,
+        effort: ClaudeCodeEffort,
+    },
 }
 
 impl WorkflowPresentationDefinition {
@@ -151,13 +159,21 @@ impl WorkflowPresentationDefinition {
                         outputs: presentation_outputs(&command.common.outputs),
                     },
                     ValidatedStep::Agent(agent) => {
-                        let ValidatedHarness::Pi(config) = &agent.agent.harness;
-                        WorkflowPresentationStep::Agent {
-                            profile: agent.agent.profile.clone(),
-                            harness: AgentPresentationHarness::Pi {
+                        let harness = match &agent.agent.harness {
+                            ValidatedHarness::Pi(config) => AgentPresentationHarness::Pi {
                                 model: config.model.clone(),
                                 thinking: config.thinking,
                             },
+                            ValidatedHarness::ClaudeCode(config) => {
+                                AgentPresentationHarness::ClaudeCode {
+                                    model: config.model.clone(),
+                                    effort: config.effort,
+                                }
+                            }
+                        };
+                        WorkflowPresentationStep::Agent {
+                            profile: agent.agent.profile.clone(),
+                            harness,
                             direct_dependencies: agent.common.prerequisites.clone(),
                             outputs: presentation_outputs(&agent.common.outputs),
                         }

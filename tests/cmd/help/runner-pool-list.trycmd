@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud runner pool list --help
+List Scherzo Cloud runner pools
+
+Usage: scherzo-cloud runner pool list [OPTIONS] <ORGANIZATION>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+
+Options:
+      --limit <LIMIT>        Limit the number of pools returned
+      --cursor <CURSOR>      Continue from an opaque page cursor
+      --json                 Print the runner result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

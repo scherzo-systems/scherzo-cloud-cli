@@ -37,7 +37,7 @@ fn result_fixture() -> Value {
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": 65536
+            "maximumRetainedBytesPerStream": super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "succeeded",
         "steps": [{
@@ -75,6 +75,98 @@ fn encode(value: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+#[test]
+fn accepts_stream_at_shared_retention_cap_and_rejects_larger_claim() {
+    let maximum = super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM;
+    let bytes = vec![b'x'; usize::try_from(maximum).unwrap()];
+    let stream = json!({
+        "encoding": "base64",
+        "data": BASE64_STANDARD.encode(bytes),
+        "retainedBytes": maximum,
+        "discardedBytes": 0,
+        "truncated": false,
+        "fullyDrained": true
+    });
+    let mut result = result_fixture();
+    result["steps"][0]["kind"] = Value::String("cmd".to_owned());
+    result["steps"][0]["commandOutput"] = json!({
+        "stdout": stream,
+        "stderr": {
+            "encoding": "base64",
+            "data": "",
+            "retainedBytes": 0,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": true
+        }
+    });
+
+    assert!(decode(&encode(&result)).is_ok());
+
+    let oversized = vec![b'x'; usize::try_from(maximum + 1).unwrap()];
+    result["steps"][0]["commandOutput"]["stdout"]["data"] =
+        Value::String(BASE64_STANDARD.encode(&oversized));
+    result["steps"][0]["commandOutput"]["stdout"]["retainedBytes"] = Value::from(maximum + 1);
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+}
+
+#[test]
+fn partitions_the_durable_stream_budget_across_maximum_step_count() {
+    let step_count = 256;
+    let maximum = super::super::maximum_retained_bytes_per_stream(step_count);
+    let retained = vec![b'x'; usize::try_from(maximum).unwrap()];
+    let stream = json!({
+        "encoding": "base64",
+        "data": BASE64_STANDARD.encode(&retained),
+        "retainedBytes": maximum,
+        "discardedBytes": 1,
+        "truncated": true,
+        "fullyDrained": true
+    });
+    let mut result = result_fixture();
+    let command = json!({
+        "id": "step0",
+        "kind": "cmd",
+        "state": "succeeded",
+        "startedAt": "2026-08-02T12:01:44Z",
+        "durationMilliseconds": 1000,
+        "commandOutput": {
+            "stdout": stream,
+            "stderr": {
+                "encoding": "base64",
+                "data": "",
+                "retainedBytes": 0,
+                "discardedBytes": 0,
+                "truncated": false,
+                "fullyDrained": true
+            }
+        }
+    });
+    let agents = (1..step_count).map(|index| {
+        json!({
+            "id": format!("step{index}"),
+            "kind": "agent",
+            "state": "succeeded",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000
+        })
+    });
+    result["steps"] = Value::Array(std::iter::once(command).chain(agents).collect());
+
+    assert!(decode(&encode(&result)).is_ok());
+
+    let oversized = vec![b'x'; usize::try_from(maximum + 1).unwrap()];
+    result["steps"][0]["commandOutput"]["stdout"] = json!({
+        "encoding": "base64",
+        "data": BASE64_STANDARD.encode(oversized),
+        "retainedBytes": maximum + 1,
+        "discardedBytes": 0,
+        "truncated": false,
+        "fullyDrained": true
+    });
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
 }
 
 #[test]

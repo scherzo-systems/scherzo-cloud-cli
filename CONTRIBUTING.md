@@ -43,62 +43,38 @@ the pinned Rust overlay and from rustup on every native release runner. Update
 change deliberately refreshes dependencies. Because the CLI is pre-release, replace the
 old baseline rather than retaining parallel support.
 
-Treat a higher source-build requirement as a breaking change fragment. Validate a bump
-with `./scripts/check`, the monorepo dependency-state check, and `nix flake check`; CI
-then builds every supported native release target with the declared release line.
+Treat a higher source-build requirement as breaking release intent in the canonical
+private journal. Validate a bump with `./scripts/check`, the monorepo dependency-state
+check, and `nix flake check`; release CI builds every supported native target with the
+allocated version.
 
-## Release intent
+## Release policy and archived notes
 
-`release.toml` is the visible source of truth for the CLI's `MAJOR.MINOR` release series.
-Choose its value together with the fragment category: `internal`, `fixed`, and compatible
-`changed` work stays in the stable series for a patch; `added` selects the adjacent minor
-series; and `breaking` selects the adjacent minor before `1.0` or the adjacent major,
-with minor reset to zero, from `1.0` onward. The highest impact across every fragment
-since the latest stable tag controls one cumulative plan, so a second addition behind an
-unreleased minor does not advance the series again.
+`release.toml` schema 2 is static policy, not mutable next-version intent. Keep its
+initial version at `0.1.0`, development version at `0.0.0-dev`, and pre-1.0 breaking
+impact at `minor`. Keep the Cargo fallback in `Cargo.toml` and `Cargo.lock` permanently
+at `0.0.0-dev`. `./scripts/check-release` validates those values, and
+`./scripts/release-impact` derives a version only when given explicit impact and an
+optional latest stable version.
 
-When changing the series, update the package fallback in `Cargo.toml` and `Cargo.lock` to
-`MAJOR.MINOR.0` in the same change. `./scripts/check-release` validates the declaration
-and fallback, and `./scripts/release-impact` rejects missing, regressing, skipped, or
-impact-inconsistent intent. `./scripts/classify-release-path` is the sole releaseable-path
-policy, while `./scripts/plan-release` inspects synthetic public Git history and remains
-the source of exact tag discovery and deterministic semantic planning for workflow
-automation.
+`changes/` is a frozen legacy archive. Do not add, modify, move, or delete fragments.
+New release intent is admitted through the canonical private repository's append-only
+journal and is intentionally absent from this exported source tree. Public notes still
+describe present-tense user behavior and must not include credentials, private URLs,
+customer or incident details, premature vulnerability details, or an `internal` marker
+that conceals a user-visible security fix. Run `./scripts/check-change-fragments` to
+validate the complete frozen archive offline.
 
-### Change fragments
-
-Record release intent under `changes/` (`cli/changes/` in the canonical monorepo).
-Choose the category by primary user impact: `added` for a new capability and an adjacent
-minor series, `changed` for an observable compatible patch, `fixed` for a corrected
-user-visible patch, and `breaking` when users or integrations must adapt. A breaking note
-includes the migration in the same sentence and selects an adjacent minor before `1.0`
-or an adjacent major afterward. Use `internal` only when the change has no user-visible
-effect; it selects a patch and its file must contain exactly
-`No user-visible changes.` and one newline. Make the fragment, `release.toml`, Cargo
-fallback, and lockfile update one coherent candidate change.
-
-Generate the filename from the canonical monorepo root with the exact command in
-[`changes/README.md`](changes/README.md):
-
-```bash
-set -euo pipefail
-category=fixed
-fragment_id=$(LC_ALL=C od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')
-[[ $fragment_id =~ ^[0-9a-f]{32}$ ]]
-mkdir -p "cli/changes/$category"
-printf '%s\n' 'Fix run monitoring occasionally stopping before completion.' \
-  >"cli/changes/$category/$fragment_id.md"
-```
-
-Public notes describe present-tense user behavior rather than implementation details.
-Do not include credentials, private URLs, customer or incident details, or premature
-vulnerability details. Do not use `internal` to conceal a user-visible security fix.
-Run `./scripts/check-change-fragments` in the standalone checkout to validate the full
-byte grammar and tree.
-
-Human review may require editing, replacing, or removing a fragment before release.
-Once a stable public tag contains that fragment, it is immutable; correct released text
-with a new fragment instead.
+Managed Buildkite allocates one exact version and publishes an allocation record with the
+mirror. Public Actions ignores allocation- and recovery-metadata branch creation and never
+plans a version: `scripts/verify-release-allocation` checks the exact allocation,
+stable-state snapshot, release body, and any current recovery chain after the accompanying
+`main` push, then the four native builds check out the original allocated commit. The write-scoped
+`scripts/reconcile-release` accepts only matching absent, partial-tag, or draft state and
+leaves an exact published release unchanged. Run
+`python3 scripts/test-release-allocation` for the local Git and mocked GitHub fixture. Do
+not add another allocation path, move a stable tag, edit a published release, broaden the
+recovery allowlist, or make recovery build the repaired mirror.
 
 ## Security reports
 

@@ -57,6 +57,7 @@ pub(crate) struct ResolutionFailure {
     kind: ResolutionFailureKind,
     location: ResolutionLocation,
     workflow_path: Option<String>,
+    source_path: Option<PathBuf>,
 }
 
 impl ResolutionFailure {
@@ -72,16 +73,26 @@ impl ResolutionFailure {
         self.workflow_path.as_deref()
     }
 
+    pub(crate) fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
     fn new(kind: ResolutionFailureKind, location: ResolutionLocation) -> Self {
         Self {
             kind,
             location,
             workflow_path: None,
+            source_path: None,
         }
     }
 
     fn with_workflow_path(mut self, workflow_path: String) -> Self {
         self.workflow_path = Some(workflow_path);
+        self
+    }
+
+    fn with_source_path(mut self, source_path: PathBuf) -> Self {
+        self.source_path = Some(source_path);
         self
     }
 }
@@ -367,6 +378,10 @@ impl SourceResolver {
         let supplied_workflow = workflow_file.to_owned();
         let canonical_workflow = fs::canonicalize(&supplied_workflow).map_err(|_| {
             ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(
+                    lexical_normalize(&supplied_workflow)
+                        .unwrap_or_else(|| supplied_workflow.clone()),
+                )
         })?;
         if canonical_workflow.starts_with(&self.canonical_root) {
             return Ok(canonical_workflow);
@@ -411,6 +426,7 @@ impl SourceResolver {
                 )?;
             let bytes = self.closure.get(&canonical_path).cloned().ok_or_else(|| {
                 ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location)
+                    .with_source_path(canonical_host_path.clone())
             })?;
             return Ok(LoadedSource {
                 canonical_host_path,
@@ -419,8 +435,11 @@ impl SourceResolver {
             });
         }
 
+        let resolved_candidate =
+            lexical_normalize(candidate).unwrap_or_else(|| candidate.to_owned());
         let canonical_host_path = fs::canonicalize(candidate).map_err(|_| {
             ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(resolved_candidate)
         })?;
         if !canonical_host_path.starts_with(&self.canonical_root) {
             return Err(ResolutionFailure::new(
@@ -431,15 +450,18 @@ impl SourceResolver {
 
         let mut file = open_source_file(&canonical_host_path).map_err(|_| {
             ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(canonical_host_path.clone())
         })?;
         let handle_metadata = file.metadata().map_err(|_| {
             ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(canonical_host_path.clone())
         })?;
         if !handle_metadata.is_file() {
             return Err(ResolutionFailure::new(
                 ResolutionFailureKind::SourceNotRegularFile,
                 location,
-            ));
+            )
+            .with_source_path(canonical_host_path));
         }
 
         let rebound_path = fs::canonicalize(candidate).map_err(|_| {

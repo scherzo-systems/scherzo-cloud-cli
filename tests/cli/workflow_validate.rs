@@ -197,11 +197,11 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
     let human = validate(&bundle, false);
     assert!(human.status.success());
     let stdout = String::from_utf8(human.stdout.clone()).expect("human output should be UTF-8");
-    assert!(stdout.contains("✓ Workflow V1 definition is valid."));
-    assert!(stdout.contains("Workflow: workflows/complete.yaml"));
+    assert!(stdout.contains("✓ Workflow definition is valid."));
+    assert!(stdout.contains("workflow: workflows/complete.yaml"));
     let digest = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("Digest: sha256:"))
+        .find_map(|line| line.strip_prefix("digest: sha256:"))
         .expect("human output should contain a SHA-256 digest");
     assert_eq!(digest.len(), 64);
     assert!(
@@ -209,9 +209,8 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
-    assert!(stdout.contains("Steps: 3"));
-    assert!(stdout.contains("Required optional imports: prompt"));
-    assert!(stdout.contains("No workflow steps were executed."));
+    assert!(stdout.contains("steps: 3"));
+    assert!(stdout.contains("optional imports: prompt"));
     assert!(human.stderr.is_empty());
     assert_static_contents_absent(&human);
 
@@ -300,10 +299,10 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         let human = validate(&bundle, false);
         assert_eq!(human.status.code(), Some(1));
         let stdout = String::from_utf8_lossy(&human.stdout);
-        assert!(stdout.contains("✗ Workflow V1 definition is invalid."));
-        assert!(stdout.contains("Workflow: workflows/complete.yaml"));
-        assert!(stdout.contains(&format!("Code: {expected_code}")));
-        assert!(stdout.contains("No workflow steps were executed."));
+        assert!(stdout.contains("✗ Workflow definition is invalid."));
+        assert!(stdout.contains("workflow: workflows/complete.yaml"));
+        assert!(stdout.contains(&format!("code: {expected_code}")));
+        assert!(stdout.contains(&format!("location: {expected_location}")));
         assert!(human.stdout.len() < 1024);
         assert!(human.stderr.is_empty());
         assert_static_contents_absent(&human);
@@ -330,6 +329,27 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         assert!(json.stderr.is_empty());
         assert_static_contents_absent(&json);
     }
+}
+
+#[test]
+fn missing_source_remedy_names_the_resolved_path() {
+    let bundle = WorkflowBundle::valid();
+    let missing_source = bundle.root.join("prompts/system.md");
+    fs::remove_file(&missing_source).expect("system prompt should be removed");
+    let resolved_missing_source = fs::canonicalize(&bundle.root)
+        .expect("source root should resolve")
+        .join("prompts/system.md");
+
+    let output = validate(&bundle, false);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).expect("human output should be UTF-8");
+    assert!(stdout.ends_with(&format!(
+        "No workflow steps were executed.\n\nAdd or make readable the required workflow source file:\n  {}\n",
+        resolved_missing_source.display()
+    )));
+    assert!(!stdout.contains("at this location"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

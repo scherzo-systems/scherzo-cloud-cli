@@ -1,15 +1,14 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 
+use crate::exit_code::ExitCode;
 use crate::runner::doctor::{CheckResult, Report, Status, built_in_registry};
 
-pub(super) const ABOUT: &str = "Inspect local runner prerequisites";
+pub(super) const ABOUT: &str = "Check local runner prerequisites";
 const COMMAND_NAME: &str = "scherzo-cloud runner doctor";
-const USAGE_ERROR: u8 = 2;
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -28,100 +27,72 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
-        let registry = match built_in_registry() {
-            Ok(registry) => registry,
-            Err(error) => return report_error(error),
-        };
+    pub(super) fn execute(self) -> super::super::CommandResult {
+        let registry = built_in_registry().map_err(|error| anyhow!(error))?;
 
         if self.list_checks {
-            return match write_check_list(&registry.descriptors()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => report_error(error),
-            };
+            write_check_list(&registry.descriptors())?;
+            return Ok(ExitCode::Success);
         }
 
-        let report = match registry.run(&self.checks) {
-            Ok(report) => report,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return ExitCode::from(USAGE_ERROR);
-            }
-        };
-        let output = if self.json {
-            write_json_report(&report)
+        let report = registry.run(&self.checks).map_err(|error| {
+            super::super::CommandFailure::with_exit_code(anyhow!(error), ExitCode::UsageError)
+        })?;
+        if self.json {
+            write_json_report(&report)?;
         } else {
-            write_human_report(&report)
-        };
-        if let Err(error) = output {
-            return report_error(error);
+            write_human_report(&report).context("write runner doctor report")?;
         }
-        if report.has_failures() {
-            ExitCode::FAILURE
+        Ok(if report.has_failures() {
+            ExitCode::GeneralFailure
         } else {
-            ExitCode::SUCCESS
-        }
+            ExitCode::Success
+        })
     }
 }
 
-fn report_error(error: impl fmt::Display) -> ExitCode {
-    eprintln!("Error: {error}");
-    ExitCode::FAILURE
-}
-
-fn write_check_list(
-    descriptors: &[crate::runner::doctor::CheckDescriptor],
-) -> Result<(), DoctorOutputError> {
+fn write_check_list(descriptors: &[crate::runner::doctor::CheckDescriptor]) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     for descriptor in descriptors {
-        writeln!(stdout, "{}", descriptor.id).map_err(DoctorOutputError::WriteOutput)?;
+        writeln!(stdout, "{}", descriptor.id).context("write runner doctor check list")?;
     }
     Ok(())
 }
 
-fn write_human_report(report: &Report) -> Result<(), DoctorOutputError> {
+fn write_human_report(report: &Report) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    writeln!(stdout, "Scherzo Cloud runner doctor").map_err(DoctorOutputError::WriteOutput)?;
-    writeln!(stdout).map_err(DoctorOutputError::WriteOutput)?;
+    writeln!(stdout, "Scherzo Cloud runner doctor")?;
+    writeln!(stdout)?;
 
     for result in &report.results {
         let marker = match result.outcome.status {
             Status::Pass => '✓',
             Status::Fail => '✗',
         };
-        writeln!(stdout, "{marker} {}", result.descriptor.title)
-            .map_err(DoctorOutputError::WriteOutput)?;
-        writeln!(stdout, "  {}", result.outcome.message).map_err(DoctorOutputError::WriteOutput)?;
+        writeln!(stdout, "{marker} {}", result.descriptor.title)?;
+        writeln!(stdout, "  {}", result.outcome.message)?;
         if result.outcome.status == Status::Fail {
-            writeln!(stdout, "  Code: {}", result.outcome.code)
-                .map_err(DoctorOutputError::WriteOutput)?;
+            writeln!(stdout, "  code: {}", result.outcome.code)?;
         }
-        writeln!(stdout).map_err(DoctorOutputError::WriteOutput)?;
+        writeln!(stdout)?;
     }
 
     let summary = report.summary();
-    writeln!(
-        stdout,
-        "Summary: {} passed, {} failed",
-        summary.passed, summary.failed
-    )
-    .map_err(DoctorOutputError::WriteOutput)?;
-    let conclusion = if report.has_failures() {
-        "Selected checks failed."
-    } else {
-        "Selected checks passed."
-    };
-    writeln!(stdout, "{conclusion}").map_err(DoctorOutputError::WriteOutput)
+    writeln!(stdout, "── summary ──")?;
+    writeln!(stdout, "passed: {}", summary.passed)?;
+    writeln!(stdout, "failed: {}", summary.failed)?;
+    Ok(())
 }
 
-fn write_json_report(report: &Report) -> Result<(), DoctorOutputError> {
+fn write_json_report(report: &Report) -> anyhow::Result<()> {
     let output = JsonReport::from_report(report);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, &output).map_err(DoctorOutputError::WriteJson)?;
-    writeln!(stdout).map_err(DoctorOutputError::WriteOutput)
+    serde_json::to_writer_pretty(&mut stdout, &output)
+        .context("write JSON runner doctor report")?;
+    writeln!(stdout).context("write runner doctor report")
 }
 
 #[derive(Serialize)]
@@ -176,19 +147,4 @@ impl<'a> JsonCheck<'a> {
 struct JsonSummary {
     passed: usize,
     failed: usize,
-}
-
-#[derive(Debug)]
-enum DoctorOutputError {
-    WriteJson(serde_json::Error),
-    WriteOutput(io::Error),
-}
-
-impl fmt::Display for DoctorOutputError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WriteJson(error) => write!(formatter, "write JSON runner doctor report: {error}"),
-            Self::WriteOutput(error) => write!(formatter, "write runner doctor report: {error}"),
-        }
-    }
 }

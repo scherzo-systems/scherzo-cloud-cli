@@ -226,9 +226,17 @@ struct ArtifactLease {
     store: Weak<ArtifactStagingInner>,
     artifact_identity: Arc<str>,
     file_identity: CarrierFileIdentity,
-    size: u64,
-    budget_class: CarrierBudgetClass,
+    metadata: StagedCarrierMetadata,
     budgeted: AtomicBool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedCarrierMetadata {
+    output_identity: Arc<str>,
+    size: u64,
+    media_type: Arc<str>,
+    sha256: Arc<str>,
+    budget_class: CarrierBudgetClass,
 }
 
 impl ArtifactLease {
@@ -238,7 +246,7 @@ impl ArtifactLease {
 
     fn release_budget(&self, store: &ArtifactStagingInner) {
         if self.budgeted.swap(false, Ordering::AcqRel) {
-            store.release_budget(self.budget_class, self.size);
+            store.release_budget(self.metadata.budget_class, self.metadata.size);
         }
     }
 }
@@ -277,12 +285,9 @@ impl fmt::Debug for ArtifactHandle {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct StagedCarrier {
     handle: ArtifactHandle,
-    size: u64,
-    media_type: Arc<str>,
-    budget_class: CarrierBudgetClass,
 }
 
 impl StagedCarrier {
@@ -294,22 +299,37 @@ impl StagedCarrier {
         self.handle.opaque_id()
     }
 
+    pub(crate) fn output_identity(&self) -> &str {
+        &self.handle.lease.metadata.output_identity
+    }
+
     pub(crate) fn size(&self) -> u64 {
-        self.size
+        self.handle.lease.metadata.size
     }
 
     pub(crate) fn media_type(&self) -> &str {
-        &self.media_type
+        &self.handle.lease.metadata.media_type
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.handle.lease.metadata.sha256
     }
 
     pub(crate) fn budget_class(&self) -> CarrierBudgetClass {
-        self.budget_class
+        self.handle.lease.metadata.budget_class
     }
 }
 
+impl PartialEq for StagedCarrier {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
+}
+
+impl Eq for StagedCarrier {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapturedArtifact {
-    output_identity: Arc<str>,
     carrier: StagedCarrier,
 }
 
@@ -319,7 +339,7 @@ impl CapturedArtifact {
     }
 
     pub(crate) fn output_identity(&self) -> &str {
-        &self.output_identity
+        self.carrier.output_identity()
     }
 
     pub(crate) fn size(&self) -> u64 {
@@ -328,6 +348,10 @@ impl CapturedArtifact {
 
     pub(crate) fn media_type(&self) -> &str {
         self.carrier.media_type()
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        self.carrier.sha256()
     }
 
     pub(crate) fn carrier(&self) -> &StagedCarrier {
@@ -392,7 +416,6 @@ impl GitBranchMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitBranchCarrier {
     staged: StagedCarrier,
-    sha256: Arc<str>,
 }
 
 impl GitBranchCarrier {
@@ -417,7 +440,7 @@ impl GitBranchCarrier {
     }
 
     pub(crate) fn sha256(&self) -> &str {
-        &self.sha256
+        self.staged.sha256()
     }
 
     pub(crate) fn staged(&self) -> &StagedCarrier {
@@ -487,6 +510,14 @@ impl Drop for CaptureCandidateSet {
 struct CaptureBounds {
     maximum_bytes: u64,
     overflow_kind: CaptureFailureKind,
+}
+
+struct PendingStagedCarrier {
+    artifact_identity: Arc<str>,
+    output_identity: Arc<str>,
+    destination: File,
+    capture_result: Result<(u64, Arc<str>), CaptureAttemptFailure>,
+    profile: (Arc<str>, CarrierBudgetClass),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -686,6 +717,22 @@ pub(crate) enum ArtifactReadFailure {
     DestinationWrite,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactExposeFailure {
+    UnknownHandle,
+    InvalidDestination,
+    DestinationExists,
+    Unavailable,
+}
+
+impl fmt::Display for ArtifactExposeFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "artifact exposure failure: {self:?}")
+    }
+}
+
+impl std::error::Error for ArtifactExposeFailure {}
+
 impl fmt::Display for ArtifactReadFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "artifact read failure: {self:?}")
@@ -715,6 +762,8 @@ struct ArtifactStagingInner {
     capture_serial: Mutex<()>,
     #[cfg(test)]
     artifact_unlinks_blocked: AtomicBool,
+    #[cfg(test)]
+    artifact_links_blocked: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -864,6 +913,8 @@ impl ArtifactStaging {
                 capture_serial: Mutex::new(()),
                 #[cfg(test)]
                 artifact_unlinks_blocked: AtomicBool::new(false),
+                #[cfg(test)]
+                artifact_links_blocked: AtomicBool::new(false),
             }),
         })
     }
@@ -1146,6 +1197,66 @@ impl ArtifactStaging {
         }
     }
 
+    pub(crate) fn expose_carrier(
+        &self,
+        carrier: &StagedCarrier,
+        expected_output_identity: &str,
+        destination: &OwnedFd,
+        destination_name: &OsStr,
+    ) -> Result<(), ArtifactExposeFailure> {
+        if !is_single_path_component(destination_name) {
+            return Err(ArtifactExposeFailure::InvalidDestination);
+        }
+        let lifecycle = self
+            .inner
+            .lifecycle
+            .read()
+            .map_err(|_| ArtifactExposeFailure::Unavailable)?;
+        if *lifecycle != StagingLifecycle::Active
+            || carrier.output_identity() != expected_output_identity
+        {
+            return Err(ArtifactExposeFailure::UnknownHandle);
+        }
+        let source = self
+            .open_artifact_while_active(carrier.handle())
+            .map_err(expose_read_failure)?;
+        let source_metadata = fstat(&source).map_err(|_| ArtifactExposeFailure::Unavailable)?;
+        let destination_metadata =
+            fstat(destination).map_err(|_| ArtifactExposeFailure::Unavailable)?;
+        if FileType::from_raw_mode(destination_metadata.st_mode) != FileType::Directory
+            || source_metadata.st_dev != destination_metadata.st_dev
+            || u64::try_from(source_metadata.st_size) != Ok(carrier.size())
+        {
+            return Err(ArtifactExposeFailure::Unavailable);
+        }
+        #[cfg(test)]
+        if self.inner.artifact_links_blocked.load(Ordering::Acquire) {
+            return Err(ArtifactExposeFailure::Unavailable);
+        }
+        linkat(
+            &self.inner.staging_root,
+            carrier.handle.artifact_identity.as_ref(),
+            destination,
+            destination_name,
+            AtFlags::empty(),
+        )
+        .map_err(|failure| match failure {
+            Errno::EXIST => ArtifactExposeFailure::DestinationExists,
+            _ => ArtifactExposeFailure::Unavailable,
+        })?;
+        let exposed = statat(destination, destination_name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ArtifactExposeFailure::Unavailable)?;
+        let expected = carrier.handle.lease.file_identity;
+        if FileType::from_raw_mode(exposed.st_mode) != FileType::RegularFile
+            || exposed.st_dev != expected.device
+            || exposed.st_ino != expected.inode
+            || u64::try_from(exposed.st_size) != Ok(carrier.size())
+        {
+            return Err(ArtifactExposeFailure::Unavailable);
+        }
+        Ok(())
+    }
+
     pub(crate) fn release(&self) -> Result<(), ArtifactReleaseFailure> {
         self.inner.cleanup()
     }
@@ -1208,6 +1319,13 @@ impl ArtifactStaging {
     pub(crate) fn block_artifact_unlinks(&self) {
         self.inner
             .artifact_unlinks_blocked
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_artifact_links(&self) {
+        self.inner
+            .artifact_links_blocked
             .store(true, Ordering::Release);
     }
 
@@ -1315,52 +1433,50 @@ impl ArtifactStaging {
         let (artifact_identity, mut destination) = self.create_destination().map_err(|kind| {
             CaptureAttemptFailure::Capture(CaptureFailure::new(Arc::clone(&output_identity), kind))
         })?;
-        let capture_result = copier
-            .copy(CopyRequest {
-                source: &mut source,
-                destination: &mut destination,
-                maximum_bytes: bounds.maximum_bytes,
-                output_identity: &output_identity,
-                cancellation,
-            })
-            .map_err(|failure| match failure {
-                CaptureAttemptFailure::Capture(failure)
-                    if failure.kind == CaptureFailureKind::FileSizeLimitExceeded =>
-                {
-                    CaptureAttemptFailure::Capture(CaptureFailure::new(
-                        Arc::clone(&output_identity),
-                        bounds.overflow_kind,
-                    ))
-                }
-                failure => failure,
-            })
-            .and_then(|size| {
-                self.finish_destination(
-                    &artifact_identity,
-                    &mut destination,
-                    &output_identity,
+        let capture_result = {
+            let mut hashing = HashingCarrierDestination::new(&mut destination);
+            copier
+                .copy(CopyRequest {
+                    source: &mut source,
+                    destination: &mut hashing,
+                    maximum_bytes: bounds.maximum_bytes,
+                    output_identity: &output_identity,
                     cancellation,
-                )
-                .map(|file_identity| (size, file_identity))
-            });
-        drop(destination);
-
-        let (size, file_identity) = self.finish_staging_result(
+                })
+                .map_err(|failure| match failure {
+                    CaptureAttemptFailure::Capture(failure)
+                        if failure.kind == CaptureFailureKind::FileSizeLimitExceeded =>
+                    {
+                        CaptureAttemptFailure::Capture(CaptureFailure::new(
+                            Arc::clone(&output_identity),
+                            bounds.overflow_kind,
+                        ))
+                    }
+                    failure => failure,
+                })
+                .and_then(|size| {
+                    (size == hashing.bytes_written)
+                        .then(|| (size, hashing.finish_digest()))
+                        .ok_or_else(|| {
+                            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                                Arc::clone(&output_identity),
+                                CaptureFailureKind::StagingUnavailable,
+                            ))
+                        })
+                })
+        };
+        self.finish_staged_carrier(
             lifecycle,
-            &artifact_identity,
-            &output_identity,
-            capture_result,
-        )?;
-        Ok(CapturedArtifact {
-            output_identity,
-            carrier: self.staged_carrier(
+            cancellation,
+            PendingStagedCarrier {
                 artifact_identity,
-                file_identity,
-                size,
-                media_type,
-                CarrierBudgetClass::File,
-            ),
-        })
+                output_identity,
+                destination,
+                capture_result,
+                profile: (media_type, CarrierBudgetClass::File),
+            },
+        )
+        .map(|carrier| CapturedArtifact { carrier })
     }
 
     fn stage_git_carrier(
@@ -1389,34 +1505,22 @@ impl ArtifactStaging {
                 ))),
                 (None, Ok(())) => Ok((size, bounded.finish_digest())),
             }
-        }
-        .and_then(|(size, digest)| {
-            self.finish_destination(
-                &artifact_identity,
-                &mut destination,
-                &output_identity,
-                cancellation,
-            )
-            .map(|file_identity| (size, digest, file_identity))
-        });
-        drop(destination);
-
-        let (size, sha256, file_identity) = self.finish_staging_result(
+        };
+        self.finish_staged_carrier(
             lifecycle,
-            &artifact_identity,
-            &output_identity,
-            capture_result,
-        )?;
-        Ok(GitBranchCarrier {
-            staged: self.staged_carrier(
+            cancellation,
+            PendingStagedCarrier {
                 artifact_identity,
-                file_identity,
-                size,
-                Arc::from("application/vnd.git.bundle"),
-                CarrierBudgetClass::Git,
-            ),
-            sha256,
-        })
+                output_identity,
+                destination,
+                capture_result,
+                profile: (
+                    Arc::from("application/vnd.git.bundle"),
+                    CarrierBudgetClass::Git,
+                ),
+            },
+        )
+        .map(|staged| GitBranchCarrier { staged })
     }
 
     fn active_lifecycle(
@@ -1436,6 +1540,65 @@ impl ArtifactStaging {
             )));
         }
         Ok(lifecycle)
+    }
+
+    fn finish_carrier_destination(
+        &self,
+        artifact_identity: &Arc<str>,
+        destination: &mut File,
+        output_identity: &Arc<str>,
+        cancellation: &CaptureCancellation,
+        capture_result: Result<(u64, Arc<str>), CaptureAttemptFailure>,
+    ) -> Result<(u64, Arc<str>, CarrierFileIdentity), CaptureAttemptFailure> {
+        capture_result.and_then(|(size, digest)| {
+            self.finish_destination(
+                artifact_identity,
+                destination,
+                output_identity,
+                cancellation,
+            )
+            .map(|file_identity| (size, digest, file_identity))
+        })
+    }
+
+    fn finish_staged_carrier(
+        &self,
+        lifecycle: RwLockReadGuard<'_, StagingLifecycle>,
+        cancellation: &CaptureCancellation,
+        pending: PendingStagedCarrier,
+    ) -> Result<StagedCarrier, CaptureAttemptFailure> {
+        let PendingStagedCarrier {
+            artifact_identity,
+            output_identity,
+            mut destination,
+            capture_result,
+            profile,
+        } = pending;
+        let capture_result = self.finish_carrier_destination(
+            &artifact_identity,
+            &mut destination,
+            &output_identity,
+            cancellation,
+            capture_result,
+        );
+        drop(destination);
+        let (size, sha256, file_identity) = self.finish_staging_result(
+            lifecycle,
+            &artifact_identity,
+            &output_identity,
+            capture_result,
+        )?;
+        Ok(self.staged_carrier(
+            artifact_identity,
+            file_identity,
+            StagedCarrierMetadata {
+                output_identity,
+                size,
+                media_type: profile.0,
+                sha256,
+                budget_class: profile.1,
+            },
+        ))
     }
 
     fn finish_staging_result<Value>(
@@ -1521,9 +1684,7 @@ impl ArtifactStaging {
         &self,
         artifact_identity: Arc<str>,
         file_identity: CarrierFileIdentity,
-        size: u64,
-        media_type: Arc<str>,
-        budget_class: CarrierBudgetClass,
+        metadata: StagedCarrierMetadata,
     ) -> StagedCarrier {
         StagedCarrier {
             handle: ArtifactHandle {
@@ -1533,14 +1694,10 @@ impl ArtifactStaging {
                     store: Arc::downgrade(&self.inner),
                     artifact_identity,
                     file_identity,
-                    size,
-                    budget_class,
+                    metadata,
                     budgeted: AtomicBool::new(false),
                 }),
             },
-            size,
-            media_type,
-            budget_class,
         }
     }
 
@@ -1581,9 +1738,17 @@ impl ArtifactStaging {
             .lifecycle
             .read()
             .map_err(|_| ArtifactReadFailure::Unavailable)?;
-        if *lifecycle != StagingLifecycle::Active
-            || handle.store_identity != self.inner.store_identity
-        {
+        if *lifecycle != StagingLifecycle::Active {
+            return Err(ArtifactReadFailure::UnknownHandle);
+        }
+        self.open_artifact_while_active(handle)
+    }
+
+    fn open_artifact_while_active(
+        &self,
+        handle: &ArtifactHandle,
+    ) -> Result<File, ArtifactReadFailure> {
+        if handle.store_identity != self.inner.store_identity {
             return Err(ArtifactReadFailure::UnknownHandle);
         }
         let opened = openat(
@@ -1783,6 +1948,14 @@ impl Drop for ArtifactStagingInner {
     }
 }
 
+fn finish_sha256(digest: &mut Option<DigestContext>) -> Arc<str> {
+    let digest = digest
+        .take()
+        .unwrap_or_else(|| DigestContext::new(&SHA256))
+        .finish();
+    Arc::from(lowercase_hex(digest.as_ref()))
+}
+
 pub(crate) struct CarrierDestination<'a> {
     destination: &'a mut File,
     bounds: CaptureBounds,
@@ -1812,12 +1985,7 @@ impl<'a> CarrierDestination<'a> {
     }
 
     fn finish_digest(&mut self) -> Arc<str> {
-        let digest = self
-            .digest
-            .take()
-            .unwrap_or_else(|| DigestContext::new(&SHA256))
-            .finish();
-        Arc::from(lowercase_hex(digest.as_ref()))
+        finish_sha256(&mut self.digest)
     }
 
     fn record_failure(&mut self, failure: CaptureAttemptFailure) -> io::Error {
@@ -1914,22 +2082,60 @@ impl Write for CarrierDestination<'_> {
     }
 }
 
-struct CopyRequest<'a> {
-    source: &'a mut File,
+struct HashingCarrierDestination<'a> {
     destination: &'a mut File,
+    digest: Option<DigestContext>,
+    bytes_written: u64,
+}
+
+impl<'a> HashingCarrierDestination<'a> {
+    fn new(destination: &'a mut File) -> Self {
+        Self {
+            destination,
+            digest: Some(DigestContext::new(&SHA256)),
+            bytes_written: 0,
+        }
+    }
+
+    fn finish_digest(&mut self) -> Arc<str> {
+        finish_sha256(&mut self.digest)
+    }
+}
+
+impl Write for HashingCarrierDestination<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.destination.write(bytes)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(u64::try_from(written).map_err(|_| io::Error::other("carrier size"))?)
+            .ok_or_else(|| io::Error::other("carrier size"))?;
+        if let Some(digest) = &mut self.digest {
+            digest.update(&bytes[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.destination.flush()
+    }
+}
+
+struct CopyRequest<'request, 'destination> {
+    source: &'request mut File,
+    destination: &'request mut HashingCarrierDestination<'destination>,
     maximum_bytes: u64,
-    output_identity: &'a Arc<str>,
-    cancellation: &'a CaptureCancellation,
+    output_identity: &'request Arc<str>,
+    cancellation: &'request CaptureCancellation,
 }
 
 trait StreamCopier {
-    fn copy(&mut self, request: CopyRequest<'_>) -> Result<u64, CaptureAttemptFailure>;
+    fn copy(&mut self, request: CopyRequest<'_, '_>) -> Result<u64, CaptureAttemptFailure>;
 }
 
 struct PortableCopier;
 
 impl StreamCopier for PortableCopier {
-    fn copy(&mut self, request: CopyRequest<'_>) -> Result<u64, CaptureAttemptFailure> {
+    fn copy(&mut self, request: CopyRequest<'_, '_>) -> Result<u64, CaptureAttemptFailure> {
         copy_bounded(
             request.source,
             request.destination,
@@ -1985,6 +2191,21 @@ fn copy_bounded(
         }
         copied += read_length;
     }
+}
+
+fn expose_read_failure(failure: ArtifactReadFailure) -> ArtifactExposeFailure {
+    match failure {
+        ArtifactReadFailure::UnknownHandle => ArtifactExposeFailure::UnknownHandle,
+        ArtifactReadFailure::Unavailable | ArtifactReadFailure::DestinationWrite => {
+            ArtifactExposeFailure::Unavailable
+        }
+    }
+}
+
+fn is_single_path_component(name: &OsStr) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(component)) if component == name)
+        && components.next().is_none()
 }
 
 fn capture_components(path: &Path) -> Result<Vec<OsString>, CaptureFailureKind> {

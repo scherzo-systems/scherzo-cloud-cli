@@ -15,6 +15,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 
+use super::input_transport::PreparedInputTransport;
 use super::result_bridge::{
     IncomingResultRequest, PreparedResultBridge, ResultSocketEvent, ValidatePiResultV1Response,
 };
@@ -27,7 +28,7 @@ use crate::execution::workflow::agent::{
     AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
     AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
-    AgentValueMode, PositiveDuration,
+    AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration,
 };
 use crate::execution::workflow::child_guard::{StoppedChildGuard, force_stop_direct_child};
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -265,14 +266,14 @@ struct ActiveResultBridge<Clock, Worker> {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct PiJsonV1LaunchPlan {
     arguments: Vec<OsString>,
+    result_extension_argument_index: usize,
     expected_cwd: Arc<str>,
 }
 
 impl PiJsonV1LaunchPlan {
     fn add_result_extension(&mut self, extension_path: &std::path::Path) {
-        const EXTENSION_ARGUMENT_INDEX: usize = 10;
         self.arguments.splice(
-            EXTENSION_ARGUMENT_INDEX..EXTENSION_ARGUMENT_INDEX,
+            self.result_extension_argument_index..self.result_extension_argument_index,
             [
                 OsString::from("--extension"),
                 extension_path.as_os_str().to_owned(),
@@ -302,6 +303,10 @@ where
         || compatibility_profile_for_version(invocation.adapter().version())
             != Some(PiCompatibilityProfile::PiJsonV1)
         || !invocation.adapter().executable().is_absolute()
+        || invocation
+            .diagnostic_session()
+            .verify_pi_native_session_path_binding()
+            .is_err()
     {
         return Err(AgentFailureCause::HarnessStartFailed);
     }
@@ -318,31 +323,69 @@ where
         .to_str()
         .map(Arc::from)
         .ok_or(AgentFailureCause::HarnessStartFailed)?;
+    let staged_system_prompt =
+        (system_prompt.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES).then_some(system_prompt.as_str());
+    let staged_message = if invocation.prompt().message().len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+        Some(
+            invocation
+                .staging()
+                .message_file()
+                .ok_or(AgentFailureCause::HarnessStartFailed)?,
+        )
+    } else {
+        None
+    };
+    let input_transport = PreparedInputTransport::prepare(
+        invocation.identity(),
+        invocation.staging().result_endpoint_directory(),
+        staged_system_prompt,
+        staged_message,
+    )
+    .map_err(|()| AgentFailureCause::HarnessStartFailed)?;
+
     let config = invocation.adapter().native_configuration();
-    let mut arguments = Vec::with_capacity(13_usize.saturating_add(invocation.attachments().len()));
+    let mut arguments = Vec::with_capacity(15_usize.saturating_add(invocation.attachments().len()));
     arguments.extend([
         OsString::from("--mode"),
         OsString::from("json"),
         OsString::from("--approve"),
-        OsString::from("--no-session"),
+        OsString::from("--session-dir"),
+        invocation
+            .diagnostic_session()
+            .pi_native_session_directory()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?
+            .as_os_str()
+            .to_owned(),
         OsString::from("--model"),
         OsString::from(&config.model),
         OsString::from("--thinking"),
         OsString::from(config.thinking.as_str()),
         OsString::from("--append-system-prompt"),
-        OsString::from(system_prompt),
+        input_transport
+            .system_prompt_marker()
+            .map_or_else(|| OsString::from(system_prompt), OsString::from),
     ]);
+    arguments.extend([
+        OsString::from("--extension"),
+        input_transport.extension_path().as_os_str().to_owned(),
+    ]);
+    let result_extension_argument_index = arguments.len();
     for attachment in invocation.attachments() {
         let mut argument = OsString::from("@");
         argument.push(attachment.path());
         arguments.push(argument);
     }
-    let mut message = OsString::from("\n");
-    message.push(invocation.prompt().message());
-    arguments.push(message);
+    if let Some(message_marker) = input_transport.message_marker() {
+        arguments.push(OsString::from(message_marker));
+    } else {
+        let mut message = OsString::from("\n");
+        message.push(invocation.prompt().message());
+        arguments.push(message);
+    }
 
     Ok(PiJsonV1LaunchPlan {
         arguments,
+        result_extension_argument_index,
         expected_cwd,
     })
 }
@@ -354,6 +397,10 @@ pub(super) fn build_command<Sink>(
 where
     Sink: AgentObservationSink,
 {
+    invocation
+        .diagnostic_session()
+        .verify_pi_native_session_path_binding()
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
     let mut command = Command::new(invocation.adapter().executable());
     command
         .args(&plan.arguments)
@@ -417,6 +464,15 @@ where
             return Err(AgentFailureCause::HarnessStartFailed);
         }
     };
+    if invocation
+        .diagnostic_session()
+        .verify_pi_native_session_path_binding()
+        .is_err()
+    {
+        let _ = child.force_stop().await;
+        let _ = registration.mark_quiesced();
+        return Err(AgentFailureCause::HarnessStartFailed);
+    }
     if child.continue_execution().is_err() || registration.mark_released().is_err() {
         let _ = child.force_stop().await;
         let _ = registration.mark_quiesced();
@@ -556,7 +612,7 @@ impl PiChild {
     }
 }
 
-const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
+pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(10);
 
 struct ResultSettlementConfiguration<Clock> {
@@ -606,6 +662,7 @@ where
     let mut process_group_termination_requested = false;
     let mut settlement_admitted = false;
     let mut settlement_active = false;
+    let mut pending_result_event = None;
     let mut parser_enabled = true;
     let mut failure = None;
     let mut cancelled = None;
@@ -693,37 +750,10 @@ where
                     }
                 }
             }
-            event = receive_result_event(result_bridge), if parser_enabled => {
-                match handle_result_event(
-                    event,
-                    result_bridge,
-                    &mut parser,
-                    &cancellation_source,
-                ).await {
-                    ResultEventProgress::Continue { observation } => {
-                        if let Some(observation) = observation
-                        {
-                            let emitted = invocation.observations().emit(observation).await;
-                            if let Some(reason) = cancellation_source.cancellation_reason() {
-                                cancelled = Some(reason);
-                                parser_enabled = false;
-                            } else if emitted.is_err() {
-                                failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                                parser_enabled = false;
-                                child.force_process_group(process_group);
-                            }
-                        }
-                    }
-                    ResultEventProgress::Failed(cause) => {
-                        failure = Some(cause);
-                        parser_enabled = false;
-                        child.force_process_group(process_group);
-                    }
-                    ResultEventProgress::Cancelled(reason) => {
-                        cancelled = Some(reason);
-                        parser_enabled = false;
-                    }
-                }
+            event = receive_result_event(result_bridge),
+                if parser_enabled && pending_result_event.is_none() =>
+            {
+                pending_result_event = Some(event);
             }
             outcome = settlement_outcome.recv(), if parser_enabled && settlement_active => {
                 settlement_active = false;
@@ -751,6 +781,37 @@ where
             }
             () = wait_for_process_group_probe(&mut process_group_probe_clock),
                 if process_group_termination_requested => {}
+        }
+
+        if parser_enabled && let Some(event) = pending_result_event.take() {
+            match handle_result_event(event, result_bridge, &mut parser, &cancellation_source).await
+            {
+                ResultEventProgress::Continue { observation } => {
+                    if let Some(observation) = observation {
+                        let emitted = invocation.observations().emit(observation).await;
+                        if let Some(reason) = cancellation_source.cancellation_reason() {
+                            cancelled = Some(reason);
+                            parser_enabled = false;
+                        } else if emitted.is_err() {
+                            failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                            parser_enabled = false;
+                            child.force_process_group(process_group);
+                        }
+                    }
+                }
+                ResultEventProgress::Pending(incoming) => {
+                    pending_result_event = Some(ResultSocketEvent::Request(incoming));
+                }
+                ResultEventProgress::Failed(cause) => {
+                    failure = Some(cause);
+                    parser_enabled = false;
+                    child.force_process_group(process_group);
+                }
+                ResultEventProgress::Cancelled(reason) => {
+                    cancelled = Some(reason);
+                    parser_enabled = false;
+                }
+            }
         }
 
         if standard_output_closed
@@ -811,6 +872,7 @@ enum ResultEventProgress {
     Continue {
         observation: Option<AgentObservation>,
     },
+    Pending(IncomingResultRequest),
     Failed(AgentFailureCause),
     Cancelled(CancellationReason),
 }
@@ -845,16 +907,17 @@ where
     let Some(candidate) = request.candidate().cloned() else {
         return fail_correlated_request(incoming, parser, cancellation).await;
     };
-    if request.tool_name() != result_bridge.bridge.tool_name().as_ref()
-        || parser
-            .correlate_result_request(
-                request.tool_name(),
-                request.tool_call_id(),
-                request.arguments(),
-            )
-            .is_err()
-    {
+    if request.tool_name() != result_bridge.bridge.tool_name().as_ref() {
         return fail_correlated_request(incoming, parser, cancellation).await;
+    }
+    match parser.try_correlate_result_request(
+        request.tool_name(),
+        request.tool_call_id(),
+        request.arguments(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => return ResultEventProgress::Pending(incoming),
+        Err(_) => return fail_correlated_request(incoming, parser, cancellation).await,
     }
 
     let call_id = Arc::<str>::from(request.tool_call_id());

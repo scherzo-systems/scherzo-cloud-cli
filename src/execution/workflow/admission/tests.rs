@@ -6,7 +6,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
+use crate::execution::claude_code::{
+    ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation,
+};
 use crate::execution::pi::{PiCapability, PiCompatibilityProfile, ValidatedPiInstallation};
+use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 
@@ -189,6 +193,32 @@ fn all_thinking_levels_workflow() -> String {
 }
 
 #[test]
+fn admission_partitions_durable_stream_bytes_before_capture() {
+    let mut source = String::from("schemaVersion: 1\nsteps:\n");
+    for index in 0..256 {
+        source.push_str(&format!(
+            "  step{index}:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+        ));
+    }
+    let fixture = WorkflowFixture::new(&source);
+    let admitted = admit_workflow(
+        fixture.resolve(),
+        ResolvedImports::default(),
+        fixture.context(
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            1,
+            Duration::from_secs(1),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        admitted.execution().limits().maximum_step_log_bytes().get(),
+        super::super::maximum_retained_bytes_per_stream(256)
+    );
+}
+
+#[test]
 fn admission_requires_pi_only_for_graphs_containing_agent_steps() {
     for (source, agent_step_count) in [
         (AGENT_WORKFLOW, 1),
@@ -269,7 +299,10 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
 
     assert_eq!(admitted.agent_steps().len(), THINKING_LEVELS.len());
     for (index, (_, thinking)) in THINKING_LEVELS.iter().enumerate() {
-        let step = admitted.agent_step(&format!("agent{index}")).unwrap();
+        let AdmittedHarness::Pi(step) = admitted.agent_step(&format!("agent{index}")).unwrap()
+        else {
+            panic!("the public Pi profile must retain Pi admission");
+        };
         assert_eq!(step.installation(), &installation);
         assert_eq!(
             step.installation().executable(),
@@ -295,10 +328,22 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             step.project_trust(),
             ProjectTrustPolicy::InvocationScopedEnabled
         );
-        assert_eq!(step.limits().maximum_system_prompt_bytes().get(), 64 * 1024);
-        assert_eq!(step.limits().maximum_message_bytes().get(), 64 * 1024);
-        assert_eq!(step.limits().maximum_response_bytes().get(), 1024 * 1024);
-        assert_eq!(step.limits().maximum_result_bytes().get(), 1024 * 1024);
+        assert_eq!(
+            step.limits().maximum_system_prompt_bytes().get(),
+            MAXIMUM_AGENT_PROMPT_BYTES
+        );
+        assert_eq!(
+            step.limits().maximum_message_bytes().get(),
+            MAXIMUM_AGENT_PROMPT_BYTES
+        );
+        assert_eq!(
+            step.limits().maximum_response_bytes().get(),
+            MAXIMUM_AGENT_RESPONSE_BYTES
+        );
+        assert_eq!(
+            step.limits().maximum_result_bytes().get(),
+            MAXIMUM_AGENT_RESULT_BYTES
+        );
         assert_eq!(
             step.limits()
                 .maximum_result_rejection_feedback_bytes()
@@ -307,16 +352,16 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
         );
         assert_eq!(
             step.limits().result_validation_deadline().get(),
-            Duration::from_secs(5)
+            Duration::from_secs(60)
         );
         assert_eq!(
             step.limits().result_settlement_grace().get(),
             Duration::from_secs(30)
         );
-        assert_eq!(
-            step.limits().adapter_protocol().maximum_frame_bytes().get(),
-            16 * 1024 * 1024
-        );
+        let maximum_frame_bytes = step.limits().adapter_protocol().maximum_frame_bytes().get();
+        assert_eq!(maximum_frame_bytes, 16 * 1024 * 1024);
+        assert!(step.limits().maximum_response_bytes().get() < maximum_frame_bytes);
+        assert!(step.limits().maximum_result_bytes().get() < maximum_frame_bytes);
     }
     assert_eq!(
         admitted
@@ -352,6 +397,53 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
     );
     recorder.assert_empty();
     assert_eq!(root_snapshot(&fixture.execution_root), root_before);
+}
+
+#[test]
+fn internal_claude_admission_retains_native_effort_and_profile_limits() {
+    let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
+    let mut resolved = fixture.resolve();
+    let ValidatedStep::Agent(step) = resolved.definition.steps.get_mut("agent").unwrap() else {
+        panic!("the fixture must contain an agent step");
+    };
+    step.agent.harness = ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+        model: "claude-opus-4-1".to_owned(),
+        effort: ClaudeCodeEffort::XHigh,
+    });
+    let installation =
+        ValidatedClaudeCodeInstallation::fixture(fixture.execution_root.join("validated-claude"));
+    let admitted = admit_workflow(
+        resolved,
+        ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
+        fixture
+            .context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            )
+            .with_claude_code_installation(installation.clone()),
+    )
+    .unwrap();
+
+    let AdmittedHarness::ClaudeCode(agent) = admitted.agent_step("agent").unwrap() else {
+        panic!("the internal Claude profile must retain Claude admission");
+    };
+    assert_eq!(agent.installation(), &installation);
+    assert_eq!(
+        agent.installation().profile(),
+        ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+    );
+    assert_eq!(agent.installation().version().as_str(), "2.1.222");
+    assert_eq!(agent.configuration().model, "claude-opus-4-1");
+    assert_eq!(agent.configuration().effort, ClaudeCodeEffort::XHigh);
+    assert_eq!(
+        agent.limits().adapter_protocol(),
+        &ClaudeCodeStreamJsonV1ProtocolLimits::profile()
+    );
+    assert_eq!(
+        agent.limits().maximum_response_bytes().get(),
+        MAXIMUM_AGENT_RESPONSE_BYTES
+    );
 }
 
 #[test]
@@ -569,7 +661,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
 }
 
 #[test]
-fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_policy() {
+fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_policy() {
     let zero_parallelism = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
         admit_workflow(
@@ -757,18 +849,18 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
         AdmissionLocation::MaximumStepLogBytes,
     );
 
-    let zero_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let short_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
         admit_workflow(
-            zero_grace.resolve(),
+            short_grace.resolve(),
             ResolvedImports::default(),
-            zero_grace.context(
+            short_grace.context(
                 ExecutionRootLifecycle::EngineOwnedRetained,
                 1,
-                Duration::ZERO,
+                MINIMUM_CANCELLATION_GRACE - Duration::from_nanos(1),
             ),
         ),
-        AdmissionFailureKind::NonPositiveCancellationGrace,
+        AdmissionFailureKind::CancellationGraceTooShort,
         AdmissionLocation::CancellationPolicy,
     );
 
@@ -780,7 +872,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
             excessive_grace.context(
                 ExecutionRootLifecycle::EngineOwnedRetained,
                 1,
-                MAX_CANCELLATION_GRACE + Duration::from_nanos(1),
+                MAXIMUM_CANCELLATION_GRACE + Duration::from_nanos(1),
             ),
         ),
         AdmissionFailureKind::CancellationGraceTooLong,
@@ -876,7 +968,7 @@ fn admitted_root_lifecycle_preserves_each_closed_ownership_variant() {
         let admitted = admit_workflow(
             fixture.resolve(),
             ResolvedImports::default(),
-            fixture.context(lifecycle, 1, MAX_CANCELLATION_GRACE),
+            fixture.context(lifecycle, 1, MAXIMUM_CANCELLATION_GRACE),
         )
         .unwrap();
         assert_eq!(admitted.execution().root_lifecycle(), lifecycle);

@@ -8,8 +8,8 @@ use super::{private_credential_directory, run_with_env, write_runner_credential}
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CAPABILITY_PROBE: &str = "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help";
 const CLOSED_PROBES: &[u8] = b"--version\n--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help\n";
-pub(super) const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
-const REQUIRED_CAPABILITIES: &str = "json_event_stream,ephemeral_session,extension_loading,system_prompt_append,invocation_scoped_project_trust";
+pub(super) const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+const REQUIRED_CAPABILITIES: &str = "json_event_stream,custom_session_directory,extension_loading,system_prompt_append,invocation_scoped_project_trust";
 
 pub(super) struct PiFixture {
     _directory: tempfile::TempDir,
@@ -163,6 +163,14 @@ fn report_code(output: &std::process::Output) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn assert_invalid_runner_gateway(output: &std::process::Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with(
+        "Error: configure runner gateway endpoint https://not-a-websocket.example.test: "
+    ));
+    assert!(stderr.contains("invalid runner gateway URL"));
 }
 
 #[test]
@@ -340,7 +348,13 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
         ),
         (
             "0.83.0",
-            "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n",
+            "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n",
+            "unsupported_pi_capability",
+            CLOSED_PROBES,
+        ),
+        (
+            "0.83.0",
+            "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n",
             "unsupported_pi_capability",
             CLOSED_PROBES,
         ),
@@ -388,11 +402,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     );
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(
-        output
-            .stderr
-            .starts_with(b"Error: invalid runner gateway URL\n")
-    );
+    assert_invalid_runner_gateway(&output);
 
     let fixture = PiFixture::new("0.83.0", COMPLETE_HELP, true);
     let output = run_with_env(
@@ -400,11 +410,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
         &[("PATH", fixture.path_directory().to_str().unwrap())],
     );
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        output
-            .stderr
-            .starts_with(b"Error: invalid runner gateway URL\n")
-    );
+    assert_invalid_runner_gateway(&output);
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 
     let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
@@ -414,11 +420,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     );
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(
-        output
-            .stderr
-            .starts_with(b"Error: invalid runner gateway URL\n")
-    );
+    assert_invalid_runner_gateway(&output);
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
 }
 

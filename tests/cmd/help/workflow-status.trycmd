@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud workflow status --help
+Show local workflow run status
+
+Usage: scherzo-cloud workflow status [OPTIONS] <RUN_DIR>
+
+Arguments:
+  <RUN_DIR>  Directory containing the workflow run
+
+Options:
+      --plain         Force plain human presentation
+      --json          Print the result as JSON
+      --color <WHEN>  Select renderer color behavior [default: auto] [possible values: auto, always, never]
+  -h, --help          Print help
+
+```

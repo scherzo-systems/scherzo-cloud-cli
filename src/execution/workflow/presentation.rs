@@ -16,6 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
 use super::document::Output;
+use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
 use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
@@ -27,8 +28,8 @@ use super::presentation_feed::{
 use super::publication::{
     LocalPublicationError, WorkflowRunResult, WorkflowRunStep, WorkflowRunTerminalResultV1,
 };
-use super::rejection::RejectionDiagnostic;
-use super::resolution::{ResolutionFailure, ResolvedWorkflow};
+use super::rejection::{RejectionDiagnostic, human_resolution_remedy};
+use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolvedWorkflow};
 use super::run_timing::{ObservationClock, ObservationTime};
 use super::runtime::{
     FailurePhase, NotRunReason, RunOutcome, StepState, StepStateKind, TransitionEvent,
@@ -276,12 +277,14 @@ impl std::error::Error for PresentationFailure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WorkflowRunPresentationResult {
-    Rejected,
+    Rejected {
+        human_diagnostic: Option<String>,
+    },
     Published {
         exit_status: u16,
         result_directory: String,
     },
-    PublicationFailed,
+    PublicationFailed(LocalPublicationError),
     Failed(PresentationFailure),
 }
 
@@ -327,10 +330,28 @@ where
         self,
         failure: &ResolutionFailure,
     ) -> WorkflowRunPresentationResult {
+        let diagnostic = RejectionDiagnostic::from_resolution(failure);
+        let human_subject = match (failure.kind(), failure.source_path()) {
+            (ResolutionFailureKind::SourceUnavailable, Some(_)) => {
+                Some("workflow source unavailable")
+            }
+            (ResolutionFailureKind::SourceNotRegularFile, Some(_)) => {
+                Some("workflow source is not a regular file")
+            }
+            _ => None,
+        };
+        let human_message = human_subject.map(|subject| {
+            format!(
+                "{subject} at {}\n\n{}",
+                diagnostic.location,
+                human_resolution_remedy(failure)
+            )
+        });
         self.write_workflow_rejection(
             "resolution",
             failure.workflow_path(),
-            RejectionDiagnostic::from_resolution(failure),
+            diagnostic,
+            human_message,
         )
     }
 
@@ -348,6 +369,7 @@ where
             "admission",
             Some(&workflow.source.workflow_path),
             diagnostic,
+            None,
         )
     }
 
@@ -360,6 +382,7 @@ where
             "installation",
             Some(&workflow.source.workflow_path),
             RejectionDiagnostic::from_pi_installation(failure),
+            None,
         )
     }
 
@@ -368,25 +391,26 @@ where
         phase: &'static str,
         workflow_path: Option<&str>,
         diagnostic: RejectionDiagnostic<'_>,
+        human_message: Option<String>,
     ) -> WorkflowRunPresentationResult {
         let retry_run_directory = self.retry_run_directory.clone();
         let rejection = TerminalRejectionV1 {
             schema_version: 1,
             command: self.command,
             outcome: "rejected",
-            exit_status: 1,
+            exit_status: crate::exit_code::ExitCode::GeneralFailure.as_u8(),
             phase,
             run_directory: retry_run_directory.as_deref(),
             workflow: workflow_path.map(|path| RejectedWorkflowV1 { path }),
             diagnostics: [diagnostic.clone()],
         };
-        self.write_rejection(
-            &rejection,
-            &format!(
+        let human_message = human_message.unwrap_or_else(|| {
+            format!(
                 "workflow rejected: {} at {}: {}",
                 diagnostic.code, diagnostic.location, diagnostic.message
-            ),
-        )
+            )
+        });
+        self.write_rejection(&rejection, &human_message)
     }
 
     pub(crate) fn render_retry_rejection(
@@ -413,20 +437,13 @@ where
             schema_version: 1,
             command: RETRY_COMMAND,
             outcome: "rejected",
-            exit_status: 1,
+            exit_status: crate::exit_code::ExitCode::GeneralFailure.as_u8(),
             phase: "retry",
             run_directory,
             attempt_number: rejection.attempt_number(),
             diagnostics: [diagnostic],
         };
-        self.write_rejection(
-            &terminal,
-            &format!(
-                "workflow retry rejected: {} at attempt {}: {message}",
-                rejection.reason().as_str(),
-                rejection.attempt_number()
-            ),
-        )
+        self.write_rejection(&terminal, &human_retry_rejection(rejection))
     }
 
     fn write_rejection(
@@ -434,17 +451,9 @@ where
         rejection: &impl Serialize,
         human_message: &str,
     ) -> WorkflowRunPresentationResult {
-        let result = match self.config.mode() {
-            PresentationMode::Tui | PresentationMode::Plain => {
-                { writeln!(self.standard_error, "Error: {human_message}") }
-                    .and_then(|()| self.standard_error.flush())
-                    .map_err(|error| {
-                        PresentationFailure::writer(
-                            PresentationFailureOperation::DiagnosticWriter,
-                            &error,
-                        )
-                    })
-            }
+        let mode = self.config.mode();
+        let result = match mode {
+            PresentationMode::Tui | PresentationMode::Plain => Ok(()),
             PresentationMode::Json => write_pretty_json(&mut self.standard_output, rejection)
                 .map_err(|error| {
                     PresentationFailure::writer(
@@ -454,14 +463,11 @@ where
                 }),
         };
         match result {
-            Ok(()) => WorkflowRunPresentationResult::Rejected,
-            Err(failure) => {
-                if self.config.mode() == PresentationMode::Json {
-                    let _ = writeln!(self.standard_error, "Error: {failure}")
-                        .and_then(|()| self.standard_error.flush());
-                }
-                WorkflowRunPresentationResult::Failed(failure)
-            }
+            Ok(()) => WorkflowRunPresentationResult::Rejected {
+                human_diagnostic: (mode != PresentationMode::Json)
+                    .then(|| human_message.to_owned()),
+            },
+            Err(failure) => WorkflowRunPresentationResult::Failed(failure),
         }
     }
 
@@ -583,6 +589,24 @@ struct RetryLocationV1<'a> {
     ownership_reason: Option<&'static str>,
 }
 
+fn human_retry_rejection(rejection: &LocalRetryRejection) -> String {
+    let attempt = rejection.attempt_number();
+    match rejection.reason() {
+        RetryIneligibilityReason::RunLocked => format!(
+            "retry blocked: attempt {attempt} has an active execution owner\n\nWait for the current attempt to finish, then retry."
+        ),
+        RetryIneligibilityReason::LatestAttemptSucceeded => format!(
+            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+        ),
+        RetryIneligibilityReason::LatestAttemptRejected => format!(
+            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+        ),
+        RetryIneligibilityReason::OwnershipUnproven => format!(
+            "retry blocked: process ownership for attempt {attempt} is unproven\n\nNo safe retry remedy is available for this run."
+        ),
+    }
+}
+
 const fn retry_rejection_message(reason: RetryIneligibilityReason) -> &'static str {
     match reason {
         RetryIneligibilityReason::RunLocked => {
@@ -666,10 +690,7 @@ where
             finished: false,
         };
         let opened_at = clock.sample();
-        if let Err(failure) = state.write_header(opened_at.utc, maximum_parallel_steps) {
-            state.report_output_failure(&failure);
-            return Err(failure);
-        }
+        state.write_header(opened_at.utc, maximum_parallel_steps)?;
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
             clock,
@@ -724,14 +745,12 @@ where
         };
         if let Some(failure) = state.failure.clone() {
             let failure = failure.with_result_directory(result_directory);
-            state.report_output_failure(&failure);
             return WorkflowRunPresentationResult::Failed(failure);
         }
 
         let observed_at = self.clock.sample();
         if let Err(failure) = state.finish_child_streams(observed_at) {
             let failure = failure.with_result_directory(result_directory);
-            state.report_output_failure(&failure);
             return WorkflowRunPresentationResult::Failed(failure);
         }
         if let Err(failure) =
@@ -1260,7 +1279,6 @@ where
             Ok(()) => Ok(()),
             Err(failure) => {
                 let failure = failure.with_result_directory(result_directory);
-                self.report_output_failure(&failure);
                 Err(WorkflowRunPresentationResult::Failed(failure))
             }
         }
@@ -1474,8 +1492,7 @@ where
     ) -> WorkflowRunPresentationResult {
         match publication {
             PublicationPresentation::Failed(error) => {
-                self.write_publication_diagnostic(error);
-                WorkflowRunPresentationResult::PublicationFailed
+                WorkflowRunPresentationResult::PublicationFailed(error.clone())
             }
             PublicationPresentation::Published(terminal) => {
                 if emit_terminal_json
@@ -1487,7 +1504,6 @@ where
                         &error,
                     )
                     .with_result_directory(Some(terminal.result_directory()));
-                    self.report_output_failure(&failure);
                     return WorkflowRunPresentationResult::Failed(failure);
                 }
                 WorkflowRunPresentationResult::Published {
@@ -1496,25 +1512,6 @@ where
                 }
             }
         }
-    }
-
-    fn write_publication_diagnostic(&mut self, error: &LocalPublicationError) {
-        let _ = writeln!(self.standard_error, "Error: {error}")
-            .and_then(|()| self.standard_error.flush());
-    }
-
-    fn report_output_failure(&mut self, failure: &PresentationFailure) {
-        if self.mode == PresentationMode::Json
-            && matches!(
-                failure.operation,
-                PresentationFailureOperation::HeaderWriter
-                    | PresentationFailureOperation::LineWriter
-            )
-        {
-            return;
-        }
-        let _ = writeln!(self.standard_error, "Error: {failure}")
-            .and_then(|()| self.standard_error.flush());
     }
 
     fn write_line_bytes(&mut self, bytes: &[u8]) -> Result<(), PresentationFailure> {
@@ -1712,6 +1709,12 @@ fn start_detail(step: &WorkflowPresentationStep) -> String {
                 let thinking = format!("{thinking:?}").to_ascii_lowercase();
                 format!("agent · {profile} · pi · {model} · thinking={thinking}")
             }
+            AgentPresentationHarness::ClaudeCode { model, effort } => {
+                format!(
+                    "agent · {profile} · claude code · {model} · effort={}",
+                    effort.as_str()
+                )
+            }
         },
     };
     visible_text(&detail)
@@ -1884,9 +1887,12 @@ fn failure_cause(cause: &StepFailureCause) -> String {
                 };
                 format!("{code} · output {}", failure.output_identity())
             }
-            OutputCaptureFailure::Git { output, failure } => {
-                format!("Git branch capture {failure:?} · output {output}")
-            }
+            OutputCaptureFailure::Git { output, failure } => match failure {
+                GitCaptureFailure::CommandTimedOut(_) => {
+                    format!("{failure} · output {output}")
+                }
+                _ => format!("Git branch capture {failure:?} · output {output}"),
+            },
         },
     }
 }

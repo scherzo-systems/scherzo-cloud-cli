@@ -1,14 +1,13 @@
-use std::process::ExitCode;
-
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::api::list_organization_memberships;
+use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 
-use super::{CommandError, LeafOptions, output};
+use super::{LeafOptions, output};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organization members";
-const LIST_ABOUT: &str = "List one page of organization members";
+const LIST_ABOUT: &str = "List organization members";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -23,15 +22,13 @@ enum MembersCommand {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_deployment_command(
             self.command,
             &["organization", "members"],
             "configure Scherzo Cloud organization access",
-            |command, deployment| {
-                super::super::finish_command(match command {
-                    MembersCommand::List(command) => command.execute(deployment),
-                })
+            |command, deployment| match command {
+                MembersCommand::List(command) => command.execute(deployment).map_err(Into::into),
             },
         )
     }
@@ -63,7 +60,7 @@ struct ListCommand {
 }
 
 impl ListCommand {
-    fn execute(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
+    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self {
             organization_ref,
             limit,
@@ -82,7 +79,6 @@ impl ListCommand {
                     limit,
                     cursor.as_deref(),
                 )
-                .map_err(CommandError::Organization)
             },
             output::write_members_list,
         )

@@ -1,26 +1,23 @@
 // Signup and status have independent output contracts, so their command-local
 // adapters stay separate rather than coupling unrelated command behavior.
 // jscpd:ignore-start
-use std::fmt;
 use std::io::{self, Write};
-use std::process::ExitCode;
 
+use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 // jscpd:ignore-end
 
 use crate::api::{
-    HttpClient, HttpClientError, HumanPrincipal, SignupError, SignupOutcome,
-    generate_idempotency_key, signup_human,
+    HttpClient, HumanPrincipal, SignupError, SignupOutcome, generate_idempotency_key, signup_human,
 };
-use crate::human_auth::credentials::{CredentialError, CredentialStore};
+use crate::exit_code::ExitCode;
+use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
 
 use super::super::principal::PrincipalResult;
 
 pub(super) const ABOUT: &str = "Create your Scherzo Cloud account";
-const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
-const UNREACHABLE_EXIT_CODE: u8 = 3;
 
 // Signup owns credential mutation while status is read-only; keeping these
 // command adapters local makes their different cleanup and output paths explicit.
@@ -35,28 +32,27 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
-        match self.run(deployment) {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
-        }
+    pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
+        self.run(deployment).map_err(Into::into)
     }
 
-    fn run(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
-        let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
+    fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let store = CredentialStore::from_environment()
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?;
         // jscpd:ignore-end
         let Some(credential) = store
             .selected(deployment.fingerprint(), crate::timing::utc_now())
-            .map_err(CommandError::CredentialStore)?
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?
         else {
             return self.write_outcome(deployment, &SignupOutcome::Unauthenticated);
         };
-        let idempotency_key = generate_idempotency_key().map_err(CommandError::Random)?;
-        let client =
-            HttpClient::new(self.http.transport_policy()).map_err(CommandError::HttpClient)?;
+        let idempotency_key =
+            generate_idempotency_key().context("create signup request identity")?;
+        let client = HttpClient::new(self.http.transport_policy())
+            .map_err(|error| anyhow!(error))
+            .context("prepare signup networking")?;
         let outcome = signup_human(
             &client,
             deployment.fingerprint().api_url(),
@@ -71,10 +67,16 @@ impl Command {
         if credential_rejected {
             store
                 .remove_if_access_token_matches(deployment.fingerprint(), credential.access_token())
-                .map_err(CommandError::CredentialStore)?;
+                .map_err(|error| anyhow!(error))
+                .context("access credential store")?;
         }
 
-        let outcome = outcome.map_err(CommandError::Signup)?;
+        let outcome = outcome.map_err(|error| anyhow!(error)).with_context(|| {
+            format!(
+                "create Scherzo Cloud account through {}",
+                deployment.fingerprint().api_url()
+            )
+        })?;
         self.write_outcome(deployment, &outcome)
     }
 
@@ -82,7 +84,7 @@ impl Command {
         self,
         deployment: &Deployment,
         outcome: &SignupOutcome,
-    ) -> Result<ExitCode, CommandError> {
+    ) -> anyhow::Result<ExitCode> {
         if self.json {
             write_json_result(deployment.fingerprint().api_url(), outcome)?;
         } else {
@@ -94,12 +96,12 @@ impl Command {
 
 fn exit_code(outcome: &SignupOutcome) -> ExitCode {
     match outcome {
-        SignupOutcome::Authenticated(_) => ExitCode::SUCCESS,
-        SignupOutcome::Unauthenticated => ExitCode::from(UNAUTHENTICATED_EXIT_CODE),
-        SignupOutcome::Unreachable(_) => ExitCode::from(UNREACHABLE_EXIT_CODE),
+        SignupOutcome::Authenticated(_) => ExitCode::Success,
+        SignupOutcome::Unauthenticated => ExitCode::AuthenticationRequired,
+        SignupOutcome::Unreachable(_) => ExitCode::Unavailable,
         SignupOutcome::SignupNotPermitted
         | SignupOutcome::AlreadyProvisioned
-        | SignupOutcome::IdempotencyConflict => ExitCode::FAILURE,
+        | SignupOutcome::IdempotencyConflict => ExitCode::GeneralFailure,
     }
 }
 
@@ -145,15 +147,15 @@ impl<'a> SignupResult<'a> {
     }
 }
 
-fn write_json_result(deployment: &str, outcome: &SignupOutcome) -> Result<(), CommandError> {
+fn write_json_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Result<()> {
     let result = SignupResult::new(deployment, outcome);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, &result).map_err(CommandError::WriteJson)?;
-    writeln!(stdout).map_err(CommandError::WriteOutput)
+    serde_json::to_writer_pretty(&mut stdout, &result).context("write JSON signup result")?;
+    writeln!(stdout).context("write signup result")
 }
 
-fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> Result<(), CommandError> {
+fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     match outcome {
@@ -162,7 +164,7 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> Result<(), C
         }
         SignupOutcome::Unauthenticated => writeln!(
             stdout,
-            "! You must sign in before creating a Scherzo Cloud account.\n\nRun:\n  scherzo-cloud auth login"
+            "! You're not signed in to Scherzo Cloud.\n\nSign in to create your account:\n  scherzo-cloud auth login"
         ),
         SignupOutcome::SignupNotPermitted => writeln!(
             stdout,
@@ -182,7 +184,7 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> Result<(), C
             category.as_str()
         ),
     }
-    .map_err(CommandError::WriteOutput)
+    .context("write signup result")
 }
 
 fn write_created_account(
@@ -196,27 +198,4 @@ fn write_created_account(
     }
     writeln!(output, "  Principal:  {}", principal.id)?;
     writeln!(output, "  Deployment: {deployment}")
-}
-
-#[derive(Debug)]
-enum CommandError {
-    CredentialStore(CredentialError),
-    HttpClient(HttpClientError),
-    Random(getrandom::Error),
-    Signup(SignupError),
-    WriteJson(serde_json::Error),
-    WriteOutput(io::Error),
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CredentialStore(error) => write!(formatter, "access credential store: {error}"),
-            Self::HttpClient(error) => write!(formatter, "prepare signup networking: {error}"),
-            Self::Random(error) => write!(formatter, "create signup request identity: {error}"),
-            Self::Signup(error) => write!(formatter, "create Scherzo Cloud account: {error}"),
-            Self::WriteJson(error) => write!(formatter, "write JSON signup result: {error}"),
-            Self::WriteOutput(error) => write!(formatter, "write signup result: {error}"),
-        }
-    }
 }

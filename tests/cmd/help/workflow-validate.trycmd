@@ -1,0 +1,15 @@
+```console
+$ scherzo-cloud workflow validate --help
+Validate a local workflow definition
+
+Usage: scherzo-cloud workflow validate [OPTIONS] --source-root <ROOT> <WORKFLOW_FILE>
+
+Arguments:
+  <WORKFLOW_FILE>  Workflow definition path, resolved from the initial working directory
+
+Options:
+      --source-root <ROOT>  Directory boundary for workflow source files
+      --json                Print the validation result as JSON
+  -h, --help                Print help
+
+```

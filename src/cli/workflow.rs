@@ -7,12 +7,12 @@ mod view;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
 
-pub(super) const ABOUT: &str = "Validate, run, retry, and inspect local Workflow V1 definitions";
+pub(super) const ABOUT: &str = "Work with local workflow definitions and runs";
 const NAME: &str = "workflow";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -27,13 +27,13 @@ pub(super) struct PresentationOptions {
     #[arg(long, conflicts_with = "json", help = "Force plain human presentation")]
     pub(super) plain: bool,
 
-    #[arg(long, help = "Print one schema-version-1 JSON result")]
+    #[arg(long, help = "Print the result as JSON")]
     pub(super) json: bool,
 
     #[arg(
         long,
         value_enum,
-        value_name = "auto|always|never",
+        value_name = "WHEN",
         default_value_t = ColorArgument::Auto,
         help = "Select renderer color behavior"
     )]
@@ -42,10 +42,7 @@ pub(super) struct PresentationOptions {
 
 #[derive(Debug, Args)]
 pub(super) struct ExistingLocalRun {
-    #[arg(
-        value_name = "RUN_DIR",
-        help = "Existing durable directory for exactly one workflow run"
-    )]
+    #[arg(value_name = "RUN_DIR", help = "Directory containing the workflow run")]
     pub(super) run_dir: PathBuf,
 }
 
@@ -54,7 +51,7 @@ pub(super) struct LocalExecutionRoot {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Existing caller-owned workflow execution directory"
+        help = "Directory for workflow execution (must already exist)"
     )]
     pub(super) execution_root: PathBuf,
 }
@@ -64,13 +61,13 @@ pub(super) struct LocalWorkflowSource {
     #[arg(
         long,
         value_name = "ROOT",
-        help = "Explicit directory boundary for workflow source files"
+        help = "Directory boundary for workflow source files"
     )]
     pub(super) source_root: PathBuf,
 
     #[arg(
         value_name = "WORKFLOW_FILE",
-        help = "Workflow YAML file path resolved from the initial working directory"
+        help = "Workflow definition path, resolved from the initial working directory"
     )]
     pub(super) workflow_file: PathBuf,
 }
@@ -83,7 +80,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
-    #[command(about = retry::ABOUT)]
+    #[command(about = retry::ABOUT, after_help = retry::AFTER_HELP)]
     Retry(retry::Command),
     #[command(about = run::ABOUT, after_help = run::AFTER_HELP)]
     Run(run::Command),
@@ -91,7 +88,7 @@ enum WorkflowCommand {
     Status(status::Command),
     #[command(about = validate::ABOUT)]
     Validate(validate::Command),
-    #[command(about = view::ABOUT)]
+    #[command(about = view::ABOUT, after_help = view::AFTER_HELP)]
     View(view::Command),
 }
 
@@ -99,18 +96,12 @@ enum WorkflowCommand {
 // filesystem worker without delaying process shutdown.
 pub(super) fn execute_with_abandonable_runtime(
     leaf: &'static str,
-    execution: impl Future<Output = ExitCode>,
-) -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    execution: impl Future<Output = super::CommandResult>,
+) -> super::CommandResult {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("Error: start workflow {leaf} runtime: {:?}", error.kind());
-            return ExitCode::FAILURE;
-        }
-    };
+        .with_context(|| format!("start workflow {leaf} runtime"))?;
     let result = runtime.block_on(execution);
     runtime.shutdown_timeout(Duration::ZERO);
     result
@@ -118,26 +109,17 @@ pub(super) fn execute_with_abandonable_runtime(
 
 pub(super) fn observe_workflow_signals(
     leaf: &'static str,
-) -> Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
-    let signals = (|| -> io::Result<_> {
+) -> anyhow::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
+    (|| -> io::Result<_> {
         let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         Ok((interrupt, terminate))
-    })();
-    match signals {
-        Ok(signals) => Some(signals),
-        Err(error) => {
-            eprintln!(
-                "Error: install workflow {leaf} signal observation: {:?}",
-                error.kind()
-            );
-            None
-        }
-    }
+    })()
+    .with_context(|| format!("install workflow {leaf} signal observation"))
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(WorkflowCommand::Retry(command)) => command.execute(),

@@ -11,11 +11,13 @@
 mod api;
 mod build_info;
 mod cli;
+mod error;
 #[allow(
     dead_code,
     reason = "validation resolves execution fields that later runtime components will consume"
 )]
 mod execution;
+mod exit_code;
 mod human_auth;
 mod process;
 mod runner;
@@ -24,7 +26,8 @@ mod timing;
 mod tls;
 
 use std::env;
-use std::process::ExitCode;
+
+use crate::exit_code::ExitCode;
 
 fn main() -> ExitCode {
     if execution::workflow::child_guard::internal_worker_requested() {
@@ -35,23 +38,24 @@ fn main() -> ExitCode {
     }
 
     match cli::parse(env::args_os()) {
-        Ok(command) => command.execute(),
+        Ok(command) => match command.execute() {
+            Ok(exit_code) => exit_code,
+            Err(failure) => error::render(failure.error(), failure.exit_code()),
+        },
         Err(error) => {
-            let exit_code = error.exit_code();
+            let exit_code = if error.use_stderr() {
+                ExitCode::UsageError
+            } else {
+                ExitCode::Success
+            };
 
             if let Err(write_error) = error.print() {
-                eprintln!("Error: failed to write command output: {write_error}");
-                return ExitCode::FAILURE;
+                let failure =
+                    anyhow::Error::new(write_error).context("failed to write command output");
+                return crate::error::render(&failure, ExitCode::GeneralFailure);
             }
 
-            to_exit_code(exit_code)
+            exit_code
         }
-    }
-}
-
-fn to_exit_code(code: i32) -> ExitCode {
-    match u8::try_from(code) {
-        Ok(code) => ExitCode::from(code),
-        Err(_) => ExitCode::FAILURE,
     }
 }

@@ -1,12 +1,16 @@
 pub(crate) mod admission;
 pub(crate) mod agent;
+pub(crate) mod agent_diagnostics;
 pub(crate) mod agent_input;
 pub(crate) mod archived_attempt;
 pub(crate) mod artifact;
 mod artifact_json;
 mod artifact_set;
+pub(crate) mod cancellation;
 mod canonical_json;
 pub(crate) mod child_guard;
+mod claude_code;
+pub(crate) mod claude_code_stream_json_v1;
 pub(crate) mod command_contract;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
@@ -57,6 +61,20 @@ const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
     "/schemas/workflow-v1.schema.json"
 ));
 pub(crate) const MAX_DECODE_DIAGNOSTIC_BYTES: usize = 96;
+pub(crate) const MAXIMUM_PARALLEL_STEPS: usize = 256;
+pub(crate) const MAXIMUM_RETAINED_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024;
+pub(crate) const RUN_LOG_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+pub(crate) const MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN: u64 = 2 * RUN_LOG_BYTE_BUDGET;
+
+pub(crate) const fn maximum_retained_bytes_per_stream(step_count: usize) -> u64 {
+    let step_count = if step_count == 0 { 1 } else { step_count };
+    let allocated = RUN_LOG_BYTE_BUDGET / step_count as u64;
+    if allocated < MAXIMUM_RETAINED_BYTES_PER_STREAM {
+        allocated
+    } else {
+        MAXIMUM_RETAINED_BYTES_PER_STREAM
+    }
+}
 
 static STRUCTURAL_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();
 static MEDIA_TYPE_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();

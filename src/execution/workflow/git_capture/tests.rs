@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::process::Command;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +136,10 @@ fn git_parent(arguments: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn create_fifo(path: &Path) {
+    assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
 }
 
 fn add_clean_submodule(repository: &Path, source: &Path) {
@@ -863,78 +868,146 @@ fn post_staging_recheck_rejects_head_changed_after_tree_observation() {
 }
 
 #[test]
-fn timed_out_git_subprocess_is_terminated_and_reaped() {
+fn process_timeout_terminates_and_reaps_a_running_child() {
     let temporary = tempfile::tempdir().unwrap();
-    let repository = temporary.path().join("repository");
-    init_repository(&repository);
-    fs::write(repository.join("base.txt"), b"base\n").unwrap();
-    git(&repository, &["add", "base.txt"]);
-    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
-    let marker = temporary.path().join("git.pid");
-    let wrapper = temporary.path().join("slow-git");
-    fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'
-exec sleep 300\n",
-            marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-    let (admitted, _artifacts) = admitted_capture(temporary.path(), &repository, []);
+    let blocker = temporary.path().join("blocker");
+    create_fifo(&blocker);
+    let mut command = Command::new("cat");
+    command
+        .arg(blocker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let pid = i32::try_from(child.child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .unwrap();
+    assert!(rustix::process::test_kill_process(pid).is_ok());
 
-    let failure = match GitCaptureContext::admit_with_program(
-        admitted.execution(),
-        &CaptureCancellation::default(),
-        wrapper,
-        Duration::from_millis(100),
-    ) {
-        Err(failure) => failure,
-        Ok(_) => panic!("timed-out Git admission unexpectedly succeeded"),
-    };
-    assert_eq!(failure, GitWorkspaceAdmissionFailure::GitTimedOut);
-    #[cfg(target_os = "linux")]
-    {
-        let pid = fs::read_to_string(marker).unwrap().trim().to_owned();
-        assert!(!Path::new("/proc").join(pid).exists());
-    }
+    let command_description = Arc::<str>::from("cat blocker");
+    let failure = child
+        .wait(
+            &CaptureCancellation::default(),
+            Duration::ZERO,
+            Arc::clone(&command_description),
+            || false,
+            || false,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        failure,
+        ProcessFailure::TimedOut {
+            command: command_description,
+            limit: Duration::ZERO,
+        }
+    );
+    assert_eq!(
+        admission_process_failure(failure),
+        GitWorkspaceAdmissionFailure::GitTimedOut
+    );
+    assert!(child.reaped);
+    assert!(rustix::process::test_kill_process(pid).is_err());
 }
 
 #[test]
-fn admission_timeout_covers_descendants_that_inherit_output_pipes() {
+fn process_timeout_covers_blocked_output_workers_after_the_leader_exits() {
+    let temporary = tempfile::tempdir().unwrap();
+    let blocker = temporary.path().join("blocker");
+    create_fifo(&blocker);
+    let marker = temporary.path().join("helper.pid");
+    let wrapper = temporary.path().join("leader-with-lingering-helper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncat '{}' & printf '%s\\n' \"$!\" > '{}'\n",
+            blocker.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(wrapper);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let leader_status = child.child.wait().unwrap();
+    child.reaped = true;
+    assert!(leader_status.success());
+    let helper_pid = fs::read_to_string(marker)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .and_then(Pid::from_raw)
+        .unwrap();
+    assert!(rustix::process::test_kill_process(helper_pid).is_ok());
+
+    let command_description = Arc::<str>::from("leader with lingering helper");
+    let failure = child
+        .wait(
+            &CaptureCancellation::default(),
+            Duration::ZERO,
+            Arc::clone(&command_description),
+            || false,
+            || false,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        failure,
+        ProcessFailure::TimedOut {
+            command: command_description,
+            limit: Duration::ZERO,
+        }
+    );
+}
+
+#[test]
+fn capture_timeout_names_git_command_and_limit() {
     let temporary = tempfile::tempdir().unwrap();
     let repository = temporary.path().join("repository");
     init_repository(&repository);
     fs::write(repository.join("base.txt"), b"base\n").unwrap();
     git(&repository, &["add", "base.txt"]);
     git(&repository, &["commit", "--quiet", "-m", "baseline"]);
-    let marker = temporary.path().join("helper.pid");
-    let wrapper = temporary.path().join("git-with-lingering-helper");
+    let wrapper = temporary.path().join("git-with-timeout");
     fs::write(
         &wrapper,
-        format!(
-            "#!/bin/sh\ncase \" $* \" in\n  *\" rev-parse --is-inside-work-tree --show-prefix --show-object-format \"*) sleep 1 & printf '%s\\n' \"$!\" > '{}'; printf 'true\\n\\nsha1\\n'; exit 0 ;;\nesac\nexec git \"$@\"\n",
-            marker.display()
-        ),
+        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --window=0 --depth=0 \"*) exec sleep 300 ;;
+esac\nexec \"$REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-    let (admitted, _artifacts) = admitted_capture(temporary.path(), &repository, []);
-
-    let started = crate::timing::monotonic_now();
-    let failure = match GitCaptureContext::admit_with_program(
+    let (admitted, artifacts) = admitted_capture(
+        temporary.path(),
+        &repository,
+        [("REAL_GIT", OsStr::new("git"))],
+    );
+    let capture = GitCaptureContext::admit_with_program(
         admitted.execution(),
         &CaptureCancellation::default(),
         wrapper,
-        Duration::from_millis(100),
-    ) {
-        Err(failure) => failure,
-        Ok(_) => panic!("Git admission ignored the subprocess timeout"),
-    };
-    assert_eq!(failure, GitWorkspaceAdmissionFailure::GitTimedOut);
-    assert!(crate::timing::elapsed(started) < Duration::from_millis(500));
-    assert!(!fs::read_to_string(marker).unwrap().trim().is_empty());
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    fs::write(repository.join("change.txt"), b"change\n").unwrap();
+    git(&repository, &["add", "change.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "change"]);
+
+    let failure =
+        capture_failure(capture.capture("changes", &artifacts, &CaptureCancellation::default()));
+
+    assert_eq!(
+        failure.to_string(),
+        "Git branch capture command `git pack-objects --stdout --revs --window=0 --depth=0` exceeded the 1s timeout"
+    );
+    assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }
 
 #[test]

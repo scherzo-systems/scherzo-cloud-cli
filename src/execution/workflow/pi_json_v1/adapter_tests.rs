@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::{Future, pending, ready};
+use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,16 +20,16 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::adapter::{PiJsonV1Adapter, build_command, prepare_launch};
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationReason, CancellationSource, EnvironmentSnapshot,
+    CancellationReason, CancellationSource, EnvironmentSnapshot, MAXIMUM_AGENT_PROMPT_BYTES,
 };
 use crate::execution::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInputKind, AgentInvocation,
     AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
     AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessContext,
     AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiveError,
-    AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode, PositiveDuration,
-    RetainedResultSchema, StagedAgentAttachment, WorkflowRunId, agent_start_channel,
-    agent_terminal_channel, invoke_agent_adapter,
+    AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES,
+    PositiveDuration, RetainedResultSchema, StagedAgentAttachment, WorkflowRunId,
+    agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
@@ -42,7 +43,7 @@ use crate::execution::workflow::result_validation::{
 };
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 
-const MAXIMUM_INPUT_BYTES: u64 = 64 * 1024;
+const MAXIMUM_INPUT_BYTES: u64 = MAXIMUM_AGENT_PROMPT_BYTES;
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 const RECORDED_CWD: &str = "/execution/worktree";
 const RESPONSE_SUCCESS: &str = include_str!("fixtures/response-success.jsonl");
@@ -306,6 +307,7 @@ struct ProcessFixture {
     trust_state: PathBuf,
     expected_environment: BTreeMap<OsString, OsString>,
     expected_attachments: Vec<PathBuf>,
+    expected_diagnostic_session: PathBuf,
 }
 
 impl ProcessFixture {
@@ -361,12 +363,14 @@ impl ProcessFixture {
         let cwd = execution_root.join("worktree");
         let staging = temporary.path().join("staging");
         let result_endpoint = staging.join("result-endpoint");
+        let diagnostic_session = temporary.path().join("diagnostics/session");
         let controls = temporary.path().join("controls");
         let agent_directory = temporary.path().join("agent");
         for directory in [
             &cwd,
             &staging,
             &result_endpoint,
+            &diagnostic_session,
             &controls,
             &agent_directory,
         ] {
@@ -535,6 +539,13 @@ impl ProcessFixture {
         ]);
         let (observation_sender, observations) = mpsc::unbounded_channel();
         let observation_gate = Arc::new(Mutex::new(None));
+        let mut invocation_staging = AgentInvocationStaging::new(result_endpoint.clone());
+        if message.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+            let message_file = staging.join("message.md");
+            fs::write(&message_file, message.as_bytes()).unwrap();
+            fs::set_permissions(&message_file, fs::Permissions::from_mode(0o400)).unwrap();
+            invocation_staging = invocation_staging.with_message_file(message_file);
+        }
         let invocation = AgentInvocation::new(
             identity,
             AdmittedAgentAdapter::new(
@@ -550,7 +561,10 @@ impl ProcessFixture {
                 working_directory,
                 EnvironmentSnapshot::new(expected_environment.clone()),
             ),
-            AgentInvocationStaging::new(result_endpoint.clone()),
+            invocation_staging,
+            crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession::fixture(
+                diagnostic_session.clone(),
+            ),
             AgentPrompt::new(Arc::from(system_prompt), Arc::from(message)),
             Arc::from(
                 attachments
@@ -597,6 +611,7 @@ impl ProcessFixture {
             trust_state,
             expected_environment,
             expected_attachments: attachments,
+            expected_diagnostic_session: diagnostic_session,
         }
     }
 }
@@ -682,7 +697,34 @@ struct CapturedRun {
     observations: Vec<AgentObservationEnvelope>,
     outcome: AgentOutcome,
     diagnostic: StepDiagnostic,
+    expected_input_extension: PathBuf,
     expected_attachments: Vec<PathBuf>,
+    expected_diagnostic_session: PathBuf,
+}
+
+fn assert_prepared_launch_command(fixture: &ProcessFixture) {
+    let plan = prepare_launch(&fixture.invocation).unwrap();
+    let command = build_command(&fixture.invocation, &plan).unwrap();
+    assert_eq!(
+        command.as_std().get_program(),
+        fixture.invocation.adapter().executable()
+    );
+    assert_eq!(
+        command.as_std().get_args().collect::<Vec<_>>(),
+        plan.arguments()
+            .iter()
+            .map(OsString::as_os_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.unwrap().to_owned()))
+            .collect::<BTreeMap<_, _>>(),
+        fixture.expected_environment
+    );
+    assert_eq!(command.as_std().get_current_dir(), None);
 }
 
 fn start_invocation(
@@ -758,7 +800,7 @@ async fn admit_test_cancellation(
     cancellation: &CancellationSource,
     process_control: AgentProcessControl,
     mut clock: TestClock,
-    interrupted: PathBuf,
+    interrupted: SignalFifo,
     registered_deadlines: &mut mpsc::UnboundedReceiver<Duration>,
 ) -> (Duration, tokio::task::JoinHandle<()>) {
     assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
@@ -768,7 +810,7 @@ async fn admit_test_cancellation(
         clock.wait_until(deadline).await;
         process_control.force();
     });
-    read_signal(interrupted).await;
+    interrupted.receive().await;
     assert_eq!(registered_deadlines.recv().await, Some(deadline));
     (deadline, task)
 }
@@ -787,30 +829,9 @@ async fn assert_user_cancellation(
 }
 
 async fn run_success(mut fixture: ProcessFixture) -> CapturedRun {
-    let plan = prepare_launch(&fixture.invocation).unwrap();
-    let command = build_command(&fixture.invocation, &plan).unwrap();
-    assert_eq!(
-        command.as_std().get_program(),
-        fixture.invocation.adapter().executable()
-    );
-    assert_eq!(
-        command.as_std().get_args().collect::<Vec<_>>(),
-        plan.arguments()
-            .iter()
-            .map(OsString::as_os_str)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        command
-            .as_std()
-            .get_envs()
-            .map(|(name, value)| (name.to_owned(), value.unwrap().to_owned()))
-            .collect::<BTreeMap<_, _>>(),
-        fixture.expected_environment
-    );
-    assert_eq!(command.as_std().get_current_dir(), None);
-    drop(command);
-
+    let expected_input_extension = fixture
+        .result_endpoint
+        .join("pi-json-v1-input-extension.ts");
     let (task, started, terminal) =
         start_invocation(fixture.invocation, fixture.diagnostics.clone());
 
@@ -847,7 +868,9 @@ async fn run_success(mut fixture: ProcessFixture) -> CapturedRun {
         observations,
         outcome,
         diagnostic: fixture.diagnostics.get("agent-step").unwrap(),
+        expected_input_extension,
         expected_attachments: fixture.expected_attachments,
+        expected_diagnostic_session: fixture.expected_diagnostic_session,
     }
 }
 
@@ -1129,19 +1152,89 @@ fn validation_socket_address(tool_name: &str) -> PathBuf {
         .join("result-validation.sock")
 }
 
-async fn read_signal(path: PathBuf) {
-    let bytes = tokio::task::spawn_blocking(move || fs::read(path))
-        .await
+fn open_fifo_reader(path: &Path) -> fs::File {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
         .unwrap()
-        .unwrap();
-    assert!(!bytes.is_empty());
+}
+
+// Keep FIFO synchronization on Tokio's reactor: a blocking FIFO operation survives
+// future cancellation and can strand the runtime after the watchdog fires.
+struct SignalFifo(tokio::io::unix::AsyncFd<fs::File>);
+
+impl SignalFifo {
+    fn create(path: &Path) -> Self {
+        mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        Self::reader(path)
+    }
+
+    fn reader(path: &Path) -> Self {
+        Self(tokio::io::unix::AsyncFd::new(open_fifo_reader(path)).unwrap())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a nonblocking FIFO open must yield until the external reader connects"
+    )]
+    async fn writer(path: &Path) -> Self {
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => return Self(tokio::io::unix::AsyncFd::new(file).unwrap()),
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("failed to open signal FIFO: {error}"),
+            }
+        }
+    }
+
+    async fn receive(self) {
+        let mut signal = [0; 64];
+        loop {
+            let mut ready = self.0.readable().await.unwrap();
+            match ready.try_io(|fifo| {
+                let mut fifo = fifo.get_ref();
+                fifo.read(&mut signal)
+            }) {
+                Ok(Ok(0)) => panic!("signal FIFO closed without a signal"),
+                Ok(Ok(_)) => return,
+                Ok(Err(error)) => panic!("failed to read signal FIFO: {error}"),
+                Err(_) => {}
+            }
+        }
+    }
+
+    async fn send(self, signal: &[u8]) {
+        loop {
+            let mut ready = self.0.writable().await.unwrap();
+            match ready.try_io(|fifo| {
+                let mut fifo = fifo.get_ref();
+                fifo.write(signal)
+            }) {
+                Ok(Ok(written)) => {
+                    assert_eq!(written, signal.len(), "signal FIFO write must be atomic");
+                    return;
+                }
+                Ok(Err(error)) => panic!("failed to write signal FIFO: {error}"),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+async fn read_signal(path: PathBuf) {
+    SignalFifo::reader(&path).receive().await;
 }
 
 async fn write_signal(path: PathBuf) {
-    tokio::task::spawn_blocking(move || fs::write(path, b"release\n"))
-        .await
-        .unwrap()
-        .unwrap();
+    SignalFifo::writer(&path).await.send(b"release\n").await;
 }
 
 fn process_id(bytes: &[u8]) -> Pid {
@@ -1421,6 +1514,11 @@ fn thinking_finalization_fixture(
 async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agent_start() {
     with_watchdog(async {
         let message = "@/caller/path\n$HOME; * remains literal";
+        let inspected =
+            ProcessFixture::new("success", "system @ exact\n".to_owned(), message.to_owned());
+        assert_prepared_launch_command(&inspected);
+        drop(inspected);
+
         let first = run_success(ProcessFixture::new(
             "success",
             "system @ exact\n".to_owned(),
@@ -1435,25 +1533,54 @@ async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agen
         .await;
 
         for run in [&first, &second] {
-            let expected = [
-                b"--mode".as_slice(),
-                b"json".as_slice(),
-                b"--approve".as_slice(),
-                b"--no-session".as_slice(),
-                b"--model".as_slice(),
-                b"openai/gpt-5.6-sol".as_slice(),
-                b"--thinking".as_slice(),
-                b"xhigh".as_slice(),
-                b"--append-system-prompt".as_slice(),
-                b"system @ exact\n".as_slice(),
-            ];
-            assert_eq!(&run.arguments[..expected.len()], expected);
             assert_eq!(
-                run.arguments[expected.len()],
+                &run.arguments[..4],
+                [
+                    b"--mode".as_slice(),
+                    b"json".as_slice(),
+                    b"--approve".as_slice(),
+                    b"--session-dir".as_slice(),
+                ]
+            );
+            assert_eq!(
+                run.arguments[4],
+                run.expected_diagnostic_session
+                    .as_os_str()
+                    .as_encoded_bytes()
+            );
+            assert!(run.expected_diagnostic_session.is_absolute());
+            assert_eq!(
+                &run.arguments[5..11],
+                [
+                    b"--model".as_slice(),
+                    b"openai/gpt-5.6-sol".as_slice(),
+                    b"--thinking".as_slice(),
+                    b"xhigh".as_slice(),
+                    b"--append-system-prompt".as_slice(),
+                    b"system @ exact\n".as_slice(),
+                ]
+            );
+            for forbidden in [
+                b"--continue".as_slice(),
+                b"--resume".as_slice(),
+                b"--session".as_slice(),
+                b"--session-id".as_slice(),
+                b"--fork".as_slice(),
+                b"--no-session".as_slice(),
+            ] {
+                assert!(!run.arguments.iter().any(|argument| argument == forbidden));
+            }
+            assert_eq!(run.arguments[11], b"--extension");
+            assert_eq!(
+                run.arguments[12],
+                run.expected_input_extension.as_os_str().as_encoded_bytes()
+            );
+            assert_eq!(
+                run.arguments[13],
                 format!("@{}", run.expected_attachments[0].display()).as_bytes()
             );
             assert_eq!(
-                run.arguments[expected.len() + 1],
+                run.arguments[14],
                 format!("@{}", run.expected_attachments[1].display()).as_bytes()
             );
             assert_eq!(
@@ -1488,6 +1615,10 @@ async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agen
         }
         assert_ne!(first.process, second.process);
         assert_ne!(first.session, second.session);
+        assert_ne!(
+            first.expected_diagnostic_session,
+            second.expected_diagnostic_session
+        );
         assert!(first.cwd.ends_with(b"/execution/worktree\n"));
         assert!(second.cwd.ends_with(b"/execution/worktree\n"));
     })
@@ -1835,21 +1966,84 @@ fn positional_transport_escape_preserves_every_adversarial_message() {
     }
 }
 
+#[test]
+fn launch_rejects_a_session_path_rebound_after_planning() {
+    let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
+    let plan = prepare_launch(&fixture.invocation).unwrap();
+    let moved_session = fixture
+        .expected_diagnostic_session
+        .with_file_name("moved-session");
+    std::fs::rename(&fixture.expected_diagnostic_session, moved_session).unwrap();
+    std::fs::create_dir(&fixture.expected_diagnostic_session).unwrap();
+
+    assert!(matches!(
+        build_command(&fixture.invocation, &plan),
+        Err(AgentFailureCause::HarnessStartFailed)
+    ));
+}
+
 #[tokio::test]
-async fn exact_input_limits_launch_unchanged_and_one_excess_byte_never_launches() {
+async fn admitted_system_prompt_above_kernel_single_argument_limit_launches() {
     with_watchdog(async {
-        let system_prompt = "s".repeat(usize::try_from(MAXIMUM_INPUT_BYTES).unwrap());
-        let message = "m".repeat(usize::try_from(MAXIMUM_INPUT_BYTES).unwrap());
-        let exact = run_success(ProcessFixture::new(
-            "success",
-            system_prompt.clone(),
-            message.clone(),
-        ))
-        .await;
-        assert_eq!(exact.arguments[9], system_prompt.as_bytes());
-        assert_eq!(exact.arguments.last().unwrap().len(), message.len() + 1);
-        assert_eq!(exact.arguments.last().unwrap()[0], b'\n');
-        assert_eq!(&exact.arguments.last().unwrap()[1..], message.as_bytes());
+        let fixture = ProcessFixture::new("success", "s".repeat(256 * 1024), "message".to_owned());
+        let plan = prepare_launch(&fixture.invocation).unwrap();
+        let mut command = build_command(&fixture.invocation, &plan).unwrap();
+        command.kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .expect("an admitted system prompt must be executable");
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn exact_input_limits_prepare_unchanged_and_one_excess_byte_never_launches() {
+    with_watchdog(async {
+        for (system_prompt, message) in [
+            (
+                "s".repeat(usize::try_from(MAXIMUM_INPUT_BYTES).unwrap()),
+                "message".to_owned(),
+            ),
+            (
+                "system".to_owned(),
+                "m".repeat(usize::try_from(MAXIMUM_INPUT_BYTES).unwrap()),
+            ),
+        ] {
+            let fixture = ProcessFixture::new("success", system_prompt.clone(), message.clone());
+            let plan = prepare_launch(&fixture.invocation).unwrap();
+            assert_eq!(plan.arguments()[11], "--extension");
+            assert!(fs::metadata(&plan.arguments()[12]).unwrap().is_file());
+            if system_prompt.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+                assert!(
+                    plan.arguments()[10]
+                        .as_encoded_bytes()
+                        .starts_with(b"__scherzo_result_")
+                );
+                assert_eq!(
+                    fs::read(fixture.result_endpoint.join("system-prompt.md")).unwrap(),
+                    system_prompt.as_bytes()
+                );
+            } else {
+                assert_eq!(
+                    plan.arguments()[10].as_encoded_bytes(),
+                    system_prompt.as_bytes()
+                );
+            }
+            let message_argument = plan.arguments().last().unwrap().as_encoded_bytes();
+            if message.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+                assert!(message_argument.starts_with(b"__scherzo_result_"));
+                assert_eq!(
+                    fs::read(fixture.invocation.staging().message_file().unwrap()).unwrap(),
+                    message.as_bytes()
+                );
+            } else {
+                assert_eq!(message_argument.len(), message.len() + 1);
+                assert_eq!(message_argument[0], b'\n');
+                assert_eq!(&message_argument[1..], message.as_bytes());
+            }
+        }
 
         for (system_prompt, message, input) in [
             (
@@ -2001,10 +2195,9 @@ async fn cancellation_wins_during_every_native_phase_and_drains_late_events() {
             .unwrap();
             let cwd = fixture.invocation.process().cwd().to_str().unwrap();
             fs::write(&fixture.phase_transcript, phase.transcript(cwd)).unwrap();
-            mkfifo(&fixture.standard_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+            let interrupted = SignalFifo::create(&fixture.standard_input);
             let cancellation = fixture.invocation.cancellation().clone();
             let diagnostics = fixture.diagnostics.clone();
-            let interrupted = fixture.standard_input.clone();
             let release = fixture.agent_release.clone();
             let (task, started, terminal) =
                 start_invocation(fixture.invocation, diagnostics.clone());
@@ -2013,7 +2206,7 @@ async fn cancellation_wins_during_every_native_phase_and_drains_late_events() {
             wait_for_phase(phase, &mut fixture.observations).await;
             started.receive().await.unwrap();
             assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
-            read_signal(interrupted).await;
+            interrupted.receive().await;
             assert!(
                 !task.is_finished(),
                 "the {phase:?} invocation must not report before its process releases"
@@ -2065,7 +2258,7 @@ async fn cancellation_keeps_the_admitted_deadline_when_observation_delivery_is_b
             CancellationPhase::Model.transcript(cwd),
         )
         .unwrap();
-        mkfifo(&fixture.standard_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let interrupted = SignalFifo::create(&fixture.standard_input);
 
         let (gate_reached, mut reached) = mpsc::unbounded_channel();
         let (gate_release, release_gate) = watch::channel(false);
@@ -2076,7 +2269,6 @@ async fn cancellation_keeps_the_admitted_deadline_when_observation_delivery_is_b
 
         let cancellation = fixture.invocation.cancellation().clone();
         let process_control = fixture.invocation.process_control().clone();
-        let interrupted = fixture.standard_input.clone();
         let process_release = fixture.agent_release.clone();
         let now_seconds = Arc::new(AtomicU64::new(42));
         let (deadline_release, release_deadline) = watch::channel(false);
@@ -2122,11 +2314,10 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             STUBBORN_DESCENDANT_PI,
         )
         .unwrap();
-        mkfifo(&fixture.standard_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let interrupted = SignalFifo::create(&fixture.standard_input);
         let cancellation = fixture.invocation.cancellation().clone();
         let process_control = fixture.invocation.process_control().clone();
         let diagnostics = fixture.diagnostics.clone();
-        let interrupted = fixture.standard_input.clone();
         let (deadline_release, release_deadline) = watch::channel(false);
         let (registrations, mut registered_deadlines) = mpsc::unbounded_channel();
         let deadline_clock = TestClock::Controlled {

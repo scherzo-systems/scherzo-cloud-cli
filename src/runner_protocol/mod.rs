@@ -1210,7 +1210,7 @@ mod tests {
               "terminalReportDeliveryBudgetMilliseconds": 5000,
               "startDeliveryBudgetMilliseconds": 5000,
               "renewalDeliveryBudgetMilliseconds": 5000,
-              "leaseDurationMilliseconds": 30000,
+              "leaseDurationMilliseconds": 320000,
               "fencingMarginMilliseconds": 11000
             }
           }

@@ -11,244 +11,124 @@ fail() {
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/release-impact validate --series SERIES [--latest-tag TAG] [CATEGORY...]
-  scripts/release-impact plan --series SERIES [--latest-tag TAG] \
-    --release BOOL --reason REASON --source-revision REVISION \
-    --changelog-sha256 DIGEST [CATEGORY...]
+  scripts/release-impact validate --initial-version VERSION \
+    --pre-1-breaking-impact IMPACT [--latest-version VERSION] [IMPACT...]
 EOF
 }
 
-[[ $# -ge 1 ]] || {
-  usage
-  exit 2
-}
+[[ $# -ge 1 ]] || { usage; exit 2; }
 mode=$1
 shift
-case "$mode" in
-  validate|plan)
-    ;;
-  *)
-    usage
-    exit 2
-    ;;
-esac
+[[ $mode == validate ]] || { usage; exit 2; }
 
-series=
-latest_tag=
-release=
-reason=
-source_revision=
-changelog_sha256=
-series_set=0
-latest_tag_set=0
-release_set=0
-reason_set=0
-source_revision_set=0
-changelog_sha256_set=0
-categories=()
+initial_version=
+breaking_policy=
+latest_version=
+declare -A supplied=()
+impacts=()
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --series)
-      [[ $series_set -eq 0 && $# -ge 2 ]] || fail "--series requires one value"
-      series=$2
-      series_set=1
+  case $1 in
+    --initial-version|--pre-1-breaking-impact|--latest-version)
+      option=$1
+      [[ -z ${supplied[$option]+set} && $# -ge 2 ]] || fail "$option requires one value"
+      supplied[$option]=1
+      value=$2
+      case $option in
+        --initial-version) initial_version=$value ;;
+        --pre-1-breaking-impact) breaking_policy=$value ;;
+        --latest-version) latest_version=$value ;;
+      esac
       shift 2
       ;;
-    --latest-tag)
-      [[ $latest_tag_set -eq 0 && $# -ge 2 ]] || fail "--latest-tag requires one value"
-      latest_tag=$2
-      latest_tag_set=1
-      shift 2
-      ;;
-    --release)
-      [[ $release_set -eq 0 && $# -ge 2 ]] || fail "--release requires one value"
-      release=$2
-      release_set=1
-      shift 2
-      ;;
-    --reason)
-      [[ $reason_set -eq 0 && $# -ge 2 ]] || fail "--reason requires one value"
-      reason=$2
-      reason_set=1
-      shift 2
-      ;;
-    --source-revision)
-      [[ $source_revision_set -eq 0 && $# -ge 2 ]] \
-        || fail "--source-revision requires one value"
-      source_revision=$2
-      source_revision_set=1
-      shift 2
-      ;;
-    --changelog-sha256)
-      [[ $changelog_sha256_set -eq 0 && $# -ge 2 ]] \
-        || fail "--changelog-sha256 requires one value"
-      changelog_sha256=$2
-      changelog_sha256_set=1
-      shift 2
-      ;;
-    --)
-      shift
-      categories+=("$@")
-      break
-      ;;
-    --*)
-      fail "unknown option: $1"
-      ;;
-    *)
-      categories+=("$1")
-      shift
-      ;;
+    --) shift; impacts+=("$@"); break ;;
+    --*) fail "unknown option: $1" ;;
+    *) impacts+=("$1"); shift ;;
   esac
 done
 
-[[ $series_set -eq 1 ]] || fail "--series is required"
-if [[ ! $series =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
-  fail "release series must use canonical MAJOR.MINOR syntax: $series"
-fi
-series_major=$((10#${BASH_REMATCH[1]}))
-series_minor=$((10#${BASH_REMATCH[2]}))
+[[ -n $initial_version ]] || fail "--initial-version is required"
+[[ -n $breaking_policy ]] || fail "--pre-1-breaking-impact is required"
+[[ $breaking_policy == minor ]] || fail "pre-1.0 breaking impact must be minor"
+version_pattern='^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$'
+[[ $initial_version =~ $version_pattern ]] \
+  || fail "initial version must use canonical MAJOR.MINOR.PATCH syntax: $initial_version"
+initial_major=$((10#${BASH_REMATCH[1]}))
+initial_minor=$((10#${BASH_REMATCH[2]}))
+initial_patch=$((10#${BASH_REMATCH[3]}))
 maximum_component=999999
-((series_major <= maximum_component && series_minor <= maximum_component)) \
-  || fail "release series components must not exceed $maximum_component: $series"
+((initial_major <= maximum_component && initial_minor <= maximum_component \
+  && initial_patch <= maximum_component)) || fail "initial version component is too large"
 
 latest_stable_version=none
 latest_major=-1
 latest_minor=-1
 latest_patch=-1
-if [[ $latest_tag_set -eq 1 ]]; then
-  if [[ ! $latest_tag =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
-    fail "latest stable tag must use canonical vMAJOR.MINOR.PATCH syntax: $latest_tag"
-  fi
+if [[ -n $latest_version ]]; then
+  [[ $latest_version =~ $version_pattern ]] \
+    || fail "latest stable version must use canonical MAJOR.MINOR.PATCH syntax: $latest_version"
   latest_major=$((10#${BASH_REMATCH[1]}))
   latest_minor=$((10#${BASH_REMATCH[2]}))
   latest_patch=$((10#${BASH_REMATCH[3]}))
-  ((latest_major <= maximum_component \
-    && latest_minor <= maximum_component \
-    && latest_patch <= maximum_component)) \
-    || fail "latest stable tag components must not exceed $maximum_component: $latest_tag"
-  latest_stable_version=${latest_tag#v}
-else
-  latest_tag=none
+  ((latest_major <= maximum_component && latest_minor <= maximum_component \
+    && latest_patch <= maximum_component)) || fail "latest stable version component is too large"
+  ((latest_major > initial_major \
+    || latest_major == initial_major && latest_minor > initial_minor \
+    || latest_major == initial_major && latest_minor == initial_minor \
+      && latest_patch >= initial_patch)) \
+    || fail "latest stable version precedes the initial release: $latest_version"
+  latest_stable_version=$latest_version
 fi
 
 impact=none
-impact_rank=0
-for category in "${categories[@]}"; do
-  case "$category" in
-    internal|fixed|changed)
-      category_impact='patch'
-      category_rank=1
-      ;;
-    added)
-      category_impact='minor'
-      category_rank=2
-      ;;
+rank=0
+policy_major=$initial_major
+((latest_major < 0)) || policy_major=$latest_major
+for explicit in "${impacts[@]}"; do
+  case $explicit in
+    patch) resolved='patch'; candidate_rank=1 ;;
+    minor) resolved='minor'; candidate_rank=2 ;;
     breaking)
-      policy_major=$series_major
-      if ((latest_major >= 0)); then
-        policy_major=$latest_major
-      fi
       if ((policy_major < 1)); then
-        category_impact='minor'
-        category_rank=2
+        resolved=$breaking_policy
+        candidate_rank=2
       else
-        category_impact='major'
-        category_rank=3
+        resolved='major'
+        candidate_rank=3
       fi
       ;;
-    *)
-      fail "unknown release fragment category: $category"
-      ;;
+    *) fail "unknown explicit release impact: $explicit" ;;
   esac
-  if ((category_rank > impact_rank)); then
-    impact=$category_impact
-    impact_rank=$category_rank
+  if ((candidate_rank > rank)); then
+    impact=$resolved
+    rank=$candidate_rank
   fi
 done
 
-expected_series=$series
 version=none
 tag=none
-if ((latest_major >= 0)); then
-  case "$impact" in
-    none|patch)
-      expected_major=$latest_major
-      expected_minor=$latest_minor
-      ;;
-    minor)
-      ((latest_minor < maximum_component)) \
-        || fail "minor release cannot advance beyond $maximum_component after $latest_tag"
-      expected_major=$latest_major
-      expected_minor=$((latest_minor + 1))
-      ;;
-    major)
-      ((latest_major < maximum_component)) \
-        || fail "major release cannot advance beyond $maximum_component after $latest_tag"
-      expected_major=$((latest_major + 1))
-      expected_minor=0
-      ;;
-    *)
-      fail "unsupported release impact: $impact"
-      ;;
-  esac
-  expected_series=$expected_major.$expected_minor
-  [[ $series == "$expected_series" ]] \
-    || fail "declared release series $series does not match $impact impact after $latest_tag; expected $expected_series"
-fi
-
 if [[ $impact != none ]]; then
   if ((latest_major < 0)); then
-    version=$series.0
-  elif [[ $impact == patch ]]; then
-    ((latest_patch < maximum_component)) \
-      || fail "patch release cannot advance beyond $maximum_component after $latest_tag"
-    version=$series.$((latest_patch + 1))
+    version=$initial_version
   else
-    version=$series.0
+    case $impact in
+      patch)
+        ((latest_patch < maximum_component)) || fail "patch release component overflow"
+        version=$latest_major.$latest_minor.$((latest_patch + 1))
+        ;;
+      minor)
+        ((latest_minor < maximum_component)) || fail "minor release component overflow"
+        version=$latest_major.$((latest_minor + 1)).0
+        ;;
+      major)
+        ((latest_major < maximum_component)) || fail "major release component overflow"
+        version=$((latest_major + 1)).0.0
+        ;;
+    esac
   fi
   tag=v$version
 fi
 
-if [[ $mode == validate ]]; then
-  printf 'impact=%s\n' "$impact"
-  printf 'series=%s\n' "$series"
-  printf 'version=%s\n' "$version"
-  printf 'tag=%s\n' "$tag"
-  exit 0
-fi
-
-[[ $release_set -eq 1 && $reason_set -eq 1 \
-  && $source_revision_set -eq 1 && $changelog_sha256_set -eq 1 ]] \
-  || fail "plan mode requires --release, --reason, --source-revision, and --changelog-sha256"
-[[ $release == true || $release == false ]] \
-  || fail "--release must be true or false"
-[[ $source_revision =~ ^[0-9a-f]{40}$ ]] \
-  || fail "source revision must be exactly 40 lowercase hexadecimal characters"
-[[ $changelog_sha256 =~ ^[0-9a-f]{64}$ ]] \
-  || fail "changelog digest must be exactly 64 lowercase hexadecimal characters"
-
-if [[ $release == true ]]; then
-  [[ $impact != none ]] || fail "a release plan requires at least one impact-bearing fragment"
-  if [[ $latest_tag == none ]]; then
-    [[ $reason == initial-release ]] || fail "an initial release must use reason initial-release"
-  else
-    [[ $reason == releaseable-changes ]] \
-      || fail "a release after a stable tag must use reason releaseable-changes"
-  fi
-else
-  [[ $impact == none ]] || fail "a no-release plan must not contain impact-bearing fragments"
-  [[ $reason == no-releaseable-changes ]] \
-    || fail "a no-release plan must use reason no-releaseable-changes"
-fi
-
-printf 'contract=1\n'
-printf 'release=%s\n' "$release"
-printf 'reason=%s\n' "$reason"
-printf 'latest_stable_tag=%s\n' "$latest_tag"
 printf 'latest_stable_version=%s\n' "$latest_stable_version"
 printf 'impact=%s\n' "$impact"
-printf 'series=%s\n' "$series"
 printf 'version=%s\n' "$version"
 printf 'tag=%s\n' "$tag"
-printf 'source_revision=%s\n' "$source_revision"
-printf 'changelog_sha256=%s\n' "$changelog_sha256"

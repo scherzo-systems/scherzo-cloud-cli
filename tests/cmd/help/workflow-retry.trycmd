@@ -1,0 +1,22 @@
+```console
+$ scherzo-cloud workflow retry --help
+Retry a local workflow run
+
+Usage: scherzo-cloud workflow retry [OPTIONS] --execution-root <PATH> <RUN_DIR>
+
+Arguments:
+  <RUN_DIR>  Directory containing the workflow run
+
+Options:
+      --execution-root <PATH>  Directory for workflow execution (must already exist)
+      --plain                  Force plain human presentation
+      --json                   Print the result as JSON
+      --color <WHEN>           Select renderer color behavior [default: auto] [possible values: auto, always, never]
+  -h, --help                   Print help
+
+Retry eligibility:
+  Retry is available when the latest attempt did not succeed or end in rejection, no
+  execution owner holds the run, and prior process ownership can be proven safe. A retry
+  executes every workflow step as a new attempt.
+
+```

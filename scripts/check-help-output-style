@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+metadata=$(mktemp)
+violations=$(mktemp)
+cleanup() {
+  rm -f "$metadata" "$violations"
+}
+trap cleanup EXIT
+
+while IFS= read -r -d '' rust_source; do
+  awk '
+    function emit() {
+      printf "%s:%d:%s\n", FILENAME, start_line, block
+      block = ""
+      collecting = 0
+    }
+
+    /^[[:space:]]*\/\/\// {
+      printf "%s:%d:%s\n", FILENAME, FNR, $0
+      next
+    }
+
+    collecting {
+      block = block "\n" $0
+      if ((kind == "attribute" && $0 ~ /\)\][[:space:]]*$/) ||
+          (kind == "constant" && $0 ~ /;[[:space:]]*$/)) {
+        emit()
+      }
+      next
+    }
+
+    /^[[:space:]]*#\[(arg|command)\(/ {
+      collecting = 1
+      kind = "attribute"
+      start_line = FNR
+      block = $0
+      if ($0 ~ /\)\][[:space:]]*$/) {
+        emit()
+      }
+      next
+    }
+
+    /const[[:space:]]+[[:alnum:]_]*(ABOUT|HELP)[[:space:]]*:/ {
+      collecting = 1
+      kind = "constant"
+      start_line = FNR
+      block = $0
+      if ($0 ~ /;[[:space:]]*$/) {
+        emit()
+      }
+    }
+  ' "$rust_source" >>"$metadata"
+done < <(
+  printf '%s\0' "$public_root/src/cli.rs"
+  find "$public_root/src/cli" -name '*.rs' -type f -print0
+)
+
+if grep --extended-regexp \
+  '(^|[^[:alnum:]_])V1([^[:alnum:]_]|$)|schema-version-1|Schema[[:space:]]+1|[Dd]urable|Inspect' \
+  "$metadata" >"$violations"; then
+  echo "CLI help metadata contains terminology banned by docs/output-style.md:" >&2
+  cat "$violations" >&2
+  exit 1
+fi
+
+printf 'CLI help metadata follows the banned-terminology policy.\n'

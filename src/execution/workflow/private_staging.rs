@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, statat, unlinkat,
+    AtFlags, Dir, FileType, Mode, OFlags, fchmod, fstat, mkdirat, open, openat, statat, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -163,6 +163,10 @@ pub(super) fn create_payload_file(path: &Path) -> io::Result<File> {
 pub(super) fn finish_payload_file(mut file: File) -> io::Result<()> {
     file.flush()?;
     file.set_permissions(std::fs::Permissions::from_mode(0o400))
+}
+
+pub(super) fn open_directory_path(path: &Path) -> Result<OwnedFd, Errno> {
+    open(path, directory_open_flags(), Mode::empty())
 }
 
 fn directory_open_flags() -> OFlags {

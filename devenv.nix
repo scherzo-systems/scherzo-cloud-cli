@@ -29,6 +29,7 @@ in
     pkgs.git
     pkgs.jq
     pkgs.nodejs_24
+    pkgs.python3
   ];
 
   enterTest = ''

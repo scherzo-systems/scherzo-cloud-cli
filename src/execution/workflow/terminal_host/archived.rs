@@ -12,6 +12,8 @@ use crate::execution::workflow::presentation_feed::{
     normalize_terminal_shell_argument,
 };
 
+const ARCHIVED_WORKFLOW_COLUMN_PERCENTAGE: u16 = 52;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedTerminalHostExit {
     Quit,
@@ -696,8 +698,12 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
             outputs,
         } => {
             *profile = safe_text(profile);
-            let AgentPresentationHarness::Pi { model, .. } = harness;
-            *model = safe_text(model);
+            match harness {
+                AgentPresentationHarness::Pi { model, .. }
+                | AgentPresentationHarness::ClaudeCode { model, .. } => {
+                    *model = safe_text(model);
+                }
+            }
             for dependency in direct_dependencies {
                 *dependency = safe_text(dependency);
             }
@@ -935,6 +941,7 @@ fn render_archived(
             sections[1].y,
             interaction.help_visible,
             color,
+            archived_wide_split_columns(sections[0]),
         );
     }
 
@@ -946,6 +953,15 @@ fn render_archived(
             color,
         );
     }
+}
+
+fn archived_wide_split_columns(area: Rect) -> [Rect; 2] {
+    let columns = Layout::horizontal([
+        Constraint::Percentage(ARCHIVED_WORKFLOW_COLUMN_PERCENTAGE),
+        Constraint::Percentage(100 - ARCHIVED_WORKFLOW_COLUMN_PERCENTAGE),
+    ])
+    .split(area);
+    [columns[0], columns[1]]
 }
 
 fn render_archived_split(
@@ -961,6 +977,7 @@ fn render_archived_split(
         area,
         archived_summary_height(view),
         inspector_desired_height(selected_step),
+        archived_wide_split_columns(area),
     );
     render_archived_summary(frame, layout.summary, view, color, layout.summary_borders());
     render_split_steps(
@@ -1378,7 +1395,7 @@ mod tests {
         let view = ArchivedTerminalView::new(archived_attempt(Some(hostile_output())));
         let graph = DagLayout::for_steps(&view.steps);
         let mut interaction = ArchivedHostInteraction::default();
-        let buffer = render_view(&view, &graph, &mut interaction, 180, 40);
+        let buffer = render_view(&view, &graph, &mut interaction, 300, 40);
         let rendered = buffer_text(&buffer);
 
         for expected in [
@@ -1415,7 +1432,7 @@ mod tests {
             interaction.handle_key(TerminalInputEvent::Down, &view),
             None
         );
-        let selected = buffer_text(&render_view(&view, &graph, &mut interaction, 180, 40));
+        let selected = buffer_text(&render_view(&view, &graph, &mut interaction, 300, 40));
         assert!(selected.contains("▏ × verify"));
         assert!(
             selected.contains("failure       execution · command_exit · exit 17"),
@@ -1439,9 +1456,10 @@ mod tests {
         assert!(stdout < stderr);
         assert!(text.contains("cross-stream order is unavailable"));
         assert!(text.contains("retained 24 B · discarded 0 B · truncated no · fully drained yes"));
-        assert!(text.contains(
-            "retained 65536 B · discarded 9 B · truncated yes · fully drained no (incomplete drain)"
-        ));
+        assert!(text.contains(&format!(
+            "retained {} B · discarded 9 B · truncated yes · fully drained no (incomplete drain)",
+            super::super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+        )));
         assert!(text.contains("stdout red\\xff  end"));
         assert!(text.contains("stderr\\x00warning"));
         assert!(text.contains("retained-prefix boundary"));
@@ -1861,7 +1879,10 @@ mod tests {
         let stdout = b"stdout \x1b[31mred\x1b[0m\xff\tend".to_vec();
         assert_eq!(stdout.len(), 24);
         let mut stderr = b"stderr\0\x1b]0;title\x07warning\n".to_vec();
-        stderr.resize(65_536, b'x');
+        stderr.resize(
+            usize::try_from(super::super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM).unwrap(),
+            b'x',
+        );
         ArchivedCommandOutput {
             stdout: stream(stdout, 0, true),
             stderr: stream(stderr, 9, false),

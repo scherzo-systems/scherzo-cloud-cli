@@ -5,7 +5,7 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,9 @@ use rustix::process::{
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
+use crate::exit_code::ExitCode;
+
+use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 #[cfg(any(target_vendor = "apple", test))]
 use super::process_group::process_group_is_quiescent;
 use super::process_group::{
@@ -46,7 +49,7 @@ const WORKER_FAILURE_FILE: &str = "worker.failure";
 const ACTIVITY_LOCK_FILE: &str = ".activity.lock";
 const TEMPORARY_DIRECTORY_PREFIX: &str = "scherzo-child-guard-v1-";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const WORKER_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_BOUNDARY_TIMEOUT: Duration = MAXIMUM_CANCELLATION_GRACE;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -304,7 +307,7 @@ fn check_worker_boundary(child: &mut Child, started: Instant) -> io::Result<()> 
     if child.try_wait()?.is_some() {
         return Err(io::Error::other("child process guard exited early"));
     }
-    if crate::timing::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+    if worker_boundary_timed_out(crate::timing::elapsed(started)) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "child process guard did not respond",
@@ -312,6 +315,10 @@ fn check_worker_boundary(child: &mut Child, started: Instant) -> io::Result<()> 
     }
     crate::timing::sleep(WORKER_POLL_INTERVAL);
     Ok(())
+}
+
+fn worker_boundary_timed_out(elapsed: Duration) -> bool {
+    elapsed >= WORKER_BOUNDARY_TIMEOUT
 }
 
 pub(crate) fn internal_worker_requested() -> bool {
@@ -329,12 +336,12 @@ pub(crate) fn run_internal_worker() -> ExitCode {
         _ => Err(()),
     };
     if result.is_ok() {
-        ExitCode::SUCCESS
+        ExitCode::Success
     } else {
         if let (Ok(mode), Ok(root)) = (mode, internal_root()) {
             let _ = write_atomic(&root.join(WORKER_FAILURE_FILE), mode.as_bytes());
         }
-        ExitCode::FAILURE
+        ExitCode::GeneralFailure
     }
 }
 
@@ -831,6 +838,12 @@ mod tests {
         fn observe(&self, _identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
             ProcessIdentityObservation::Unavailable
         }
+    }
+
+    #[test]
+    fn worker_boundary_allows_waits_beyond_ten_seconds() {
+        assert!(!worker_boundary_timed_out(Duration::from_secs(11)));
+        assert!(worker_boundary_timed_out(MAXIMUM_CANCELLATION_GRACE));
     }
 
     #[test]

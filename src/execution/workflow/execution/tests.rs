@@ -5,6 +5,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::ops::Add;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,7 @@ use crate::execution::workflow::agent::{
     AgentFailureCause, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
     WorkflowRunId,
 };
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::{ArtifactReadFailure, ArtifactStaging};
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -80,12 +82,12 @@ impl CoordinatorClock for TestClock {
     }
 }
 
-async fn execute_workflow<Clock, Observer, Adapter>(
+async fn execute_workflow<Clock, Observer, Dispatcher>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     inputs: &InputStaging,
     diagnostics: &StepDiagnosticLog,
-    agents: AgentExecution<Adapter>,
+    agents: AgentExecution<Dispatcher>,
     clock: Clock,
     observer: Observer,
 ) -> Result<WorkflowExecutionResult, CoordinationError>
@@ -93,7 +95,7 @@ where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
-    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
     super::execute_workflow(
         admitted,
@@ -239,6 +241,7 @@ struct ExecutionFixture {
     artifacts: ArtifactStaging,
     inputs: InputStaging,
     agent_inputs: AgentInputStaging,
+    diagnostic_sessions: AgentDiagnosticSessionStore,
 }
 
 fn execution_fixture(
@@ -305,6 +308,16 @@ fn execution_fixture_with_source_files(
     let artifacts = ArtifactStaging::create(admitted.execution(), &staging_root).unwrap();
     let inputs = InputStaging::create(admitted.execution(), &staging_root).unwrap();
     let agent_inputs = AgentInputStaging::create(admitted.execution(), &staging_root).unwrap();
+    let attempt_directory = temporary.path().join("run/attempts/000001");
+    fs::create_dir_all(&attempt_directory).unwrap();
+    let attempt_handle: OwnedFd = fs::File::open(&attempt_directory).unwrap().into();
+    let diagnostic_sessions = AgentDiagnosticSessionStore::create(
+        &attempt_handle,
+        &attempt_directory,
+        Arc::from("00000000-0000-4000-8000-000000000001"),
+        1,
+    )
+    .unwrap();
     ExecutionFixture {
         _temporary: temporary,
         execution_root,
@@ -313,6 +326,7 @@ fn execution_fixture_with_source_files(
         artifacts,
         inputs,
         agent_inputs,
+        diagnostic_sessions,
     }
 }
 
@@ -752,6 +766,7 @@ fn agent_runtime(
     AgentExecution::enabled(
         WorkflowRunId::from(Arc::from("run-fixed")),
         fixture.agent_inputs.clone(),
+        fixture.diagnostic_sessions.clone(),
         adapter,
     )
 }

@@ -290,7 +290,7 @@ struct PreparedGroupCommand {
     listener: TcpListener,
     admitted: AdmittedWorkflow,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TestInstant(Duration);
 
 impl Add<Duration> for TestInstant {
@@ -386,6 +386,79 @@ impl DeadlineControl {
 
     fn release(&self) {
         self.release.send(true).unwrap();
+    }
+
+    fn active_waiters(&self) -> usize {
+        self.active_waiters.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct AdvancingClock {
+    now: Arc<Mutex<TestInstant>>,
+    changed: watch::Receiver<TestInstant>,
+    registrations: mpsc::UnboundedSender<TestInstant>,
+    active_waiters: Arc<AtomicUsize>,
+}
+
+struct AdvancingClockControl {
+    now: Arc<Mutex<TestInstant>>,
+    changed: watch::Sender<TestInstant>,
+    registrations: mpsc::UnboundedReceiver<TestInstant>,
+    active_waiters: Arc<AtomicUsize>,
+}
+
+impl AdvancingClock {
+    fn new(now: TestInstant) -> (Self, AdvancingClockControl) {
+        let (changed, changes) = watch::channel(now);
+        let (registrations, registered) = mpsc::unbounded_channel();
+        let now = Arc::new(Mutex::new(now));
+        let active_waiters = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                now: Arc::clone(&now),
+                changed: changes,
+                registrations,
+                active_waiters: Arc::clone(&active_waiters),
+            },
+            AdvancingClockControl {
+                now,
+                changed,
+                registrations: registered,
+                active_waiters,
+            },
+        )
+    }
+}
+
+impl CoordinatorClock for AdvancingClock {
+    type Instant = TestInstant;
+
+    fn now(&mut self) -> Self::Instant {
+        *self.now.lock().unwrap()
+    }
+
+    async fn wait_until(&self, deadline: Self::Instant) {
+        self.active_waiters.fetch_add(1, Ordering::SeqCst);
+        let _guard = DeadlineWaiterGuard(Arc::clone(&self.active_waiters));
+        let _ = self.registrations.send(deadline);
+        let mut changed = self.changed.clone();
+        while *changed.borrow_and_update() < deadline {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl AdvancingClockControl {
+    async fn next_deadline(&mut self) -> TestInstant {
+        self.registrations.recv().await.unwrap()
+    }
+
+    fn advance_to(&self, now: TestInstant) {
+        *self.now.lock().unwrap() = now;
+        self.changed.send(now).unwrap();
     }
 
     fn active_waiters(&self) -> usize {
@@ -2993,6 +3066,60 @@ async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once
         assert_eq!(runtime.active_work_count(), 0);
         assert_eq!(control.active_waiters(), 0);
         assert!(receiver.try_recv().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sixty_second_local_grace_allows_clean_exit_after_thirty_seconds() {
+    with_watchdog(async {
+        let PreparedGroupCommand {
+            _temporary,
+            listener,
+            admitted,
+        } = prepare_group_command(FIXTURE_MODE_STUBBORN).await;
+        let deadline = TestInstant(Duration::from_secs(60));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let cancel_action = cancel.id;
+        let start_action = start.id;
+        let (clock, mut control) = AdvancingClock::new(TestInstant(Duration::ZERO));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
+
+        runtime.release(start).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start_action,
+            }
+        );
+        let mut processes = accept_group(&listener).await;
+
+        runtime.release(cancel).await;
+        assert_group_interrupted(&processes).await;
+        assert_eq!(control.next_deadline().await, deadline);
+        control.advance_to(TestInstant(Duration::from_secs(30)));
+        assert_eq!(control.active_waiters(), 1);
+        release_group(&processes).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+            }
+        );
+
+        assert_group_closed(&mut processes).await;
+        assert_eq!(control.active_waiters(), 0);
+        assert_eq!(runtime.active_work_count(), 0);
     })
     .await;
 }

@@ -1,0 +1,19 @@
+```console
+$ scherzo-cloud workflow view --help
+View a published local workflow attempt
+
+Usage: scherzo-cloud workflow view [OPTIONS] <RUN_DIR>
+
+Arguments:
+  <RUN_DIR>  Directory containing the workflow run
+
+Options:
+      --attempt <NUMBER>  Attempt number to view (defaults to the current attempt)
+      --color <WHEN>      Select renderer color behavior [default: auto] [possible values: auto, always, never]
+  -h, --help              Print help
+
+Attempt selection:
+  When --attempt is omitted, the command selects the current attempt from a stable run
+  snapshot before opening the interactive view.
+
+```

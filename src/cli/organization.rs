@@ -4,17 +4,16 @@ mod output;
 mod show;
 mod update;
 
-use std::fmt;
-use std::process::ExitCode;
-
+use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
 use crate::api::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
-    HttpClientError, HttpTransportPolicy, ListOrganizationMembershipsOutcome, OrganizationError,
+    HttpTransportPolicy, ListOrganizationMembershipsOutcome, OrganizationError,
     UpdateOrganizationOutcome,
 };
-use crate::human_auth::credentials::{CredentialError, CredentialStore};
+use crate::exit_code::ExitCode;
+use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
@@ -51,30 +50,31 @@ impl LeafOptions {
     fn execute<O>(
         self,
         deployment: &Deployment,
-        operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, CommandError>,
-        write: impl FnOnce(&str, &O, bool) -> Result<ExitCode, output::OutputError>,
-    ) -> Result<ExitCode, CommandError>
+        operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
+        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+    ) -> anyhow::Result<ExitCode>
     where
         O: HumanCredentialOutcome,
     {
         let outcome = with_human_credential(deployment, self.http.transport_policy(), operation)?;
-        write(deployment.fingerprint().api_url(), &outcome, self.json).map_err(CommandError::Output)
+        write(deployment.fingerprint().api_url(), &outcome, self.json)
+            .context("write organization result")
     }
 
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
-        operation: impl FnOnce(&HttpClient, &str, &str, &str) -> Result<O, CommandError>,
-        write: impl FnOnce(&str, &O, bool) -> Result<ExitCode, output::OutputError>,
-    ) -> Result<ExitCode, CommandError>
+        operation: impl FnOnce(&HttpClient, &str, &str, &str) -> Result<O, OrganizationError>,
+        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+    ) -> anyhow::Result<ExitCode>
     where
         O: HumanCredentialOutcome,
     {
+        let idempotency_key = crate::api::generate_idempotency_key()
+            .context("generate organization mutation request identity")?;
         self.execute(
             deployment,
             |client, api_url, access_token| {
-                let idempotency_key =
-                    crate::api::generate_idempotency_key().map_err(CommandError::Random)?;
                 operation(client, api_url, access_token, &idempotency_key)
             },
             write,
@@ -83,7 +83,7 @@ impl LeafOptions {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(OrganizationCommand::Create(command)) => {
@@ -102,13 +102,13 @@ impl Command {
 
 fn execute_leaf<T>(
     command: T,
-    execute: impl FnOnce(T, &Deployment) -> Result<ExitCode, CommandError>,
-) -> ExitCode {
+    execute: impl FnOnce(T, &Deployment) -> anyhow::Result<ExitCode>,
+) -> super::CommandResult {
     super::execute_deployment_command(
         Some(command),
         &[NAME],
         "configure Scherzo Cloud organization access",
-        |command, deployment| super::finish_command(execute(command, deployment)),
+        |command, deployment| execute(command, deployment).map_err(Into::into),
     )
 }
 
@@ -146,19 +146,24 @@ impl_human_credential_outcome!(
 fn with_human_credential<O>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
-    operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, CommandError>,
-) -> Result<O, CommandError>
+    operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
+) -> anyhow::Result<O>
 where
     O: HumanCredentialOutcome,
 {
-    let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
+    let store = CredentialStore::from_environment()
+        .map_err(|error| anyhow!(error))
+        .context("access credential store")?;
     let Some(credential) = store
         .selected(deployment.fingerprint(), crate::timing::utc_now())
-        .map_err(CommandError::CredentialStore)?
+        .map_err(|error| anyhow!(error))
+        .context("access credential store")?
     else {
         return Ok(O::unauthenticated());
     };
-    let client = HttpClient::new(transport_policy).map_err(CommandError::HttpClient)?;
+    let client = HttpClient::new(transport_policy)
+        .map_err(|error| anyhow!(error))
+        .context("prepare organization networking")?;
     let result = operation(
         &client,
         deployment.fingerprint().api_url(),
@@ -167,45 +172,17 @@ where
     let credential_rejected = result.as_ref().is_ok_and(O::is_unauthenticated)
         || result
             .as_ref()
-            .is_err_and(CommandError::credential_rejected);
+            .is_err_and(OrganizationError::credential_rejected);
     if credential_rejected {
         store
             .remove_if_access_token_matches(deployment.fingerprint(), credential.access_token())
-            .map_err(CommandError::CredentialStore)?;
+            .map_err(|error| anyhow!(error))
+            .context("access credential store")?;
     }
-    result
-}
-
-#[derive(Debug)]
-enum CommandError {
-    CredentialStore(CredentialError),
-    HttpClient(HttpClientError),
-    Random(getrandom::Error),
-    Organization(OrganizationError),
-    Output(output::OutputError),
-}
-
-impl CommandError {
-    fn credential_rejected(&self) -> bool {
-        matches!(self, Self::Organization(error) if error.credential_rejected())
-    }
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CredentialStore(error) => write!(formatter, "access credential store: {error}"),
-            Self::HttpClient(error) => {
-                write!(formatter, "prepare organization networking: {error}")
-            }
-            Self::Random(error) => {
-                write!(
-                    formatter,
-                    "generate organization mutation request identity: {error}"
-                )
-            }
-            Self::Organization(error) => write!(formatter, "contact organization API: {error}"),
-            Self::Output(error) => write!(formatter, "write organization result: {error}"),
-        }
-    }
+    result.map_err(|error| anyhow!(error)).with_context(|| {
+        format!(
+            "contact organization API at {}",
+            deployment.fingerprint().api_url()
+        )
+    })
 }

@@ -4,17 +4,35 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const packageRoot = new URL("../", import.meta.url);
-const runtimeSources = [
-  new URL("src/pi-json-v1-extension.ts", packageRoot),
-  new URL("fixtures/generated/pi-json-v1-extension.ts", packageRoot),
-];
-const allowedImports = new Map([
+const resultExtensionImports = new Map([
   ["@earendil-works/pi-coding-agent", "type"],
+  ["node:crypto", "runtime"],
   ["node:net", "runtime"],
   ["typebox", "runtime"],
 ]);
+const runtimeSources = [
+  {
+    path: new URL("src/pi-json-v1-extension.ts", packageRoot),
+    expectedImports: resultExtensionImports,
+  },
+  {
+    path: new URL("fixtures/generated/pi-json-v1-extension.ts", packageRoot),
+    expectedImports: resultExtensionImports,
+  },
+  {
+    path: new URL("src/pi-json-v1-input.ts", packageRoot),
+    expectedImports: new Map([
+      ["@earendil-works/pi-coding-agent", "type"],
+      ["node:fs", "runtime"],
+    ]),
+  },
+];
 
-function checkSource(path: URL, source: string): void {
+function checkSource(
+  path: URL,
+  source: string,
+  expectedImports: ReadonlyMap<string, string>,
+): void {
   const sourceFile = ts.createSourceFile(
     fileURLToPath(path),
     source,
@@ -30,7 +48,7 @@ function checkSource(path: URL, source: string): void {
       ts.isStringLiteral(node.moduleSpecifier)
     ) {
       const specifier = node.moduleSpecifier.text;
-      const expectedKind = allowedImports.get(specifier);
+      const expectedKind = expectedImports.get(specifier);
       const actualKind =
         node.importClause?.isTypeOnly === true ? "type" : "runtime";
       if (expectedKind === undefined || expectedKind !== actualKind) {
@@ -56,7 +74,7 @@ function checkSource(path: URL, source: string): void {
   }
 
   visit(sourceFile);
-  assert.deepEqual(observedImports, allowedImports);
+  assert.deepEqual(observedImports, expectedImports);
 
   for (const forbiddenText of [
     "node_modules",
@@ -80,6 +98,6 @@ if ("dependencies" in packageJson) {
   );
 }
 
-for (const sourceUrl of runtimeSources) {
-  checkSource(sourceUrl, await readFile(sourceUrl, "utf8"));
+for (const { path, expectedImports } of runtimeSources) {
+  checkSource(path, await readFile(path, "utf8"), expectedImports);
 }

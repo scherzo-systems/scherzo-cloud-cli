@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::ops::Add;
 use std::path::PathBuf;
-use std::process::{ExitCode, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use jsonschema::error::ValidationErrorKind;
@@ -16,7 +16,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use super::admission::{CancellationReason, CancellationSource};
+use crate::exit_code::ExitCode;
+
+use super::admission::{CancellationReason, CancellationSource, MAXIMUM_AGENT_RESULT_BYTES};
 use super::agent::PositiveDuration;
 use super::canonical_json::{self, CanonicalJsonError};
 use super::coordinator::CoordinatorClock;
@@ -25,7 +27,6 @@ const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema"
 const INTERNAL_WORKER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_RESULT_VALIDATION_WORKER";
 const INTERNAL_WORKER_VERSION: &str = "workflow-result-v1";
 const MAXIMUM_SCHEMA_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_WORKER_CANDIDATE_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_WORKER_FEEDBACK_BYTES: u64 = 8 * 1024;
 const MAXIMUM_REPORTED_FAILURES: usize = 16;
 const MAXIMUM_JSON_ESCAPE_BYTES_PER_INPUT_BYTE: u64 = 6;
@@ -170,7 +171,7 @@ where
             schema,
             maximum_candidate_bytes: clamp_nonzero(
                 maximum_candidate_bytes,
-                MAXIMUM_WORKER_CANDIDATE_BYTES,
+                MAXIMUM_AGENT_RESULT_BYTES,
             ),
             maximum_feedback_bytes: clamp_nonzero(
                 maximum_feedback_bytes,
@@ -510,14 +511,14 @@ pub(crate) fn internal_worker_requested() -> bool {
 
 pub(crate) fn run_internal_worker() -> ExitCode {
     match run_internal_worker_io(&mut io::stdin().lock(), &mut io::stdout().lock()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(()) => ExitCode::FAILURE,
+        Ok(()) => ExitCode::Success,
+        Err(()) => ExitCode::GeneralFailure,
     }
 }
 
 fn run_internal_worker_io(input: &mut impl Read, output: &mut impl Write) -> Result<(), ()> {
     let schema_bytes = read_frame(input, MAXIMUM_SCHEMA_BYTES)?;
-    let candidate_bytes = read_frame(input, MAXIMUM_WORKER_CANDIDATE_BYTES)?;
+    let candidate_bytes = read_frame(input, MAXIMUM_AGENT_RESULT_BYTES)?;
     let mut feedback_limit = [0_u8; 8];
     input.read_exact(&mut feedback_limit).map_err(|_| ())?;
     let feedback_limit = u64::from_be_bytes(feedback_limit);

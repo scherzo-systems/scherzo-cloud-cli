@@ -1,10 +1,8 @@
 mod validate;
 
-use std::process::ExitCode;
-
 use clap::{Args, Subcommand};
 
-pub(super) const ABOUT: &str = "Inspect and validate portable workflow artifacts";
+pub(super) const ABOUT: &str = "Work with portable workflow artifacts";
 const NAME: &str = "artifact";
 
 #[derive(Debug, Args)]
@@ -20,7 +18,7 @@ enum ArtifactCommand {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(ArtifactCommand::Validate(command)) => command.execute(),

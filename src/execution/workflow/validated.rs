@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::claude_code::ClaudeCodeConfig;
 use super::document::Output;
 use super::pi::PiConfig;
 
@@ -102,6 +103,7 @@ pub(crate) struct ValidatedAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidatedHarness {
     Pi(PiConfig),
+    ClaudeCode(ClaudeCodeConfig),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

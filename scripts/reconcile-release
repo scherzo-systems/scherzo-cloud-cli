@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""Inspect or reconcile one verified managed CLI GitHub Release."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import NoReturn, Sequence
+
+
+class ReconciliationError(Exception):
+    """The local assets or GitHub state cannot be reconciled safely."""
+
+
+def fail(message: str) -> NoReturn:
+    raise ReconciliationError(message)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_verifier() -> ModuleType:
+    path = Path(__file__).resolve().with_name("verify-release-allocation")
+    loader = importlib.machinery.SourceFileLoader("scherzo_release_verifier", os.fspath(path))
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    if specification is None:
+        fail("cannot load the allocation verifier")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+@dataclass(frozen=True)
+class LocalAsset:
+    path: Path
+    name: str
+    size: int
+    digest: str
+
+
+def verify_archive(path: Path, version: str, target: str) -> None:
+    package = f"scherzo-cloud-{version}-{target}"
+    if path.read_bytes()[4:8] != b"\0\0\0\0":
+        fail(f"release archive has a non-canonical gzip timestamp: {path.name}")
+    try:
+        with gzip.open(path, "rb") as compressed:
+            with tarfile.open(fileobj=compressed, mode="r:") as archive:
+                members = archive.getmembers()
+    except (OSError, tarfile.TarError) as error:
+        fail(f"release archive is malformed ({path.name}): {error}")
+    expected = {
+        f"{package}/": ("directory", 0o755),
+        f"{package}/LICENSE": ("file", 0o644),
+        f"{package}/README.md": ("file", 0o644),
+        f"{package}/scherzo-cloud": ("file", 0o755),
+    }
+    actual: dict[str, tuple[str, int]] = {}
+    for member in members:
+        name = member.name + ("/" if member.isdir() and not member.name.endswith("/") else "")
+        kind = "directory" if member.isdir() else "file" if member.isfile() else "other"
+        if (
+            kind == "other"
+            or member.uid != 0
+            or member.gid != 0
+            or member.uname != ""
+            or member.gname != ""
+            or member.mtime != 0
+            or name in actual
+        ):
+            fail(f"release archive contains non-canonical metadata: {path.name}")
+        actual[name] = (kind, member.mode)
+    if actual != expected:
+        fail(f"release archive inventory differs: {path.name}")
+
+
+def local_assets(dist: Path, version: str, expected_names: Sequence[str]) -> tuple[LocalAsset, ...]:
+    if not dist.is_dir() or dist.is_symlink():
+        fail("release dist path is not a regular directory")
+    paths = sorted(dist.iterdir(), key=lambda path: os.fsencode(path.name))
+    if any(not path.is_file() or path.is_symlink() for path in paths):
+        fail("release dist contains a non-regular file")
+    if [path.name for path in paths] != list(expected_names):
+        fail("release dist has a missing or unexpected asset")
+    targets = (
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    )
+    archive_paths: dict[str, Path] = {}
+    for target in targets:
+        name = f"scherzo-cloud-{version}-{target}.tar.gz"
+        archive_paths[name] = dist / name
+        verify_archive(dist / name, version, target)
+    checksums = b"".join(
+        f"{sha256(archive_paths[name])}  {name}\n".encode("ascii")
+        for name in sorted(archive_paths, key=os.fsencode)
+    )
+    if (dist / "SHA256SUMS").read_bytes() != checksums:
+        fail("SHA256SUMS is not the exact C-sorted archive digest manifest")
+    result = tuple(
+        LocalAsset(path, path.name, path.stat().st_size, sha256(path)) for path in paths
+    )
+    if any(asset.size <= 0 for asset in result):
+        fail("release dist contains an empty asset")
+    return result
+
+
+def compare_existing(local: Sequence[LocalAsset], existing: Sequence[object]) -> list[LocalAsset]:
+    local_by_name = {asset.name: asset for asset in local}
+    existing_by_name = {asset.name: asset for asset in existing}
+    for name, remote in existing_by_name.items():
+        local_asset = local_by_name.get(name)
+        if (
+            local_asset is None
+            or remote.size != local_asset.size
+            or remote.digest != local_asset.digest
+        ):
+            fail(f"existing draft asset differs from the exact local asset: {name}")
+    return [asset for asset in local if asset.name not in existing_by_name]
+
+
+@dataclass(frozen=True)
+class Inspection:
+    verifier: ModuleType
+    repository: Path
+    verification: object
+    github: object
+    local: tuple[LocalAsset, ...]
+    missing: tuple[LocalAsset, ...]
+
+
+def inspect(arguments: argparse.Namespace) -> Inspection:
+    verifier = load_verifier()
+    try:
+        verification = verifier.verify_release(
+            repository_path=arguments.repository,
+            allocated_input=arguments.allocated_mirror,
+            workflow_commit=arguments.workflow_commit,
+            event=arguments.event,
+            github_repository=arguments.github_repository,
+        )
+    except verifier.VerificationError as error:
+        fail(str(error))
+    github = verifier.GitHub(arguments.github_repository)
+    live_target = tag_target(github, github.repository, verification.tag)
+    expected_target = (
+        None if verification.release_state == "absent" else verification.allocated_mirror
+    )
+    if live_target != expected_target:
+        fail("live stable-tag state differs from the verified Git checkout")
+    expected_names = verifier.expected_asset_names(verification.version)
+    assets = local_assets(arguments.dist, verification.version, expected_names)
+    missing = compare_existing(assets, verification.target_release.assets)
+    if verification.complete and missing:
+        fail("published release is missing an exact local asset")
+    return Inspection(
+        verifier,
+        arguments.repository,
+        verification,
+        github,
+        assets,
+        tuple(missing),
+    )
+
+
+def tag_target(github: object, repository: str, tag: str) -> str | None:
+    value = github.api_json(f"repos/{repository}/git/ref/tags/{tag}", missing=True)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("ref") != f"refs/tags/{tag}":
+        fail("GitHub returned malformed stable-tag state")
+    target = value.get("object")
+    if (
+        not isinstance(target, dict)
+        or target.get("type") != "commit"
+        or not isinstance(target.get("sha"), str)
+    ):
+        fail("allocated stable tag is not a direct commit ref")
+    return target["sha"]
+
+
+def fetch_allocated_tag(inspection: Inspection) -> None:
+    verification = inspection.verification
+    repository = inspection.verifier.GitRepository(inspection.repository)
+    repository.run(
+        "fetch",
+        "--force",
+        "--no-tags",
+        "origin",
+        f"refs/tags/{verification.tag}:refs/tags/{verification.tag}",
+    )
+
+
+def refreshed_release(inspection: Inspection) -> object:
+    verification = inspection.verification
+    document = inspection.github.target_release(verification.tag)
+    target = tag_target(
+        inspection.github, inspection.github.repository, verification.tag
+    )
+    if target != verification.allocated_mirror:
+        fail("allocated stable tag was not created at the allocated mirror")
+    return inspection.verifier.verify_target_release(
+        inspection.github,
+        verification.plan,
+        verification.notes,
+        True,
+    )
+
+
+def create_draft(inspection: Inspection) -> None:
+    verification = inspection.verification
+    with tempfile.TemporaryDirectory(prefix="scherzo-release-notes.") as temporary:
+        notes = Path(temporary) / "rendered-notes.md"
+        notes.write_bytes(verification.notes)
+        command = [
+            "release",
+            "create",
+            verification.tag,
+            "--repo",
+            inspection.github.repository,
+            "--target",
+            verification.allocated_mirror,
+            "--title",
+            f"Scherzo Cloud CLI {verification.tag}",
+            "--notes-file",
+            os.fspath(notes),
+            "--draft",
+        ]
+        if verification.release_state == "tag-only":
+            command.append("--verify-tag")
+        inspection.github.run(*command)
+    fetch_allocated_tag(inspection)
+    state = refreshed_release(inspection)
+    if state.state != "draft" or state.assets:
+        fail("GitHub did not create the exact empty draft release")
+
+
+def upload_missing(inspection: Inspection, missing: Sequence[LocalAsset]) -> None:
+    if not missing:
+        return
+    inspection.github.run(
+        "release",
+        "upload",
+        inspection.verification.tag,
+        "--repo",
+        inspection.github.repository,
+        *(os.fspath(asset.path) for asset in missing),
+    )
+    state = refreshed_release(inspection)
+    if state.state != "draft":
+        fail("GitHub draft changed state during asset upload")
+    if compare_existing(inspection.local, state.assets):
+        fail("GitHub draft is still missing an uploaded release asset")
+
+
+def publish(inspection: Inspection) -> None:
+    inspection.github.run(
+        "release",
+        "edit",
+        inspection.verification.tag,
+        "--repo",
+        inspection.github.repository,
+        "--draft=false",
+        "--latest",
+    )
+    state = refreshed_release(inspection)
+    if state.state != "published":
+        fail("GitHub did not publish the exact verified release")
+    if compare_existing(inspection.local, state.assets):
+        fail("published GitHub Release is missing an exact asset")
+
+
+def apply(arguments: argparse.Namespace) -> None:
+    inspection = inspect(arguments)
+    verification = inspection.verification
+    if verification.complete:
+        print(f"{verification.tag} is already published exactly; no GitHub write is required.")
+        return
+    if verification.release_state in {"absent", "tag-only"}:
+        create_draft(inspection)
+        inspection = inspect(arguments)
+        verification = inspection.verification
+    if verification.release_state != "draft":
+        fail("release state is not an allowed reconciliation state")
+    upload_missing(inspection, inspection.missing)
+    inspection = inspect(arguments)
+    if inspection.missing:
+        fail("draft release remains incomplete after upload")
+    publish(inspection)
+    print(
+        f"Published {inspection.verification.tag} at "
+        f"{inspection.verification.allocated_mirror}."
+    )
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("operation", choices=("inspect", "apply"))
+    result.add_argument("--repository", type=Path, required=True)
+    result.add_argument("--allocated-mirror", required=True)
+    result.add_argument("--workflow-commit", required=True)
+    result.add_argument("--event", choices=("push", "recovery"), required=True)
+    result.add_argument("--github-repository", required=True)
+    result.add_argument("--dist", type=Path, required=True)
+    return result
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    if arguments.operation == "inspect":
+        inspection = inspect(arguments)
+        print(
+            f"Verified {inspection.verification.release_state} provider state for "
+            f"{inspection.verification.tag}; {len(inspection.missing)} assets remain."
+        )
+    else:
+        apply(arguments)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReconciliationError as error:
+        print(f"CLI release reconciliation failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

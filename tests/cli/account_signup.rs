@@ -187,10 +187,12 @@ fn signup_rejects_http_before_transmitting_the_credential() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"Error: create Scherzo Cloud account: the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error: create Scherzo Cloud account through "));
+    assert!(stderr.contains(&api_url));
+    assert!(stderr.contains(
+        "the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it"
+    ));
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
@@ -206,9 +208,18 @@ fn signup_without_a_credential_does_not_contact_the_api() {
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = deployment_environment(&api_url, credential_path_string);
 
+    let human = run_with_env(&["account", "signup"], &environment);
+
+    assert_eq!(human.status.code(), Some(3));
+    assert_eq!(
+        human.stdout,
+        b"! You're not signed in to Scherzo Cloud.\n\nSign in to create your account:\n  scherzo-cloud auth login\n"
+    );
+    assert!(human.stderr.is_empty());
+
     let output = run_with_env(&["account", "signup", "--json"], &environment);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
@@ -306,7 +317,7 @@ fn rejected_signup_credential_is_removed_without_leaking_it() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
         "unauthenticated"

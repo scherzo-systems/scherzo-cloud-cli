@@ -20,7 +20,7 @@ pub(crate) enum CredentialError {
 impl fmt::Display for CredentialError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFile => formatter.write_str("invalid runner credential file"),
+            Self::InvalidFile => formatter.write_str("content or permissions are invalid"),
         }
     }
 }

@@ -489,7 +489,7 @@ impl Drop for Recorder {
     fn drop(&mut self) {
         let _ = self
             .provider
-            .shutdown_with_timeout(std::time::Duration::from_millis(250));
+            .shutdown_with_timeout(otlp::MAX_SHUTDOWN_TIMEOUT);
     }
 }
 

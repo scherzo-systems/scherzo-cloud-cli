@@ -1,0 +1,30 @@
+```console
+$ scherzo-cloud workflow run --help
+Run a local command and agent workflow
+
+Usage: scherzo-cloud workflow run [OPTIONS] --source-root <ROOT> --execution-root <PATH> --run-dir <PATH> <WORKFLOW_FILE>
+
+Arguments:
+  <WORKFLOW_FILE>  Workflow definition path, resolved from the initial working directory
+
+Options:
+      --source-root <ROOT>              Directory boundary for workflow source files
+      --execution-root <PATH>           Directory for workflow execution (must already exist)
+      --run-dir <PATH>                  Directory to create for this run (must not already exist)
+      --prompt-file <PATH>              UTF-8 prompt file, or - to read standard input
+      --attachment <MEDIA_TYPE> <PATH>  Append an immutable attachment with its declared media type
+      --max-parallel <COUNT>            Maximum simultaneous workflow steps [default: 1]
+      --plain                           Force plain human presentation
+      --json                            Print the result as JSON
+      --color <WHEN>                    Select renderer color behavior [default: auto] [possible values: auto, always, never]
+  -h, --help                            Print help
+
+Interactive mode:
+  Automatic mode uses the terminal interface only when stdin and stdout are terminals,
+  TERM is usable, and stdin is not reserved by --prompt-file -. Resize keeps the
+  interface active; undersized terminals show a resize notice without changing modes.
+  Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
+  Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
+  After q, Scherzo restores the terminal and prints the standard plain summary.
+
+```

@@ -327,7 +327,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
                 "https://api.scherzo.dev/problems/unauthorized",
             ),
             "unauthenticated",
-            2,
+            3,
             None,
         ),
         (
@@ -394,13 +394,13 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
                 .unwrap(),
             ),
             "rate_limited",
-            3,
+            4,
             Some(42),
         ),
         (
             http_response("503 Service Unavailable", None, &[]),
             "unreachable",
-            3,
+            4,
             None,
         ),
     ];
@@ -462,7 +462,7 @@ fn two_ambiguous_create_failures_report_an_unconfirmed_result() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(4));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
         "unreachable"
@@ -535,7 +535,7 @@ fn missing_and_expired_credentials_do_not_contact_the_api() {
             &environment,
         );
 
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(3));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
             serde_json::json!({
@@ -560,7 +560,7 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
                 401,
                 "https://api.scherzo.dev/problems/unauthorized",
             ),
-            2,
+            3,
             false,
         ),
         (
@@ -768,7 +768,7 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
         command.join().unwrap()
     });
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert!(output.stderr.is_empty());
     let stored: serde_json::Value =
         serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
@@ -805,7 +805,7 @@ fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
                 "https://api.scherzo.dev/problems/unauthorized",
             ),
             "unauthenticated",
-            2,
+            3,
         ),
         (
             organization_problem(
@@ -828,7 +828,7 @@ fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
         (
             http_response("500 Internal Server Error", None, &[]),
             "unreachable",
-            3,
+            4,
         ),
     ];
 
@@ -874,7 +874,7 @@ fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
         ],
         &environment,
     );
-    assert_eq!(transport.status.code(), Some(3));
+    assert_eq!(transport.status.code(), Some(4));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&transport.stdout).unwrap()["category"],
         "connection"
@@ -1097,7 +1097,7 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
                 "https://api.scherzo.dev/problems/unauthorized",
             ),
             "unauthenticated",
-            2,
+            3,
         ),
         (
             organization_problem(
@@ -1138,7 +1138,7 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
         (
             http_response("503 Service Unavailable", None, &[]),
             "unreachable",
-            3,
+            4,
         ),
     ];
 
@@ -1197,7 +1197,7 @@ fn update_transport_and_protocol_failures_have_closed_statuses() {
         ],
         &environment,
     );
-    assert_eq!(transport.status.code(), Some(3));
+    assert_eq!(transport.status.code(), Some(4));
     let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
     assert_eq!(value["outcome"], "unreachable");
     assert_eq!(value["category"], "connection");
@@ -1469,7 +1469,7 @@ fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
                 "https://api.scherzo.dev/problems/unauthorized",
             ),
             "unauthenticated",
-            2,
+            3,
         ),
         (
             organization_problem(
@@ -1492,7 +1492,7 @@ fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
         (
             http_response("500 Internal Server Error", None, &[]),
             "unreachable",
-            3,
+            4,
         ),
     ];
 
@@ -1545,7 +1545,7 @@ fn members_list_transport_and_protocol_failures_have_closed_statuses() {
         ],
         &environment,
     );
-    assert_eq!(transport.status.code(), Some(3));
+    assert_eq!(transport.status.code(), Some(4));
     let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
     assert_eq!(value["outcome"], "unreachable");
     assert_eq!(value["category"], "connection");
@@ -1649,7 +1649,7 @@ fn update_and_members_list_report_missing_credentials_without_network_requests()
 
         let output = run_with_env(args, &environment);
 
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(3));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
             serde_json::json!({

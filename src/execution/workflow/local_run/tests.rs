@@ -268,6 +268,39 @@ fn attempt_directory_names_are_exact_at_the_six_digit_boundary() {
 }
 
 #[test]
+fn retained_read_budget_enforces_the_component_derivation() {
+    assert_eq!(
+        MAXIMUM_RETAINED_TOTAL_BYTES,
+        MAXIMUM_RETAINED_CAPTURED_FILE_BYTES
+            + crate::execution::workflow::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+            + MAXIMUM_RETAINED_RUN_JSON_BYTES
+    );
+
+    let mut captured_file_bytes = MAXIMUM_RETAINED_CAPTURED_FILE_BYTES - 1;
+    account_retained_bytes(
+        &mut captured_file_bytes,
+        1,
+        MAXIMUM_RETAINED_CAPTURED_FILE_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        account_retained_bytes(
+            &mut captured_file_bytes,
+            1,
+            MAXIMUM_RETAINED_CAPTURED_FILE_BYTES,
+        ),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut budget = RetainedReadBudget::with_bytes(MAXIMUM_RETAINED_TOTAL_BYTES - 1).unwrap();
+    budget.account(&[0]).unwrap();
+    assert_eq!(
+        budget.account(&[0]),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
+#[test]
 fn retained_manifest_rejects_source_files_out_of_canonical_order() {
     let source_file = |path: &str, ordinal: u64| ManifestSourceFileV1 {
         path: path.to_owned(),
@@ -710,6 +743,57 @@ fn abandoned_exact_group_is_authenticated_terminated_and_proven_absent() {
     assert_eq!(authority.terminations.get(), 1);
 }
 
+struct DelayedAbsentAuthority {
+    host: ExecutionHostV1,
+    observations: std::cell::Cell<usize>,
+    waits: std::cell::Cell<usize>,
+}
+
+impl LocalRecoveryAuthority for DelayedAbsentAuthority {
+    fn execution_host(&self) -> Result<ExecutionHostV1, ()> {
+        Ok(self.host.clone())
+    }
+
+    fn observe_process(&self, _guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+        let observation = self.observations.get() + 1;
+        self.observations.set(observation);
+        if observation <= 2_002 {
+            ProcessIdentityObservation::Exact {
+                leader: crate::execution::workflow::process_group::LeaderState::Running,
+            }
+        } else {
+            ProcessIdentityObservation::Absent
+        }
+    }
+}
+
+impl LocalQuiescenceAuthority for DelayedAbsentAuthority {
+    fn terminate_process(&self, _guard: &ProcessGuardV1) -> AuthenticatedSignalResult {
+        AuthenticatedSignalResult::Signalled
+    }
+
+    fn wait_for_process_change(&self) {
+        self.waits.set(self.waits.get() + 1);
+    }
+}
+
+#[test]
+fn quiescence_wait_allows_exit_after_ten_seconds() {
+    let attempt = fixture_guarded_attempt();
+    let authority = DelayedAbsentAuthority {
+        host: attempt.owner.execution_host.clone(),
+        observations: std::cell::Cell::new(0),
+        waits: std::cell::Cell::new(0),
+    };
+
+    assert_eq!(quiesce_attempt(&attempt, &authority), Ok(()));
+    assert_eq!(authority.waits.get(), 2_001);
+    assert!(
+        authority.waits.get() * usize::try_from(QUIESCENCE_POLL_INTERVAL.as_millis()).unwrap()
+            > 10_000
+    );
+}
+
 #[test]
 fn retry_execution_setup_rejects_a_rebound_run_path() {
     let fixture = AdmittedFixture::new();
@@ -909,7 +993,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": 65536
+            "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": outcome,
         "steps": steps,
@@ -1282,7 +1366,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": 65_536
+            "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "succeeded",
         "steps": steps,
@@ -1360,7 +1444,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": 65536
+            "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "succeeded",
         "steps": [{
@@ -1395,11 +1479,9 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         u64::try_from(result_bytes.len()).unwrap()
             <= crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES
     );
-    let archived_reader_limit = 4 * 1024 * 1024 + 2 * (65_536_u64.div_ceil(3) * 4);
     assert!(
-        u64::try_from(result_bytes.len()).unwrap() > archived_reader_limit,
-        "result bytes: {}, archived reader limit: {archived_reader_limit}",
-        result_bytes.len()
+        u64::try_from(result_bytes.len()).unwrap() > MAXIMUM_DURABLE_JSON_BYTES,
+        "the artifact metadata fixture must exceed the smaller run/state JSON budget"
     );
     let result_directory = run
         .run_directory()
@@ -1506,17 +1588,29 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
     let result_directory = publish_result_fixture(&fixture, &run);
     let valid = result_value(&result_directory);
 
+    let maximum = crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM;
+    let retained = vec![b'x'; usize::try_from(maximum).unwrap()];
     let mut full_prefix = valid.clone();
     full_prefix["steps"][0]["commandOutput"]["stdout"] = serde_json::json!({
         "encoding": "base64",
-        "data": BASE64_STANDARD.encode(vec![b'x'; 65_536]),
-        "retainedBytes": 65_536,
+        "data": BASE64_STANDARD.encode(&retained),
+        "retainedBytes": maximum,
         "discardedBytes": 1,
         "truncated": true,
         "fullyDrained": true
     });
     overwrite_result(&result_directory, full_prefix);
-    load_local_archived_attempt(&run_path, None).unwrap();
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+    assert_eq!(
+        archived.steps[0]
+            .command_output
+            .as_ref()
+            .unwrap()
+            .stdout
+            .bytes
+            .as_ref(),
+        retained
+    );
 
     let mut impossible = valid;
     impossible["steps"][0]["commandOutput"]["stdout"]["discardedBytes"] = Value::from(1);
@@ -1703,7 +1797,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": 65_536
+            "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "failed",
         "primaryFailure": {
