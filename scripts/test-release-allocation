@@ -1011,6 +1011,19 @@ def prove_recovery(module: ModuleType, root: Path) -> None:
     )
 
 
+def prove_stable_manifest_order(module: ModuleType) -> None:
+    refs = {
+        "v0.2.1": "1" * 40,
+        "v0.2.10": "2" * 40,
+    }
+    expected = (
+        f"refs/tags/v0.2.10={'2' * 40}\n"
+        f"refs/tags/v0.2.1={'1' * 40}\n"
+    ).encode("ascii")
+    if module.stable_manifest(refs) != expected:
+        fail("stable-ref manifest is not C-sorted by complete rendered records")
+
+
 def prove_workflow_contract(module: ModuleType) -> None:
     workflow = ROOT.joinpath(".github/workflows/check.yml").read_text()
     required = (
@@ -1047,6 +1060,7 @@ def prove_workflow_contract(module: ModuleType) -> None:
 
 def main() -> int:
     module = load_verifier()
+    prove_stable_manifest_order(module)
     prove_workflow_contract(module)
     with tempfile.TemporaryDirectory(prefix="scherzo-public-release.") as temporary:
         root = Path(temporary)

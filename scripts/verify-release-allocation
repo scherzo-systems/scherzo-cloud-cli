@@ -808,8 +808,12 @@ def stable_refs(repository: GitRepository) -> dict[str, str]:
 
 def stable_manifest(refs: Mapping[str, str]) -> bytes:
     return b"".join(
-        f"refs/tags/{tag}={refs[tag]}\n".encode("ascii")
-        for tag in sorted(refs, key=os.fsencode)
+        sorted(
+            (
+                f"refs/tags/{tag}={commit}\n".encode("ascii")
+                for tag, commit in refs.items()
+            )
+        )
     )
 
 
