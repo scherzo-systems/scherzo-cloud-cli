@@ -11,9 +11,7 @@
     "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
     "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abq",
     "lease": {
-      "leaseSequence": 1,
-      "leaseExpiresAt": "2026-07-23T00:05:00Z",
-      "runnerStopBefore": "2026-07-23T00:04:49Z"
+      "leaseSequence": 1
     },
     "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
   }

@@ -6,7 +6,8 @@ use serde_json::Value;
 use super::document::{
     Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, FailurePolicy,
     FinalizationTrigger, FinalizerDefinition, HarnessDefinition, MessageSource, NodeBody, Output,
-    OutputReference, StepDefinition, ValueReference, WorkflowDocument,
+    OutputReference, RecoveryHandler, StepDefinition, StepRecovery, ValueReference,
+    WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -33,6 +34,7 @@ enum StepDto {
         body: CommandNodeDto,
         #[serde(rename = "dependsOn", default)]
         control_dependencies: Vec<String>,
+        recovery: Option<RecoveryDto>,
     },
     #[serde(rename = "agent")]
     Agent {
@@ -40,6 +42,7 @@ enum StepDto {
         body: AgentNodeDto,
         #[serde(rename = "dependsOn", default)]
         control_dependencies: Vec<String>,
+        recovery: Option<RecoveryDto>,
     },
 }
 
@@ -99,6 +102,29 @@ struct CommonNodeDto {
 #[serde(deny_unknown_fields)]
 struct CommandDto {
     argv: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryDto {
+    retries: u8,
+    handler: Option<RecoveryHandlerDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum RecoveryHandlerDto {
+    #[serde(rename = "cmd")]
+    Command {
+        command: CommandDto,
+        cwd: Option<String>,
+    },
+    #[serde(rename = "agent")]
+    Agent {
+        profile: String,
+        prompt: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -219,19 +245,22 @@ impl WorkflowDto {
 
 impl StepDto {
     fn into_step(self) -> Option<StepDefinition> {
-        let (body, control_dependencies) = match self {
+        let (body, control_dependencies, recovery) = match self {
             Self::Command {
                 body,
                 control_dependencies,
-            } => (body.into_body()?, control_dependencies),
+                recovery,
+            } => (body.into_body()?, control_dependencies, recovery),
             Self::Agent {
                 body,
                 control_dependencies,
-            } => (body.into_body()?, control_dependencies),
+                recovery,
+            } => (body.into_body()?, control_dependencies, recovery),
         };
         Some(StepDefinition {
             body,
             control_dependencies,
+            recovery: recovery.map(RecoveryDto::into_recovery),
         })
     }
 }
@@ -290,6 +319,35 @@ fn parse_references(
             parse_value_reference(&reference.reference).map(|reference| (name, reference))
         })
         .collect()
+}
+
+impl RecoveryDto {
+    fn into_recovery(self) -> StepRecovery {
+        StepRecovery {
+            retries: self.retries,
+            handler: self.handler.map(RecoveryHandlerDto::into_handler),
+        }
+    }
+}
+
+impl RecoveryHandlerDto {
+    fn into_handler(self) -> RecoveryHandler {
+        match self {
+            Self::Command { command, cwd } => RecoveryHandler::Command {
+                argv: command.argv,
+                cwd,
+            },
+            Self::Agent {
+                profile,
+                prompt,
+                cwd,
+            } => RecoveryHandler::Agent {
+                profile,
+                prompt,
+                cwd,
+            },
+        }
+    }
 }
 
 impl AgentProfileDto {

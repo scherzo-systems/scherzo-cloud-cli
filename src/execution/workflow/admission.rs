@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use super::agent::{AgentCompatibilityProfile, AgentInvocationLimits, PositiveDuration};
 use super::artifact::CaptureCancellation;
 use super::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE};
+use super::capacity::WorkflowCapacity;
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::codex::CodexConfig;
@@ -26,7 +27,7 @@ use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
 #[cfg(test)]
 use super::test_support::SynchronousGate;
-use super::validated::{ValidatedHarness, ValidatedStep};
+use super::validated::{ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep};
 use crate::execution::claude_code::{
     ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation,
 };
@@ -752,6 +753,66 @@ enum GitCaptureAdmission {
     Cloud(CloudGitCaptureProjection),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowCapacityBudget {
+    pub(crate) maximum_invocations: u64,
+    pub(crate) diagnostic_retention_bytes: u64,
+    pub(crate) native_session_retention_bytes: u64,
+    pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) encoded_outbox_bytes: u64,
+}
+
+impl WorkflowCapacityBudget {
+    pub(crate) const fn supported_maximum() -> Self {
+        Self {
+            maximum_invocations: 488,
+            diagnostic_retention_bytes: 134_217_728,
+            native_session_retention_bytes: 67_108_864,
+            aggregate_retention_bytes: 201_326_592,
+            encoded_outbox_bytes: 105_185_280,
+        }
+    }
+
+    pub(crate) fn exact(capacity: &WorkflowCapacity) -> Self {
+        let requirements = capacity.requirements;
+        Self {
+            maximum_invocations: requirements.maximum_invocations,
+            diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
+            native_session_retention_bytes: requirements.native_session_retention_bytes,
+            aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+            encoded_outbox_bytes: requirements.encoded_outbox_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowExecutionContract {
+    General,
+    WorkflowV1InputlessCloudArtifactsV1,
+}
+
+impl WorkflowExecutionContract {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "workflow_v1_general@1",
+            Self::WorkflowV1InputlessCloudArtifactsV1 => "workflow_v1_inputless_cloud_artifacts@1",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryExecutionGuard {
+    Local,
+    Runner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedWorkflowCapacity {
+    pub(crate) resolved: WorkflowCapacity,
+    pub(crate) execution_contract: WorkflowExecutionContract,
+    pub(crate) maximum_transitions: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
@@ -763,6 +824,7 @@ pub(crate) struct ExecutionContext {
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
     git_capture: GitCaptureAdmission,
+    capacity_budget: WorkflowCapacityBudget,
 }
 
 impl ExecutionContext {
@@ -783,6 +845,7 @@ impl ExecutionContext {
             claude_code_installation: None,
             codex_installation: None,
             git_capture: GitCaptureAdmission::None,
+            capacity_budget: WorkflowCapacityBudget::supported_maximum(),
         }
     }
 
@@ -793,6 +856,11 @@ impl ExecutionContext {
 
     pub(crate) fn with_cloud_git_capture(mut self, projection: CloudGitCaptureProjection) -> Self {
         self.git_capture = GitCaptureAdmission::Cloud(projection);
+        self
+    }
+
+    pub(crate) fn with_capacity_budget(mut self, budget: WorkflowCapacityBudget) -> Self {
+        self.capacity_budget = budget;
         self
     }
 
@@ -1031,6 +1099,9 @@ pub(crate) struct AdmittedWorkflow {
     imports: ResolvedImports,
     execution: AdmittedExecutionContext,
     agent_steps: Arc<BTreeMap<String, AdmittedHarness>>,
+    recovery_handlers: Arc<BTreeMap<String, AdmittedHarness>>,
+    capacity: AdmittedWorkflowCapacity,
+    recovery_execution_guard: Option<RecoveryExecutionGuard>,
     git_capture: Option<Arc<GitCaptureContext>>,
 }
 
@@ -1053,6 +1124,30 @@ impl AdmittedWorkflow {
 
     pub(crate) fn agent_steps(&self) -> &BTreeMap<String, AdmittedHarness> {
         &self.agent_steps
+    }
+
+    pub(crate) fn recovery_handler(&self, step: &str) -> Option<&AdmittedHarness> {
+        self.recovery_handlers.get(step)
+    }
+
+    pub(crate) fn recovery_handlers(&self) -> &BTreeMap<String, AdmittedHarness> {
+        &self.recovery_handlers
+    }
+
+    pub(crate) fn capacity(&self) -> &AdmittedWorkflowCapacity {
+        &self.capacity
+    }
+
+    pub(crate) fn recovery_execution_guard(&self) -> Option<RecoveryExecutionGuard> {
+        self.recovery_execution_guard
+    }
+
+    pub(crate) fn has_recovery(&self) -> bool {
+        self.workflow
+            .definition
+            .recoveries
+            .values()
+            .any(Option::is_some)
     }
 
     pub(crate) fn git_capture(&self) -> Option<&GitCaptureContext> {
@@ -1089,6 +1184,12 @@ pub(crate) enum AdmissionFailureKind {
     NonPositiveStepLogBytes,
     CancellationGraceTooShort,
     CancellationGraceTooLong,
+    CapacitySourceBindingMismatch,
+    InvocationCapacityUnavailable,
+    DiagnosticRetentionCapacityUnavailable,
+    NativeSessionRetentionCapacityUnavailable,
+    AggregateRetentionCapacityUnavailable,
+    EncodedOutboxCapacityUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1097,6 +1198,7 @@ pub(crate) enum AdmissionLocation {
     PromptImport,
     AttachmentImport { index: usize },
     Step { step: String },
+    RecoveryHandler { step: String },
     ExecutionRoot,
     GitContext,
     MaximumParallelSteps,
@@ -1112,6 +1214,12 @@ pub(crate) enum AdmissionLocation {
     MaximumLiveInputBytes,
     MaximumStepLogBytes,
     CancellationPolicy,
+    CapacitySourceBinding,
+    MaximumInvocations,
+    DiagnosticRetention,
+    NativeSessionRetention,
+    AggregateRetention,
+    EncodedOutbox,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1169,7 +1277,30 @@ pub(crate) fn admit_local_workflow(
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_workflow(workflow, imports, context)
+    admit_guarded_workflow(workflow, imports, context, RecoveryExecutionGuard::Local)
+}
+
+pub(crate) fn admit_runner_workflow(
+    workflow: ResolvedWorkflow,
+    imports: ResolvedImports,
+    context: ExecutionContext,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    admit_guarded_workflow(workflow, imports, context, RecoveryExecutionGuard::Runner)
+}
+
+fn admit_guarded_workflow(
+    workflow: ResolvedWorkflow,
+    imports: ResolvedImports,
+    context: ExecutionContext,
+    guard: RecoveryExecutionGuard,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    let contract = match guard {
+        RecoveryExecutionGuard::Local => WorkflowExecutionContract::General,
+        RecoveryExecutionGuard::Runner => {
+            WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1
+        }
+    };
+    admit_workflow_for(workflow, imports, context, contract, Some(guard))
 }
 
 pub(crate) fn admit_workflow(
@@ -1177,6 +1308,23 @@ pub(crate) fn admit_workflow(
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    admit_workflow_for(
+        workflow,
+        imports,
+        context,
+        WorkflowExecutionContract::General,
+        None,
+    )
+}
+
+fn admit_workflow_for(
+    workflow: ResolvedWorkflow,
+    imports: ResolvedImports,
+    context: ExecutionContext,
+    execution_contract: WorkflowExecutionContract,
+    recovery_execution_guard: Option<RecoveryExecutionGuard>,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
     if workflow.required_imports().prompt && imports.prompt().is_none() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::MissingRequiredPrompt,
@@ -1196,12 +1344,13 @@ pub(crate) fn admit_workflow(
         ));
     }
 
-    let agent_steps = admit_agent_steps(
-        &workflow,
+    let available_harnesses = AvailableHarnesses::new(
         context.pi_installation.as_ref(),
         context.claude_code_installation.as_ref(),
         context.codex_installation.as_ref(),
-    )?;
+    );
+    let agent_steps = admit_agent_steps(&workflow, &available_harnesses)?;
+    let recovery_handlers = admit_recovery_handlers(&workflow, &available_harnesses)?;
 
     let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
         .ok_or_else(|| {
@@ -1290,15 +1439,12 @@ pub(crate) fn admit_workflow(
             )
         })?;
     let maximum_step_log_bytes = NonZeroU64::new(
-        configured_maximum_step_log_bytes
-            .get()
-            .min(super::maximum_retained_bytes_per_stream(
-                workflow
-                    .definition
-                    .presentation_order
-                    .len()
-                    .saturating_add(workflow.definition.finalizer_presentation_order.len()),
-            )),
+        configured_maximum_step_log_bytes.get().min(
+            capacity
+                .resolved
+                .requirements
+                .maximum_retained_bytes_per_invocation,
+        ),
     )
     .ok_or_else(|| {
         AdmissionFailure::new(
@@ -1373,7 +1519,73 @@ pub(crate) fn admit_workflow(
         imports,
         execution,
         agent_steps: Arc::new(agent_steps),
+        recovery_handlers: Arc::new(recovery_handlers),
+        capacity,
+        recovery_execution_guard,
         git_capture,
+    })
+}
+
+fn admit_capacity(
+    workflow: &ResolvedWorkflow,
+    budget: WorkflowCapacityBudget,
+    execution_contract: WorkflowExecutionContract,
+) -> Result<AdmittedWorkflowCapacity, AdmissionFailure> {
+    if !workflow.capacity_is_bound_to_source_closure() {
+        return Err(AdmissionFailure::new(
+            AdmissionFailureKind::CapacitySourceBindingMismatch,
+            AdmissionLocation::CapacitySourceBinding,
+        ));
+    }
+    let requirements = workflow.capacity.requirements;
+    for (available, required, kind, location) in [
+        (
+            budget.maximum_invocations,
+            requirements.maximum_invocations,
+            AdmissionFailureKind::InvocationCapacityUnavailable,
+            AdmissionLocation::MaximumInvocations,
+        ),
+        (
+            budget.diagnostic_retention_bytes,
+            requirements.diagnostic_retention_bytes,
+            AdmissionFailureKind::DiagnosticRetentionCapacityUnavailable,
+            AdmissionLocation::DiagnosticRetention,
+        ),
+        (
+            budget.native_session_retention_bytes,
+            requirements.native_session_retention_bytes,
+            AdmissionFailureKind::NativeSessionRetentionCapacityUnavailable,
+            AdmissionLocation::NativeSessionRetention,
+        ),
+        (
+            budget.aggregate_retention_bytes,
+            requirements.aggregate_retention_bytes,
+            AdmissionFailureKind::AggregateRetentionCapacityUnavailable,
+            AdmissionLocation::AggregateRetention,
+        ),
+    ] {
+        if available < required {
+            return Err(AdmissionFailure::new(kind, location));
+        }
+    }
+    if execution_contract == WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1
+        && budget.encoded_outbox_bytes < requirements.encoded_outbox_bytes
+    {
+        return Err(AdmissionFailure::new(
+            AdmissionFailureKind::EncodedOutboxCapacityUnavailable,
+            AdmissionLocation::EncodedOutbox,
+        ));
+    }
+    let maximum_transitions = match execution_contract {
+        WorkflowExecutionContract::General => requirements.general_maximum_transitions,
+        WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1 => {
+            requirements.cloud_maximum_transitions
+        }
+    };
+    Ok(AdmittedWorkflowCapacity {
+        resolved: workflow.capacity.clone(),
+        execution_contract,
+        maximum_transitions,
     })
 }
 
@@ -1403,17 +1615,31 @@ fn git_admission_failure(failure: GitWorkspaceAdmissionFailure) -> AdmissionFail
     AdmissionFailure::new(kind, AdmissionLocation::GitContext)
 }
 
+struct AvailableHarnesses {
+    pi: Option<Arc<ValidatedPiInstallation>>,
+    claude_code: Option<Arc<ValidatedClaudeCodeInstallation>>,
+    codex: Option<Arc<ValidatedCodexInstallation>>,
+}
+
+impl AvailableHarnesses {
+    fn new(
+        pi: Option<&ValidatedPiInstallation>,
+        claude_code: Option<&ValidatedClaudeCodeInstallation>,
+        codex: Option<&ValidatedCodexInstallation>,
+    ) -> Self {
+        Self {
+            pi: pi.cloned().map(Arc::new),
+            claude_code: claude_code.cloned().map(Arc::new),
+            codex: codex.cloned().map(Arc::new),
+        }
+    }
+}
+
 fn admit_agent_steps(
     workflow: &ResolvedWorkflow,
-    pi_installation: Option<&ValidatedPiInstallation>,
-    claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
-    codex_installation: Option<&ValidatedCodexInstallation>,
+    available: &AvailableHarnesses,
 ) -> Result<BTreeMap<String, AdmittedHarness>, AdmissionFailure> {
-    let pi_installation = pi_installation.map(|installation| Arc::new(installation.clone()));
-    let claude_code_installation =
-        claude_code_installation.map(|installation| Arc::new(installation.clone()));
-    let codex_installation = codex_installation.map(|installation| Arc::new(installation.clone()));
-    workflow
+    let requests = workflow
         .definition
         .steps
         .iter()
@@ -1428,55 +1654,102 @@ fn admit_agent_steps(
             let ValidatedStep::Agent(step) = step else {
                 return None;
             };
-            Some((step_name, step))
-        })
-        .map(|(step_name, step)| {
-            let missing_installation = || {
-                AdmissionFailure::new(
-                    AdmissionFailureKind::AgentStepRuntimeUnsupported,
-                    AdmissionLocation::Step {
-                        step: step_name.clone(),
-                    },
-                )
+            Some((
+                step_name.clone(),
+                &step.agent.harness,
+                AdmissionLocation::Step {
+                    step: step_name.clone(),
+                },
+            ))
+        });
+    admit_harness_requests(requests, available)
+}
+
+fn admit_recovery_handlers(
+    workflow: &ResolvedWorkflow,
+    available: &AvailableHarnesses,
+) -> Result<BTreeMap<String, AdmittedHarness>, AdmissionFailure> {
+    let requests = workflow
+        .definition
+        .recoveries
+        .iter()
+        .filter_map(|(step_name, recovery)| {
+            let Some(super::validated::ValidatedStepRecovery {
+                handler: Some(ValidatedRecoveryHandler::Agent { harness, .. }),
+                ..
+            }) = recovery
+            else {
+                return None;
             };
-            let admitted = match &step.agent.harness {
-                ValidatedHarness::Pi(configuration) => {
-                    let installation = pi_installation.as_ref().ok_or_else(missing_installation)?;
-                    let PiCompatibilityProfile::PiJsonV1 = installation.profile();
-                    AdmittedHarness::Pi(PiJsonV1Admission {
-                        installation: Arc::clone(installation),
-                        configuration: configuration.clone(),
-                        project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
-                        limits: pi_json_v1_limits(),
-                    })
-                }
-                ValidatedHarness::ClaudeCode(configuration) => {
-                    let installation = claude_code_installation
-                        .as_ref()
-                        .ok_or_else(missing_installation)?;
-                    let ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1 =
-                        installation.profile();
-                    AdmittedHarness::ClaudeCode(ClaudeCodeStreamJsonV1Admission {
-                        installation: Arc::clone(installation),
-                        configuration: configuration.clone(),
-                        limits: claude_code_stream_json_v1_limits(),
-                    })
-                }
-                ValidatedHarness::Codex(configuration) => {
-                    let installation = codex_installation
-                        .as_ref()
-                        .ok_or_else(missing_installation)?;
-                    let CodexCompatibilityProfile::CodexAppServerV1 = installation.profile();
-                    AdmittedHarness::Codex(CodexAppServerV1Admission {
-                        installation: Arc::clone(installation),
-                        configuration: configuration.clone(),
-                        limits: codex_app_server_v1_limits(),
-                    })
-                }
-            };
-            Ok((step_name.clone(), admitted))
+            Some((
+                step_name.clone(),
+                harness,
+                AdmissionLocation::RecoveryHandler {
+                    step: step_name.clone(),
+                },
+            ))
+        });
+    admit_harness_requests(requests, available)
+}
+
+fn admit_harness_requests<'a>(
+    requests: impl IntoIterator<Item = (String, &'a ValidatedHarness, AdmissionLocation)>,
+    available: &AvailableHarnesses,
+) -> Result<BTreeMap<String, AdmittedHarness>, AdmissionFailure> {
+    requests
+        .into_iter()
+        .map(|(name, harness, location)| {
+            admit_harness(harness, available, location).map(|admitted| (name, admitted))
         })
         .collect()
+}
+
+fn admit_harness(
+    harness: &ValidatedHarness,
+    available: &AvailableHarnesses,
+    location: AdmissionLocation,
+) -> Result<AdmittedHarness, AdmissionFailure> {
+    let missing_installation = || {
+        AdmissionFailure::new(
+            AdmissionFailureKind::AgentStepRuntimeUnsupported,
+            location.clone(),
+        )
+    };
+    match harness {
+        ValidatedHarness::Pi(configuration) => {
+            let installation = available.pi.as_ref().ok_or_else(missing_installation)?;
+            let PiCompatibilityProfile::PiJsonV1 = installation.profile();
+            Ok(AdmittedHarness::Pi(PiJsonV1Admission {
+                installation: Arc::clone(installation),
+                configuration: configuration.clone(),
+                project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
+                limits: pi_json_v1_limits(),
+            }))
+        }
+        ValidatedHarness::ClaudeCode(configuration) => {
+            let installation = available
+                .claude_code
+                .as_ref()
+                .ok_or_else(missing_installation)?;
+            let ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1 = installation.profile();
+            Ok(AdmittedHarness::ClaudeCode(
+                ClaudeCodeStreamJsonV1Admission {
+                    installation: Arc::clone(installation),
+                    configuration: configuration.clone(),
+                    limits: claude_code_stream_json_v1_limits(),
+                },
+            ))
+        }
+        ValidatedHarness::Codex(configuration) => {
+            let installation = available.codex.as_ref().ok_or_else(missing_installation)?;
+            let CodexCompatibilityProfile::CodexAppServerV1 = installation.profile();
+            Ok(AdmittedHarness::Codex(CodexAppServerV1Admission {
+                installation: Arc::clone(installation),
+                configuration: configuration.clone(),
+                limits: codex_app_server_v1_limits(),
+            }))
+        }
+    }
 }
 
 fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {

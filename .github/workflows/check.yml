@@ -222,48 +222,28 @@ jobs:
           if not document.get("executablePath"):
               raise SystemExit("release binary reported an empty executablePath")
           PY
-      - name: Package deterministic release archive
+      - name: Package and verify deterministic release archive
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import gzip
-          import os
-          import tarfile
-          from pathlib import Path
-
-          version = os.environ["VERSION"]
-          target = os.environ["TARGET"]
-          package = f"scherzo-cloud-{version}-{target}"
-          destination = Path("dist") / f"{package}.tar.gz"
-          destination.parent.mkdir()
-          files = (
-              ("LICENSE", Path("LICENSE"), 0o644),
-              ("README.md", Path("README.md"), 0o644),
-              ("scherzo-cloud", Path("target") / target / "release" / "scherzo-cloud", 0o755),
+          release_dist="$RUNNER_TEMP/scherzo-release-dist"
+          test ! -e "$release_dist"
+          archive=$(
+            ./scripts/package-release-archive \
+              --binary "target/$TARGET/release/scherzo-cloud" \
+              --output "$release_dist" \
+              --target "$TARGET" \
+              --version "$VERSION"
           )
-          with destination.open("wb") as output:
-              with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-                      directory = tarfile.TarInfo(f"{package}/")
-                      directory.type = tarfile.DIRTYPE
-                      directory.mode = 0o755
-                      directory.mtime = directory.uid = directory.gid = 0
-                      directory.uname = directory.gname = ""
-                      archive.addfile(directory)
-                      for name, source, mode in files:
-                          value = source.read_bytes()
-                          member = tarfile.TarInfo(f"{package}/{name}")
-                          member.size = len(value)
-                          member.mode = mode
-                          member.mtime = member.uid = member.gid = 0
-                          member.uname = member.gname = ""
-                          import io
-                          archive.addfile(member, io.BytesIO(value))
-          PY
+          ./scripts/verify-release-package-isolated \
+            --archive "$archive" \
+            --target "$TARGET" \
+            --version "$VERSION"
+          mkdir -p dist
+          cp "$archive" dist/
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

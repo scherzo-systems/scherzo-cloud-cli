@@ -384,7 +384,7 @@ impl<'a> ProtocolLog<'a> {
                     effect_id,
                     assignment_id,
                     run_id,
-                    &lease.expires_at,
+                    lease.sequence,
                 ),
             ),
             CloudFrame::AssignmentLeaseRenewed {
@@ -401,7 +401,7 @@ impl<'a> ProtocolLog<'a> {
                     effect_id,
                     assignment_id,
                     run_id,
-                    &lease.expires_at,
+                    lease.sequence,
                 ),
             ),
             CloudFrame::AssignmentRelease {
@@ -521,7 +521,7 @@ fn leased_assignment_effect_attributes(
     effect_id: &str,
     assignment_id: &str,
     run_id: &str,
-    lease_expires_at: &str,
+    lease_sequence: u64,
 ) -> Vec<KeyValue> {
     vec![
         KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.to_owned()),
@@ -531,8 +531,8 @@ fn leased_assignment_effect_attributes(
         ),
         KeyValue::new(telemetry::attribute::RUN_ID, run_id.to_owned()),
         KeyValue::new(
-            telemetry::attribute::PROTOCOL_LEASE_EXPIRES_AT,
-            lease_expires_at.to_owned(),
+            telemetry::attribute::PROTOCOL_LEASE_SEQUENCE,
+            telemetry::integer(lease_sequence),
         ),
     ]
 }
@@ -1209,7 +1209,7 @@ impl Drop for ObservationTransport<'_> {
 }
 
 enum AssignmentManagerEffect {
-    Offer(AssignmentOffer),
+    Offer(Box<AssignmentOffer>),
     Start(AssignmentStart),
     Renewal(AssignmentRenewal),
     Release {
@@ -1925,7 +1925,7 @@ where
                 effect_id,
                 assignment_id,
                 run_id,
-                AssignmentManagerEffect::Offer(offer),
+                AssignmentManagerEffect::Offer(Box::new(offer)),
             )
         }
         CloudFrame::AssignmentStart {
@@ -2060,7 +2060,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match manager_effect {
-            AssignmentManagerEffect::Offer(offer) => manager.handle_offer(offer).map(|_| None),
+            AssignmentManagerEffect::Offer(offer) => manager.handle_offer(*offer).map(|_| None),
             AssignmentManagerEffect::Start(start) => manager.handle_start(start),
             AssignmentManagerEffect::Renewal(renewal) => {
                 manager.handle_renewal(renewal).map(|_| None)

@@ -60,6 +60,28 @@ steps:
           - ref: imports.prompt
 "#;
 
+const RECOVERY_AGENT_WORKFLOW: &str = r#"schemaVersion: 1
+agentProfiles:
+  repair:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  check:
+    kind: cmd
+    recovery:
+      retries: 2
+      handler:
+        kind: agent
+        profile: repair
+        prompt: recovery.md
+        cwd: repairs
+    command:
+      argv: ["true"]
+"#;
+
 const MIXED_WORKFLOW: &str = r#"schemaVersion: 1
 agentProfiles:
   coding:
@@ -280,8 +302,13 @@ fn admission_partitions_durable_stream_bytes_before_capture() {
         ));
     }
     let fixture = WorkflowFixture::new(&source);
+    let resolved = fixture.resolve();
+    let carried_limit = resolved
+        .capacity
+        .requirements
+        .maximum_retained_bytes_per_invocation;
     let admitted = admit_workflow(
-        fixture.resolve(),
+        resolved,
         ResolvedImports::default(),
         fixture.context(
             ExecutionRootLifecycle::EngineOwnedEphemeral,
@@ -293,7 +320,7 @@ fn admission_partitions_durable_stream_bytes_before_capture() {
 
     assert_eq!(
         admitted.execution().limits().maximum_step_log_bytes().get(),
-        super::super::maximum_retained_bytes_per_stream(256)
+        carried_limit
     );
 }
 
@@ -340,6 +367,251 @@ fn admission_requires_pi_only_for_graphs_containing_agent_steps() {
             assert_eq!(root_snapshot(&fixture.execution_root), root_before);
         }
     }
+}
+
+#[test]
+fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
+    let fixture = WorkflowFixture::new(RECOVERY_AGENT_WORKFLOW);
+    fs::write(
+        fixture.source_root.join("recovery.md"),
+        b"Repair the failed target.\n",
+    )
+    .unwrap();
+    fs::create_dir(fixture.execution_root.join("repairs")).unwrap();
+    let resolved = fixture.resolve();
+    let exact = WorkflowCapacityBudget::exact(&resolved.capacity);
+    let installation = ValidatedPiInstallation::fixture(fixture.execution_root.join("pi"));
+
+    let local = admit_local_workflow(
+        resolved.clone(),
+        ResolvedImports::default(),
+        fixture
+            .context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            )
+            .with_capacity_budget(exact)
+            .with_pi_installation(installation.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        local.capacity().maximum_transitions,
+        resolved.capacity.requirements.general_maximum_transitions
+    );
+    assert_eq!(local.capacity().resolved, resolved.capacity);
+    assert_eq!(
+        local.recovery_execution_guard(),
+        Some(RecoveryExecutionGuard::Local)
+    );
+    assert_eq!(local.recovery_handlers().len(), 1);
+
+    let runner = admit_runner_workflow(
+        resolved.clone(),
+        ResolvedImports::default(),
+        fixture
+            .context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            )
+            .with_capacity_budget(exact)
+            .with_pi_installation(installation),
+    )
+    .unwrap();
+    assert_eq!(
+        runner.capacity().maximum_transitions,
+        resolved.capacity.requirements.cloud_maximum_transitions
+    );
+    assert_eq!(runner.capacity().resolved, resolved.capacity);
+    assert_eq!(
+        runner.capacity().execution_contract.as_str(),
+        "workflow_v1_inputless_cloud_artifacts@1"
+    );
+    assert_eq!(
+        runner.recovery_execution_guard(),
+        Some(RecoveryExecutionGuard::Runner)
+    );
+}
+
+#[test]
+fn maximal_232_round_workflow_admits_exact_resolver_capacity() {
+    let mut source = String::from(
+        "schemaVersion: 1\nagentProfiles:\n  repair:\n    harness:\n      kind: pi\n      config: {model: openai/gpt-5, thinking: high}\nsteps:\n",
+    );
+    for index in 0..24 {
+        let retries = if index == 23 { 2 } else { 10 };
+        source.push_str(&format!(
+            "  step{index}:\n    kind: cmd\n    recovery:\n      retries: {retries}\n      handler:\n        kind: agent\n        profile: repair\n        prompt: recovery.md\n    command: {{argv: [\"true\"]}}\n"
+        ));
+    }
+    let fixture = WorkflowFixture::new(&source);
+    fs::write(
+        fixture.source_root.join("recovery.md"),
+        b"Repair the failed target.\n",
+    )
+    .unwrap();
+    let resolved = fixture.resolve();
+    let requirements = resolved.capacity.requirements;
+    assert_eq!(requirements.general_maximum_transitions, 1_283);
+    assert_eq!(requirements.cloud_maximum_transitions, 1_027);
+    assert_eq!(requirements.maximum_invocations, 488);
+    assert_eq!(requirements.maximum_retained_bytes_per_invocation, 137_518);
+    let exact = WorkflowCapacityBudget::exact(&resolved.capacity);
+
+    let admitted = admit_runner_workflow(
+        resolved,
+        ResolvedImports::default(),
+        fixture
+            .context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            )
+            .with_capacity_budget(exact)
+            .with_pi_installation(ValidatedPiInstallation::fixture(
+                fixture.execution_root.join("pi"),
+            )),
+    )
+    .unwrap();
+    assert_eq!(admitted.recovery_handlers().len(), 24);
+    assert_eq!(admitted.capacity().resolved.requirements, requirements);
+    assert_eq!(
+        admitted.execution().limits().maximum_step_log_bytes().get(),
+        requirements.maximum_retained_bytes_per_invocation
+    );
+}
+
+#[test]
+fn admission_rejects_capacity_reused_after_source_closure_changes() {
+    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let mut resolved = fixture.resolve();
+    resolved.source_closure.insert(
+        "injected-after-resolution.txt".to_owned(),
+        Arc::from(b"changed closure bytes".as_slice()),
+    );
+    let context = || {
+        fixture.context(
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            1,
+            Duration::from_secs(1),
+        )
+    };
+
+    let local = admit_local_workflow(resolved.clone(), ResolvedImports::default(), context());
+    let runner = admit_runner_workflow(resolved, ResolvedImports::default(), context());
+    assert_eq!(
+        (
+            local.err().map(|failure| failure.kind()),
+            runner.err().map(|failure| failure.kind()),
+        ),
+        (
+            Some(AdmissionFailureKind::CapacitySourceBindingMismatch),
+            Some(AdmissionFailureKind::CapacitySourceBindingMismatch),
+        )
+    );
+}
+
+#[test]
+fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() {
+    let fixture = WorkflowFixture::new(RECOVERY_AGENT_WORKFLOW);
+    fs::write(
+        fixture.source_root.join("recovery.md"),
+        b"Repair the failed target.\n",
+    )
+    .unwrap();
+    let resolved = fixture.resolve();
+    let exact = WorkflowCapacityBudget::exact(&resolved.capacity);
+    let context = || {
+        fixture.context(
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            1,
+            Duration::from_secs(1),
+        )
+    };
+
+    assert_failure(
+        admit_local_workflow(
+            resolved.clone(),
+            ResolvedImports::default(),
+            context().with_capacity_budget(exact),
+        ),
+        AdmissionFailureKind::AgentStepRuntimeUnsupported,
+        AdmissionLocation::RecoveryHandler {
+            step: "check".to_owned(),
+        },
+    );
+
+    let installation = ValidatedPiInstallation::fixture(fixture.execution_root.join("pi"));
+    let requirements = resolved.capacity.requirements;
+    for (budget, kind, location) in [
+        (
+            WorkflowCapacityBudget {
+                maximum_invocations: requirements.maximum_invocations - 1,
+                ..exact
+            },
+            AdmissionFailureKind::InvocationCapacityUnavailable,
+            AdmissionLocation::MaximumInvocations,
+        ),
+        (
+            WorkflowCapacityBudget {
+                diagnostic_retention_bytes: requirements.diagnostic_retention_bytes - 1,
+                ..exact
+            },
+            AdmissionFailureKind::DiagnosticRetentionCapacityUnavailable,
+            AdmissionLocation::DiagnosticRetention,
+        ),
+        (
+            WorkflowCapacityBudget {
+                native_session_retention_bytes: requirements.native_session_retention_bytes - 1,
+                ..exact
+            },
+            AdmissionFailureKind::NativeSessionRetentionCapacityUnavailable,
+            AdmissionLocation::NativeSessionRetention,
+        ),
+        (
+            WorkflowCapacityBudget {
+                aggregate_retention_bytes: requirements.aggregate_retention_bytes - 1,
+                ..exact
+            },
+            AdmissionFailureKind::AggregateRetentionCapacityUnavailable,
+            AdmissionLocation::AggregateRetention,
+        ),
+        (
+            WorkflowCapacityBudget {
+                encoded_outbox_bytes: requirements.encoded_outbox_bytes - 1,
+                ..exact
+            },
+            AdmissionFailureKind::EncodedOutboxCapacityUnavailable,
+            AdmissionLocation::EncodedOutbox,
+        ),
+    ] {
+        assert_failure(
+            admit_runner_workflow(
+                resolved.clone(),
+                ResolvedImports::default(),
+                context()
+                    .with_capacity_budget(budget)
+                    .with_pi_installation(installation.clone()),
+            ),
+            kind,
+            location,
+        );
+    }
+
+    let mut mismatched = resolved;
+    mismatched.content_digest.value = "0".repeat(64);
+    assert_failure(
+        admit_local_workflow(
+            mismatched,
+            ResolvedImports::default(),
+            context()
+                .with_capacity_budget(exact)
+                .with_pi_installation(installation),
+        ),
+        AdmissionFailureKind::CapacitySourceBindingMismatch,
+        AdmissionLocation::CapacitySourceBinding,
+    );
 }
 
 #[test]

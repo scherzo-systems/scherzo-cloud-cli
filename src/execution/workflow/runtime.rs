@@ -604,14 +604,6 @@ pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) occurrence_accepted: bool,
 }
 
-pub(crate) const fn maximum_transition_count(step_count: usize, finalizer_count: usize) -> usize {
-    if finalizer_count == 0 {
-        5 * step_count + 3
-    } else {
-        5 * (step_count + finalizer_count) + 6
-    }
-}
-
 pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
     admitted: &AdmittedWorkflow,
     initial_cancellation: Option<CancellationRequest<Deadline>>,

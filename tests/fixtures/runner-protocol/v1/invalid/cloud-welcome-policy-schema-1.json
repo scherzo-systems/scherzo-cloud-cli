@@ -1,0 +1,21 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abh",
+  "sentAt": "2026-07-23T00:00:00Z",
+  "type": "welcome",
+  "payloadVersion": 1,
+  "payload": {
+    "sessionId": "rsn_01k0z6r1w8f4jy2m7q9v3x5abj",
+    "pingIntervalSeconds": 10,
+    "pongTimeoutSeconds": 30,
+    "leasePolicy": {
+      "schemaVersion": 1,
+      "forceStopAndReapBudgetMilliseconds": 5000,
+      "terminalReportDeliveryBudgetMilliseconds": 5000,
+      "renewalDeliveryBudgetMilliseconds": 5000,
+      "leaseDurationMilliseconds": 320000,
+      "fencingMarginMilliseconds": 11000
+    }
+  }
+}

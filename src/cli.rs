@@ -354,6 +354,7 @@ mod tests {
             "runner status",
             "version",
             "workflow",
+            "workflow reference",
             "workflow retry",
             "workflow run",
             "workflow schema",

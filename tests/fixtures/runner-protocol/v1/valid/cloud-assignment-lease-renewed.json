@@ -10,9 +10,7 @@
     "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
     "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
     "lease": {
-      "leaseSequence": 2,
-      "leaseExpiresAt": "2026-07-23T00:01:00Z",
-      "runnerStopBefore": "2026-07-23T00:00:49Z"
+      "leaseSequence": 2
     },
     "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
   }

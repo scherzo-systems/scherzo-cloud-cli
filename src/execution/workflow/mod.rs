@@ -9,6 +9,7 @@ mod artifact_json;
 mod artifact_set;
 pub(crate) mod cancellation;
 mod canonical_json;
+pub(crate) mod capacity;
 pub(crate) mod child_guard;
 mod claude_code;
 pub(crate) mod claude_code_stream_json_v1;

@@ -21,7 +21,7 @@ use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
-    ResolvedAttachment, ResolvedImports, admit_workflow,
+    ResolvedAttachment, ResolvedImports, admit_local_workflow, admit_workflow,
 };
 use crate::execution::workflow::agent::scripted::{
     ScriptedAgentDispatcher, ScriptedAgentValue, scripted_agent_dispatcher,
@@ -330,6 +330,49 @@ fn execution_fixture_with_source_files(
         agent_inputs,
         diagnostic_sessions,
     }
+}
+
+#[tokio::test]
+async fn local_recovery_execution_guard_rejects_before_target_start() {
+    let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"sh\", \"-c\", \"touch target-started\"]\n";
+    let fixture = execution_fixture(
+        source,
+        ResolvedImports::default(),
+        EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+        CancellationSource::new(),
+        1,
+        32,
+    );
+    let admitted = admit_local_workflow(
+        resolution::resolve(&fixture.source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedImports::default(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            ExecutionRootLifecycle::CallerOwnedRetained,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
+                InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
+                32,
+            ),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+
+    let result = execute_workflow(
+        admitted,
+        &fixture.artifacts,
+        &fixture.inputs,
+        &StepDiagnosticLog::default(),
+        AgentExecution::disabled(),
+        TestClock,
+        NoopExecutionObserver,
+    )
+    .await;
+    assert_eq!(result, Err(CoordinationError::RecoveryExecutionGuardActive));
+    assert!(!fixture.execution_root.join("target-started").exists());
 }
 
 #[tokio::test]

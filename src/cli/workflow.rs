@@ -1,3 +1,4 @@
+mod reference;
 mod retry;
 mod run;
 mod schema;
@@ -6,12 +7,14 @@ mod validate;
 mod view;
 
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
+
+use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Work with local workflow definitions and runs";
 const NAME: &str = "workflow";
@@ -81,6 +84,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    #[command(about = reference::ABOUT)]
+    Reference(reference::Command),
     #[command(about = retry::ABOUT, after_help = retry::AFTER_HELP)]
     Retry(retry::Command),
     #[command(about = run::ABOUT, after_help = run::AFTER_HELP)]
@@ -93,6 +98,19 @@ enum WorkflowCommand {
     Validate(validate::Command),
     #[command(about = view::ABOUT, after_help = view::AFTER_HELP)]
     View(view::Command),
+}
+
+pub(super) fn write_embedded_asset(
+    asset: &'static str,
+    context: &'static str,
+) -> super::CommandResult {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout
+        .write_all(asset.as_bytes())
+        .and_then(|()| stdout.flush())
+        .context(context)?;
+    Ok(ExitCode::Success)
 }
 
 // Read-only commands use a current-thread runtime so signal exit can abandon a blocked
@@ -125,6 +143,7 @@ impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
+            Some(WorkflowCommand::Reference(command)) => command.execute(),
             Some(WorkflowCommand::Retry(command)) => command.execute(),
             Some(WorkflowCommand::Run(command)) => command.execute(),
             Some(WorkflowCommand::Schema(command)) => command.execute(),

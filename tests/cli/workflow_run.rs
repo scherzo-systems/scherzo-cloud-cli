@@ -365,13 +365,42 @@ fn normalized_run_directory(path: &Path) -> PathBuf {
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let path = std::env::var_os("PATH");
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+        ])
         .arg("-C")
         .arg(repository)
         .args(arguments)
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .unwrap();
+        .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("PAGER", "cat")
+        .env("EDITOR", "true")
+        .stdin(Stdio::null());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "git {arguments:?} failed: {}",

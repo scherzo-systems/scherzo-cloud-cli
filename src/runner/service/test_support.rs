@@ -517,11 +517,9 @@ pub(crate) fn welcome() -> Message {
                 "pingIntervalSeconds": 1,
                 "pongTimeoutSeconds": 2,
                 "leasePolicy": {
-                    "schemaVersion": 1,
-                    "maxClockUncertaintyMilliseconds": 1000,
+                    "schemaVersion": 2,
                     "forceStopAndReapBudgetMilliseconds": 5000,
                     "terminalReportDeliveryBudgetMilliseconds": 5000,
-                    "startDeliveryBudgetMilliseconds": 5000,
                     "renewalDeliveryBudgetMilliseconds": 5000,
                     "leaseDurationMilliseconds": 320000,
                     "fencingMarginMilliseconds": 11000
@@ -617,8 +615,7 @@ pub(crate) fn assignment_offer() -> Message {
                         },
                         "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
                     }
-                },
-                "offerExpiresAt": "2026-07-23T01:00:00Z"
+                }
             }
         })
         .to_string()

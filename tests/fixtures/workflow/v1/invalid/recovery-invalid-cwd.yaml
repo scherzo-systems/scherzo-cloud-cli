@@ -1,0 +1,12 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        cwd: ../outside
+        command:
+          argv: ["true"]
+    command: {argv: ["true"]}

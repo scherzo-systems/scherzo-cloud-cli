@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Create one deterministic native Scherzo Cloud release archive."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import io
+import os
+import re
+import tarfile
+import tempfile
+from pathlib import Path
+from typing import NoReturn
+
+
+TARGETS = frozenset(
+    {
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    }
+)
+VERSION_RE = re.compile(
+    r"^(?:(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|0\.0\.0-dev)$"
+)
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"package-release-archive: {message}")
+
+
+def regular_file(path: Path, description: str, *, executable: bool = False) -> Path:
+    if path.is_symlink() or not path.is_file():
+        fail(f"{description} is not a regular file: {path}")
+    if executable and not os.access(path, os.X_OK):
+        fail(f"{description} is not executable: {path}")
+    return path
+
+
+def canonical_member(name: str, value: bytes, mode: int) -> tuple[tarfile.TarInfo, io.BytesIO]:
+    member = tarfile.TarInfo(name)
+    member.size = len(value)
+    member.mode = mode
+    member.mtime = member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    return member, io.BytesIO(value)
+
+
+def package_archive(binary: Path, output: Path, version: str, target: str) -> Path:
+    public_root = Path(__file__).resolve().parent.parent
+    sources = (
+        ("LICENSE", regular_file(public_root / "LICENSE", "CLI license"), 0o644),
+        ("README.md", regular_file(public_root / "README.md", "CLI README"), 0o644),
+        ("scherzo-cloud", regular_file(binary, "release binary", executable=True), 0o755),
+    )
+
+    if not VERSION_RE.fullmatch(version):
+        fail(f"version is not canonical MAJOR.MINOR.PATCH or 0.0.0-dev: {version}")
+    if target not in TARGETS:
+        fail(f"target is not a supported release target: {target}")
+    if output.is_symlink() or (output.exists() and not output.is_dir()):
+        fail(f"output path is not a regular directory: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+
+    package = f"scherzo-cloud-{version}-{target}"
+    destination = output / f"{package}.tar.gz"
+    if destination.exists() or destination.is_symlink():
+        fail(f"release archive already exists: {destination}")
+
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output, delete=False) as temporary:
+            temporary_name = temporary.name
+            with gzip.GzipFile(filename="", mode="wb", fileobj=temporary, mtime=0) as compressed:
+                with tarfile.open(
+                    fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
+                ) as archive:
+                    directory = tarfile.TarInfo(f"{package}/")
+                    directory.type = tarfile.DIRTYPE
+                    directory.mode = 0o755
+                    directory.mtime = directory.uid = directory.gid = 0
+                    directory.uname = directory.gname = ""
+                    archive.addfile(directory)
+                    for name, source, mode in sources:
+                        member, content = canonical_member(
+                            f"{package}/{name}", source.read_bytes(), mode
+                        )
+                        archive.addfile(member, content)
+        os.replace(temporary_name, destination)
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+    return destination
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--version", required=True)
+    arguments = parser.parse_args()
+
+    archive = package_archive(
+        arguments.binary, arguments.output, arguments.version, arguments.target
+    )
+    print(archive)
+
+
+if __name__ == "__main__":
+    main()

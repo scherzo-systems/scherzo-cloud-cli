@@ -3421,11 +3421,3 @@ fn force_abort_allocates_one_distinct_containment_action_per_active_finalizer() 
             .all(|id| id.transition_sequence.get() > (1_u64 << 63))
     );
 }
-
-#[test]
-fn general_transition_bound_is_exact_and_piecewise() {
-    assert_eq!(maximum_transition_count(256, 0), 1_283);
-    assert_eq!(maximum_transition_count(255, 1), 1_286);
-    assert_eq!(maximum_transition_count(1, 0), 8);
-    assert_eq!(maximum_transition_count(1, 1), 16);
-}

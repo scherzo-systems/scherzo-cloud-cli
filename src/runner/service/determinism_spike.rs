@@ -626,7 +626,7 @@ fn scripted_assignment_offer() -> Message {
         decoded["payload"]["runId"],
         "run_01k0z6r1w8f4jy2m7q9v3x5abj"
     );
-    assert_eq!(decoded["payload"]["offerExpiresAt"], "2026-07-23T01:00:00Z");
+    assert!(decoded["payload"].get("offerExpiresAt").is_none());
     offer
 }
 

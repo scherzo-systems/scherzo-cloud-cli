@@ -1,0 +1,10 @@
+```console
+$ scherzo-cloud workflow reference --help
+Show the workflow authoring reference
+
+Usage: scherzo-cloud workflow reference
+
+Options:
+  -h, --help  Print help
+
+```

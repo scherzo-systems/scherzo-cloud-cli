@@ -507,6 +507,7 @@ pub(crate) enum CoordinationError {
     OccurrenceChannelClosed,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
+    RecoveryExecutionGuardActive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

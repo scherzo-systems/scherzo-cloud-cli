@@ -150,6 +150,9 @@ where
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
     // jscpd:ignore-end
 {
+    if admitted.has_recovery() && admitted.recovery_execution_guard().is_some() {
+        return Err(CoordinationError::RecoveryExecutionGuardActive);
+    }
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
     let coordinated = execute_workflow_observed(

@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Verify a release archive while its allocated source root is unavailable."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import FrameType
+from typing import NoReturn
+
+
+EXPECTED_ASSETS = (
+    "LICENSE",
+    "README.md",
+    "docs/workflow-v1.md",
+    "schemas/workflow-v1.schema.json",
+)
+
+
+class Interrupted(Exception):
+    """The verification process received a termination signal."""
+
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(signal_number)
+        self.signal_number = signal_number
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"verify-release-package-isolated: {message}")
+
+
+def regular_file(path: Path, description: str) -> Path:
+    if path.is_symlink() or not path.is_file():
+        fail(f"{description} is not a regular file: {path}")
+    return path
+
+
+def interrupt(signal_number: int, _frame: FrameType | None) -> NoReturn:
+    raise Interrupted(signal_number)
+
+
+def verify(archive: Path, target: str, version: str) -> int:
+    public_root = Path(__file__).resolve().parent.parent
+    archive = regular_file(archive.absolute(), "release archive")
+    if archive.is_relative_to(public_root):
+        fail("release archive must be staged outside the allocated source root")
+
+    verifier = regular_file(
+        public_root / "scripts/verify-release-package", "release-package verifier"
+    )
+    hidden_root = public_root.with_name(
+        f".{public_root.name}.release-verification-hidden-{os.getpid()}"
+    )
+    if hidden_root.exists() or hidden_root.is_symlink():
+        fail(f"source-hiding path already exists: {hidden_root}")
+
+    with tempfile.TemporaryDirectory(
+        prefix="scherzo-release-package-isolated-"
+    ) as temporary:
+        staging_root = Path(temporary)
+        expected_root = staging_root / "expected"
+        staged_verifier = staging_root / "verify-release-package"
+        shutil.copy2(verifier, staged_verifier)
+        for relative in EXPECTED_ASSETS:
+            source = regular_file(public_root / relative, "expected source asset")
+            destination = expected_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+
+        interrupted_by: int | None = None
+        previous_handlers = {
+            signal_number: signal.signal(signal_number, interrupt)
+            for signal_number in (signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            public_root.rename(hidden_root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(staged_verifier),
+                    "--archive",
+                    os.fspath(archive),
+                    "--expected-root",
+                    os.fspath(expected_root),
+                    "--target",
+                    target,
+                    "--unavailable-source-root",
+                    os.fspath(public_root),
+                    "--version",
+                    version,
+                ],
+                cwd=staging_root,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except Interrupted as error:
+            interrupted_by = error.signal_number
+        finally:
+            for signal_number in previous_handlers:
+                signal.signal(signal_number, signal.SIG_IGN)
+            restoration_error: str | None = None
+            if hidden_root.exists() or hidden_root.is_symlink():
+                if public_root.exists() or public_root.is_symlink():
+                    restoration_error = (
+                        f"cannot restore allocated source over existing path: {public_root}"
+                    )
+                else:
+                    hidden_root.rename(public_root)
+            elif not public_root.is_dir():
+                restoration_error = f"allocated source root disappeared: {public_root}"
+            for signal_number, handler in previous_handlers.items():
+                signal.signal(signal_number, handler)
+            if restoration_error is not None:
+                fail(restoration_error)
+
+        if interrupted_by is not None:
+            return 128 + interrupted_by
+        return result.returncode
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", required=True, type=Path)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--version", required=True)
+    arguments = parser.parse_args()
+    raise SystemExit(verify(arguments.archive, arguments.target, arguments.version))
+
+
+if __name__ == "__main__":
+    main()

@@ -167,7 +167,9 @@ impl<'a> RejectionLocation<'a> {
                 output: Some(output),
                 ..Self::for_finalizer("result_schema", finalizer)
             },
+            ResolutionLocation::RecoveryPrompt { step } => Self::for_step("recovery_prompt", step),
             ResolutionLocation::ContentDigest => Self::simple("content_digest"),
+            ResolutionLocation::Capacity => Self::simple("capacity"),
         }
     }
 
@@ -181,6 +183,9 @@ impl<'a> RejectionLocation<'a> {
             },
             ValidationLocation::AgentProfileReference { step } => {
                 Self::for_step("agent_profile_reference", step)
+            }
+            ValidationLocation::RecoveryAgentProfileReference { step } => {
+                Self::for_step("recovery_agent_profile_reference", step)
             }
             ValidationLocation::FinalizerAgentProfileReference { finalizer } => {
                 Self::for_finalizer("agent_profile_reference", finalizer)
@@ -241,6 +246,9 @@ impl<'a> RejectionLocation<'a> {
                 ..Self::simple("attachment_import")
             }),
             AdmissionLocation::Step { step } => Some(Self::for_step("step", step)),
+            AdmissionLocation::RecoveryHandler { step } => {
+                Some(Self::for_step("recovery_handler", step))
+            }
             AdmissionLocation::ExecutionRoot => Some(Self::simple("execution_root")),
             AdmissionLocation::GitContext => Some(Self::simple("git_context")),
             AdmissionLocation::MaximumParallelSteps
@@ -255,7 +263,13 @@ impl<'a> RejectionLocation<'a> {
             | AdmissionLocation::MaximumTotalInputBytes
             | AdmissionLocation::MaximumLiveInputBytes
             | AdmissionLocation::MaximumStepLogBytes
-            | AdmissionLocation::CancellationPolicy => None,
+            | AdmissionLocation::CancellationPolicy
+            | AdmissionLocation::CapacitySourceBinding
+            | AdmissionLocation::MaximumInvocations
+            | AdmissionLocation::DiagnosticRetention
+            | AdmissionLocation::NativeSessionRetention
+            | AdmissionLocation::AggregateRetention
+            | AdmissionLocation::EncodedOutbox => None,
         }
     }
 }
@@ -385,6 +399,18 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
         ResolutionFailureKind::DigestInputTooLarge => (
             "source_closure_too_large",
             "Reduce the total size of the workflow definition and its static source files.",
+        ),
+        ResolutionFailureKind::CapacityArithmeticOverflow => (
+            "workflow_capacity_overflow",
+            "Reduce the workflow size or configured recovery rounds.",
+        ),
+        ResolutionFailureKind::GeneralTransitionCapacityExceeded => (
+            "workflow_transition_capacity_exceeded",
+            "Reduce the workflow size or configured recovery rounds.",
+        ),
+        ResolutionFailureKind::CloudTransitionCapacityExceeded => (
+            "cloud_transition_capacity_exceeded",
+            "Reduce the workflow size or configured recovery rounds.",
         ),
     }
 }
@@ -697,7 +723,13 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         | AdmissionFailureKind::NonPositiveLiveInputBytes
         | AdmissionFailureKind::NonPositiveStepLogBytes
         | AdmissionFailureKind::CancellationGraceTooShort
-        | AdmissionFailureKind::CancellationGraceTooLong => None,
+        | AdmissionFailureKind::CancellationGraceTooLong
+        | AdmissionFailureKind::CapacitySourceBindingMismatch
+        | AdmissionFailureKind::InvocationCapacityUnavailable
+        | AdmissionFailureKind::DiagnosticRetentionCapacityUnavailable
+        | AdmissionFailureKind::NativeSessionRetentionCapacityUnavailable
+        | AdmissionFailureKind::AggregateRetentionCapacityUnavailable
+        | AdmissionFailureKind::EncodedOutboxCapacityUnavailable => None,
     }
 }
 

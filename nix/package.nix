@@ -14,6 +14,7 @@ let
     fileset = lib.fileset.unions [
       ../Cargo.lock
       ../Cargo.toml
+      ../docs/workflow-v1.md
       ../examples
       ../schemas
       ../src

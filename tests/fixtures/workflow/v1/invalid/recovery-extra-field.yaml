@@ -1,0 +1,8 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    recovery:
+      retries: 1
+      backoff: immediate
+    command: {argv: ["true"]}

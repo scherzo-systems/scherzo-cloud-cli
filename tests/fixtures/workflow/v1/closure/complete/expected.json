@@ -1,11 +1,16 @@
 {
   "workflowPath": "workflows/complete.yaml",
   "algorithm": "sha256",
-  "value": "ccf433a6c743d8329cb43c6d8c2809f16366a81c7e28fd1142bc97a82de51634",
+  "value": "8721788e6938879b9c800ac9e8d5a881400251f98c1d5bbca6af73fb92818e7c",
   "paths": [
     "attachments/data.bin",
+    "attachments/finalizer.bin",
+    "prompts/finalizer-message.md",
+    "prompts/finalizer-system.md",
     "prompts/message.md",
+    "prompts/recovery.md",
     "prompts/system.md",
+    "schemas/finalizer.schema.json",
     "schemas/result.schema.json",
     "workflows/complete.yaml"
   ]

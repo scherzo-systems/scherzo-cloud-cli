@@ -130,10 +130,7 @@ fn init_repository(path: &Path) {
 }
 
 fn fixture_git_command() -> Command {
-    let mut command = Command::new(git_executable());
-    // Keep asynchronous repository maintenance from racing byte-for-byte fixture snapshots.
-    command.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
-    command
+    crate::test_support::fixture_git_command(git_executable())
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -634,7 +631,7 @@ fn finish_promisor<const N: usize>(
         additional_environment,
     );
     git(&workspace.repository, &["checkout", "--quiet", "-"]);
-    let missing = Command::new("git")
+    let missing = fixture_git_command()
         .arg("-C")
         .arg(&workspace.repository)
         .args(["--no-lazy-fetch", "cat-file", "-e", &prepared.promised_blob])
@@ -664,7 +661,7 @@ fn promisor_capture_hydrates_only_required_objects_from_existing_source_authorit
             .carrier()
             .is_some()
     );
-    let hydrated = Command::new("git")
+    let hydrated = fixture_git_command()
         .arg("-C")
         .arg(&fixture.workspace.repository)
         .args(["--no-lazy-fetch", "cat-file", "-e", &fixture.promised_blob])

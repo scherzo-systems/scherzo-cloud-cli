@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: {argv: ["true"]}
+finalizers:
+  cleanup:
+    kind: cmd
+    recovery:
+      retries: 1
+    command: {argv: ["true"]}

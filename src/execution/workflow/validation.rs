@@ -3,14 +3,16 @@ use std::fmt;
 
 use super::document::{
     Agent, CommonNode, FailurePolicy, FinalizerDefinition, HarnessDefinition, MessageSource,
-    NodeBody, Output, OutputReference, StepDefinition, ValueReference, WorkflowDocument,
+    NodeBody, Output, OutputReference, RecoveryHandler, StepDefinition, StepRecovery,
+    ValueReference, WorkflowDocument,
 };
 use super::validated::{
     RequiredImports, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
     ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
     ValidatedCommandStep, ValidatedCommonStep, ValidatedFinalizer, ValidatedHarness,
-    ValidatedMessageSource, ValidatedOutput, ValidatedStep, ValidatedWorkflow, WorkflowImport,
-    WorkflowNode, WorkflowNodeRole, WorkflowValueType,
+    ValidatedMessageSource, ValidatedOutput, ValidatedRecoveryHandler, ValidatedStep,
+    ValidatedStepRecovery, ValidatedWorkflow, WorkflowImport, WorkflowNode, WorkflowNodeRole,
+    WorkflowValueType,
 };
 use super::{claude_code, codex, pi};
 
@@ -53,6 +55,7 @@ pub(crate) enum ValidationLocation {
     WorkflowNamespace,
     AgentProfile { profile: String },
     AgentProfileReference { step: String },
+    RecoveryAgentProfileReference { step: String },
     FinalizerAgentProfileReference { finalizer: String },
     StepDependency { step: String, index: usize },
     StepInput { step: String, input: String },
@@ -109,8 +112,9 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
 
     let mut required_imports = RequiredImports::default();
     let mut steps = BTreeMap::new();
+    let mut recoveries = BTreeMap::new();
     for (step_name, step) in &document.steps {
-        let validated = validate_body(
+        let body = validate_body(
             step_name,
             WorkflowNodeRole::Step,
             &step.body,
@@ -119,7 +123,9 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
             &agent_profiles,
             &mut required_imports,
         )?;
-        steps.insert(step_name.clone(), validated);
+        let recovery = validate_recovery(step_name, step.recovery.as_ref(), &agent_profiles)?;
+        steps.insert(step_name.clone(), body);
+        recoveries.insert(step_name.clone(), recovery);
     }
 
     let mut finalizers = BTreeMap::new();
@@ -154,6 +160,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         schema_version: document.schema_version,
         description: document.description,
         steps,
+        recoveries,
         source_order: document.step_order,
         presentation_order: step_graph.presentation_order,
         finalizers,
@@ -624,6 +631,53 @@ fn output_failure(
     output: &str,
 ) -> ValidationFailure {
     ValidationFailure::new(kind, node_output_location(name, role, output))
+}
+
+fn validate_recovery(
+    step_name: &str,
+    recovery: Option<&StepRecovery>,
+    agent_profiles: &BTreeMap<String, ValidatedHarness>,
+) -> Result<Option<ValidatedStepRecovery>, ValidationFailure> {
+    recovery
+        .map(|recovery| {
+            let handler = recovery
+                .handler
+                .as_ref()
+                .map(|handler| match handler {
+                    RecoveryHandler::Command { argv, cwd } => {
+                        Ok(ValidatedRecoveryHandler::Command {
+                            argv: argv.clone(),
+                            cwd: cwd.clone(),
+                        })
+                    }
+                    RecoveryHandler::Agent {
+                        profile,
+                        prompt,
+                        cwd,
+                    } => {
+                        let harness = agent_profiles.get(profile).cloned().ok_or_else(|| {
+                            ValidationFailure::new(
+                                ValidationFailureKind::UnknownAgentProfile,
+                                ValidationLocation::RecoveryAgentProfileReference {
+                                    step: step_name.to_owned(),
+                                },
+                            )
+                        })?;
+                        Ok(ValidatedRecoveryHandler::Agent {
+                            profile: profile.clone(),
+                            prompt: prompt.clone(),
+                            cwd: cwd.clone(),
+                            harness,
+                        })
+                    }
+                })
+                .transpose()?;
+            Ok(ValidatedStepRecovery {
+                retries: recovery.retries,
+                handler,
+            })
+        })
+        .transpose()
 }
 
 fn validate_body(

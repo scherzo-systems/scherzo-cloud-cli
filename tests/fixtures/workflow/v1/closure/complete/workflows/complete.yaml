@@ -10,6 +10,13 @@ agentProfiles:
 steps:
   agent:
     kind: agent
+    recovery:
+      retries: 2
+      handler:
+        kind: agent
+        profile: coding
+        prompt: ../prompts/recovery.md
+        cwd: repairs
     agent:
       profile: coding
       systemPrompt: ../prompts/system.md
@@ -24,6 +31,21 @@ steps:
       result:
         kind: agent_result
         schema: ../schemas/result.schema.json
+finalizers:
+  report:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: ../prompts/finalizer-system.md
+      message:
+        text:
+          - file: ../prompts/finalizer-message.md
+        attachments:
+          - file: ../attachments/finalizer.bin
+    outputs:
+      result:
+        kind: agent_result
+        schema: ../schemas/finalizer.schema.json
 exports:
   result:
     ref: outputs.agent.result

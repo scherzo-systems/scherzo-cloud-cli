@@ -19,6 +19,26 @@ pub(crate) struct WorkflowDocument {
 pub(crate) struct StepDefinition {
     pub(crate) body: NodeBody,
     pub(crate) control_dependencies: Vec<String>,
+    pub(crate) recovery: Option<StepRecovery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StepRecovery {
+    pub(crate) retries: u8,
+    pub(crate) handler: Option<RecoveryHandler>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryHandler {
+    Command {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
+    Agent {
+        profile: String,
+        prompt: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

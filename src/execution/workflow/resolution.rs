@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
+use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_workflow_capacity};
 use super::result_validation::{ResultSchemaSupportFailure, RetainedResultSchema};
 use super::schema_common::lowercase_hex;
 use super::validated::{
@@ -40,6 +41,9 @@ pub(crate) enum ResolutionFailureKind {
     InvalidResultSchemaReference,
     InvalidResultSchema,
     DigestInputTooLarge,
+    CapacityArithmeticOverflow,
+    GeneralTransitionCapacityExceeded,
+    CloudTransitionCapacityExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,7 +59,9 @@ pub(crate) enum ResolutionLocation {
     FinalizerMessageText { finalizer: String, index: usize },
     FinalizerMessageAttachment { finalizer: String, index: usize },
     FinalizerResultSchema { finalizer: String, output: String },
+    RecoveryPrompt { step: String },
     ContentDigest,
+    Capacity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +153,7 @@ pub(crate) struct ResolvedWorkflow {
     result_schemas: BTreeMap<(String, String), RetainedResultSchema>,
     pub(crate) source: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
+    pub(crate) capacity: WorkflowCapacity,
 }
 
 impl ResolvedWorkflow {
@@ -156,6 +163,11 @@ impl ResolvedWorkflow {
 
     pub(crate) fn source_bytes(&self, canonical_path: &str) -> Option<&[u8]> {
         self.source_closure.get(canonical_path).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn capacity_is_bound_to_source_closure(&self) -> bool {
+        digest_source_closure(&self.source_closure)
+            .is_ok_and(|digest| digest == self.content_digest && self.capacity.is_bound_to(&digest))
     }
 
     pub(crate) fn result_schema(&self, step: &str, output: &str) -> Option<&RetainedResultSchema> {
@@ -281,6 +293,21 @@ fn resolve_loaded_workflow(
     let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
     let content_digest = digest_source_closure(&source_closure)?;
+    let capacity =
+        resolve_workflow_capacity(&definition, content_digest.clone()).map_err(|failure| {
+            let kind = match failure {
+                CapacityCalculationFailure::ArithmeticOverflow => {
+                    ResolutionFailureKind::CapacityArithmeticOverflow
+                }
+                CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
+                    ResolutionFailureKind::GeneralTransitionCapacityExceeded
+                }
+                CapacityCalculationFailure::CloudTransitionCapacityExceeded => {
+                    ResolutionFailureKind::CloudTransitionCapacityExceeded
+                }
+            };
+            ResolutionFailure::new(kind, ResolutionLocation::Capacity)
+        })?;
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
@@ -290,6 +317,7 @@ fn resolve_loaded_workflow(
             workflow_path: workflow_source.canonical_path,
         },
         content_digest,
+        capacity,
     })
 }
 
@@ -556,17 +584,37 @@ fn resolve_static_sources(
     sources: &mut SourceResolver,
 ) -> Result<BTreeMap<(String, String), RetainedResultSchema>, ResolutionFailure> {
     let mut result_schemas = BTreeMap::new();
-    for (node_name, node) in &mut definition.steps {
+    let ValidatedWorkflow {
+        steps,
+        recoveries,
+        finalizers,
+        ..
+    } = definition;
+    for (node_name, step) in steps {
+        if let Some(super::validated::ValidatedStepRecovery {
+            handler: Some(super::validated::ValidatedRecoveryHandler::Agent { prompt, .. }),
+            ..
+        }) = recoveries.get_mut(node_name).and_then(Option::as_mut)
+        {
+            *prompt = resolve_text_source(
+                prompt,
+                workflow_directory,
+                sources,
+                ResolutionLocation::RecoveryPrompt {
+                    step: node_name.clone(),
+                },
+            )?;
+        }
         resolve_node_static_sources(
             node_name,
             WorkflowNodeRole::Step,
-            node,
+            step,
             workflow_directory,
             sources,
             &mut result_schemas,
         )?;
     }
-    for (node_name, finalizer) in &mut definition.finalizers {
+    for (node_name, finalizer) in finalizers {
         resolve_node_static_sources(
             node_name,
             WorkflowNodeRole::Finalizer,

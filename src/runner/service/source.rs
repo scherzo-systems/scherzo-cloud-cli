@@ -1061,7 +1061,7 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let bare_repository = temporary.path().join("repository.git");
             assert!(
-                Command::new("git")
+                fixture_git_command()
                     .args(["clone", "--quiet", "--bare"])
                     .arg(repository)
                     .arg(&bare_repository)
@@ -1214,7 +1214,7 @@ mod tests {
             .target
             .split_once('?')
             .unwrap_or((&request.target, ""));
-        let mut backend = Command::new("git");
+        let mut backend = fixture_git_command();
         backend
             .arg("http-backend")
             .env("GIT_HTTP_EXPORT_ALL", "1")
@@ -1427,9 +1427,13 @@ mod tests {
         assert!(!tree_contains(assignment.path(), token.as_bytes()));
     }
 
+    fn fixture_git_command() -> Command {
+        crate::test_support::fixture_git_command("git")
+    }
+
     fn run_fixture_git(repository: &Path, arguments: &[&str]) {
         assert!(
-            Command::new("git")
+            fixture_git_command()
                 .current_dir(repository)
                 .args(arguments)
                 .status()
@@ -1520,7 +1524,7 @@ mod tests {
         fs::write(repository.join("history.txt"), b"history\n").unwrap();
         commit_repository(&repository);
         let parent_commit = String::from_utf8(
-            Command::new("git")
+            fixture_git_command()
                 .current_dir(&repository)
                 .args(["rev-parse", "HEAD"])
                 .output()
@@ -1535,7 +1539,7 @@ mod tests {
         fs::create_dir(repository.join("workflows")).unwrap();
         fs::write(repository.join("workflows/workflow.yaml"), workflow).unwrap();
         commit_repository(&repository);
-        let commit = Command::new("git")
+        let commit = fixture_git_command()
             .current_dir(&repository)
             .args(["rev-parse", "HEAD"])
             .output()
@@ -1661,7 +1665,7 @@ mod tests {
         assert!(request_evidence.accepted > 0);
         assert!(request_evidence.helper_observed);
         assert!(!request_evidence.token_observed_in_private_root);
-        let configuration = Command::new("git")
+        let configuration = fixture_git_command()
             .current_dir(&materialized.execution_root)
             .args(["config", "--local", "--list", "--show-origin"])
             .output()
@@ -1673,7 +1677,7 @@ mod tests {
                 .windows(TOKEN.len())
                 .any(|bytes| bytes == TOKEN.as_bytes())
         );
-        let head = Command::new("git")
+        let head = fixture_git_command()
             .current_dir(&materialized.execution_root)
             .args(["rev-parse", "HEAD"])
             .output()
@@ -1682,7 +1686,7 @@ mod tests {
             String::from_utf8(head.stdout).unwrap().trim(),
             fixture.commit
         );
-        let shallow = Command::new("git")
+        let shallow = fixture_git_command()
             .current_dir(&materialized.execution_root)
             .args(["rev-parse", "--is-shallow-repository"])
             .output()
@@ -1694,7 +1698,7 @@ mod tests {
             "refs/remotes/origin/fixture-history",
             "refs/tags/fixture-history",
         ] {
-            let resolved = Command::new("git")
+            let resolved = fixture_git_command()
                 .current_dir(&materialized.execution_root)
                 .args(["rev-parse", reference])
                 .output()
@@ -1712,7 +1716,7 @@ mod tests {
                 .exists()
         );
         assert!(
-            !Command::new("git")
+            !fixture_git_command()
                 .current_dir(&materialized.execution_root)
                 .args(["symbolic-ref", "-q", "HEAD"])
                 .status()
@@ -1871,7 +1875,7 @@ mod tests {
             &["commit", "--quiet", "-m", "capture branch"],
         );
         let changed_head = String::from_utf8(
-            Command::new("git")
+            fixture_git_command()
                 .current_dir(admitted.execution().root())
                 .args(["rev-parse", "HEAD"])
                 .output()
@@ -2040,7 +2044,7 @@ mod tests {
     fn rejects_a_non_commit_pinned_oid_as_an_integrity_failure() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let fixture = repository_fixture(workflow);
-        let blob = Command::new("git")
+        let blob = fixture_git_command()
             .current_dir(&fixture.repository)
             .args(["rev-parse", "HEAD:workflows/workflow.yaml"])
             .output()

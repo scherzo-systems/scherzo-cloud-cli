@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
+#[cfg(test)]
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Notify, mpsc};
 
 use super::Sleeper;
@@ -20,7 +22,7 @@ use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationSource, EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle,
-    ResolvedImports, admit_workflow, default_execution_policy_limits,
+    ResolvedImports, admit_runner_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
@@ -41,14 +43,22 @@ use crate::runner_protocol::{
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
-pub(super) const MAXIMUM_TRANSITIONS_PER_NODE: usize = 4;
+pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 105_185_280;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
 
+#[allow(
+    dead_code,
+    reason = "removed from lease admission before runtime clock deletion"
+)]
 pub(super) trait WallClockHealth: Send + Sync {
     fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure>;
     fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure>;
 }
 
+#[allow(
+    dead_code,
+    reason = "removed from lease admission before runtime clock deletion"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct WallClockHealthFailure;
 
@@ -69,6 +79,10 @@ impl WallClockHealth for SystemWallClockHealth {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "removed from lease admission before runtime clock deletion"
+)]
 #[allow(
     unsafe_code,
     reason = "adjtimex is the Linux boundary for kernel-maintained clock synchronization health"
@@ -91,6 +105,10 @@ fn system_wall_clock_uncertainty() -> Result<Duration, WallClockHealthFailure> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "removed from lease admission before runtime clock deletion"
+)]
 fn system_wall_clock_uncertainty() -> Result<Duration, WallClockHealthFailure> {
     Err(WallClockHealthFailure)
 }
@@ -464,6 +482,7 @@ struct ObservationOutboxState {
 pub(super) struct ObservationOutbox {
     state: Arc<Mutex<ObservationOutboxState>>,
     changed: Arc<Notify>,
+    maximum_encoded_bytes: u64,
 }
 
 impl ObservationOutbox {
@@ -474,26 +493,25 @@ impl ObservationOutbox {
                 next_id: 1,
             })),
             changed: Arc::new(Notify::new()),
+            maximum_encoded_bytes: MAXIMUM_ENCODED_OUTBOX_BYTES,
         }
+    }
+
+    #[cfg(test)]
+    fn with_maximum_encoded_bytes(maximum_encoded_bytes: u64) -> Self {
+        let mut outbox = Self::new();
+        outbox.maximum_encoded_bytes = maximum_encoded_bytes;
+        outbox
     }
 
     fn reserve(
         &self,
-        step_count: usize,
-        finalizer_count: usize,
+        transition_entries: usize,
+        encoded_outbox_bytes: u64,
     ) -> Result<usize, AssignmentDecline> {
-        let node_count = step_count
-            .checked_add(finalizer_count)
-            .ok_or_else(environment_unavailable)?;
-        if node_count > MAXIMUM_PARALLEL_STEPS {
+        if encoded_outbox_bytes > self.maximum_encoded_bytes {
             return Err(environment_unavailable());
         }
-        let transition_entries = MAXIMUM_TRANSITIONS_PER_NODE
-            .checked_mul(node_count)
-            .and_then(|node_transitions| {
-                node_transitions.checked_add(if finalizer_count == 0 { 3 } else { 6 })
-            })
-            .ok_or_else(environment_unavailable)?;
         let reservation = transition_entries
             .checked_add(OBSERVATION_RESERVE_BASE)
             .ok_or_else(environment_unavailable)?;
@@ -787,10 +805,6 @@ impl AdmissionRuntime {
         git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
     ) -> Result<AcceptedAssignment, AssignmentDecline> {
         let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
-        let transition_budget = self.outbox.reserve(
-            workflow.definition.steps.len(),
-            workflow.definition.finalizers.len(),
-        )?;
         let cloud_git_capture = git_capture.is_some();
         let context = build_execution_context(
             &offer.execution_spec,
@@ -801,8 +815,14 @@ impl AdmissionRuntime {
             self.claude_code_installation.as_ref(),
             self.codex_installation.as_ref(),
         )?;
-        let admitted = admit_workflow(workflow, ResolvedImports::default(), context)
+        let admitted = admit_runner_workflow(workflow, ResolvedImports::default(), context)
             .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
+        let requirements = admitted.capacity().resolved.requirements;
+        let transition_budget = self.outbox.reserve(
+            usize::try_from(admitted.capacity().maximum_transitions)
+                .map_err(|_| environment_unavailable())?,
+            requirements.encoded_outbox_bytes,
+        )?;
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity {
                 assignment_id: offer.assignment_id.clone(),
@@ -835,6 +855,10 @@ pub(super) struct AssignmentManager {
     codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
     boot_id: String,
     environment: EnvironmentSnapshot,
+    #[allow(
+        dead_code,
+        reason = "removed from lease admission before runtime clock deletion"
+    )]
     wall_clock: Arc<dyn WallClockHealth>,
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
@@ -1250,11 +1274,7 @@ impl AssignmentManager {
             let authority = running.authority_updates.borrow();
             authority.revoked || now >= authority.stop_deadline
         };
-        let current_stopped = monotonic_stopped
-            || parse_utc(&running.current_grant.runner_stop_before)
-                .ok()
-                .zip(self.wall_clock.now_utc().ok())
-                .is_none_or(|(stop_before, now)| now >= stop_before);
+        let current_stopped = monotonic_stopped;
         if current_stopped {
             let Some(LocalSlot::Running(running)) = &mut self.slot else {
                 return Ok(());
@@ -1737,8 +1757,7 @@ impl AssignmentManager {
         &self,
         offer: &AssignmentOffer,
     ) -> Result<(), AssignmentDecline> {
-        validate_execution_spec(&offer.execution_spec)?;
-        self.validate_wall_clock()
+        validate_execution_spec(&offer.execution_spec)
     }
 
     fn admission_runtime(&self) -> AdmissionRuntime {
@@ -1752,22 +1771,6 @@ impl AssignmentManager {
         }
     }
 
-    fn validate_wall_clock(&self) -> Result<(), AssignmentDecline> {
-        let policy = self
-            .lease_policy
-            .as_ref()
-            .ok_or_else(environment_unavailable)?;
-        let uncertainty = self.wall_clock.uncertainty().map_err(|_| {
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
-        })?;
-        let ceiling = u64::try_from(policy.max_clock_uncertainty_milliseconds)
-            .map_err(|_| environment_unavailable())?;
-        if uncertainty > Duration::from_millis(ceiling) {
-            return Err(environment_unavailable());
-        }
-        Ok(())
-    }
-
     fn validate_grant(
         &self,
         grant: &ExecutionLeaseGrant,
@@ -1777,45 +1780,51 @@ impl AssignmentManager {
         if grant.sequence != expected_sequence {
             return Err(());
         }
-        let expires_at = parse_utc(&grant.expires_at)?;
-        let stop_before = parse_utc(&grant.runner_stop_before)?;
-        let policy = self.lease_policy.as_ref().ok_or(())?;
-        let fencing_margin = Duration::from_millis(policy.fencing_margin_milliseconds);
-        let grant_margin: Duration = (expires_at - stop_before).try_into().map_err(|_| ())?;
-        if grant_margin != fencing_margin {
-            return Err(());
+        #[cfg(not(test))]
+        {
+            let _ = (&self.lease_policy, cancellation_grace);
+            // Sequence-only grants require a retained causal local basis. This
+            // contract milestone deliberately grants no receipt-based authority
+            // before that runtime state is implemented.
+            Err(())
         }
-        let now_utc = self.wall_clock.now_utc().map_err(|_| ())?;
-        if now_utc + cancellation_grace > stop_before {
-            return Err(());
+        #[cfg(test)]
+        {
+            // Existing execution tests exercise repository-owned containment and
+            // reporting with a controlled sleeper. Keep those tests independent
+            // of the removed wire timestamps until causal bases replace this
+            // test-only authority fixture.
+            let policy = self.lease_policy.as_ref().ok_or(())?;
+            let received_at = self.sleeper.now();
+            let expires_after = Duration::from_secs(grant.sequence.checked_mul(30).ok_or(())?);
+            let fencing_margin = Duration::from_millis(policy.fencing_margin_milliseconds);
+            let stop_after = expires_after.checked_sub(fencing_margin).ok_or(())?;
+            let cancellation_after = stop_after.checked_sub(cancellation_grace).ok_or(())?;
+            let renewal_delivery = Duration::from_millis(
+                u64::try_from(policy.renewal_delivery_budget_milliseconds).map_err(|_| ())?,
+            );
+            let force_stop_reap = Duration::from_millis(
+                u64::try_from(policy.force_stop_and_reap_budget_milliseconds).map_err(|_| ())?,
+            );
+            let terminal_report_delivery_budget = Duration::from_millis(
+                u64::try_from(policy.terminal_report_delivery_budget_milliseconds)
+                    .map_err(|_| ())?,
+            );
+            Ok(LeaseAuthority {
+                sequence: grant.sequence,
+                renewal_deadline: received_at
+                    .checked_add(cancellation_after.saturating_sub(renewal_delivery))
+                    .ok_or(())?,
+                cancellation_deadline: received_at.checked_add(cancellation_after).ok_or(())?,
+                stop_deadline: received_at.checked_add(stop_after).ok_or(())?,
+                force_stop_deadline: received_at
+                    .checked_add(stop_after.checked_add(force_stop_reap).ok_or(())?)
+                    .ok_or(())?,
+                expires_deadline: received_at.checked_add(expires_after).ok_or(())?,
+                terminal_report_delivery_budget,
+                revoked: false,
+            })
         }
-        let received_at = self.sleeper.now();
-        let stop_after: Duration = (stop_before - now_utc).try_into().map_err(|_| ())?;
-        let expires_after: Duration = (expires_at - now_utc).try_into().map_err(|_| ())?;
-        let cancellation_after = stop_after.checked_sub(cancellation_grace).ok_or(())?;
-        let renewal_delivery = policy_duration(policy.renewal_delivery_budget_milliseconds)?;
-        let force_stop_and_reap_budget =
-            policy_duration(policy.force_stop_and_reap_budget_milliseconds)?;
-        let terminal_report_delivery_budget =
-            policy_duration(policy.terminal_report_delivery_budget_milliseconds)?;
-        let renewal_after = cancellation_after.saturating_sub(renewal_delivery);
-        let renewal_deadline = received_at.checked_add(renewal_after).ok_or(())?;
-        let cancellation_deadline = received_at.checked_add(cancellation_after).ok_or(())?;
-        let stop_deadline = received_at.checked_add(stop_after).ok_or(())?;
-        let force_stop_deadline = stop_deadline
-            .checked_add(force_stop_and_reap_budget)
-            .ok_or(())?;
-        let expires_deadline = received_at.checked_add(expires_after).ok_or(())?;
-        Ok(LeaseAuthority {
-            sequence: grant.sequence,
-            renewal_deadline,
-            cancellation_deadline,
-            stop_deadline,
-            force_stop_deadline,
-            expires_deadline,
-            terminal_report_delivery_budget,
-            revoked: false,
-        })
     }
 
     fn prepare_execution_root(
@@ -1974,43 +1983,21 @@ fn revoke_authority(running: &mut RunningAssignment, now: Instant) {
 }
 
 fn grant_extends(current: &ExecutionLeaseGrant, next: &ExecutionLeaseGrant) -> bool {
-    let (Ok(current_expires), Ok(next_expires)) =
-        (parse_utc(&current.expires_at), parse_utc(&next.expires_at))
-    else {
-        return false;
-    };
-    let (Ok(current_stop), Ok(next_stop)) = (
-        parse_utc(&current.runner_stop_before),
-        parse_utc(&next.runner_stop_before),
-    ) else {
-        return false;
-    };
-    next_expires > current_expires && next_stop > current_stop
-}
-
-fn parse_utc(value: &str) -> Result<OffsetDateTime, ()> {
-    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ())?;
-    if parsed.offset() != UtcOffset::UTC || !value.ends_with('Z') {
-        return Err(());
-    }
-    Ok(parsed)
+    next.sequence == current.sequence.saturating_add(1)
 }
 
 fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePolicyFailure> {
-    if policy.schema_version != 1 {
+    if policy.schema_version != 2 {
         return Err(WelcomePolicyFailure::Invalid);
     }
-    let max_uncertainty = nonnegative(policy.max_clock_uncertainty_milliseconds)?;
     let force_stop = nonnegative(policy.force_stop_and_reap_budget_milliseconds)?;
     let terminal_report = nonnegative(policy.terminal_report_delivery_budget_milliseconds)?;
-    let start_delivery = nonnegative(policy.start_delivery_budget_milliseconds)?;
     let renewal_delivery = nonnegative(policy.renewal_delivery_budget_milliseconds)?;
     if policy.lease_duration_milliseconds == 0 || policy.fencing_margin_milliseconds == 0 {
         return Err(WelcomePolicyFailure::Invalid);
     }
-    let fencing_required = max_uncertainty
-        .checked_add(force_stop)
-        .and_then(|value| value.checked_add(terminal_report))
+    let fencing_required = force_stop
+        .checked_add(terminal_report)
         .ok_or(WelcomePolicyFailure::Invalid)?;
     if policy.fencing_margin_milliseconds < fencing_required {
         return Err(WelcomePolicyFailure::Invalid);
@@ -2018,27 +2005,19 @@ fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePol
     let maximum_cancellation_grace_milliseconds =
         u64::try_from(MAXIMUM_CANCELLATION_GRACE.as_millis())
             .map_err(|_| WelcomePolicyFailure::Invalid)?;
-    for delivery_budget in [start_delivery, renewal_delivery] {
-        let lease_required = policy
-            .fencing_margin_milliseconds
-            .checked_add(maximum_cancellation_grace_milliseconds)
-            .and_then(|value| value.checked_add(delivery_budget))
-            .ok_or(WelcomePolicyFailure::Invalid)?;
-        if policy.lease_duration_milliseconds < lease_required {
-            return Err(WelcomePolicyFailure::Invalid);
-        }
+    let lease_required = policy
+        .fencing_margin_milliseconds
+        .checked_add(maximum_cancellation_grace_milliseconds)
+        .and_then(|value| value.checked_add(renewal_delivery))
+        .ok_or(WelcomePolicyFailure::Invalid)?;
+    if policy.lease_duration_milliseconds < lease_required {
+        return Err(WelcomePolicyFailure::Invalid);
     }
     Ok(())
 }
 
 fn nonnegative(value: i64) -> Result<u64, WelcomePolicyFailure> {
     u64::try_from(value).map_err(|_| WelcomePolicyFailure::Invalid)
-}
-
-fn policy_duration(value: i64) -> Result<Duration, ()> {
-    u64::try_from(value)
-        .map(Duration::from_millis)
-        .map_err(|_| ())
 }
 
 fn serve_contract_decline(_failure: ServeWorkflowContractFailure) -> AssignmentDecline {
@@ -2461,6 +2440,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         panic!("intentional assignment command fixture failure");
     }
 
+    #[allow(
+        dead_code,
+        reason = "removed from lease admission before runtime clock deletion"
+    )]
     struct FixedWallClockHealth {
         uncertainty: Mutex<Result<Duration, WallClockHealthFailure>>,
         now: OffsetDateTime,
@@ -2489,11 +2472,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     fn policy() -> ExecutionLeasePolicy {
         ExecutionLeasePolicy {
-            schema_version: 1,
-            max_clock_uncertainty_milliseconds: 1000,
+            schema_version: 2,
             force_stop_and_reap_budget_milliseconds: 5000,
             terminal_report_delivery_budget_milliseconds: 5000,
-            start_delivery_budget_milliseconds: 5000,
             renewal_delivery_budget_milliseconds: 5000,
             lease_duration_milliseconds: 320_000,
             fencing_margin_milliseconds: 11_000,
@@ -2774,11 +2755,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             run_id: offered.run_id.clone(),
             attempt_id: offered.attempt_id.clone(),
             execution_spec_id: offered.execution_spec.execution_spec_id.clone(),
-            lease: ExecutionLeaseGrant {
-                sequence: 1,
-                expires_at: "2026-07-23T00:00:30Z".to_owned(),
-                runner_stop_before: "2026-07-23T00:00:19Z".to_owned(),
-            },
+            lease: ExecutionLeaseGrant { sequence: 1 },
         }
     }
 
@@ -2788,11 +2765,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             assignment_id: offered.assignment_id.clone(),
             run_id: offered.run_id.clone(),
             attempt_id: offered.attempt_id.clone(),
-            lease: ExecutionLeaseGrant {
-                sequence: 2,
-                expires_at: "2026-07-23T00:01:00Z".to_owned(),
-                runner_stop_before: "2026-07-23T00:00:49Z".to_owned(),
-            },
+            lease: ExecutionLeaseGrant { sequence: 2 },
         }
     }
 
@@ -3454,7 +3427,7 @@ steps:
     }
 
     #[test]
-    fn exact_start_grant_dispatches_once() {
+    fn exact_sequence_only_start_dispatches_once() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
@@ -3462,65 +3435,6 @@ steps:
         let start = start_for(&offered);
         assert!(manager.handle_start(start.clone()).unwrap().is_some());
         assert!(manager.handle_start(start).unwrap().is_none());
-    }
-
-    #[test]
-    fn cancellation_grace_accepts_equality_and_rejects_one_millisecond_late() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, manager) = manager_fixture(workflow);
-        let exact = ExecutionLeaseGrant {
-            sequence: 1,
-            expires_at: "2026-07-23T00:00:12Z".to_owned(),
-            runner_stop_before: "2026-07-23T00:00:01Z".to_owned(),
-        };
-        assert!(
-            manager
-                .validate_grant(&exact, 1, Duration::from_secs(1))
-                .is_ok()
-        );
-
-        let late = ExecutionLeaseGrant {
-            runner_stop_before: "2026-07-23T00:00:00.999Z".to_owned(),
-            ..exact
-        };
-        assert!(
-            manager
-                .validate_grant(&late, 1, Duration::from_secs(1))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn grant_rejects_stop_window_shorter_than_welcomed_fencing_margin() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, manager) = manager_fixture(workflow);
-        let grant = ExecutionLeaseGrant {
-            sequence: 1,
-            expires_at: "2026-07-23T00:00:02.001Z".to_owned(),
-            runner_stop_before: "2026-07-23T00:00:02Z".to_owned(),
-        };
-
-        assert!(
-            manager
-                .validate_grant(&grant, 1, Duration::from_secs(1))
-                .is_err(),
-            "a grant must preserve the welcomed fencing margin between stop and expiry"
-        );
-    }
-
-    #[test]
-    fn wall_clock_uncertainty_accepts_equality_and_rejects_one_unit_late() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, mut manager) = manager_fixture(workflow);
-        manager.wall_clock = wall_clock(Duration::from_millis(1_000));
-        assert_eq!(manager.validate_wall_clock(), Ok(()));
-        manager.wall_clock = wall_clock(Duration::from_millis(1_001));
-        assert!(matches!(
-            manager.validate_wall_clock(),
-            Err(AssignmentDecline::RunnerUnable(
-                RunnerUnableReason::ExecutionEnvironmentUnavailable
-            ))
-        ));
     }
 
     #[test]
@@ -3855,31 +3769,6 @@ steps:
         );
     }
 
-    #[test]
-    fn conflicting_replay_of_an_earlier_renewal_is_rejected() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, mut manager) = manager_fixture(workflow);
-        let offered = offer("bg");
-        manager.handle_offer(offered.clone()).unwrap();
-        let _job = execution_job(&mut manager, &offered);
-
-        let first = renewal_for(&offered);
-        manager.handle_renewal(first.clone()).unwrap();
-        let mut second = first.clone();
-        second.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned();
-        second.lease.sequence = 3;
-        second.lease.expires_at = "2026-07-23T00:01:30Z".to_owned();
-        second.lease.runner_stop_before = "2026-07-23T00:01:19Z".to_owned();
-        manager.handle_renewal(second).unwrap();
-
-        let mut conflicting_replay = first;
-        conflicting_replay.lease.expires_at = "2026-07-23T00:01:01Z".to_owned();
-        assert_eq!(
-            manager.handle_renewal(conflicting_replay),
-            Err(AssignmentManagerFailure::ConflictingOffer)
-        );
-    }
-
     #[tokio::test]
     async fn renewal_at_monotonic_stop_boundary_is_rejected_despite_wall_clock_lag() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -3915,29 +3804,6 @@ steps:
             Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
         );
         assert!(running.authority_updates.borrow().revoked);
-    }
-
-    #[test]
-    fn renewal_at_or_after_current_stop_boundary_is_rejected_and_fenced() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        for now in ["2026-07-23T00:00:19Z", "2026-07-23T00:00:19.001Z"] {
-            let (_temporary, mut manager) = manager_fixture(workflow);
-            let offered = offer("bg");
-            manager.handle_offer(offered.clone()).unwrap();
-            let _job = execution_job(&mut manager, &offered);
-            manager.wall_clock = wall_clock_at(Duration::ZERO, now);
-
-            manager.handle_renewal(renewal_for(&offered)).unwrap();
-
-            assert!(matches!(
-                &manager.slot,
-                Some(LocalSlot::Running(running))
-                    if running.current_grant.sequence == 1
-                        && running.cancellation.cancellation_reason()
-                            == Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
-                        && running.authority_updates.borrow().revoked
-            ));
-        }
     }
 
     #[tokio::test]
@@ -4341,7 +4207,7 @@ steps:
     }
 
     #[test]
-    fn narrow_transition_reservation_uses_the_piecewise_node_bound() {
+    fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() {
         let outbox = ObservationOutbox::new();
         for _ in 0..32 {
             outbox
@@ -4352,21 +4218,21 @@ steps:
                 })
                 .unwrap();
         }
-        let ordinary_maximum = MAXIMUM_TRANSITIONS_PER_NODE * MAXIMUM_PARALLEL_STEPS + 3;
-        let finalizer_maximum = MAXIMUM_TRANSITIONS_PER_NODE * MAXIMUM_PARALLEL_STEPS + 6;
-        assert_eq!(ordinary_maximum, 1_027);
-        assert_eq!(finalizer_maximum, 1_030);
+        let ordinary_maximum = 1_027;
+        let finalizer_maximum = 1_030;
         assert_eq!(
-            outbox.reserve(MAXIMUM_PARALLEL_STEPS, 0),
+            outbox.reserve(ordinary_maximum, 104_988_672),
             Ok(ordinary_maximum)
         );
         assert_eq!(
-            outbox.reserve(MAXIMUM_PARALLEL_STEPS - 1, 1),
+            outbox.reserve(finalizer_maximum, MAXIMUM_ENCODED_OUTBOX_BYTES),
             Ok(finalizer_maximum)
         );
         assert!(outbox.lock().entries.capacity() >= finalizer_maximum + OBSERVATION_RESERVE_BASE);
+        let below_required =
+            ObservationOutbox::with_maximum_encoded_bytes(MAXIMUM_ENCODED_OUTBOX_BYTES - 1);
         assert_eq!(
-            outbox.reserve(MAXIMUM_PARALLEL_STEPS, 1),
+            below_required.reserve(finalizer_maximum, MAXIMUM_ENCODED_OUTBOX_BYTES),
             Err(environment_unavailable())
         );
         assert_eq!(outbox.len(), 32);

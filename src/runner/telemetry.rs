@@ -49,7 +49,7 @@ pub(crate) mod attribute {
     pub(crate) const PROTOCOL_EVENT: &str = "scherzo.protocol.event";
     pub(crate) const PROTOCOL_FRAME_KIND: &str = "scherzo.protocol.frame_kind";
     pub(crate) const PROTOCOL_FRAME_TYPE: &str = "scherzo.protocol.frame_type";
-    pub(crate) const PROTOCOL_LEASE_EXPIRES_AT: &str = "scherzo.protocol.lease_expires_at";
+    pub(crate) const PROTOCOL_LEASE_SEQUENCE: &str = "scherzo.protocol.lease_sequence";
     pub(crate) const PROTOCOL_MESSAGE_ID: &str = "scherzo.protocol.message_id";
     pub(crate) const PROTOCOL_ORDER: &str = "scherzo.protocol.order";
     pub(crate) const PROTOCOL_PAYLOAD_VERSION: &str = "scherzo.protocol.payload_version";

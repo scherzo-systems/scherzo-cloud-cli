@@ -66,7 +66,9 @@ use crate::execution::workflow::run_view_model::{
 use crate::execution::workflow::runtime::RunOutcome;
 use crate::execution::workflow::step_runtime::AgentExecution;
 use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
-use crate::execution::workflow::validated::WorkflowNodeRole;
+use crate::execution::workflow::validated::{
+    ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole,
+};
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
@@ -678,6 +680,47 @@ fn parse_parallelism(value: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("value must be between 1 and {MAXIMUM_PARALLEL_STEPS}"))
 }
 
+fn required_agent_harnesses(
+    workflow: &ResolvedWorkflow,
+) -> impl Iterator<Item = &ValidatedHarness> {
+    let node_harnesses = workflow
+        .definition
+        .source_order
+        .iter()
+        .chain(&workflow.definition.finalizer_source_order)
+        .filter_map(|step_name| {
+            let step = workflow.definition.steps.get(step_name).or_else(|| {
+                workflow
+                    .definition
+                    .finalizers
+                    .get(step_name)
+                    .map(|finalizer| &finalizer.body)
+            })?;
+            let ValidatedStep::Agent(step) = step else {
+                return None;
+            };
+            Some(&step.agent.harness)
+        });
+    let recovery_harnesses = workflow
+        .definition
+        .source_order
+        .iter()
+        .filter_map(|step_name| {
+            let handler = workflow
+                .definition
+                .recoveries
+                .get(step_name)?
+                .as_ref()?
+                .handler
+                .as_ref()?;
+            let ValidatedRecoveryHandler::Agent { harness, .. } = handler else {
+                return None;
+            };
+            Some(harness)
+        });
+    node_harnesses.chain(recovery_harnesses)
+}
+
 pub(super) fn execution_context_for_workflow(
     workflow: &ResolvedWorkflow,
     root: PathBuf,
@@ -699,49 +742,29 @@ pub(super) fn execution_context_for_workflow(
     let mut pi_validated = false;
     let mut claude_code_validated = false;
     let mut codex_validated = false;
-    for step_name in workflow
-        .definition
-        .source_order
-        .iter()
-        .chain(&workflow.definition.finalizer_source_order)
-    {
-        let Some(crate::execution::workflow::validated::ValidatedStep::Agent(step)) =
-            workflow.definition.steps.get(step_name).or_else(|| {
-                workflow
-                    .definition
-                    .finalizers
-                    .get(step_name)
-                    .map(|finalizer| &finalizer.body)
-            })
-        else {
-            continue;
-        };
-        match &step.agent.harness {
-            crate::execution::workflow::validated::ValidatedHarness::Pi(_) if !pi_validated => {
+    for harness in required_agent_harnesses(workflow) {
+        match harness {
+            ValidatedHarness::Pi(_) if !pi_validated => {
                 let installation = discover_and_validate_pi_installation()
                     .map_err(AgentHarnessInstallationFailure::Pi)?;
                 context = context.with_pi_installation(installation);
                 pi_validated = true;
             }
-            crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_)
-                if !claude_code_validated =>
-            {
+            ValidatedHarness::ClaudeCode(_) if !claude_code_validated => {
                 let installation = discover_and_validate_claude_code_installation()
                     .map_err(AgentHarnessInstallationFailure::ClaudeCode)?;
                 context = context.with_claude_code_installation(installation);
                 claude_code_validated = true;
             }
-            crate::execution::workflow::validated::ValidatedHarness::Codex(_)
-                if !codex_validated =>
-            {
+            ValidatedHarness::Codex(_) if !codex_validated => {
                 let installation = discover_and_validate_codex_installation()
                     .map_err(AgentHarnessInstallationFailure::Codex)?;
                 context = context.with_codex_installation(installation);
                 codex_validated = true;
             }
-            crate::execution::workflow::validated::ValidatedHarness::Pi(_)
-            | crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_)
-            | crate::execution::workflow::validated::ValidatedHarness::Codex(_) => {}
+            ValidatedHarness::Pi(_)
+            | ValidatedHarness::ClaudeCode(_)
+            | ValidatedHarness::Codex(_) => {}
         }
     }
     Ok(context)
@@ -1690,6 +1713,24 @@ mod tests {
             self.observations.fetch_add(1, Ordering::SeqCst);
             ready(())
         }
+    }
+
+    #[test]
+    fn local_context_discovers_a_recovery_only_agent_harness() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("source");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::write(source_root.join("recovery.md"), "Repair the target.\n").unwrap();
+        std::fs::write(
+            source_root.join("workflow.yaml"),
+            "schemaVersion: 1\nagentProfiles:\n  repair:\n    harness:\n      kind: pi\n      config: {model: openai/gpt-5, thinking: high}\nsteps:\n  check:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: agent\n        profile: repair\n        prompt: recovery.md\n    command: {argv: [\"true\"]}\n",
+        )
+        .unwrap();
+        let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+
+        let harnesses = required_agent_harnesses(&workflow).collect::<Vec<_>>();
+        assert_eq!(harnesses.len(), 1);
+        assert!(matches!(harnesses[0], ValidatedHarness::Pi(_)));
     }
 
     #[test]

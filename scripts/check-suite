@@ -33,4 +33,30 @@ TMPDIR="$tmp_alias" SCHERZO_CLOUD_VERSION=0.2.7 \
   cargo nextest run --locked --workspace --all-targets --all-features resolved_build_version
 cargo build --locked --workspace --all-features --release
 
+host_target=$(rustc -vV | awk '$1 == "host:" { print $2 }')
+case $host_target in
+  aarch64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu)
+    cargo_target_dir=${CARGO_TARGET_DIR:-$public_root/target}
+    if [[ $cargo_target_dir != /* ]]; then
+      cargo_target_dir=$public_root/$cargo_target_dir
+    fi
+    release_dist=$long_tmp_parent/release-dist
+    archive=$(
+      "$public_root/scripts/package-release-archive" \
+        --binary "$cargo_target_dir/release/scherzo-cloud" \
+        --output "$release_dist" \
+        --target "$host_target" \
+        --version 0.0.0-dev
+    )
+    "$public_root/scripts/verify-release-package-isolated" \
+      --archive "$archive" \
+      --target "$host_target" \
+      --version 0.0.0-dev
+    ;;
+  *)
+    printf 'Skipped release-package execution on unsupported host target: %s\n' \
+      "$host_target"
+    ;;
+esac
+
 printf 'Public CLI source checks passed.\n'

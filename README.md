@@ -12,8 +12,9 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup,
 renewable human sessions and revoking logout, organization profile management and
-one-page member-directory reads, local Workflow V1 definition validation and structural
-schema output, portable artifact-set validation, mixed command and agent execution,
+one-page member-directory reads, local Workflow V1 definition validation, an installed
+authoring reference and structural schema output, portable artifact-set validation,
+mixed command and agent execution,
 durable run status inspection, runner diagnostics, and an
 enrolled outbound runner transport. `runner serve` connects only to the Cloud-issued
 endpoint retained in protected state and resolves, admits, and executes one configured
@@ -49,19 +50,34 @@ working directory, then canonicalized and required to remain within that explici
 The CLI does not infer the boundary from an enclosing repository or the YAML file's
 directory.
 
-The source distribution publishes the self-contained Workflow V1 JSON Schema at
-[`schemas/workflow-v1.schema.json`](schemas/workflow-v1.schema.json). An installed
-executable emits its exact embedded copy offline:
+For concise, version-aligned authoring guidance from the installed executable, run:
 
 ```sh
-scherzo-cloud workflow schema
+scherzo-cloud workflow reference
 ```
 
-The command writes raw JSON Schema bytes to standard output without a wrapper or
-preamble and preserves the canonical asset's single terminal newline. It needs no
-workflow file, source checkout, configuration, credentials, or network access.
-Configure a JSON Schema-aware YAML editor or validation tool to use either the
-checked-out file or this command's output for Workflow V1 documents; every schema
+The command writes its version-aligned embedded Markdown unchanged to standard output.
+It includes the supported authoring loop, language semantics, safety boundaries, a
+checked example, and these stable public handoffs:
+
+- [Workflow V1 authoring guide](https://docs.scherzo.dev/agent/workflow-authoring.md)
+- [Workflow V1 language reference](https://docs.scherzo.dev/reference/workflow-v1.md)
+- [Workflow V1 raw schema](https://docs.scherzo.dev/schemas/workflow-v1.schema.json)
+
+It needs no source checkout, workflow file, configuration, credentials, or network
+access.
+
+Retrieve the self-contained Workflow V1 JSON Schema from an installed executable
+without a source checkout:
+
+```sh
+scherzo-cloud workflow schema > workflow-v1.schema.json
+```
+
+The command writes raw JSON Schema bytes without a wrapper or preamble and preserves the
+canonical asset's single terminal newline. It needs no workflow file, configuration,
+credentials, or network access. Configure a JSON Schema-aware YAML editor or validation
+tool to use the emitted file or the stable public raw-schema URL above; every schema
 reference resolves within the document. Do not add a `$schema` property to the workflow
 document.
 

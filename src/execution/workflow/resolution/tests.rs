@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
 use crate::execution::workflow::validated::{
-    ValidatedHarness, ValidatedMessageSource, ValidatedStep,
+    ValidatedHarness, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
 };
 
 const WORKFLOW_PATH: &str = "workflows/complete.yaml";
@@ -193,6 +193,100 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
         resolved.source_bytes(WORKFLOW_PATH),
         Some(WORKFLOW.as_bytes())
     );
+}
+
+#[test]
+fn recovery_resolution_pins_profiles_paths_prompt_bytes_and_explicit_absence() {
+    let bundle = FixtureBundle::new();
+    fs::write(
+        bundle.root.join("prompts/recovery.md"),
+        b"Repair the failed target.\n",
+    )
+    .unwrap();
+    let workflow = WORKFLOW
+        .replace(
+            "  agent:\n    kind: agent\n    cwd: runtime/does-not-exist\n",
+            "  agent:\n    kind: agent\n    cwd: runtime/does-not-exist\n    recovery:\n      retries: 3\n      handler:\n        kind: agent\n        profile: coding\n        prompt: ../prompts/recovery.md\n        cwd: repairs\n",
+        )
+        .replace(
+            "exports:\n",
+            "  commandRepair:\n    kind: cmd\n    recovery:\n      retries: 2\n      handler:\n        kind: cmd\n        cwd: repairs\n        command:\n          argv: [\"./repair\", \"--generated\"]\n    command:\n      argv: [\"true\"]\nexports:\n",
+        );
+    fs::write(bundle.workflow_path(), workflow).unwrap();
+
+    let first = bundle.resolve().unwrap();
+    let recovery = first.definition.recoveries["agent"].as_ref().unwrap();
+    assert_eq!(recovery.retries, 3);
+    let Some(ValidatedRecoveryHandler::Agent {
+        profile,
+        prompt,
+        cwd,
+        harness,
+    }) = &recovery.handler
+    else {
+        panic!("fixture recovery must use an agent handler");
+    };
+    assert_eq!(profile, "coding");
+    assert_eq!(prompt, "prompts/recovery.md");
+    assert_eq!(cwd.as_deref(), Some("repairs"));
+    assert_eq!(
+        harness,
+        &ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::XHigh,
+        })
+    );
+    assert!(first.source_bytes("prompts/recovery.md").is_some());
+    let command_recovery = first.definition.recoveries["commandRepair"]
+        .as_ref()
+        .unwrap();
+    assert_eq!(command_recovery.retries, 2);
+    assert_eq!(
+        command_recovery.handler,
+        Some(ValidatedRecoveryHandler::Command {
+            argv: vec!["./repair".to_owned(), "--generated".to_owned()],
+            cwd: Some("repairs".to_owned()),
+        })
+    );
+    assert!(first.capacity.is_bound_to(&first.content_digest));
+
+    fs::write(
+        bundle.root.join("prompts/recovery.md"),
+        b"Changed recovery prompt bytes.\n",
+    )
+    .unwrap();
+    let second = bundle.resolve().unwrap();
+    assert_ne!(first.content_digest, second.content_digest);
+    assert_ne!(
+        first.capacity.source_closure_digest,
+        second.capacity.source_closure_digest
+    );
+
+    let omitted = FixtureBundle::new().resolve().unwrap();
+    assert_eq!(omitted.definition.recoveries["agent"], None);
+}
+
+#[test]
+fn recovery_resolution_rejects_unknown_profiles_and_invalid_static_paths() {
+    for replacement in [
+        "        profile: missing\n        prompt: ../prompts/recovery.md",
+        "        profile: coding\n        prompt: ../../outside.md",
+    ] {
+        let bundle = FixtureBundle::new();
+        fs::write(
+            bundle.root.join("prompts/recovery.md"),
+            b"Repair the failed target.\n",
+        )
+        .unwrap();
+        let workflow = WORKFLOW.replace(
+            "    agent:\n      profile: coding\n",
+            &format!(
+                "    recovery:\n      retries: 1\n      handler:\n        kind: agent\n{replacement}\n    agent:\n      profile: coding\n"
+            ),
+        );
+        fs::write(bundle.workflow_path(), workflow).unwrap();
+        assert!(bundle.resolve().is_err());
+    }
 }
 
 #[test]

@@ -234,10 +234,8 @@ pub(crate) struct ExecutionSpecV1RunnerProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionLeasePolicy {
     pub(crate) schema_version: u64,
-    pub(crate) max_clock_uncertainty_milliseconds: i64,
     pub(crate) force_stop_and_reap_budget_milliseconds: i64,
     pub(crate) terminal_report_delivery_budget_milliseconds: i64,
-    pub(crate) start_delivery_budget_milliseconds: i64,
     pub(crate) renewal_delivery_budget_milliseconds: i64,
     pub(crate) lease_duration_milliseconds: u64,
     pub(crate) fencing_margin_milliseconds: u64,
@@ -246,8 +244,6 @@ pub(crate) struct ExecutionLeasePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionLeaseGrant {
     pub(crate) sequence: u64,
-    pub(crate) expires_at: String,
-    pub(crate) runner_stop_before: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,7 +401,6 @@ pub(crate) enum CloudFrame {
         project_id: String,
         attempt_id: String,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
-        offer_expires_at: String,
     },
     AssignmentStart {
         envelope: CloudEnvelope,
@@ -868,14 +863,12 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 pong_timeout_seconds,
                 lease_policy: ExecutionLeasePolicy {
                     schema_version,
-                    max_clock_uncertainty_milliseconds: policy.max_clock_uncertainty_milliseconds.0,
                     force_stop_and_reap_budget_milliseconds: policy
                         .force_stop_and_reap_budget_milliseconds
                         .0,
                     terminal_report_delivery_budget_milliseconds: policy
                         .terminal_report_delivery_budget_milliseconds
                         .0,
-                    start_delivery_budget_milliseconds: policy.start_delivery_budget_milliseconds.0,
                     renewal_delivery_budget_milliseconds: policy
                         .renewal_delivery_budget_milliseconds
                         .0,
@@ -926,7 +919,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         }
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
-            let offer_expires_at = validate_timestamp(&frame.payload.offer_expires_at)?;
             let execution_spec = frame.payload.execution_spec;
             let schema_version = execution_spec
                 .schema_version
@@ -979,7 +971,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     },
                     source,
                 }),
-                offer_expires_at,
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentStart(frame) => {
@@ -994,8 +985,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 execution_spec_id: frame.payload.execution_spec_id.to_string(),
                 lease: ExecutionLeaseGrant {
                     sequence: lease.lease_sequence.get(),
-                    expires_at: validate_timestamp(&lease.lease_expires_at)?,
-                    runner_stop_before: validate_timestamp(&lease.runner_stop_before)?,
                 },
             }))
         }
@@ -1010,11 +999,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
                 attempt_id: frame.payload.attempt_id.to_string(),
-                lease: ExecutionLeaseGrant {
-                    sequence,
-                    expires_at: validate_timestamp(&lease.lease_expires_at)?,
-                    runner_stop_before: validate_timestamp(&lease.runner_stop_before)?,
-                },
+                lease: ExecutionLeaseGrant { sequence },
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentRelease(frame) => {
@@ -1359,7 +1344,6 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "projectId",
             "attemptId",
             "executionSpec",
-            "offerExpiresAt",
         ],
         "assignment_start" => &[
             "effectId",
@@ -1749,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_lease_policy_version_is_not_normalized_to_v1() {
+    fn unsupported_lease_policy_version_is_not_normalized_to_schema_2() {
         let mut welcome: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/cloud-welcome.json"
@@ -1822,11 +1806,9 @@ mod tests {
             "pingIntervalSeconds": 10,
             "pongTimeoutSeconds": 19,
             "leasePolicy": {
-              "schemaVersion": 1,
-              "maxClockUncertaintyMilliseconds": 1000,
+              "schemaVersion": 2,
               "forceStopAndReapBudgetMilliseconds": 5000,
               "terminalReportDeliveryBudgetMilliseconds": 5000,
-              "startDeliveryBudgetMilliseconds": 5000,
               "renewalDeliveryBudgetMilliseconds": 5000,
               "leaseDurationMilliseconds": 320000,
               "fencingMarginMilliseconds": 11000

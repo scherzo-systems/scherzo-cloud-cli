@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Extract and exercise one native Scherzo Cloud release archive in isolation."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import os
+import re
+import stat
+import subprocess
+import tarfile
+import tempfile
+from pathlib import Path
+from typing import NoReturn, Sequence
+
+
+TARGETS = frozenset(
+    {
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    }
+)
+VERSION_RE = re.compile(
+    r"^(?:(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|0\.0\.0-dev)$"
+)
+COMMAND_TIMEOUT_SECONDS = 10
+
+
+class VerificationError(Exception):
+    """The archive is not the expected executable release package."""
+
+
+def fail(message: str) -> NoReturn:
+    raise VerificationError(message)
+
+
+def member_name(member: tarfile.TarInfo) -> str:
+    if member.isdir() and not member.name.endswith("/"):
+        return member.name + "/"
+    return member.name
+
+
+def extract_archive(archive_path: Path, destination: Path, package: str) -> Path:
+    if archive_path.is_symlink() or not archive_path.is_file():
+        fail(f"release archive is not a regular file: {archive_path}")
+    header = archive_path.read_bytes()[:10]
+    if len(header) != 10 or header[:2] != b"\x1f\x8b" or header[4:8] != b"\0\0\0\0":
+        fail("release archive does not have a canonical gzip header")
+
+    destination.mkdir()
+    expected = (
+        (f"{package}/", "directory", 0o755),
+        (f"{package}/LICENSE", "file", 0o644),
+        (f"{package}/README.md", "file", 0o644),
+        (f"{package}/scherzo-cloud", "file", 0o755),
+    )
+    try:
+        with gzip.open(archive_path, "rb") as compressed:
+            with tarfile.open(fileobj=compressed, mode="r:") as archive:
+                members = archive.getmembers()
+                actual: list[tuple[str, str, int]] = []
+                for member in members:
+                    kind = "directory" if member.isdir() else "file" if member.isfile() else "other"
+                    if (
+                        kind == "other"
+                        or member.uid != 0
+                        or member.gid != 0
+                        or member.uname != ""
+                        or member.gname != ""
+                        or member.mtime != 0
+                    ):
+                        fail("release archive contains non-canonical metadata")
+                    actual.append((member_name(member), kind, member.mode))
+                if tuple(actual) != expected:
+                    fail("release archive inventory or ordering differs")
+
+                package_root = destination / package
+                package_root.mkdir(mode=0o755)
+                for member in members[1:]:
+                    source = archive.extractfile(member)
+                    if source is None:
+                        fail(f"release archive member is unreadable: {member.name}")
+                    target = destination / member.name
+                    target.write_bytes(source.read())
+                    target.chmod(member.mode)
+    except (OSError, tarfile.TarError) as error:
+        fail(f"release archive is malformed: {error}")
+
+    return destination / package
+
+
+def help_command_inventory(help_text: str) -> set[str]:
+    sections = re.findall(r"(?ms)^Commands:\n(.*?)(?:\n\n|\Z)", help_text)
+    if len(sections) != 1:
+        fail("packaged workflow help does not contain one command inventory")
+    return set(
+        re.findall(r"(?m)^  ([a-z0-9][a-z0-9-]*)\s{2,}\S", sections[0])
+    )
+
+
+def run(binary: Path, arguments: Sequence[str], environment_root: Path) -> bytes:
+    environment = {
+        "HOME": os.fspath(environment_root / "home"),
+        "LC_ALL": "C",
+        "PATH": os.fspath(environment_root / "path"),
+        "TMPDIR": os.fspath(environment_root / "tmp"),
+        "XDG_CACHE_HOME": os.fspath(environment_root / "home" / ".cache"),
+        "XDG_CONFIG_HOME": os.fspath(environment_root / "home" / ".config"),
+        "XDG_DATA_HOME": os.fspath(environment_root / "home" / ".local" / "share"),
+    }
+    try:
+        result = subprocess.run(
+            [binary, *arguments],
+            cwd=environment_root / "work",
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail(f"packaged executable could not run {' '.join(arguments)}: {error}")
+    if result.returncode != 0:
+        fail(
+            f"packaged executable failed {' '.join(arguments)} with status {result.returncode}"
+        )
+    if result.stderr:
+        fail(f"packaged executable wrote stderr for {' '.join(arguments)}")
+    return result.stdout
+
+
+def require_empty_environment(environment_root: Path) -> None:
+    for relative in ("home", "path", "tmp", "work"):
+        directory = environment_root / relative
+        if any(directory.iterdir()):
+            fail(f"packaged authoring command changed isolated {relative} state")
+
+
+def verify(
+    archive: Path,
+    version: str,
+    target: str,
+    expected_root: Path,
+    unavailable_source_root: Path,
+) -> None:
+    if not VERSION_RE.fullmatch(version):
+        fail(f"version is not canonical MAJOR.MINOR.PATCH or 0.0.0-dev: {version}")
+    if target not in TARGETS:
+        fail(f"target is not a supported release target: {target}")
+
+    source_root = unavailable_source_root.absolute()
+    if source_root.exists() or source_root.is_symlink():
+        fail(f"allocated source root remains visible: {source_root}")
+    expected_root = expected_root.absolute()
+    if expected_root.is_symlink() or not expected_root.is_dir():
+        fail(f"expected source snapshot is not a regular directory: {expected_root}")
+    if expected_root.is_relative_to(source_root):
+        fail("expected source snapshot is inside the unavailable source root")
+    if archive.absolute().is_relative_to(source_root):
+        fail("release archive is inside the unavailable source root")
+
+    expected_files: dict[str, bytes] = {}
+    for relative in (
+        "LICENSE",
+        "README.md",
+        "docs/workflow-v1.md",
+        "schemas/workflow-v1.schema.json",
+    ):
+        path = expected_root / relative
+        if path.is_symlink() or not path.is_file():
+            fail(f"expected source asset is not a regular file: {path}")
+        expected_files[relative] = path.read_bytes()
+
+    expected_reference = expected_files["docs/workflow-v1.md"]
+    expected_schema = expected_files["schemas/workflow-v1.schema.json"]
+    package = f"scherzo-cloud-{version}-{target}"
+
+    with tempfile.TemporaryDirectory(prefix="scherzo-release-package-") as temporary:
+        temporary_root = Path(temporary)
+        package_root = extract_archive(archive, temporary_root / "extracted", package)
+        for name in ("LICENSE", "README.md"):
+            if (package_root / name).read_bytes() != expected_files[name]:
+                fail(f"packaged {name} differs from allocated source")
+
+        binary = package_root / "scherzo-cloud"
+        if not binary.is_file() or binary.is_symlink():
+            fail("packaged executable is not a regular file")
+        if stat.S_IMODE(binary.stat().st_mode) != 0o755:
+            fail("packaged executable mode differs")
+
+        environment_root = temporary_root / "environment"
+        for relative in ("home", "path", "tmp", "work"):
+            (environment_root / relative).mkdir(parents=True, exist_ok=True)
+
+        expected_version = f"scherzo-cloud {version}\n".encode("ascii")
+        if run(binary, ["--version"], environment_root) != expected_version:
+            fail("packaged executable version differs")
+
+        help_output = run(binary, ["workflow", "--help"], environment_root)
+        try:
+            help_text = help_output.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("packaged workflow help is not UTF-8")
+        commands = help_command_inventory(help_text)
+        for command in ("reference", "schema"):
+            if command not in commands:
+                fail(f"packaged workflow help does not expose {command}")
+
+        if run(binary, ["workflow", "reference"], environment_root) != expected_reference:
+            fail("packaged workflow reference differs from allocated source")
+        if run(binary, ["workflow", "schema"], environment_root) != expected_schema:
+            fail("packaged workflow schema differs from allocated source")
+        require_empty_environment(environment_root)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", required=True, type=Path)
+    parser.add_argument("--expected-root", required=True, type=Path)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--unavailable-source-root", required=True, type=Path)
+    parser.add_argument("--version", required=True)
+    arguments = parser.parse_args()
+
+    try:
+        verify(
+            arguments.archive,
+            arguments.version,
+            arguments.target,
+            arguments.expected_root,
+            arguments.unavailable_source_root,
+        )
+    except VerificationError as error:
+        raise SystemExit(f"verify-release-package: {error}") from error
+    print(f"Verified packaged Workflow V1 authoring assets: {arguments.archive}")
+
+
+if __name__ == "__main__":
+    main()

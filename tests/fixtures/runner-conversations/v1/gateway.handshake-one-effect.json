@@ -34,10 +34,8 @@
             "fencingMarginMilliseconds": 11000,
             "forceStopAndReapBudgetMilliseconds": 5000,
             "leaseDurationMilliseconds": 320000,
-            "maxClockUncertaintyMilliseconds": 1000,
             "renewalDeliveryBudgetMilliseconds": 5000,
-            "schemaVersion": 1,
-            "startDeliveryBudgetMilliseconds": 5000,
+            "schemaVersion": 2,
             "terminalReportDeliveryBudgetMilliseconds": 5000
           },
           "pingIntervalSeconds": 60,
@@ -97,7 +95,6 @@
               }
             }
           },
-          "offerExpiresAt": "2026-07-23T13:00:00Z",
           "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
           "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj"
         },

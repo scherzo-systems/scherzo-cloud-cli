@@ -42,6 +42,7 @@ pub(crate) struct ValidatedWorkflow {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
     pub(crate) steps: BTreeMap<String, ValidatedStep>,
+    pub(crate) recoveries: BTreeMap<String, Option<ValidatedStepRecovery>>,
     pub(crate) source_order: Vec<String>,
     pub(crate) presentation_order: Vec<String>,
     pub(crate) finalizers: BTreeMap<String, ValidatedFinalizer>,
@@ -56,6 +57,30 @@ pub(crate) struct ValidatedFinalizer {
     pub(crate) body: ValidatedStep,
     pub(crate) when: BTreeSet<FinalizationTrigger>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedStepRecovery {
+    pub(crate) retries: u8,
+    pub(crate) handler: Option<ValidatedRecoveryHandler>,
+}
+
+// Source and validated handlers deliberately remain separate: validation pins an agent
+// harness, while source syntax must not carry one. Sharing the type would blur that boundary.
+// jscpd:ignore-start
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ValidatedRecoveryHandler {
+    Command {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
+    Agent {
+        profile: String,
+        prompt: String,
+        cwd: Option<String>,
+        harness: ValidatedHarness,
+    },
+}
+// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidatedStep {

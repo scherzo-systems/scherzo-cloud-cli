@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::document::{
     FailurePolicy, FinalizationTrigger, HarnessDefinition, MessageSource, NodeBody, Output,
-    OutputReference, ValueReference,
+    OutputReference, RecoveryHandler, ValueReference,
 };
 use super::*;
 
@@ -169,6 +169,36 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             output: "report".to_owned(),
         }
     );
+}
+
+#[test]
+fn workflow_v1_decodes_the_three_closed_recovery_forms_only_on_ordinary_steps() {
+    let fixture = fs::read(fixture_root().join("valid/recovery-forms.yaml")).unwrap();
+    let workflow = decode(&fixture).unwrap();
+
+    let handlerless = workflow.steps["handlerless"].recovery.as_ref().unwrap();
+    assert_eq!(handlerless.retries, 1);
+    assert_eq!(handlerless.handler, None);
+    let command = workflow.steps["commandRepair"].recovery.as_ref().unwrap();
+    assert_eq!(command.retries, 2);
+    assert_eq!(
+        command.handler,
+        Some(RecoveryHandler::Command {
+            argv: vec!["./repair".to_owned(), "--generated".to_owned()],
+            cwd: Some("repair".to_owned()),
+        })
+    );
+    let agent = workflow.steps["agentRepair"].recovery.as_ref().unwrap();
+    assert_eq!(agent.retries, 10);
+    assert_eq!(
+        agent.handler,
+        Some(RecoveryHandler::Agent {
+            profile: "repair".to_owned(),
+            prompt: "prompts/recovery.md".to_owned(),
+            cwd: Some("repair".to_owned()),
+        })
+    );
+    assert!(workflow.finalizers.is_empty());
 }
 
 #[test]

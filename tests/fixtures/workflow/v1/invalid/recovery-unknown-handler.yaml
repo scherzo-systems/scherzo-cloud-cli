@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: service
+    command: {argv: ["true"]}

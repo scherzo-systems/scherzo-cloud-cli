@@ -40,6 +40,8 @@ mod runner_administration;
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
+#[path = "cli/workflow_reference.rs"]
+mod workflow_reference;
 #[path = "cli/workflow_retry.rs"]
 mod workflow_retry;
 #[path = "cli/workflow_run.rs"]

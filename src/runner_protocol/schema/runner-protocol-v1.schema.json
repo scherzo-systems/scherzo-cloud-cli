@@ -263,18 +263,12 @@
       "additionalProperties": false,
       "properties": {
         "schemaVersion": {
-          "const": 1
-        },
-        "maxClockUncertaintyMilliseconds": {
-          "$ref": "#/$defs/nonnegativeSequence"
+          "const": 2
         },
         "forceStopAndReapBudgetMilliseconds": {
           "$ref": "#/$defs/nonnegativeSequence"
         },
         "terminalReportDeliveryBudgetMilliseconds": {
-          "$ref": "#/$defs/nonnegativeSequence"
-        },
-        "startDeliveryBudgetMilliseconds": {
           "$ref": "#/$defs/nonnegativeSequence"
         },
         "renewalDeliveryBudgetMilliseconds": {
@@ -289,10 +283,8 @@
       },
       "required": [
         "schemaVersion",
-        "maxClockUncertaintyMilliseconds",
         "forceStopAndReapBudgetMilliseconds",
         "terminalReportDeliveryBudgetMilliseconds",
-        "startDeliveryBudgetMilliseconds",
         "renewalDeliveryBudgetMilliseconds",
         "leaseDurationMilliseconds",
         "fencingMarginMilliseconds"
@@ -304,18 +296,10 @@
       "properties": {
         "leaseSequence": {
           "$ref": "#/$defs/positiveSequence"
-        },
-        "leaseExpiresAt": {
-          "$ref": "#/$defs/utcTimestamp"
-        },
-        "runnerStopBefore": {
-          "$ref": "#/$defs/utcTimestamp"
         }
       },
       "required": [
-        "leaseSequence",
-        "leaseExpiresAt",
-        "runnerStopBefore"
+        "leaseSequence"
       ]
     },
     "RunnerUnableReason": {
@@ -739,9 +723,6 @@
                 },
                 "executionSpec": {
                   "$ref": "#/$defs/ExecutionSpec"
-                },
-                "offerExpiresAt": {
-                  "$ref": "#/$defs/utcTimestamp"
                 }
               },
               "required": [
@@ -750,8 +731,7 @@
                 "runId",
                 "projectId",
                 "attemptId",
-                "executionSpec",
-                "offerExpiresAt"
+                "executionSpec"
               ]
             }
           }

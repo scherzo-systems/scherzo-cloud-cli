@@ -12,6 +12,7 @@ required_files=(
   LICENSE
   .config/nextest.toml
   changes/README.md
+  docs/workflow-v1.md
   release.toml
   schemas/workflow-status-result-v1.schema.json
   schemas/workflow-v1.schema.json
@@ -43,13 +44,17 @@ required_files=(
   scripts/test-strict-devenv
   scripts/classify-release-path
   scripts/format-pi-json-v1-extension
+  scripts/package-release-archive
   scripts/reconcile-release
   scripts/release-impact
   scripts/test-change-fragments
   scripts/test-release-allocation
   scripts/test-release-impact
+  scripts/test-release-package
   scripts/test-release-path-classifier
   scripts/verify-release-allocation
+  scripts/verify-release-package
+  scripts/verify-release-package-isolated
   src/execution/workflow/pi-json-v1-extension/package.json
   src/execution/workflow/pi-json-v1-extension/package-lock.json
   src/execution/workflow/pi-json-v1-extension/tsconfig.json
@@ -128,9 +133,13 @@ while IFS= read -r -d '' script_file; do
 done < <(find "$public_root/scripts" -type f -print0)
 
 python3 - \
+  "$public_root/scripts/package-release-archive" \
   "$public_root/scripts/reconcile-release" \
   "$public_root/scripts/test-release-allocation" \
-  "$public_root/scripts/verify-release-allocation" <<'PY'
+  "$public_root/scripts/test-release-package" \
+  "$public_root/scripts/verify-release-allocation" \
+  "$public_root/scripts/verify-release-package" \
+  "$public_root/scripts/verify-release-package-isolated" <<'PY'
 from pathlib import Path
 import sys
 
@@ -147,8 +156,21 @@ PY
 "$public_root/scripts/test-release"
 python3 "$public_root/scripts/test-release-allocation"
 "$public_root/scripts/test-release-impact"
+python3 "$public_root/scripts/test-release-package"
 "$public_root/scripts/test-release-path-classifier"
 "$public_root/scripts/check-release"
+
+for readme_contract in \
+  'scherzo-cloud workflow reference' \
+  'scherzo-cloud workflow schema > workflow-v1.schema.json' \
+  'https://docs.scherzo.dev/agent/workflow-authoring.md' \
+  'https://docs.scherzo.dev/reference/workflow-v1.md' \
+  'https://docs.scherzo.dev/schemas/workflow-v1.schema.json'; do
+  if ! grep --fixed-strings --quiet -- "$readme_contract" "$public_root/README.md"; then
+    echo "The public README is missing Workflow V1 guidance: $readme_contract" >&2
+    exit 1
+  fi
+done
 
 if ! command -v actionlint >/dev/null 2>&1; then
   echo "actionlint is required to check public release automation." >&2

@@ -43,8 +43,11 @@ service.
 resolver in `src/execution/workflow/resolution.rs`. The execution component embeds the
 public `schemas/workflow-v1.schema.json` artifact for structural validation; no
 implementation-local schema copy exists. `src/cli/workflow/schema.rs` writes that same
-embedded asset unchanged to standard output. The validation adapter requires both an
-explicit source root and a selected workflow path, then renders only normalized
+embedded asset unchanged to standard output. `src/cli/workflow/reference.rs` likewise
+writes the reviewed `docs/workflow-v1.md` authoring asset unchanged. The private mirror
+workflow verifies that checked-in asset against its canonical public-documentation
+source before export, while the exported build remains self-contained. The validation
+adapter requires both an explicit source root and a selected workflow path, then renders only normalized
 provenance, digest, step-count, required-import, and closed diagnostic fields. It does
 not parse or validate workflow definitions independently.
 
