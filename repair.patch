@@ -1,0 +1,178 @@
+diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
+index e1f5a513218352012dfd2869137bbd56e690af61..67120ff174bc645a83a782b153ea251d37224726 100644
+--- a/.github/workflows/check.yml
++++ b/.github/workflows/check.yml
+@@ -24,7 +24,7 @@ jobs:
+   check:
+     name: Public source
+     runs-on: ubuntu-latest
+-    timeout-minutes: 10
++    timeout-minutes: 15
+     steps:
+       - name: Check out source
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+diff --git a/scripts/reconcile-release b/scripts/reconcile-release
+index 1faed3b15b7e834af245d088ff1b88144734f7ec..67825914009ed2e57975288d65389aebae951b6c 100755
+--- a/scripts/reconcile-release
++++ b/scripts/reconcile-release
+@@ -224,28 +224,44 @@ def refreshed_release(inspection: Inspection) -> object:
+     )
+ 
+ 
++def create_tag(inspection: Inspection) -> None:
++    verification = inspection.verification
++    inspection.github.run(
++        "api",
++        "--method",
++        "POST",
++        "-f",
++        f"ref=refs/tags/{verification.tag}",
++        "-f",
++        f"sha={verification.allocated_mirror}",
++        f"repos/{inspection.github.repository}/git/refs",
++    )
++    if tag_target(inspection.github, inspection.github.repository, verification.tag) != (
++        verification.allocated_mirror
++    ):
++        fail("GitHub did not create the stable tag at the allocated mirror")
++
++
+ def create_draft(inspection: Inspection) -> None:
+     verification = inspection.verification
++    if verification.release_state == "absent":
++        create_tag(inspection)
+     with tempfile.TemporaryDirectory(prefix="scherzo-release-notes.") as temporary:
+         notes = Path(temporary) / "rendered-notes.md"
+         notes.write_bytes(verification.notes)
+-        command = [
++        inspection.github.run(
+             "release",
+             "create",
+             verification.tag,
+             "--repo",
+             inspection.github.repository,
+-            "--target",
+-            verification.allocated_mirror,
++            "--verify-tag",
+             "--title",
+             f"Scherzo Cloud CLI {verification.tag}",
+             "--notes-file",
+             os.fspath(notes),
+             "--draft",
+-        ]
+-        if verification.release_state == "tag-only":
+-            command.append("--verify-tag")
+-        inspection.github.run(*command)
++        )
+     fetch_allocated_tag(inspection)
+     state = refreshed_release(inspection)
+     if state.state != "draft" or state.assets:
+diff --git a/scripts/test-release-allocation b/scripts/test-release-allocation
+index c06bc16365737f5aaf9d20e55e6370976e1c8bbf..4faf383e10fb5a903b73d753a241de1b5d2a1f12 100644
+--- a/scripts/test-release-allocation
++++ b/scripts/test-release-allocation
+@@ -539,6 +539,14 @@ def die404():
+ def option(name):
+     return args[args.index(name) + 1]
+ 
++def fields():
++    result = {}
++    for index, argument in enumerate(args):
++        if argument == "-f":
++            name, value = args[index + 1].split("=", 1)
++            result[name] = value
++    return result
++
+ if args[:2] == ["attestation", "verify"]:
+     raise SystemExit(0)
+ 
+@@ -553,6 +561,21 @@ if args[0] == "api":
+                     sys.stdout.buffer.write(base64.b64decode(asset["bytes"]))
+                     raise SystemExit(0)
+         die404()
++    if endpoint.endswith("/git/refs") and option("--method") == "POST":
++        values = fields()
++        ref = values.get("ref", "")
++        target = values.get("sha", "")
++        if not ref.startswith("refs/tags/") or not target:
++            raise SystemExit("malformed stable-tag creation")
++        tag = ref.removeprefix("refs/tags/")
++        if tag in state["tags"]:
++            raise SystemExit("tag already exists")
++        state["tags"][tag] = target
++        subprocess.run(["git", f"--git-dir={state['git_remote']}", "update-ref", ref, target], check=True)
++        state["writes"].append("create-tag")
++        save()
++        print(json.dumps({"ref": ref, "object": {"type": "commit", "sha": target}}))
++        raise SystemExit(0)
+     if "/git/ref/tags/" in endpoint:
+         tag = endpoint.rsplit("/", 1)[1]
+         target = state["tags"].get(tag)
+@@ -586,15 +609,11 @@ if args[:2] == ["release", "create"]:
+     tag = args[2]
+     if any(release["tag_name"] == tag for release in state["releases"]):
+         raise SystemExit("release already exists")
+-    target = option("--target")
+-    if "--verify-tag" in args:
+-        if state["tags"].get(tag) != target:
+-            raise SystemExit("tag target differs")
+-    else:
+-        if tag in state["tags"]:
+-            raise SystemExit("tag already exists")
+-        state["tags"][tag] = target
+-        subprocess.run(["git", f"--git-dir={state['git_remote']}", "update-ref", f"refs/tags/{tag}", target], check=True)
++    if "--target" in args or "--verify-tag" not in args:
++        raise SystemExit("release creation must use the existing stable tag")
++    target = state["tags"].get(tag)
++    if target is None:
++        raise SystemExit("tag does not exist")
+     release = {
+         "id": state["next_release_id"],
+         "tag_name": tag,
+@@ -1011,6 +1030,19 @@ def prove_recovery(module: ModuleType, root: Path) -> None:
+     )
+ 
+ 
++def prove_stable_manifest_order(module: ModuleType) -> None:
++    refs = {
++        "v0.2.1": "1" * 40,
++        "v0.2.10": "2" * 40,
++    }
++    expected = (
++        f"refs/tags/v0.2.10={'2' * 40}\n"
++        f"refs/tags/v0.2.1={'1' * 40}\n"
++    ).encode("ascii")
++    if module.stable_manifest(refs) != expected:
++        fail("stable-ref manifest is not C-sorted by complete rendered records")
++
++
+ def prove_workflow_contract(module: ModuleType) -> None:
+     workflow = ROOT.joinpath(".github/workflows/check.yml").read_text()
+     required = (
+@@ -1047,6 +1079,7 @@ def prove_workflow_contract(module: ModuleType) -> None:
+ 
+ def main() -> int:
+     module = load_verifier()
++    prove_stable_manifest_order(module)
+     prove_workflow_contract(module)
+     with tempfile.TemporaryDirectory(prefix="scherzo-public-release.") as temporary:
+         root = Path(temporary)
+diff --git a/scripts/verify-release-allocation b/scripts/verify-release-allocation
+index 481a21f48bd03facdbb3bad3914d2db05e998452..7a699e8fa2a28d4c47a11fb1d882184ce7689e08 100755
+--- a/scripts/verify-release-allocation
++++ b/scripts/verify-release-allocation
+@@ -808,8 +808,12 @@ def stable_refs(repository: GitRepository) -> dict[str, str]:
+ 
+ def stable_manifest(refs: Mapping[str, str]) -> bytes:
+     return b"".join(
+-        f"refs/tags/{tag}={refs[tag]}\n".encode("ascii")
+-        for tag in sorted(refs, key=os.fsencode)
++        sorted(
++            (
++                f"refs/tags/{tag}={commit}\n".encode("ascii")
++                for tag, commit in refs.items()
++            )
++        )
+     )
+ 
+ 
