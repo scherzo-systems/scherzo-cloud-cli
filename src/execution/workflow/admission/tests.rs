@@ -9,8 +9,13 @@ use super::*;
 use crate::execution::claude_code::{
     ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation,
 };
+use crate::execution::codex::{
+    CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CodexCompatibilityProfile,
+    ValidatedCodexInstallation,
+};
 use crate::execution::pi::{PiCapability, PiCompatibilityProfile, ValidatedPiInstallation};
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::execution::workflow::codex::CodexConfig;
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 
@@ -513,6 +518,56 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
     assert_eq!(
         agent.limits().adapter_protocol(),
         &ClaudeCodeStreamJsonV1ProtocolLimits::profile()
+    );
+    assert_eq!(
+        agent.limits().maximum_response_bytes().get(),
+        MAXIMUM_AGENT_RESPONSE_BYTES
+    );
+}
+
+#[test]
+fn codex_admission_preserves_the_exact_installation_configuration_and_limits() {
+    let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
+    let mut resolved = fixture.resolve();
+    let ValidatedStep::Agent(step) = resolved.definition.steps.get_mut("agent").unwrap() else {
+        panic!("the fixture must contain an agent step");
+    };
+    step.agent.harness = ValidatedHarness::Codex(CodexConfig {
+        model: "gpt-5.4".to_owned(),
+        effort: "future-native-effort".to_owned(),
+    });
+    let installation =
+        ValidatedCodexInstallation::fixture(fixture.execution_root.join("validated-codex"));
+    let admitted = admit_workflow(
+        resolved,
+        ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
+        fixture
+            .context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            )
+            .with_codex_installation(installation.clone()),
+    )
+    .unwrap();
+
+    let AdmittedHarness::Codex(agent) = admitted.agent_step("agent").unwrap() else {
+        panic!("the Codex profile must retain Codex admission");
+    };
+    assert_eq!(agent.installation(), &installation);
+    assert_eq!(
+        agent.installation().profile(),
+        CodexCompatibilityProfile::CodexAppServerV1
+    );
+    assert_eq!(
+        agent.installation().version().as_str(),
+        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION
+    );
+    assert_eq!(agent.configuration().model, "gpt-5.4");
+    assert_eq!(agent.configuration().effort, "future-native-effort");
+    assert_eq!(
+        agent.limits().adapter_protocol(),
+        &CodexAppServerV1ProtocolLimits::profile()
     );
     assert_eq!(
         agent.limits().maximum_response_bytes().get(),

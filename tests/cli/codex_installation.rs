@@ -4,7 +4,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
 use super::pi_installation::quote;
-use super::run_with_env;
+use super::{assert_human_doctor_detail_matches_json, run_with_env};
 
 const CODEX_CHECK_ID: &str = "execution.harness.codex-app-server-v1";
 const CLOSED_PROBES: &[u8] = b"--version\napp-server generate-json-schema --out ../schemas\n";
@@ -21,7 +21,7 @@ const SCHEMA_FILES: [&str; 9] = [
     "v2/TurnStartParams.json",
 ];
 
-struct CodexFixture {
+pub(super) struct CodexFixture {
     _directory: tempfile::TempDir,
     executable: PathBuf,
     path_executable: PathBuf,
@@ -30,6 +30,19 @@ struct CodexFixture {
 
 impl CodexFixture {
     fn new(version: &str, schema_compatible: bool, capability_success: bool) -> Self {
+        Self::build(version, schema_compatible, capability_success, false)
+    }
+
+    pub(super) fn with_execution(version: &str) -> Self {
+        Self::build(version, true, true, true)
+    }
+
+    fn build(
+        version: &str,
+        schema_compatible: bool,
+        capability_success: bool,
+        execution_enabled: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary Codex directory should be created");
         let executable = directory.path().join("codex-real");
         let path_executable = directory.path().join("codex");
@@ -88,6 +101,31 @@ impl CodexFixture {
         } else {
             writeln!(file, "    exit 88 ;; ").unwrap();
         }
+        if execution_enabled {
+            writeln!(file, "  *'app-server --strict-config --listen stdio://')").unwrap();
+            writeln!(file, "    for argument in \"$@\"; do").unwrap();
+            writeln!(file, "      case \"$argument\" in").unwrap();
+            writeln!(file, "        sqlite_home=\\\"*\\\")").unwrap();
+            writeln!(
+                file,
+                "          CODEX_FIXTURE_SQLITE_HOME=${{argument#sqlite_home=\\\"}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "          CODEX_FIXTURE_SQLITE_HOME=${{CODEX_FIXTURE_SQLITE_HOME%\\\"}}"
+            )
+            .unwrap();
+            writeln!(file, "          export CODEX_FIXTURE_SQLITE_HOME ;;").unwrap();
+            writeln!(file, "      esac").unwrap();
+            writeln!(file, "    done").unwrap();
+            writeln!(file, "    printf 'codex fixture diagnostic\\n' >&2").unwrap();
+            writeln!(
+                file,
+                "    exec \"$CODEX_FIXTURE_HELPER\" --exact workflow_run::codex_app_server_fixture --ignored --test-threads=1 3>&1 >/dev/null ;;"
+            )
+            .unwrap();
+        }
         writeln!(file, "  *) exit 97 ;; ").unwrap();
         writeln!(file, "esac").unwrap();
         drop(file);
@@ -101,22 +139,31 @@ impl CodexFixture {
         }
     }
 
-    fn path_directory(&self) -> &Path {
+    pub(super) fn path_directory(&self) -> &Path {
         self.path_executable.parent().unwrap()
     }
 
-    fn recorded_probes(&self) -> Vec<u8> {
+    pub(super) fn recorded_probes(&self) -> Vec<u8> {
         fs::read(&self.probe_log).unwrap_or_default()
     }
 }
 
-fn doctor_json(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+fn doctor(path: &Path, environment: &[(&str, &str)], json: bool) -> std::process::Output {
     let mut environment = Vec::from(environment);
     environment.push(("PATH", path.to_str().unwrap()));
-    run_with_env(
-        &["runner", "doctor", "--check", CODEX_CHECK_ID, "--json"],
-        &environment,
-    )
+    let mut arguments = vec!["runner", "doctor", "--check", CODEX_CHECK_ID];
+    if json {
+        arguments.push("--json");
+    }
+    run_with_env(&arguments, &environment)
+}
+
+fn doctor_json(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+    doctor(path, environment, true)
+}
+
+fn doctor_human(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+    doctor(path, environment, false)
 }
 
 fn report(output: &std::process::Output) -> serde_json::Value {
@@ -194,6 +241,28 @@ fn doctor_does_not_fall_back_after_the_first_path_candidate_fails() {
     );
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
     assert!(fallback.recorded_probes().is_empty());
+}
+
+#[test]
+fn human_doctor_reports_codex_range_and_qualification_when_missing() {
+    let missing = tempfile::tempdir().expect("missing Codex directory should be created");
+    let human = doctor_human(missing.path(), &[]);
+    let json = doctor_json(missing.path(), &[]);
+    let report = report(&json);
+
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(json.status.code(), Some(1));
+    for (label, key) in [
+        ("profile", "profile"),
+        ("supported range", "supportedRange"),
+        ("qualification version", "qualificationVersion"),
+    ] {
+        assert_human_doctor_detail_matches_json(&human, &report, label, key);
+    }
+    assert_ne!(
+        report["checks"][0]["details"]["supportedRange"],
+        report["checks"][0]["details"]["qualificationVersion"]
+    );
 }
 
 #[test]

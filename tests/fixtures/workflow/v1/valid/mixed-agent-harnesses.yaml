@@ -12,6 +12,12 @@ agentProfiles:
       config:
         model: claude-opus-4-1
         effort: xhigh
+  codexCoding:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: xhigh
 steps:
   plan:
     kind: agent
@@ -36,6 +42,18 @@ steps:
     outputs:
       response:
         kind: agent_response
+  review:
+    kind: agent
+    dependsOn: [implement]
+    agent:
+      profile: codexCoding
+      systemPrompt: prompts/review-system.md
+      message:
+        text:
+          - ref: outputs.implement.response
+    outputs:
+      response:
+        kind: agent_response
 exports:
   response:
-    ref: outputs.implement.response
+    ref: outputs.review.response

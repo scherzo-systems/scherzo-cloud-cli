@@ -2423,6 +2423,13 @@ fn harness_description(harness: &AgentPresentationHarness) -> String {
             visible_text(model),
             effort.as_str()
         ),
+        AgentPresentationHarness::Codex { model, effort } => {
+            format!(
+                "codex · {} · effort={}",
+                visible_text(model),
+                visible_text(effort)
+            )
+        }
     }
 }
 

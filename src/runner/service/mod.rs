@@ -9,6 +9,11 @@ mod conversation;
 #[cfg(test)]
 mod determinism_spike;
 mod execution;
+#[allow(
+    dead_code,
+    reason = "the suspend-aware lease boundary is proven before the lease supervisor cutover"
+)]
+mod lease_clock;
 mod source;
 #[cfg(test)]
 mod test_support;

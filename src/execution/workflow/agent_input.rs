@@ -25,6 +25,8 @@ use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
 use super::canonical_json;
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use super::codex::CodexConfig;
+use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use super::document::Output;
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
 use super::pi::PiConfig;
@@ -53,6 +55,8 @@ const STATIC_ATTACHMENT_MEDIA_TYPE: &str = "application/octet-stream";
 type PiJsonV1Invocation<Sink> = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>;
 type ClaudeCodeStreamJsonV1Invocation<Sink> =
     AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>;
+type CodexAppServerV1Invocation<Sink> =
+    AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>;
 
 pub(crate) enum ClosedAgentInvocation<Sink>
 where
@@ -60,6 +64,7 @@ where
 {
     Pi(PiJsonV1Invocation<Sink>),
     ClaudeCode(ClaudeCodeStreamJsonV1Invocation<Sink>),
+    Codex(CodexAppServerV1Invocation<Sink>),
 }
 
 impl<Sink> ClosedAgentInvocation<Sink>
@@ -70,6 +75,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.adapter().profile(),
             Self::ClaudeCode(invocation) => invocation.adapter().profile(),
+            Self::Codex(invocation) => invocation.adapter().profile(),
         }
     }
 
@@ -77,6 +83,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.identity(),
             Self::ClaudeCode(invocation) => invocation.identity(),
+            Self::Codex(invocation) => invocation.identity(),
         }
     }
 
@@ -84,6 +91,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.process(),
             Self::ClaudeCode(invocation) => invocation.process(),
+            Self::Codex(invocation) => invocation.process(),
         }
     }
 
@@ -91,6 +99,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.staging(),
             Self::ClaudeCode(invocation) => invocation.staging(),
+            Self::Codex(invocation) => invocation.staging(),
         }
     }
 
@@ -98,6 +107,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.diagnostic_session(),
             Self::ClaudeCode(invocation) => invocation.diagnostic_session(),
+            Self::Codex(invocation) => invocation.diagnostic_session(),
         }
     }
 
@@ -105,6 +115,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.prompt(),
             Self::ClaudeCode(invocation) => invocation.prompt(),
+            Self::Codex(invocation) => invocation.prompt(),
         }
     }
 
@@ -112,6 +123,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.attachments(),
             Self::ClaudeCode(invocation) => invocation.attachments(),
+            Self::Codex(invocation) => invocation.attachments(),
         }
     }
 
@@ -119,6 +131,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.value_mode(),
             Self::ClaudeCode(invocation) => invocation.value_mode(),
+            Self::Codex(invocation) => invocation.value_mode(),
         }
     }
 
@@ -126,6 +139,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.cancellation(),
             Self::ClaudeCode(invocation) => invocation.cancellation(),
+            Self::Codex(invocation) => invocation.cancellation(),
         }
     }
 
@@ -133,6 +147,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.observations(),
             Self::ClaudeCode(invocation) => invocation.observations(),
+            Self::Codex(invocation) => invocation.observations(),
         }
     }
 
@@ -140,6 +155,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.process_control(),
             Self::ClaudeCode(invocation) => invocation.process_control(),
+            Self::Codex(invocation) => invocation.process_control(),
         }
     }
 
@@ -147,6 +163,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.limits().maximum_response_bytes(),
             Self::ClaudeCode(invocation) => invocation.limits().maximum_response_bytes(),
+            Self::Codex(invocation) => invocation.limits().maximum_response_bytes(),
         }
     }
 
@@ -154,6 +171,7 @@ where
         match self {
             Self::Pi(invocation) => invocation.limits().maximum_result_bytes(),
             Self::ClaudeCode(invocation) => invocation.limits().maximum_result_bytes(),
+            Self::Codex(invocation) => invocation.limits().maximum_result_bytes(),
         }
     }
 }
@@ -743,6 +761,7 @@ where
     let harness_version = match admitted_step {
         AdmittedHarness::Pi(admission) => admission.installation().version().as_str(),
         AdmittedHarness::ClaudeCode(admission) => admission.installation().version().as_str(),
+        AdmittedHarness::Codex(admission) => admission.installation().version().as_str(),
     };
     let diagnostic_session =
         match diagnostic_sessions.allocate(&identity, admitted_step.profile(), harness_version) {
@@ -755,59 +774,96 @@ where
                 ));
             }
         };
-    let invocation = match admitted_step {
-        AdmittedHarness::Pi(admission) => ClosedAgentInvocation::Pi(AgentInvocation::new(
-            identity,
-            AdmittedAgentAdapter::new(
-                AgentCompatibilityProfile::PiJsonV1,
-                admission.installation().executable().to_owned(),
-                Arc::from(admission.installation().version().as_str()),
-                admission.configuration().clone(),
-            ),
-            AgentProcessContext::new(
+    // The macro keeps the common immutable envelope in one place while the closed enum
+    // preserves a distinct native type for each exhaustively selected profile.
+    macro_rules! materialize_invocation {
+        ($variant:ident, $profile:expr, $admission:ident) => {
+            ClosedAgentInvocation::$variant(agent_invocation(
+                identity,
+                $profile,
+                $admission.installation().executable(),
+                $admission.installation().version().as_str(),
+                $admission.configuration().clone(),
+                $admission.limits().clone(),
                 working_directory,
                 admitted.execution().environment().clone(),
-            ),
-            invocation_staging,
-            diagnostic_session,
-            plan.prompt,
-            Arc::from(staged_attachments),
-            plan.value_mode,
-            admission.limits().clone(),
-            cancellation,
-            process_guards,
-            observation_sink,
-        )),
-        AdmittedHarness::ClaudeCode(admission) => {
-            ClosedAgentInvocation::ClaudeCode(AgentInvocation::new(
-                identity,
-                AdmittedAgentAdapter::new(
-                    AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-                    admission.installation().executable().to_owned(),
-                    Arc::from(admission.installation().version().as_str()),
-                    admission.configuration().clone(),
-                ),
-                AgentProcessContext::new(
-                    working_directory,
-                    admitted.execution().environment().clone(),
-                ),
                 invocation_staging,
                 diagnostic_session,
                 plan.prompt,
-                Arc::from(staged_attachments),
+                staged_attachments,
                 plan.value_mode,
-                admission.limits().clone(),
                 cancellation,
                 process_guards,
                 observation_sink,
             ))
+        };
+    }
+    let invocation = match admitted_step {
+        AdmittedHarness::Pi(admission) => {
+            materialize_invocation!(Pi, AgentCompatibilityProfile::PiJsonV1, admission)
         }
+        AdmittedHarness::ClaudeCode(admission) => materialize_invocation!(
+            ClaudeCode,
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+            admission
+        ),
+        AdmittedHarness::Codex(admission) => materialize_invocation!(
+            Codex,
+            AgentCompatibilityProfile::CodexAppServerV1,
+            admission
+        ),
     };
     drop(lifecycle);
     Ok(MaterializedAgentInvocation {
         invocation,
         staging: view,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the closed invocation constructor keeps every admitted identity explicit"
+)]
+fn agent_invocation<NativeConfiguration, ProtocolLimits, Sink>(
+    identity: AgentInvocationIdentity,
+    profile: AgentCompatibilityProfile,
+    executable: &Path,
+    version: &str,
+    configuration: NativeConfiguration,
+    limits: super::agent::AgentInvocationLimits<ProtocolLimits>,
+    working_directory: super::execution_root::AdmittedWorkingDirectory,
+    environment: super::admission::EnvironmentSnapshot,
+    staging: AgentInvocationStaging,
+    diagnostic_session: super::agent_diagnostics::AgentDiagnosticSession,
+    prompt: AgentPrompt,
+    attachments: Vec<StagedAgentAttachment>,
+    value_mode: AgentValueMode,
+    cancellation: CancellationSource,
+    process_guards: ProcessGuardRegistry,
+    observation_sink: Sink,
+) -> AgentInvocation<NativeConfiguration, ProtocolLimits, Sink>
+where
+    Sink: AgentObservationSink,
+{
+    AgentInvocation::new(
+        identity,
+        AdmittedAgentAdapter::new(
+            profile,
+            executable.to_owned(),
+            Arc::from(version),
+            configuration,
+        ),
+        AgentProcessContext::new(working_directory, environment),
+        staging,
+        diagnostic_session,
+        prompt,
+        Arc::from(attachments),
+        value_mode,
+        limits,
+        cancellation,
+        process_guards,
+        observation_sink,
+    )
 }
 
 fn build_plan<'a>(

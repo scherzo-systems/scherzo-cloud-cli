@@ -10,6 +10,9 @@ use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
+use crate::execution::workflow::codex::CodexConfig;
+use crate::execution::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
+use crate::execution::workflow::codex_app_server_v1::adapter::CodexAppServerV1Adapter;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
 
@@ -42,20 +45,28 @@ pub(crate) async fn invoke_agent_dispatcher<Dispatcher, Sink>(
 }
 
 #[derive(Clone)]
-pub(crate) struct ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter> {
+pub(crate) struct ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter, CodexAdapter> {
     pi: PiAdapter,
     claude_code: ClaudeCodeAdapter,
+    codex: CodexAdapter,
 }
 
-impl<PiAdapter, ClaudeCodeAdapter> ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter> {
-    pub(crate) fn new(pi: PiAdapter, claude_code: ClaudeCodeAdapter) -> Self {
-        Self { pi, claude_code }
+impl<PiAdapter, ClaudeCodeAdapter, CodexAdapter>
+    ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter, CodexAdapter>
+{
+    pub(crate) fn new(pi: PiAdapter, claude_code: ClaudeCodeAdapter, codex: CodexAdapter) -> Self {
+        Self {
+            pi,
+            claude_code,
+            codex,
+        }
     }
 }
 
 pub(crate) type ProductionAgentDispatcher<Clock, Observer> = ClosedAgentDispatcher<
     PiJsonV1Adapter<Clock, Observer>,
     ClaudeCodeStreamJsonV1Adapter<Clock, Observer>,
+    CodexAppServerV1Adapter<Clock, Observer>,
 >;
 
 pub(crate) fn production_agent_dispatcher<Clock, Observer>(
@@ -75,16 +86,22 @@ where
         observer.clone(),
     )?;
     let claude_code = ClaudeCodeStreamJsonV1Adapter::new(
+        diagnostics.clone(),
+        maximum_diagnostic_stream_bytes,
+        clock.clone(),
+        observer.clone(),
+    )?;
+    let codex = CodexAppServerV1Adapter::new(
         diagnostics,
         maximum_diagnostic_stream_bytes,
         clock,
         observer,
     )?;
-    Ok(ClosedAgentDispatcher::new(pi, claude_code))
+    Ok(ClosedAgentDispatcher::new(pi, claude_code, codex))
 }
 
-impl<Sink, PiAdapter, ClaudeCodeAdapter> AgentInvocationDispatcher<Sink>
-    for ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter>
+impl<Sink, PiAdapter, ClaudeCodeAdapter, CodexAdapter> AgentInvocationDispatcher<Sink>
+    for ClosedAgentDispatcher<PiAdapter, ClaudeCodeAdapter, CodexAdapter>
 where
     Sink: AgentObservationSink,
     PiAdapter: AgentAdapter<
@@ -96,6 +113,11 @@ where
             Sink,
             NativeConfiguration = ClaudeCodeConfig,
             ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits,
+        >,
+    CodexAdapter: AgentAdapter<
+            Sink,
+            NativeConfiguration = CodexConfig,
+            ProtocolLimits = CodexAppServerV1ProtocolLimits,
         >,
 {
     async fn invoke(
@@ -110,6 +132,9 @@ where
             }
             ClosedAgentInvocation::ClaudeCode(invocation) => {
                 invoke_agent_adapter(&self.claude_code, invocation, started, terminal).await;
+            }
+            ClosedAgentInvocation::Codex(invocation) => {
+                invoke_agent_adapter(&self.codex, invocation, started, terminal).await;
             }
         }
     }

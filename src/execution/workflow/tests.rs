@@ -172,11 +172,11 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
 }
 
 #[test]
-fn workflow_v1_decodes_the_closed_claude_code_profile() {
+fn workflow_v1_decodes_all_three_closed_agent_profiles() {
     let fixture = fs::read(fixture_root().join("valid/mixed-agent-harnesses.yaml")).unwrap();
     let workflow = decode(&fixture).unwrap();
 
-    assert_eq!(workflow.agent_profiles.len(), 2);
+    assert_eq!(workflow.agent_profiles.len(), 3);
     assert_eq!(
         workflow.agent_profiles["claudeCoding"].harness,
         HarnessDefinition::ClaudeCode {
@@ -195,15 +195,26 @@ fn workflow_v1_decodes_the_closed_claude_code_profile() {
             }),
         }
     );
+    assert_eq!(
+        workflow.agent_profiles["codexCoding"].harness,
+        HarnessDefinition::Codex {
+            config: serde_json::json!({
+                "model": "gpt-5.4",
+                "effort": "xhigh",
+            }),
+        }
+    );
 }
 
 #[test]
-fn workflow_v1_remains_closed_to_every_future_codex_configuration_shape() {
+fn workflow_v1_codex_shape_is_exact() {
     for config in [
-        "model: gpt-5\n        effort: high",
-        "model: gpt-5\n        effort: future-native-effort",
-        "model: gpt-5\n        effort: high\n        modelProvider: openai",
-        "model: gpt-5\n        effort: high\n        apiKey: forbidden",
+        "effort: high",
+        "model: gpt-5.4",
+        "model: \"\"\n        effort: high",
+        "model: gpt-5.4\n        effort: \"\"",
+        "model: gpt-5.4\n        effort: high\n        modelProvider: openai",
+        "model: gpt-5.4\n        effort: high\n        apiKey: forbidden",
     ] {
         let source = format!(
             "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: codex\n      config:\n        {config}\nsteps:\n  command:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"

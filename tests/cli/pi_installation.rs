@@ -3,7 +3,10 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
-use super::{private_credential_directory, run_with_env, write_runner_config};
+use super::{
+    assert_human_doctor_detail_matches_json, private_credential_directory, run_with_env,
+    write_runner_config,
+};
 
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CAPABILITY_PROBE: &str = "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help";
@@ -141,14 +144,23 @@ pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn pi_doctor_json(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+fn pi_doctor(path: &Path, environment: &[(&str, &str)], json: bool) -> std::process::Output {
     let path = path.to_str().expect("controlled PATH should be UTF-8");
     let mut environment = Vec::from(environment);
     environment.push(("PATH", path));
-    run_with_env(
-        &["runner", "doctor", "--check", PI_CHECK_ID, "--json"],
-        &environment,
-    )
+    let mut arguments = vec!["runner", "doctor", "--check", PI_CHECK_ID];
+    if json {
+        arguments.push("--json");
+    }
+    run_with_env(&arguments, &environment)
+}
+
+fn pi_doctor_json(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+    pi_doctor(path, environment, true)
+}
+
+fn pi_doctor_human(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+    pi_doctor(path, environment, false)
 }
 
 fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
@@ -262,6 +274,79 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
             trust
         );
     }
+}
+
+#[test]
+fn human_doctor_reports_pi_policy_when_missing_and_unsupported() {
+    let missing = tempfile::tempdir().expect("missing Pi directory should be created");
+    let missing_human = pi_doctor_human(missing.path(), &[]);
+    let missing_json = pi_doctor_json(missing.path(), &[]);
+    let missing_report: serde_json::Value = serde_json::from_slice(&missing_json.stdout).unwrap();
+
+    assert_eq!(missing_human.status.code(), Some(1));
+    assert_eq!(missing_json.status.code(), Some(1));
+    for (label, key) in [
+        ("profile", "profile"),
+        ("supported range", "supportedRange"),
+    ] {
+        assert_human_doctor_detail_matches_json(&missing_human, &missing_report, label, key);
+    }
+
+    let unsupported = PiFixture::new("0.85.0", COMPLETE_HELP, true);
+    let unsupported_human = pi_doctor_human(unsupported.path_directory(), &[]);
+    let unsupported_json = pi_doctor_json(unsupported.path_directory(), &[]);
+    let unsupported_report: serde_json::Value =
+        serde_json::from_slice(&unsupported_json.stdout).unwrap();
+
+    assert_eq!(unsupported_human.status.code(), Some(1));
+    assert_eq!(unsupported_json.status.code(), Some(1));
+    for (label, key) in [
+        ("profile", "profile"),
+        ("observed version", "version"),
+        ("supported range", "supportedRange"),
+    ] {
+        assert_human_doctor_detail_matches_json(
+            &unsupported_human,
+            &unsupported_report,
+            label,
+            key,
+        );
+    }
+    assert_ne!(
+        unsupported_report["checks"][0]["details"]["version"],
+        unsupported_report["checks"][0]["details"]["supportedRange"]
+    );
+}
+
+#[test]
+fn human_doctor_reports_pi_qualification_anchor_when_missing() {
+    let missing = tempfile::tempdir().expect("missing Pi directory should be created");
+    let human = pi_doctor_human(missing.path(), &[]);
+    let json = pi_doctor_json(missing.path(), &[]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let missing = [
+        (
+            "human",
+            !human_stdout
+                .lines()
+                .any(|line| line.trim().starts_with("qualification version: ")),
+        ),
+        (
+            "json",
+            report["checks"][0]["details"]["qualificationVersion"]
+                .as_str()
+                .is_none(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(format, missing)| missing.then_some(format))
+    .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "Pi qualification anchor missing from report formats {missing:?}"
+    );
 }
 
 #[test]

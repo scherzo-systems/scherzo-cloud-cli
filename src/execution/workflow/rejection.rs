@@ -525,15 +525,21 @@ fn pi_installation_classification(failure: &PiInstallationFailure) -> (&'static 
             "missing_pi_installation",
             "Install a supported `pi` executable in the inherited PATH.",
         ),
-        PiInstallationFailure::Unexecutable => (
+        PiInstallationFailure::Unexecutable { .. } => (
             "unexecutable_pi_installation",
             "The selected `pi` executable could not complete its validation probes.",
         ),
-        PiInstallationFailure::Malformed(PiProbe::Version) => (
+        PiInstallationFailure::Malformed {
+            probe: PiProbe::Version,
+            ..
+        } => (
             "malformed_pi_version",
             "The selected `pi` executable returned a malformed version.",
         ),
-        PiInstallationFailure::Malformed(PiProbe::Capabilities) => (
+        PiInstallationFailure::Malformed {
+            probe: PiProbe::Capabilities,
+            ..
+        } => (
             "malformed_pi_capabilities",
             "The selected `pi` executable returned malformed capability help.",
         ),
@@ -541,7 +547,7 @@ fn pi_installation_classification(failure: &PiInstallationFailure) -> (&'static 
             "unsupported_pi_version",
             "The selected `pi` version is outside the supported PiJsonV1 range.",
         ),
-        PiInstallationFailure::Unsupported(PiIncompatibility::Capability(_)) => (
+        PiInstallationFailure::Unsupported(PiIncompatibility::Capability { .. }) => (
             "unsupported_pi_capability",
             "The selected `pi` executable lacks a capability required by PiJsonV1.",
         ),
@@ -556,15 +562,21 @@ fn claude_code_installation_classification(
             "missing_claude_code_installation",
             "Install a supported stable `claude` executable in the inherited PATH.",
         ),
-        ClaudeCodeInstallationFailure::Unexecutable => (
+        ClaudeCodeInstallationFailure::Unexecutable { .. } => (
             "unexecutable_claude_code_installation",
             "The selected `claude` executable could not complete its validation probes.",
         ),
-        ClaudeCodeInstallationFailure::Malformed(ClaudeCodeProbe::Version) => (
+        ClaudeCodeInstallationFailure::Malformed {
+            probe: ClaudeCodeProbe::Version,
+            ..
+        } => (
             "malformed_claude_code_version",
             "The selected `claude` executable returned a malformed version.",
         ),
-        ClaudeCodeInstallationFailure::Malformed(ClaudeCodeProbe::Capabilities) => (
+        ClaudeCodeInstallationFailure::Malformed {
+            probe: ClaudeCodeProbe::Capabilities,
+            ..
+        } => (
             "malformed_claude_code_capabilities",
             "The selected `claude` executable returned malformed capability help.",
         ),
@@ -572,7 +584,9 @@ fn claude_code_installation_classification(
             "unsupported_claude_code_version",
             "The selected `claude` version is outside the supported ClaudeCodeStreamJsonV1 range.",
         ),
-        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability(_)) => (
+        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability {
+            ..
+        }) => (
             "unsupported_claude_code_capability",
             "The selected `claude` executable lacks a capability required by ClaudeCodeStreamJsonV1.",
         ),

@@ -197,6 +197,24 @@
       },
       "required": ["kind", "config"]
     },
+    "CodexConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "type": "string", "minLength": 1 }
+      },
+      "required": ["model", "effort"]
+    },
+    "CodexHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "codex" },
+        "config": { "$ref": "#/$defs/CodexConfig" }
+      },
+      "required": ["kind", "config"]
+    },
     "AgentProfile": {
       "type": "object",
       "additionalProperties": false,
@@ -204,7 +222,8 @@
         "harness": {
           "oneOf": [
             { "$ref": "#/$defs/PiHarness" },
-            { "$ref": "#/$defs/ClaudeCodeHarness" }
+            { "$ref": "#/$defs/ClaudeCodeHarness" },
+            { "$ref": "#/$defs/CodexHarness" }
           ]
         }
       },

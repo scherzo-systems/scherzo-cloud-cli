@@ -14,6 +14,8 @@ use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use crate::execution::workflow::codex::CodexConfig;
+use crate::execution::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
 use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
@@ -54,6 +56,34 @@ struct RecordingClaudeCodeAdapter(Arc<Mutex<Vec<ClaudeCodeConfig>>>);
 impl AgentAdapter<NoopAgentObservationSink> for RecordingClaudeCodeAdapter {
     type NativeConfiguration = ClaudeCodeConfig;
     type ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits;
+
+    async fn invoke(
+        &self,
+        invocation: AgentInvocation<
+            Self::NativeConfiguration,
+            Self::ProtocolLimits,
+            NoopAgentObservationSink,
+        >,
+        started: AgentStartCallback,
+        terminal: AgentTerminalCallback,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(invocation.adapter().native_configuration().clone());
+        started.report().unwrap();
+        terminal
+            .report(AgentOutcome::Completed(CompletedAgentInvocation::NoValue))
+            .unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct RecordingCodexAdapter(Arc<Mutex<Vec<CodexConfig>>>);
+
+impl AgentAdapter<NoopAgentObservationSink> for RecordingCodexAdapter {
+    type NativeConfiguration = CodexConfig;
+    type ProtocolLimits = CodexAppServerV1ProtocolLimits;
 
     async fn invoke(
         &self,
@@ -142,7 +172,11 @@ fn invocation<Configuration, ProtocolLimits>(
 }
 
 async fn dispatch(
-    dispatcher: &ClosedAgentDispatcher<RecordingPiAdapter, RecordingClaudeCodeAdapter>,
+    dispatcher: &ClosedAgentDispatcher<
+        RecordingPiAdapter,
+        RecordingClaudeCodeAdapter,
+        RecordingCodexAdapter,
+    >,
     invocation: ClosedAgentInvocation<NoopAgentObservationSink>,
 ) {
     let value_mode = AgentValueMode::None;
@@ -161,9 +195,11 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
     let temporary = tempfile::tempdir().unwrap();
     let pi_calls = Arc::new(Mutex::new(Vec::new()));
     let claude_code_calls = Arc::new(Mutex::new(Vec::new()));
+    let codex_calls = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = ClosedAgentDispatcher::new(
         RecordingPiAdapter(Arc::clone(&pi_calls)),
         RecordingClaudeCodeAdapter(Arc::clone(&claude_code_calls)),
+        RecordingCodexAdapter(Arc::clone(&codex_calls)),
     );
     let pi_config = PiConfig {
         model: "openai/gpt-5".to_owned(),
@@ -172,6 +208,10 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
     let claude_code_config = ClaudeCodeConfig {
         model: "claude-opus-4-1".to_owned(),
         effort: ClaudeCodeEffort::High,
+    };
+    let codex_config = CodexConfig {
+        model: "gpt-5.4".to_owned(),
+        effort: "xhigh".to_owned(),
     };
 
     dispatch(
@@ -198,7 +238,20 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
         )),
     )
     .await;
+    dispatch(
+        &dispatcher,
+        ClosedAgentInvocation::Codex(invocation(
+            &temporary,
+            AgentCompatibilityProfile::CodexAppServerV1,
+            "/validated/codex",
+            "0.147.23",
+            codex_config.clone(),
+            CodexAppServerV1ProtocolLimits::profile(),
+        )),
+    )
+    .await;
 
     assert_eq!(*pi_calls.lock().unwrap(), [pi_config]);
     assert_eq!(*claude_code_calls.lock().unwrap(), [claude_code_config]);
+    assert_eq!(*codex_calls.lock().unwrap(), [codex_config]);
 }

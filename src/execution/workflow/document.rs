@@ -135,4 +135,5 @@ pub(crate) enum MessageSource {
 pub(crate) enum HarnessDefinition {
     Pi { config: Value },
     ClaudeCode { config: Value },
+    Codex { config: Value },
 }

@@ -146,6 +146,138 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     command.output().expect("scherzo-cloud should run")
 }
 
+fn assert_human_doctor_detail_matches_json(
+    human: &Output,
+    json: &serde_json::Value,
+    human_label: &str,
+    json_key: &str,
+) {
+    let expected = json["checks"][0]["details"][json_key]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON doctor report should contain {json_key}"));
+    let expected_line = format!("{human_label}: {expected}");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.lines().any(|line| line.trim() == expected_line),
+        "human doctor report should contain {expected_line:?}: {stdout}"
+    );
+}
+
+#[test]
+fn human_doctor_retains_observed_versions_after_capability_failures() {
+    let pi_help = pi_installation::COMPLETE_HELP
+        .replace("  --approve, -a Trust project files for this run\n", "");
+    let pi = pi_installation::PiFixture::new("0.84.7", &pi_help, true);
+    let claude_help =
+        claude_code_installation::COMPLETE_HELP.replace("  --session-id <uuid> Use session\n", "");
+    let claude = claude_code_installation::ClaudeCodeFixture::new(
+        "2.1.235 (Claude Code)",
+        &claude_help,
+        true,
+    );
+    let path = std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "doctor",
+            "--check",
+            "execution.harness.pi-json-v1",
+            "--check",
+            "execution.harness.claude-code-stream-json-v1",
+        ],
+        &[("PATH", path.to_str().unwrap())],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("code: unsupported_pi_capability"));
+    assert!(stdout.contains("code: unsupported_claude_code_capability"));
+    let missing = ["observed version: 0.84.7", "observed version: 2.1.235"]
+        .into_iter()
+        .filter(|field| !stdout.lines().any(|line| line.trim() == *field))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "capability-failure report omitted observed versions {missing:?}: {stdout}"
+    );
+}
+
+#[test]
+fn human_doctor_retains_observed_versions_after_late_probe_failures() {
+    let malformed_pi = pi_installation::PiFixture::new("0.84.7", "not Pi help\n", true);
+    let malformed_claude = claude_code_installation::ClaudeCodeFixture::new(
+        "2.1.235 (Claude Code)",
+        "not Claude help\n",
+        true,
+    );
+    let malformed_path = std::env::join_paths([
+        malformed_pi.path_directory(),
+        malformed_claude.path_directory(),
+    ])
+    .unwrap();
+    let failed_pi = pi_installation::PiFixture::with_execution_and_capability_hook(
+        "0.84.7",
+        pi_installation::COMPLETE_HELP,
+        true,
+        "exit 97",
+        "exit 88",
+    );
+    let failed_claude =
+        claude_code_installation::ClaudeCodeFixture::with_execution_and_capability_hook(
+            "2.1.235 (Claude Code)",
+            claude_code_installation::COMPLETE_HELP,
+            true,
+            "exit 97",
+            "exit 88",
+        );
+    let failed_path =
+        std::env::join_paths([failed_pi.path_directory(), failed_claude.path_directory()]).unwrap();
+
+    let mut missing = Vec::new();
+    for (path, pi_code, claude_code) in [
+        (
+            &malformed_path,
+            "malformed_pi_capabilities",
+            "malformed_claude_code_capabilities",
+        ),
+        (
+            &failed_path,
+            "unexecutable_pi_installation",
+            "unexecutable_claude_code_installation",
+        ),
+    ] {
+        let output = run_with_env(
+            &[
+                "runner",
+                "doctor",
+                "--check",
+                "execution.harness.pi-json-v1",
+                "--check",
+                "execution.harness.claude-code-stream-json-v1",
+            ],
+            &[("PATH", path.to_str().unwrap())],
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!("code: {pi_code}")));
+        assert!(stdout.contains(&format!("code: {claude_code}")));
+        for version in ["0.84.7", "2.1.235"] {
+            if !stdout
+                .lines()
+                .any(|line| line.trim() == format!("observed version: {version}"))
+            {
+                missing.push(format!("{pi_code}/{claude_code}: {version}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "late probe failures omitted observed versions: {missing:?}"
+    );
+}
+
 fn fake_git(body: &str) -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary Git directory should be created");
     let git_path = directory.path().join("git");

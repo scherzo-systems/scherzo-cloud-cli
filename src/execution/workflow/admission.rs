@@ -15,6 +15,8 @@ use super::artifact::CaptureCancellation;
 use super::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE};
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use super::codex::CodexConfig;
+use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{
     CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure,
@@ -28,6 +30,7 @@ use super::validated::{ValidatedHarness, ValidatedStep};
 use crate::execution::claude_code::{
     ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation,
 };
+use crate::execution::codex::{CodexCompatibilityProfile, ValidatedCodexInstallation};
 use crate::execution::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
 
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
@@ -758,6 +761,7 @@ pub(crate) struct ExecutionContext {
     cancellation: CancellationPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<ValidatedCodexInstallation>,
     git_capture: GitCaptureAdmission,
 }
 
@@ -777,6 +781,7 @@ impl ExecutionContext {
             cancellation,
             pi_installation: None,
             claude_code_installation: None,
+            codex_installation: None,
             git_capture: GitCaptureAdmission::None,
         }
     }
@@ -801,6 +806,14 @@ impl ExecutionContext {
         installation: ValidatedClaudeCodeInstallation,
     ) -> Self {
         self.claude_code_installation = Some(installation);
+        self
+    }
+
+    pub(crate) fn with_codex_installation(
+        mut self,
+        installation: ValidatedCodexInstallation,
+    ) -> Self {
+        self.codex_installation = Some(installation);
         self
     }
 }
@@ -959,9 +972,31 @@ impl ClaudeCodeStreamJsonV1Admission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodexAppServerV1Admission {
+    installation: Arc<ValidatedCodexInstallation>,
+    configuration: CodexConfig,
+    limits: AgentInvocationLimits<CodexAppServerV1ProtocolLimits>,
+}
+
+impl CodexAppServerV1Admission {
+    pub(crate) fn installation(&self) -> &ValidatedCodexInstallation {
+        &self.installation
+    }
+
+    pub(crate) fn configuration(&self) -> &CodexConfig {
+        &self.configuration
+    }
+
+    pub(crate) fn limits(&self) -> &AgentInvocationLimits<CodexAppServerV1ProtocolLimits> {
+        &self.limits
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmittedHarness {
     Pi(PiJsonV1Admission),
     ClaudeCode(ClaudeCodeStreamJsonV1Admission),
+    Codex(CodexAppServerV1Admission),
 }
 
 impl AdmittedHarness {
@@ -969,6 +1004,7 @@ impl AdmittedHarness {
         match self {
             Self::Pi(_) => AgentCompatibilityProfile::PiJsonV1,
             Self::ClaudeCode(_) => AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+            Self::Codex(_) => AgentCompatibilityProfile::CodexAppServerV1,
         }
     }
 
@@ -976,6 +1012,7 @@ impl AdmittedHarness {
         match self {
             Self::Pi(admission) => admission.limits().maximum_attachments(),
             Self::ClaudeCode(admission) => admission.limits().maximum_attachments(),
+            Self::Codex(admission) => admission.limits().maximum_attachments(),
         }
     }
 
@@ -983,6 +1020,7 @@ impl AdmittedHarness {
         match self {
             Self::Pi(admission) => admission.limits().maximum_attachment_bytes(),
             Self::ClaudeCode(admission) => admission.limits().maximum_attachment_bytes(),
+            Self::Codex(admission) => admission.limits().maximum_attachment_bytes(),
         }
     }
 }
@@ -1162,6 +1200,7 @@ pub(crate) fn admit_workflow(
         &workflow,
         context.pi_installation.as_ref(),
         context.claude_code_installation.as_ref(),
+        context.codex_installation.as_ref(),
     )?;
 
     let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
@@ -1368,10 +1407,12 @@ fn admit_agent_steps(
     workflow: &ResolvedWorkflow,
     pi_installation: Option<&ValidatedPiInstallation>,
     claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<&ValidatedCodexInstallation>,
 ) -> Result<BTreeMap<String, AdmittedHarness>, AdmissionFailure> {
     let pi_installation = pi_installation.map(|installation| Arc::new(installation.clone()));
     let claude_code_installation =
         claude_code_installation.map(|installation| Arc::new(installation.clone()));
+    let codex_installation = codex_installation.map(|installation| Arc::new(installation.clone()));
     workflow
         .definition
         .steps
@@ -1421,6 +1462,17 @@ fn admit_agent_steps(
                         limits: claude_code_stream_json_v1_limits(),
                     })
                 }
+                ValidatedHarness::Codex(configuration) => {
+                    let installation = codex_installation
+                        .as_ref()
+                        .ok_or_else(missing_installation)?;
+                    let CodexCompatibilityProfile::CodexAppServerV1 = installation.profile();
+                    AdmittedHarness::Codex(CodexAppServerV1Admission {
+                        installation: Arc::clone(installation),
+                        configuration: configuration.clone(),
+                        limits: codex_app_server_v1_limits(),
+                    })
+                }
             };
             Ok((step_name.clone(), admitted))
         })
@@ -1434,6 +1486,10 @@ fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
 fn claude_code_stream_json_v1_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits>
 {
     agent_invocation_limits(ClaudeCodeStreamJsonV1ProtocolLimits::profile())
+}
+
+fn codex_app_server_v1_limits() -> AgentInvocationLimits<CodexAppServerV1ProtocolLimits> {
+    agent_invocation_limits(CodexAppServerV1ProtocolLimits::profile())
 }
 
 fn agent_invocation_limits<ProtocolLimits>(

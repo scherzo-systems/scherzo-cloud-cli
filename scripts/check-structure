@@ -69,6 +69,35 @@ for required_file in "${required_files[@]}"; do
   fi
 done
 
+if ! locked_devenv_revision=$(
+  jq --exit-status --raw-output '
+    .nodes.devenv.locked.rev
+    | strings
+    | select(test("^[0-9a-f]{40}$"))
+  ' "$public_root/devenv.lock"
+); then
+  echo "devenv.lock must contain a canonical Devenv revision." >&2
+  exit 1
+fi
+
+mapfile -t workflow_devenv_installs < <(
+  grep --fixed-strings \
+    'nix profile add github:cachix/devenv/' \
+    "$public_root/.github/workflows/check.yml" \
+    || true
+)
+if [[ ${#workflow_devenv_installs[@]} -ne 1 ]]; then
+  echo "The public check workflow must contain exactly one direct Devenv installation." >&2
+  exit 1
+fi
+workflow_devenv_install=${workflow_devenv_installs[0]}
+workflow_devenv_install=${workflow_devenv_install#"${workflow_devenv_install%%[![:space:]]*}"}
+if [[ $workflow_devenv_install != \
+  "run: nix profile add github:cachix/devenv/$locked_devenv_revision" ]]; then
+  echo "The public check workflow must install the Devenv revision pinned in devenv.lock." >&2
+  exit 1
+fi
+
 obsolete_workflow_schema=src/execution/workflow/workflow-v1.schema.json
 if [[ -e "$public_root/$obsolete_workflow_schema" ]]; then
   echo "Obsolete internal Workflow V1 schema is present: $obsolete_workflow_schema" >&2

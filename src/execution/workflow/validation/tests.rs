@@ -412,6 +412,40 @@ steps:
 }
 
 #[test]
+fn codex_profiles_resolve_exact_nonempty_native_strings_without_lookup() {
+    let source = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: codex
+      config:
+        model: future-codex-model
+        effort: future-native-effort
+steps:
+  agent:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+";
+
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
+        panic!("agent must be an agent step");
+    };
+    assert_eq!(
+        agent.agent.harness,
+        ValidatedHarness::Codex(crate::execution::workflow::codex::CodexConfig {
+            model: "future-codex-model".to_owned(),
+            effort: "future-native-effort".to_owned(),
+        })
+    );
+}
+
+#[test]
 fn output_bindings_require_declared_non_self_outputs() {
     let missing_step = "schemaVersion: 1
 steps:

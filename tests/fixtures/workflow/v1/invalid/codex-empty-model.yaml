@@ -1,0 +1,13 @@
+schemaVersion: 1
+agentProfiles:
+  invalid:
+    harness:
+      kind: codex
+      config:
+        model: ""
+        effort: high
+steps:
+  noop:
+    kind: cmd
+    command:
+      argv: ["true"]

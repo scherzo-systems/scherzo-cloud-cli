@@ -4,7 +4,10 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use super::pi_installation::{COMPLETE_HELP as PI_COMPLETE_HELP, PiFixture, quote};
-use super::{private_credential_directory, run_with_env, write_runner_config};
+use super::{
+    assert_human_doctor_detail_matches_json, private_credential_directory, run_with_env,
+    write_runner_config,
+};
 
 const CLAUDE_CODE_CHECK_ID: &str = "execution.harness.claude-code-stream-json-v1";
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
@@ -87,16 +90,35 @@ impl ClaudeCodeFixture {
     }
 }
 
-fn doctor_json(path: &Path, checks: &[&str], environment: &[(&str, &str)]) -> std::process::Output {
+fn doctor(
+    path: &Path,
+    checks: &[&str],
+    environment: &[(&str, &str)],
+    json: bool,
+) -> std::process::Output {
     let path = path.to_str().expect("controlled PATH should be UTF-8");
     let mut args = vec!["runner", "doctor"];
     for check in checks {
         args.extend(["--check", check]);
     }
-    args.push("--json");
+    if json {
+        args.push("--json");
+    }
     let mut environment = Vec::from(environment);
     environment.push(("PATH", path));
     run_with_env(&args, &environment)
+}
+
+fn doctor_json(path: &Path, checks: &[&str], environment: &[(&str, &str)]) -> std::process::Output {
+    doctor(path, checks, environment, true)
+}
+
+fn doctor_human(
+    path: &Path,
+    checks: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
+    doctor(path, checks, environment, false)
 }
 
 fn report(output: &std::process::Output) -> serde_json::Value {
@@ -188,6 +210,24 @@ fn doctor_reports_the_compatible_claude_code_snapshot_without_ambient_values() {
         br#"{"native":"settings-sentinel"}"#
     );
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
+}
+
+#[test]
+fn human_doctor_reports_claude_code_policy_when_missing() {
+    let missing = tempfile::tempdir().expect("missing Claude Code directory should be created");
+    let human = doctor_human(missing.path(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    let json = doctor_json(missing.path(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    let report = report(&json);
+
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(json.status.code(), Some(1));
+    for (label, key) in [
+        ("profile", "profile"),
+        ("supported range", "supportedRange"),
+        ("qualification version", "qualificationVersion"),
+    ] {
+        assert_human_doctor_detail_matches_json(&human, &report, label, key);
+    }
 }
 
 #[test]

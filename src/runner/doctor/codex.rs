@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
 use crate::execution::codex::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CODEX_APP_SERVER_V1_SUPPORTED_RANGE,
-    CodexIncompatibility, CodexInstallationFailure, CodexProbe,
+    CodexCompatibilityProfile, CodexIncompatibility, CodexInstallationFailure, CodexProbe,
     discover_and_validate_codex_installation,
 };
 
@@ -102,6 +102,12 @@ fn failure_outcome(failure: CodexInstallationFailure) -> Outcome {
 
 fn compatibility_details() -> BTreeMap<String, String> {
     BTreeMap::from([
+        (
+            "profile".to_owned(),
+            CodexCompatibilityProfile::CodexAppServerV1
+                .as_str()
+                .to_owned(),
+        ),
         (
             "qualificationVersion".to_owned(),
             CODEX_APP_SERVER_V1_QUALIFICATION_VERSION.to_owned(),

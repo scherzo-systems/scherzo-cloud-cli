@@ -152,7 +152,10 @@ fn version_range_and_capabilities_are_both_required() {
         };
         assert_eq!(
             validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner,),
-            Err(PiInstallationFailure::Malformed(PiProbe::Version))
+            Err(PiInstallationFailure::Malformed {
+                probe: PiProbe::Version,
+                version: None,
+            })
         );
     }
 
@@ -172,7 +175,10 @@ fn version_range_and_capabilities_are_both_required() {
             &missing_session_directory,
         ),
         Err(PiInstallationFailure::Unsupported(
-            PiIncompatibility::Capability(PiCapability::CustomSessionDirectory)
+            PiIncompatibility::Capability {
+                capability: PiCapability::CustomSessionDirectory,
+                version: "0.84.2".to_owned(),
+            }
         ))
     );
 
@@ -188,7 +194,10 @@ fn version_range_and_capabilities_are_both_required() {
     assert_eq!(
         validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &missing_trust,),
         Err(PiInstallationFailure::Unsupported(
-            PiIncompatibility::Capability(PiCapability::InvocationScopedProjectTrust)
+            PiIncompatibility::Capability {
+                capability: PiCapability::InvocationScopedProjectTrust,
+                version: "0.84.2".to_owned(),
+            }
         ))
     );
 }

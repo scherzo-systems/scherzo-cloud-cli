@@ -14,6 +14,8 @@ use super::{
 };
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use crate::execution::workflow::codex::CodexConfig;
+use crate::execution::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use crate::execution::workflow::pi::PiConfig;
 use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 
@@ -85,6 +87,7 @@ impl<Configuration, ProtocolLimits> Clone for ScriptedNativeAdapter<Configuratio
 pub(crate) type ScriptedAgentDispatcher = ClosedAgentDispatcher<
     ScriptedNativeAdapter<PiConfig, PiJsonV1ProtocolLimits>,
     ScriptedNativeAdapter<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits>,
+    ScriptedNativeAdapter<CodexConfig, CodexAppServerV1ProtocolLimits>,
 >;
 
 pub(crate) struct ScriptedAgentControl {
@@ -169,11 +172,15 @@ pub(crate) fn scripted_agent_dispatcher() -> (ScriptedAgentDispatcher, ScriptedA
     };
     let claude_code =
         ScriptedNativeAdapter::<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits> {
-            started: started_sender,
+            started: started_sender.clone(),
             native_types: PhantomData,
         };
+    let codex = ScriptedNativeAdapter::<CodexConfig, CodexAppServerV1ProtocolLimits> {
+        started: started_sender,
+        native_types: PhantomData,
+    };
     (
-        ClosedAgentDispatcher::new(pi, claude_code),
+        ClosedAgentDispatcher::new(pi, claude_code, codex),
         ScriptedAgentControl {
             current: None,
             started,

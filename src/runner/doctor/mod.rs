@@ -61,6 +61,16 @@ impl Outcome {
     }
 }
 
+fn capability_failure_details(
+    mut details: std::collections::BTreeMap<String, String>,
+    capability: &str,
+    version: String,
+) -> std::collections::BTreeMap<String, String> {
+    details.insert("capability".to_owned(), capability.to_owned());
+    details.insert("version".to_owned(), version);
+    details
+}
+
 fn compatible_harness_outcome(
     harness: &str,
     version: &str,

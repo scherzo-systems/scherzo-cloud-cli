@@ -144,14 +144,22 @@ impl PiProbe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PiIncompatibility {
     Version(String),
-    Capability(PiCapability),
+    Capability {
+        capability: PiCapability,
+        version: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PiInstallationFailure {
     Missing,
-    Unexecutable,
-    Malformed(PiProbe),
+    Unexecutable {
+        version: Option<String>,
+    },
+    Malformed {
+        probe: PiProbe,
+        version: Option<String>,
+    },
     Unsupported(PiIncompatibility),
 }
 
@@ -162,19 +170,25 @@ impl fmt::Display for PiInstallationFailure {
                 formatter,
                 "Pi was not found in inherited PATH; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
             ),
-            Self::Unexecutable => formatter.write_str(
+            Self::Unexecutable { .. } => formatter.write_str(
                 "Pi selected from inherited PATH could not complete its validation probes",
             ),
-            Self::Malformed(PiProbe::Version) => {
+            Self::Malformed {
+                probe: PiProbe::Version,
+                ..
+            } => {
                 formatter.write_str("Pi selected from inherited PATH returned a malformed version")
             }
-            Self::Malformed(PiProbe::Capabilities) => formatter
+            Self::Malformed {
+                probe: PiProbe::Capabilities,
+                ..
+            } => formatter
                 .write_str("Pi selected from inherited PATH returned malformed capability help"),
             Self::Unsupported(PiIncompatibility::Version(version)) => write!(
                 formatter,
                 "Pi version {version} selected from inherited PATH is unsupported; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
             ),
-            Self::Unsupported(PiIncompatibility::Capability(capability)) => write!(
+            Self::Unsupported(PiIncompatibility::Capability { capability, .. }) => write!(
                 formatter,
                 "Pi selected from inherited PATH lacks the required {} capability",
                 capability.as_str()
@@ -224,13 +238,23 @@ impl HarnessInstallationProfile for PiInstallationProfile {
         output: &CommandOutput,
         _isolation: &ProbeIsolation,
         _executable: &Path,
-        _version: &Self::Version,
+        version: &Self::Version,
         _profile: &Self::CompatibilityProfile,
     ) -> Result<Self::Capabilities, Self::Failure> {
-        validate_capability_output(output)?;
+        validate_capability_output(output, version)?;
         Ok(PiJsonV1Capabilities {
             required: REQUIRED_CAPABILITIES,
         })
+    }
+
+    fn capability_probe_failure(
+        _executable: &Path,
+        version: &Self::Version,
+        _profile: &Self::CompatibilityProfile,
+    ) -> Self::Failure {
+        PiInstallationFailure::Unexecutable {
+            version: Some(version.as_str().to_owned()),
+        }
     }
 
     fn installation(
@@ -252,12 +276,12 @@ impl HarnessInstallationProfile for PiInstallationProfile {
     fn executable_failure(failure: ExecutableValidationFailure) -> Self::Failure {
         match failure {
             ExecutableValidationFailure::Missing => PiInstallationFailure::Missing,
-            ExecutableValidationFailure::Unexecutable => PiInstallationFailure::Unexecutable,
+            ExecutableValidationFailure::Unexecutable => Self::unexecutable_failure(),
         }
     }
 
     fn unexecutable_failure() -> Self::Failure {
-        PiInstallationFailure::Unexecutable
+        PiInstallationFailure::Unexecutable { version: None }
     }
 }
 
@@ -284,9 +308,12 @@ fn validate_pi_installation_with(
 }
 
 fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallationFailure> {
-    let version =
-        parse_probe_line(output).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))?;
-    PiVersion::parse(version).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))
+    let malformed = || PiInstallationFailure::Malformed {
+        probe: PiProbe::Version,
+        version: None,
+    };
+    let version = parse_probe_line(output).ok_or_else(malformed)?;
+    PiVersion::parse(version).ok_or_else(malformed)
 }
 
 fn compatibility_profile(version: &PiVersion) -> Option<PiCompatibilityProfile> {
@@ -299,22 +326,31 @@ pub(crate) fn compatibility_profile_for_version(observed: &str) -> Option<PiComp
     compatibility_profile(&PiVersion::parse(observed)?)
 }
 
-fn validate_capability_output(output: &CommandOutput) -> Result<(), PiInstallationFailure> {
-    let help =
-        parse_probe_text(output).ok_or(PiInstallationFailure::Malformed(PiProbe::Capabilities))?;
+fn validate_capability_output(
+    output: &CommandOutput,
+    version: &PiVersion,
+) -> Result<(), PiInstallationFailure> {
+    let malformed = || PiInstallationFailure::Malformed {
+        probe: PiProbe::Capabilities,
+        version: Some(version.as_str().to_owned()),
+    };
+    let help = parse_probe_text(output).ok_or_else(malformed)?;
     if !help.starts_with("pi ")
         || !help
             .lines()
             .any(|line| line.trim() == "pi [options] [@files...] [messages...]")
     {
-        return Err(PiInstallationFailure::Malformed(PiProbe::Capabilities));
+        return Err(malformed());
     }
     if let Some(capability) = REQUIRED_CAPABILITIES
         .into_iter()
         .find(|capability| !capability.is_advertised_by(help))
     {
         return Err(PiInstallationFailure::Unsupported(
-            PiIncompatibility::Capability(capability),
+            PiIncompatibility::Capability {
+                capability,
+                version: version.as_str().to_owned(),
+            },
         ));
     }
     Ok(())

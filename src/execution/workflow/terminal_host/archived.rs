@@ -737,6 +737,10 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
                 | AgentPresentationHarness::ClaudeCode { model, .. } => {
                     *model = safe_text(model);
                 }
+                AgentPresentationHarness::Codex { model, effort } => {
+                    *model = safe_text(model);
+                    *effort = safe_text(effort);
+                }
             }
             for dependency in direct_dependencies {
                 *dependency = safe_text(dependency);

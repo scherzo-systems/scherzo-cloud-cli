@@ -97,9 +97,9 @@ return 2 and do not inspect the artifact directory.
 
 ## Local workflow execution
 
-Use `scherzo-cloud workflow run` to execute a mixed command, PiJsonV1 agent, and
-ClaudeCodeStreamJsonV1 agent Workflow V1 DAG in an existing caller-owned directory and
-create one durable local run
+Use `scherzo-cloud workflow run` to execute a mixed command, PiJsonV1,
+ClaudeCodeStreamJsonV1, and CodexAppServerV1 agent Workflow V1 DAG in an existing
+caller-owned directory and create one durable local run
 directory:
 
 ```sh
@@ -116,23 +116,25 @@ normalizes it from its nearest existing parent and creates any missing parent su
 First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable state root
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and import bytes, durable closed run and attempt
-state, and attempt 1's atomic result beneath
-`attempts/000001/result`. Every PiJsonV1 and ClaudeCodeStreamJsonV1 invocation receives
-fresh native session storage beneath its profile directory under
-`attempts/<attempt>/diagnostics/`. It remains after
-normal private-staging cleanup together with metadata identifying the attempt, step,
+state, and attempt 1's atomic result beneath `attempts/000001/result`. Every PiJsonV1
+and ClaudeCodeStreamJsonV1 invocation receives fresh native session storage beneath its
+profile directory under `attempts/<attempt>/diagnostics/`. It remains after normal
+private-staging cleanup together with metadata identifying the attempt, step,
 invocation, immutable profile, exact harness version, and native format. Claude sessions
 are never resumed and are removed from ambient Claude history when the invocation
-quiesces. The run-directory path is the local run handle. Add
-`--json` for one terminal schema-version-1 object on stdout while the live presentation
-remains on stderr, or `--plain` to force the line presentation on stdout.
+quiesces. Codex instead starts one fresh ephemeral thread and uses one transient
+owner-private SQLite directory beneath invocation staging. App Server events remain
+authoritative, the transient directory is removed after settlement, and no Codex-native
+thread or file is retained. The run-directory path is the local run handle. Add `--json` for one
+terminal schema-version-1 object on stdout while the live presentation remains on
+stderr, or `--plain` to force the line presentation on stdout.
 
-Retained harness diagnostics can contain sensitive prompts, model output, tool activity,
-paths, and extension or provider state. Native sessions may be incomplete or malformed
-after a failure or forced stop and are diagnostic only: workflow status, results, retry, and
-recovery never read them as authority. They are owner-private on Unix, are not included
-in published attempt results, have no stable viewer or download interface, and disappear
-when the owning run directory is removed.
+Retained Pi and Claude Code harness diagnostics can contain sensitive prompts, model
+output, tool activity, paths, and extension or provider state. Native sessions may be
+incomplete or malformed after a failure or forced stop and are diagnostic only: workflow
+status, results, retry, and recovery never read them as authority. They are owner-private
+on Unix, are not included in published attempt results, have no stable viewer or download
+interface, and disappear when the owning run directory is removed.
 
 Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
 `--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
@@ -177,25 +179,43 @@ agentProfiles:
 rejected. Scherzo does not query a model catalog, install Claude Code, or supply a
 fallback model or harness.
 
+A Codex profile is also independent:
+
+```yaml
+agentProfiles:
+  codex:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: xhigh
+```
+
+Both Codex values are required nonempty native strings, and additional configuration is
+rejected. Scherzo does not read provider credentials during definition resolution,
+installation discovery, rejection presentation, or doctor checks.
+
 Local execution snapshots the inherited environment after resolution and removes
 `SCHERZO_` variables before launching commands or agents. Other caller-provided values are
 retained unless the closed harness profile fixes them. ClaudeCodeStreamJsonV1 removes
 `CLAUDE_CODE_PROJECT_DIR_NAME` to keep retained-session routing authoritative and applies
 its documented native controls; values such as `GH_TOKEN`, `GITHUB_TOKEN`, and Git or SSH
 credential-helper configuration remain available for local repository setup and cloning.
-The local caller owns that authority; Runner Serve applies a separate managed credential-isolation policy. The CLI
-inspects the resolved agent steps and validates each required harness once: `pi` for
-PiJsonV1 and `claude` for ClaudeCodeStreamJsonV1. Each search selects the first executable candidate in inherited
-`PATH` and pins its canonical absolute path, exact observed version, profile, and
-capabilities for the run. Claude Code must be a canonical stable release in
-`>=2.1.234 <2.2.0`, and every native initialization frame must report the pinned observed
-version exactly. Later `PATH` changes cannot switch either executable. Command-only workflows
-probe neither harness; Pi-only and Claude-only workflows do not require the unrelated
-installation. A mixed workflow requires both and never substitutes or falls back between
-them. Workflow definitions, imports, and remote values cannot supply an executable or
-alter selection. The adapter does not read Scherzo human or runner credentials and does
-not contact Scherzo Cloud; an admitted agent harness may use the provider and other host
-authority selected by its closed profile and inherited environment.
+The local caller owns that authority; Runner Serve applies a separate managed
+credential-isolation policy. The CLI inspects the resolved agent steps and validates
+each required harness once: `pi` for PiJsonV1, `claude` for
+ClaudeCodeStreamJsonV1, and `codex` for CodexAppServerV1. Each search selects the first
+executable candidate in inherited `PATH` and pins its canonical absolute path, exact
+observed version, profile, and capabilities for the run. Claude Code must be a canonical
+stable release in `>=2.1.234 <2.2.0`, and every native initialization frame must report
+the pinned observed version exactly. Later `PATH` changes cannot switch an admitted
+executable. Command-only workflows probe no harness; each single-harness workflow
+requires no unrelated installation. A mixed workflow requires exactly its selected
+harnesses and never substitutes or falls back between them. Workflow definitions,
+imports, and remote values cannot supply an executable or alter selection. The adapter
+does not read Scherzo human or runner credentials and does not contact Scherzo Cloud; an
+admitted agent harness may use the provider and other host authority selected by its
+closed profile and inherited environment.
 
 Command and agent steps may declare `kind: git_branch`. Such an output is export-only in
 Workflow V1 and cannot bind a downstream command input or agent message. Before any step
@@ -395,10 +415,10 @@ the runner. The default set contains only `environment.command.git`. It executes
 `git` resolved from the runner process's `PATH`, requires a parseable version at least
 `0.0.1`, and reports a pass or failure for that check. Select
 `execution.harness.pi-json-v1` explicitly to check the `pi` inherited through the same
-operator-controlled `PATH`, or select
-`execution.harness.claude-code-stream-json-v1` to check `claude` independently. A
-successful result does not mean the runner is ready to
-serve assignments: runner configuration, machine identity, connectivity, and other
+operator-controlled `PATH`, select `execution.harness.claude-code-stream-json-v1` to 
+check `claude`, or `execution.harness.codex-app-server-v1` to check `codex` 
+independently. A successful result does not mean the runner is ready to serve
+assignments: runner configuration, machine identity, connectivity, and other 
 execution requirements are not all checked yet.
 
 ```sh
@@ -412,9 +432,13 @@ scherzo-cloud runner doctor --check environment.command.git
 scherzo-cloud runner doctor \
   --check execution.harness.pi-json-v1
 
-# Validate Claude Code independently, or repeat --check to inspect both.
+# Validate Claude Code independently, or repeat --check to inspect multiple harnesses.
 scherzo-cloud runner doctor \
   --check execution.harness.claude-code-stream-json-v1
+
+# Validate Codex independently.
+scherzo-cloud runner doctor \
+  --check execution.harness.codex-app-server-v1
 
 # List IDs without running any checks.
 scherzo-cloud runner doctor --list-checks
@@ -422,6 +446,13 @@ scherzo-cloud runner doctor --list-checks
 # Emit the schema-version-1 JSON report.
 scherzo-cloud runner doctor --json
 ```
+
+A selected harness check identifies its execution profile and compatibility policy in
+both report formats, including when the harness is missing or incompatible. Human
+reports label an available observed version separately from a supported range or exact
+required version. When a range has a repository qualification release, the report shows
+that qualification version separately rather than presenting it as the only admitted
+release.
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins, read human credentials, contact Scherzo Cloud, or change
@@ -452,8 +483,15 @@ capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, 
 observed version, supported range, exact repository qualification version, closed
 capabilities, and the selected absolute path. Qualification remains pinned to `2.1.234`
 and does not claim that every admitted release or unexecuted host received exact-binary
-conformance. The report never exposes environment values, credentials, or loaded
-Claude settings. The JSON report has no `ready` field.
+conformance. The report never exposes environment values, credentials, or loaded Claude
+settings. The JSON report has no `ready` field.
+
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.148.0`, and
+requires the generated App Server schema capability used by CodexAppServerV1. Its
+isolated version and schema probes do not read ambient `CODEX_HOME`, provider
+credentials, or native configuration. The report contains the exact observed version,
+supported range, exact repository qualification version, closed capabilities, and
+canonical executable without starting a thread.
 
 ## Runner serve
 

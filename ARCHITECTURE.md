@@ -11,11 +11,12 @@ definition validation, and an outbound, enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
 admission boundary, and execution engine for one configured inputless command, Pi,
-Claude Code, or mixed workflow. Semantic acceptance reserves the runner's single local
+Claude Code, or mixed workflow. Local Workflow Run additionally admits Codex; Runner
+Serve Codex snapshots and assignment admission remain deferred. Semantic acceptance reserves the runner's single local
 assignment slot; a matching later start effect authorizes execution. `scherzo-cloud runner doctor` performs one
-default local Git check and can explicitly check the `pi` and `claude` installations
-selected independently from inherited `PATH`; passing those checks establishes only the
-closed `PiJsonV1` or `ClaudeCodeStreamJsonV1` installation, not complete runner readiness.
+default local Git check and can explicitly check the `pi`, `claude`, and `codex`
+installations selected independently from inherited `PATH`; passing those checks
+establishes only the selected closed harness installation, not complete runner readiness.
 
 ## One executable with separate roles
 
@@ -62,16 +63,18 @@ it is not a dynamic plugin API, does not discover libraries or scripts, and is n
 third-party extension contract.
 
 The first registry entry is `environment.command.git` and is the sole default. The
-operator-selected entries `execution.harness.pi-json-v1` and
-`execution.harness.claude-code-stream-json-v1` resolve `pi` and `claude` independently
+operator-selected entries `execution.harness.pi-json-v1`,
+`execution.harness.claude-code-stream-json-v1`, and
+`execution.harness.codex-app-server-v1` resolve `pi`, `claude`, and `codex` independently
 from the doctor's inherited `PATH`. Doctor does not construct human deployment state,
 read the human credential store, or make a network request. Future runner bootstrap code
 can add compiled-in checks through the same registry without adding a central check-name
 enum, but it must keep those boundaries intact.
 
-The two harness validators live at the execution boundary. Pi and Claude Code validation
-are each shared by doctor, local Workflow Run, and agent-capable Runner Serve
-initialization. Each selects the first executable
+The three harness validators live at the execution boundary. Pi and Claude Code validation
+are shared by doctor, local Workflow Run, and agent-capable Runner Serve initialization;
+Codex validation is shared by doctor and local Workflow Run until the runner boundary is
+implemented. Each selects the first executable
 with its fixed name in inherited `PATH` and never accepts an executable path from a
 workflow, assignment, import, remote value, dedicated environment variable, or CLI
 option. Validation canonicalizes the selected path and invokes only that absolute
@@ -82,17 +85,19 @@ select another harness candidate.
 Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
 `ValidatedPiInstallation`. Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.234`. Each immutable value carries the absolute path, exact
-observed version, closed profile, and closed capability set. Local and runner admission
-inspect the resolved workflow and require only the installation selected by each agent
-step. Shared admission and later execution use those values without another `PATH` lookup
-or native probe, so later `PATH` changes cannot switch an active operation's executable.
-Claude execution also requires every native initialization frame to equal the retained
-observed version rather than a compile-time qualification release.
-Command-only work requires neither harness; Pi-only and Claude-only work require no
-unrelated installation. Runner Serve retains independent optional Pi and Claude Code
-snapshots for its process lifetime and exposes neither through the runner protocol.
-
+qualifies exact release `2.1.234`. Codex maps stable `>=0.147.0 <0.148.0`
+installations with the maintained App Server schema capabilities into
+`ValidatedCodexInstallation`. Each immutable value carries the absolute path, exact
+observed version, closed profile, and closed capability set. Local admission inspects
+resolved workflows and requires only each selected installation; runner admission
+remains limited to Pi and Claude Code. Admission and later execution use those values
+without another `PATH` lookup or native probe, so later `PATH` changes cannot switch an
+active operation's executable. Claude execution also requires every native
+initialization frame to equal the retained observed version rather than a compile-time
+qualification release. Command-only work requires no harness, and each local
+single-harness workflow requires no unrelated installation. Runner Serve retains
+independent optional Pi and Claude Code snapshots for its process lifetime and exposes
+neither through the runner protocol.
 
 ## Runner service observability
 

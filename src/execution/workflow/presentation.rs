@@ -1846,6 +1846,9 @@ fn start_detail(step: &WorkflowPresentationStep) -> String {
                     effort.as_str()
                 )
             }
+            AgentPresentationHarness::Codex { model, effort } => {
+                format!("agent · {profile} · codex · {model} · effort={effort}")
+            }
         },
     };
     visible_text(&detail)

@@ -20,8 +20,11 @@ use tempfile::TempDir;
 use super::claude_code_installation::{
     COMPLETE_HELP as CLAUDE_CODE_COMPLETE_HELP, ClaudeCodeFixture,
 };
+use super::codex_installation::CodexFixture;
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
-use super::{CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES};
+use super::{
+    CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES, poll_until,
+};
 
 const WORKFLOW_PATH: &str = "workflow.yaml";
 const OVERSIZED_AGENT_MESSAGE_BYTES: usize = 512 * 1024;
@@ -29,6 +32,10 @@ const OVERSIZED_AGENT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const OVERSIZED_AGENT_SYSTEM_PROMPT_BYTES: usize = 256 * 1024;
 const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
 const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
+const CODEX_THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
+const CODEX_TURN_ID: &str = "turn-fixture";
+const CODEX_CORRECTION_TURN_ID: &str = "turn-correction";
+const CODEX_PROVIDER: &str = "fixture-provider";
 
 #[cfg(target_os = "linux")]
 #[expect(
@@ -630,6 +637,82 @@ exports:
 "#
 }
 
+fn response_codex_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: codex
+      config:
+        model: fixture/codex
+        effort: xhigh
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.answer.response
+"#
+}
+
+fn no_value_codex_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: codex
+      config:
+        model: fixture/codex
+        effort: high
+steps:
+  act:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+"#
+}
+
+fn result_codex_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: codex
+      config:
+        model: fixture/codex
+        effort: high
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: result.schema.json
+exports:
+  result:
+    ref: outputs.answer.result
+"#
+}
+
 fn mixed_harness_source() -> &'static str {
     r#"schemaVersion: 1
 agentProfiles:
@@ -677,13 +760,80 @@ exports:
 "#
 }
 
+fn mixed_codex_harness_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  piLocal:
+    harness:
+      kind: pi
+      config:
+        model: fixture/pi
+        thinking: high
+  claudeLocal:
+    harness:
+      kind: claude_code
+      config:
+        model: fixture/claude
+        effort: xhigh
+  codexLocal:
+    harness:
+      kind: codex
+      config:
+        model: fixture/codex
+        effort: high
+steps:
+  piAnswer:
+    kind: agent
+    agent:
+      profile: piLocal
+      systemPrompt: pi-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+  claudeAnswer:
+    kind: agent
+    dependsOn: [piAnswer]
+    agent:
+      profile: claudeLocal
+      systemPrompt: claude-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+  codexAnswer:
+    kind: agent
+    dependsOn: [claudeAnswer]
+    agent:
+      profile: codexLocal
+      systemPrompt: codex-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  claudeResponse:
+    ref: outputs.claudeAnswer.response
+  codexResponse:
+    ref: outputs.codexAnswer.response
+  piResponse:
+    ref: outputs.piAnswer.response
+"#
+}
+
 #[test]
-fn command_only_run_remains_pi_independent() {
+fn command_only_run_remains_harness_independent() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf command-only\"]\n",
     );
     let empty_path = tempfile::tempdir().unwrap();
-    let destination = bundle.result("without-pi");
+    let destination = bundle.result("without-agent-harness");
     let output = isolated_command(&bundle.args(&destination))
         .env("PATH", empty_path.path())
         .output()
@@ -1577,6 +1727,7 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
 fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     let pi = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     let claude = ClaudeCodeFixture::new("2.1.234 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+    let codex = CodexFixture::with_execution("0.147.0");
 
     let claude_bundle = RunBundle::new(response_claude_code_agent_source());
     claude_bundle.write_source("system.md", "system");
@@ -1616,6 +1767,43 @@ fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     assert!(claude.recorded_probes().is_empty());
     assert!(!pi_destination.exists());
 
+    let codex_bundle = RunBundle::new(response_codex_agent_source());
+    codex_bundle.write_source("system.md", "system");
+    codex_bundle.write_source("message.md", "prompt");
+    let codex_destination = codex_bundle.result("missing-codex");
+    let mut codex_args = codex_bundle.args(&codex_destination);
+    codex_args.insert(codex_args.len() - 1, "--json".to_owned());
+    let pi_and_claude =
+        std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+    let missing_codex = isolated_command(&codex_args)
+        .env("PATH", pi_and_claude)
+        .output()
+        .unwrap();
+    assert_eq!(missing_codex.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&missing_codex.stdout).unwrap()["diagnostics"]
+            [0]["code"],
+        "missing_codex_installation"
+    );
+    assert!(pi.recorded_probes().is_empty());
+    assert!(claude.recorded_probes().is_empty());
+    assert!(!codex_destination.exists());
+
+    let codex_only_path = codex.path_directory();
+    let unrelated_pi_bundle = RunBundle::new(response_agent_source());
+    unrelated_pi_bundle.write_source("system.md", "system");
+    unrelated_pi_bundle.write_source("message.md", "prompt");
+    let unrelated_pi_destination = unrelated_pi_bundle.result("codex-must-not-substitute-pi");
+    let mut unrelated_pi_args = unrelated_pi_bundle.args(&unrelated_pi_destination);
+    unrelated_pi_args.insert(unrelated_pi_args.len() - 1, "--json".to_owned());
+    let missing_pi_with_codex_available = isolated_command(&unrelated_pi_args)
+        .env("PATH", codex_only_path)
+        .output()
+        .unwrap();
+    assert_eq!(missing_pi_with_codex_available.status.code(), Some(1));
+    assert!(codex.recorded_probes().is_empty());
+    assert!(!unrelated_pi_destination.exists());
+
     let incompatible_claude =
         ClaudeCodeFixture::new("2.1.221 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
     let available_pi =
@@ -1644,6 +1832,207 @@ fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     assert_eq!(incompatible_claude.recorded_probes(), b"--version\n");
     assert!(available_pi.recorded_probes().is_empty());
     assert!(!incompatible_destination.exists());
+}
+
+fn run_codex_scenario(
+    bundle: &RunBundle,
+    fixture: &CodexFixture,
+    destination: &Path,
+    scenario: &str,
+) -> Output {
+    let mut args = bundle.args(destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let codex_home = bundle.initial_cwd().join(format!("codex-home-{scenario}"));
+    fs::create_dir(&codex_home).unwrap();
+    let codex_home = fs::canonicalize(codex_home).unwrap();
+    isolated_command(&args)
+        .env(
+            "PATH",
+            fixture_path_with_host_tools(&[fixture.path_directory()]),
+        )
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_FIXTURE_HELPER", std::env::current_exe().unwrap())
+        .env("CODEX_LOCAL_SCENARIO", scenario)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn codex_only_response_and_no_value_use_the_selected_production_dispatcher() {
+    for (scenario, source) in [
+        ("response", response_codex_agent_source()),
+        ("no-value", no_value_codex_agent_source()),
+    ] {
+        let fixture = CodexFixture::with_execution("0.147.0");
+        let bundle = RunBundle::new(source);
+        bundle.write_source("system.md", "system");
+        bundle.write_source("message.md", "prompt");
+        let destination = bundle.result(scenario);
+
+        let output = run_codex_scenario(&bundle, &fixture, &destination, scenario);
+
+        assert!(
+            output.status.success(),
+            "{scenario}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = result_json(&destination);
+        assert_eq!(result["outcome"], "succeeded");
+        if scenario == "response" {
+            let relative = result["exports"]["response"]["path"].as_str().unwrap();
+            assert_eq!(
+                fs::read(attempt_result(&destination).join(relative)).unwrap(),
+                b"codex response"
+            );
+        }
+        let diagnostic_root = destination.join("attempts/000001/diagnostics/codex-app-server-v1");
+        let invocation = fs::read_dir(diagnostic_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(invocation.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["profile"], "CodexAppServerV1");
+        assert_eq!(metadata["codexVersion"], "0.147.0");
+        assert!(!invocation.join("session").exists());
+        if scenario == "response" {
+            let status = isolated_command(&[
+                "workflow".to_owned(),
+                "status".to_owned(),
+                destination.to_string_lossy().into_owned(),
+                "--json".to_owned(),
+            ])
+            .output()
+            .unwrap();
+            assert!(status.status.success());
+            let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+            assert_eq!(status["state"]["attempts"][0]["state"], "succeeded");
+            assert_eq!(status["recovery"]["status"], "settled");
+        }
+        assert!(String::from_utf8_lossy(&output.stderr).contains("codex fixture diagnostic"));
+        let probes = String::from_utf8(fixture.recorded_probes()).unwrap();
+        assert_eq!(probes.matches("--version").count(), 1);
+        assert_eq!(probes.matches("generate-json-schema").count(), 1);
+        assert_eq!(probes.matches("app-server --strict-config").count(), 1);
+    }
+}
+
+#[test]
+fn codex_result_correction_publishes_only_the_schema_valid_value() {
+    let fixture = CodexFixture::with_execution("0.147.0");
+    let bundle = RunBundle::new(result_codex_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    bundle.write_source(
+        "result.schema.json",
+        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"integer","minimum":1}"#,
+    );
+    let destination = bundle.result("codex-correction");
+
+    let output = run_codex_scenario(&bundle, &fixture, &destination, "result-correction");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = result_json(&destination);
+    let relative = result["exports"]["result"]["path"].as_str().unwrap();
+    assert_eq!(
+        fs::read(attempt_result(&destination).join(relative)).unwrap(),
+        b"7"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("value_rejected"));
+}
+
+#[test]
+fn codex_native_failure_is_attributed_without_value_publication_or_fallback() {
+    let fixture = CodexFixture::with_execution("0.147.0");
+    let bundle = RunBundle::new(response_codex_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("codex-native-failure");
+
+    let output = run_codex_scenario(&bundle, &fixture, &destination, "native-failure");
+
+    assert_eq!(output.status.code(), Some(1));
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(
+        result["steps"][0]["failure"]["cause"]["code"],
+        "harness_failed"
+    );
+    assert_eq!(
+        result["exports"]["response"],
+        serde_json::json!({"state": "unavailable", "reason": "source_failed"})
+    );
+    assert!(!attempt_result(&destination).join("exports/0001").exists());
+    assert_eq!(
+        String::from_utf8(fixture.recorded_probes())
+            .unwrap()
+            .matches("app-server --strict-config")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn codex_cancellation_quiesces_before_atomic_publication() {
+    let fixture = CodexFixture::with_execution("0.147.0");
+    let bundle = RunBundle::new(response_codex_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("codex-cancelled");
+    let ready = bundle.initial_cwd().join("codex-ready");
+    let codex_home = bundle.initial_cwd().join("codex-home-cancellation");
+    fs::create_dir(&codex_home).unwrap();
+    let codex_home = fs::canonicalize(codex_home).unwrap();
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let child = isolated_command(&args)
+        .env(
+            "PATH",
+            fixture_path_with_host_tools(&[fixture.path_directory()]),
+        )
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_FIXTURE_HELPER", std::env::current_exe().unwrap())
+        .env("CODEX_LOCAL_SCENARIO", "cancellation")
+        .env("CODEX_LOCAL_READY", &ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    poll_until(
+        "Codex cancellation readiness",
+        || ready.is_file(),
+        |ready| *ready,
+    );
+    assert!(!attempt_result(&destination).exists());
+    kill_process(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(130));
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "cancelled");
+    assert_eq!(
+        result["exports"]["response"],
+        serde_json::json!({"state": "unavailable", "reason": "source_cancelled"})
+    );
+    assert!(
+        fs::read_dir(destination.join(".private"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1710,6 +2099,89 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_exports() {
+    let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.234 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+    );
+    let codex = CodexFixture::with_execution("0.147.0");
+    let path = fixture_path_with_host_tools(&[
+        pi.path_directory(),
+        claude.path_directory(),
+        codex.path_directory(),
+    ]);
+    let bundle = RunBundle::new(mixed_codex_harness_source());
+    for source in [
+        "pi-system.md",
+        "claude-system.md",
+        "codex-system.md",
+        "message.md",
+    ] {
+        bundle.write_source(source, "fixture");
+    }
+    let codex_home = bundle.initial_cwd().join("codex-home-mixed");
+    fs::create_dir(&codex_home).unwrap();
+    let codex_home = fs::canonicalize(codex_home).unwrap();
+    let destination = bundle.result("mixed-with-codex");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args)
+        .env("PATH", path)
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_FIXTURE_HELPER", std::env::current_exe().unwrap())
+        .env("CODEX_LOCAL_SCENARIO", "response")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(pi.recorded_probes())
+            .unwrap()
+            .matches("--mode json")
+            .count(),
+        1
+    );
+    assert_eq!(
+        String::from_utf8(claude.recorded_probes())
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("-p --input-format stream-json"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        String::from_utf8(codex.recorded_probes())
+            .unwrap()
+            .matches("app-server --strict-config")
+            .count(),
+        1
+    );
+    let transcript = String::from_utf8_lossy(&output.stderr);
+    assert!(transcript.contains("codexLocal · codex · fixture/codex · effort=high"));
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "succeeded");
+    let result_root = attempt_result(&destination);
+    for (name, expected) in [
+        ("claudeResponse", b"claude response".as_slice()),
+        ("codexResponse", b"codex response".as_slice()),
+        ("piResponse", b"hello world".as_slice()),
+    ] {
+        let relative = result["exports"][name]["path"].as_str().unwrap();
+        assert_eq!(fs::read(result_root.join(relative)).unwrap(), expected);
+    }
 }
 
 #[test]
@@ -4076,6 +4548,297 @@ fn failure_then_signal_bundle() -> RunBundle {
     RunBundle::new(&format!(
         "schemaVersion: 1\nsteps:\n  active:\n    kind: cmd\n    command:\n      argv: {argv}\n  fail:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"exit 23\"]\n"
     ))
+}
+
+fn write_codex_server_frame(output: &mut impl Write, value: serde_json::Value) {
+    serde_json::to_writer(&mut *output, &value).unwrap();
+    output.write_all(b"\n").unwrap();
+    output.flush().unwrap();
+}
+
+fn read_codex_client_frame(input: &mut impl BufRead) -> serde_json::Value {
+    let mut line = String::new();
+    assert!(input.read_line(&mut line).unwrap() > 0);
+    serde_json::from_str(line.trim_end()).unwrap()
+}
+
+fn codex_thread_document(cwd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": CODEX_THREAD_ID,
+        "sessionId": CODEX_THREAD_ID,
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "ephemeral": true,
+        "path": null,
+        "cliVersion": "0.147.0",
+        "turns": [],
+        "cwd": cwd,
+        "modelProvider": CODEX_PROVIDER,
+    })
+}
+
+fn send_codex_item(
+    output: &mut impl Write,
+    turn_id: &str,
+    item_id: &str,
+    text: &str,
+) -> serde_json::Value {
+    write_codex_server_frame(
+        output,
+        serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "threadId": CODEX_THREAD_ID,
+                "turnId": turn_id,
+                "item": {"id": item_id, "type": "agentMessage", "text": ""},
+            }
+        }),
+    );
+    let item = serde_json::json!({
+        "id": item_id,
+        "type": "agentMessage",
+        "text": text,
+        "phase": "final_answer",
+    });
+    write_codex_server_frame(
+        output,
+        serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": CODEX_THREAD_ID,
+                "turnId": turn_id,
+                "item": item,
+            }
+        }),
+    );
+    item
+}
+
+fn send_codex_turn_completed(
+    output: &mut impl Write,
+    turn_id: &str,
+    status: &str,
+    items: Vec<serde_json::Value>,
+    error: Option<serde_json::Value>,
+) {
+    let mut turn = serde_json::json!({"id": turn_id, "items": items, "status": status});
+    if let Some(error) = error {
+        turn["error"] = error;
+    }
+    write_codex_server_frame(
+        output,
+        serde_json::json!({
+            "method": "turn/completed",
+            "params": {"threadId": CODEX_THREAD_ID, "turn": turn}
+        }),
+    );
+}
+
+#[test]
+#[ignore = "launched as the local production Codex App Server fixture"]
+fn codex_app_server_fixture() {
+    let scenario = std::env::var("CODEX_LOCAL_SCENARIO").unwrap();
+    eprintln!("codex fixture diagnostic: {scenario}");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut output = OpenOptions::new().write(true).open("/dev/fd/3").unwrap();
+
+    let initialize = read_codex_client_frame(&mut input);
+    assert_eq!(initialize["id"], 1);
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "id": 1,
+            "result": {
+                "userAgent": "codex/0.147.0",
+                "codexHome": std::env::var("CODEX_HOME").unwrap(),
+            }
+        }),
+    );
+    assert_eq!(read_codex_client_frame(&mut input)["method"], "initialized");
+    let config_read = read_codex_client_frame(&mut input);
+    assert_eq!(config_read["id"], 2);
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "method": "configWarning",
+            "params": {"summary": "local fixture configuration warning"}
+        }),
+    );
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "id": 2,
+            "result": {
+                "config": {
+                    "developer_instructions": "native fixture instructions",
+                    "sqlite_home": std::env::var("CODEX_FIXTURE_SQLITE_HOME").unwrap(),
+                    "model_provider": CODEX_PROVIDER,
+                },
+                "origins": {},
+            }
+        }),
+    );
+
+    let thread = read_codex_client_frame(&mut input);
+    assert_eq!(thread["id"], 3);
+    assert_eq!(thread["params"]["model"], "fixture/codex");
+    assert_eq!(thread["params"]["ephemeral"], true);
+    let cwd = thread["params"]["cwd"].as_str().unwrap();
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "id": 3,
+            "result": {
+                "thread": codex_thread_document(cwd),
+                "model": "fixture/codex",
+                "modelProvider": CODEX_PROVIDER,
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandbox": {"type": "dangerFullAccess"},
+            }
+        }),
+    );
+
+    let turn = read_codex_client_frame(&mut input);
+    assert_eq!(turn["id"], 4);
+    assert!(matches!(
+        turn["params"]["effort"].as_str(),
+        Some("high" | "xhigh")
+    ));
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "method": "thread/started",
+            "params": {"thread": codex_thread_document(cwd)}
+        }),
+    );
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "id": 4,
+            "result": {
+                "turn": {"id": CODEX_TURN_ID, "items": [], "status": "inProgress"}
+            }
+        }),
+    );
+    write_codex_server_frame(
+        &mut output,
+        serde_json::json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": CODEX_THREAD_ID,
+                "turn": {"id": CODEX_TURN_ID, "items": [], "status": "inProgress"}
+            }
+        }),
+    );
+
+    match scenario.as_str() {
+        "response" => {
+            let item = send_codex_item(
+                &mut output,
+                CODEX_TURN_ID,
+                "response-message",
+                "codex response",
+            );
+            send_codex_turn_completed(&mut output, CODEX_TURN_ID, "completed", vec![item], None);
+        }
+        "no-value" => {
+            send_codex_turn_completed(&mut output, CODEX_TURN_ID, "completed", Vec::new(), None);
+        }
+        "native-failure" => {
+            write_codex_server_frame(
+                &mut output,
+                serde_json::json!({
+                    "method": "error",
+                    "params": {
+                        "threadId": CODEX_THREAD_ID,
+                        "turnId": CODEX_TURN_ID,
+                        "error": {
+                            "message": "native authentication failed",
+                            "codexErrorInfo": "unauthorized",
+                        },
+                        "willRetry": false,
+                    }
+                }),
+            );
+            send_codex_turn_completed(
+                &mut output,
+                CODEX_TURN_ID,
+                "failed",
+                Vec::new(),
+                Some(serde_json::json!({
+                    "message": "native authentication failed",
+                    "codexErrorInfo": "unauthorized",
+                })),
+            );
+        }
+        "result-correction" => {
+            let invalid = send_codex_item(
+                &mut output,
+                CODEX_TURN_ID,
+                "invalid-result",
+                r#"{"result":-1}"#,
+            );
+            send_codex_turn_completed(&mut output, CODEX_TURN_ID, "completed", vec![invalid], None);
+            let correction = read_codex_client_frame(&mut input);
+            assert_eq!(correction["id"], 6);
+            assert_eq!(correction["method"], "turn/start");
+            write_codex_server_frame(
+                &mut output,
+                serde_json::json!({
+                    "id": 6,
+                    "result": {
+                        "turn": {
+                            "id": CODEX_CORRECTION_TURN_ID,
+                            "items": [],
+                            "status": "inProgress",
+                        }
+                    }
+                }),
+            );
+            write_codex_server_frame(
+                &mut output,
+                serde_json::json!({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": CODEX_THREAD_ID,
+                        "turn": {
+                            "id": CODEX_CORRECTION_TURN_ID,
+                            "items": [],
+                            "status": "inProgress",
+                        }
+                    }
+                }),
+            );
+            let valid = send_codex_item(
+                &mut output,
+                CODEX_CORRECTION_TURN_ID,
+                "valid-result",
+                r#"{"result":7}"#,
+            );
+            send_codex_turn_completed(
+                &mut output,
+                CODEX_CORRECTION_TURN_ID,
+                "completed",
+                vec![valid],
+                None,
+            );
+        }
+        "cancellation" => {
+            fs::write(std::env::var_os("CODEX_LOCAL_READY").unwrap(), b"ready\n").unwrap();
+            let interrupt = read_codex_client_frame(&mut input);
+            assert_eq!(interrupt["id"], 5);
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            write_codex_server_frame(&mut output, serde_json::json!({"id": 5, "result": {}}));
+            send_codex_turn_completed(&mut output, CODEX_TURN_ID, "interrupted", Vec::new(), None);
+        }
+        other => panic!("unknown local Codex fixture scenario: {other}"),
+    }
+
+    let mut trailing = Vec::new();
+    input.read_to_end(&mut trailing).unwrap();
+    assert!(trailing.is_empty());
 }
 
 fn fixture_argv() -> String {

@@ -129,8 +129,15 @@ fn init_repository(path: &Path) {
     git(path, &["config", "user.email", "test@example.invalid"]);
 }
 
+fn fixture_git_command() -> Command {
+    let mut command = Command::new(git_executable());
+    // Keep asynchronous repository maintenance from racing byte-for-byte fixture snapshots.
+    command.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
+    command
+}
+
 fn git(repository: &Path, arguments: &[&str]) -> String {
-    let output = Command::new(git_executable())
+    let output = fixture_git_command()
         .arg("-C")
         .arg(repository)
         .args(arguments)
@@ -146,10 +153,7 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
 }
 
 fn git_parent(arguments: &[&str]) -> String {
-    let output = Command::new(git_executable())
-        .args(arguments)
-        .output()
-        .unwrap();
+    let output = fixture_git_command().args(arguments).output().unwrap();
     assert!(
         output.status.success(),
         "git {arguments:?} failed: {}",

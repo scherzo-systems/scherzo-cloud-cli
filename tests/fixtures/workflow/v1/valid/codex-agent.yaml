@@ -2,10 +2,10 @@ schemaVersion: 1
 agentProfiles:
   coding:
     harness:
-      kind: future_agent
+      kind: codex
       config:
-        model: gpt-5
-        effort: high
+        model: gpt-5.4
+        effort: xhigh
 steps:
   implement:
     kind: agent
@@ -15,3 +15,9 @@ steps:
       message:
         text:
           - file: prompts/implement-message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.implement.response

@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
-use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
+use super::{
+    CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
+};
 use crate::execution::claude_code::{
     CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION, CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE,
-    ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
-    discover_and_validate_claude_code_installation,
+    ClaudeCodeCompatibilityProfile, ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure,
+    ClaudeCodeProbe, discover_and_validate_claude_code_installation,
 };
 
 pub(super) struct ClaudeCodeCheck;
@@ -47,12 +49,20 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
             "Claude Code was not found in inherited PATH; install a stable release in the supported range.",
             compatibility_details(),
         ),
-        ClaudeCodeInstallationFailure::Unexecutable => Outcome::fail(
-            "unexecutable_claude_code_installation",
-            "Claude Code selected from inherited PATH could not complete its validation probes.",
-            compatibility_details(),
-        ),
-        ClaudeCodeInstallationFailure::Malformed(probe) => {
+        ClaudeCodeInstallationFailure::Unexecutable { version } => {
+            let mut details = compatibility_details();
+            if let Some(version) = version {
+                details.insert("version".to_owned(), version);
+            }
+            Outcome::fail(
+                "unexecutable_claude_code_installation",
+                "Claude Code selected from inherited PATH could not complete its validation probes.",
+                details,
+            )
+        }
+        // Claude probe codes and messages stay local so Pi diagnostics can evolve independently.
+        // jscpd:ignore-start
+        ClaudeCodeInstallationFailure::Malformed { probe, version } => {
             let (code, message) = match probe {
                 ClaudeCodeProbe::Version => (
                     "malformed_claude_code_version",
@@ -65,8 +75,12 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
             };
             let mut details = compatibility_details();
             details.insert("probe".to_owned(), probe.as_str().to_owned());
+            if let Some(version) = version {
+                details.insert("version".to_owned(), version);
+            }
             Outcome::fail(code, message, details)
         }
+        // jscpd:ignore-end
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Version(version)) => {
             let mut details = compatibility_details();
             details.insert("version".to_owned(), version);
@@ -76,11 +90,12 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
                 details,
             )
         }
-        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability(
+        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability {
             capability,
-        )) => {
-            let mut details = compatibility_details();
-            details.insert("capability".to_owned(), capability.as_str().to_owned());
+            version,
+        }) => {
+            let details =
+                capability_failure_details(compatibility_details(), capability.as_str(), version);
             Outcome::fail(
                 "unsupported_claude_code_capability",
                 "Claude Code selected from inherited PATH does not provide every capability required by ClaudeCodeStreamJsonV1.",
@@ -92,6 +107,12 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
 
 fn compatibility_details() -> BTreeMap<String, String> {
     BTreeMap::from([
+        (
+            "profile".to_owned(),
+            ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+                .as_str()
+                .to_owned(),
+        ),
         (
             "qualificationVersion".to_owned(),
             CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION.to_owned(),

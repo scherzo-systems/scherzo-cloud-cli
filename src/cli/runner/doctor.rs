@@ -63,26 +63,53 @@ fn write_check_list(descriptors: &[crate::runner::doctor::CheckDescriptor]) -> a
 fn write_human_report(report: &Report) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    writeln!(stdout, "Scherzo Cloud runner doctor")?;
-    writeln!(stdout)?;
+    write_human_report_to(&mut stdout, report)
+}
+
+fn write_human_report_to(output: &mut impl Write, report: &Report) -> anyhow::Result<()> {
+    writeln!(output, "Scherzo Cloud runner doctor")?;
+    writeln!(output)?;
 
     for result in &report.results {
         let marker = match result.outcome.status {
             Status::Pass => '✓',
             Status::Fail => '✗',
         };
-        writeln!(stdout, "{marker} {}", result.descriptor.title)?;
-        writeln!(stdout, "  {}", result.outcome.message)?;
+        writeln!(output, "{marker} {}", result.descriptor.title)?;
+        writeln!(output, "  {}", result.outcome.message)?;
         if result.outcome.status == Status::Fail {
-            writeln!(stdout, "  code: {}", result.outcome.code)?;
+            writeln!(output, "  code: {}", result.outcome.code)?;
         }
-        writeln!(stdout)?;
+        write_harness_compatibility_details(output, &result.outcome.details)?;
+        writeln!(output)?;
     }
 
     let summary = report.summary();
-    writeln!(stdout, "── summary ──")?;
-    writeln!(stdout, "passed: {}", summary.passed)?;
-    writeln!(stdout, "failed: {}", summary.failed)?;
+    writeln!(output, "── summary ──")?;
+    writeln!(output, "passed: {}", summary.passed)?;
+    writeln!(output, "failed: {}", summary.failed)?;
+    Ok(())
+}
+
+fn write_harness_compatibility_details(
+    output: &mut impl Write,
+    details: &std::collections::BTreeMap<String, String>,
+) -> io::Result<()> {
+    if !details.contains_key("profile") {
+        return Ok(());
+    }
+
+    for (key, label) in [
+        ("profile", "profile"),
+        ("version", "observed version"),
+        ("supportedRange", "supported range"),
+        ("expectedVersion", "required version"),
+        ("qualificationVersion", "qualification version"),
+    ] {
+        if let Some(value) = details.get(key) {
+            writeln!(output, "  {label}: {value}")?;
+        }
+    }
     Ok(())
 }
 
@@ -147,4 +174,79 @@ impl<'a> JsonCheck<'a> {
 struct JsonSummary {
     passed: usize,
     failed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::write_human_report_to;
+    use crate::runner::doctor::{CheckDescriptor, CheckResult, Outcome, Report, Status};
+
+    fn result(
+        id: &'static str,
+        title: &'static str,
+        details: BTreeMap<String, String>,
+    ) -> CheckResult {
+        CheckResult {
+            descriptor: CheckDescriptor {
+                id,
+                title,
+                default: false,
+            },
+            outcome: Outcome {
+                status: Status::Pass,
+                code: "ok",
+                message: "Fixture result".to_owned(),
+                details,
+            },
+        }
+    }
+
+    #[test]
+    fn human_harness_details_render_structured_compatibility_policy() {
+        let report = Report {
+            results: vec![
+                result(
+                    "execution.harness.range-fixture",
+                    "Range fixture",
+                    BTreeMap::from([
+                        ("profile".to_owned(), "RangeProfile".to_owned()),
+                        ("version".to_owned(), "2.3.5".to_owned()),
+                        ("supportedRange".to_owned(), ">=2.3.4 <2.4.0".to_owned()),
+                        ("qualificationVersion".to_owned(), "2.3.4".to_owned()),
+                    ]),
+                ),
+                result(
+                    "execution.harness.exact-fixture",
+                    "Exact fixture",
+                    BTreeMap::from([
+                        ("profile".to_owned(), "ExactProfile".to_owned()),
+                        ("expectedVersion".to_owned(), "7.8.9".to_owned()),
+                    ]),
+                ),
+                result(
+                    "environment.command.fixture",
+                    "Environment fixture",
+                    BTreeMap::from([("version".to_owned(), "1.2.3".to_owned())]),
+                ),
+            ],
+        };
+        let mut output = Vec::new();
+
+        write_human_report_to(&mut output, &report).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        for field in [
+            "profile: RangeProfile",
+            "observed version: 2.3.5",
+            "supported range: >=2.3.4 <2.4.0",
+            "qualification version: 2.3.4",
+            "profile: ExactProfile",
+            "required version: 7.8.9",
+        ] {
+            assert!(output.lines().any(|line| line.trim() == field), "{field}");
+        }
+        assert!(!output.contains("observed version: 1.2.3"));
+    }
 }

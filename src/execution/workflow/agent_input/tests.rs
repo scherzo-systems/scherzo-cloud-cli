@@ -10,6 +10,9 @@ use serde_json::json;
 
 use super::*;
 use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
+use crate::execution::codex::{
+    CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedCodexInstallation,
+};
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
@@ -20,6 +23,8 @@ use crate::execution::workflow::agent::{AgentValueKind, NoopAgentObservationSink
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::execution::workflow::codex::CodexConfig;
+use crate::execution::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use crate::execution::workflow::input::{InputStaging, InputValue};
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution;
@@ -39,6 +44,13 @@ enum ConsumerValueMode {
     Result,
 }
 
+#[derive(Clone, Copy)]
+enum ConsumerHarness {
+    Pi,
+    ClaudeCode,
+    Codex,
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     source_root: PathBuf,
@@ -53,21 +65,25 @@ struct Fixture {
 
 impl Fixture {
     fn new(mode: ConsumerValueMode) -> Self {
-        Self::with_configuration(mode, 1, false)
+        Self::with_configuration(mode, 1, ConsumerHarness::Pi)
     }
 
     fn with_attachment_splices(mode: ConsumerValueMode, attachment_splices: usize) -> Self {
-        Self::with_configuration(mode, attachment_splices, false)
+        Self::with_configuration(mode, attachment_splices, ConsumerHarness::Pi)
     }
 
     fn with_claude_code_consumer(mode: ConsumerValueMode) -> Self {
-        Self::with_configuration(mode, 1, true)
+        Self::with_configuration(mode, 1, ConsumerHarness::ClaudeCode)
+    }
+
+    fn with_codex_consumer(mode: ConsumerValueMode) -> Self {
+        Self::with_configuration(mode, 1, ConsumerHarness::Codex)
     }
 
     fn with_configuration(
         mode: ConsumerValueMode,
         attachment_splices: usize,
-        claude_code_consumer: bool,
+        consumer_harness: ConsumerHarness,
     ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
@@ -99,16 +115,24 @@ impl Fixture {
         .unwrap();
 
         let mut resolved = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        if claude_code_consumer {
-            let ValidatedStep::Agent(consumer) =
-                resolved.definition.steps.get_mut("consumer").unwrap()
-            else {
-                panic!("the fixture consumer must be an agent step");
-            };
-            consumer.agent.harness = ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
-                model: "claude-opus-4-1".to_owned(),
-                effort: ClaudeCodeEffort::High,
-            });
+        let ValidatedStep::Agent(consumer) = resolved.definition.steps.get_mut("consumer").unwrap()
+        else {
+            panic!("the fixture consumer must be an agent step");
+        };
+        match consumer_harness {
+            ConsumerHarness::Pi => {}
+            ConsumerHarness::ClaudeCode => {
+                consumer.agent.harness = ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+                    model: "claude-opus-4-1".to_owned(),
+                    effort: ClaudeCodeEffort::High,
+                });
+            }
+            ConsumerHarness::Codex => {
+                consumer.agent.harness = ValidatedHarness::Codex(CodexConfig {
+                    model: "gpt-5.4".to_owned(),
+                    effort: "xhigh".to_owned(),
+                });
+            }
         }
 
         // This ordered mutation occurs after resolution and before materialization. The
@@ -143,10 +167,18 @@ impl Fixture {
             ]),
         );
         let mut context = execution_context(&execution_root);
-        if claude_code_consumer {
-            context = context.with_claude_code_installation(
-                ValidatedClaudeCodeInstallation::fixture("/validated/claude".into()),
-            );
+        match consumer_harness {
+            ConsumerHarness::Pi => {}
+            ConsumerHarness::ClaudeCode => {
+                context = context.with_claude_code_installation(
+                    ValidatedClaudeCodeInstallation::fixture("/validated/claude".into()),
+                );
+            }
+            ConsumerHarness::Codex => {
+                context = context.with_codex_installation(ValidatedCodexInstallation::fixture(
+                    "/validated/codex".into(),
+                ));
+            }
         }
         let admitted = admit_workflow(resolved, imports, context).unwrap();
         let artifacts = ArtifactStaging::create(admitted.execution(), &staging_parent).unwrap();
@@ -505,6 +537,34 @@ fn materialization_preserves_each_profiles_native_configuration_and_limits() {
             .and_then(Path::file_name)
             .and_then(|name| name.to_str()),
         Some("claude-code-stream-json-v1")
+    );
+
+    let codex_fixture = Fixture::with_codex_consumer(ConsumerValueMode::None);
+    let codex_materialized = codex_fixture
+        .materialize(CancellationSource::new())
+        .unwrap();
+    let ClosedAgentInvocation::Codex(codex) = codex_materialized.invocation() else {
+        panic!("the Codex fixture must materialize a Codex invocation");
+    };
+    assert_eq!(codex.adapter().executable(), Path::new("/validated/codex"));
+    assert_eq!(
+        codex.adapter().version(),
+        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION
+    );
+    assert_eq!(codex.adapter().native_configuration().model, "gpt-5.4");
+    assert_eq!(codex.adapter().native_configuration().effort, "xhigh");
+    assert_eq!(
+        codex.limits().adapter_protocol(),
+        &CodexAppServerV1ProtocolLimits::profile()
+    );
+    assert_eq!(
+        codex
+            .diagnostic_session()
+            .directory()
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str()),
+        Some("codex-app-server-v1")
     );
 }
 

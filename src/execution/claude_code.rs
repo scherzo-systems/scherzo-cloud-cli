@@ -184,14 +184,22 @@ impl ClaudeCodeProbe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaudeCodeIncompatibility {
     Version(String),
-    Capability(ClaudeCodeCapability),
+    Capability {
+        capability: ClaudeCodeCapability,
+        version: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaudeCodeInstallationFailure {
     Missing,
-    Unexecutable,
-    Malformed(ClaudeCodeProbe),
+    Unexecutable {
+        version: Option<String>,
+    },
+    Malformed {
+        probe: ClaudeCodeProbe,
+        version: Option<String>,
+    },
     Unsupported(ClaudeCodeIncompatibility),
 }
 
@@ -202,19 +210,25 @@ impl fmt::Display for ClaudeCodeInstallationFailure {
                 formatter,
                 "Claude Code was not found in inherited PATH; install a stable Claude Code release in range {CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE}"
             ),
-            Self::Unexecutable => formatter.write_str(
+            Self::Unexecutable { .. } => formatter.write_str(
                 "Claude Code selected from inherited PATH could not complete its validation probes",
             ),
-            Self::Malformed(ClaudeCodeProbe::Version) => formatter
+            Self::Malformed {
+                probe: ClaudeCodeProbe::Version,
+                ..
+            } => formatter
                 .write_str("Claude Code selected from inherited PATH returned a malformed version"),
-            Self::Malformed(ClaudeCodeProbe::Capabilities) => formatter.write_str(
+            Self::Malformed {
+                probe: ClaudeCodeProbe::Capabilities,
+                ..
+            } => formatter.write_str(
                 "Claude Code selected from inherited PATH returned malformed capability help",
             ),
             Self::Unsupported(ClaudeCodeIncompatibility::Version(version)) => write!(
                 formatter,
                 "Claude Code version {version} selected from inherited PATH is unsupported; install a stable Claude Code release in range {CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE}"
             ),
-            Self::Unsupported(ClaudeCodeIncompatibility::Capability(capability)) => write!(
+            Self::Unsupported(ClaudeCodeIncompatibility::Capability { capability, .. }) => write!(
                 formatter,
                 "Claude Code selected from inherited PATH lacks the required {} capability",
                 capability.as_str()
@@ -278,13 +292,23 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
         output: &CommandOutput,
         _isolation: &ProbeIsolation,
         _executable: &Path,
-        _version: &Self::Version,
+        version: &Self::Version,
         _profile: &Self::CompatibilityProfile,
     ) -> Result<Self::Capabilities, Self::Failure> {
-        validate_capability_output(output)?;
+        validate_capability_output(output, version)?;
         Ok(ClaudeCodeStreamJsonV1Capabilities {
             required: REQUIRED_CAPABILITIES,
         })
+    }
+
+    fn capability_probe_failure(
+        _executable: &Path,
+        version: &Self::Version,
+        _profile: &Self::CompatibilityProfile,
+    ) -> Self::Failure {
+        ClaudeCodeInstallationFailure::Unexecutable {
+            version: Some(version.as_str().to_owned()),
+        }
     }
 
     fn installation(
@@ -306,14 +330,12 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     fn executable_failure(failure: ExecutableValidationFailure) -> Self::Failure {
         match failure {
             ExecutableValidationFailure::Missing => ClaudeCodeInstallationFailure::Missing,
-            ExecutableValidationFailure::Unexecutable => {
-                ClaudeCodeInstallationFailure::Unexecutable
-            }
+            ExecutableValidationFailure::Unexecutable => Self::unexecutable_failure(),
         }
     }
 
     fn unexecutable_failure() -> Self::Failure {
-        ClaudeCodeInstallationFailure::Unexecutable
+        ClaudeCodeInstallationFailure::Unexecutable { version: None }
     }
     // jscpd:ignore-end
 }
@@ -347,18 +369,15 @@ fn validate_claude_code_installation_with(
 fn parse_version_output(
     output: &CommandOutput,
 ) -> Result<ClaudeCodeVersion, ClaudeCodeInstallationFailure> {
-    let observed = parse_probe_line(output).ok_or(ClaudeCodeInstallationFailure::Malformed(
-        ClaudeCodeProbe::Version,
-    ))?;
-    let version =
-        observed
-            .strip_suffix(" (Claude Code)")
-            .ok_or(ClaudeCodeInstallationFailure::Malformed(
-                ClaudeCodeProbe::Version,
-            ))?;
-    ClaudeCodeVersion::parse(version).ok_or(ClaudeCodeInstallationFailure::Malformed(
-        ClaudeCodeProbe::Version,
-    ))
+    let malformed = || ClaudeCodeInstallationFailure::Malformed {
+        probe: ClaudeCodeProbe::Version,
+        version: None,
+    };
+    let observed = parse_probe_line(output).ok_or_else(malformed)?;
+    let version = observed
+        .strip_suffix(" (Claude Code)")
+        .ok_or_else(malformed)?;
+    ClaudeCodeVersion::parse(version).ok_or_else(malformed)
 }
 
 fn compatibility_profile(version: &ClaudeCodeVersion) -> Option<ClaudeCodeCompatibilityProfile> {
@@ -373,21 +392,27 @@ pub(crate) fn compatibility_profile_for_version(
     compatibility_profile(&ClaudeCodeVersion::parse(observed)?)
 }
 
-fn validate_capability_output(output: &CommandOutput) -> Result<(), ClaudeCodeInstallationFailure> {
-    let help = parse_probe_text(output).ok_or(ClaudeCodeInstallationFailure::Malformed(
-        ClaudeCodeProbe::Capabilities,
-    ))?;
+fn validate_capability_output(
+    output: &CommandOutput,
+    version: &ClaudeCodeVersion,
+) -> Result<(), ClaudeCodeInstallationFailure> {
+    let malformed = || ClaudeCodeInstallationFailure::Malformed {
+        probe: ClaudeCodeProbe::Capabilities,
+        version: Some(version.as_str().to_owned()),
+    };
+    let help = parse_probe_text(output).ok_or_else(malformed)?;
     if !help.starts_with("Usage: claude [options] [command] [prompt]\n") {
-        return Err(ClaudeCodeInstallationFailure::Malformed(
-            ClaudeCodeProbe::Capabilities,
-        ));
+        return Err(malformed());
     }
     if let Some(capability) = REQUIRED_CAPABILITIES
         .into_iter()
         .find(|capability| !capability.is_advertised_by(help))
     {
         return Err(ClaudeCodeInstallationFailure::Unsupported(
-            ClaudeCodeIncompatibility::Capability(capability),
+            ClaudeCodeIncompatibility::Capability {
+                capability,
+                version: version.as_str().to_owned(),
+            },
         ));
     }
     Ok(())

@@ -154,6 +154,10 @@ pub(crate) enum AgentPresentationHarness {
         model: String,
         effort: ClaudeCodeEffort,
     },
+    Codex {
+        model: String,
+        effort: String,
+    },
 }
 
 impl WorkflowPresentationDefinition {
@@ -216,6 +220,10 @@ fn presentation_step(step: &ValidatedStep) -> WorkflowPresentationStep {
                 ValidatedHarness::ClaudeCode(config) => AgentPresentationHarness::ClaudeCode {
                     model: config.model.clone(),
                     effort: config.effort,
+                },
+                ValidatedHarness::Codex(config) => AgentPresentationHarness::Codex {
+                    model: config.model.clone(),
+                    effort: config.effort.clone(),
                 },
             };
             WorkflowPresentationStep::Agent {

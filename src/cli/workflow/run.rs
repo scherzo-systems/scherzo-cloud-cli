@@ -18,6 +18,7 @@ use tokio::io::unix::AsyncFd;
 
 use crate::execution::AgentHarnessInstallationFailure;
 use crate::execution::claude_code::discover_and_validate_claude_code_installation;
+use crate::execution::codex::discover_and_validate_codex_installation;
 use crate::execution::pi::discover_and_validate_pi_installation;
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 #[cfg(test)]
@@ -697,6 +698,7 @@ pub(super) fn execution_context_for_workflow(
 
     let mut pi_validated = false;
     let mut claude_code_validated = false;
+    let mut codex_validated = false;
     for step_name in workflow
         .definition
         .source_order
@@ -729,8 +731,17 @@ pub(super) fn execution_context_for_workflow(
                 context = context.with_claude_code_installation(installation);
                 claude_code_validated = true;
             }
+            crate::execution::workflow::validated::ValidatedHarness::Codex(_)
+                if !codex_validated =>
+            {
+                let installation = discover_and_validate_codex_installation()
+                    .map_err(AgentHarnessInstallationFailure::Codex)?;
+                context = context.with_codex_installation(installation);
+                codex_validated = true;
+            }
             crate::execution::workflow::validated::ValidatedHarness::Pi(_)
-            | crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_) => {}
+            | crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_)
+            | crate::execution::workflow::validated::ValidatedHarness::Codex(_) => {}
         }
     }
     Ok(context)

@@ -1,0 +1,14 @@
+schemaVersion: 1
+agentProfiles:
+  invalid:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: high
+        modelProvider: openai
+steps:
+  noop:
+    kind: cmd
+    command:
+      argv: ["true"]

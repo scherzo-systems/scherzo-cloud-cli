@@ -143,6 +143,8 @@ enum HarnessDto {
     Pi { config: Value },
     #[serde(rename = "claude_code")]
     ClaudeCode { config: Value },
+    #[serde(rename = "codex")]
+    Codex { config: Value },
 }
 
 #[derive(Deserialize)]
@@ -303,6 +305,7 @@ impl HarnessDto {
         match self {
             Self::Pi { config } => HarnessDefinition::Pi { config },
             Self::ClaudeCode { config } => HarnessDefinition::ClaudeCode { config },
+            Self::Codex { config } => HarnessDefinition::Codex { config },
         }
     }
 }

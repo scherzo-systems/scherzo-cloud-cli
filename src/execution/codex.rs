@@ -126,6 +126,20 @@ pub(crate) struct ValidatedCodexInstallation {
 }
 
 impl ValidatedCodexInstallation {
+    #[cfg(test)]
+    pub(crate) fn fixture(executable: PathBuf) -> Self {
+        Self {
+            identity: CodexInstallationIdentity::from_parts(
+                executable,
+                CodexVersion::parse(CODEX_APP_SERVER_V1_QUALIFICATION_VERSION).unwrap(),
+                CodexCompatibilityProfile::CodexAppServerV1,
+            ),
+            capabilities: CodexAppServerV1Capabilities {
+                required: REQUIRED_CAPABILITIES,
+            },
+        }
+    }
+
     pub(crate) fn executable(&self) -> &Path {
         self.identity.executable()
     }

@@ -158,6 +158,15 @@ or host. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider crede
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
 
+The operator-selected CodexAppServerV1 check applies the same first-executable,
+canonical-path, no-fallback rule to executable name `codex`. Its isolated version and
+generated-schema probes use fresh private native and XDG directories, accept only stable
+`>=0.147.0 <0.148.0`, and require the maintained App Server schema capability, including
+the ephemeral-thread contract. The validator does not read ambient `CODEX_HOME`, provider
+credentials, or
+native configuration; start an App Server thread; query a provider; or expose any such
+value in doctor output.
+
 Each probe has a bounded deadline, runs in an owned process group, drains both child
 output streams so a child cannot block on a full pipe, bounds retained standard output,
 and terminates and reaps the group before joining those streams. Truncated output is
@@ -200,7 +209,23 @@ inside the owner-private run diagnostics tree and removes its temporary ambient 
 links after containment quiesces. The transcript can be incomplete or malformed and is
 never workflow, result, failure, retry, or recovery authority. There is no automatic
 installation or cross-harness fallback. A missing or incompatible Claude installation
-fails Claude-required admission before launch while command-only and Pi work remain
-independent. Removing Claude from a runner service environment and restarting prevents
-future Claude admission; it is not an emergency sandbox or a way to
-revoke authority from already-running native work.
+fails Claude-required admission before launch while command-only and other selected work
+remain independent. Removing Claude from a runner service environment and restarting
+prevents future Claude admission; it is not an emergency sandbox or a way to revoke
+authority from already-running native work.
+
+## Codex execution authority
+
+CodexAppServerV1 launches the admitted canonical executable as `codex app-server` with
+unattended approval, runner-owned containment, native configuration, provider resources,
+and project resources. The profile does not sandbox native tool authority, supply
+credentials, translate model settings, or fall back to Pi or Claude Code. Local admission
+validates and pins only a workflow-selected Codex installation; command-only, Pi-only,
+and Claude-only workflows do not probe it.
+
+Each invocation creates one fresh ephemeral thread and one owner-private transient SQLite
+directory beneath private invocation staging. The directory remains outside the workflow
+execution root and ambient `CODEX_HOME`, stays live through settlement and process-group
+quiescence, and is then removed. Scherzo retains no native thread transcript or
+Codex-native state. App Server events remain the only native workflow, result, failure,
+retry, cancellation, settlement, or recovery authority.

@@ -149,9 +149,10 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
                 OsStr::new("/controlled/bin"),
                 &runner,
             ),
-            Err(ClaudeCodeInstallationFailure::Malformed(
-                ClaudeCodeProbe::Version
-            ))
+            Err(ClaudeCodeInstallationFailure::Malformed {
+                probe: ClaudeCodeProbe::Version,
+                version: None,
+            })
         );
     }
 
@@ -193,7 +194,10 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
             &missing_schema,
         ),
         Err(ClaudeCodeInstallationFailure::Unsupported(
-            ClaudeCodeIncompatibility::Capability(ClaudeCodeCapability::JsonSchema)
+            ClaudeCodeIncompatibility::Capability {
+                capability: ClaudeCodeCapability::JsonSchema,
+                version: "2.1.234".to_owned(),
+            }
         ))
     );
 }

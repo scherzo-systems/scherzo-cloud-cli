@@ -12,7 +12,7 @@ use super::validated::{
     ValidatedMessageSource, ValidatedOutput, ValidatedStep, ValidatedWorkflow, WorkflowImport,
     WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
-use super::{claude_code, pi};
+use super::{claude_code, codex, pi};
 
 const MAXIMUM_WORKFLOW_NODES: usize = 256;
 
@@ -806,6 +806,9 @@ fn validate_agent_profiles(
                     .ok_or_else(invalid_config)?,
                 HarnessDefinition::ClaudeCode { config } => claude_code::resolve_config(config)
                     .map(ValidatedHarness::ClaudeCode)
+                    .ok_or_else(invalid_config)?,
+                HarnessDefinition::Codex { config } => codex::resolve_config(config)
+                    .map(ValidatedHarness::Codex)
                     .ok_or_else(invalid_config)?,
             };
             Ok((name.clone(), harness))
