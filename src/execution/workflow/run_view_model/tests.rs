@@ -112,6 +112,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
+            failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
             from,
             to,
         },
@@ -654,6 +655,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
             super::super::publication::WorkflowRunStep {
                 id: "prepare".to_owned(),
                 kind: super::super::publication::WorkflowRunStepKind::Command,
+                failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "report".to_owned(),
@@ -669,6 +671,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
                 kind: super::super::publication::WorkflowRunStepKind::Command,
+                failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "receipt".to_owned(),

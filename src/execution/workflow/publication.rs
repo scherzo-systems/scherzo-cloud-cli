@@ -29,6 +29,7 @@ use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind
 use super::artifact_set;
 use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
+use super::document::FailurePolicy;
 use super::execution_root::open_directory;
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
@@ -82,6 +83,7 @@ pub(crate) enum WorkflowRunStepKind {
 pub(crate) struct WorkflowRunStep {
     pub(crate) id: String,
     pub(crate) kind: WorkflowRunStepKind,
+    pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: StepState<StepFailureCause, CapturedValue>,
     pub(crate) timing: Option<WorkflowStepTiming>,
     pub(crate) command_output: Option<StepDiagnostic>,
@@ -338,6 +340,7 @@ pub(crate) enum WorkflowStepStateV1 {
 pub(crate) struct WorkflowStepV1 {
     pub(crate) id: String,
     pub(crate) kind: String,
+    pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: WorkflowStepStateV1,
     #[serde(
         default,
@@ -1414,6 +1417,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             WorkflowRunStepKind::Agent => "agent",
         }
         .to_owned(),
+        failure_policy: step.failure_policy,
         state,
         started_at,
         duration_milliseconds,

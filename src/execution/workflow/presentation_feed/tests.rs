@@ -44,6 +44,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: "a".to_owned(),
+            failure_policy: FailurePolicy::Required,
             from,
             to,
         },
@@ -94,6 +95,7 @@ steps:
         WorkflowPresentationStep::Command {
             argv: vec!["printf".to_owned(), "hello world".to_owned()],
             cwd: Some("packages/a".to_owned()),
+            failure_policy: FailurePolicy::Required,
             direct_dependencies: Vec::new(),
             outputs: BTreeMap::new(),
         }
@@ -106,6 +108,7 @@ steps:
                 model: "openai/gpt-5".to_owned(),
                 thinking: Thinking::XHigh,
             },
+            failure_policy: FailurePolicy::Required,
             direct_dependencies: Vec::new(),
             outputs: BTreeMap::new(),
         }

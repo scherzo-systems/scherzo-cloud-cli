@@ -4,8 +4,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentProfile, AgentStep, CommandStep, CommonStep, HarnessDefinition,
-    MessageSource, Output, OutputReference, Step, ValueReference, WorkflowDocument,
+    Agent, AgentMessage, AgentProfile, AgentStep, CommandStep, CommonStep, FailurePolicy,
+    HarnessDefinition, MessageSource, Output, OutputReference, Step, ValueReference,
+    WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -42,6 +43,8 @@ enum StepDto {
 
 #[derive(Deserialize)]
 struct CommonStepDto {
+    #[serde(rename = "failurePolicy", default)]
+    failure_policy: FailurePolicy,
     #[serde(rename = "dependsOn", default)]
     control_dependencies: Vec<String>,
     cwd: Option<String>,
@@ -181,6 +184,7 @@ impl CommonStepDto {
             .collect();
 
         CommonStep {
+            failure_policy: self.failure_policy,
             control_dependencies: self.control_dependencies,
             cwd: self.cwd,
             outputs,

@@ -7,10 +7,10 @@ use super::document::{
 };
 use super::pi;
 use super::validated::{
-    RequiredImports, ResolvedOutputSource, ResolvedValueReference, ResolvedValueSource,
-    ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep, ValidatedCommandStep,
-    ValidatedCommonStep, ValidatedHarness, ValidatedMessageSource, ValidatedOutput, ValidatedStep,
-    ValidatedWorkflow, WorkflowImport, WorkflowValueType,
+    RequiredImports, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
+    ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
+    ValidatedCommandStep, ValidatedCommonStep, ValidatedHarness, ValidatedMessageSource,
+    ValidatedOutput, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,7 +30,9 @@ pub(crate) enum ValidationFailureKind {
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
     ConflictingAgentValueOutputs,
+    AdvisoryDataDependency,
     InvalidExportTarget,
+    AdvisoryExportTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +77,7 @@ impl fmt::Display for ValidationFailure {
 impl std::error::Error for ValidationFailure {}
 
 struct ValidatedGraph {
-    direct_prerequisites: BTreeMap<String, Vec<String>>,
+    direct_prerequisites: BTreeMap<String, Vec<ResolvedDirectPrerequisite>>,
     presentation_order: Vec<String>,
     ancestors: BTreeMap<String, BTreeSet<String>>,
 }
@@ -153,7 +155,7 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
     for (step_name, prerequisites) in &direct_prerequisites {
         for prerequisite in prerequisites {
             dependents
-                .entry(prerequisite.clone())
+                .entry(prerequisite.producer.clone())
                 .or_default()
                 .push(step_name.clone());
         }
@@ -194,8 +196,8 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
     for step_name in &presentation_order {
         let mut step_ancestors = BTreeSet::new();
         for prerequisite in &direct_prerequisites[step_name] {
-            step_ancestors.insert(prerequisite.clone());
-            if let Some(prerequisite_ancestors) = ancestors.get(prerequisite) {
+            step_ancestors.insert(prerequisite.producer.clone());
+            if let Some(prerequisite_ancestors) = ancestors.get(&prerequisite.producer) {
                 step_ancestors.extend(prerequisite_ancestors.iter().cloned());
             }
         }
@@ -211,12 +213,13 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
 
 fn resolve_direct_prerequisites(
     document: &WorkflowDocument,
-) -> Result<BTreeMap<String, Vec<String>>, ValidationFailure> {
+) -> Result<BTreeMap<String, Vec<ResolvedDirectPrerequisite>>, ValidationFailure> {
     document
         .steps
         .iter()
         .map(|(step_name, step)| {
-            let mut prerequisites = BTreeSet::new();
+            let mut control_dependencies = BTreeSet::new();
+            let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
             for (index, dependency) in common_step(step).control_dependencies.iter().enumerate() {
                 let location = || ValidationLocation::StepDependency {
                     step: step_name.clone(),
@@ -228,7 +231,7 @@ fn resolve_direct_prerequisites(
                         location(),
                     ));
                 }
-                if !prerequisites.insert(dependency.clone()) {
+                if !control_dependencies.insert(dependency.clone()) {
                     return Err(ValidationFailure::new(
                         ValidationFailureKind::DuplicateDependency,
                         location(),
@@ -240,9 +243,17 @@ fn resolve_direct_prerequisites(
                         location(),
                     ));
                 }
+                prerequisites.insert(
+                    dependency.clone(),
+                    ResolvedDirectPrerequisite {
+                        producer: dependency.clone(),
+                        control: true,
+                        data: false,
+                    },
+                );
             }
             infer_data_prerequisites(step_name, step, document, &mut prerequisites)?;
-            Ok((step_name.clone(), prerequisites.into_iter().collect()))
+            Ok((step_name.clone(), prerequisites.into_values().collect()))
         })
         .collect()
 }
@@ -251,7 +262,7 @@ fn infer_data_prerequisites(
     step_name: &str,
     step: &Step,
     document: &WorkflowDocument,
-    prerequisites: &mut BTreeSet<String>,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
 ) -> Result<(), ValidationFailure> {
     match step {
         Step::Command(command) => {
@@ -302,7 +313,7 @@ fn infer_message_prerequisite(
     step_name: &str,
     source: &MessageSource,
     document: &WorkflowDocument,
-    prerequisites: &mut BTreeSet<String>,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
 ) -> Result<(), ValidationFailure> {
     if let MessageSource::Reference(reference) = source {
@@ -315,7 +326,7 @@ fn infer_reference_prerequisite(
     step_name: &str,
     reference: &ValueReference,
     document: &WorkflowDocument,
-    prerequisites: &mut BTreeSet<String>,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
 ) -> Result<(), ValidationFailure> {
     let ValueReference::Output(reference) = reference else {
@@ -334,7 +345,24 @@ fn infer_reference_prerequisite(
             location,
         ));
     }
-    prerequisites.insert(reference.step.clone());
+    if common_step(&document.steps[&reference.step]).failure_policy
+        == super::document::FailurePolicy::Advisory
+        && common_step(&document.steps[step_name]).failure_policy
+            == super::document::FailurePolicy::Required
+    {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::AdvisoryDataDependency,
+            location,
+        ));
+    }
+    prerequisites
+        .entry(reference.step.clone())
+        .and_modify(|prerequisite| prerequisite.data = true)
+        .or_insert_with(|| ResolvedDirectPrerequisite {
+            producer: reference.step.clone(),
+            control: false,
+            data: true,
+        });
     Ok(())
 }
 
@@ -397,7 +425,10 @@ fn output_failure(kind: ValidationFailureKind, step: &str, output: &str) -> Vali
     )
 }
 
-fn validate_common(common: &CommonStep, prerequisites: &[String]) -> ValidatedCommonStep {
+fn validate_common(
+    common: &CommonStep,
+    prerequisites: &[ResolvedDirectPrerequisite],
+) -> ValidatedCommonStep {
     let outputs = common
         .outputs
         .iter()
@@ -413,6 +444,7 @@ fn validate_common(common: &CommonStep, prerequisites: &[String]) -> ValidatedCo
         .collect();
 
     ValidatedCommonStep {
+        failure_policy: common.failure_policy,
         prerequisites: prerequisites.to_vec(),
         cwd: common.cwd.clone(),
         outputs,
@@ -678,6 +710,14 @@ fn resolve_export(
     let Some(output) = common_step(step).outputs.get(&reference.output) else {
         return Err(invalid_export(name));
     };
+    if common_step(step).failure_policy == super::document::FailurePolicy::Advisory {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::AdvisoryExportTarget,
+            ValidationLocation::Export {
+                name: name.to_owned(),
+            },
+        ));
+    }
     Ok(ResolvedOutputSource {
         step: reference.step.clone(),
         output: reference.output.clone(),

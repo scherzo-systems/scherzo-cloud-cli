@@ -7,6 +7,14 @@ pub(super) fn utc_timestamp(value: OffsetDateTime) -> Result<String, time::error
     value.to_offset(UtcOffset::UTC).format(&Rfc3339)
 }
 
+pub(super) fn parse_canonical_utc_timestamp(value: &str) -> Option<OffsetDateTime> {
+    if !value.ends_with('Z') {
+        return None;
+    }
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    (utc_timestamp(parsed).ok()?.as_str() == value).then_some(parsed)
+}
+
 pub(super) fn is_canonical_relative_path(value: &str) -> bool {
     let path = Path::new(value);
     !value.is_empty()

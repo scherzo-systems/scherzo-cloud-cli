@@ -270,6 +270,7 @@ impl Fixture {
                 .map(|id| WorkflowRunStep {
                     id: id.clone(),
                     kind: WorkflowRunStepKind::Command,
+                    failure_policy: FailurePolicy::Required,
                     state: StepState::Succeeded {
                         outputs: BTreeMap::new(),
                     },
@@ -379,6 +380,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
+            failure_policy: FailurePolicy::Required,
             from: StepStateKind::Pending,
             to,
         },
@@ -972,6 +974,7 @@ steps:
     let step = WorkflowRunStep {
         id: "plan".to_owned(),
         kind: WorkflowRunStepKind::Agent,
+        failure_policy: FailurePolicy::Required,
         state: StepState::Succeeded {
             outputs: BTreeMap::from([(
                 "plan".to_owned(),

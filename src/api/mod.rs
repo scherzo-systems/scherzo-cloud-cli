@@ -26,8 +26,8 @@ pub(crate) use organizations::{
     list_organization_memberships, update_organization,
 };
 pub(crate) use runners::{
-    RunnerApi, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
-    RunnerRegistrationList,
+    RunnerActivationArtifact, RunnerActivationIssuance, RunnerActivationState, RunnerApi,
+    RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

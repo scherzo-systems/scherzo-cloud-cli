@@ -1,0 +1,7 @@
+schemaVersion: 1
+steps:
+  lint:
+    kind: cmd
+    failurePolicy: optional
+    command:
+      argv: ["./scripts/lint.sh"]

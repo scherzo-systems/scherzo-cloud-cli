@@ -43,9 +43,14 @@ fn definition(
                 (
                     (*step).to_owned(),
                     RuntimeStep {
+                        failure_policy: FailurePolicy::Required,
                         prerequisites: dependencies
                             .iter()
-                            .map(|dependency| (*dependency).to_owned())
+                            .map(|dependency| ResolvedDirectPrerequisite {
+                                producer: (*dependency).to_owned(),
+                                control: true,
+                                data: false,
+                            })
                             .collect::<Vec<_>>()
                             .into(),
                         inputs: BTreeMap::new(),
@@ -89,6 +94,7 @@ fn step_event(
     TransitionEvent::Step {
         sequence: sequence(value),
         step: step.to_owned(),
+        failure_policy: FailurePolicy::Required,
         from,
         to,
     }
@@ -2014,6 +2020,220 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
             .filter(|action| matches!(action.action, Action::FinishRun { .. }))
             .count(),
         1
+    );
+}
+
+#[test]
+fn advisory_failure_satisfies_control_and_keeps_the_gate_open() {
+    let mut runtime_definition =
+        definition(&[("lint", &[], &[]), ("package", &["lint"], &[])], &[], 1);
+    runtime_definition
+        .steps
+        .get_mut("lint")
+        .unwrap()
+        .failure_policy = FailurePolicy::Advisory;
+    let initialization = initialize_test(runtime_definition);
+    assert_eq!(initialization.actions, [start_action(1, "lint")]);
+    let mut state = initialization.state;
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "lint".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let failed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".to_owned(),
+            action: action_id(1),
+            cause: "lint failed".to_owned(),
+        },
+    );
+
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        }
+    );
+    assert_step(&state, "lint", StepStateKind::Failed);
+    assert_step(&state, "package", StepStateKind::Starting);
+    assert!(failed.events.iter().any(|event| matches!(
+        event,
+        TransitionEvent::Step {
+            step,
+            failure_policy: FailurePolicy::Advisory,
+            from: StepStateKind::Running,
+            to: StepStateKind::Failed,
+            ..
+        } if step == "lint"
+    )));
+    assert_eq!(failed.actions, [start_action(4, "package")]);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "package".to_owned(),
+            action: action_id(4),
+        },
+    );
+    let completed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "package".to_owned(),
+            action: action_id(4),
+            provisional: "unused".to_owned(),
+        },
+    );
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert!(matches!(
+        completed.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Succeeded,
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() {
+    let mut runtime_definition = definition(
+        &[
+            ("analyze", &[], &["report"]),
+            ("summarize", &["analyze"], &[]),
+            ("package", &["summarize"], &[]),
+        ],
+        &[],
+        1,
+    );
+    runtime_definition
+        .steps
+        .get_mut("analyze")
+        .unwrap()
+        .failure_policy = FailurePolicy::Advisory;
+    let summarize = runtime_definition.steps.get_mut("summarize").unwrap();
+    summarize.failure_policy = FailurePolicy::Advisory;
+    summarize.prerequisites = Arc::from([ResolvedDirectPrerequisite {
+        producer: "analyze".to_owned(),
+        control: true,
+        data: true,
+    }]);
+    let initialization = initialize_test(runtime_definition);
+    let mut state = initialization.state;
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "analyze".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let failed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "analyze".to_owned(),
+            action: action_id(1),
+            cause: "analysis failed".to_owned(),
+        },
+    );
+
+    assert_step(&state, "analyze", StepStateKind::Failed);
+    assert_eq!(
+        state.steps["summarize"].state,
+        StepState::Blocked {
+            dependency: "analyze".to_owned(),
+        }
+    );
+    assert_step(&state, "package", StepStateKind::Starting);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        }
+    );
+    assert_eq!(failed.actions, [start_action(5, "package")]);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "package".to_owned(),
+            action: action_id(5),
+        },
+    );
+    let completed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "package".to_owned(),
+            action: action_id(5),
+            provisional: "unused".to_owned(),
+        },
+    );
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert!(matches!(
+        completed.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Succeeded,
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn required_failure_remains_primary_after_an_advisory_failure() {
+    let mut runtime_definition = definition(&[("lint", &[], &[]), ("test", &[], &[])], &[], 2);
+    runtime_definition
+        .steps
+        .get_mut("lint")
+        .unwrap()
+        .failure_policy = FailurePolicy::Advisory;
+    let initialization = initialize_test(runtime_definition);
+    let mut state = initialization.state;
+    for (step, action) in [("lint", 1), ("test", 2)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.to_owned(),
+                action: action_id(action),
+            },
+        );
+    }
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".to_owned(),
+            action: action_id(1),
+            cause: "advisory".to_owned(),
+        },
+    );
+    let required = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "test".to_owned(),
+            action: action_id(2),
+            cause: "required".to_owned(),
+        },
+    );
+    let primary_failure = failure("test", FailurePhase::Execution, "required");
+
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_failure: primary_failure.clone(),
+            later_cancellation: None,
+        }
+    );
+    assert_eq!(
+        required.actions,
+        [finish_failed_action(8, primary_failure, ExportSet::new())]
     );
 }
 

@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud runner activation revoke --help
+Revoke a runner activation
+
+Usage: scherzo-cloud runner activation revoke [OPTIONS] <ORGANIZATION> <RUNNER> <ACTIVATION>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUNNER>        Runner ID or exact name
+  <ACTIVATION>    Runner activation ID
+
+Options:
+      --json                 Print the runner result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

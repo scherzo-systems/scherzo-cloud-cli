@@ -875,6 +875,9 @@
             },
             "to": {
               "const": "starting"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -882,6 +885,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to"
           ]
@@ -907,6 +911,9 @@
             },
             "to": {
               "const": "running"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -914,6 +921,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to"
           ]
@@ -939,6 +947,9 @@
             },
             "to": {
               "const": "capturing_outputs"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -946,6 +957,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to"
           ]
@@ -971,6 +983,9 @@
             },
             "to": {
               "const": "succeeded"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -978,6 +993,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to"
           ]
@@ -1010,6 +1026,9 @@
             },
             "failure": {
               "$ref": "#/$defs/StartStepFailureEvidence"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -1017,6 +1036,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to",
             "failure"
@@ -1046,6 +1066,9 @@
             },
             "failure": {
               "$ref": "#/$defs/ExecutionStepFailureEvidence"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -1053,6 +1076,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to",
             "failure"
@@ -1082,6 +1106,9 @@
             },
             "failure": {
               "$ref": "#/$defs/OutputCaptureStepFailureEvidence"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -1089,6 +1116,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to",
             "failure"
@@ -1120,6 +1148,9 @@
         },
         "dependency": {
           "$ref": "#/$defs/stepId"
+        },
+        "failurePolicy": {
+          "$ref": "#/$defs/FailurePolicy"
         }
       },
       "required": [
@@ -1127,6 +1158,7 @@
         "eventType",
         "transitionSequence",
         "stepId",
+        "failurePolicy",
         "from",
         "to",
         "dependency"
@@ -1156,6 +1188,9 @@
         },
         "reason": {
           "const": "failure_stop"
+        },
+        "failurePolicy": {
+          "$ref": "#/$defs/FailurePolicy"
         }
       },
       "required": [
@@ -1163,6 +1198,7 @@
         "eventType",
         "transitionSequence",
         "stepId",
+        "failurePolicy",
         "from",
         "to",
         "reason"
@@ -1196,6 +1232,9 @@
         },
         "reason": {
           "$ref": "#/$defs/RuntimeCancellationReason"
+        },
+        "failurePolicy": {
+          "$ref": "#/$defs/FailurePolicy"
         }
       },
       "required": [
@@ -1203,6 +1242,7 @@
         "eventType",
         "transitionSequence",
         "stepId",
+        "failurePolicy",
         "from",
         "to",
         "reason"
@@ -1234,6 +1274,9 @@
             },
             "reason": {
               "$ref": "#/$defs/RuntimeCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -1241,6 +1284,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to",
             "reason"
@@ -1270,6 +1314,9 @@
             },
             "reason": {
               "$ref": "#/$defs/RuntimeCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
             }
           },
           "required": [
@@ -1277,6 +1324,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "failurePolicy",
             "from",
             "to",
             "reason"
@@ -2247,6 +2295,12 @@
       "required": [
         "phase",
         "cause"
+      ]
+    },
+    "FailurePolicy": {
+      "enum": [
+        "required",
+        "advisory"
       ]
     }
   }

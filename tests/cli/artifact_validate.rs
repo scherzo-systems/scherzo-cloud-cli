@@ -69,6 +69,7 @@ impl ArtifactSet {
             "steps": [{
                 "id": "produce",
                 "kind": "agent",
+                "failurePolicy": "required",
                 "state": "succeeded",
                 "startedAt": "2026-08-06T10:00:00Z",
                 "durationMilliseconds": 1000

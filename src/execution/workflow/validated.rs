@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::claude_code::ClaudeCodeConfig;
-use super::document::Output;
+use super::document::{FailurePolicy, Output};
 use super::pi::PiConfig;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -55,8 +55,16 @@ pub(crate) struct ValidatedAgentStep {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedDirectPrerequisite {
+    pub(crate) producer: String,
+    pub(crate) control: bool,
+    pub(crate) data: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedCommonStep {
-    pub(crate) prerequisites: Vec<String>,
+    pub(crate) failure_policy: FailurePolicy,
+    pub(crate) prerequisites: Vec<ResolvedDirectPrerequisite>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, ValidatedOutput>,
 }

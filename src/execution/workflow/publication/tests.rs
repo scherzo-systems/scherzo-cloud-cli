@@ -129,6 +129,7 @@ fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunSte
     WorkflowRunStep {
         id: id.to_owned(),
         kind: WorkflowRunStepKind::Command,
+        failure_policy: FailurePolicy::Required,
         state: StepState::Succeeded { outputs },
         timing: Some(WorkflowStepTiming {
             started_at: timestamp_fixture("2026-08-02T12:01:44.01Z"),

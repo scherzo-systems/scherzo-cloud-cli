@@ -1,0 +1,15 @@
+```console
+$ scherzo-cloud runner enroll --help
+Enroll a protected runner credential
+
+Usage: scherzo-cloud runner enroll [OPTIONS] --config <PATH>
+
+Options:
+      --activation-file <PATH|->  Read the activation artifact from a protected file or explicit stdin
+      --resume                    Resend the exact unresolved enrollment journal
+      --replace-credential        Stage the enrolled credential as a replacement for this runner
+      --config <PATH>             Read the closed runner operator configuration
+      --json                      Print the non-secret enrollment result as JSON
+  -h, --help                      Print help
+
+```

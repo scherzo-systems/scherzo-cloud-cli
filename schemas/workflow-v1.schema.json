@@ -95,6 +95,11 @@
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": { "$ref": "#/$defs/ImportOrOutputReference" }
     },
+    "FailurePolicy": {
+      "enum": ["required", "advisory"],
+      "default": "required",
+      "description": "Controls workflow outcome and control-edge satisfaction when this step fails or is blocked. Omission resolves to required."
+    },
     "Dependencies": {
       "type": "array",
       "uniqueItems": true,
@@ -238,6 +243,7 @@
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "cmd" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
         "dependsOn": { "$ref": "#/$defs/Dependencies" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "inputs": { "$ref": "#/$defs/InputBindings" },
@@ -251,6 +257,7 @@
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "agent" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
         "dependsOn": { "$ref": "#/$defs/Dependencies" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },

@@ -1,0 +1,12 @@
+schemaVersion: 1
+steps:
+  lint:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv: ["./scripts/lint.sh"]
+  package:
+    kind: cmd
+    dependsOn: [lint]
+    command:
+      argv: ["./scripts/package.sh"]

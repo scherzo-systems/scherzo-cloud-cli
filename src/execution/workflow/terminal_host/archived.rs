@@ -415,10 +415,16 @@ impl StepProjection for ArchivedTerminalStepView {
                     WorkflowPresentationStep::Agent { .. } => None,
                 }
             }
-            ArchivedStepDetail::Failed(failure) => Some(archived_failure_detail(failure)),
-            ArchivedStepDetail::Blocked { dependency } => {
-                Some(format!("blocked by {}", safe_text(dependency)))
-            }
+            ArchivedStepDetail::Failed(failure) => Some(issue_detail_for_step(
+                archived_failure_detail(failure),
+                &self.definition,
+                self.state,
+            )),
+            ArchivedStepDetail::Blocked { dependency } => Some(issue_detail_for_step(
+                format!("blocked by {}", safe_text(dependency)),
+                &self.definition,
+                self.state,
+            )),
             ArchivedStepDetail::NotRun => Some("failure_stop".to_owned()),
             ArchivedStepDetail::Cancelled { reason } => {
                 Some(archived_cancellation_reason(*reason).to_owned())
@@ -679,6 +685,7 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
             cwd,
             direct_dependencies,
             outputs,
+            ..
         } => {
             for argument in argv {
                 *argument = safe_text(argument);
@@ -696,6 +703,7 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
             harness,
             direct_dependencies,
             outputs,
+            ..
         } => {
             *profile = safe_text(profile);
             match harness {
@@ -1410,7 +1418,7 @@ mod tests {
             "▏ ✓ prepare",
             "× verify",
             "prepare   cmd",
-            "succeeded · 1.0s",
+            "succeeded · required · 1.0s",
             "command",
             "printf payload",
             "report",
@@ -1801,6 +1809,7 @@ mod tests {
                 "\u{1b}]0;hostile title\u{7}payload".to_owned(),
             ],
             cwd: Some("work".to_owned()),
+            failure_policy: FailurePolicy::Required,
             direct_dependencies: Vec::new(),
             outputs: BTreeMap::from([(
                 "report".to_owned(),
@@ -1813,6 +1822,7 @@ mod tests {
         let verify_definition = WorkflowPresentationStep::Command {
             argv: vec!["verify".to_owned()],
             cwd: None,
+            failure_policy: FailurePolicy::Required,
             direct_dependencies: vec!["prepare".to_owned()],
             outputs: BTreeMap::new(),
         };
@@ -1857,6 +1867,7 @@ mod tests {
             steps: vec![
                 ArchivedStep {
                     id: "prepare".to_owned(),
+                    failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Succeeded,
                     started_at: Some(started),
                     duration: Some(Duration::from_secs(1)),
@@ -1865,6 +1876,7 @@ mod tests {
                 },
                 ArchivedStep {
                     id: "verify".to_owned(),
+                    failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Failed,
                     started_at: Some(started + Duration::from_secs(1)),
                     duration: Some(Duration::from_secs(2)),

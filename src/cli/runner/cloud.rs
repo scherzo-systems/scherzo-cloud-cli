@@ -352,7 +352,7 @@ fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
     }
 }
 
-fn write_failure(
+pub(super) fn write_failure(
     deployment: &str,
     failure: &RunnerFailure,
     json: bool,
@@ -404,6 +404,18 @@ fn write_failure(
             "idempotency_conflict",
             None,
             "error: runner request identity conflicted with another request\n\nRun the command again to use a new request identity.".to_owned(),
+            ExitCode::GeneralFailure,
+        ),
+        RunnerFailure::CredentialLimit => (
+            "credential_limit_reached",
+            None,
+            "error: runner credential limit reached\n\nRevoke a credential or wait for retirement before issuing another activation.".to_owned(),
+            ExitCode::GeneralFailure,
+        ),
+        RunnerFailure::ActivationUnavailable => (
+            "activation_unavailable",
+            None,
+            "error: runner activation is no longer available\n\nList activations and issue a replacement when needed.".to_owned(),
             ExitCode::GeneralFailure,
         ),
         RunnerFailure::Unreachable(category) => (

@@ -1,7 +1,9 @@
 pub(crate) mod credential;
 pub(crate) mod doctor;
+pub(crate) mod enrollment;
 pub(crate) mod service;
 mod telemetry;
+mod validation;
 
 fn is_loopback(endpoint: &url::Url) -> bool {
     match endpoint.host() {

@@ -458,6 +458,7 @@ fn signals_interrupt_blocked_status_output_without_a_valid_object() {
             .map(|index| {
                 serde_json::json!({
                     "id": format!("step-{index:05}"),
+                    "failurePolicy": "required",
                     "state": "succeeded"
                 })
             })

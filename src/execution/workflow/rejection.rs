@@ -362,9 +362,17 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "conflicting_agent_value_outputs",
             "Declare either one agent response output or one agent result output, not both.",
         ),
+        ValidationFailureKind::AdvisoryDataDependency => (
+            "advisory_data_dependency",
+            "Make the data consumer advisory or use a required output producer.",
+        ),
         ValidationFailureKind::InvalidExportTarget => (
             "invalid_export_target",
             "Reference a declared step output from the workflow export.",
+        ),
+        ValidationFailureKind::AdvisoryExportTarget => (
+            "advisory_export_target",
+            "Export an output from a required step.",
         ),
     }
 }

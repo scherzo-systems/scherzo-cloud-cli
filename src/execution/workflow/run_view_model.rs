@@ -843,7 +843,10 @@ fn validate_terminal_result(
         return Err(WorkflowRunViewModelError::InvalidTerminalResult);
     }
     for (view, terminal) in state.steps.iter().zip(&run.steps) {
-        if view.id != terminal.id || !terminal_step_is_valid(view, terminal) {
+        if view.id != terminal.id
+            || terminal.failure_policy != view.definition.failure_policy()
+            || !terminal_step_is_valid(view, terminal)
+        {
             return Err(WorkflowRunViewModelError::InvalidTerminalResult);
         }
     }

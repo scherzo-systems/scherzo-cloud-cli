@@ -5,17 +5,16 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use super::MAXIMUM_PARALLEL_STEPS;
+use super::document::FailurePolicy;
 use super::publication::{
     DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1, StepReasonV1,
     WorkflowOutcomeV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
-    utc_timestamp,
+    parse_canonical_utc_timestamp,
 };
 
 const MAXIMUM_STEPS: usize = 256;
@@ -92,8 +91,8 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
         || !is_lowercase_hex(&result.workflow.digest.value, 64)
         || !is_canonical_absolute_path(&result.execution.execution_root)
         || !(1..=MAXIMUM_PARALLEL_STEPS).contains(&result.execution.maximum_parallel_steps)
-        || parse_timestamp(&result.execution.started_at).is_none()
-        || parse_timestamp(&result.execution.finished_at).is_none()
+        || parse_canonical_utc_timestamp(&result.execution.started_at).is_none()
+        || parse_canonical_utc_timestamp(&result.execution.finished_at).is_none()
         || result.command_output_policy.encoding != BASE64_ENCODING
         || result
             .command_output_policy
@@ -116,10 +115,7 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         WorkflowOutcomeV1::Succeeded => {
             result.primary_failure.is_none()
                 && result.cancellation.is_none()
-                && result
-                    .steps
-                    .iter()
-                    .all(|step| step.state == WorkflowStepStateV1::Succeeded)
+                && result.steps.iter().all(step_succeeds_workflow)
         }
         WorkflowOutcomeV1::Failed => {
             result.primary_failure.is_some()
@@ -133,10 +129,7 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
             result.primary_failure.is_none()
                 && result.cancellation.is_some()
                 && result.steps.iter().all(|step| {
-                    matches!(
-                        step.state,
-                        WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Cancelled
-                    )
+                    step_succeeds_workflow(step) || step.state == WorkflowStepStateV1::Cancelled
                 })
                 && result
                     .steps
@@ -149,7 +142,7 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
     }
 
     if let Some(cancellation) = &result.cancellation
-        && parse_timestamp(&cancellation.force_stop_deadline).is_none()
+        && parse_canonical_utc_timestamp(&cancellation.force_stop_deadline).is_none()
     {
         return Err(ResultMetadataError);
     }
@@ -167,11 +160,21 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         .iter()
         .any(|step| {
             step.id == primary.step
+                && step.failure_policy == FailurePolicy::Required
                 && step.state == WorkflowStepStateV1::Failed
                 && step.failure.as_ref() == Some(&failure)
         })
         .then_some(())
         .ok_or(ResultMetadataError)
+}
+
+fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
+    step.state == WorkflowStepStateV1::Succeeded
+        || (step.failure_policy == FailurePolicy::Advisory
+            && matches!(
+                step.state,
+                WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
+            ))
 }
 
 fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
@@ -188,7 +191,7 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
             validate_failure(failure)?;
         }
         match (&step.started_at, step.duration_milliseconds) {
-            (Some(started_at), Some(_)) if parse_timestamp(started_at).is_some() => {}
+            (Some(started_at), Some(_)) if parse_canonical_utc_timestamp(started_at).is_some() => {}
             (None, None) => {}
             _ => return Err(ResultMetadataError),
         }
@@ -553,14 +556,6 @@ pub(super) fn parse_carrier_ordinal(path: &str) -> Option<usize> {
     }
     let value = ordinal.parse::<usize>().ok().filter(|value| *value != 0)?;
     (format!("{value:04}") == ordinal).then_some(value)
-}
-
-fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
-    if !value.ends_with('Z') {
-        return None;
-    }
-    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
-    (utc_timestamp(parsed).ok()?.as_str() == value).then_some(parsed)
 }
 
 struct UniqueValue(Value);

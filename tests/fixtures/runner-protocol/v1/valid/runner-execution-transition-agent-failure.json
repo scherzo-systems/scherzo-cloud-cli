@@ -17,6 +17,7 @@
       "eventType": "step_state_changed",
       "transitionSequence": 11,
       "stepId": "agent",
+      "failurePolicy": "advisory",
       "from": "running",
       "to": "failed",
       "failure": {

@@ -16,11 +16,19 @@ const NAME_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/runner-name-una
 const QUANTITY_LIMIT: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
 const RATE_LIMIT: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+const CREDENTIAL_LIMIT: &str = "https://api.scherzo.dev/problems/runner-credential-limit-reached";
+const ACTIVATION_UNAVAILABLE: &str =
+    "https://api.scherzo.dev/problems/runner-activation-unavailable";
 
 pub(crate) type RunnerPool = models::RunnerPool;
 pub(crate) type RunnerPoolList = models::RunnerPoolList;
 pub(crate) type RunnerRegistration = models::RunnerRegistration;
 pub(crate) type RunnerRegistrationList = models::RunnerRegistrationList;
+pub(crate) type RunnerActivation = models::RunnerActivation;
+pub(crate) type RunnerActivationList = models::RunnerActivationList;
+pub(crate) type RunnerActivationState = models::runner_activation::State;
+pub(crate) type RunnerActivationArtifact = models::RunnerActivationArtifact;
+pub(crate) type RunnerActivationIssuance = models::RunnerActivationIssuance;
 
 pub(crate) struct RunnerApi {
     configuration: apis::configuration::Configuration,
@@ -125,6 +133,75 @@ impl RunnerApi {
         .map_err(classify_runner_error)
     }
 
+    pub(crate) fn create_registration(
+        &self,
+        organization: &str,
+        idempotency_key: &str,
+        pool_id: &str,
+        name: Option<&str>,
+    ) -> Result<RunnerRegistration, RunnerFailure> {
+        let mut request = models::CreateRunnerRegistrationRequest::new(pool_id.to_owned());
+        request.name = name.map(ToOwned::to_owned);
+        runners_api::create_runner_registration(
+            &self.configuration,
+            organization,
+            idempotency_key,
+            request,
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn create_activation(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerActivationIssuance, RunnerFailure> {
+        runners_api::create_runner_activation(
+            &self.configuration,
+            organization,
+            runner_id,
+            idempotency_key,
+            models::CreateRunnerActivationRequest::new(),
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn list_activations(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        limit: Option<u16>,
+        cursor: Option<&str>,
+    ) -> Result<RunnerActivationList, RunnerFailure> {
+        runners_api::list_runner_activations(
+            &self.configuration,
+            organization,
+            runner_id,
+            limit.map(i32::from),
+            cursor,
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn revoke_activation(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        activation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerActivation, RunnerFailure> {
+        runners_api::revoke_runner_activation(
+            &self.configuration,
+            organization,
+            runner_id,
+            activation_id,
+            idempotency_key,
+            models::RevokeRunnerActivationRequest::new(),
+        )
+        .map_err(classify_runner_error)
+    }
+
     pub(crate) fn list_registrations(
         &self,
         organization: &str,
@@ -218,6 +295,8 @@ pub(crate) enum RunnerFailure {
     QuantityLimitReached,
     RateLimited,
     IdempotencyConflict,
+    CredentialLimit,
+    ActivationUnavailable,
     Unreachable(UnreachableCategory),
     Protocol,
 }
@@ -253,6 +332,8 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
         (StatusCode::CONFLICT, NAME_UNAVAILABLE) => RunnerFailure::NameUnavailable,
         (StatusCode::CONFLICT, QUANTITY_LIMIT) => RunnerFailure::QuantityLimitReached,
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => RunnerFailure::IdempotencyConflict,
+        (StatusCode::CONFLICT, CREDENTIAL_LIMIT) => RunnerFailure::CredentialLimit,
+        (StatusCode::CONFLICT, ACTIVATION_UNAVAILABLE) => RunnerFailure::ActivationUnavailable,
         (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT) => RunnerFailure::RateLimited,
         _ => RunnerFailure::Protocol,
     }

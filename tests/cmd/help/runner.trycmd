@@ -5,13 +5,16 @@ Work with the Scherzo Cloud runner
 Usage: scherzo-cloud runner [COMMAND]
 
 Commands:
-  pool    Manage Scherzo Cloud runner pools
-  list    List Scherzo Cloud runner registrations
-  show    Show a Scherzo Cloud runner registration
-  rename  Rename a Scherzo Cloud runner registration
-  doctor  Check local runner prerequisites
-  serve   Connect to Scherzo Cloud and serve run assignments
-  help    Print this message or the help of the given subcommand(s)
+  pool        Manage Scherzo Cloud runner pools
+  create      Create a runner registration and enrollment activation
+  activation  Manage runner enrollment activations
+  enroll      Enroll a protected runner credential
+  list        List Scherzo Cloud runner registrations
+  show        Show a Scherzo Cloud runner registration
+  rename      Rename a Scherzo Cloud runner registration
+  doctor      Check local runner prerequisites
+  serve       Connect to Scherzo Cloud and serve run assignments
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help

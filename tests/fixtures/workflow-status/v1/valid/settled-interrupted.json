@@ -49,6 +49,7 @@
           "steps": [
             {
               "id": "check",
+              "failurePolicy": "required",
               "state": "pending"
             }
           ],

@@ -4,6 +4,8 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
+use super::validation::{valid_secret_syntax, valid_typed_id};
+
 const MAX_CREDENTIAL_FILE_BYTES: usize = 256;
 const MAX_CREDENTIAL_FILE_BYTES_U64: u64 = 256;
 #[expect(
@@ -102,25 +104,11 @@ fn validate_private_file(metadata: &fs::Metadata) -> Result<(), CredentialError>
 }
 
 fn valid_runner_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("rnr_") else {
-        return false;
-    };
-    let bytes = suffix.as_bytes();
-    bytes.len() == 26
-        && matches!(bytes.first(), Some(b'0'..=b'7'))
-        && bytes[1..].iter().all(|byte| {
-            matches!(
-                byte,
-                b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'
-            )
-        })
+    valid_typed_id(value, "rnr_")
 }
 
 fn valid_secret(value: &str) -> bool {
-    value.len() == 43
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    valid_secret_syntax(value)
 }
 
 #[cfg(test)]

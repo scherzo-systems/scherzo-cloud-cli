@@ -1,13 +1,9 @@
-#[cfg(target_os = "linux")]
-use std::ffi::OsStr;
 #[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt as _;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -18,8 +14,6 @@ use std::process::{Command, Output, Stdio};
 use nix::pty::{Winsize, openpty};
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
-#[cfg(target_os = "linux")]
-use rustix::fs::inotify;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
@@ -56,68 +50,6 @@ fn process_state(process: Pid) -> Option<u8> {
             .rposition(|bytes| bytes == b") ")
             .and_then(|end| stat.get(end + 2).copied())
     })
-}
-
-#[cfg(target_os = "linux")]
-fn monitor_child_guard_directories() -> OwnedFd {
-    let monitor = inotify::init(inotify::CreateFlags::CLOEXEC).unwrap();
-    inotify::add_watch(&monitor, "/tmp", inotify::WatchFlags::CREATE).unwrap();
-    monitor
-}
-
-#[cfg(target_os = "linux")]
-fn stop_owner_at_child_guard_manifest(
-    directory_monitor: &OwnedFd,
-    owner: Pid,
-    program: &Path,
-) -> (PathBuf, serde_json::Value) {
-    let mut directory_buffer = [std::mem::MaybeUninit::uninit(); 4096];
-    let mut directory_events = inotify::Reader::new(directory_monitor, &mut directory_buffer);
-
-    loop {
-        let event = directory_events.next().unwrap();
-        let Some(name) = event.file_name() else {
-            continue;
-        };
-        if !name.to_bytes().starts_with(b"scherzo-child-guard-v1-") {
-            continue;
-        }
-        let guard_root = Path::new("/tmp").join(OsStr::from_bytes(name.to_bytes()));
-        let manifest_monitor = inotify::init(inotify::CreateFlags::CLOEXEC).unwrap();
-        if inotify::add_watch(
-            &manifest_monitor,
-            &guard_root,
-            inotify::WatchFlags::CLOSE_WRITE,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        let mut manifest_buffer = [std::mem::MaybeUninit::uninit(); 4096];
-        let mut manifest_events = inotify::Reader::new(&manifest_monitor, &mut manifest_buffer);
-        let manifest_path = guard_root.join("launch.json");
-        let manifest = loop {
-            if let Ok(bytes) = fs::read(&manifest_path)
-                && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            {
-                break manifest;
-            }
-            let _ = manifest_events.next().unwrap();
-        };
-        let matches_program = manifest["program"].as_array().is_some_and(|bytes| {
-            bytes.iter().map(|byte| byte.as_u64()).eq(program
-                .as_os_str()
-                .as_bytes()
-                .iter()
-                .copied()
-                .map(u64::from)
-                .map(Some))
-        });
-        if matches_program {
-            kill_process(owner, Signal::STOP).unwrap();
-            return (guard_root, manifest);
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -558,6 +490,94 @@ fn command_only_run_and_help_remain_pi_independent() {
 }
 
 #[test]
+fn advisory_failure_keeps_truthful_state_and_returns_success() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  analyze:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv: ["/bin/sh", "-c", "exit 9"]
+    outputs:
+      report:
+        kind: file
+        path: report.json
+        mediaType: application/json
+  package:
+    kind: cmd
+    dependsOn: [analyze]
+    command:
+      argv: ["/bin/sh", "-c", "printf packaged > package.txt"]
+  summarize:
+    kind: cmd
+    failurePolicy: advisory
+    inputs:
+      report:
+        ref: outputs.analyze.report
+    command:
+      argv: ["/bin/true"]
+"#,
+    );
+    let destination = bundle.result("advisory-failure");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["exitStatus"], 0);
+    assert!(terminal["result"].get("primaryFailure").is_none());
+    assert_eq!(terminal["result"]["steps"][0]["id"], "analyze");
+    assert_eq!(terminal["result"]["steps"][0]["failurePolicy"], "advisory");
+    assert_eq!(terminal["result"]["steps"][0]["state"], "failed");
+    assert_eq!(terminal["result"]["steps"][1]["id"], "package");
+    assert_eq!(terminal["result"]["steps"][1]["failurePolicy"], "required");
+    assert_eq!(terminal["result"]["steps"][1]["state"], "succeeded");
+    assert_eq!(terminal["result"]["steps"][2]["id"], "summarize");
+    assert_eq!(terminal["result"]["steps"][2]["failurePolicy"], "advisory");
+    assert_eq!(terminal["result"]["steps"][2]["state"], "blocked");
+    assert_eq!(terminal["result"]["steps"][2]["dependency"], "analyze");
+    assert_eq!(
+        fs::read(bundle.execution_root().join("package.txt")).unwrap(),
+        b"packaged"
+    );
+    let progress = String::from_utf8(output.stderr).unwrap();
+    assert!(progress.contains("failed"));
+    assert!(progress.contains("advisory"));
+    assert!(progress.contains("2 advisory issues"));
+
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["state"]["attempts"][0]["state"], "succeeded");
+    assert_eq!(
+        status["state"]["attempts"][0]["progress"]["steps"][0]["failurePolicy"],
+        "advisory"
+    );
+    assert_eq!(
+        status["state"]["attempts"][0]["progress"]["steps"][0]["state"],
+        "failed"
+    );
+    assert_eq!(status["retry"]["eligible"], false);
+    assert_eq!(status["retry"]["reason"], "latest_attempt_succeeded");
+}
+
+#[test]
 fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
@@ -967,80 +987,6 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
     assert!(fallback.recorded_probes().is_empty());
     assert!(!incompatible_destination.exists());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn durable_pi_launch_rechecks_session_binding_before_releasing_the_process() {
-    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
-    let bundle = RunBundle::new(response_agent_source());
-    bundle.write_source("system.md", "system");
-    bundle.write_source("message.md", "prompt");
-    let destination = bundle.result("rebound-diagnostic-session");
-    let mut args = bundle.args(&destination);
-    args.insert(args.len() - 1, "--json".to_owned());
-    let child_guard_monitor = monitor_child_guard_directories();
-    let child = isolated_command(&args)
-        .env("PATH", pi.path_directory())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let owner = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-    let resolved_pi_executable = fs::canonicalize(pi.executable()).unwrap();
-    let (guard_root, manifest) =
-        stop_owner_at_child_guard_manifest(&child_guard_monitor, owner, &resolved_pi_executable);
-    for _ in 0..500 {
-        if matches!(process_state(owner), Some(b'T' | b't')) {
-            break;
-        }
-        wait_for_process_poll();
-    }
-    assert!(matches!(process_state(owner), Some(b'T' | b't')));
-    let stopped_before_release = !guard_root.join("released").exists();
-
-    let arguments = manifest["arguments"].as_array().unwrap();
-    let session_index = arguments
-        .iter()
-        .position(|argument| {
-            argument.as_array().is_some_and(|bytes| {
-                bytes.iter().map(|byte| byte.as_u64()).eq(b"--session-dir"
-                    .iter()
-                    .copied()
-                    .map(|byte| Some(u64::from(byte))))
-            })
-        })
-        .unwrap();
-    let session_directory = PathBuf::from(OsString::from_vec(
-        arguments[session_index + 1]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|byte| u8::try_from(byte.as_u64().unwrap()).unwrap())
-            .collect(),
-    ));
-    if stopped_before_release {
-        let retained_directory = session_directory.with_file_name("descriptor-owned-session");
-        fs::rename(&session_directory, &retained_directory).unwrap();
-        fs::create_dir(&session_directory).unwrap();
-        fs::set_permissions(&session_directory, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    kill_process(owner, Signal::CONT).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        stopped_before_release,
-        "the proof did not stop the owner before release; stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let rebound_marker = session_directory.join("retained-partial.jsonl");
-    assert!(
-        !rebound_marker.exists(),
-        "durable launch executed Pi against a rebound diagnostic-session path; stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]

@@ -3,9 +3,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::admission::{AdmittedWorkflow, CancellationReason};
+use super::document::FailurePolicy;
 use super::validated::{
-    ResolvedValueSource, ValidatedCommonStep, ValidatedMessageSource, ValidatedStep,
-    ValidatedWorkflow,
+    ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedCommonStep, ValidatedMessageSource,
+    ValidatedStep, ValidatedWorkflow,
 };
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -130,16 +131,6 @@ impl<Cause, Output> StepState<Cause, Output> {
                 | Self::Cancelled { .. }
         )
     }
-
-    fn is_terminal_without_success(&self) -> bool {
-        matches!(
-            self,
-            Self::Failed { .. }
-                | Self::Blocked { .. }
-                | Self::NotRun { .. }
-                | Self::Cancelled { .. }
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,7 +155,8 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeStep {
-    prerequisites: Arc<[String]>,
+    failure_policy: FailurePolicy,
+    prerequisites: Arc<[ResolvedDirectPrerequisite]>,
     inputs: BTreeMap<String, ResolvedValueSource>,
     declared_outputs: BTreeSet<String>,
 }
@@ -199,6 +191,7 @@ impl RuntimeDefinition {
                 (
                     step_id.clone(),
                     RuntimeStep {
+                        failure_policy: common.failure_policy,
                         prerequisites: Arc::from(common.prerequisites.clone()),
                         inputs: match step {
                             ValidatedStep::Command(command) => command
@@ -382,6 +375,7 @@ pub(crate) enum TransitionEvent<Cause, Deadline> {
     Step {
         sequence: TransitionSequence,
         step: String,
+        failure_policy: FailurePolicy,
         from: StepStateKind,
         to: StepStateKind,
     },
@@ -755,6 +749,13 @@ where
         return false;
     }
 
+    let failure_policy = reduction
+        .state
+        .definition
+        .steps
+        .get(&step)
+        .map(|definition| definition.failure_policy)
+        .unwrap_or_default();
     let primary_failure = StepFailure {
         step: step.clone(),
         phase,
@@ -767,7 +768,9 @@ where
         StepState::Failed { phase, cause },
         None,
     );
-    close_gate_for_failure(&mut reduction.state, &mut reduction.events, primary_failure);
+    if failure_policy == FailurePolicy::Required {
+        close_gate_for_failure(&mut reduction.state, &mut reduction.events, primary_failure);
+    }
     true
 }
 
@@ -802,7 +805,7 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
     Cause: Clone,
     Output: Clone,
 {
-    propagate_failure_stop(reduction);
+    propagate_pending_dispositions(reduction);
     select_ready_steps(reduction);
     finish_if_terminal(reduction);
 }
@@ -813,18 +816,9 @@ enum PendingDisposition {
     NotRun,
 }
 
-fn propagate_failure_stop<Provisional, Cause, Output, Deadline>(
+fn propagate_pending_dispositions<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) {
-    if !matches!(
-        &reduction.state.workflow,
-        WorkflowState::Executing {
-            gate: SchedulingGate::FailureStopped { .. }
-        }
-    ) {
-        return;
-    }
-
     while let Some((step, disposition)) = next_pending_disposition(&reduction.state) {
         let state = match disposition {
             PendingDisposition::Blocked { dependency } => StepState::Blocked { dependency },
@@ -845,6 +839,12 @@ fn propagate_failure_stop<Provisional, Cause, Output, Deadline>(
 fn next_pending_disposition<Cause, Output>(
     state: &RuntimeState<Cause, Output>,
 ) -> Option<(String, PendingDisposition)> {
+    let failure_stopped = matches!(
+        &state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped { .. }
+        }
+    );
     state
         .definition
         .steps
@@ -855,36 +855,54 @@ fn next_pending_disposition<Cause, Output>(
                 return None;
             }
 
-            if let Some(dependency) = definition
+            if let Some(prerequisite) = definition
                 .prerequisites
                 .iter()
-                .filter(|dependency| {
+                .filter(|prerequisite| {
                     state
                         .steps
-                        .get(*dependency)
-                        .is_some_and(|step| step.state.is_terminal_without_success())
+                        .get(&prerequisite.producer)
+                        .is_some_and(|step| step.state.is_terminal())
+                        && !prerequisite_satisfied(state, prerequisite)
                 })
-                .min()
+                .min_by(|left, right| left.producer.cmp(&right.producer))
             {
                 return Some((
                     step_id.clone(),
                     PendingDisposition::Blocked {
-                        dependency: dependency.clone(),
+                        dependency: prerequisite.producer.clone(),
                     },
                 ));
             }
 
-            definition
-                .prerequisites
-                .iter()
-                .all(|dependency| {
-                    state
-                        .steps
-                        .get(dependency)
-                        .is_some_and(|step| matches!(step.state, StepState::Succeeded { .. }))
-                })
-                .then(|| (step_id.clone(), PendingDisposition::NotRun))
+            (failure_stopped
+                && definition
+                    .prerequisites
+                    .iter()
+                    .all(|prerequisite| prerequisite_satisfied(state, prerequisite)))
+            .then(|| (step_id.clone(), PendingDisposition::NotRun))
         })
+}
+
+fn prerequisite_satisfied<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
+    prerequisite: &ResolvedDirectPrerequisite,
+) -> bool {
+    let Some(producer) = state.steps.get(&prerequisite.producer) else {
+        return false;
+    };
+    let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+    let control_satisfied = succeeded
+        || (state
+            .definition
+            .steps
+            .get(&prerequisite.producer)
+            .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
+            && matches!(
+                producer.state,
+                StepState::Failed { .. } | StepState::Blocked { .. }
+            ));
+    (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
 }
 
 fn select_ready_steps<Provisional, Cause, Output, Deadline>(
@@ -982,12 +1000,10 @@ fn step_is_ready<Cause, Output>(
         .steps
         .get(step_id)
         .is_some_and(|step| matches!(step.state, StepState::Pending))
-        && definition.prerequisites.iter().all(|dependency| {
-            state
-                .steps
-                .get(dependency)
-                .is_some_and(|step| matches!(step.state, StepState::Succeeded { .. }))
-        })
+        && definition
+            .prerequisites
+            .iter()
+            .all(|prerequisite| prerequisite_satisfied(state, prerequisite))
 }
 
 fn finish_if_terminal<Provisional, Cause, Output, Deadline>(
@@ -1154,6 +1170,12 @@ fn transition_step<Cause, Output, Deadline>(
     current_action: Option<ActionId>,
 ) -> TransitionSequence {
     let sequence = next_sequence(state);
+    let failure_policy = state
+        .definition
+        .steps
+        .get(step)
+        .map(|definition| definition.failure_policy)
+        .unwrap_or_default();
     if let Some(runtime) = state.steps.get_mut(step) {
         let from = runtime.state.kind();
         let to_kind = to.kind();
@@ -1162,6 +1184,7 @@ fn transition_step<Cause, Output, Deadline>(
         events.push(TransitionEvent::Step {
             sequence,
             step: step.to_owned(),
+            failure_policy,
             from,
             to: to_kind,
         });

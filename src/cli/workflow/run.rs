@@ -24,11 +24,10 @@ use crate::execution::workflow::admission::{
     ResolvedAttachment, ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
-use crate::execution::workflow::agent::dispatch::{
-    ClosedAgentDispatcher, UnavailableClaudeCodeAdapter,
-};
+use crate::execution::workflow::agent::dispatch::ClosedAgentDispatcher;
 use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::ArtifactStaging;
+use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
 use crate::execution::workflow::coordinator::CoordinationError;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
@@ -479,7 +478,13 @@ pub(super) async fn execute_owned_attempt(
                     return diagnose("prepare local PiJsonV1 runtime");
                 }
             };
-            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, UnavailableClaudeCodeAdapter);
+            let claude_code_adapter = ClaudeCodeStreamJsonV1Adapter::new(
+                diagnostics.clone(),
+                admitted.execution().limits().maximum_step_log_bytes(),
+                SystemExecutionClock,
+                observer.clone(),
+            );
+            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, claude_code_adapter);
             AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_directory.as_str())),
                 staging.clone(),
@@ -1380,18 +1385,19 @@ fn build_run_result(
                 })
             }
         };
-        let kind = match workflow.definition.steps.get(id) {
-            Some(crate::execution::workflow::validated::ValidatedStep::Command(_)) => {
-                WorkflowRunStepKind::Command
+        let (kind, failure_policy) = match workflow.definition.steps.get(id) {
+            Some(crate::execution::workflow::validated::ValidatedStep::Command(command)) => {
+                (WorkflowRunStepKind::Command, command.common.failure_policy)
             }
-            Some(crate::execution::workflow::validated::ValidatedStep::Agent(_)) => {
-                WorkflowRunStepKind::Agent
+            Some(crate::execution::workflow::validated::ValidatedStep::Agent(agent)) => {
+                (WorkflowRunStepKind::Agent, agent.common.failure_policy)
             }
             None => return Err(invalid_terminal_result_error()),
         };
         steps.push(WorkflowRunStep {
             id: id.clone(),
             kind,
+            failure_policy,
             state,
             timing,
             command_output: (kind == WorkflowRunStepKind::Command)
@@ -1859,6 +1865,7 @@ mod tests {
             event: TransitionEvent::Step {
                 sequence: TransitionSequence::default(),
                 step: "step".to_owned(),
+                failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 from,
                 to,
             },

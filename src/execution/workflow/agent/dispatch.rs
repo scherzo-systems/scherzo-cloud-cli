@@ -80,27 +80,5 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct UnavailableClaudeCodeAdapter;
-
-impl<Sink> AgentAdapter<Sink> for UnavailableClaudeCodeAdapter
-where
-    Sink: AgentObservationSink,
-{
-    type NativeConfiguration = ClaudeCodeConfig;
-    type ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits;
-
-    async fn invoke(
-        &self,
-        _invocation: super::AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
-        _started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        let _ = terminal.report(AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests;

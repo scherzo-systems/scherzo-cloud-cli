@@ -1,9 +1,9 @@
 use super::super::decode;
-use super::super::document::{HarnessDefinition, Output, Step, ValueReference};
+use super::super::document::{FailurePolicy, HarnessDefinition, Output, Step, ValueReference};
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
-    ResolvedOutputSource, ResolvedValueSource, ValidatedHarness, ValidatedMessageSource,
-    ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
+    ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueSource, ValidatedHarness,
+    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 use super::{ValidationFailureKind, ValidationLocation};
 
@@ -19,6 +19,111 @@ fn assert_failure(source: &str, kind: ValidationFailureKind, location: Validatio
 
 fn command_step(name: &str, dependencies: &str) -> String {
     format!("  {name}:\n    kind: cmd\n{dependencies}    command:\n      argv: [\"true\"]\n")
+}
+
+fn prerequisite_shape(prerequisites: &[ResolvedDirectPrerequisite]) -> Vec<(&str, bool, bool)> {
+    prerequisites
+        .iter()
+        .map(|prerequisite| {
+            (
+                prerequisite.producer.as_str(),
+                prerequisite.control,
+                prerequisite.data,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn failure_policy_defaults_and_typed_data_compatibility_are_resolved() {
+    let source = "schemaVersion: 1
+steps:
+  analyze:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv: [\"true\"]
+    outputs:
+      report:
+        kind: file
+        path: report.json
+        mediaType: application/json
+  summarize:
+    kind: cmd
+    failurePolicy: advisory
+    dependsOn: [analyze]
+    inputs:
+      report:
+        ref: outputs.analyze.report
+    command:
+      argv: [\"true\"]
+  required:
+    kind: cmd
+    dependsOn: [analyze]
+    command:
+      argv: [\"true\"]
+";
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Command(analyze) = &workflow.steps["analyze"] else {
+        panic!("analyze must be a command step");
+    };
+    let ValidatedStep::Command(summarize) = &workflow.steps["summarize"] else {
+        panic!("summarize must be a command step");
+    };
+    let ValidatedStep::Command(required) = &workflow.steps["required"] else {
+        panic!("required must be a command step");
+    };
+    assert_eq!(analyze.common.failure_policy, FailurePolicy::Advisory);
+    assert_eq!(summarize.common.failure_policy, FailurePolicy::Advisory);
+    assert_eq!(required.common.failure_policy, FailurePolicy::Required);
+    assert_eq!(
+        prerequisite_shape(&summarize.common.prerequisites),
+        [("analyze", true, true)]
+    );
+    assert_eq!(
+        prerequisite_shape(&required.common.prerequisites),
+        [("analyze", true, false)]
+    );
+
+    let required_consumer = source.replace(
+        "  summarize:\n    kind: cmd\n    failurePolicy: advisory\n",
+        "  summarize:\n    kind: cmd\n",
+    );
+    assert_failure(
+        &required_consumer,
+        ValidationFailureKind::AdvisoryDataDependency,
+        ValidationLocation::StepInput {
+            step: "summarize".to_owned(),
+            input: "report".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn advisory_outputs_cannot_be_exported() {
+    let source = "schemaVersion: 1
+steps:
+  analyze:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv: [\"true\"]
+    outputs:
+      report:
+        kind: file
+        path: report.json
+        mediaType: application/json
+exports:
+  report:
+    ref: outputs.analyze.report
+";
+    assert_failure(
+        source,
+        ValidationFailureKind::AdvisoryExportTarget,
+        ValidationLocation::Export {
+            name: "report".to_owned(),
+        },
+    );
 }
 
 #[test]
@@ -150,7 +255,10 @@ fn branching_and_disconnected_dag_retains_every_edge_and_step() {
     let ValidatedStep::Command(join) = &workflow.steps["join"] else {
         panic!("join must be a command step");
     };
-    assert_eq!(join.common.prerequisites, ["left", "right"]);
+    assert_eq!(
+        prerequisite_shape(&join.common.prerequisites),
+        [("left", true, false), ("right", true, false)]
+    );
     for (dependency, dependent) in [
         ("root", "left"),
         ("root", "right"),
@@ -383,8 +491,13 @@ steps:
         panic!("consumer must be a command step");
     };
     assert_eq!(
-        consumer.common.prerequisites,
-        ["alpha", "beta", "middle", "zeta"]
+        prerequisite_shape(&consumer.common.prerequisites),
+        [
+            ("alpha", true, true),
+            ("beta", false, true),
+            ("middle", true, false),
+            ("zeta", true, false),
+        ]
     );
     assert_eq!(consumer.inputs.len(), 2);
     assert_eq!(consumer.inputs["first"].value_type, WorkflowValueType::File);
@@ -426,7 +539,10 @@ steps:
     let ValidatedStep::Command(consumer) = &workflow.steps["consumer"] else {
         panic!("consumer must be a command step");
     };
-    assert_eq!(consumer.common.prerequisites, ["middle", "producer"]);
+    assert_eq!(
+        prerequisite_shape(&consumer.common.prerequisites),
+        [("middle", true, false), ("producer", false, true)]
+    );
     assert_eq!(
         workflow.presentation_order,
         ["producer", "middle", "consumer"]
@@ -662,8 +778,11 @@ exports:
         panic!("consumer must be an agent step");
     };
     assert_eq!(
-        consumer.common.prerequisites,
-        ["responseProducer", "resultProducer"]
+        prerequisite_shape(&consumer.common.prerequisites),
+        [
+            ("responseProducer", true, true),
+            ("resultProducer", true, true),
+        ]
     );
     assert_eq!(
         consumer.agent.message.text,
@@ -771,7 +890,10 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
     let ValidatedStep::Agent(consumer) = &workflow.steps["consumer"] else {
         panic!("consumer must be an agent step");
     };
-    assert_eq!(consumer.common.prerequisites, ["responseProducer"]);
+    assert_eq!(
+        prerequisite_shape(&consumer.common.prerequisites),
+        [("responseProducer", false, true)]
+    );
 }
 
 #[test]

@@ -28,8 +28,9 @@ use crate::execution::workflow::agent::{
     AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
     AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
-    AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration,
+    AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
 };
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::execution::workflow::child_guard::{StoppedChildGuard, force_stop_direct_child};
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
@@ -293,7 +294,7 @@ pub(super) fn prepare_launch<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    check_input_bound(
+    check_agent_input_bound(
         invocation.prompt().message(),
         invocation.limits().maximum_message_bytes(),
         AgentInputKind::Message,
@@ -464,16 +465,12 @@ where
             return Err(AgentFailureCause::HarnessStartFailed);
         }
     };
-    if invocation
-        .diagnostic_session()
-        .verify_pi_native_session_path_binding()
-        .is_err()
+    if release_guarded_pi(invocation.diagnostic_session(), || {
+        child.continue_execution().map_err(|_| ())?;
+        registration.mark_released()
+    })
+    .is_err()
     {
-        let _ = child.force_stop().await;
-        let _ = registration.mark_quiesced();
-        return Err(AgentFailureCause::HarnessStartFailed);
-    }
-    if child.continue_execution().is_err() || registration.mark_released().is_err() {
         let _ = child.force_stop().await;
         let _ = registration.mark_quiesced();
         return Err(AgentFailureCause::HarnessStartFailed);
@@ -490,6 +487,16 @@ where
         },
         standard_error,
     ))
+}
+
+fn release_guarded_pi(
+    diagnostic_session: &AgentDiagnosticSession,
+    release: impl FnOnce() -> Result<(), ()>,
+) -> Result<(), AgentFailureCause> {
+    diagnostic_session
+        .verify_pi_native_session_path_binding()
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    release().map_err(|()| AgentFailureCause::HarnessStartFailed)
 }
 
 async fn launch_direct_process<Sink>(
@@ -542,24 +549,8 @@ fn combined_system_prompt(
         || workflow_prompt.to_owned(),
         |project_prompt| format!("{project_prompt}\n\n{workflow_prompt}"),
     );
-    check_input_bound(&combined, maximum_bytes, AgentInputKind::SystemPrompt)?;
+    check_agent_input_bound(&combined, maximum_bytes, AgentInputKind::SystemPrompt)?;
     Ok(combined)
-}
-
-fn check_input_bound(
-    value: &str,
-    admitted_bytes: NonZeroU64,
-    input: AgentInputKind,
-) -> Result<(), AgentFailureCause> {
-    let observed_bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
-    if observed_bytes > admitted_bytes.get() {
-        return Err(AgentFailureCause::HarnessInputTooLarge {
-            input,
-            admitted_bytes,
-            observed_bytes,
-        });
-    }
-    Ok(())
 }
 
 struct LaunchedPiProcess {
@@ -1144,10 +1135,36 @@ async fn stop_child(child: &mut Child, process_group: Option<Pid>) {
     if let Some(process_group) = process_group {
         terminate_process_group(process_group);
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    let _ = force_stop_direct_child(child).await;
 }
 
 fn failed(cause: AgentFailureCause) -> AgentOutcome {
     AgentOutcome::Failed { cause }
+}
+
+#[cfg(test)]
+mod guarded_release_tests {
+    use super::*;
+
+    #[test]
+    fn session_binding_is_rechecked_before_releasing_pi() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_directory = temporary.path().join("session");
+        let diagnostic_session = AgentDiagnosticSession::fixture(session_directory.clone());
+        diagnostic_session
+            .verify_pi_native_session_path_binding()
+            .unwrap();
+        fs::rename(&session_directory, temporary.path().join("moved-session")).unwrap();
+        fs::create_dir(&session_directory).unwrap();
+        let mut release_attempted = false;
+
+        assert!(matches!(
+            release_guarded_pi(&diagnostic_session, || {
+                release_attempted = true;
+                Ok(())
+            }),
+            Err(AgentFailureCause::HarnessStartFailed)
+        ));
+        assert!(!release_attempted);
+    }
 }

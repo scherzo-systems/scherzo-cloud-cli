@@ -15,7 +15,7 @@ use super::admission::CancellationReason;
 use super::agent::{
     AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentLifecycleMilestone,
     AgentObservation, AgentToolCallPhase, AgentValueKind, BoundedAgentResponse,
-    BoundedSchemaValidAgentResult, CompletedAgentInvocation,
+    BoundedSchemaValidAgentResult, CompletedAgentInvocation, tool_call_observation,
 };
 use super::canonical_json;
 use super::schema_common::lowercase_hex;
@@ -807,11 +807,11 @@ impl PiJsonV1Parser {
         {
             return Err(self.protocol_failure());
         }
-        self.observations.push(AgentObservation::ToolCall {
-            call_id: Arc::from(call_id),
-            name: Arc::from(name),
-            phase: AgentToolCallPhase::Updated,
-        });
+        self.observations.push(tool_call_observation(
+            call_id,
+            name,
+            AgentToolCallPhase::Updated,
+        ));
         Ok(())
     }
 

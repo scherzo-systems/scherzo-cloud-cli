@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
-use super::document::Output;
+use super::document::{FailurePolicy, Output};
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
@@ -989,7 +989,12 @@ where
                     TokenRole::Blocked,
                 )
             }
-            TransitionEvent::Step { step, to, .. } => match to {
+            TransitionEvent::Step {
+                step,
+                failure_policy,
+                to,
+                ..
+            } => match to {
                 StepStateKind::Starting => {
                     self.step_starts
                         .entry(step.clone())
@@ -1049,6 +1054,7 @@ where
                         detail,
                         self.finish_step_duration(&step, observed_at.monotonic),
                     );
+                    let detail = issue_detail(detail, failure_policy);
                     self.write_event(
                         observed_at.utc,
                         &step,
@@ -1064,6 +1070,7 @@ where
                         }
                         _ => "dependency did not succeed".to_owned(),
                     };
+                    let detail = issue_detail(detail, failure_policy);
                     self.step_starts.remove(&step);
                     self.write_event(
                         observed_at.utc,
@@ -1928,12 +1935,16 @@ fn summary_step(
             success_detail(success, outputs.len()),
             TokenRole::Success,
         )),
-        StepState::Failed { phase, cause } => {
-            Some(("failed", failure_detail(*phase, cause), TokenRole::Failure))
-        }
-        StepState::Blocked { dependency } => {
-            Some(("blocked", format!("by {dependency}"), TokenRole::Blocked))
-        }
+        StepState::Failed { phase, cause } => Some((
+            "failed",
+            issue_detail(failure_detail(*phase, cause), step.failure_policy),
+            TokenRole::Failure,
+        )),
+        StepState::Blocked { dependency } => Some((
+            "blocked",
+            issue_detail(format!("by {dependency}"), step.failure_policy),
+            TokenRole::Blocked,
+        )),
         StepState::NotRun {
             reason: NotRunReason::FailureStop,
         } => Some(("not-run", "failure stop".to_owned(), TokenRole::Neutral)),
@@ -1950,13 +1961,21 @@ fn summary_step(
     }
 }
 
-fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 5] {
+fn issue_detail(detail: String, failure_policy: FailurePolicy) -> String {
+    match failure_policy {
+        FailurePolicy::Required => detail,
+        FailurePolicy::Advisory => format!("{detail} · advisory"),
+    }
+}
+
+fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
     let mut counts = [
         ("succeeded", 0),
         ("failed", 0),
         ("blocked", 0),
         ("not-run", 0),
         ("cancelled", 0),
+        ("advisory issues", 0),
     ];
     for step in &run.steps {
         let index = match step.state {
@@ -1973,6 +1992,14 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 5] {
         };
         if let Some(index) = index {
             counts[index].1 += 1;
+        }
+        if step.failure_policy == FailurePolicy::Advisory
+            && matches!(
+                step.state,
+                StepState::Failed { .. } | StepState::Blocked { .. }
+            )
+        {
+            counts[5].1 += 1;
         }
     }
     counts

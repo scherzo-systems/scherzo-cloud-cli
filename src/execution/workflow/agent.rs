@@ -488,6 +488,18 @@ impl AgentObservationEnvelope {
     }
 }
 
+pub(crate) fn tool_call_observation(
+    call_id: &str,
+    name: &str,
+    phase: AgentToolCallPhase,
+) -> AgentObservation {
+    AgentObservation::ToolCall {
+        call_id: Arc::from(call_id),
+        name: Arc::from(name),
+        phase,
+    }
+}
+
 pub(crate) trait AgentObservationSink: Clone + Send + Sync + 'static {
     fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send;
 }
@@ -790,6 +802,26 @@ pub(crate) enum AgentFailureCause {
     },
     CapturedValueTooLarge,
     ResultSettlementFailed,
+}
+
+pub(crate) fn failed_agent_outcome(cause: AgentFailureCause) -> AgentOutcome {
+    AgentOutcome::Failed { cause }
+}
+
+pub(crate) fn check_agent_input_bound(
+    value: &str,
+    admitted_bytes: NonZeroU64,
+    input: AgentInputKind,
+) -> Result<(), AgentFailureCause> {
+    let observed_bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    if observed_bytes > admitted_bytes.get() {
+        return Err(AgentFailureCause::HarnessInputTooLarge {
+            input,
+            admitted_bytes,
+            observed_bytes,
+        });
+    }
+    Ok(())
 }
 
 impl AgentFailureCause {

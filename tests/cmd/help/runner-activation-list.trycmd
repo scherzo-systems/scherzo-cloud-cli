@@ -1,0 +1,18 @@
+```console
+$ scherzo-cloud runner activation list --help
+List runner activations
+
+Usage: scherzo-cloud runner activation list [OPTIONS] <ORGANIZATION> <RUNNER>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUNNER>        Runner ID or exact name
+
+Options:
+      --limit <LIMIT>        
+      --cursor <CURSOR>      
+      --json                 Print the runner result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

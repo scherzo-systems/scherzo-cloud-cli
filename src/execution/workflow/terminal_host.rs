@@ -28,7 +28,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use self::dag_layout::DagLayout;
 use super::admission::{CancellationReason, CancellationSource};
-use super::document::Output as WorkflowOutput;
+use super::document::{FailurePolicy, Output as WorkflowOutput};
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
@@ -2218,6 +2218,13 @@ fn step_kind_badge_style(color: bool) -> Style {
 fn selected_step_status_title<Step: StepProjection>(step: &Step, color: bool) -> Line<'static> {
     let style = tone_style(color, step_state_tone(step.state()));
     let mut spans = vec![Span::styled(step_state_label(step.state()), style)];
+    spans.push(Span::styled(
+        format!(
+            " · {}",
+            failure_policy_name(step.definition().failure_policy())
+        ),
+        style,
+    ));
     if let Some(timing) = step.timing() {
         let duration = if timing.frozen && step_state_is_active(step.state()) {
             format!("{} interrupted", human_duration(timing.duration))
@@ -2774,12 +2781,16 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
         Some(ObservedStepTransition::OutputsCommitted { outputs }) => {
             Some(output_count_detail(outputs.len()))
         }
-        Some(ObservedStepTransition::Failed { phase, cause }) => {
-            Some(failure_detail(*phase, cause))
-        }
-        Some(ObservedStepTransition::Blocked { dependency }) => {
-            Some(format!("blocked by {}", visible_text(dependency)))
-        }
+        Some(ObservedStepTransition::Failed { phase, cause }) => Some(issue_detail_for_step(
+            failure_detail(*phase, cause),
+            &step.definition,
+            step.state,
+        )),
+        Some(ObservedStepTransition::Blocked { dependency }) => Some(issue_detail_for_step(
+            format!("blocked by {}", visible_text(dependency)),
+            &step.definition,
+            step.state,
+        )),
         Some(ObservedStepTransition::NotRun {
             reason: NotRunReason::FailureStop,
         }) => Some("failure_stop".to_owned()),
@@ -2814,6 +2825,30 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
 #[cfg(test)]
 fn step_detail(step: &WorkflowRunStepView) -> Option<String> {
     live_step_detail(step)
+}
+
+fn failure_policy_name(policy: FailurePolicy) -> &'static str {
+    match policy {
+        FailurePolicy::Required => "required",
+        FailurePolicy::Advisory => "advisory",
+    }
+}
+
+fn is_advisory_issue(definition: &WorkflowPresentationStep, state: StepStateKind) -> bool {
+    definition.failure_policy() == FailurePolicy::Advisory
+        && matches!(state, StepStateKind::Failed | StepStateKind::Blocked)
+}
+
+fn issue_detail_for_step(
+    detail: String,
+    definition: &WorkflowPresentationStep,
+    state: StepStateKind,
+) -> String {
+    if is_advisory_issue(definition, state) {
+        format!("{detail} · advisory")
+    } else {
+        detail
+    }
 }
 
 pub(super) fn output_count_detail(count: usize) -> String {
@@ -7016,6 +7051,7 @@ mod tests {
             steps: vec![WorkflowRunStep {
                 id: "complete".to_owned(),
                 kind: WorkflowRunStepKind::Command,
+                failure_policy: FailurePolicy::Required,
                 state: step_state,
                 timing: step_timing,
                 command_output: None,
@@ -7364,6 +7400,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 thinking: Thinking::Medium,
             },
+            failure_policy: FailurePolicy::Required,
             direct_dependencies: Vec::new(),
             outputs: BTreeMap::new(),
         };
@@ -7409,6 +7446,7 @@ mod tests {
             definition: WorkflowPresentationStep::Command {
                 argv: vec!["build".to_owned(), "héllo world".to_owned()],
                 cwd: Some("work".to_owned()),
+                failure_policy: FailurePolicy::Required,
                 direct_dependencies: vec!["prepare".to_owned()],
                 outputs: BTreeMap::from([("report".to_owned(), output)]),
             },

@@ -1,6 +1,9 @@
 use std::ffi::OsString;
 use std::fs;
+use std::future::{Future, pending};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -10,16 +13,82 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::FIXED_INVOCATION_ENVIRONMENT;
+use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
+use crate::execution::workflow::admission::EnvironmentSnapshot;
+use crate::execution::workflow::agent::{
+    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity,
+    AgentObservationEnvelope, AgentObservationSink, WorkflowRunId,
+};
+use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::execution::workflow::coordinator::CoordinatorClock;
+use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const PLACEHOLDER_API_KEY: &str = "scherzo-loopback-placeholder";
+
+#[derive(Clone, Copy)]
+pub(super) struct PendingClock;
+
+impl CoordinatorClock for PendingClock {
+    type Instant = Duration;
+
+    fn now(&mut self) -> Self::Instant {
+        Duration::ZERO
+    }
+
+    async fn wait_until(&self, _deadline: Self::Instant) {
+        pending().await
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
+
+impl RecordingObservationSink {
+    pub(super) fn snapshot(&self) -> Vec<AgentObservationEnvelope> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl AgentObservationSink for RecordingObservationSink {
+    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
+        self.0.lock().unwrap().push(observation);
+        async {}
+    }
+}
+
+pub(super) fn invocation_identity(run: &str, step: &str) -> AgentInvocationIdentity {
+    AgentInvocationIdentity::new(
+        WorkflowRunId::from(Arc::from(run)),
+        Arc::from(step),
+        ActionId {
+            transition_sequence: TransitionSequence::default(),
+        },
+    )
+}
+
+pub(super) fn admitted_adapter(
+    executable: PathBuf,
+    model: &str,
+) -> AdmittedAgentAdapter<ClaudeCodeConfig> {
+    AdmittedAgentAdapter::new(
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+        executable,
+        Arc::from(CLAUDE_CODE_STREAM_JSON_V1_VERSION),
+        ClaudeCodeConfig {
+            model: model.to_owned(),
+            effort: ClaudeCodeEffort::XHigh,
+        },
+    )
+}
 
 pub(super) struct SyntheticClaudeCodeRoot {
     _temporary: tempfile::TempDir,
     project: PathBuf,
     home: PathBuf,
     config: PathBuf,
+    private: PathBuf,
     system_prompt: PathBuf,
 }
 
@@ -29,7 +98,8 @@ impl SyntheticClaudeCodeRoot {
         let project = temporary.path().join("project");
         let home = temporary.path().join("home");
         let config = temporary.path().join("claude-config");
-        for directory in [&project, &home, &config] {
+        let private = temporary.path().join("adapter-private");
+        for directory in [&project, &home, &config, &private] {
             fs::create_dir(directory).unwrap();
         }
         fs::write(
@@ -57,6 +127,7 @@ impl SyntheticClaudeCodeRoot {
             project: canonical_project,
             home,
             config,
+            private,
             system_prompt,
         }
     }
@@ -67,6 +138,31 @@ impl SyntheticClaudeCodeRoot {
 
     pub(super) fn system_prompt(&self) -> &Path {
         &self.system_prompt
+    }
+
+    pub(super) fn private(&self) -> &Path {
+        &self.private
+    }
+
+    pub(super) fn environment_snapshot(&self, provider: &LoopbackProvider) -> EnvironmentSnapshot {
+        EnvironmentSnapshot::new([
+            (OsString::from("HOME"), self.home.as_os_str().to_owned()),
+            (
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                self.config.as_os_str().to_owned(),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("CI"), OsString::from("1")),
+            (OsString::from("NO_COLOR"), OsString::from("1")),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from(PLACEHOLDER_API_KEY),
+            ),
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from(provider.base_url()),
+            ),
+        ])
     }
 
     pub(super) fn configure_command(&self, command: &mut Command, provider: &LoopbackProvider) {

@@ -7,7 +7,7 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind,
 };
 use super::claude_code::ClaudeCodeEffort;
-use super::document::Output;
+use super::document::{FailurePolicy, Output};
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
     ExecutionObservation, SourceSequence, TransitionObservation,
@@ -100,12 +100,14 @@ pub(crate) enum WorkflowPresentationStep {
     Command {
         argv: Vec<String>,
         cwd: Option<String>,
+        failure_policy: FailurePolicy,
         direct_dependencies: Vec<String>,
         outputs: BTreeMap<String, Output>,
     },
     Agent {
         profile: String,
         harness: AgentPresentationHarness,
+        failure_policy: FailurePolicy,
         direct_dependencies: Vec<String>,
         outputs: BTreeMap<String, Output>,
     },
@@ -122,6 +124,14 @@ impl WorkflowPresentationStep {
                 direct_dependencies,
                 ..
             } => direct_dependencies,
+        }
+    }
+
+    pub(crate) fn failure_policy(&self) -> FailurePolicy {
+        match self {
+            Self::Command { failure_policy, .. } | Self::Agent { failure_policy, .. } => {
+                *failure_policy
+            }
         }
     }
 
@@ -155,7 +165,13 @@ impl WorkflowPresentationDefinition {
                     ValidatedStep::Command(command) => WorkflowPresentationStep::Command {
                         argv: command.argv.clone(),
                         cwd: command.common.cwd.clone(),
-                        direct_dependencies: command.common.prerequisites.clone(),
+                        failure_policy: command.common.failure_policy,
+                        direct_dependencies: command
+                            .common
+                            .prerequisites
+                            .iter()
+                            .map(|prerequisite| prerequisite.producer.clone())
+                            .collect(),
                         outputs: presentation_outputs(&command.common.outputs),
                     },
                     ValidatedStep::Agent(agent) => {
@@ -174,7 +190,13 @@ impl WorkflowPresentationDefinition {
                         WorkflowPresentationStep::Agent {
                             profile: agent.agent.profile.clone(),
                             harness,
-                            direct_dependencies: agent.common.prerequisites.clone(),
+                            failure_policy: agent.common.failure_policy,
+                            direct_dependencies: agent
+                                .common
+                                .prerequisites
+                                .iter()
+                                .map(|prerequisite| prerequisite.producer.clone())
+                                .collect(),
                             outputs: presentation_outputs(&agent.common.outputs),
                         }
                     }
@@ -460,11 +482,13 @@ fn normalize_transition<Deadline: DisplayDeadline>(
         TransitionEvent::Step {
             sequence,
             step,
+            failure_policy,
             from,
             to,
         } => TransitionEvent::Step {
             sequence,
             step,
+            failure_policy,
             from,
             to,
         },

@@ -43,6 +43,7 @@ fn result_fixture() -> Value {
         "steps": [{
             "id": "produce",
             "kind": "agent",
+            "failurePolicy": "required",
             "state": "succeeded",
             "startedAt": "2026-08-02T12:01:44Z",
             "durationMilliseconds": 1000
@@ -129,6 +130,7 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
     let command = json!({
         "id": "step0",
         "kind": "cmd",
+        "failurePolicy": "required",
         "state": "succeeded",
         "startedAt": "2026-08-02T12:01:44Z",
         "durationMilliseconds": 1000,
@@ -148,6 +150,7 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
         json!({
             "id": format!("step{index}"),
             "kind": "agent",
+            "failurePolicy": "required",
             "state": "succeeded",
             "startedAt": "2026-08-02T12:01:44Z",
             "durationMilliseconds": 1000
@@ -221,6 +224,30 @@ fn rejects_failures_with_impossible_phases_or_cause_fields() {
     ] {
         assert_eq!(decode(&encode(&invalid)), Err(ResultMetadataError));
     }
+}
+
+#[test]
+fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
+    let mut advisory = result_fixture();
+    advisory["steps"][0]["failurePolicy"] = Value::String("advisory".to_owned());
+    advisory["steps"][0]["state"] = Value::String("failed".to_owned());
+    advisory["steps"][0]["failure"] = json!({
+        "phase": "execution",
+        "cause": { "code": "harness_failed" }
+    });
+    assert!(decode(&encode(&advisory)).is_ok());
+
+    let mut required = advisory.clone();
+    required["steps"][0]["failurePolicy"] = Value::String("required".to_owned());
+    assert_eq!(decode(&encode(&required)), Err(ResultMetadataError));
+
+    advisory["outcome"] = Value::String("failed".to_owned());
+    advisory["primaryFailure"] = json!({
+        "step": "produce",
+        "phase": "execution",
+        "cause": { "code": "harness_failed" }
+    });
+    assert_eq!(decode(&encode(&advisory)), Err(ResultMetadataError));
 }
 
 #[test]

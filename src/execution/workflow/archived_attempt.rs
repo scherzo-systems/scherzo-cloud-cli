@@ -12,10 +12,9 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
 use rustix::io::dup;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use super::artifact_set;
-use super::document::Output;
+use super::document::{FailurePolicy, Output};
 use super::local_run::{
     AttemptResultV1, AttemptStateV1, AttemptStepStateV1, AttemptTriggerV1, LocalAttemptV1,
     LocalStatusError, LocalStatusErrorCode, RetainedReadBudget, StableLocalRunSnapshot,
@@ -31,8 +30,9 @@ use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex,
+    parse_canonical_utc_timestamp,
 };
-use super::validated::{ValidatedStep, WorkflowValueType};
+use super::validated::{ResolvedDirectPrerequisite, ValidatedStep, WorkflowValueType};
 
 const RESULT_FILE: &str = "result.json";
 const SHA256_ALGORITHM: &str = "sha256";
@@ -193,6 +193,7 @@ pub(crate) enum ArchivedStepDetail {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedStep {
     pub(crate) id: String,
+    pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: ArchivedStepState,
     pub(crate) started_at: Option<OffsetDateTime>,
     pub(crate) duration: Option<Duration>,
@@ -348,18 +349,19 @@ fn load_local_archived_attempt_with(
             AttemptTriggerV1::ExplicitRetry => ArchivedAttemptTrigger::ExplicitRetry,
         },
         state: validated.state,
-        created_at: parse_timestamp(&attempt.created_at)
+        created_at: parse_canonical_utc_timestamp(&attempt.created_at)
             .ok_or_else(|| result_invalid(&snapshot.run_directory))?,
         started_at: match attempt.started_at.as_deref() {
             Some(value) => Some(
-                parse_timestamp(value).ok_or_else(|| result_invalid(&snapshot.run_directory))?,
+                parse_canonical_utc_timestamp(value)
+                    .ok_or_else(|| result_invalid(&snapshot.run_directory))?,
             ),
             None => None,
         },
         settled_at: attempt
             .settled_at
             .as_deref()
-            .and_then(parse_timestamp)
+            .and_then(parse_canonical_utc_timestamp)
             .ok_or_else(|| result_invalid(&snapshot.run_directory))?,
         workflow_path: workflow.source.workflow_path.clone(),
         source_root: workflow.source.source_root.clone(),
@@ -573,8 +575,8 @@ fn validate_and_project_result(
     let execution = ArchivedExecution {
         execution_root: PathBuf::from(&result.execution.execution_root),
         maximum_parallel_steps,
-        started_at: parse_timestamp(&result.execution.started_at).ok_or(())?,
-        finished_at: parse_timestamp(&result.execution.finished_at).ok_or(())?,
+        started_at: parse_canonical_utc_timestamp(&result.execution.started_at).ok_or(())?,
+        finished_at: parse_canonical_utc_timestamp(&result.execution.finished_at).ok_or(())?,
         duration: Duration::from_millis(result.execution.duration_milliseconds),
     };
     let steps = project_steps(attempt, result, workflow)?;
@@ -622,6 +624,8 @@ fn project_steps(
             let definition = workflow.definition.steps.get(expected_id).ok_or(())?;
             if step.id != *expected_id
                 || durable.id != *expected_id
+                || step.failure_policy != step_failure_policy(definition)
+                || durable.failure_policy != step_failure_policy(definition)
                 || !step_kind_matches(&step.kind, definition)
                 || !step_state_matches(step.state, durable.state)
             {
@@ -640,22 +644,21 @@ fn validate_terminal_step_facts(
     for step in steps {
         match &step.detail {
             ArchivedStepDetail::Blocked { dependency } => {
-                let dependency = steps
+                let definition = workflow.definition.steps.get(&step.id).ok_or(())?;
+                let recorded_prerequisite = direct_prerequisites(definition)
                     .iter()
-                    .find(|candidate| candidate.id == *dependency)
+                    .find(|prerequisite| prerequisite.producer == *dependency)
                     .ok_or(())?;
-                if dependency.state == ArchivedStepState::Succeeded {
+                if prerequisite_satisfied(recorded_prerequisite, steps) {
                     return Err(());
                 }
             }
             ArchivedStepDetail::NotRun => {
                 let definition = workflow.definition.steps.get(&step.id).ok_or(())?;
-                if direct_dependencies(definition).iter().any(|dependency| {
-                    !steps.iter().any(|candidate| {
-                        candidate.id == *dependency
-                            && candidate.state == ArchivedStepState::Succeeded
-                    })
-                }) {
+                if direct_prerequisites(definition)
+                    .iter()
+                    .any(|prerequisite| !prerequisite_satisfied(prerequisite, steps))
+                {
                     return Err(());
                 }
             }
@@ -666,16 +669,11 @@ fn validate_terminal_step_facts(
     }
 
     let valid_outcome = match outcome {
-        WorkflowOutcomeV1::Succeeded => steps
-            .iter()
-            .all(|step| step.state == ArchivedStepState::Succeeded),
+        WorkflowOutcomeV1::Succeeded => steps.iter().all(step_succeeds_workflow),
         WorkflowOutcomeV1::Failed => true,
         WorkflowOutcomeV1::Cancelled => {
             steps.iter().all(|step| {
-                matches!(
-                    step.state,
-                    ArchivedStepState::Succeeded | ArchivedStepState::Cancelled
-                )
+                step_succeeds_workflow(step) || step.state == ArchivedStepState::Cancelled
             }) && steps
                 .iter()
                 .any(|step| step.state == ArchivedStepState::Cancelled)
@@ -691,7 +689,7 @@ fn project_step(
 ) -> Result<ArchivedStep, ()> {
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
         (Some(started_at), Some(duration)) => (
-            Some(parse_timestamp(started_at).ok_or(())?),
+            Some(parse_canonical_utc_timestamp(started_at).ok_or(())?),
             Some(Duration::from_millis(duration)),
         ),
         (None, None) => (None, None),
@@ -714,7 +712,10 @@ fn project_step(
         WorkflowStepStateV1::Blocked => {
             exact_step_fields(step, false, true, false)?;
             let dependency = step.dependency.clone().ok_or(())?;
-            if !direct_dependencies(definition).contains(&dependency) {
+            if !direct_prerequisites(definition)
+                .iter()
+                .any(|prerequisite| prerequisite.producer == dependency)
+            {
                 return Err(());
             }
             (
@@ -769,6 +770,7 @@ fn project_step(
     }
     Ok(ArchivedStep {
         id: step.id.clone(),
+        failure_policy: step.failure_policy,
         state,
         started_at,
         duration,
@@ -845,7 +847,8 @@ fn project_primary_failure(
                 .iter()
                 .find(|step| step.id == primary.step)
                 .ok_or(())?;
-            if !matches!(&step.detail, ArchivedStepDetail::Failed(failure) if *failure == projected.failure)
+            if step.failure_policy != FailurePolicy::Required
+                || !matches!(&step.detail, ArchivedStepDetail::Failed(failure) if *failure == projected.failure)
             {
                 return Err(());
             }
@@ -944,8 +947,11 @@ fn project_cancellation(
     }
     Ok(Some(ArchivedCancellation {
         reason,
-        requested_at: parse_timestamp(&durable.requested_at).ok_or(())?,
-        force_stop_deadline: parse_timestamp(&result_cancellation.force_stop_deadline).ok_or(())?,
+        requested_at: parse_canonical_utc_timestamp(&durable.requested_at).ok_or(())?,
+        force_stop_deadline: parse_canonical_utc_timestamp(
+            &result_cancellation.force_stop_deadline,
+        )
+        .ok_or(())?,
     }))
 }
 
@@ -1115,20 +1121,47 @@ fn step_state_matches(result: WorkflowStepStateV1, durable: AttemptStepStateV1) 
     )
 }
 
-fn direct_dependencies(step: &ValidatedStep) -> &[String] {
+fn step_failure_policy(step: &ValidatedStep) -> FailurePolicy {
+    match step {
+        ValidatedStep::Command(command) => command.common.failure_policy,
+        ValidatedStep::Agent(agent) => agent.common.failure_policy,
+    }
+}
+
+fn direct_prerequisites(step: &ValidatedStep) -> &[ResolvedDirectPrerequisite] {
     match step {
         ValidatedStep::Command(command) => &command.common.prerequisites,
         ValidatedStep::Agent(agent) => &agent.common.prerequisites,
     }
 }
 
-fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
-    if !value.ends_with('Z') {
-        return None;
-    }
-    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
-    let canonical = super::schema_common::utc_timestamp(parsed).ok()?;
-    (canonical == value).then_some(parsed)
+fn prerequisite_satisfied(
+    prerequisite: &ResolvedDirectPrerequisite,
+    steps: &[ArchivedStep],
+) -> bool {
+    let Some(producer) = steps
+        .iter()
+        .find(|candidate| candidate.id == prerequisite.producer)
+    else {
+        return false;
+    };
+    let succeeded = producer.state == ArchivedStepState::Succeeded;
+    let control_satisfied = succeeded
+        || (producer.failure_policy == FailurePolicy::Advisory
+            && matches!(
+                producer.state,
+                ArchivedStepState::Failed | ArchivedStepState::Blocked
+            ));
+    (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
+}
+
+fn step_succeeds_workflow(step: &ArchivedStep) -> bool {
+    step.state == ArchivedStepState::Succeeded
+        || (step.failure_policy == FailurePolicy::Advisory
+            && matches!(
+                step.state,
+                ArchivedStepState::Failed | ArchivedStepState::Blocked
+            ))
 }
 
 fn valid_digest(algorithm: &str, value: &str) -> bool {

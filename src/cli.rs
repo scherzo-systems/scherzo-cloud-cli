@@ -337,7 +337,13 @@ mod tests {
             "organization show",
             "organization update",
             "runner",
+            "runner activation",
+            "runner activation create",
+            "runner activation list",
+            "runner activation revoke",
+            "runner create",
             "runner doctor",
+            "runner enroll",
             "runner list",
             "runner pool",
             "runner pool create",
@@ -434,12 +440,24 @@ mod tests {
     fn runner_help_is_composed_from_leaf_metadata() {
         let help = command_help(&["runner"]);
 
-        assert!(help.contains("pool    Manage Scherzo Cloud runner pools"));
-        assert!(help.contains("list    List Scherzo Cloud runner registrations"));
-        assert!(help.contains("show    Show a Scherzo Cloud runner registration"));
-        assert!(help.contains("rename  Rename a Scherzo Cloud runner registration"));
-        assert!(help.contains("doctor  Check local runner prerequisites"));
-        assert!(help.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
+        assert!(help.contains("pool        Manage Scherzo Cloud runner pools"));
+        assert!(
+            help.contains("create      Create a runner registration and enrollment activation")
+        );
+        assert!(help.contains("activation  Manage runner enrollment activations"));
+        assert!(help.contains("enroll      Enroll a protected runner credential"));
+        assert!(help.contains("list        List Scherzo Cloud runner registrations"));
+        assert!(help.contains("show        Show a Scherzo Cloud runner registration"));
+        assert!(help.contains("rename      Rename a Scherzo Cloud runner registration"));
+        assert!(help.contains("doctor      Check local runner prerequisites"));
+        assert!(help.contains("serve       Connect to Scherzo Cloud and serve run assignments"));
+
+        let activation = command_help(&["runner", "activation"]);
+        assert!(activation.contains("create  Create a single-use runner activation"));
+        assert!(activation.contains("list    List runner activations"));
+        assert!(activation.contains("revoke  Revoke a runner activation"));
+        assert!(command_help(&["runner", "create"]).contains("--activation-file <PATH|->"));
+        assert!(command_help(&["runner", "enroll"]).contains("--resume"));
 
         let pool = command_help(&["runner", "pool"]);
         assert!(pool.contains("create  Create a Scherzo Cloud runner pool"));

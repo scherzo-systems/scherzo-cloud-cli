@@ -14,15 +14,14 @@ use super::assignment::{
     ObservationOutbox,
 };
 use crate::execution::workflow::admission::CancellationReason;
-use crate::execution::workflow::agent::dispatch::{
-    ClosedAgentDispatcher, UnavailableClaudeCodeAdapter,
-};
+use crate::execution::workflow::agent::dispatch::ClosedAgentDispatcher;
 use crate::execution::workflow::agent::{
     AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind, WorkflowRunId,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStartFailure};
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind};
+use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{NoopCommitPort, execute_workflow};
@@ -428,7 +427,17 @@ impl ExecutionJob {
                     ));
                 }
             };
-            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, UnavailableClaudeCodeAdapter);
+            let claude_code_adapter = ClaudeCodeStreamJsonV1Adapter::new(
+                diagnostics.clone(),
+                self.accepted
+                    .admitted
+                    .execution()
+                    .limits()
+                    .maximum_step_log_bytes(),
+                RunnerExecutionClock,
+                observer.clone(),
+            );
+            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, claude_code_adapter);
             let agents = AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_id)),
                 agent_staging.clone(),
@@ -988,6 +997,7 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
         TransitionEvent::Step {
             sequence,
             step,
+            failure_policy,
             from,
             to,
         } => {
@@ -996,6 +1006,7 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
                 ("eventType".to_owned(), json!("step_state_changed")),
                 ("transitionSequence".to_owned(), json!(sequence.get())),
                 ("stepId".to_owned(), json!(step)),
+                ("failurePolicy".to_owned(), json!(failure_policy)),
                 ("from".to_owned(), json!(step_state_name(*from))),
                 ("to".to_owned(), json!(step_state_name(*to))),
             ]);
@@ -1689,6 +1700,36 @@ mod tests {
     }
 
     #[test]
+    fn advisory_step_transition_preserves_policy_and_raw_disposition() {
+        let transition = TransitionObservation::<RunnerExecutionInstant> {
+            event: TransitionEvent::Step {
+                sequence: crate::execution::workflow::runtime::TransitionSequence::default(),
+                step: "lint".to_owned(),
+                failure_policy: crate::execution::workflow::document::FailurePolicy::Advisory,
+                from: StepStateKind::Pending,
+                to: StepStateKind::Blocked,
+            },
+            step: Some(ObservedStepTransition::Blocked {
+                dependency: "analyze".to_owned(),
+            }),
+        };
+
+        assert_eq!(
+            workflow_event(&transition),
+            json!({
+                "eventVersion": 1,
+                "eventType": "step_state_changed",
+                "transitionSequence": 0,
+                "stepId": "lint",
+                "failurePolicy": "advisory",
+                "from": "pending",
+                "to": "blocked",
+                "dependency": "analyze",
+            })
+        );
+    }
+
+    #[test]
     fn closed_failure_vocabulary_projects_and_encodes() {
         let source = ResolvedOutputSource {
             step: "upstream".to_owned(),
@@ -2110,6 +2151,7 @@ mod tests {
                         "eventType": "step_state_changed",
                         "transitionSequence": 1,
                         "stepId": "step",
+                        "failurePolicy": "required",
                         "from": from,
                         "to": "failed",
                         "failure": evidence,

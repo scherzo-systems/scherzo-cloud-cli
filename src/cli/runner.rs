@@ -1,7 +1,11 @@
+mod activation;
 mod cloud;
 mod doctor;
+mod enroll;
 mod pool;
 mod serve;
+
+use std::io::{self, Write};
 
 use clap::{Args, Subcommand};
 
@@ -22,6 +26,12 @@ pub(super) struct Command {
 enum RunnerCommand {
     #[command(about = pool::ABOUT)]
     Pool(pool::Command),
+    #[command(about = "Create a runner registration and enrollment activation")]
+    Create(CreateCommand),
+    #[command(about = activation::ABOUT)]
+    Activation(activation::Command),
+    #[command(about = enroll::ABOUT)]
+    Enroll(enroll::Command),
     #[command(about = "List Scherzo Cloud runner registrations")]
     List(ListCommand),
     #[command(about = "Show a Scherzo Cloud runner registration")]
@@ -42,6 +52,33 @@ struct CloudOptions {
     #[command(flatten)]
     http: super::HttpOptions,
 }
+
+// Registration creation and standalone activation issuance intentionally keep
+// distinct Clap types because their positional resources and required options
+// are different operator contracts.
+// jscpd:ignore-start
+#[derive(Debug, Args)]
+struct CreateCommand {
+    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
+    organization: String,
+
+    #[arg(long, value_name = "POOL", help = "Runner pool ID or exact name")]
+    pool: String,
+
+    #[arg(long, help = "Set the exact runner name")]
+    name: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH|-",
+        help = "Create the protected artifact file, or write only the artifact to stdout"
+    )]
+    activation_file: String,
+
+    #[command(flatten)]
+    options: CloudOptions,
+}
+// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct ListCommand {
@@ -98,6 +135,9 @@ impl Command {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(RunnerCommand::Pool(command)) => command.execute(),
+            Some(RunnerCommand::Create(command)) => execute_cloud(command, CreateCommand::execute),
+            Some(RunnerCommand::Activation(command)) => command.execute(),
+            Some(RunnerCommand::Enroll(command)) => command.execute(),
             Some(RunnerCommand::List(command)) => execute_cloud(command, ListCommand::execute),
             Some(RunnerCommand::Show(command)) => execute_cloud(command, ShowCommand::execute),
             Some(RunnerCommand::Rename(command)) => execute_cloud(command, RenameCommand::execute),
@@ -105,6 +145,155 @@ impl Command {
             Some(RunnerCommand::Serve(command)) => command.execute(),
         }
     }
+}
+
+enum CreateOutcome {
+    Complete {
+        registration: crate::api::RunnerRegistration,
+        issuance: crate::api::RunnerActivationIssuance,
+    },
+    ActivationFailed {
+        registration: crate::api::RunnerRegistration,
+        failure: crate::api::RunnerFailure,
+    },
+}
+
+impl CreateCommand {
+    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        validate_activation_destination(&self.activation_file, self.options.json)?;
+        let registration_key =
+            generate_idempotency_key().context("generate runner registration request identity")?;
+        let activation_key =
+            generate_idempotency_key().context("generate activation request identity")?;
+        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
+            let pool = api.get_pool(&self.organization, &self.pool)?;
+            let registration = api.create_registration(
+                &self.organization,
+                &registration_key,
+                &pool.id,
+                self.name.as_deref(),
+            )?;
+            Ok(
+                match api.create_activation(&self.organization, &registration.id, &activation_key) {
+                    Ok(issuance) => CreateOutcome::Complete {
+                        registration,
+                        issuance,
+                    },
+                    Err(failure) => CreateOutcome::ActivationFailed {
+                        registration,
+                        failure,
+                    },
+                },
+            )
+        })?;
+        let outcome = match completed_cloud_result(deployment, result, self.options.json)? {
+            Ok(outcome) => outcome,
+            Err(exit_code) => return Ok(exit_code),
+        };
+        let (registration, issuance) = match outcome {
+            CreateOutcome::Complete {
+                registration,
+                issuance,
+            } => (registration, issuance),
+            CreateOutcome::ActivationFailed {
+                registration,
+                failure,
+            } => {
+                writeln!(
+                    io::stderr().lock(),
+                    "error: runner {} was created but activation issuance did not complete\n\nIssue an activation without creating another runner:\n  scherzo-cloud runner activation create {} {} --activation-file <PATH>",
+                    registration.id,
+                    self.organization,
+                    registration.id
+                )?;
+                let _ = failure;
+                return Ok(ExitCode::GeneralFailure);
+            }
+        };
+        write_activation_issuance(&self.activation_file, &issuance)?;
+        if self.activation_file == "-" {
+            writeln!(
+                io::stderr().lock(),
+                "✓ Runner {} created with an activation.",
+                registration.id
+            )?;
+        } else if self.options.json {
+            serde_json::to_writer_pretty(
+                &mut io::stdout().lock(),
+                &serde_json::json!({
+                    "schemaVersion": 1,
+                    "outcome": "created",
+                    "runner": registration,
+                    "activation": issuance.activation,
+                    "activationFile": self.activation_file,
+                }),
+            )?;
+            writeln!(io::stdout().lock())?;
+        } else {
+            write_activation_summary(
+                &mut io::stdout().lock(),
+                "✓ Runner created.",
+                &registration.id,
+                Some(&registration.name),
+                &self.activation_file,
+            )?;
+        }
+        Ok(ExitCode::Success)
+    }
+}
+
+fn completed_cloud_result<T>(
+    deployment: &Deployment,
+    result: Result<T, crate::api::RunnerFailure>,
+    json: bool,
+) -> anyhow::Result<Result<T, ExitCode>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(failure) => Ok(Err(cloud::write_failure(
+            deployment.fingerprint().api_url(),
+            &failure,
+            json,
+        )?)),
+    }
+}
+
+fn validate_activation_destination(destination: &str, json: bool) -> anyhow::Result<()> {
+    if destination == "-" && json {
+        return Err(anyhow::anyhow!(
+            "--json cannot be combined with --activation-file -"
+        ));
+    }
+    Ok(())
+}
+
+fn write_activation_issuance(
+    destination: &str,
+    issuance: &crate::api::RunnerActivationIssuance,
+) -> anyhow::Result<crate::runner::enrollment::ActivationArtifact> {
+    let api_artifact = issuance.artifact.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "activation issuance replay omitted its secret; issue a replacement activation with a new command"
+        )
+    })?;
+    let artifact = crate::runner::enrollment::ActivationArtifact::from_api(api_artifact);
+    crate::runner::enrollment::write_activation_file(destination, &artifact)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(artifact)
+}
+
+fn write_activation_summary(
+    output: &mut impl Write,
+    heading: &str,
+    runner_id: &str,
+    runner_name: Option<&str>,
+    destination: &str,
+) -> io::Result<()> {
+    writeln!(output, "{heading}\n")?;
+    writeln!(output, "  Runner:          {runner_id}")?;
+    if let Some(name) = runner_name {
+        writeln!(output, "  Name:            {name}")?;
+    }
+    writeln!(output, "  Activation file: {destination}")
 }
 
 impl ListCommand {

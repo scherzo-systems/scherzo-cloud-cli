@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,8 +37,17 @@ pub(crate) struct AgentStep {
     pub(crate) agent: Agent,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailurePolicy {
+    #[default]
+    Required,
+    Advisory,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommonStep {
+    pub(crate) failure_policy: FailurePolicy,
     pub(crate) control_dependencies: Vec<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, Output>,

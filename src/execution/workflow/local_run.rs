@@ -25,6 +25,7 @@ use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use super::coordinator::{CommitPort, CommittedActionKind, CommittedReduction};
+use super::document::FailurePolicy;
 use super::execution_root::AdmittedExecutionRoot;
 use super::private_staging::{
     create_staging_root, directory_entry_names, open_directory_path, remove_staging_root, same_file,
@@ -321,6 +322,7 @@ pub(super) struct AttemptProgressV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AttemptStepV1 {
     pub(super) id: String,
+    pub(super) failure_policy: FailurePolicy,
     pub(super) state: AttemptStepStateV1,
 }
 
@@ -2446,9 +2448,16 @@ fn fresh_attempt(
         .definition
         .presentation_order
         .iter()
-        .map(|id| AttemptStepV1 {
-            id: id.clone(),
-            state: AttemptStepStateV1::Pending,
+        .map(|id| {
+            let failure_policy = match &admitted.workflow().definition.steps[id] {
+                super::validated::ValidatedStep::Command(command) => command.common.failure_policy,
+                super::validated::ValidatedStep::Agent(agent) => agent.common.failure_policy,
+            };
+            AttemptStepV1 {
+                id: id.clone(),
+                failure_policy,
+                state: AttemptStepStateV1::Pending,
+            }
         })
         .collect();
     Ok(LocalAttemptV1 {

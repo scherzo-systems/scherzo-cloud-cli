@@ -131,9 +131,10 @@
     "AttemptStep": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "state"],
+      "required": ["id", "failurePolicy", "state"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "failurePolicy": { "enum": ["required", "advisory"] },
         "state": {
           "enum": [
             "pending",

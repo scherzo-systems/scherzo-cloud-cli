@@ -906,6 +906,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 serde_json::json!({
                     "id": "first",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "succeeded",
                     "startedAt": "2026-08-02T12:01:44Z",
                     "durationMilliseconds": 100,
@@ -914,6 +915,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 serde_json::json!({
                     "id": "second",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "succeeded",
                     "startedAt": "2026-08-02T12:01:44.1Z",
                     "durationMilliseconds": 200,
@@ -928,6 +930,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 serde_json::json!({
                     "id": "first",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "failed",
                     "startedAt": "2026-08-02T12:01:44Z",
                     "durationMilliseconds": 100,
@@ -940,6 +943,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 serde_json::json!({
                     "id": "second",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "blocked",
                     "dependency": "first"
                 }),
@@ -956,12 +960,14 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 serde_json::json!({
                     "id": "first",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "cancelled",
                     "reason": "user_request"
                 }),
                 serde_json::json!({
                     "id": "second",
                     "kind": "cmd",
+                    "failurePolicy": "required",
                     "state": "cancelled",
                     "reason": "user_request"
                 }),
@@ -1015,6 +1021,60 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
     fs::write(result_directory.join("result.json"), json_bytes(result)).unwrap();
     run.record_result_published().unwrap();
     result_directory
+}
+
+#[test]
+fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    failurePolicy: advisory\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        path: report.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    failurePolicy: advisory\n    inputs:\n      report:\n        ref: outputs.first.report\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run_path = fixture.run_path("archive-advisory-success");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let mut result = result_value(&result_directory);
+    result["steps"][0]["failurePolicy"] = Value::String("advisory".to_owned());
+    result["steps"][0]["state"] = Value::String("failed".to_owned());
+    result["steps"][0]["failure"] = serde_json::json!({
+        "phase": "execution",
+        "cause": { "code": "command_exit", "exitCode": 9 }
+    });
+    result["steps"][1] = serde_json::json!({
+        "id": "second",
+        "kind": "cmd",
+        "failurePolicy": "advisory",
+        "state": "blocked",
+        "dependency": "first"
+    });
+    overwrite_result(&result_directory, result);
+    run.state
+        .update(|state| {
+            let progress = &mut current_attempt_mut(state)?.progress.steps;
+            progress[0].state = AttemptStepStateV1::Failed;
+            progress[1].state = AttemptStepStateV1::Blocked;
+            Ok(())
+        })
+        .unwrap();
+
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+
+    assert_eq!(archived.state, ArchivedAttemptState::Succeeded);
+    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Succeeded);
+    assert!(archived.primary_failure.is_none());
+    assert!(matches!(
+        archived.steps[0].detail,
+        ArchivedStepDetail::Failed(_)
+    ));
+    assert!(matches!(
+        archived.steps[1].detail,
+        ArchivedStepDetail::Blocked { ref dependency } if dependency == "first"
+    ));
+    assert!(
+        archived
+            .steps
+            .iter()
+            .all(|step| step.failure_policy == super::super::document::FailurePolicy::Advisory)
+    );
 }
 
 fn result_value(result_directory: &Path) -> Value {
@@ -1333,6 +1393,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
             serde_json::json!({
                 "id": step.id,
                 "kind": "cmd",
+                "failurePolicy": "required",
                 "state": "succeeded",
                 "startedAt": "2026-08-02T12:01:44Z",
                 "durationMilliseconds": 1,
@@ -1450,6 +1511,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         "steps": [{
             "id": "produce",
             "kind": "cmd",
+            "failurePolicy": "required",
             "state": "succeeded",
             "startedAt": "2026-08-02T12:01:44Z",
             "durationMilliseconds": 1000,
@@ -1809,6 +1871,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             {
                 "id": "first",
                 "kind": "cmd",
+                "failurePolicy": "required",
                 "state": "failed",
                 "startedAt": "2026-08-02T12:01:44Z",
                 "durationMilliseconds": 100,
@@ -1821,6 +1884,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             {
                 "id": "second",
                 "kind": "cmd",
+                "failurePolicy": "required",
                 "state": "succeeded",
                 "startedAt": "2026-08-02T12:01:44Z",
                 "durationMilliseconds": 100,
@@ -1829,6 +1893,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             {
                 "id": "third",
                 "kind": "cmd",
+                "failurePolicy": "required",
                 "state": "blocked",
                 "dependency": "first"
             }
@@ -1842,6 +1907,36 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
     overwrite_result(&result_directory, valid.clone());
     run.record_result_published().unwrap();
     load_local_archived_attempt(&run_path, None).unwrap();
+
+    // Both roots can already be active when `second` fails first. The consumer records
+    // that then-terminal prerequisite even if lexicographically lower `first` fails later.
+    let mut historical_blocker = valid.clone();
+    historical_blocker["primaryFailure"] = serde_json::json!({
+        "step": "second",
+        "phase": "execution",
+        "cause": { "code": "command_exit", "exitCode": 29 }
+    });
+    historical_blocker["steps"][1]["state"] = Value::String("failed".to_owned());
+    historical_blocker["steps"][1]["failure"] = serde_json::json!({
+        "phase": "execution",
+        "cause": { "code": "command_exit", "exitCode": 29 }
+    });
+    historical_blocker["steps"][2]["dependency"] = Value::String("second".to_owned());
+    run.state
+        .update(|state| {
+            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::Failed;
+            Ok(())
+        })
+        .unwrap();
+    overwrite_result(&result_directory, historical_blocker);
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    run.state
+        .update(|state| {
+            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::Succeeded;
+            Ok(())
+        })
+        .unwrap();
 
     let mut false_blocker = valid.clone();
     false_blocker["steps"][2]["dependency"] = Value::String("second".to_owned());
@@ -1881,6 +1976,7 @@ fn archived_attempt_rejects_not_run_step_with_failed_dependency() {
     result["steps"][1] = serde_json::json!({
         "id": "second",
         "kind": "cmd",
+        "failurePolicy": "required",
         "state": "not_run",
         "reason": "failure_stop"
     });

@@ -488,8 +488,9 @@ fn runner_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud runner [COMMAND]"));
-    assert!(stdout.contains("doctor  Check local runner prerequisites"));
-    assert!(stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
+    assert!(stdout.contains("doctor      Check local runner prerequisites"));
+    assert!(stdout.contains("enroll      Enroll a protected runner credential"));
+    assert!(stdout.contains("serve       Connect to Scherzo Cloud and serve run assignments"));
     assert!(output.stderr.is_empty());
 }
 
@@ -547,8 +548,11 @@ fn nested_help_flags_use_the_composed_command_tree() {
 
     assert!(runner.status.success());
     let runner_stdout = String::from_utf8_lossy(&runner.stdout);
-    assert!(runner_stdout.contains("doctor  Check local runner prerequisites"));
-    assert!(runner_stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
+    assert!(runner_stdout.contains("doctor      Check local runner prerequisites"));
+    assert!(runner_stdout.contains("enroll      Enroll a protected runner credential"));
+    assert!(
+        runner_stdout.contains("serve       Connect to Scherzo Cloud and serve run assignments")
+    );
     assert!(runner.stderr.is_empty());
 
     assert!(doctor.status.success());

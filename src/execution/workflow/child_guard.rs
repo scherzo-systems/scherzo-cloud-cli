@@ -98,12 +98,25 @@ struct ReadyIdentity {
     leader_start_identity: String,
 }
 
+struct ActivityLease {
+    file: File,
+}
+
+impl Drop for ActivityLease {
+    fn drop(&mut self) {
+        // A concurrently forked process can briefly inherit this open file
+        // description before exec closes it. Unlock explicitly so such a
+        // descriptor cannot extend the owner's lease after this guard drops.
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
 pub(crate) struct StoppedChildGuard {
     child: Child,
     identity: AuthenticatedProcessGroup,
     owner_control: Option<File>,
     staging: tempfile::TempDir,
-    _activity_lease: File,
+    _activity_lease: ActivityLease,
 }
 
 impl StoppedChildGuard {
@@ -252,14 +265,14 @@ impl Drop for StoppedChildGuard {
     }
 }
 
-fn create_activity_lease(root: &Path) -> io::Result<File> {
-    let lease = OpenOptions::new()
+fn create_activity_lease(root: &Path) -> io::Result<ActivityLease> {
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .open(root.join(ACTIVITY_LOCK_FILE))?;
-    fs4::FileExt::lock_shared(&lease)?;
-    Ok(lease)
+    fs4::FileExt::lock_shared(&file)?;
+    Ok(ActivityLease { file })
 }
 
 pub(crate) async fn force_stop_direct_child(child: &mut Child) -> Result<(), ()> {
@@ -847,9 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn activity_lease_blocks_an_exclusive_cleanup_lock() {
+    fn activity_lease_drop_unlocks_an_inherited_descriptor() {
         let staging = tempfile::tempdir().unwrap();
         let lease = create_activity_lease(staging.path()).unwrap();
+        let inherited = lease.file.try_clone().unwrap();
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
@@ -863,6 +877,7 @@ mod tests {
 
         drop(lease);
         fs4::FileExt::try_lock(&contender).unwrap();
+        drop(inherited);
     }
 
     #[test]
