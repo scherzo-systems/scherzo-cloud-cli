@@ -6,7 +6,6 @@ import ts from "typescript";
 const packageRoot = new URL("../", import.meta.url);
 const resultExtensionImports = new Map([
   ["@earendil-works/pi-coding-agent", "type"],
-  ["node:crypto", "runtime"],
   ["node:net", "runtime"],
   ["typebox", "runtime"],
 ]);

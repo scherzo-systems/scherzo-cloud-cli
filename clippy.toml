@@ -15,6 +15,7 @@ disallowed-methods = [
   { path = "std::thread::park_timeout_ms", reason = "use explicit synchronization rather than a park timeout", allow-invalid = true },
   { path = "std::thread::sleep", reason = "use the module's timing abstraction" },
   { path = "std::thread::yield_now", reason = "use explicit synchronization rather than scheduler yielding" },
+  { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "use explicit synchronization or an item-scoped anti-hang watchdog" },
   { path = "std::time::Instant::elapsed", reason = "use the module's timing abstraction" },
   { path = "std::time::Instant::now", reason = "use the module's timing abstraction" },
   { path = "std::time::SystemTime::now", reason = "use the module's clock abstraction" },

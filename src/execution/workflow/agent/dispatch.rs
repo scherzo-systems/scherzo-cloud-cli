@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::io;
+use std::num::NonZeroU64;
 
 use super::{
     AgentAdapter, AgentFailureCause, AgentObservationSink, AgentOutcome, AgentStartCallback,
@@ -7,6 +9,9 @@ use super::{
 use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
+use crate::execution::workflow::diagnostic::StepDiagnosticLog;
+use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
 
 pub(crate) trait AgentInvocationDispatcher<Sink>: Clone + Send + Sync + 'static
 where
@@ -46,6 +51,36 @@ impl<PiAdapter, ClaudeCodeAdapter> ClosedAgentDispatcher<PiAdapter, ClaudeCodeAd
     pub(crate) fn new(pi: PiAdapter, claude_code: ClaudeCodeAdapter) -> Self {
         Self { pi, claude_code }
     }
+}
+
+pub(crate) type ProductionAgentDispatcher<Clock, Observer> = ClosedAgentDispatcher<
+    PiJsonV1Adapter<Clock, Observer>,
+    ClaudeCodeStreamJsonV1Adapter<Clock, Observer>,
+>;
+
+pub(crate) fn production_agent_dispatcher<Clock, Observer>(
+    diagnostics: StepDiagnosticLog,
+    maximum_diagnostic_stream_bytes: NonZeroU64,
+    clock: Clock,
+    observer: Observer,
+) -> io::Result<ProductionAgentDispatcher<Clock, Observer>>
+where
+    Clock: Clone,
+    Observer: Clone,
+{
+    let pi = PiJsonV1Adapter::new(
+        diagnostics.clone(),
+        maximum_diagnostic_stream_bytes,
+        clock.clone(),
+        observer.clone(),
+    )?;
+    let claude_code = ClaudeCodeStreamJsonV1Adapter::new(
+        diagnostics,
+        maximum_diagnostic_stream_bytes,
+        clock,
+        observer,
+    )?;
+    Ok(ClosedAgentDispatcher::new(pi, claude_code))
 }
 
 impl<Sink, PiAdapter, ClaudeCodeAdapter> AgentInvocationDispatcher<Sink>

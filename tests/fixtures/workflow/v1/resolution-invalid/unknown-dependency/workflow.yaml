@@ -1,0 +1,7 @@
+schemaVersion: 1
+steps:
+  build:
+    kind: cmd
+    dependsOn: [missing]
+    command:
+      argv: ["true"]

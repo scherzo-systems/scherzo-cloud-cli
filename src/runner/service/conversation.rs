@@ -415,8 +415,12 @@ fn validate_entries(conversation: &Conversation) {
 async fn replay_conversation(conversation: Conversation) -> Result<(), ConnectionError> {
     let opening = opening_metadata(&conversation);
     let frame_source = ReplayFrameSource::new(&conversation);
-    let config = Config::fixture("ws://127.0.0.1:1/v1/connect", test_credential(), true)
-        .expect("configure conversation replay gateway");
+    let config = Config::fixture(
+        "ws://127.0.0.1:1/v1/runner/connect",
+        test_credential(),
+        true,
+    )
+    .expect("configure conversation replay gateway");
     assert_eq!(config.credential().runner_id(), opening.runner_id);
     let opening_message_id = frame_source.public_id("rmsg_");
     let encoded_opening = opening_hello(

@@ -3,7 +3,9 @@
 This private npm project checks the engine-owned TypeScript extension that Scherzo will
 materialize for a `PiJsonV1` result invocation. It is development tooling, not a
 published package and not a workflow runtime. Rust remains responsible for invocation
-identity, retained-schema validation, and terminal workflow state.
+identity, retained-schema validation, and terminal workflow state. The result
+extension leaves provider tool arguments unchanged while Pi streams, validates,
+executes, and persists them; it does not maintain a redacted or restorable copy.
 
 The checked-in fixture is a complete materialization for the fixed inputs in
 `fixtures/materialization-input.json`. The extension loaded by Pi is a standalone file;

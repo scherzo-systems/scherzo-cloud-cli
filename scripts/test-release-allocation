@@ -253,6 +253,7 @@ class Fixture:
                 "next_asset_id": 2000,
                 "writes": [],
                 "fail_upload_once": False,
+                "hide_created_release_queries": 0,
             }
         )
         git(self.remote, "update-ref", "-d", "refs/tags/v0.1.1")
@@ -532,6 +533,22 @@ def save():
 def public_release(release):
     return {key: value for key, value in release.items() if key != "_private"}
 
+def listed_releases():
+    result = []
+    changed = False
+    for release in state["releases"]:
+        private = release.get("_private", {})
+        remaining = private.get("list_visibility_queries", 0)
+        if remaining > 0:
+            private["list_visibility_queries"] = remaining - 1
+            release["_private"] = private
+            changed = True
+        else:
+            result.append(release)
+    if changed:
+        save()
+    return result
+
 def die404():
     print("gh: HTTP 404 Not Found", file=sys.stderr)
     raise SystemExit(1)
@@ -591,7 +608,7 @@ if args[0] == "api":
         print(json.dumps(public_release(matches[0])))
         raise SystemExit(0)
     if endpoint.endswith("/releases?per_page=100"):
-        releases = state["releases"][:100]
+        releases = listed_releases()[:100]
         print(json.dumps([public_release(release) for release in releases]))
         raise SystemExit(0)
     if "/releases?per_page=100&page=" in endpoint:
@@ -600,7 +617,7 @@ if args[0] == "api":
             raise SystemExit("invalid releases page: " + raw_page)
         page = int(raw_page)
         start = (page - 1) * 100
-        releases = state["releases"][start:start + 100]
+        releases = listed_releases()[start:start + 100]
         print(json.dumps([public_release(release) for release in releases]))
         raise SystemExit(0)
     raise SystemExit("unsupported mock gh api: " + endpoint)
@@ -624,6 +641,9 @@ if args[:2] == ["release", "create"]:
         "draft": True,
         "prerelease": False,
         "assets": [],
+        "_private": {
+            "list_visibility_queries": state["hide_created_release_queries"],
+        },
     }
     state["next_release_id"] += 1
     state["releases"].append(release)
@@ -828,6 +848,19 @@ def prove_partial_and_transient(module: ModuleType, root: Path) -> None:
     reconciliation_command(partial, dist, "apply")
     if partial.state()["tags"]["v0.1.1"] != partial.allocated:
         fail("partial-tag reconciliation moved the allocated tag")
+
+    delayed = build_fixture(module, root / "delayed")
+    delayed_dist = make_dist(delayed.root)
+    state = delayed.state()
+    state["hide_created_release_queries"] = 1
+    delayed.write_state(state)
+    reconciliation_command(delayed, delayed_dist, "apply")
+    if next(
+        release
+        for release in delayed.state()["releases"]
+        if release["tag_name"] == "v0.1.1"
+    )["draft"]:
+        fail("eventually visible draft did not reconcile")
 
     draft = build_fixture(module, root / "draft")
     draft_dist = make_dist(draft.root)

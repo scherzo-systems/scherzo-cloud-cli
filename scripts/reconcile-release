@@ -12,10 +12,15 @@ import os
 import sys
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import NoReturn, Sequence
+
+
+RELEASE_VISIBILITY_TIMEOUT_SECONDS = 30.0
+RELEASE_VISIBILITY_POLL_SECONDS = 1.0
 
 
 class ReconciliationError(Exception):
@@ -210,7 +215,6 @@ def fetch_allocated_tag(inspection: Inspection) -> None:
 
 def refreshed_release(inspection: Inspection) -> object:
     verification = inspection.verification
-    document = inspection.github.target_release(verification.tag)
     target = tag_target(
         inspection.github, inspection.github.repository, verification.tag
     )
@@ -222,6 +226,15 @@ def refreshed_release(inspection: Inspection) -> object:
         verification.notes,
         True,
     )
+
+
+def wait_for_created_draft(inspection: Inspection) -> object:
+    deadline = time.monotonic() + RELEASE_VISIBILITY_TIMEOUT_SECONDS
+    while True:
+        state = refreshed_release(inspection)
+        if state.state != "tag-only" or time.monotonic() >= deadline:
+            return state
+        time.sleep(RELEASE_VISIBILITY_POLL_SECONDS)
 
 
 def create_tag(inspection: Inspection) -> None:
@@ -263,7 +276,7 @@ def create_draft(inspection: Inspection) -> None:
             "--draft",
         )
     fetch_allocated_tag(inspection)
-    state = refreshed_release(inspection)
+    state = wait_for_created_draft(inspection)
     if state.state != "draft" or state.assets:
         fail("GitHub did not create the exact empty draft release")
 

@@ -2,16 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::document::{
-    Agent, CommonStep, HarnessDefinition, MessageSource, Output, OutputReference, Step,
-    ValueReference, WorkflowDocument,
+    Agent, CommonNode, FailurePolicy, FinalizerDefinition, HarnessDefinition, MessageSource,
+    NodeBody, Output, OutputReference, StepDefinition, ValueReference, WorkflowDocument,
 };
-use super::pi;
 use super::validated::{
     RequiredImports, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
     ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
-    ValidatedCommandStep, ValidatedCommonStep, ValidatedHarness, ValidatedMessageSource,
-    ValidatedOutput, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
+    ValidatedCommandStep, ValidatedCommonStep, ValidatedFinalizer, ValidatedHarness,
+    ValidatedMessageSource, ValidatedOutput, ValidatedStep, ValidatedWorkflow, WorkflowImport,
+    WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
+use super::{claude_code, pi};
+
+const MAXIMUM_WORKFLOW_NODES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationFailureKind {
@@ -33,18 +36,34 @@ pub(crate) enum ValidationFailureKind {
     AdvisoryDataDependency,
     InvalidExportTarget,
     AdvisoryExportTarget,
+    TooManyNodes,
+    DuplicateNodeId,
+    InvalidSourceOrder,
+    CrossPhaseOutputReference,
+    InvalidFinalizerAfterTarget,
+    InvalidFinalizerTrigger,
+    IncompatibleFinalizerTriggers,
+    InvalidFinalizationContext,
+    FinalizerExportTrigger,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationLocation {
     WorkflowGraph,
+    WorkflowNamespace,
     AgentProfile { profile: String },
     AgentProfileReference { step: String },
+    FinalizerAgentProfileReference { finalizer: String },
     StepDependency { step: String, index: usize },
     StepInput { step: String, input: String },
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
     StepOutput { step: String, output: String },
+    FinalizerAfter { finalizer: String, index: usize },
+    FinalizerInput { finalizer: String, input: String },
+    FinalizerMessageText { finalizer: String, index: usize },
+    FinalizerMessageAttachment { finalizer: String, index: usize },
+    FinalizerOutput { finalizer: String, output: String },
     Export { name: String },
 }
 
@@ -79,47 +98,48 @@ impl std::error::Error for ValidationFailure {}
 struct ValidatedGraph {
     direct_prerequisites: BTreeMap<String, Vec<ResolvedDirectPrerequisite>>,
     presentation_order: Vec<String>,
-    ancestors: BTreeMap<String, BTreeSet<String>>,
 }
 
 pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, ValidationFailure> {
+    validate_node_namespace(&document)?;
     let agent_profiles = validate_agent_profiles(&document)?;
-    let graph = validate_graph(&document)?;
+    let step_graph = validate_step_graph(&document)?;
+    let finalizer_graph = validate_finalizer_graph(&document)?;
     validate_output_rules(&document)?;
 
     let mut required_imports = RequiredImports::default();
     let mut steps = BTreeMap::new();
     for (step_name, step) in &document.steps {
-        let validated = match step {
-            Step::Command(command) => ValidatedStep::Command(ValidatedCommandStep {
-                common: validate_common(&command.common, &graph.direct_prerequisites[step_name]),
-                inputs: validate_command_inputs(
-                    step_name,
-                    &command.inputs,
-                    &document,
-                    &graph.ancestors,
-                    &mut required_imports,
-                )?,
-                argv: command.argv.clone(),
-            }),
-            Step::Agent(agent) => {
-                let common = validate_common(&agent.common, &graph.direct_prerequisites[step_name]);
-                let harness = resolve_agent_profile(step_name, &agent.agent, &agent_profiles)?;
-                let validated_agent = validate_agent(
-                    step_name,
-                    &agent.agent,
-                    &document,
-                    &graph.ancestors,
-                    &mut required_imports,
-                    harness,
-                )?;
-                ValidatedStep::Agent(ValidatedAgentStep {
-                    common,
-                    agent: validated_agent,
-                })
-            }
-        };
+        let validated = validate_body(
+            step_name,
+            WorkflowNodeRole::Step,
+            &step.body,
+            &step_graph.direct_prerequisites[step_name],
+            &document,
+            &agent_profiles,
+            &mut required_imports,
+        )?;
         steps.insert(step_name.clone(), validated);
+    }
+
+    let mut finalizers = BTreeMap::new();
+    for (finalizer_name, finalizer) in &document.finalizers {
+        let body = validate_body(
+            finalizer_name,
+            WorkflowNodeRole::Finalizer,
+            &finalizer.body,
+            &finalizer_graph.direct_prerequisites[finalizer_name],
+            &document,
+            &agent_profiles,
+            &mut required_imports,
+        )?;
+        finalizers.insert(
+            finalizer_name.clone(),
+            ValidatedFinalizer {
+                body,
+                when: finalizer.when.clone(),
+            },
+        );
     }
 
     let exports = document
@@ -135,31 +155,109 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         description: document.description,
         steps,
         source_order: document.step_order,
-        presentation_order: graph.presentation_order,
+        presentation_order: step_graph.presentation_order,
+        finalizers,
+        finalizer_source_order: document.finalizer_order,
+        finalizer_presentation_order: finalizer_graph.presentation_order,
         exports,
         required_imports,
     })
 }
 
-fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, ValidationFailure> {
-    let direct_prerequisites = resolve_direct_prerequisites(document)?;
-    let source_indices = document
-        .step_order
+fn validate_node_namespace(document: &WorkflowDocument) -> Result<(), ValidationFailure> {
+    let total = document
+        .steps
+        .len()
+        .checked_add(document.finalizers.len())
+        .ok_or_else(|| namespace_failure(ValidationFailureKind::TooManyNodes))?;
+    if total > MAXIMUM_WORKFLOW_NODES {
+        return Err(namespace_failure(ValidationFailureKind::TooManyNodes));
+    }
+    if document
+        .steps
+        .keys()
+        .any(|id| document.finalizers.contains_key(id))
+    {
+        return Err(namespace_failure(ValidationFailureKind::DuplicateNodeId));
+    }
+    validate_source_order(&document.steps, &document.step_order)?;
+    validate_source_order(&document.finalizers, &document.finalizer_order)?;
+    Ok(())
+}
+
+fn validate_source_order<T>(
+    nodes: &BTreeMap<String, T>,
+    source_order: &[String],
+) -> Result<(), ValidationFailure> {
+    let unique = source_order.iter().collect::<BTreeSet<_>>();
+    if source_order.len() != nodes.len()
+        || unique.len() != source_order.len()
+        || source_order.iter().any(|id| !nodes.contains_key(id))
+    {
+        return Err(namespace_failure(ValidationFailureKind::InvalidSourceOrder));
+    }
+    Ok(())
+}
+
+fn namespace_failure(kind: ValidationFailureKind) -> ValidationFailure {
+    ValidationFailure::new(kind, ValidationLocation::WorkflowNamespace)
+}
+
+fn validate_step_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, ValidationFailure> {
+    let direct_prerequisites = document
+        .steps
+        .iter()
+        .map(|(step_name, step)| {
+            resolve_step_prerequisites(step_name, step, document)
+                .map(|prerequisites| (step_name.clone(), prerequisites))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    validate_graph(
+        direct_prerequisites,
+        &document.step_order,
+        document.steps.len(),
+    )
+}
+
+fn validate_finalizer_graph(
+    document: &WorkflowDocument,
+) -> Result<ValidatedGraph, ValidationFailure> {
+    let direct_prerequisites = document
+        .finalizers
+        .iter()
+        .map(|(finalizer_name, finalizer)| {
+            resolve_finalizer_prerequisites(finalizer_name, finalizer, document)
+                .map(|prerequisites| (finalizer_name.clone(), prerequisites))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    validate_graph(
+        direct_prerequisites,
+        &document.finalizer_order,
+        document.finalizers.len(),
+    )
+}
+
+fn validate_graph(
+    direct_prerequisites: BTreeMap<String, Vec<ResolvedDirectPrerequisite>>,
+    source_order: &[String],
+    node_count: usize,
+) -> Result<ValidatedGraph, ValidationFailure> {
+    let source_indices = source_order
         .iter()
         .enumerate()
-        .map(|(index, step)| (step.clone(), index))
+        .map(|(index, node)| (node.clone(), index))
         .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<String, Vec<String>>::new();
     let mut remaining_prerequisites = BTreeMap::<String, usize>::new();
 
-    for (step_name, prerequisites) in &direct_prerequisites {
+    for (node_name, prerequisites) in &direct_prerequisites {
         for prerequisite in prerequisites {
             dependents
                 .entry(prerequisite.producer.clone())
                 .or_default()
-                .push(step_name.clone());
+                .push(node_name.clone());
         }
-        remaining_prerequisites.insert(step_name.clone(), prerequisites.len());
+        remaining_prerequisites.insert(node_name.clone(), prerequisites.len());
     }
 
     let mut ready = remaining_prerequisites
@@ -167,12 +265,12 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
         .filter(|(_, count)| **count == 0)
         .filter_map(|(name, _)| source_indices.get(name).map(|index| (*index, name.clone())))
         .collect::<BTreeSet<_>>();
-    let mut presentation_order = Vec::with_capacity(document.steps.len());
+    let mut presentation_order = Vec::with_capacity(node_count);
 
-    while let Some((_, step_name)) = ready.pop_first() {
-        presentation_order.push(step_name.clone());
-        if let Some(step_dependents) = dependents.get(&step_name) {
-            for dependent in step_dependents {
+    while let Some((_, node_name)) = ready.pop_first() {
+        presentation_order.push(node_name.clone());
+        if let Some(node_dependents) = dependents.get(&node_name) {
+            for dependent in node_dependents {
                 if let Some(count) = remaining_prerequisites.get_mut(dependent) {
                     *count -= 1;
                     if *count == 0
@@ -185,123 +283,160 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
         }
     }
 
-    if presentation_order.len() != document.steps.len() {
+    if presentation_order.len() != node_count {
         return Err(ValidationFailure::new(
             ValidationFailureKind::DependencyCycle,
             ValidationLocation::WorkflowGraph,
         ));
     }
 
-    let mut ancestors = BTreeMap::<String, BTreeSet<String>>::new();
-    for step_name in &presentation_order {
-        let mut step_ancestors = BTreeSet::new();
-        for prerequisite in &direct_prerequisites[step_name] {
-            step_ancestors.insert(prerequisite.producer.clone());
-            if let Some(prerequisite_ancestors) = ancestors.get(&prerequisite.producer) {
-                step_ancestors.extend(prerequisite_ancestors.iter().cloned());
-            }
-        }
-        ancestors.insert(step_name.clone(), step_ancestors);
-    }
-
     Ok(ValidatedGraph {
         direct_prerequisites,
         presentation_order,
-        ancestors,
     })
 }
 
-fn resolve_direct_prerequisites(
+fn resolve_step_prerequisites(
+    step_name: &str,
+    step: &StepDefinition,
     document: &WorkflowDocument,
-) -> Result<BTreeMap<String, Vec<ResolvedDirectPrerequisite>>, ValidationFailure> {
-    document
-        .steps
-        .iter()
-        .map(|(step_name, step)| {
-            let mut control_dependencies = BTreeSet::new();
-            let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
-            for (index, dependency) in common_step(step).control_dependencies.iter().enumerate() {
-                let location = || ValidationLocation::StepDependency {
-                    step: step_name.clone(),
-                    index,
-                };
-                if dependency == step_name {
-                    return Err(ValidationFailure::new(
-                        ValidationFailureKind::SelfDependency,
-                        location(),
-                    ));
-                }
-                if !control_dependencies.insert(dependency.clone()) {
-                    return Err(ValidationFailure::new(
-                        ValidationFailureKind::DuplicateDependency,
-                        location(),
-                    ));
-                }
-                if !document.steps.contains_key(dependency) {
-                    return Err(ValidationFailure::new(
-                        ValidationFailureKind::MissingDependency,
-                        location(),
-                    ));
-                }
-                prerequisites.insert(
-                    dependency.clone(),
-                    ResolvedDirectPrerequisite {
-                        producer: dependency.clone(),
-                        control: true,
-                        data: false,
-                    },
-                );
-            }
-            infer_data_prerequisites(step_name, step, document, &mut prerequisites)?;
-            Ok((step_name.clone(), prerequisites.into_values().collect()))
-        })
-        .collect()
+) -> Result<Vec<ResolvedDirectPrerequisite>, ValidationFailure> {
+    let mut control_dependencies = BTreeSet::new();
+    let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
+    for (index, dependency) in step.control_dependencies.iter().enumerate() {
+        insert_control_prerequisite(
+            step_name,
+            dependency,
+            &mut control_dependencies,
+            &mut prerequisites,
+            document.steps.contains_key(dependency),
+            ValidationFailureKind::MissingDependency,
+            ValidationLocation::StepDependency {
+                step: step_name.to_owned(),
+                index,
+            },
+        )?;
+    }
+    infer_body_prerequisites(
+        step_name,
+        WorkflowNodeRole::Step,
+        &step.body,
+        document,
+        &mut prerequisites,
+    )?;
+    Ok(prerequisites.into_values().collect())
 }
 
-fn infer_data_prerequisites(
-    step_name: &str,
-    step: &Step,
+fn resolve_finalizer_prerequisites(
+    finalizer_name: &str,
+    finalizer: &FinalizerDefinition,
+    document: &WorkflowDocument,
+) -> Result<Vec<ResolvedDirectPrerequisite>, ValidationFailure> {
+    if finalizer.when.is_empty() {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidFinalizerTrigger,
+            ValidationLocation::WorkflowGraph,
+        ));
+    }
+
+    let mut after = BTreeSet::new();
+    let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
+    for (index, dependency) in finalizer.after.iter().enumerate() {
+        insert_control_prerequisite(
+            finalizer_name,
+            dependency,
+            &mut after,
+            &mut prerequisites,
+            document.finalizers.contains_key(dependency),
+            ValidationFailureKind::InvalidFinalizerAfterTarget,
+            ValidationLocation::FinalizerAfter {
+                finalizer: finalizer_name.to_owned(),
+                index,
+            },
+        )?;
+    }
+    infer_body_prerequisites(
+        finalizer_name,
+        WorkflowNodeRole::Finalizer,
+        &finalizer.body,
+        document,
+        &mut prerequisites,
+    )?;
+    Ok(prerequisites.into_values().collect())
+}
+
+fn insert_control_prerequisite(
+    consumer: &str,
+    dependency: &String,
+    seen: &mut BTreeSet<String>,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
+    target_exists: bool,
+    missing_kind: ValidationFailureKind,
+    location: ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    let failure = |kind| ValidationFailure::new(kind, location.clone());
+    if dependency == consumer {
+        return Err(failure(ValidationFailureKind::SelfDependency));
+    }
+    if !seen.insert(dependency.clone()) {
+        return Err(failure(ValidationFailureKind::DuplicateDependency));
+    }
+    if !target_exists {
+        return Err(failure(missing_kind));
+    }
+    prerequisites.insert(
+        dependency.clone(),
+        ResolvedDirectPrerequisite {
+            producer: dependency.clone(),
+            control: true,
+            data: false,
+        },
+    );
+    Ok(())
+}
+
+fn infer_body_prerequisites(
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    body: &NodeBody,
     document: &WorkflowDocument,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
 ) -> Result<(), ValidationFailure> {
-    match step {
-        Step::Command(command) => {
+    match body {
+        NodeBody::Command(command) => {
             for (input, reference) in &command.inputs {
                 infer_reference_prerequisite(
-                    step_name,
+                    consumer_name,
+                    consumer_role,
                     reference,
                     document,
                     prerequisites,
-                    ValidationLocation::StepInput {
-                        step: step_name.to_owned(),
-                        input: input.clone(),
-                    },
+                    node_input_location(consumer_name, consumer_role, input),
+                    consumer_role == WorkflowNodeRole::Finalizer,
                 )?;
             }
         }
-        Step::Agent(agent) => {
+        NodeBody::Agent(agent) => {
             for (index, source) in agent.agent.message.text.iter().enumerate() {
                 infer_message_prerequisite(
-                    step_name,
+                    consumer_name,
+                    consumer_role,
                     source,
                     document,
                     prerequisites,
-                    ValidationLocation::MessageText {
-                        step: step_name.to_owned(),
-                        index,
-                    },
+                    node_message_location(consumer_name, consumer_role, index, false),
+                    false,
                 )?;
             }
             for (index, source) in agent.agent.message.attachments.iter().enumerate() {
                 infer_message_prerequisite(
-                    step_name,
+                    consumer_name,
+                    consumer_role,
                     source,
                     document,
                     prerequisites,
-                    ValidationLocation::MessageAttachment {
-                        step: step_name.to_owned(),
-                        index,
-                    },
+                    node_message_location(consumer_name, consumer_role, index, true),
+                    consumer_role == WorkflowNodeRole::Finalizer,
                 )?;
             }
         }
@@ -310,104 +445,171 @@ fn infer_data_prerequisites(
 }
 
 fn infer_message_prerequisite(
-    step_name: &str,
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
     source: &MessageSource,
     document: &WorkflowDocument,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
+    context_allowed: bool,
 ) -> Result<(), ValidationFailure> {
     if let MessageSource::Reference(reference) = source {
-        infer_reference_prerequisite(step_name, reference, document, prerequisites, location)?;
+        infer_reference_prerequisite(
+            consumer_name,
+            consumer_role,
+            reference,
+            document,
+            prerequisites,
+            location,
+            context_allowed,
+        )?;
     }
     Ok(())
 }
 
 fn infer_reference_prerequisite(
-    step_name: &str,
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
     reference: &ValueReference,
     document: &WorkflowDocument,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
+    context_allowed: bool,
 ) -> Result<(), ValidationFailure> {
-    let ValueReference::Output(reference) = reference else {
-        return Ok(());
-    };
-    let output = declared_output(document, reference, location.clone())?;
-    if matches!(output, Output::GitBranch) {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::TerminalOutputReference,
-            location,
-        ));
+    match reference {
+        ValueReference::Import { .. } => return Ok(()),
+        ValueReference::FinalizationContext => {
+            return if context_allowed {
+                Ok(())
+            } else {
+                Err(ValidationFailure::new(
+                    ValidationFailureKind::InvalidFinalizationContext,
+                    location,
+                ))
+            };
+        }
+        ValueReference::Output(reference) => {
+            let (producer_role, producer_body, output) =
+                declared_output(document, reference, location.clone())?;
+            if matches!(output, Output::GitBranch) {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::TerminalOutputReference,
+                    location,
+                ));
+            }
+            if reference.node == consumer_name && producer_role == consumer_role {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::SelfDependency,
+                    location,
+                ));
+            }
+            if consumer_role == WorkflowNodeRole::Step
+                && producer_role == WorkflowNodeRole::Finalizer
+            {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::CrossPhaseOutputReference,
+                    location,
+                ));
+            }
+            let consumer_policy =
+                node_common(document, consumer_name, consumer_role).failure_policy;
+            if common_node(producer_body).failure_policy == FailurePolicy::Advisory
+                && consumer_policy == FailurePolicy::Required
+            {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::AdvisoryDataDependency,
+                    location,
+                ));
+            }
+            if consumer_role == WorkflowNodeRole::Finalizer
+                && producer_role == WorkflowNodeRole::Finalizer
+            {
+                let consumer = &document.finalizers[consumer_name];
+                let producer = &document.finalizers[&reference.node];
+                if !consumer.when.is_subset(&producer.when) {
+                    return Err(ValidationFailure::new(
+                        ValidationFailureKind::IncompatibleFinalizerTriggers,
+                        location,
+                    ));
+                }
+            }
+            if consumer_role == producer_role {
+                mark_data_prerequisite(prerequisites, &reference.node);
+            }
+        }
     }
-    if reference.step == step_name {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::SelfDependency,
-            location,
-        ));
-    }
-    if common_step(&document.steps[&reference.step]).failure_policy
-        == super::document::FailurePolicy::Advisory
-        && common_step(&document.steps[step_name]).failure_policy
-            == super::document::FailurePolicy::Required
-    {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::AdvisoryDataDependency,
-            location,
-        ));
-    }
-    prerequisites
-        .entry(reference.step.clone())
-        .and_modify(|prerequisite| prerequisite.data = true)
-        .or_insert_with(|| ResolvedDirectPrerequisite {
-            producer: reference.step.clone(),
-            control: false,
-            data: true,
-        });
     Ok(())
 }
 
+fn mark_data_prerequisite(
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
+    producer: &str,
+) {
+    prerequisites
+        .entry(producer.to_owned())
+        .and_modify(|prerequisite| prerequisite.data = true)
+        .or_insert_with(|| ResolvedDirectPrerequisite {
+            producer: producer.to_owned(),
+            control: false,
+            data: true,
+        });
+}
+
 fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFailure> {
-    for (step_name, step) in &document.steps {
-        match step {
-            Step::Command(command) => {
-                for (output_name, output) in &command.common.outputs {
-                    if !matches!(output, Output::File { .. } | Output::GitBranch) {
-                        return Err(output_failure(
-                            ValidationFailureKind::IllegalCommandOutput,
-                            step_name,
-                            output_name,
-                        ));
-                    }
+    for (name, step) in &document.steps {
+        validate_node_outputs(name, WorkflowNodeRole::Step, &step.body)?;
+    }
+    for (name, finalizer) in &document.finalizers {
+        validate_node_outputs(name, WorkflowNodeRole::Finalizer, &finalizer.body)?;
+    }
+    Ok(())
+}
+
+fn validate_node_outputs(
+    name: &str,
+    role: WorkflowNodeRole,
+    body: &NodeBody,
+) -> Result<(), ValidationFailure> {
+    match body {
+        NodeBody::Command(command) => {
+            for (output_name, output) in &command.common.outputs {
+                if !matches!(output, Output::File { .. } | Output::GitBranch) {
+                    return Err(output_failure(
+                        ValidationFailureKind::IllegalCommandOutput,
+                        name,
+                        role,
+                        output_name,
+                    ));
                 }
             }
-            Step::Agent(agent) => {
-                let mut response_count = 0;
-                let mut result_count = 0;
-                for (output_name, output) in &agent.common.outputs {
-                    let failure_kind = match output {
-                        Output::AgentResponse => {
-                            response_count += 1;
-                            if response_count > 1 {
-                                Some(ValidationFailureKind::ExcessAgentResponseOutput)
-                            } else {
-                                (result_count > 0)
-                                    .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
-                            }
+        }
+        NodeBody::Agent(agent) => {
+            let mut response_count = 0;
+            let mut result_count = 0;
+            for (output_name, output) in &agent.common.outputs {
+                let failure_kind = match output {
+                    Output::AgentResponse => {
+                        response_count += 1;
+                        if response_count > 1 {
+                            Some(ValidationFailureKind::ExcessAgentResponseOutput)
+                        } else {
+                            (result_count > 0)
+                                .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
                         }
-                        Output::AgentResult { .. } => {
-                            result_count += 1;
-                            if result_count > 1 {
-                                Some(ValidationFailureKind::ExcessAgentResultOutput)
-                            } else {
-                                (response_count > 0)
-                                    .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
-                            }
-                        }
-                        Output::File { .. } | Output::GitBranch => None,
-                    };
-                    if let Some(kind) = failure_kind {
-                        return Err(output_failure(kind, step_name, output_name));
                     }
+                    Output::AgentResult { .. } => {
+                        result_count += 1;
+                        if result_count > 1 {
+                            Some(ValidationFailureKind::ExcessAgentResultOutput)
+                        } else {
+                            (response_count > 0)
+                                .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
+                        }
+                    }
+                    Output::File { .. } | Output::GitBranch => None,
+                };
+                if let Some(kind) = failure_kind {
+                    return Err(output_failure(kind, name, role, output_name));
                 }
             }
         }
@@ -415,18 +617,57 @@ fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFa
     Ok(())
 }
 
-fn output_failure(kind: ValidationFailureKind, step: &str, output: &str) -> ValidationFailure {
-    ValidationFailure::new(
-        kind,
-        ValidationLocation::StepOutput {
-            step: step.to_owned(),
-            output: output.to_owned(),
-        },
-    )
+fn output_failure(
+    kind: ValidationFailureKind,
+    name: &str,
+    role: WorkflowNodeRole,
+    output: &str,
+) -> ValidationFailure {
+    ValidationFailure::new(kind, node_output_location(name, role, output))
+}
+
+fn validate_body(
+    node_name: &str,
+    role: WorkflowNodeRole,
+    body: &NodeBody,
+    prerequisites: &[ResolvedDirectPrerequisite],
+    document: &WorkflowDocument,
+    agent_profiles: &BTreeMap<String, ValidatedHarness>,
+    required_imports: &mut RequiredImports,
+) -> Result<ValidatedStep, ValidationFailure> {
+    match body {
+        NodeBody::Command(command) => Ok(ValidatedStep::Command(ValidatedCommandStep {
+            common: validate_common(&command.common, prerequisites),
+            inputs: validate_command_inputs(
+                node_name,
+                role,
+                &command.inputs,
+                document,
+                required_imports,
+            )?,
+            argv: command.argv.clone(),
+        })),
+        NodeBody::Agent(agent) => {
+            let common = validate_common(&agent.common, prerequisites);
+            let harness = resolve_agent_profile(node_name, role, &agent.agent, agent_profiles)?;
+            let validated_agent = validate_agent(
+                node_name,
+                role,
+                &agent.agent,
+                document,
+                required_imports,
+                harness,
+            )?;
+            Ok(ValidatedStep::Agent(ValidatedAgentStep {
+                common,
+                agent: validated_agent,
+            }))
+        }
+    }
 }
 
 fn validate_common(
-    common: &CommonStep,
+    common: &CommonNode,
     prerequisites: &[ResolvedDirectPrerequisite],
 ) -> ValidatedCommonStep {
     let outputs = common
@@ -452,25 +693,21 @@ fn validate_common(
 }
 
 fn validate_command_inputs(
-    step_name: &str,
+    node_name: &str,
+    role: WorkflowNodeRole,
     inputs: &BTreeMap<String, ValueReference>,
     document: &WorkflowDocument,
-    ancestors: &BTreeMap<String, BTreeSet<String>>,
     required_imports: &mut RequiredImports,
 ) -> Result<BTreeMap<String, ResolvedValueReference>, ValidationFailure> {
     inputs
         .iter()
         .map(|(input_name, reference)| {
             resolve_value_reference(
-                step_name,
                 reference,
                 document,
-                ancestors,
                 required_imports,
-                ValidationLocation::StepInput {
-                    step: step_name.to_owned(),
-                    input: input_name.clone(),
-                },
+                node_input_location(node_name, role, input_name),
+                role == WorkflowNodeRole::Finalizer,
             )
             .map(|input| (input_name.clone(), input))
         })
@@ -478,12 +715,11 @@ fn validate_command_inputs(
 }
 
 fn resolve_value_reference(
-    step_name: &str,
     reference: &ValueReference,
     document: &WorkflowDocument,
-    ancestors: &BTreeMap<String, BTreeSet<String>>,
     required_imports: &mut RequiredImports,
     location: ValidationLocation,
+    context_allowed: bool,
 ) -> Result<ResolvedValueReference, ValidationFailure> {
     match reference {
         ValueReference::Import { name } => {
@@ -509,24 +745,28 @@ fn resolve_value_reference(
             })
         }
         ValueReference::Output(reference) => {
-            let output = declared_output(document, reference, location)?;
-            debug_assert!(
-                ancestors
-                    .get(step_name)
-                    .is_some_and(|step_ancestors| step_ancestors.contains(&reference.step)),
-                "every output reference must contribute a graph edge"
-            );
-
+            let (role, _, output) = declared_output(document, reference, location)?;
             let value_type = output_value_type(output);
             Ok(ResolvedValueReference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: reference.step.clone(),
+                    node: WorkflowNode {
+                        id: reference.node.clone(),
+                        role,
+                    },
                     output: reference.output.clone(),
                     value_type,
                 }),
                 value_type,
             })
         }
+        ValueReference::FinalizationContext if context_allowed => Ok(ResolvedValueReference {
+            source: ResolvedValueSource::FinalizationContext,
+            value_type: WorkflowValueType::Json,
+        }),
+        ValueReference::FinalizationContext => Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidFinalizationContext,
+            location,
+        )),
     }
 }
 
@@ -534,17 +774,15 @@ fn declared_output<'a>(
     document: &'a WorkflowDocument,
     reference: &OutputReference,
     location: ValidationLocation,
-) -> Result<&'a Output, ValidationFailure> {
-    let Some(producer) = document.steps.get(&reference.step) else {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::UnknownOutputStep,
-            location,
-        ));
-    };
-    common_step(producer)
+) -> Result<(WorkflowNodeRole, &'a NodeBody, &'a Output), ValidationFailure> {
+    let (role, body) = node_body(document, &reference.node).ok_or_else(|| {
+        ValidationFailure::new(ValidationFailureKind::UnknownOutputStep, location.clone())
+    })?;
+    let output = common_node(body)
         .outputs
         .get(&reference.output)
-        .ok_or_else(|| ValidationFailure::new(ValidationFailureKind::UnknownOutput, location))
+        .ok_or_else(|| ValidationFailure::new(ValidationFailureKind::UnknownOutput, location))?;
+    Ok((role, body, output))
 }
 
 fn validate_agent_profiles(
@@ -554,17 +792,21 @@ fn validate_agent_profiles(
         .agent_profiles
         .iter()
         .map(|(name, profile)| {
+            let invalid_config = || {
+                ValidationFailure::new(
+                    ValidationFailureKind::InvalidAgentProfileConfig,
+                    ValidationLocation::AgentProfile {
+                        profile: name.clone(),
+                    },
+                )
+            };
             let harness = match &profile.harness {
                 HarnessDefinition::Pi { config } => pi::resolve_config(config)
                     .map(ValidatedHarness::Pi)
-                    .ok_or_else(|| {
-                        ValidationFailure::new(
-                            ValidationFailureKind::InvalidAgentProfileConfig,
-                            ValidationLocation::AgentProfile {
-                                profile: name.clone(),
-                            },
-                        )
-                    })?,
+                    .ok_or_else(invalid_config)?,
+                HarnessDefinition::ClaudeCode { config } => claude_code::resolve_config(config)
+                    .map(ValidatedHarness::ClaudeCode)
+                    .ok_or_else(invalid_config)?,
             };
             Ok((name.clone(), harness))
         })
@@ -572,25 +814,29 @@ fn validate_agent_profiles(
 }
 
 fn resolve_agent_profile(
-    step_name: &str,
+    node_name: &str,
+    role: WorkflowNodeRole,
     agent: &Agent,
     profiles: &BTreeMap<String, ValidatedHarness>,
 ) -> Result<ValidatedHarness, ValidationFailure> {
     profiles.get(&agent.profile).cloned().ok_or_else(|| {
-        ValidationFailure::new(
-            ValidationFailureKind::UnknownAgentProfile,
-            ValidationLocation::AgentProfileReference {
-                step: step_name.to_owned(),
+        let location = match role {
+            WorkflowNodeRole::Step => ValidationLocation::AgentProfileReference {
+                step: node_name.to_owned(),
             },
-        )
+            WorkflowNodeRole::Finalizer => ValidationLocation::FinalizerAgentProfileReference {
+                finalizer: node_name.to_owned(),
+            },
+        };
+        ValidationFailure::new(ValidationFailureKind::UnknownAgentProfile, location)
     })
 }
 
 fn validate_agent(
-    step_name: &str,
+    node_name: &str,
+    role: WorkflowNodeRole,
     agent: &Agent,
     document: &WorkflowDocument,
-    ancestors: &BTreeMap<String, BTreeSet<String>>,
     required_imports: &mut RequiredImports,
     harness: ValidatedHarness,
 ) -> Result<ValidatedAgent, ValidationFailure> {
@@ -601,11 +847,11 @@ fn validate_agent(
         .enumerate()
         .map(|(index, source)| {
             validate_message_source(
-                step_name,
+                node_name,
+                role,
                 index,
                 source,
                 document,
-                ancestors,
                 required_imports,
                 MessageDestination::Text,
             )
@@ -618,11 +864,11 @@ fn validate_agent(
         .enumerate()
         .map(|(index, source)| {
             validate_message_source(
-                step_name,
+                node_name,
+                role,
                 index,
                 source,
                 document,
-                ancestors,
                 required_imports,
                 MessageDestination::Attachment,
             )
@@ -644,24 +890,16 @@ enum MessageDestination {
 }
 
 fn validate_message_source(
-    step_name: &str,
+    node_name: &str,
+    role: WorkflowNodeRole,
     index: usize,
     source: &MessageSource,
     document: &WorkflowDocument,
-    ancestors: &BTreeMap<String, BTreeSet<String>>,
     required_imports: &mut RequiredImports,
     destination: MessageDestination,
 ) -> Result<ValidatedMessageSource, ValidationFailure> {
-    let location = match destination {
-        MessageDestination::Text => ValidationLocation::MessageText {
-            step: step_name.to_owned(),
-            index,
-        },
-        MessageDestination::Attachment => ValidationLocation::MessageAttachment {
-            step: step_name.to_owned(),
-            index,
-        },
-    };
+    let attachment = matches!(destination, MessageDestination::Attachment);
+    let location = node_message_location(node_name, role, index, attachment);
 
     let reference = match source {
         MessageSource::File { path } => {
@@ -670,12 +908,11 @@ fn validate_message_source(
         MessageSource::Reference(reference) => reference,
     };
     let value = resolve_value_reference(
-        step_name,
         reference,
         document,
-        ancestors,
         required_imports,
         location.clone(),
+        role == WorkflowNodeRole::Finalizer && attachment,
     )?;
     let compatible = match destination {
         MessageDestination::Text => value.value_type == WorkflowValueType::Text,
@@ -704,13 +941,13 @@ fn resolve_export(
     reference: &OutputReference,
     document: &WorkflowDocument,
 ) -> Result<ResolvedOutputSource, ValidationFailure> {
-    let Some(step) = document.steps.get(&reference.step) else {
+    let Some((role, body)) = node_body(document, &reference.node) else {
         return Err(invalid_export(name));
     };
-    let Some(output) = common_step(step).outputs.get(&reference.output) else {
+    let Some(output) = common_node(body).outputs.get(&reference.output) else {
         return Err(invalid_export(name));
     };
-    if common_step(step).failure_policy == super::document::FailurePolicy::Advisory {
+    if common_node(body).failure_policy == FailurePolicy::Advisory {
         return Err(ValidationFailure::new(
             ValidationFailureKind::AdvisoryExportTarget,
             ValidationLocation::Export {
@@ -718,8 +955,23 @@ fn resolve_export(
             },
         ));
     }
+    if role == WorkflowNodeRole::Finalizer
+        && !document.finalizers[&reference.node]
+            .when
+            .contains(&super::document::FinalizationTrigger::Succeeded)
+    {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::FinalizerExportTrigger,
+            ValidationLocation::Export {
+                name: name.to_owned(),
+            },
+        ));
+    }
     Ok(ResolvedOutputSource {
-        step: reference.step.clone(),
+        node: WorkflowNode {
+            id: reference.node.clone(),
+            role,
+        },
         output: reference.output.clone(),
         value_type: output_value_type(output),
     })
@@ -734,10 +986,89 @@ fn invalid_export(name: &str) -> ValidationFailure {
     )
 }
 
-fn common_step(step: &Step) -> &CommonStep {
-    match step {
-        Step::Command(command) => &command.common,
-        Step::Agent(agent) => &agent.common,
+fn node_body<'a>(
+    document: &'a WorkflowDocument,
+    name: &str,
+) -> Option<(WorkflowNodeRole, &'a NodeBody)> {
+    document
+        .steps
+        .get(name)
+        .map(|step| (WorkflowNodeRole::Step, &step.body))
+        .or_else(|| {
+            document
+                .finalizers
+                .get(name)
+                .map(|finalizer| (WorkflowNodeRole::Finalizer, &finalizer.body))
+        })
+}
+
+fn node_common<'a>(
+    document: &'a WorkflowDocument,
+    name: &str,
+    role: WorkflowNodeRole,
+) -> &'a CommonNode {
+    match role {
+        WorkflowNodeRole::Step => common_node(&document.steps[name].body),
+        WorkflowNodeRole::Finalizer => common_node(&document.finalizers[name].body),
+    }
+}
+
+fn common_node(body: &NodeBody) -> &CommonNode {
+    match body {
+        NodeBody::Command(command) => &command.common,
+        NodeBody::Agent(agent) => &agent.common,
+    }
+}
+
+fn node_input_location(name: &str, role: WorkflowNodeRole, input: &str) -> ValidationLocation {
+    match role {
+        WorkflowNodeRole::Step => ValidationLocation::StepInput {
+            step: name.to_owned(),
+            input: input.to_owned(),
+        },
+        WorkflowNodeRole::Finalizer => ValidationLocation::FinalizerInput {
+            finalizer: name.to_owned(),
+            input: input.to_owned(),
+        },
+    }
+}
+
+fn node_message_location(
+    name: &str,
+    role: WorkflowNodeRole,
+    index: usize,
+    attachment: bool,
+) -> ValidationLocation {
+    match (role, attachment) {
+        (WorkflowNodeRole::Step, false) => ValidationLocation::MessageText {
+            step: name.to_owned(),
+            index,
+        },
+        (WorkflowNodeRole::Step, true) => ValidationLocation::MessageAttachment {
+            step: name.to_owned(),
+            index,
+        },
+        (WorkflowNodeRole::Finalizer, false) => ValidationLocation::FinalizerMessageText {
+            finalizer: name.to_owned(),
+            index,
+        },
+        (WorkflowNodeRole::Finalizer, true) => ValidationLocation::FinalizerMessageAttachment {
+            finalizer: name.to_owned(),
+            index,
+        },
+    }
+}
+
+fn node_output_location(name: &str, role: WorkflowNodeRole, output: &str) -> ValidationLocation {
+    match role {
+        WorkflowNodeRole::Step => ValidationLocation::StepOutput {
+            step: name.to_owned(),
+            output: output.to_owned(),
+        },
+        WorkflowNodeRole::Finalizer => ValidationLocation::FinalizerOutput {
+            finalizer: name.to_owned(),
+            output: output.to_owned(),
+        },
     }
 }
 

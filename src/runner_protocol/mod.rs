@@ -155,11 +155,28 @@ pub(crate) struct ExecutionLimitsV1RunnerProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowSourceClosureDigestV1RunnerProjection {
+    pub(crate) algorithm: String,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionSourceV1RunnerProjection {
+    pub(crate) repository_connection_id: String,
+    pub(crate) object_format: String,
+    pub(crate) commit_oid: String,
+    pub(crate) workflow_path: String,
+    pub(crate) workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection,
+    pub(crate) checkout_credential_reference: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) execution_spec_id: String,
     pub(crate) schema_version: u64,
     pub(crate) registered_workflow_id: String,
     pub(crate) execution_limits: ExecutionLimitsV1RunnerProjection,
+    pub(crate) source: Option<ExecutionSourceV1RunnerProjection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -634,6 +651,29 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let cancellation_grace_seconds =
                 u64::try_from(execution_spec.execution_limits.cancellation_grace_seconds.0)
                     .map_err(|_| DecodeError::InvalidFrame("cancellationGraceSeconds"))?;
+            let source = execution_spec
+                .source
+                .map(|source| {
+                    let repository_connection_id = source.repository_connection_id.to_string();
+                    let checkout_credential_reference =
+                        source.checkout_credential_reference.to_string();
+                    if checkout_credential_reference != repository_connection_id {
+                        return Err(DecodeError::InvalidFrame("checkoutCredentialReference"));
+                    }
+                    Ok(ExecutionSourceV1RunnerProjection {
+                        repository_connection_id,
+                        object_format: "sha1".to_owned(),
+                        commit_oid: source.commit_oid.to_string(),
+                        workflow_path: source.workflow_path.to_string(),
+                        workflow_source_closure_digest:
+                            WorkflowSourceClosureDigestV1RunnerProjection {
+                                algorithm: "sha256".to_owned(),
+                                value: source.workflow_source_closure_digest.value.to_string(),
+                            },
+                        checkout_credential_reference,
+                    })
+                })
+                .transpose()?;
             Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
@@ -648,6 +688,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                         maximum_parallel_steps,
                         cancellation_grace_seconds,
                     },
+                    source,
                 }),
                 offer_expires_at,
             }))

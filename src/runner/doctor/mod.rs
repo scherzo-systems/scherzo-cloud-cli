@@ -1,9 +1,11 @@
+mod claude_code;
 mod git;
 mod pi;
 
 use std::collections::BTreeSet;
 use std::fmt;
 
+use claude_code::ClaudeCodeCheck;
 use git::GitCheck;
 use pi::PiCheck;
 
@@ -54,6 +56,31 @@ impl Outcome {
             message: message.to_owned(),
             details,
         }
+    }
+}
+
+fn compatible_harness_outcome(
+    harness: &str,
+    version: &str,
+    profile: &str,
+    capabilities: impl IntoIterator<Item = &'static str>,
+    executable: &std::path::Path,
+    mut details: std::collections::BTreeMap<String, String>,
+) -> Outcome {
+    details.insert(
+        "capabilities".to_owned(),
+        capabilities.into_iter().collect::<Vec<_>>().join(","),
+    );
+    details.insert("profile".to_owned(), profile.to_owned());
+    details.insert("version".to_owned(), version.to_owned());
+    if let Some(executable) = executable.to_str() {
+        details.insert("executablePath".to_owned(), executable.to_owned());
+    }
+    Outcome {
+        status: Status::Pass,
+        code: "ok",
+        message: format!("{harness} {version} is compatible with {profile}."),
+        details,
     }
 }
 
@@ -163,6 +190,7 @@ pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
     registry.register(Box::new(PiCheck))?;
+    registry.register(Box::new(ClaudeCodeCheck))?;
     Ok(registry)
 }
 
@@ -530,6 +558,11 @@ mod tests {
                 CheckDescriptor {
                     id: "execution.harness.pi-json-v1",
                     title: "PiJsonV1 installation",
+                    default: false,
+                },
+                CheckDescriptor {
+                    id: "execution.harness.claude-code-stream-json-v1",
+                    title: "ClaudeCodeStreamJsonV1 installation",
                     default: false,
                 },
             ]

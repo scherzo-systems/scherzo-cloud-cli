@@ -39,7 +39,7 @@ use super::step_runtime::{
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
 use super::validated::ValidatedStep;
-use crate::execution::pi::PiInstallationFailure;
+use crate::execution::AgentHarnessInstallationFailure;
 
 const RUN_COMMAND: &str = "scherzo-cloud workflow run";
 const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
@@ -373,15 +373,15 @@ where
         )
     }
 
-    pub(crate) fn render_pi_installation_rejection(
+    pub(crate) fn render_agent_harness_installation_rejection(
         self,
         workflow: &ResolvedWorkflow,
-        failure: &PiInstallationFailure,
+        failure: &AgentHarnessInstallationFailure,
     ) -> WorkflowRunPresentationResult {
         self.write_workflow_rejection(
             "installation",
             Some(&workflow.source.workflow_path),
-            RejectionDiagnostic::from_pi_installation(failure),
+            RejectionDiagnostic::from_agent_harness_installation(failure),
             None,
         )
     }

@@ -69,7 +69,7 @@ impl Command {
                     WorkflowRunOutput::new(presentation_config, io::stdout(), io::stderr())
                         .for_retry(pending.run_directory());
                 return super::run::rejection_exit(
-                    output.render_pi_installation_rejection(&workflow, &failure),
+                    output.render_agent_harness_installation_rejection(&workflow, &failure),
                 );
             }
         };

@@ -1,12 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentProfile, AgentStep, CommandStep, CommonStep, FailurePolicy,
-    HarnessDefinition, MessageSource, Output, OutputReference, Step, ValueReference,
-    WorkflowDocument,
+    Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, FailurePolicy,
+    FinalizationTrigger, FinalizerDefinition, HarnessDefinition, MessageSource, NodeBody, Output,
+    OutputReference, StepDefinition, ValueReference, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -19,6 +19,8 @@ pub(super) struct WorkflowDto {
     agent_profiles: BTreeMap<String, AgentProfileDto>,
     steps: BTreeMap<String, StepDto>,
     #[serde(default)]
+    finalizers: BTreeMap<String, FinalizerDto>,
+    #[serde(default)]
     exports: BTreeMap<String, ReferenceDto>,
 }
 
@@ -28,25 +30,66 @@ enum StepDto {
     #[serde(rename = "cmd")]
     Command {
         #[serde(flatten)]
-        common: CommonStepDto,
-        #[serde(default)]
-        inputs: BTreeMap<String, ReferenceDto>,
-        command: CommandDto,
+        body: CommandNodeDto,
+        #[serde(rename = "dependsOn", default)]
+        control_dependencies: Vec<String>,
     },
     #[serde(rename = "agent")]
     Agent {
         #[serde(flatten)]
-        common: CommonStepDto,
-        agent: AgentDto,
+        body: AgentNodeDto,
+        #[serde(rename = "dependsOn", default)]
+        control_dependencies: Vec<String>,
     },
 }
 
 #[derive(Deserialize)]
-struct CommonStepDto {
+#[serde(tag = "kind")]
+enum FinalizerDto {
+    #[serde(rename = "cmd")]
+    Command {
+        #[serde(flatten)]
+        body: CommandNodeDto,
+        #[serde(default)]
+        after: Vec<String>,
+        #[serde(default = "all_finalization_triggers")]
+        when: BTreeSet<FinalizationTrigger>,
+    },
+    #[serde(rename = "agent")]
+    Agent {
+        #[serde(flatten)]
+        body: AgentNodeDto,
+        #[serde(default)]
+        after: Vec<String>,
+        #[serde(default = "all_finalization_triggers")]
+        when: BTreeSet<FinalizationTrigger>,
+    },
+}
+
+fn all_finalization_triggers() -> BTreeSet<FinalizationTrigger> {
+    FinalizationTrigger::all()
+}
+
+#[derive(Deserialize)]
+struct CommandNodeDto {
+    #[serde(flatten)]
+    common: CommonNodeDto,
+    #[serde(default)]
+    inputs: BTreeMap<String, ReferenceDto>,
+    command: CommandDto,
+}
+
+#[derive(Deserialize)]
+struct AgentNodeDto {
+    #[serde(flatten)]
+    common: CommonNodeDto,
+    agent: AgentDto,
+}
+
+#[derive(Deserialize)]
+struct CommonNodeDto {
     #[serde(rename = "failurePolicy", default)]
     failure_policy: FailurePolicy,
-    #[serde(rename = "dependsOn", default)]
-    control_dependencies: Vec<String>,
     cwd: Option<String>,
     #[serde(default)]
     outputs: BTreeMap<String, OutputDto>,
@@ -98,6 +141,8 @@ enum MessageSourceDto {
 enum HarnessDto {
     #[serde(rename = "pi")]
     Pi { config: Value },
+    #[serde(rename = "claude_code")]
+    ClaudeCode { config: Value },
 }
 
 #[derive(Deserialize)]
@@ -125,7 +170,11 @@ struct ReferenceDto {
 }
 
 impl WorkflowDto {
-    pub(super) fn into_document(self, step_order: Vec<String>) -> Option<WorkflowDocument> {
+    pub(super) fn into_document(
+        self,
+        step_order: Vec<String>,
+        finalizer_order: Vec<String>,
+    ) -> Option<WorkflowDocument> {
         let agent_profiles = self
             .agent_profiles
             .into_iter()
@@ -135,6 +184,15 @@ impl WorkflowDto {
             .steps
             .into_iter()
             .map(|(name, step)| step.into_step().map(|step| (name, step)))
+            .collect::<Option<_>>()?;
+        let finalizers = self
+            .finalizers
+            .into_iter()
+            .map(|(name, finalizer)| {
+                finalizer
+                    .into_finalizer()
+                    .map(|finalizer| (name, finalizer))
+            })
             .collect::<Option<_>>()?;
         let exports = self
             .exports
@@ -150,42 +208,71 @@ impl WorkflowDto {
             agent_profiles,
             steps,
             step_order,
+            finalizers,
+            finalizer_order,
             exports,
         })
     }
 }
 
 impl StepDto {
-    fn into_step(self) -> Option<Step> {
-        match self {
+    fn into_step(self) -> Option<StepDefinition> {
+        let (body, control_dependencies) = match self {
             Self::Command {
-                common,
-                inputs,
-                command,
-            } => Some(Step::Command(CommandStep {
-                common: common.into_common_step(),
-                inputs: parse_references(inputs)?,
-                argv: command.argv,
-            })),
-            Self::Agent { common, agent } => Some(Step::Agent(AgentStep {
-                common: common.into_common_step(),
-                agent: agent.into_agent()?,
-            })),
-        }
+                body,
+                control_dependencies,
+            } => (body.into_body()?, control_dependencies),
+            Self::Agent {
+                body,
+                control_dependencies,
+            } => (body.into_body()?, control_dependencies),
+        };
+        Some(StepDefinition {
+            body,
+            control_dependencies,
+        })
     }
 }
 
-impl CommonStepDto {
-    fn into_common_step(self) -> CommonStep {
+impl FinalizerDto {
+    fn into_finalizer(self) -> Option<FinalizerDefinition> {
+        let (body, after, when) = match self {
+            Self::Command { body, after, when } => (body.into_body()?, after, when),
+            Self::Agent { body, after, when } => (body.into_body()?, after, when),
+        };
+        Some(FinalizerDefinition { body, after, when })
+    }
+}
+
+impl CommandNodeDto {
+    fn into_body(self) -> Option<NodeBody> {
+        Some(NodeBody::Command(CommandNode {
+            common: self.common.into_common_node(),
+            inputs: parse_references(self.inputs)?,
+            argv: self.command.argv,
+        }))
+    }
+}
+
+impl AgentNodeDto {
+    fn into_body(self) -> Option<NodeBody> {
+        Some(NodeBody::Agent(AgentNode {
+            common: self.common.into_common_node(),
+            agent: self.agent.into_agent()?,
+        }))
+    }
+}
+
+impl CommonNodeDto {
+    fn into_common_node(self) -> CommonNode {
         let outputs = self
             .outputs
             .into_iter()
             .map(|(name, output)| (name, output.into_output()))
             .collect();
 
-        CommonStep {
+        CommonNode {
             failure_policy: self.failure_policy,
-            control_dependencies: self.control_dependencies,
             cwd: self.cwd,
             outputs,
         }
@@ -215,6 +302,7 @@ impl HarnessDto {
     fn into_harness(self) -> HarnessDefinition {
         match self {
             Self::Pi { config } => HarnessDefinition::Pi { config },
+            Self::ClaudeCode { config } => HarnessDefinition::ClaudeCode { config },
         }
     }
 }
@@ -256,6 +344,9 @@ impl OutputDto {
 }
 
 fn parse_value_reference(reference: &str) -> Option<ValueReference> {
+    if reference == "finalization.context" {
+        return Some(ValueReference::FinalizationContext);
+    }
     if let Some(name) = reference.strip_prefix("imports.") {
         return Some(ValueReference::Import {
             name: name.to_owned(),
@@ -270,11 +361,11 @@ fn parse_output_reference(reference: &str) -> Option<OutputReference> {
     if segments.next() != Some("outputs") {
         return None;
     }
-    let step = segments.next()?.to_owned();
+    let node = segments.next()?.to_owned();
     let output = segments.next()?.to_owned();
     if segments.next().is_some() {
         return None;
     }
 
-    Some(OutputReference { step, output })
+    Some(OutputReference { node, output })
 }

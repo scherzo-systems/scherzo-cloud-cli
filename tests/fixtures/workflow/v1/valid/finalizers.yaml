@@ -1,0 +1,53 @@
+schemaVersion: 1
+description: Release resources and report finalization.
+agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  provision:
+    kind: cmd
+    command:
+      argv: ["./scripts/provision.sh"]
+    outputs:
+      resource:
+        kind: file
+        path: artifacts/resource.json
+        mediaType: application/json
+finalizers:
+  release:
+    kind: cmd
+    inputs:
+      resource:
+        ref: outputs.provision.resource
+      context:
+        ref: finalization.context
+    command:
+      argv: ["./scripts/release.sh"]
+    outputs:
+      receipt:
+        kind: file
+        path: artifacts/release.json
+        mediaType: application/json
+  summarize:
+    kind: agent
+    after: [release]
+    when: [succeeded]
+    agent:
+      profile: reporting
+      systemPrompt: prompts/summarize-system.md
+      message:
+        text:
+          - file: prompts/summarize-message.md
+        attachments:
+          - ref: outputs.release.receipt
+          - ref: finalization.context
+    outputs:
+      report:
+        kind: agent_response
+exports:
+  finalizationReport:
+    ref: outputs.summarize.report

@@ -1,11 +1,14 @@
 mod activation;
 mod cloud;
+mod credential;
 mod doctor;
 mod enroll;
 mod pool;
 mod serve;
+mod status;
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 
@@ -30,18 +33,30 @@ enum RunnerCommand {
     Create(CreateCommand),
     #[command(about = activation::ABOUT)]
     Activation(activation::Command),
+    #[command(about = credential::ABOUT)]
+    Credential(credential::Command),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
     #[command(about = "List Scherzo Cloud runner registrations")]
     List(ListCommand),
     #[command(about = "Show a Scherzo Cloud runner registration")]
     Show(ShowCommand),
+    #[command(about = "Enable a Scherzo Cloud runner registration")]
+    Enable(ModeCommand),
+    #[command(about = "Drain a Scherzo Cloud runner registration")]
+    Drain(ModeCommand),
+    #[command(about = "Disable a Scherzo Cloud runner registration")]
+    Disable(ModeCommand),
+    #[command(about = "Move a quiescent Scherzo Cloud runner registration")]
+    Move(MoveCommand),
     #[command(about = "Rename a Scherzo Cloud runner registration")]
     Rename(RenameCommand),
     #[command(about = doctor::ABOUT)]
     Doctor(doctor::Command),
     #[command(about = serve::ABOUT)]
     Serve(serve::Command),
+    #[command(about = status::ABOUT)]
+    Status(status::Command),
 }
 
 #[derive(Debug, Args)]
@@ -104,12 +119,39 @@ struct ListCommand {
 }
 
 #[derive(Debug, Args)]
-struct ShowCommand {
+struct RegistrationTarget {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
     organization: String,
 
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
+}
+
+#[derive(Debug, Args)]
+struct ShowCommand {
+    #[command(flatten)]
+    target: RegistrationTarget,
+
+    #[command(flatten)]
+    options: CloudOptions,
+}
+
+#[derive(Debug, Args)]
+struct ModeCommand {
+    #[command(flatten)]
+    target: RegistrationTarget,
+
+    #[command(flatten)]
+    options: CloudOptions,
+}
+
+#[derive(Debug, Args)]
+struct MoveCommand {
+    #[command(flatten)]
+    target: RegistrationTarget,
+
+    #[arg(long, value_name = "POOL", help = "Destination pool ID or exact name")]
+    pool: String,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -137,14 +179,50 @@ impl Command {
             Some(RunnerCommand::Pool(command)) => command.execute(),
             Some(RunnerCommand::Create(command)) => execute_cloud(command, CreateCommand::execute),
             Some(RunnerCommand::Activation(command)) => command.execute(),
+            Some(RunnerCommand::Credential(command)) => command.execute(),
             Some(RunnerCommand::Enroll(command)) => command.execute(),
             Some(RunnerCommand::List(command)) => execute_cloud(command, ListCommand::execute),
             Some(RunnerCommand::Show(command)) => execute_cloud(command, ShowCommand::execute),
+            Some(RunnerCommand::Enable(command)) => {
+                execute_cloud(command, |command, deployment| {
+                    command.execute(
+                        deployment,
+                        crate::api::RunnerRegistrationMode::Enabled,
+                        "enabled",
+                        "✓ Runner enabled.",
+                    )
+                })
+            }
+            Some(RunnerCommand::Drain(command)) => execute_cloud(command, |command, deployment| {
+                command.execute(
+                    deployment,
+                    crate::api::RunnerRegistrationMode::Draining,
+                    "draining",
+                    "✓ Runner draining.",
+                )
+            }),
+            Some(RunnerCommand::Disable(command)) => {
+                execute_cloud(command, |command, deployment| {
+                    command.execute(
+                        deployment,
+                        crate::api::RunnerRegistrationMode::Disabled,
+                        "disabled",
+                        "✓ Runner disabled.",
+                    )
+                })
+            }
+            Some(RunnerCommand::Move(command)) => execute_cloud(command, MoveCommand::execute),
             Some(RunnerCommand::Rename(command)) => execute_cloud(command, RenameCommand::execute),
             Some(RunnerCommand::Doctor(command)) => command.execute(),
             Some(RunnerCommand::Serve(command)) => command.execute(),
+            Some(RunnerCommand::Status(command)) => command.execute(),
         }
     }
+}
+
+fn operator_config_path(path: &Path) -> anyhow::Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("resolve runner operator configuration {}", path.display()))
 }
 
 enum CreateOutcome {
@@ -313,15 +391,55 @@ impl ListCommand {
 
 impl ShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let Self {
-            organization,
-            runner,
-            options,
-        } = self;
+        let Self { target, options } = self;
         let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.get_registration(&organization, &runner)
+            api.get_registration(&target.organization, &target.runner)
         })?;
         cloud::write_runner_show(deployment.fingerprint().api_url(), &result, options.json)
+    }
+}
+
+impl ModeCommand {
+    fn execute(
+        self,
+        deployment: &Deployment,
+        mode: crate::api::RunnerRegistrationMode,
+        outcome: &'static str,
+        heading: &'static str,
+    ) -> anyhow::Result<ExitCode> {
+        let Self { target, options } = self;
+        let key = generate_idempotency_key().context("generate runner mode request identity")?;
+        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
+            api.update_registration_mode(&target.organization, &target.runner, &key, mode)
+        })?;
+        cloud::write_runner_transition(
+            deployment.fingerprint().api_url(),
+            &result,
+            outcome,
+            heading,
+            options.json,
+        )
+    }
+}
+
+impl MoveCommand {
+    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let Self {
+            target,
+            pool,
+            options,
+        } = self;
+        let key = generate_idempotency_key().context("generate runner move request identity")?;
+        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
+            api.move_registration(&target.organization, &target.runner, &pool, &key)
+        })?;
+        cloud::write_runner_transition(
+            deployment.fingerprint().api_url(),
+            &result,
+            "moved",
+            "✓ Runner moved.",
+            options.json,
+        )
     }
 }
 

@@ -15,9 +15,12 @@ use nix::pty::{Winsize, openpty};
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use tempfile::TempDir;
 
+use super::claude_code_installation::{
+    COMPLETE_HELP as CLAUDE_CODE_COMPLETE_HELP, ClaudeCodeFixture,
+};
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
 use super::{CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES};
 
@@ -29,6 +32,10 @@ const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
 const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wall time only prevents external-process quiescence polling from busy-spinning"
+)]
 pub(super) fn wait_for_process_poll() {
     let (_sender, receiver) = std::sync::mpsc::channel::<()>();
     assert_eq!(
@@ -459,6 +466,178 @@ fn response_pi_execution() -> String {
     format!(
         "session_dir=; while [ \"$#\" -gt 0 ]; do if [ \"$1\" = --session-dir ]; then shift; session_dir=$1; fi; shift; done; case \"$session_dir\" in /*) ;; *) exit 74 ;; esac; printf '{{partial' > \"$session_dir/retained-partial.jsonl\"; cwd=$(pwd); printf '{{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-4000-8000-000000000001\",\"timestamp\":\"2026-07-30T12:00:00Z\",\"cwd\":\"%s\"}}\\n' \"$cwd\"; printf '%s\\n' {remaining}"
     )
+}
+
+fn response_claude_code_execution() -> &'static str {
+    r#"set -eu
+model=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --model ]; then model=$argument; fi
+  previous=$argument
+done
+while IFS= read -r _; do :; done
+session=00000000-0000-4000-8000-000000000002
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-local","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
+printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude response"}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+printf '{"type":"assistant","message":{"id":"msg-local","type":"message","role":"assistant","content":[{"type":"text","text":"claude response"}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$model" "$session"
+printf '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"convenience duplicate","session_id":"%s"}\n' "$session""#
+}
+
+fn corrected_claude_code_result_execution() -> &'static str {
+    r#"set -eu
+model=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --model ]; then model=$argument; fi
+  previous=$argument
+done
+session=00000000-0000-4000-8000-000000000004
+emit_exchange() {
+  exchange=$1
+  value=$2
+  call=tool-result-$exchange
+  message=msg-result-$exchange
+  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+  printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$message" "$model" "$session"
+  printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}},"session_id":"%s","parent_tool_use_id":null}\n' "$call" "$value" "$session"
+  printf '{"type":"assistant","message":{"id":"%s","type":"message","role":"assistant","content":[{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$message" "$call" "$value" "$model" "$session"
+  printf '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"%s","content":"Structured output provided successfully"}]},"parent_tool_use_id":null,"session_id":"%s","tool_use_result":"Structured output provided successfully"}\n' "$call" "$session"
+  printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+  printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
+  printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"structured convenience","session_id":"%s","structured_output":{"result":%s}}\n' "$session" "$value"
+}
+IFS= read -r _
+emit_exchange 1 -1
+IFS= read -r _
+emit_exchange 2 7
+"#
+}
+
+fn result_claude_code_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: claude_code
+      config:
+        model: fixture/claude
+        effort: high
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: result.schema.json
+exports:
+  result:
+    ref: outputs.answer.result
+"#
+}
+
+fn blocked_claude_code_execution() -> &'static str {
+    r#"set -eu
+model=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --model ]; then model=$argument; fi
+  previous=$argument
+done
+IFS= read -r _
+printf '%s\n' "$$" > "$CLAUDE_FIXTURE_PID"
+trap 'exit 130' INT TERM
+session=00000000-0000-4000-8000-000000000003
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '\001' > "$WORKFLOW_READY_FIFO"
+IFS= read -r _ < "$WORKFLOW_RELEASE_FIFO"
+exit 23"#
+}
+
+fn response_claude_code_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: claude_code
+      config:
+        model: fixture/claude
+        effort: high
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.answer.response
+"#
+}
+
+fn mixed_harness_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  piLocal:
+    harness:
+      kind: pi
+      config:
+        model: fixture/pi
+        thinking: high
+  claudeLocal:
+    harness:
+      kind: claude_code
+      config:
+        model: fixture/claude
+        effort: xhigh
+steps:
+  piAnswer:
+    kind: agent
+    agent:
+      profile: piLocal
+      systemPrompt: pi-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+  claudeAnswer:
+    kind: agent
+    dependsOn: [piAnswer]
+    agent:
+      profile: claudeLocal
+      systemPrompt: claude-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  claudeResponse:
+    ref: outputs.claudeAnswer.response
+  piResponse:
+    ref: outputs.piAnswer.response
+"#
 }
 
 #[test]
@@ -987,6 +1166,347 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
     assert!(fallback.recorded_probes().is_empty());
     assert!(!incompatible_destination.exists());
+}
+
+#[test]
+fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallback() {
+    let replacement =
+        ClaudeCodeFixture::new("2.1.222 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
+    let mut probe_barrier = AgentBarrierFixture::new();
+    let capability_hook = format!(
+        "printf '\\001' > {}; IFS= read -r _ < {}",
+        quote(probe_barrier.ready_path.to_str().unwrap()),
+        quote(probe_barrier.release_path.to_str().unwrap()),
+    );
+    let claude = ClaudeCodeFixture::with_execution_and_capability_hook(
+        "2.1.222 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+        &capability_hook,
+    );
+    let ordered_path =
+        std::env::join_paths([replacement.path_directory(), claude.path_directory()]).unwrap();
+    let bundle = RunBundle::new(response_claude_code_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("claude-response");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let child = isolated_command(&args)
+        .env("PATH", ordered_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    probe_barrier.wait_until_started();
+    fs::set_permissions(replacement.executable(), fs::Permissions::from_mode(0o755)).unwrap();
+    probe_barrier.release_observation();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(replacement.recorded_probes().is_empty());
+    let probes = String::from_utf8(claude.recorded_probes()).unwrap();
+    let lines = probes.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "--version");
+    assert_eq!(lines[1], "--help");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("-p --input-format stream-json"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"claude response"
+    );
+    let metadata_root = destination.join("attempts/000001/diagnostics/claude-code-stream-json-v1");
+    let diagnostic = fs::read_dir(metadata_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(diagnostic.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
+    assert_eq!(metadata["claudeCodeVersion"], "2.1.222");
+    assert_eq!(metadata["nativeSessionPersistence"], false);
+    assert!(metadata.get("environment").is_none());
+}
+
+#[test]
+fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
+    let pi = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.222 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+
+    let claude_bundle = RunBundle::new(response_claude_code_agent_source());
+    claude_bundle.write_source("system.md", "system");
+    claude_bundle.write_source("message.md", "prompt");
+    let claude_destination = claude_bundle.result("missing-claude");
+    let mut claude_args = claude_bundle.args(&claude_destination);
+    claude_args.insert(claude_args.len() - 1, "--json".to_owned());
+    let missing_claude = isolated_command(&claude_args)
+        .env("PATH", pi.path_directory())
+        .output()
+        .unwrap();
+    assert_eq!(missing_claude.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&missing_claude.stdout).unwrap()["diagnostics"]
+            [0]["code"],
+        "missing_claude_code_installation"
+    );
+    assert!(pi.recorded_probes().is_empty());
+    assert!(!claude_destination.exists());
+
+    let pi_bundle = RunBundle::new(response_agent_source());
+    pi_bundle.write_source("system.md", "system");
+    pi_bundle.write_source("message.md", "prompt");
+    let pi_destination = pi_bundle.result("missing-pi");
+    let mut pi_args = pi_bundle.args(&pi_destination);
+    pi_args.insert(pi_args.len() - 1, "--json".to_owned());
+    let missing_pi = isolated_command(&pi_args)
+        .env("PATH", claude.path_directory())
+        .output()
+        .unwrap();
+    assert_eq!(missing_pi.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&missing_pi.stdout).unwrap()["diagnostics"][0]
+            ["code"],
+        "missing_pi_installation"
+    );
+    assert!(claude.recorded_probes().is_empty());
+    assert!(!pi_destination.exists());
+
+    let incompatible_claude =
+        ClaudeCodeFixture::new("2.1.221 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+    let available_pi =
+        PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+    let path = std::env::join_paths([
+        incompatible_claude.path_directory(),
+        available_pi.path_directory(),
+    ])
+    .unwrap();
+    let incompatible_bundle = RunBundle::new(response_claude_code_agent_source());
+    incompatible_bundle.write_source("system.md", "system");
+    incompatible_bundle.write_source("message.md", "prompt");
+    let incompatible_destination = incompatible_bundle.result("incompatible-claude");
+    let mut incompatible_args = incompatible_bundle.args(&incompatible_destination);
+    incompatible_args.insert(incompatible_args.len() - 1, "--json".to_owned());
+    let incompatible = isolated_command(&incompatible_args)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(incompatible.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&incompatible.stdout).unwrap()["diagnostics"]
+            [0]["code"],
+        "unsupported_claude_code_version"
+    );
+    assert_eq!(incompatible_claude.recorded_probes(), b"--version\n");
+    assert!(available_pi.recorded_probes().is_empty());
+    assert!(!incompatible_destination.exists());
+}
+
+#[test]
+fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
+    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.222 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+    );
+    let path = std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+    let bundle = RunBundle::new(mixed_harness_source());
+    for path in ["pi-system.md", "claude-system.md", "message.md"] {
+        bundle.write_source(path, "fixture");
+    }
+    let destination = bundle.result("mixed-harnesses");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args).env("PATH", path).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pi_probes = String::from_utf8(pi.recorded_probes()).unwrap();
+    assert_eq!(pi_probes.matches("--mode json").count(), 1);
+    let claude_probes = String::from_utf8(claude.recorded_probes()).unwrap();
+    assert_eq!(
+        claude_probes
+            .lines()
+            .filter(|line| line.starts_with("-p --input-format stream-json"))
+            .count(),
+        1
+    );
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "succeeded");
+    let steps = result["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert!(steps.iter().all(|step| step["state"] == "succeeded"));
+    let transcript = String::from_utf8(output.stderr).unwrap();
+    assert!(transcript.contains("event       assistant"));
+    assert!(!transcript.contains("stream_event"));
+    assert!(!transcript.contains("00000000-0000-4000-8000-00000000000"));
+    let result_root = attempt_result(&destination);
+    for (name, expected) in [
+        ("claudeResponse", b"claude response".as_slice()),
+        ("piResponse", b"hello world".as_slice()),
+    ] {
+        assert_eq!(result["exports"][name]["state"], "available");
+        let path = result["exports"][name]["path"].as_str().unwrap();
+        assert_eq!(fs::read(result_root.join(path)).unwrap(), expected);
+    }
+    assert!(
+        fs::read_dir(destination.join(".private"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value() {
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.222 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        corrected_claude_code_result_execution(),
+    );
+    let bundle = RunBundle::new(result_claude_code_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    bundle.write_source(
+        "result.schema.json",
+        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"integer","minimum":1}"#,
+    );
+    let destination = bundle.result("corrected-result");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args)
+        .env("PATH", claude.path_directory())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "succeeded");
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"7"
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("value_rejected")
+    );
+}
+
+#[test]
+fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
+    for (mode, expected_status, expected_outcome, unavailable_reason) in [
+        ("failure", 1, "failed", "source_failed"),
+        ("cancellation", 130, "cancelled", "source_cancelled"),
+    ] {
+        let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+        let claude = ClaudeCodeFixture::with_execution(
+            "2.1.222 (Claude Code)",
+            CLAUDE_CODE_COMPLETE_HELP,
+            true,
+            blocked_claude_code_execution(),
+        );
+        let path = std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+        let bundle = RunBundle::new(mixed_harness_source());
+        for path in ["pi-system.md", "claude-system.md", "message.md"] {
+            bundle.write_source(path, "fixture");
+        }
+        let destination = bundle.result(mode);
+        let mut args = bundle.args(&destination);
+        args.insert(args.len() - 1, "--json".to_owned());
+        let mut barrier = AgentBarrierFixture::new();
+        let process_pid = bundle.initial_cwd().join(format!("{mode}-claude.pid"));
+        let child = isolated_command(&args)
+            .env("PATH", path)
+            .env("WORKFLOW_READY_FIFO", &barrier.ready_path)
+            .env("WORKFLOW_RELEASE_FIFO", &barrier.release_path)
+            .env("CLAUDE_FIXTURE_PID", &process_pid)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        barrier.wait_until_started();
+        assert_eq!(
+            String::from_utf8(pi.recorded_probes())
+                .unwrap()
+                .matches("--mode json")
+                .count(),
+            1
+        );
+        assert_eq!(
+            String::from_utf8(claude.recorded_probes())
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("-p --input-format stream-json"))
+                .count(),
+            1
+        );
+        assert!(
+            !attempt_result(&destination).exists(),
+            "a provisional mixed result became visible before {mode} settled"
+        );
+
+        if mode == "failure" {
+            barrier.release_observation();
+        } else {
+            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+            kill_process(pid, Signal::INT).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        let result = result_json(&destination);
+        assert_eq!(result["outcome"], expected_outcome);
+        assert_eq!(result["exports"]["piResponse"]["state"], "available");
+        assert_eq!(
+            result["exports"]["claudeResponse"],
+            serde_json::json!({"state": "unavailable", "reason": unavailable_reason})
+        );
+        let claude_pid = fs::read_to_string(&process_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            test_kill_process(Pid::from_raw(claude_pid).unwrap()),
+            Err(rustix::io::Errno::SRCH),
+            "the contained Claude process survived {mode} publication"
+        );
+        assert!(
+            fs::read_dir(destination.join(".private"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -1937,6 +2457,30 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     assert!(output.stderr.is_empty());
     assert!(!rejected_destination.exists());
 
+    let finalizers = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: { argv: [\"sh\", \"-c\", \"touch finalizer-must-not-run\"] }\n",
+    );
+    let finalizer_destination = finalizers.result("finalizers-unsupported");
+    let mut args = finalizers.args(&finalizer_destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejection["outcome"], "rejected");
+    assert_eq!(rejection["phase"], "admission");
+    assert_eq!(
+        rejection["diagnostics"][0]["code"],
+        "workflow_finalizers_execution_unsupported"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!finalizer_destination.exists());
+    assert!(
+        !finalizers
+            .execution_root
+            .join("finalizer-must-not-run")
+            .exists()
+    );
+
     let malformed = RunBundle::new("schemaVersion: [\n");
     let malformed_destination = malformed.result("malformed");
     let mut args = malformed.args(&malformed_destination);
@@ -2337,6 +2881,10 @@ fn presentation_setup_failure_settles_the_published_attempt() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wall time only bounds an external PTY anti-hang watchdog"
+)]
 fn real_pty_boundary_restores_input_mode_before_the_standard_summary_handoff() {
     let (finished, completion) = std::sync::mpsc::channel();
     let progress = std::sync::Arc::new(std::sync::Mutex::new("starting"));
@@ -2787,6 +3335,7 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
             format!("touch {}", marker.display()).into_bytes(),
         ],
         "environment": Vec::<(Vec<u8>, Vec<u8>)>::new(),
+        "streamingStandardInput": false,
     });
     fs::write(
         staging.path().join("launch.json"),

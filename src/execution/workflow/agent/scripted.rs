@@ -1,16 +1,21 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::dispatch::AgentInvocationDispatcher;
+use super::dispatch::ClosedAgentDispatcher;
 use super::{
-    AgentCompatibilityProfile, AgentFailureCause, AgentInvocationIdentity, AgentObservation,
-    AgentObservationEmissionError, AgentObservationSink, AgentOutcome, AgentStartCallback,
-    AgentStartReportError, AgentTerminalCallback, AgentTerminalReportError, AgentValueKind,
-    BoundedAgentResponse, BoundedSchemaValidAgentResult, CompletedAgentInvocation,
+    AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInvocation,
+    AgentInvocationIdentity, AgentObservation, AgentObservationEmissionError, AgentObservationSink,
+    AgentOutcome, AgentStartCallback, AgentStartReportError, AgentTerminalCallback,
+    AgentTerminalReportError, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    CompletedAgentInvocation,
 };
-use crate::execution::workflow::agent_input::ClosedAgentInvocation;
+use crate::execution::workflow::claude_code::ClaudeCodeConfig;
+use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use crate::execution::workflow::pi::PiConfig;
+use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScriptedAgentValue {
@@ -63,10 +68,24 @@ impl ScriptedInvocationStarted {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct ScriptedAgentAdapter {
+pub(crate) struct ScriptedNativeAdapter<Configuration, ProtocolLimits> {
     started: mpsc::UnboundedSender<ScriptedInvocationStarted>,
+    native_types: PhantomData<fn() -> (Configuration, ProtocolLimits)>,
 }
+
+impl<Configuration, ProtocolLimits> Clone for ScriptedNativeAdapter<Configuration, ProtocolLimits> {
+    fn clone(&self) -> Self {
+        Self {
+            started: self.started.clone(),
+            native_types: PhantomData,
+        }
+    }
+}
+
+pub(crate) type ScriptedAgentDispatcher = ClosedAgentDispatcher<
+    ScriptedNativeAdapter<PiConfig, PiJsonV1ProtocolLimits>,
+    ScriptedNativeAdapter<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits>,
+>;
 
 pub(crate) struct ScriptedAgentControl {
     current: Option<ScriptedInvocationControl>,
@@ -142,19 +161,24 @@ pub(crate) enum ScriptedAgentError {
     WrongValueMode,
 }
 
-impl ScriptedAgentAdapter {
-    pub(crate) fn new() -> (Self, ScriptedAgentControl) {
-        let (started_sender, started) = mpsc::unbounded_channel();
-        (
-            Self {
-                started: started_sender,
-            },
-            ScriptedAgentControl {
-                current: None,
-                started,
-            },
-        )
-    }
+pub(crate) fn scripted_agent_dispatcher() -> (ScriptedAgentDispatcher, ScriptedAgentControl) {
+    let (started_sender, started) = mpsc::unbounded_channel();
+    let pi = ScriptedNativeAdapter::<PiConfig, PiJsonV1ProtocolLimits> {
+        started: started_sender.clone(),
+        native_types: PhantomData,
+    };
+    let claude_code =
+        ScriptedNativeAdapter::<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits> {
+            started: started_sender,
+            native_types: PhantomData,
+        };
+    (
+        ClosedAgentDispatcher::new(pi, claude_code),
+        ScriptedAgentControl {
+            current: None,
+            started,
+        },
+    )
 }
 
 impl ScriptedAgentControl {
@@ -287,13 +311,19 @@ async fn receive_acknowledgement(
         .map_err(|_| ScriptedAgentError::AdapterStopped)?
 }
 
-impl<Sink> AgentInvocationDispatcher<Sink> for ScriptedAgentAdapter
+impl<Sink, Configuration, ProtocolLimits> AgentAdapter<Sink>
+    for ScriptedNativeAdapter<Configuration, ProtocolLimits>
 where
     Sink: AgentObservationSink,
+    Configuration: Send + Sync + 'static,
+    ProtocolLimits: Send + Sync + 'static,
 {
+    type NativeConfiguration = Configuration;
+    type ProtocolLimits = ProtocolLimits;
+
     async fn invoke(
         &self,
-        invocation: ClosedAgentInvocation<Sink>,
+        invocation: AgentInvocation<Configuration, ProtocolLimits, Sink>,
         started: AgentStartCallback,
         terminal: AgentTerminalCallback,
     ) {
@@ -307,7 +337,7 @@ where
             .started
             .send(ScriptedInvocationStarted {
                 identity: invocation.identity().clone(),
-                profile: invocation.profile(),
+                profile: invocation.adapter().profile(),
                 message: Arc::from(invocation.prompt().message()),
                 attachments: Arc::from(invocation.attachments()),
                 value_kind: invocation.value_mode().kind(),
@@ -429,8 +459,8 @@ where
     }
 }
 
-fn propose_value<Sink>(
-    invocation: &ClosedAgentInvocation<Sink>,
+fn propose_value<Configuration, ProtocolLimits, Sink>(
+    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
     provisional: &mut Option<CompletedAgentInvocation>,
     value: ScriptedAgentValue,
 ) -> Result<(), ScriptedAgentError>
@@ -450,7 +480,7 @@ where
     let completed = match value {
         ScriptedAgentValue::Response(value) => {
             if u64::try_from(value.len()).map_or(true, |bytes| {
-                bytes > invocation.maximum_response_bytes().get()
+                bytes > invocation.limits().maximum_response_bytes().get()
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
@@ -460,7 +490,7 @@ where
             let bytes = serde_json::to_vec(value.as_ref())
                 .map_err(|_| ScriptedAgentError::WrongValueMode)?;
             if u64::try_from(bytes.len()).map_or(true, |bytes| {
-                bytes > invocation.maximum_result_bytes().get()
+                bytes > invocation.limits().maximum_result_bytes().get()
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
@@ -474,8 +504,8 @@ where
     Ok(())
 }
 
-fn completed_outcome<Sink>(
-    invocation: &ClosedAgentInvocation<Sink>,
+fn completed_outcome<Configuration, ProtocolLimits, Sink>(
+    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
     provisional: Option<CompletedAgentInvocation>,
 ) -> AgentOutcome
 where
@@ -501,7 +531,9 @@ where
     }
 }
 
-fn cancellation_outcome<Sink>(invocation: &ClosedAgentInvocation<Sink>) -> Option<AgentOutcome>
+fn cancellation_outcome<Configuration, ProtocolLimits, Sink>(
+    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
+) -> Option<AgentOutcome>
 where
     Sink: AgentObservationSink,
 {

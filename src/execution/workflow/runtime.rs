@@ -215,7 +215,9 @@ impl RuntimeDefinition {
                                     )),
                                     ValidatedMessageSource::File { .. }
                                     | ValidatedMessageSource::Reference {
-                                        source: ResolvedValueSource::Import(_),
+                                        source:
+                                            ResolvedValueSource::Import(_)
+                                            | ResolvedValueSource::FinalizationContext,
                                         ..
                                     } => None,
                                 })
@@ -233,7 +235,7 @@ impl RuntimeDefinition {
                 (
                     name.clone(),
                     RuntimeExport {
-                        step: source.step.clone(),
+                        step: source.node.id.clone(),
                         output: source.output.clone(),
                     },
                 )
@@ -976,9 +978,10 @@ where
         .map(|(input, source)| {
             let value = match source {
                 ResolvedValueSource::Import(_) => ActionInput::Import,
+                ResolvedValueSource::FinalizationContext => ActionInput::Unavailable,
                 ResolvedValueSource::Output(source) => state
                     .steps
-                    .get(&source.step)
+                    .get(&source.node.id)
                     .and_then(|producer| match &producer.state {
                         StepState::Succeeded { outputs } => outputs.get(&source.output),
                         _ => None,

@@ -861,25 +861,65 @@ fn result_identity_ambiguity_and_post_acceptance_work_are_protocol_failures() {
 }
 
 #[test]
-fn extension_digest_correlates_unicode_object_keys() {
-    let arguments = json!({
-        "result": {
-            "\u{1f600}": 1,
-            "\u{ff21}": 2
-        }
-    });
-    // The extension compares UTF-8 bytes, placing the BMP fullwidth key before
-    // the supplementary-plane emoji key just as Rust's canonical JSON does.
-    let extension_canonical = "{\"result\":{\"\u{ff21}\":2,\"\u{1f600}\":1}}";
-    let extension_digest = lowercase_hex(digest(&SHA256, extension_canonical.as_bytes()).as_ref());
-    let transcript = Value::Object(serde_json::Map::from_iter([(
-        RESULT_DIGEST_PROPERTY.to_owned(),
-        Value::String(extension_digest),
-    )]));
+fn accepted_result_allows_exact_cancelled_threshold_compaction_before_settlement() {
+    let tool_end = event_offset(TERMINAL_TOOL_USE, "tool_execution_end");
+    let settled = event_offset(TERMINAL_TOOL_USE, "agent_settled");
+    let parser_after_agent_end = || {
+        let mut parser = result_parser();
+        parser
+            .push_ignoring(&TERMINAL_TOOL_USE[..tool_end])
+            .unwrap();
+        let arguments = Arc::new(json!({"result": {"answer": 42}}));
+        parser
+            .correlate_result_request("scherzo_result_fixed", "call-result", arguments.as_ref())
+            .unwrap();
+        parser
+            .accept_result(AcceptedPiJsonV1Result::new(
+                Arc::from("call-result"),
+                Arc::from("scherzo_result_fixed"),
+                arguments,
+                BoundedSchemaValidAgentResult::fixture(
+                    Arc::new(json!({"answer": 42})),
+                    Arc::from(br#"{"answer":42}"#.as_slice()),
+                ),
+            ))
+            .unwrap();
+        parser
+            .push_ignoring(&TERMINAL_TOOL_USE[tool_end..settled])
+            .unwrap();
+        parser
+    };
 
-    assert!(
-        correlates_result_arguments(&transcript, &arguments),
-        "Rust must accept the digest emitted by the checked JavaScript extension"
+    let mut cancelled = parser_after_agent_end();
+    cancelled
+        .push_ignoring(&encoded(&[
+            json!({"type": "compaction_start", "reason": "threshold"}),
+            json!({"type": "compaction_end", "reason": "threshold", "aborted": true, "willRetry": false}),
+        ]))
+        .unwrap();
+    cancelled
+        .push_ignoring(&TERMINAL_TOOL_USE[settled..])
+        .unwrap();
+    assert!(matches!(
+        cancelled.finish(PiJsonV1ProcessCompletion::exited(true)),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+
+    let mut overflow = parser_after_agent_end();
+    assert_eq!(
+        overflow.push_ignoring(b"{\"type\":\"compaction_start\",\"reason\":\"overflow\"}\n"),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+
+    let mut completed = parser_after_agent_end();
+    completed
+        .push_ignoring(b"{\"type\":\"compaction_start\",\"reason\":\"threshold\"}\n")
+        .unwrap();
+    assert_eq!(
+        completed.push_ignoring(
+            b"{\"type\":\"compaction_end\",\"reason\":\"threshold\",\"result\":{},\"aborted\":false,\"willRetry\":false}\n"
+        ),
+        Err(AgentFailureCause::HarnessProtocolFailed)
     );
 }
 

@@ -905,7 +905,7 @@ fn resolve_attachments<'a>(
             let value = upstream_value(upstream_outputs, source)?;
             let diagnostic_source_name = Some(Arc::from(format!(
                 "outputs.{}.{}",
-                source.step, source.output
+                source.node.id, source.output
             )));
             let attachment = match (value_type, value) {
                 (WorkflowValueType::Json, CapturedValue::Json(value)) => PlannedAgentAttachment {

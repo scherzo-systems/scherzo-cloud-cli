@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use opentelemetry::KeyValue;
 use opentelemetry::propagation::Injector;
-use tokio_tungstenite::connect_async_with_config;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -15,13 +15,15 @@ use tokio_tungstenite::tungstenite::http::{
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
-use crate::runner::service::Sleeper;
 use crate::runner::service::assignment::{
     AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentRenewal,
     AssignmentStart, PendingAssignmentObservation, WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
+use crate::runner::service::control::LiveStatus;
+use crate::runner::service::{Sequence, Sleeper};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use crate::runner_protocol::{
     CloudFrame, MAXIMUM_ENCODED_FRAME_BYTES, RunnerEnvelope, RunnerFrame, decode_cloud_frame,
@@ -532,14 +534,16 @@ impl ConnectionProgress {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum FailureKind {
     Retryable,
-    Terminal,
+    TerminalAuthentication,
+    TerminalProtocol,
 }
 
 impl FailureKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Retryable => "retryable",
-            Self::Terminal => "terminal",
+            Self::TerminalAuthentication => "terminal_authentication",
+            Self::TerminalProtocol => "terminal_protocol",
         }
     }
 }
@@ -554,6 +558,8 @@ pub(crate) enum ConnectionCause {
     BuildAuthorizationHeader,
     CredentialRejected,
     ConnectionRequestRejected,
+    GatewayRateLimited,
+    GatewayUnavailable,
     GatewayHttpError,
     ConnectGateway,
     ConnectTimeout,
@@ -601,6 +607,8 @@ impl ConnectionCause {
             Self::BuildAuthorizationHeader => "build authorization header",
             Self::CredentialRejected => "runner gateway rejected the credential",
             Self::ConnectionRequestRejected => "runner gateway rejected the connection request",
+            Self::GatewayRateLimited => "runner gateway rate limited the connection request",
+            Self::GatewayUnavailable => "runner gateway is unavailable",
             Self::GatewayHttpError => "runner gateway returned an HTTP error",
             Self::ConnectGateway => "connect to runner gateway",
             Self::ConnectTimeout => "runner gateway connect timeout",
@@ -652,6 +660,8 @@ impl ConnectionCause {
             Self::BuildAuthorizationHeader => "build_authorization_header",
             Self::CredentialRejected => "credential_rejected",
             Self::ConnectionRequestRejected => "connection_request_rejected",
+            Self::GatewayRateLimited => "gateway_rate_limited",
+            Self::GatewayUnavailable => "gateway_unavailable",
             Self::GatewayHttpError => "gateway_http_error",
             Self::ConnectGateway => "connect_gateway",
             Self::ConnectTimeout => "connect_timeout",
@@ -706,7 +716,15 @@ impl ConnectionError {
     pub(crate) const fn terminal(progress: ConnectionProgress, cause: ConnectionCause) -> Self {
         Self {
             progress,
-            kind: FailureKind::Terminal,
+            kind: FailureKind::TerminalProtocol,
+            cause,
+        }
+    }
+
+    const fn terminal_authentication(progress: ConnectionProgress, cause: ConnectionCause) -> Self {
+        Self {
+            progress,
+            kind: FailureKind::TerminalAuthentication,
             cause,
         }
     }
@@ -720,7 +738,7 @@ impl ConnectionError {
     }
 
     pub(crate) const fn is_terminal(&self) -> bool {
-        matches!(self.kind, FailureKind::Terminal)
+        !matches!(self.kind, FailureKind::Retryable)
     }
 
     pub(crate) const fn kind(&self) -> FailureKind {
@@ -801,8 +819,9 @@ async fn close_locally<W>(
     }
 }
 
-// protocol_violation closes locally with status 1002 and reports a retryable
-// ending: a misbehaving gateway is indistinguishable from a transient fault.
+// protocol_violation closes locally with status 1002 and reports a terminal
+// protocol ending. Retrying unchanged software or configuration cannot make a
+// malformed Cloud protocol stream safe.
 async fn protocol_violation<W>(
     writer: &mut W,
     sleeper: &dyn Sleeper,
@@ -821,17 +840,39 @@ where
         cause.message(),
     )
     .await;
-    ConnectionError::retryable(progress, cause)
+    ConnectionError::terminal(progress, cause)
+}
+
+type RunnerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub(super) struct CandidateTransport(RunnerSocket);
+
+pub(super) struct CandidateConnection {
+    socket: RunnerSocket,
+    progress: ConnectionProgress,
+    inbound_silence_timeout: Duration,
+    protocol_session_id: String,
+    protocol_order: u64,
 }
 
 pub(crate) async fn run(
     dependencies: ConnectionDependencies<'_>,
     opening: OpeningHello<'_>,
-    next_sequence: &mut u64,
+    next_sequence: &Sequence,
 ) -> Result<ConnectionProgress, ConnectionError> {
+    let active_effect_event = dependencies.active_effect_event;
+    let socket = connect_gateway(dependencies).await?;
+    let (writer, reader) = socket.split();
+    let result = run_established_shared(dependencies, opening, next_sequence, reader, writer).await;
+    active_effect_event.finish_connection_end(&result);
+    result
+}
+
+async fn connect_gateway(
+    dependencies: ConnectionDependencies<'_>,
+) -> Result<RunnerSocket, ConnectionError> {
     let config = dependencies.config;
     let sleeper = dependencies.sleeper;
-    let active_effect_event = dependencies.active_effect_event;
     crate::tls::install_provider();
     let unacknowledged = ConnectionProgress::unacknowledged();
     let mut request = config
@@ -871,13 +912,20 @@ pub(crate) async fn run(
         Some(Ok(established)) => established,
         Some(Err(WebSocketError::Http(response))) => {
             return Err(match response.status() {
-                StatusCode::UNAUTHORIZED => {
-                    ConnectionError::terminal(unacknowledged, ConnectionCause::CredentialRejected)
-                }
+                StatusCode::UNAUTHORIZED => ConnectionError::terminal_authentication(
+                    unacknowledged,
+                    ConnectionCause::CredentialRejected,
+                ),
                 StatusCode::BAD_REQUEST => ConnectionError::terminal(
                     unacknowledged,
                     ConnectionCause::ConnectionRequestRejected,
                 ),
+                StatusCode::TOO_MANY_REQUESTS => {
+                    ConnectionError::retryable(unacknowledged, ConnectionCause::GatewayRateLimited)
+                }
+                status if status.is_server_error() => {
+                    ConnectionError::retryable(unacknowledged, ConnectionCause::GatewayUnavailable)
+                }
                 _ => ConnectionError::retryable(unacknowledged, ConnectionCause::GatewayHttpError),
             });
         }
@@ -905,10 +953,168 @@ pub(crate) async fn run(
             ConnectionCause::RequiredSubprotocolNotSelected,
         ));
     }
-    let (writer, reader) = socket.split();
-    let result = run_established(dependencies, opening, next_sequence, reader, writer).await;
-    active_effect_event.finish_connection_end(&result);
-    result
+    Ok(socket)
+}
+
+pub(super) async fn connect_candidate_transport(
+    dependencies: ConnectionDependencies<'_>,
+) -> Result<CandidateTransport, ConnectionError> {
+    connect_gateway(dependencies).await.map(CandidateTransport)
+}
+
+pub(super) async fn authenticate_candidate(
+    dependencies: ConnectionDependencies<'_>,
+    transport: CandidateTransport,
+    opening: OpeningHello<'_>,
+) -> Result<CandidateConnection, ConnectionError> {
+    let CandidateTransport(mut socket) = transport;
+    let mut protocol = ProtocolLog::new(
+        dependencies.recorder,
+        dependencies.config.credential().runner_id(),
+        opening.boot_id,
+        dependencies.connection_attempt,
+    );
+    let unacknowledged = ConnectionProgress::unacknowledged();
+    let hello = std::str::from_utf8(opening.encoded).map_err(|_| {
+        ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
+    })?;
+    socket
+        .send(Message::Text(hello.into()))
+        .await
+        .map_err(|_| {
+            ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
+        })?;
+    protocol.opening_hello(opening);
+    let mut progress = ConnectionProgress::unacknowledged();
+    progress.runner_text_frames_sent = 1;
+    record_progress(dependencies.connection_event, progress);
+    let welcome_timeout = dependencies.sleeper.sleep(WELCOME_TIMEOUT);
+    tokio::pin!(welcome_timeout);
+    // A candidate must stop at valid welcome and return its live socket without
+    // entering assignment transport before protected-state promotion. This
+    // bounded pre-welcome parser therefore repeats only the common base-frame
+    // handling rather than reusing the effect-capable established loop.
+    // jscpd:ignore-start
+    loop {
+        let message = tokio::select! {
+            biased;
+            message = socket.next() => message,
+            () = &mut welcome_timeout => {
+                protocol.timer_expired("welcome");
+                return Err(ConnectionError::retryable(
+                    progress,
+                    ConnectionCause::GatewayWelcomeTimeout,
+                ));
+            }
+        };
+        let Some(message) = message else {
+            return Err(ConnectionError::retryable(
+                progress,
+                ConnectionCause::ReadGatewayFrame,
+            ));
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(WebSocketError::Capacity(_)) => {
+                return Err(ConnectionError::terminal(
+                    progress,
+                    ConnectionCause::OversizedGatewayFrame,
+                ));
+            }
+            Err(_) => {
+                return Err(ConnectionError::retryable(
+                    progress,
+                    ConnectionCause::ReadGatewayFrame,
+                ));
+            }
+        };
+        let frame = match message {
+            Message::Text(text) => {
+                let frame = decode_cloud_frame(text.as_bytes()).map_err(|_| {
+                    ConnectionError::terminal(progress, ConnectionCause::UndecodableGatewayFrame)
+                })?;
+                protocol.cloud_text(&frame);
+                progress.cloud_text_frames_received =
+                    progress.incremented(progress.cloud_text_frames_received)?;
+                record_progress(dependencies.connection_event, progress);
+                frame
+            }
+            Message::Ping(_) => {
+                protocol.control("cloud_to_runner", "ping");
+                socket.flush().await.map_err(|_| {
+                    ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
+                })?;
+                protocol.control("runner_to_cloud", "pong");
+                continue;
+            }
+            Message::Pong(_) => continue,
+            Message::Close(close) => {
+                return match close_outcome(progress, close) {
+                    Ok(progress) => Err(ConnectionError::retryable(
+                        progress,
+                        ConnectionCause::GatewayClosedConnection,
+                    )),
+                    Err(error) => Err(error),
+                };
+            }
+            Message::Binary(_) | Message::Frame(_) => {
+                return Err(ConnectionError::terminal(
+                    progress,
+                    ConnectionCause::UnexpectedRawGatewayFrame,
+                ));
+            }
+        };
+        match frame {
+            CloudFrame::Welcome {
+                session_id,
+                pong_timeout_seconds,
+                lease_policy,
+                ..
+            } => {
+                let policy = dependencies
+                    .assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain_lease_policy(&lease_policy);
+                let cause = match policy {
+                    Ok(()) => None,
+                    Err(WelcomePolicyFailure::Invalid) => {
+                        Some(ConnectionCause::InvalidExecutionLeasePolicy)
+                    }
+                    Err(WelcomePolicyFailure::Changed) => {
+                        Some(ConnectionCause::ChangedExecutionLeasePolicy)
+                    }
+                };
+                if let Some(cause) = cause {
+                    return Err(ConnectionError::terminal(progress, cause));
+                }
+                return Ok(CandidateConnection {
+                    socket,
+                    progress,
+                    inbound_silence_timeout: Duration::from_secs(pong_timeout_seconds),
+                    protocol_session_id: session_id,
+                    protocol_order: protocol.order,
+                });
+            }
+            CloudFrame::ObservationAck {
+                acknowledged_message_id,
+                acknowledged_sequence,
+                ..
+            } if acknowledged_message_id == opening.message_id
+                && acknowledged_sequence == opening.sequence =>
+            {
+                progress.opening_acknowledged = true;
+                record_progress(dependencies.connection_event, progress);
+            }
+            _ => {
+                return Err(ConnectionError::terminal(
+                    progress,
+                    ConnectionCause::UnexpectedGatewayFrame,
+                ));
+            }
+        }
+    }
+    // jscpd:ignore-end
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1053,6 +1259,7 @@ pub(super) struct ConnectionDependencies<'a> {
     active_effect_event: &'a ActiveEffectEvent,
     assignment_manager: &'a Mutex<AssignmentManager>,
     connection_attempt: u64,
+    live_status: Option<&'a LiveStatus>,
 }
 
 impl<'a> ConnectionDependencies<'a> {
@@ -1079,16 +1286,92 @@ impl<'a> ConnectionDependencies<'a> {
             active_effect_event,
             assignment_manager,
             connection_attempt,
+            live_status: None,
         }
+    }
+
+    pub(super) fn with_live_status(mut self, live_status: &'a LiveStatus) -> Self {
+        self.live_status = Some(live_status);
+        self
     }
 }
 
+// Deterministic transcript fixtures retain a plain mutable counter while
+// production shares one sequence allocator across candidate connections.
+// jscpd:ignore-start
+#[cfg(test)]
 pub(super) async fn run_established<R, W>(
     dependencies: ConnectionDependencies<'_>,
     opening: OpeningHello<'_>,
     next_sequence: &mut u64,
+    reader: R,
+    writer: W,
+) -> Result<ConnectionProgress, ConnectionError>
+where
+    R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    let sequence = Sequence::new(*next_sequence);
+    let result = run_established_shared(dependencies, opening, &sequence, reader, writer).await;
+    *next_sequence = sequence.peek();
+    result
+}
+// jscpd:ignore-end
+
+pub(super) async fn run_established_shared<R, W>(
+    dependencies: ConnectionDependencies<'_>,
+    opening: OpeningHello<'_>,
+    next_sequence: &Sequence,
+    reader: R,
+    writer: W,
+) -> Result<ConnectionProgress, ConnectionError>
+where
+    R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    run_established_inner(dependencies, opening, next_sequence, reader, writer, None).await
+}
+
+pub(super) async fn run_promoted(
+    dependencies: ConnectionDependencies<'_>,
+    opening: OpeningHello<'_>,
+    next_sequence: &Sequence,
+    candidate: CandidateConnection,
+) -> Result<ConnectionProgress, ConnectionError> {
+    let active_effect_event = dependencies.active_effect_event;
+    let CandidateConnection {
+        socket,
+        progress,
+        inbound_silence_timeout,
+        protocol_session_id,
+        protocol_order,
+    } = candidate;
+    let (writer, reader) = socket.split();
+    let result = run_established_inner(
+        dependencies,
+        opening,
+        next_sequence,
+        reader,
+        writer,
+        Some((
+            progress,
+            inbound_silence_timeout,
+            protocol_session_id,
+            protocol_order,
+        )),
+    )
+    .await;
+    active_effect_event.finish_connection_end(&result);
+    result
+}
+
+async fn run_established_inner<R, W>(
+    dependencies: ConnectionDependencies<'_>,
+    opening: OpeningHello<'_>,
+    next_sequence: &Sequence,
     mut reader: R,
     mut writer: W,
+    resumed: Option<(ConnectionProgress, Duration, String, u64)>,
 ) -> Result<ConnectionProgress, ConnectionError>
 where
     R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
@@ -1103,6 +1386,7 @@ where
         active_effect_event,
         assignment_manager,
         connection_attempt,
+        live_status,
     } = dependencies;
     let _observation_transport = ObservationTransport { assignment_manager };
     let mut protocol = ProtocolLog::new(
@@ -1111,23 +1395,40 @@ where
         opening.boot_id,
         connection_attempt,
     );
+    let resumed_transport = resumed.map(|(progress, timeout, session_id, order)| {
+        protocol.session_id = Some(session_id);
+        protocol.order = order;
+        (progress, timeout)
+    });
     let unacknowledged = ConnectionProgress::unacknowledged();
-    let opening_hello = std::str::from_utf8(opening.encoded).map_err(|_| {
-        ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
-    })?;
-    writer
-        .send(Message::Text(opening_hello.into()))
-        .await
-        .map_err(|_| {
-            ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
-        })?;
-    protocol.opening_hello(opening);
-
     let mut welcome_timer = sleeper.sleep(WELCOME_TIMEOUT);
-    let mut inbound_silence_timeout = None;
-    let mut progress = ConnectionProgress::unacknowledged();
-    progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
-    record_progress(connection_event, progress);
+    let (mut progress, mut inbound_silence_timeout) =
+        if let Some((mut progress, timeout)) = resumed_transport {
+            if progress.opening_acknowledged {
+                progress.handshake_completed = true;
+                record_progress(connection_event, progress);
+                if let Some(status) = live_status {
+                    status.connected(frame_source.utc_timestamp().ok());
+                }
+            }
+            (progress, Some(timeout))
+        } else {
+            let opening_hello = std::str::from_utf8(opening.encoded).map_err(|_| {
+                ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
+            })?;
+            writer
+                .send(Message::Text(opening_hello.into()))
+                .await
+                .map_err(|_| {
+                    ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
+                })?;
+            protocol.opening_hello(opening);
+            let mut progress = ConnectionProgress::unacknowledged();
+            progress.runner_text_frames_sent =
+                progress.incremented(progress.runner_text_frames_sent)?;
+            record_progress(connection_event, progress);
+            (progress, None)
+        };
     let mut in_flight = VecDeque::<PendingObservation>::new();
     let mut buffered_effect: Option<CloudFrame> = None;
     let assignment_notification = assignment_manager
@@ -1432,6 +1733,9 @@ where
         {
             progress.handshake_completed = true;
             record_progress(connection_event, progress);
+            if let Some(status) = live_status {
+                status.connected(frame_source.utc_timestamp().ok());
+            }
         }
     }
 }
@@ -1448,7 +1752,7 @@ async fn send_effect_receipt<W>(
     config: &Config,
     frame_source: &dyn FrameSource,
     boot_id: &str,
-    next_sequence: &mut u64,
+    next_sequence: &Sequence,
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
@@ -1560,7 +1864,8 @@ where
         }
     };
 
-    let sequence = *next_sequence;
+    let emission = next_sequence.lock_emission().await;
+    let sequence = next_sequence.peek();
     let event = recorder.start(
         "runner.effect_acknowledgement",
         [
@@ -1608,6 +1913,7 @@ where
         PendingObservationKind::EffectReceipt,
     )
     .await?;
+    drop(emission);
 
     let manager_result = {
         let mut manager = assignment_manager
@@ -1651,11 +1957,10 @@ fn next_envelope(
     config: &Config,
     frame_source: &dyn FrameSource,
     boot_id: &str,
-    next_sequence: &mut u64,
+    next_sequence: &Sequence,
     progress: &ConnectionProgress,
 ) -> Result<RunnerEnvelope, ConnectionError> {
-    let sequence = *next_sequence;
-    *next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+    let sequence = next_sequence.next().map_err(|_| {
         ConnectionError::terminal(*progress, ConnectionCause::ObservationSequenceOverflow)
     })?;
     let sent_at = frame_source.utc_timestamp().map_err(|_| {
@@ -1684,7 +1989,7 @@ async fn send_assignment_observation<W>(
     config: &Config,
     frame_source: &dyn FrameSource,
     boot_id: &str,
-    next_sequence: &mut u64,
+    next_sequence: &Sequence,
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
@@ -1695,6 +2000,7 @@ where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     // jscpd:ignore-end
+    let emission = next_sequence.lock_emission().await;
     let envelope = next_envelope(config, frame_source, boot_id, next_sequence, progress)?;
     let sequence = envelope.sequence;
     let message_id = envelope.message_id.clone();
@@ -1717,6 +2023,7 @@ where
         .map_err(|_| {
             ConnectionError::retryable(*progress, ConnectionCause::SendEffectAcknowledgement)
         })?;
+    drop(emission);
     protocol.runner_text(&frame);
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
     record_progress(connection_event, *progress);
@@ -1816,8 +2123,6 @@ pub(crate) fn opening_hello(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -1825,7 +2130,6 @@ mod tests {
 
     use futures_util::{Sink, SinkExt, StreamExt};
     use serde_json::json;
-    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tokio_tungstenite::accept_hdr_async;
@@ -1838,12 +2142,11 @@ mod tests {
 
     use super::{
         ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
-        ConnectionProgress, FrameSource, OBSERVATION_WINDOW, OpeningHello, ProtocolLog,
-        RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
+        ConnectionProgress, FailureKind, FrameSource, OBSERVATION_WINDOW, OpeningHello,
+        ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
         run_established,
     };
-    use crate::runner::credential::{Credential, test_credential};
-    use crate::runner::service::Sleeper;
+    use crate::runner::credential::test_credential;
     use crate::runner::service::assignment::AssignmentManager;
     use crate::runner::service::config::Config;
     use crate::runner::service::test_support::{
@@ -1853,10 +2156,9 @@ mod tests {
         observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
         sleep_request, welcome, with_watchdog,
     };
+    use crate::runner::service::{Sequence, Sleeper};
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
 
-    const CREDENTIAL: &str =
-        "rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678";
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
 
@@ -1875,7 +2177,7 @@ mod tests {
 
     impl EstablishedTestContext {
         fn new() -> Self {
-            let config = test_config("wss://gateway.example.test/v1/connect");
+            let config = test_config("wss://gateway.example.test/v1/runner/connect");
             let frame_source = deterministic_frame_source();
             let opening = test_opening(&config, frame_source.as_ref());
             let (sleeper, sleep_requests) = controlled_sleeper();
@@ -2455,7 +2757,7 @@ mod tests {
             let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
                 assert_eq!(
                     request.headers().get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()),
-                    Some("Bearer rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"),
+                    Some("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abd.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
                 );
                 assert_eq!(
                     request.headers().get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|value| value.to_str().ok()),
@@ -2588,16 +2890,8 @@ mod tests {
             socket.close(None).await.expect("close fixture socket");
         });
 
-        let directory = TempDir::new().expect("create credential directory");
-        let path = directory.path().join("runner.credential");
-        fs::write(&path, CREDENTIAL).expect("write credential");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set credential mode");
-        let config = Config::fixture(
-            &endpoint,
-            Credential::load(&path).expect("load credential"),
-            true,
-        )
-        .expect("configure loopback gateway");
+        let config = Config::fixture(&endpoint, test_credential(), true)
+            .expect("configure loopback gateway");
         let (outcome, capture, next_sequence) =
             run_configured_fixture_connection_with_capture(&config).await;
         let outcome = outcome.expect("run fixture connection");
@@ -2888,6 +3182,7 @@ mod tests {
             .await
             .expect_err("unauthorized connection succeeded");
         assert!(error.is_terminal());
+        assert_eq!(error.kind(), FailureKind::TerminalAuthentication);
         assert_eq!(error.cause(), "runner gateway rejected the credential");
         server.await.expect("join fixture server");
     }
@@ -2908,7 +3203,8 @@ mod tests {
         let error = run_fixture_connection(&endpoint)
             .await
             .expect_err("oversized frame accepted");
-        assert!(!error.is_terminal());
+        assert!(error.is_terminal());
+        assert_eq!(error.kind(), FailureKind::TerminalProtocol);
         assert_eq!(error.cause(), "oversized gateway frame");
         server.await.expect("join fixture server");
     }
@@ -2952,7 +3248,8 @@ mod tests {
         let error = run_fixture_connection(&endpoint)
             .await
             .expect_err("undecodable frame accepted");
-        assert!(!error.is_terminal());
+        assert!(error.is_terminal());
+        assert_eq!(error.kind(), FailureKind::TerminalProtocol);
         assert_eq!(error.cause(), "undecodable gateway frame");
         server.await.expect("join fixture server");
     }
@@ -3088,6 +3385,7 @@ mod tests {
             BOOT_ID.to_owned(),
             healthy_wall_clock(),
         ));
+        let sequence = Sequence::new(*next_sequence);
         let result = run(
             ConnectionDependencies::new(
                 config,
@@ -3105,9 +3403,10 @@ mod tests {
                 message_id: OPENING_MESSAGE_ID,
                 sequence: 1,
             },
-            next_sequence,
+            &sequence,
         )
         .await;
+        *next_sequence = sequence.peek();
         (result, capture)
     }
 

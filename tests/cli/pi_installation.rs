@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
-use super::{private_credential_directory, run_with_env, write_runner_credential};
+use super::{private_credential_directory, run_with_env, write_runner_config};
 
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CAPABILITY_PROBE: &str = "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help";
@@ -167,10 +167,8 @@ fn report_code(output: &std::process::Output) -> String {
 
 fn assert_invalid_runner_gateway(output: &std::process::Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with(
-        "Error: configure runner gateway endpoint https://not-a-websocket.example.test: "
-    ));
-    assert!(stderr.contains("invalid runner gateway URL"));
+    assert!(stderr.starts_with("Error: load runner operator configuration "));
+    assert!(stderr.contains("operator configuration or protected state is invalid"));
 }
 
 #[test]
@@ -377,25 +375,13 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
 
 #[test]
 fn runner_initialization_probes_path_once_and_remains_command_capable_without_compatible_pi() {
-    let credential_directory = private_credential_directory();
-    let credential_path = write_runner_credential(&credential_directory);
+    let runner_directory = private_credential_directory();
+    let config_path = write_runner_config(
+        &runner_directory,
+        "https://not-a-websocket.example.test/v1/runner/connect",
+    );
     let empty_path = tempfile::tempdir().expect("empty runner PATH");
-    let serve_args = [
-        "runner",
-        "serve",
-        "--gateway-url",
-        "https://not-a-websocket.example.test",
-        "--credential-file",
-        &credential_path,
-        "--workflow-id",
-        "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-        "--workflow-source-root",
-        "schemas",
-        "--workflow-path",
-        "workflow-v1.schema.json",
-        "--work-root",
-        "tests",
-    ];
+    let serve_args = ["runner", "serve", "--config", config_path.as_str()];
     let output = run_with_env(
         &serve_args,
         &[("PATH", empty_path.path().to_str().unwrap())],

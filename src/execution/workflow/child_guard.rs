@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -10,12 +11,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-#[cfg(target_os = "linux")]
-use rustix::process::waitpgid;
 use rustix::process::{
     Pid, Signal, WaitId, WaitIdOptions, WaitOptions, getpid, getppid, kill_process,
     kill_process_group, waitid, waitpid,
 };
+#[cfg(target_os = "linux")]
+use rustix::process::{wait, waitpgid};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
@@ -43,6 +44,7 @@ const READY_FILE: &str = "ready.json";
 const RELEASED_FILE: &str = "released";
 const QUIESCED_FILE: &str = "quiesced";
 const EXEC_BOUNDARY_SOCKET: &str = "exec.sock";
+const STANDARD_INPUT_SOCKET: &str = "stdin.sock";
 const EXEC_FAILURE_FILE: &str = "exec.failure";
 const STATUS_FILE: &str = "status";
 const WORKER_FAILURE_FILE: &str = "worker.failure";
@@ -58,10 +60,16 @@ struct LaunchManifest {
     program: Vec<u8>,
     arguments: Vec<Vec<u8>>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
+    streaming_standard_input: bool,
 }
 
 impl LaunchManifest {
-    fn new(program: &Path, arguments: &[OsString], environment: &[(OsString, OsString)]) -> Self {
+    fn new(
+        program: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        streaming_standard_input: bool,
+    ) -> Self {
         Self {
             program: program.as_os_str().as_bytes().to_vec(),
             arguments: arguments
@@ -72,6 +80,7 @@ impl LaunchManifest {
                 .iter()
                 .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
                 .collect(),
+            streaming_standard_input,
         }
     }
 
@@ -126,6 +135,32 @@ impl StoppedChildGuard {
         environment: &[(OsString, OsString)],
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Self> {
+        let (child, standard_input) =
+            Self::spawn_inner(program, arguments, environment, false, configure)?;
+        debug_assert!(standard_input.is_none());
+        Ok(child)
+    }
+
+    pub(crate) fn spawn_with_stdin(
+        program: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
+    ) -> io::Result<(Self, tokio::net::UnixStream)> {
+        let (child, standard_input) =
+            Self::spawn_inner(program, arguments, environment, true, configure)?;
+        let standard_input = standard_input
+            .ok_or_else(|| io::Error::other("guarded child standard input unavailable"))?;
+        Ok((child, standard_input))
+    }
+
+    fn spawn_inner(
+        program: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        streaming_standard_input: bool,
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
+    ) -> io::Result<(Self, Option<tokio::net::UnixStream>)> {
         if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -137,11 +172,15 @@ impl StoppedChildGuard {
             .prefix(TEMPORARY_DIRECTORY_PREFIX)
             .tempdir_in("/tmp")?;
         let activity_lease = create_activity_lease(staging.path())?;
-        let manifest = LaunchManifest::new(program, arguments, environment);
+        let standard_input_listener = streaming_standard_input
+            .then(|| UnixListener::bind(staging.path().join(STANDARD_INPUT_SOCKET)))
+            .transpose()?;
+        let manifest =
+            LaunchManifest::new(program, arguments, environment, streaming_standard_input);
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
         fs::write(staging.path().join(MANIFEST_FILE), manifest_bytes)?;
 
-        let executable = std::env::current_exe()?;
+        let executable = child_guard_worker_executable()?;
         let mut command = Command::new(executable);
         command
             .env_clear()
@@ -184,14 +223,24 @@ impl StoppedChildGuard {
         ) {
             return Err(io::Error::other("guarded process did not remain stopped"));
         }
+        let standard_input = standard_input_listener
+            .map(|listener| {
+                let (standard_input, _) = listener.accept()?;
+                standard_input.set_nonblocking(true)?;
+                tokio::net::UnixStream::from_std(standard_input)
+            })
+            .transpose()?;
 
-        Ok(Self {
-            child,
-            identity,
-            owner_control: Some(owner_control),
-            staging,
-            _activity_lease: activity_lease,
-        })
+        Ok((
+            Self {
+                child,
+                identity,
+                owner_control: Some(owner_control),
+                staging,
+                _activity_lease: activity_lease,
+            },
+            standard_input,
+        ))
     }
 
     pub(crate) fn identity(&self) -> &AuthenticatedProcessGroup {
@@ -262,6 +311,26 @@ impl Drop for StoppedChildGuard {
         // EOF is the owner-loss signal. The independent guard remains alive long
         // enough to terminate and reap the stopped or released process group.
         self.owner_control.take();
+    }
+}
+
+fn child_guard_worker_executable() -> io::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    #[cfg(not(test))]
+    {
+        Ok(current)
+    }
+    #[cfg(test)]
+    {
+        let executable = current
+            .parent()
+            .and_then(Path::parent)
+            .map(|directory| {
+                directory.join(format!("scherzo-cloud{}", std::env::consts::EXE_SUFFIX))
+            })
+            .filter(|executable| executable.is_file())
+            .ok_or_else(|| io::Error::other("test child-guard worker executable unavailable"))?;
+        Ok(executable)
     }
 }
 
@@ -567,6 +636,11 @@ fn run_leader_worker() -> Result<(), ()> {
     }
     install_parent_death_protection()?;
     let mut exec_boundary = UnixStream::connect(root.join(EXEC_BOUNDARY_SOCKET)).map_err(|_| ())?;
+    let standard_input = manifest
+        .streaming_standard_input
+        .then(|| UnixStream::connect(root.join(STANDARD_INPUT_SOCKET)))
+        .transpose()
+        .map_err(|_| ())?;
     if getppid() != Some(expected_parent)
         || getpid() != rustix::process::getpgrp()
         || kill_process(getpid(), Signal::STOP).is_err()
@@ -577,12 +651,15 @@ fn run_leader_worker() -> Result<(), ()> {
         return Err(());
     }
 
-    let error = std::process::Command::new(manifest.program())
+    let mut command = std::process::Command::new(manifest.program());
+    command
         .args(manifest.arguments())
         .env_clear()
         .envs(manifest.environment())
-        .stdin(Stdio::null())
-        .exec();
+        .stdin(standard_input.map_or_else(Stdio::null, |standard_input| {
+            Stdio::from(OwnedFd::from(standard_input))
+        }));
+    let error = command.exec();
     let raw_error = error.raw_os_error().unwrap_or(-1).to_string();
     exec_boundary
         .write_all(raw_error.as_bytes())
@@ -632,6 +709,14 @@ fn cleanup_owned_group(
     terminate_owned_group(identity, inspector)?;
     let status = leader.wait().map_err(|_| ())?;
     reap_owned_process_group(identity.process_group()).map_err(|_| ())?;
+    // Only the dedicated one-invocation guard owns every direct child. Unit-test callers share
+    // their process with unrelated guarded launches and must not sweep those sibling workers.
+    if matches!(
+        std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref(),
+        Ok(GUARD_WORKER)
+    ) {
+        terminate_and_reap_adopted_descendants().map_err(|_| ())?;
+    }
     write_atomic(&root.join(QUIESCED_FILE), b"quiesced\n")?;
     Ok(status)
 }
@@ -744,6 +829,78 @@ fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
     }
 }
 
+// One guard worker is the subreaper for one invocation. After the original leader exits,
+// surviving descendants become its direct children even when native tools created new sessions.
+#[cfg(target_os = "linux")]
+fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
+    let started = crate::timing::monotonic_now();
+    loop {
+        loop {
+            match wait(WaitOptions::NOHANG) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(Errno::CHILD) => break,
+                Err(Errno::INTR) => {}
+                Err(error) => {
+                    return Err(io::Error::from_raw_os_error(error.raw_os_error()));
+                }
+            }
+        }
+
+        let children = linux_direct_children()?;
+        if children.is_empty() && matches!(wait(WaitOptions::NOHANG), Err(Errno::CHILD)) {
+            return Ok(());
+        }
+        // Do not reap between this snapshot and signalling: an exited direct child remains a
+        // zombie, which pins its PID and prevents an unrelated process from receiving the signal.
+        for child in children {
+            match kill_process(child, Signal::KILL) {
+                Ok(()) | Err(Errno::SRCH) => {}
+                Err(error) => {
+                    return Err(io::Error::from_raw_os_error(error.raw_os_error()));
+                }
+            }
+        }
+
+        if crate::timing::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "guarded descendants did not exit",
+            ));
+        }
+        crate::timing::sleep(WORKER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_direct_children() -> io::Result<Vec<Pid>> {
+    let mut children = Vec::new();
+    for task in fs::read_dir("/proc/self/task")? {
+        let task = task?;
+        let direct_children = match fs::read_to_string(task.path().join("children")) {
+            Ok(direct_children) => direct_children,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for raw_pid in direct_children.split_ascii_whitespace() {
+            let raw_pid = raw_pid.parse::<i32>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid adopted child process")
+            })?;
+            let child = Pid::from_raw(raw_pid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid adopted child process")
+            })?;
+            if !children.contains(&child) {
+                children.push(child);
+            }
+        }
+    }
+    Ok(children)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(target_vendor = "apple")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
     let started = crate::timing::monotonic_now();
@@ -841,6 +998,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::process::Command as StdCommand;
 
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     #[cfg(target_os = "linux")]
     use super::super::process_group::capture_process_group_identity;
     use super::*;
@@ -857,6 +1016,27 @@ mod tests {
     fn worker_boundary_allows_waits_beyond_ten_seconds() {
         assert!(!worker_boundary_timed_out(Duration::from_secs(11)));
         assert!(worker_boundary_timed_out(MAXIMUM_CANCELLATION_GRACE));
+    }
+
+    #[tokio::test]
+    async fn guarded_child_can_receive_streaming_standard_input() {
+        let arguments = [
+            OsString::from("-c"),
+            OsString::from("IFS= read -r line; printf 'received:%s\\n' \"$line\""),
+        ];
+        let (mut child, mut standard_input) =
+            StoppedChildGuard::spawn_with_stdin(Path::new("/bin/sh"), &arguments, &[], |_| Ok(()))
+                .unwrap();
+        let mut standard_output = child.take_stdout().unwrap();
+        child.continue_execution().unwrap();
+
+        standard_input.write_all(b"exact input\n").await.unwrap();
+        standard_input.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        standard_output.read_to_end(&mut output).await.unwrap();
+
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(output, b"received:exact input\n");
     }
 
     #[test]

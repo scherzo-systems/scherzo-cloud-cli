@@ -23,7 +23,9 @@ use crate::execution::workflow::admission::{
     ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
     ResolvedAttachment, ResolvedImports, admit_workflow,
 };
-use crate::execution::workflow::agent::scripted::{ScriptedAgentAdapter, ScriptedAgentValue};
+use crate::execution::workflow::agent::scripted::{
+    ScriptedAgentDispatcher, ScriptedAgentValue, scripted_agent_dispatcher,
+};
 use crate::execution::workflow::agent::{
     AgentFailureCause, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
     WorkflowRunId,
@@ -761,8 +763,8 @@ const AGENT_PROFILE: &str = r#"agentProfiles:
 
 fn agent_runtime(
     fixture: &ExecutionFixture,
-    adapter: ScriptedAgentAdapter,
-) -> AgentExecution<ScriptedAgentAdapter> {
+    adapter: ScriptedAgentDispatcher,
+) -> AgentExecution<ScriptedAgentDispatcher> {
     AgentExecution::enabled(
         WorkflowRunId::from(Arc::from("run-fixed")),
         fixture.agent_inputs.clone(),
@@ -823,7 +825,7 @@ exports:
             1024,
         );
         fs::write(fixture.execution_root.join("agent.txt"), b"agent artifact").unwrap();
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();
@@ -947,7 +949,7 @@ exports:
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();
@@ -1067,7 +1069,7 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
             1024,
         );
         fs::write(fixture.execution_root.join("upstream.txt"), b"file exact").unwrap();
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();
@@ -1197,7 +1199,7 @@ exports:
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();
@@ -1294,7 +1296,7 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let (observer, entries, _observed) = RecordingObserver::new();
         let artifacts = fixture.artifacts.clone();
@@ -1406,7 +1408,7 @@ exports:
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let (observer, _entries, _observed, mut success_reached, release_success) =
             RecordingObserver::with_step_success_gate();
@@ -1514,7 +1516,7 @@ exports:
             1024,
         );
         fs::write(fixture.execution_root.join("retained.txt"), b"retained").unwrap();
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let (observer, _entries, mut observed) = RecordingObserver::new();
         let artifacts = fixture.artifacts.clone();
@@ -1647,7 +1649,7 @@ exports:
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();
@@ -1745,7 +1747,7 @@ async fn harness_start_failure_is_a_start_failure() {
             1,
             1024,
         );
-        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
         let inputs = fixture.inputs.clone();

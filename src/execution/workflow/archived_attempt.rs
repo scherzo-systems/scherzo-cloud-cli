@@ -990,10 +990,13 @@ fn validate_exports(
 
     let mut owner_ordinals = BTreeMap::<(String, String), usize>::new();
     for (index, source) in workflow.definition.exports.values().enumerate() {
-        let source_step = steps.iter().find(|step| step.id == source.step).ok_or(())?;
+        let source_step = steps
+            .iter()
+            .find(|step| step.id == source.node.id)
+            .ok_or(())?;
         if source_step.state == ArchivedStepState::Succeeded {
             owner_ordinals
-                .entry((source.step.clone(), source.output.clone()))
+                .entry((source.node.id.clone(), source.output.clone()))
                 .or_insert(index.checked_add(1).ok_or(())?);
         }
     }
@@ -1006,7 +1009,10 @@ fn validate_exports(
         if name != expected_name {
             return Err(());
         }
-        let source_step = steps.iter().find(|step| step.id == source.step).ok_or(())?;
+        let source_step = steps
+            .iter()
+            .find(|step| step.id == source.node.id)
+            .ok_or(())?;
         match export {
             ExportV1::Available {
                 kind,
@@ -1015,7 +1021,7 @@ fn validate_exports(
                 size_bytes: _,
                 digest,
             } => {
-                let identity = (source.step.clone(), source.output.clone());
+                let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
                 if source_step.state != ArchivedStepState::Succeeded
                     || kind != export_kind(source.value_type)
@@ -1033,7 +1039,7 @@ fn validate_exports(
                 }
             }
             ExportV1::GitBranch { carrier, .. } => {
-                let identity = (source.step.clone(), source.output.clone());
+                let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
                 if source_step.state != ArchivedStepState::Succeeded
                     || source.value_type != WorkflowValueType::GitBranch
@@ -1084,7 +1090,7 @@ fn export_media_type<'a>(
     workflow: &'a super::resolution::ResolvedWorkflow,
     source: &super::validated::ResolvedOutputSource,
 ) -> Result<&'a str, ()> {
-    let step = workflow.definition.steps.get(&source.step).ok_or(())?;
+    let step = workflow.definition.steps.get(&source.node.id).ok_or(())?;
     let output = match step {
         ValidatedStep::Command(command) => command.common.outputs.get(&source.output),
         ValidatedStep::Agent(agent) => agent.common.outputs.get(&source.output),

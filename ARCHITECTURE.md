@@ -7,14 +7,15 @@ executable. The current binary provides help, version output, deployment selecti
 secure local human credential store, OAuth Device Authorization, server-confirmed
 authentication status, explicit human-principal signup, local logout, organization
 profile management, one-page active member-directory reads, local Workflow V1
-definition validation, and an outbound, development-only runner transport.
+definition validation, and an outbound, enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver and
 admission boundary to accept one configured local command workflow. Execution remains
 separately authorized by a later start effect and is not part of the current service.
 `scherzo-cloud runner doctor` performs one default local Git check and can explicitly
-check the `pi` installation selected from inherited `PATH` for the closed `PiJsonV1`
-profile; it does not claim that the runner is ready to execute assignments.
+check the `pi` and `claude` installations selected independently from inherited `PATH`
+for the closed `PiJsonV1` and `ClaudeCodeStreamJsonV1` profiles; it does not claim that
+the runner is ready to execute assignments.
 
 ## One executable with separate roles
 
@@ -61,27 +62,33 @@ it is not a dynamic plugin API, does not discover libraries or scripts, and is n
 third-party extension contract.
 
 The first registry entry is `environment.command.git` and is the sole default. The
-second entry, `execution.harness.pi-json-v1`, runs only when an operator selects it with
-`--check`; it resolves `pi` from the doctor's inherited `PATH`. Doctor does not construct
-human deployment state, read the human credential store, or make a network request.
-Future runner bootstrap code can add compiled-in checks through the same registry
-without adding a central check-name enum, but it must keep those boundaries intact.
+operator-selected entries `execution.harness.pi-json-v1` and
+`execution.harness.claude-code-stream-json-v1` resolve `pi` and `claude` independently
+from the doctor's inherited `PATH`. Doctor does not construct human deployment state,
+read the human credential store, or make a network request. Future runner bootstrap code
+can add compiled-in checks through the same registry without adding a central check-name
+enum, but it must keep those boundaries intact.
 
-The Pi validator lives at the execution boundary and is shared by doctor, the local
-Workflow Run adapter, and agent-capable Runner Serve initialization. Each boundary
-selects the first `pi` in the launching process's inherited `PATH` that the process can
-execute and never accepts an executable path from a workflow, assignment, import, remote
-value, dedicated environment variable, or CLI option. Validation canonicalizes the
-selected path and invokes only that absolute executable's native version and help probes.
-Those isolated probes retain the captured inherited `PATH` so an environment-based
-launcher can resolve its interpreter; they never use it to select another `pi`.
-Validation maps canonical stable versions in `>=0.83.0 <0.84.0` plus their required
-non-model flags into an immutable
-`ValidatedPiInstallation`. The value carries the absolute path, ordered numeric and exact
-observed version, closed profile enum, and closed capability set. Shared admission and
-later execution use that pinned value without another `PATH` lookup or native probe, so
-later `PATH` changes cannot switch an active operation's executable. Command-only local
-runs and Runner Serve startup remain available when `pi` is absent.
+The two harness validators live at the execution boundary. Pi and Claude Code validation
+are each shared by doctor, local Workflow Run, and agent-capable Runner Serve
+initialization. Each selects the first executable
+with its fixed name in inherited `PATH` and never accepts an executable path from a
+workflow, assignment, import, remote value, dedicated environment variable, or CLI
+option. Validation canonicalizes the selected path and invokes only that absolute
+executable's native version and help probes. The isolated probes retain inherited `PATH`
+only so an environment-based launcher can resolve its interpreter; they never use it to
+select another harness candidate.
+
+Pi maps canonical stable versions in `>=0.83.0 <0.84.0` into
+`ValidatedPiInstallation`. Claude Code accepts only exact `2.1.222` and maps it into
+`ValidatedClaudeCodeInstallation`. Each immutable value carries the absolute path, exact
+observed version, closed profile, and closed capability set. Local and runner admission
+inspect the resolved workflow and require only the installation selected by each agent
+step. Shared admission and later execution use those values without another `PATH` lookup
+or native probe, so later `PATH` changes cannot switch an active operation's executable.
+Command-only work requires neither harness; Pi-only and Claude-only work require no
+unrelated installation. Runner Serve retains independent optional Pi and Claude Code
+snapshots for its process lifetime and exposes neither through the runner protocol.
 
 
 ## Runner service observability
@@ -171,12 +178,20 @@ continuation cursor. Private not-found responses remain one indistinguishable CL
 outcome. These commands do not interpret status actions; action selection and approval
 remain responsibilities of the governing agent guide.
 
-The runner uses a machine credential file supplied explicitly to `runner serve`. The
-current development-only format embeds a runner ID and a 43-character base64url secret;
-the loader rejects symlinks, files not owned by the current user, group/other-readable
-files, malformed values, and values larger than 256 bytes. Runner startup must never
-discover or read the human token store. Human commands likewise must not use runner
-credentials to call the public API.
+The runner uses the current `rrc_` machine credential and Cloud-issued connection URL
+from protected enrollment state. `runner enroll` and `runner serve` consume one closed
+operator configuration; startup validates and locks the owner-only state directory,
+reads the bounded non-symlink state file, and accepts no endpoint or credential override.
+Initial and replacement enrollment journals, pending staging, and promotion writes use
+one kernel-held state lock. Replacement enrollment verifies the activation and Cloud
+response against the protected runner ID, keeps current and pending material across
+interruption, and invokes only the configured secret-free local reload operation. Runner
+Serve welcomes a pending credential on a second same-boot connection before atomically
+promoting it and retains its service-scoped assignment manager throughout. Startup
+preserves a usable current connection, retries pending before terminal authentication,
+and never discards current material merely because pending authentication or protocol
+handling did not complete. Runner startup must never discover or read the human token
+store. Human commands likewise must not use runner credentials to call the public API.
 
 Sharing an executable does not permit sharing credential files, environment variables,
 refresh logic, or authorization scopes accidentally.
@@ -355,7 +370,6 @@ types at their boundary instead of becoming the workflow model.
 
 The following decisions remain open:
 
-- production runner enrollment, credential rotation, and revocation;
 - repository checkout and execution behavior;
 - supported operating systems and service managers;
 - installation, update, and release packaging; and

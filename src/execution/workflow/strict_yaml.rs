@@ -7,6 +7,7 @@ use super::DecodeFailure;
 pub(super) struct ParsedYaml {
     pub(super) value: Value,
     pub(super) step_order: Vec<String>,
+    pub(super) finalizer_order: Vec<String>,
 }
 
 pub(super) fn parse(bytes: &[u8]) -> Result<ParsedYaml, DecodeFailure> {
@@ -30,6 +31,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ParsedYaml, DecodeFailure> {
         .map(|value| ParsedYaml {
             value,
             step_order: receiver.step_order,
+            finalizer_order: receiver.finalizer_order,
         })
         .ok_or_else(DecodeFailure::malformed_yaml)
 }
@@ -63,6 +65,7 @@ struct JsonEventReceiver {
     document_count: usize,
     error: Option<BuildError>,
     step_order: Vec<String>,
+    finalizer_order: Vec<String>,
 }
 
 enum Container {
@@ -70,9 +73,15 @@ enum Container {
     Mapping {
         entries: Map<String, Value>,
         pending_key: Option<String>,
-        is_step_mapping: bool,
+        ordered_mapping: Option<OrderedMapping>,
         source_keys: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum OrderedMapping {
+    Steps,
+    Finalizers,
 }
 
 #[derive(Clone, Copy)]
@@ -135,17 +144,25 @@ impl MarkedEventReceiver for JsonEventReceiver {
                     Err(BuildError::Forbidden)
                 } else {
                     validate_collection_tag(tag.as_ref(), CoreTag::Mapping).map(|()| {
-                        let is_step_mapping = matches!(
-                            self.stack.as_slice(),
-                            [Container::Mapping {
-                                pending_key: Some(key),
-                                ..
-                            }] if key == "steps"
-                        );
+                        let ordered_mapping = match self.stack.as_slice() {
+                            [
+                                Container::Mapping {
+                                    pending_key: Some(key),
+                                    ..
+                                },
+                            ] if key == "steps" => Some(OrderedMapping::Steps),
+                            [
+                                Container::Mapping {
+                                    pending_key: Some(key),
+                                    ..
+                                },
+                            ] if key == "finalizers" => Some(OrderedMapping::Finalizers),
+                            _ => None,
+                        };
                         self.stack.push(Container::Mapping {
                             entries: Map::new(),
                             pending_key: None,
-                            is_step_mapping,
+                            ordered_mapping,
                             source_keys: Vec::new(),
                         });
                     })
@@ -185,7 +202,7 @@ impl JsonEventReceiver {
         let Some(Container::Mapping {
             entries,
             pending_key,
-            is_step_mapping,
+            ordered_mapping,
             source_keys,
         }) = self.stack.pop()
         else {
@@ -194,8 +211,10 @@ impl JsonEventReceiver {
         if pending_key.is_some() {
             return Err(BuildError::Malformed);
         }
-        if is_step_mapping {
-            self.step_order = source_keys;
+        match ordered_mapping {
+            Some(OrderedMapping::Steps) => self.step_order = source_keys,
+            Some(OrderedMapping::Finalizers) => self.finalizer_order = source_keys,
+            None => {}
         }
         self.insert_node(Value::Object(entries))
     }
@@ -209,7 +228,7 @@ impl JsonEventReceiver {
             Some(Container::Mapping {
                 entries,
                 pending_key,
-                is_step_mapping,
+                ordered_mapping,
                 source_keys,
             }) => {
                 if let Some(key) = pending_key.take() {
@@ -226,7 +245,7 @@ impl JsonEventReceiver {
                 if key == "<<" {
                     return Err(BuildError::Forbidden);
                 }
-                if *is_step_mapping {
+                if ordered_mapping.is_some() {
                     source_keys.push(key.clone());
                 }
                 *pending_key = Some(key);

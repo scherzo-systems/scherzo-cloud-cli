@@ -48,6 +48,10 @@
       "type": "string",
       "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
+    "FinalizerValueReferenceString": {
+      "type": "string",
+      "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+    },
     "OutputReferenceString": {
       "type": "string",
       "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
@@ -61,6 +65,15 @@
       "required": ["ref"],
       "description": "A step-local value reference. An outputs reference creates a direct data prerequisite on its producer; an imports reference creates no step prerequisite."
     },
+    "FinalizerValueReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/FinalizerValueReferenceString" }
+      },
+      "required": ["ref"],
+      "description": "A finalizer-local value reference. finalization.context is an engine value and creates no graph edge."
+    },
     "OutputReference": {
       "type": "object",
       "additionalProperties": false,
@@ -68,7 +81,7 @@
         "ref": { "$ref": "#/$defs/OutputReferenceString" }
       },
       "required": ["ref"],
-      "description": "A workflow export reference. Exports select outputs but create no step prerequisite."
+      "description": "A workflow export reference. Exports select outputs but create no graph edge."
     },
     "FileSource": {
       "type": "object",
@@ -90,21 +103,46 @@
         { "$ref": "#/$defs/ImportOrOutputReference" }
       ]
     },
+    "FinalizerAttachmentSource": {
+      "oneOf": [
+        { "$ref": "#/$defs/FileSource" },
+        { "$ref": "#/$defs/FinalizerValueReference" }
+      ]
+    },
     "InputBindings": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": { "$ref": "#/$defs/ImportOrOutputReference" }
     },
+    "FinalizerInputBindings": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/FinalizerValueReference" }
+    },
     "FailurePolicy": {
       "enum": ["required", "advisory"],
       "default": "required",
-      "description": "Controls workflow outcome and control-edge satisfaction when this step fails or is blocked. Omission resolves to required."
+      "description": "Controls workflow impact when this node fails or is blocked. Omission resolves to required."
     },
     "Dependencies": {
       "type": "array",
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/Identifier" },
-      "description": "Explicit control prerequisites for ordering without declared data flow. Resolution normalizes these with direct prerequisites inferred from step-local output references."
+      "description": "Explicit ordinary-step control prerequisites for ordering without declared data flow."
+    },
+    "FinalizerAfter": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/Identifier" },
+      "description": "Finalizer IDs that must be terminal before this finalizer is considered."
+    },
+    "FinalizerWhen": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["succeeded", "failed", "cancelled"] },
+      "default": ["succeeded", "failed", "cancelled"],
+      "description": "Ordinary-phase triggers that select this finalizer. Omission selects all three."
     },
     "Command": {
       "type": "object",
@@ -141,11 +179,34 @@
       },
       "required": ["kind", "config"]
     },
+    "ClaudeCodeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "enum": ["low", "medium", "high", "xhigh", "max"] }
+      },
+      "required": ["model", "effort"]
+    },
+    "ClaudeCodeHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "claude_code" },
+        "config": { "$ref": "#/$defs/ClaudeCodeConfig" }
+      },
+      "required": ["kind", "config"]
+    },
     "AgentProfile": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "harness": { "$ref": "#/$defs/PiHarness" }
+        "harness": {
+          "oneOf": [
+            { "$ref": "#/$defs/PiHarness" },
+            { "$ref": "#/$defs/ClaudeCodeHarness" }
+          ]
+        }
       },
       "required": ["harness"],
       "description": "Immutable workflow-local harness configuration. A profile grants no execution authority."
@@ -178,6 +239,32 @@
         "profile": { "$ref": "#/$defs/Identifier" },
         "systemPrompt": { "$ref": "#/$defs/SourceRelativePath" },
         "message": { "$ref": "#/$defs/AgentMessage" }
+      },
+      "required": ["profile", "systemPrompt", "message"]
+    },
+    "FinalizerAgentMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/TextSource" }
+        },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FinalizerAttachmentSource" }
+        }
+      },
+      "required": ["text"]
+    },
+    "FinalizerAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "$ref": "#/$defs/Identifier" },
+        "systemPrompt": { "$ref": "#/$defs/SourceRelativePath" },
+        "message": { "$ref": "#/$defs/FinalizerAgentMessage" }
       },
       "required": ["profile", "systemPrompt", "message"]
     },
@@ -271,6 +358,41 @@
         { "$ref": "#/$defs/AgentStep" }
       ]
     },
+    "CommandFinalizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "cmd" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
+        "after": { "$ref": "#/$defs/FinalizerAfter" },
+        "when": { "$ref": "#/$defs/FinalizerWhen" },
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "inputs": { "$ref": "#/$defs/FinalizerInputBindings" },
+        "outputs": { "$ref": "#/$defs/CommandOutputs" },
+        "command": { "$ref": "#/$defs/Command" }
+      },
+      "required": ["kind", "command"]
+    },
+    "AgentFinalizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "agent" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
+        "after": { "$ref": "#/$defs/FinalizerAfter" },
+        "when": { "$ref": "#/$defs/FinalizerWhen" },
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "outputs": { "$ref": "#/$defs/AgentOutputs" },
+        "agent": { "$ref": "#/$defs/FinalizerAgent" }
+      },
+      "required": ["kind", "agent"]
+    },
+    "Finalizer": {
+      "oneOf": [
+        { "$ref": "#/$defs/CommandFinalizer" },
+        { "$ref": "#/$defs/AgentFinalizer" }
+      ]
+    },
     "Exports": {
       "type": "object",
       "maxProperties": 4096,
@@ -290,6 +412,12 @@
           "maxProperties": 256,
           "propertyNames": { "$ref": "#/$defs/Identifier" },
           "additionalProperties": { "$ref": "#/$defs/Step" }
+        },
+        "finalizers": {
+          "type": "object",
+          "maxProperties": 256,
+          "propertyNames": { "$ref": "#/$defs/Identifier" },
+          "additionalProperties": { "$ref": "#/$defs/Finalizer" }
         },
         "exports": { "$ref": "#/$defs/Exports" }
       },

@@ -1,0 +1,41 @@
+schemaVersion: 1
+agentProfiles:
+  piCoding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+  claudeCoding:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+        effort: xhigh
+steps:
+  plan:
+    kind: agent
+    agent:
+      profile: piCoding
+      systemPrompt: prompts/plan-system.md
+      message:
+        text:
+          - file: prompts/plan-message.md
+    outputs:
+      response:
+        kind: agent_response
+  implement:
+    kind: agent
+    dependsOn: [plan]
+    agent:
+      profile: claudeCoding
+      systemPrompt: prompts/implement-system.md
+      message:
+        text:
+          - ref: outputs.plan.response
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.implement.response

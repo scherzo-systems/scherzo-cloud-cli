@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use ring::digest::{SHA256, digest};
 use serde_json::{Map, Number, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -17,14 +16,11 @@ use super::agent::{
     AgentObservation, AgentToolCallPhase, AgentValueKind, BoundedAgentResponse,
     BoundedSchemaValidAgentResult, CompletedAgentInvocation, tool_call_observation,
 };
-use super::canonical_json;
-use super::schema_common::lowercase_hex;
 
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_RESPONSE_BYTES: u64 = 1024 * 1024;
 const COMPACT_UPDATE_PROPERTY: &str = "scherzoCompact";
-const RESULT_DIGEST_PROPERTY: &str = "scherzoResultSha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PiJsonV1ProtocolLimits {
@@ -235,7 +231,7 @@ impl PiJsonV1Parser {
         if call_state.ended.is_some()
             || call.id != call_id
             || call.name != tool_name
-            || !correlates_result_arguments(&call.arguments, arguments)
+            || !semantically_equal_json(&call.arguments, arguments)
         {
             return self.fail_protocol();
         }
@@ -353,6 +349,8 @@ impl PiJsonV1Parser {
                         | "turn_end"
                         | "agent_end"
                         | "agent_settled"
+                        | "compaction_start"
+                        | "compaction_end"
                 ))
         {
             return Err(self.protocol_failure());
@@ -952,10 +950,16 @@ impl PiJsonV1Parser {
 
     fn compaction_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
         let reason = required_compaction_reason(object).ok_or_else(|| self.protocol_failure())?;
+        let accepted_result_can_cancel_threshold = self
+            .accepted_result
+            .as_ref()
+            .is_some_and(|accepted| accepted.native_execution_completed)
+            && reason == CompactionReason::Threshold;
         if self.protocol.active_attempt.is_some()
             || self.protocol.compaction.is_some()
             || self.protocol.last_agent_end.is_none()
             || self.protocol.settled
+            || (self.accepted_result.is_some() && !accepted_result_can_cancel_threshold)
         {
             return Err(self.protocol_failure());
         }
@@ -972,11 +976,18 @@ impl PiJsonV1Parser {
             required_bool(object, "willRetry").ok_or_else(|| self.protocol_failure())?;
         let error =
             optional_string(object, "errorMessage").ok_or_else(|| self.protocol_failure())?;
+        let accepted_result_cancelled_threshold = self.accepted_result.is_some()
+            && reason == CompactionReason::Threshold
+            && aborted
+            && !will_retry
+            && error.is_none()
+            && object.get("result").is_none_or(Value::is_null);
         if self.protocol.compaction != Some(reason)
             || object
                 .get("result")
-                .is_some_and(|result| !result.is_object())
+                .is_some_and(|result| !result.is_null() && !result.is_object())
             || (aborted && will_retry)
+            || (self.accepted_result.is_some() && !accepted_result_cancelled_threshold)
         {
             return Err(self.protocol_failure());
         }
@@ -2308,30 +2319,10 @@ fn finalized_content_correlates(
                 {
                     streamed.id == finalized.id
                         && streamed.name == finalized.name
-                        && correlates_result_arguments(&streamed.arguments, &finalized.arguments)
+                        && semantically_equal_json(&streamed.arguments, &finalized.arguments)
                 }
                 _ => streamed == finalized,
             })
-}
-
-fn correlates_result_arguments(transcript: &Value, request: &Value) -> bool {
-    if semantically_equal_json(transcript, request) {
-        return true;
-    }
-    let Some(transcript) = transcript.as_object() else {
-        return false;
-    };
-    let Some(Value::String(transcript_digest)) = transcript.get(RESULT_DIGEST_PROPERTY) else {
-        return false;
-    };
-    if transcript.len() != 1 {
-        return false;
-    }
-    let mut canonical = Vec::new();
-    if canonical_json::to_writer(&mut canonical, request).is_err() {
-        return false;
-    }
-    transcript_digest == &lowercase_hex(digest(&SHA256, &canonical).as_ref())
 }
 
 fn semantically_equal_json(left: &Value, right: &Value) -> bool {

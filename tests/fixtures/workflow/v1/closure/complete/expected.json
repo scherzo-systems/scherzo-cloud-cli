@@ -1,0 +1,12 @@
+{
+  "workflowPath": "workflows/complete.yaml",
+  "algorithm": "sha256",
+  "value": "ccf433a6c743d8329cb43c6d8c2809f16366a81c7e28fd1142bc97a82de51634",
+  "paths": [
+    "attachments/data.bin",
+    "prompts/message.md",
+    "prompts/system.md",
+    "schemas/result.schema.json",
+    "workflows/complete.yaml"
+  ]
+}

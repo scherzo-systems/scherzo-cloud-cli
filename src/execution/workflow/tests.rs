@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::document::{
-    HarnessDefinition, MessageSource, Output, OutputReference, Step, ValueReference,
+    FailurePolicy, FinalizationTrigger, HarnessDefinition, MessageSource, NodeBody, Output,
+    OutputReference, ValueReference,
 };
 use super::*;
 
@@ -29,6 +30,8 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         workflow.step_order,
         ["prepare", "plan", "implement", "test"]
     );
+    assert!(workflow.finalizers.is_empty());
+    assert!(workflow.finalizer_order.is_empty());
     assert_eq!(workflow.exports.len(), 2);
     assert_eq!(
         workflow.agent_profiles["coding"].harness,
@@ -40,54 +43,60 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         }
     );
 
-    let Step::Command(prepare) = &workflow.steps["prepare"] else {
+    let prepare = &workflow.steps["prepare"];
+    let NodeBody::Command(prepare_body) = &prepare.body else {
         panic!("prepare must be a command step");
     };
-    assert_eq!(prepare.argv, ["./scripts/prepare-workspace.sh"]);
-    assert!(prepare.common.control_dependencies.is_empty());
-    assert!(prepare.inputs.is_empty());
-    assert!(prepare.common.outputs.is_empty());
+    assert_eq!(prepare_body.argv, ["./scripts/prepare-workspace.sh"]);
+    assert!(prepare.control_dependencies.is_empty());
+    assert!(prepare_body.inputs.is_empty());
+    assert!(prepare_body.common.outputs.is_empty());
 
-    let Step::Agent(plan) = &workflow.steps["plan"] else {
+    let plan = &workflow.steps["plan"];
+    let NodeBody::Agent(plan_body) = &plan.body else {
         panic!("plan must be an agent step");
     };
-    assert_eq!(plan.common.control_dependencies, ["prepare"]);
-    assert_eq!(plan.agent.profile, "coding");
-    assert_eq!(plan.agent.system_prompt, "prompts/plan-system.md");
+    assert_eq!(plan.control_dependencies, ["prepare"]);
+    assert_eq!(plan_body.agent.profile, "coding");
+    assert_eq!(plan_body.agent.system_prompt, "prompts/plan-system.md");
     assert_eq!(
-        plan.agent.message.text,
+        plan_body.agent.message.text,
         [MessageSource::Reference(ValueReference::Import {
             name: "prompt".to_owned()
         })]
     );
     assert_eq!(
-        plan.agent.message.attachments,
+        plan_body.agent.message.attachments,
         [MessageSource::Reference(ValueReference::Import {
             name: "attachments".to_owned()
         })]
     );
     assert_eq!(
-        plan.common.outputs["plan"],
+        plan_body.common.outputs["plan"],
         Output::AgentResult {
             schema: "schemas/change-plan.schema.json".to_owned()
         }
     );
     assert_eq!(
-        plan.common.outputs["artifact"],
+        plan_body.common.outputs["artifact"],
         Output::File {
             path: "artifacts/plan.txt".to_owned(),
             media_type: "text/plain".to_owned(),
         }
     );
 
-    let Step::Agent(implement) = &workflow.steps["implement"] else {
+    let implement = &workflow.steps["implement"];
+    let NodeBody::Agent(implement_body) = &implement.body else {
         panic!("implement must be an agent step");
     };
-    assert!(implement.common.control_dependencies.is_empty());
-    assert_eq!(implement.agent.profile, "coding");
-    assert_eq!(implement.agent.system_prompt, "prompts/implement-system.md");
+    assert!(implement.control_dependencies.is_empty());
+    assert_eq!(implement_body.agent.profile, "coding");
     assert_eq!(
-        implement.agent.message.text,
+        implement_body.agent.system_prompt,
+        "prompts/implement-system.md"
+    );
+    assert_eq!(
+        implement_body.agent.message.text,
         [
             MessageSource::File {
                 path: "prompts/implement-message.md".to_owned()
@@ -98,44 +107,48 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         ]
     );
     assert_eq!(
-        implement.agent.message.attachments,
+        implement_body.agent.message.attachments,
         [
             MessageSource::Reference(ValueReference::Import {
                 name: "attachments".to_owned()
             }),
             MessageSource::Reference(ValueReference::Output(OutputReference {
-                step: "plan".to_owned(),
+                node: "plan".to_owned(),
                 output: "plan".to_owned(),
             })),
             MessageSource::Reference(ValueReference::Output(OutputReference {
-                step: "plan".to_owned(),
+                node: "plan".to_owned(),
                 output: "artifact".to_owned(),
             }))
         ]
     );
-    assert_eq!(implement.common.outputs["response"], Output::AgentResponse);
+    assert_eq!(
+        implement_body.common.outputs["response"],
+        Output::AgentResponse
+    );
 
-    let Step::Command(test) = &workflow.steps["test"] else {
+    let test = &workflow.steps["test"];
+    let NodeBody::Command(test_body) = &test.body else {
         panic!("test must be a command step");
     };
-    assert!(test.common.control_dependencies.is_empty());
-    assert_eq!(test.common.cwd.as_deref(), Some("packages/api"));
-    assert_eq!(test.argv, ["./scripts/test.sh"]);
+    assert!(test.control_dependencies.is_empty());
+    assert_eq!(test_body.common.cwd.as_deref(), Some("packages/api"));
+    assert_eq!(test_body.argv, ["./scripts/test.sh"]);
     assert_eq!(
-        test.inputs["prompt"],
+        test_body.inputs["prompt"],
         ValueReference::Import {
             name: "prompt".to_owned(),
         }
     );
     assert_eq!(
-        test.inputs["changeSummary"],
+        test_body.inputs["changeSummary"],
         ValueReference::Output(OutputReference {
-            step: "implement".to_owned(),
+            node: "implement".to_owned(),
             output: "response".to_owned(),
         })
     );
     assert_eq!(
-        test.common.outputs["report"],
+        test_body.common.outputs["report"],
         Output::File {
             path: "packages/api/artifacts/test-report.xml".to_owned(),
             media_type: "application/junit+xml".to_owned(),
@@ -145,16 +158,118 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     assert_eq!(
         workflow.exports["response"],
         OutputReference {
-            step: "implement".to_owned(),
+            node: "implement".to_owned(),
             output: "response".to_owned(),
         }
     );
     assert_eq!(
         workflow.exports["testReport"],
         OutputReference {
-            step: "test".to_owned(),
+            node: "test".to_owned(),
             output: "report".to_owned(),
         }
+    );
+}
+
+#[test]
+fn workflow_v1_decodes_the_closed_claude_code_profile() {
+    let fixture = fs::read(fixture_root().join("valid/mixed-agent-harnesses.yaml")).unwrap();
+    let workflow = decode(&fixture).unwrap();
+
+    assert_eq!(workflow.agent_profiles.len(), 2);
+    assert_eq!(
+        workflow.agent_profiles["claudeCoding"].harness,
+        HarnessDefinition::ClaudeCode {
+            config: serde_json::json!({
+                "model": "claude-opus-4-1",
+                "effort": "xhigh",
+            }),
+        }
+    );
+    assert_eq!(
+        workflow.agent_profiles["piCoding"].harness,
+        HarnessDefinition::Pi {
+            config: serde_json::json!({
+                "model": "openai/gpt-5",
+                "thinking": "high",
+            }),
+        }
+    );
+}
+
+#[test]
+fn finalizers_decode_with_independent_order_defaults_and_engine_context() {
+    let source = br#"schemaVersion: 1
+agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  zStep:
+    kind: cmd
+    command:
+      argv: ["true"]
+  aStep:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  zCleanup:
+    kind: cmd
+    inputs:
+      context:
+        ref: finalization.context
+    command:
+      argv: ["true"]
+  aReport:
+    kind: agent
+    failurePolicy: advisory
+    after: [zCleanup]
+    when: [failed]
+    agent:
+      profile: reporting
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+        attachments:
+          - ref: finalization.context
+"#;
+
+    let workflow = decode(source).unwrap();
+    assert_eq!(workflow.step_order, ["zStep", "aStep"]);
+    assert_eq!(workflow.finalizer_order, ["zCleanup", "aReport"]);
+    assert_eq!(
+        workflow.finalizers["zCleanup"].when,
+        FinalizationTrigger::all()
+    );
+    assert_eq!(workflow.finalizers["aReport"].after, ["zCleanup"]);
+    assert_eq!(
+        workflow.finalizers["aReport"].when,
+        [FinalizationTrigger::Failed].into_iter().collect()
+    );
+
+    let NodeBody::Command(cleanup) = &workflow.finalizers["zCleanup"].body else {
+        panic!("cleanup must be a command finalizer");
+    };
+    assert_eq!(
+        cleanup.inputs["context"],
+        ValueReference::FinalizationContext
+    );
+    assert_eq!(cleanup.common.failure_policy, FailurePolicy::Required);
+
+    let NodeBody::Agent(report) = &workflow.finalizers["aReport"].body else {
+        panic!("report must be an agent finalizer");
+    };
+    assert_eq!(report.common.failure_policy, FailurePolicy::Advisory);
+    assert_eq!(
+        report.agent.message.attachments,
+        [MessageSource::Reference(
+            ValueReference::FinalizationContext
+        )]
     );
 }
 
@@ -175,6 +290,40 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
             DecodeFailureKind::StructuralContract,
             "unexpected classification for {}",
             path.display()
+        );
+    }
+}
+
+#[test]
+fn finalization_context_is_structurally_restricted_to_finalizer_inputs_and_attachments() {
+    let agent_prefix = "schemaVersion: 1
+agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config: { model: openai/gpt-5, thinking: high }
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+";
+    let invalid = [
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    inputs: { context: { ref: finalization.context } }\n    command: { argv: [\"true\"] }\n".to_owned(),
+        format!(
+            "{agent_prefix}  observer:\n    kind: agent\n    agent:\n      profile: reporting\n      systemPrompt: system.md\n      message:\n        text: [{{ file: message.md }}]\n        attachments: [{{ ref: finalization.context }}]\n"
+        ),
+        format!(
+            "{agent_prefix}finalizers:\n  report:\n    kind: agent\n    agent:\n      profile: reporting\n      systemPrompt: system.md\n      message:\n        text: [{{ ref: finalization.context }}]\n"
+        ),
+        format!(
+            "{agent_prefix}exports:\n  context: {{ ref: finalization.context }}\n"
+        ),
+    ];
+
+    for source in invalid {
+        assert_eq!(
+            decode(source.as_bytes()).unwrap_err().kind(),
+            DecodeFailureKind::StructuralContract
         );
     }
 }
@@ -208,6 +357,14 @@ fn forbidden_yaml_features_are_not_normalized() {
         (
             "duplicate mapping key",
             "schemaVersion: 1\nschemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
+        ),
+        (
+            "duplicate step ID",
+            "schemaVersion: 1\nsteps:\n  work: {kind: cmd, command: {argv: [true]}}\n  work: {kind: cmd, command: {argv: [true]}}\n",
+        ),
+        (
+            "duplicate finalizer ID",
+            "schemaVersion: 1\nsteps: {work: {kind: cmd, command: {argv: [true]}}}\nfinalizers:\n  cleanup: {kind: cmd, command: {argv: [true]}}\n  cleanup: {kind: cmd, command: {argv: [true]}}\n",
         ),
         (
             "non-string mapping key",
@@ -262,7 +419,7 @@ fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
 
     assert_eq!(workflow.schema_version, 1);
     assert_eq!(workflow.description.as_deref(), Some("yes"));
-    let Step::Command(prepare) = &workflow.steps["prepare"] else {
+    let NodeBody::Command(prepare) = &workflow.steps["prepare"].body else {
         panic!("prepare must be a command step");
     };
     assert_eq!(prepare.argv, ["true"]);
@@ -309,7 +466,7 @@ fn explicit_yaml_core_tags_are_accepted() {
 
     assert_eq!(workflow.schema_version, 1);
     assert_eq!(workflow.description.as_deref(), Some("true"));
-    let Step::Command(prepare) = &workflow.steps["prepare"] else {
+    let NodeBody::Command(prepare) = &workflow.steps["prepare"].body else {
         panic!("prepare must be a command step");
     };
     assert_eq!(prepare.argv, ["true"]);

@@ -14,14 +14,13 @@ use super::assignment::{
     ObservationOutbox,
 };
 use crate::execution::workflow::admission::CancellationReason;
-use crate::execution::workflow::agent::dispatch::ClosedAgentDispatcher;
+use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
 use crate::execution::workflow::agent::{
     AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind, WorkflowRunId,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStartFailure};
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind};
-use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{NoopCommitPort, execute_workflow};
@@ -29,7 +28,6 @@ use crate::execution::workflow::input::{InputPreparationFailureKind, InputStagin
 use crate::execution::workflow::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
 };
-use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
 use crate::execution::workflow::process_group::{
     AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
     ProcessIdentityInspector, ProcessIdentityObservation, SystemProcessIdentityInspector,
@@ -406,38 +404,26 @@ impl ExecutionJob {
         let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
             (&agent_staging, agent_diagnostic_sessions)
         {
-            let pi_adapter = match PiJsonV1Adapter::new(
+            let maximum_log_bytes = self
+                .accepted
+                .admitted
+                .execution()
+                .limits()
+                .maximum_step_log_bytes();
+            let Ok(dispatcher) = production_agent_dispatcher(
                 diagnostics.clone(),
-                self.accepted
-                    .admitted
-                    .execution()
-                    .limits()
-                    .maximum_step_log_bytes(),
+                maximum_log_bytes,
                 RunnerExecutionClock,
                 observer.clone(),
-            ) {
-                Ok(adapter) => adapter,
-                Err(_) => {
-                    let _ = release_staging(&inputs, Some(agent_staging), &artifacts);
-                    return ExecutionCompletion::ordinary(self.abort(
-                        assignment_id,
-                        attempt_id,
-                        observer.last_sequence(),
-                        "runner_internal_failure",
-                    ));
-                }
+            ) else {
+                let _ = release_staging(&inputs, Some(agent_staging), &artifacts);
+                return ExecutionCompletion::ordinary(self.abort(
+                    assignment_id,
+                    attempt_id,
+                    observer.last_sequence(),
+                    "runner_internal_failure",
+                ));
             };
-            let claude_code_adapter = ClaudeCodeStreamJsonV1Adapter::new(
-                diagnostics.clone(),
-                self.accepted
-                    .admitted
-                    .execution()
-                    .limits()
-                    .maximum_step_log_bytes(),
-                RunnerExecutionClock,
-                observer.clone(),
-            );
-            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, claude_code_adapter);
             let agents = AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_id)),
                 agent_staging.clone(),
@@ -1414,7 +1400,9 @@ mod tests {
 
     use super::*;
     use crate::execution::workflow::agent::PositiveDuration;
-    use crate::execution::workflow::validated::{ResolvedOutputSource, WorkflowValueType};
+    use crate::execution::workflow::validated::{
+        ResolvedOutputSource, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
+    };
     use crate::runner::service::test_support::{
         SleepRelease, controlled_sleeper, sleep_request, with_watchdog,
     };
@@ -1732,7 +1720,10 @@ mod tests {
     #[test]
     fn closed_failure_vocabulary_projects_and_encodes() {
         let source = ResolvedOutputSource {
-            step: "upstream".to_owned(),
+            node: WorkflowNode {
+                id: "upstream".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
             output: "value".to_owned(),
             value_type: WorkflowValueType::Text,
         };

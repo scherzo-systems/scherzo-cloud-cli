@@ -20,6 +20,7 @@ use crate::execution::workflow::artifact::{
 use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::OutputSet;
+use crate::execution::workflow::validated::{WorkflowNode, WorkflowNodeRole};
 
 struct PublicationFixture {
     _temporary: tempfile::TempDir,
@@ -119,7 +120,10 @@ fn diagnostic(fully_drained: bool) -> StepDiagnostic {
 
 fn export_source(step: &str, output: &str, value_type: WorkflowValueType) -> ResolvedOutputSource {
     ResolvedOutputSource {
-        step: step.to_owned(),
+        node: WorkflowNode {
+            id: step.to_owned(),
+            role: WorkflowNodeRole::Step,
+        },
         output: output.to_owned(),
         value_type,
     }

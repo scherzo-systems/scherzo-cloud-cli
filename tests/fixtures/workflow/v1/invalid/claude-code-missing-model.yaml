@@ -1,0 +1,12 @@
+schemaVersion: 1
+agentProfiles:
+  invalid:
+    harness:
+      kind: claude_code
+      config:
+        effort: high
+steps:
+  command:
+    kind: cmd
+    command:
+      argv: ["true"]

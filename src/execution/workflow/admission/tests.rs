@@ -193,6 +193,41 @@ fn all_thinking_levels_workflow() -> String {
 }
 
 #[test]
+fn finalizer_bearing_workflows_are_rejected_before_execution_admission() {
+    let fixture = WorkflowFixture::new(
+        "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  cleanup:
+    kind: cmd
+    inputs:
+      prompt: { ref: imports.prompt }
+      context: { ref: finalization.context }
+    command: { argv: [\"true\"] }
+",
+    );
+    let unavailable_root = fixture.execution_root.join("missing");
+
+    assert_failure(
+        admit_workflow(
+            fixture.resolve(),
+            ResolvedImports::default(),
+            execution_context(
+                unavailable_root,
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            ),
+        ),
+        AdmissionFailureKind::WorkflowFinalizersUnsupported,
+        AdmissionLocation::Workflow,
+    );
+}
+
+#[test]
 fn admission_partitions_durable_stream_bytes_before_capture() {
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
     for index in 0..256 {

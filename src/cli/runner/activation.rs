@@ -4,8 +4,8 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use super::{
-    CloudOptions, cloud, completed_cloud_result, validate_activation_destination,
-    write_activation_issuance, write_activation_summary,
+    CloudOptions, RegistrationTarget, cloud, completed_cloud_result,
+    validate_activation_destination, write_activation_issuance, write_activation_summary,
 };
 use crate::api::generate_idempotency_key;
 use crate::exit_code::ExitCode;
@@ -36,10 +36,8 @@ enum ActivationCommand {
 
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
-    #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
-    runner: String,
+    #[command(flatten)]
+    target: RegistrationTarget,
     #[arg(
         long,
         value_name = "PATH|-",
@@ -52,10 +50,8 @@ struct CreateCommand {
 
 #[derive(Debug, Args)]
 struct ListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
-    #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
-    runner: String,
+    #[command(flatten)]
+    target: RegistrationTarget,
     #[arg(long, value_name = "LIMIT")]
     limit: Option<u16>,
     #[arg(long, value_name = "CURSOR")]
@@ -66,10 +62,8 @@ struct ListCommand {
 
 #[derive(Debug, Args)]
 struct RevokeCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
-    #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
-    runner: String,
+    #[command(flatten)]
+    target: RegistrationTarget,
     #[arg(value_name = "ACTIVATION", help = "Runner activation ID")]
     activation: String,
     #[command(flatten)]
@@ -104,8 +98,8 @@ impl CreateCommand {
         validate_activation_destination(&self.activation_file, self.options.json)?;
         let key = generate_idempotency_key().context("generate activation request identity")?;
         let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.organization, &self.runner)?;
-            api.create_activation(&self.organization, &runner.id, &key)
+            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
+            api.create_activation(&self.target.organization, &runner.id, &key)
         })?;
         let issuance = match completed_cloud_result(deployment, result, self.options.json)? {
             Ok(issuance) => issuance,
@@ -149,9 +143,9 @@ impl CreateCommand {
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.organization, &self.runner)?;
+            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
             api.list_activations(
-                &self.organization,
+                &self.target.organization,
                 &runner.id,
                 self.limit,
                 self.cursor.as_deref(),
@@ -201,8 +195,13 @@ impl RevokeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = generate_idempotency_key().context("generate activation revocation identity")?;
         let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.organization, &self.runner)?;
-            api.revoke_activation(&self.organization, &runner.id, &self.activation, &key)
+            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
+            api.revoke_activation(
+                &self.target.organization,
+                &runner.id,
+                &self.activation,
+                &key,
+            )
         })?;
         match result {
             Ok(activation) => {

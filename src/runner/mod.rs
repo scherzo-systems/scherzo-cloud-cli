@@ -1,3 +1,5 @@
+pub(crate) mod control_client;
+pub(crate) mod control_protocol;
 pub(crate) mod credential;
 pub(crate) mod doctor;
 pub(crate) mod enrollment;

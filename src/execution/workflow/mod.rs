@@ -140,7 +140,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowDocument, DecodeFailure> {
 
     let dto = serde_json::from_value::<schema::WorkflowDto>(parsed.value)
         .map_err(|_| DecodeFailure::structural_contract())?;
-    dto.into_document(parsed.step_order)
+    dto.into_document(parsed.step_order, parsed.finalizer_order)
         .ok_or_else(DecodeFailure::structural_contract)
 }
 

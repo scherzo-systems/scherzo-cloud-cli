@@ -3,7 +3,6 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
 import { createConnection } from "node:net";
 import { Type } from "typebox";
 
@@ -46,131 +45,8 @@ interface ToolCallBlock {
   arguments?: unknown;
 }
 
-type ResultArgumentsConsumer = (
-  toolCallId: string,
-) => ResultArguments | undefined;
-
 type ResultToolCallGroup =
-  | { kind: "singleton"; arguments: ResultArguments }
-  | { kind: "sibling" }
-  | { kind: "uncorrelated" };
-
-const RESULT_DIGEST_PROPERTY = "scherzoResultSha256";
-
-function compareUtf8(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    const encoded = JSON.stringify(value);
-    if (encoded === undefined) {
-      throw new Error("The result candidate is not JSON serializable.");
-    }
-    return encoded;
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-
-  const object = value as Record<string, unknown>;
-  return `{${Object.keys(object)
-    .sort(compareUtf8)
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
-    .join(",")}}`;
-}
-
-export function resultDigest(argumentsValue: ResultArguments): string {
-  return createHash("sha256")
-    .update(canonicalJson(argumentsValue), "utf8")
-    .digest("hex");
-}
-
-function resultToolCalls(value: unknown, toolName: string): ToolCallBlock[] {
-  if (!isRecord(value) || !Array.isArray(value.content)) {
-    return [];
-  }
-  return value.content
-    .filter(isToolCallBlock)
-    .filter((call) => call.name === toolName);
-}
-
-function captureResultCalls(
-  value: unknown,
-  toolName: string,
-  captured: Map<string, ResultArguments>,
-): void {
-  const calls = isToolCallBlock(value)
-    ? value.name === toolName
-      ? [value]
-      : []
-    : resultToolCalls(value, toolName);
-  for (const call of calls) {
-    if (isResultArguments(call.arguments)) {
-      captured.set(call.id, call.arguments);
-    }
-  }
-}
-
-function captureAndRedactResultCalls(
-  value: unknown,
-  toolName: string,
-  captured: Map<string, ResultArguments>,
-): void {
-  const calls = isToolCallBlock(value)
-    ? value.name === toolName
-      ? [value]
-      : []
-    : resultToolCalls(value, toolName);
-  for (const call of calls) {
-    if (isResultArguments(call.arguments)) {
-      captured.set(call.id, call.arguments);
-    }
-    const argumentsValue = captured.get(call.id);
-    if (argumentsValue !== undefined) {
-      call.arguments = {
-        [RESULT_DIGEST_PROPERTY]: resultDigest(argumentsValue),
-      };
-    }
-  }
-}
-
-function classifyFinalResultCalls(
-  message: unknown,
-  toolName: string,
-  captured: Map<string, ResultArguments>,
-): Map<string, ResultToolCallGroup> {
-  const groups = new Map<string, ResultToolCallGroup>();
-  if (!isRecord(message) || !Array.isArray(message.content)) {
-    return groups;
-  }
-  const toolCalls = message.content.filter(isToolCallBlock);
-  const matchingCalls = toolCalls.filter((call) => call.name === toolName);
-  for (const call of matchingCalls) {
-    const argumentsValue = isResultArguments(call.arguments)
-      ? call.arguments
-      : captured.get(call.id);
-    groups.set(
-      call.id,
-      toolCalls.length !== 1
-        ? { kind: "sibling" }
-        : argumentsValue === undefined
-          ? { kind: "uncorrelated" }
-          : { kind: "singleton", arguments: argumentsValue },
-    );
-  }
-  return groups;
-}
-
-function replaceToolInput(
-  input: Record<string, unknown>,
-  argumentsValue: ResultArguments,
-): void {
-  for (const key of Object.keys(input)) {
-    delete input[key];
-  }
-  Object.assign(input, argumentsValue);
-}
+  { kind: "singleton" } | { kind: "sibling" } | { kind: "uncorrelated" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -247,7 +123,7 @@ function classifyResultToolCallGroup(
       return { kind: "uncorrelated" };
     }
 
-    candidate = { kind: "singleton", arguments: toolCall.arguments };
+    candidate = { kind: "singleton" };
   }
 
   return candidate ?? { kind: "uncorrelated" };
@@ -388,7 +264,7 @@ const validateOverSocket: ResultValidator = (socketPath, request, signal) =>
 export function createResultTool(
   config: PiJsonV1ExtensionConfig,
   validate: ResultValidator,
-  consumeResultArguments: ResultArgumentsConsumer,
+  onAccepted: () => void = () => {},
 ) {
   const parameters = Type.Unsafe<ResultArguments>(config.parameters);
 
@@ -400,19 +276,11 @@ export function createResultTool(
     parameters,
     async execute(
       toolCallId: string,
-      _argumentsValue: ResultArguments,
+      argumentsValue: ResultArguments,
       signal: AbortSignal | undefined,
       _onUpdate: AgentToolUpdateCallback | undefined,
       ctx: ExtensionContext,
     ) {
-      const resultArguments = consumeResultArguments(toolCallId);
-      if (resultArguments === undefined) {
-        ctx.abort();
-        throw new Error(
-          "Fatal result-validation failure: the assistant result candidate could not be correlated.",
-        );
-      }
-
       let response: ValidatePiResultV1Response;
       try {
         response = await validate(
@@ -421,7 +289,7 @@ export function createResultTool(
             kind: "ValidatePiResultV1",
             toolCallId,
             toolName: config.toolName,
-            arguments: resultArguments,
+            arguments: argumentsValue,
           },
           signal,
         );
@@ -441,6 +309,7 @@ export function createResultTool(
         throw new Error(`Fatal result-validation failure: ${response.cause}`);
       }
 
+      onAccepted();
       return {
         content: [
           { type: "text" as const, text: "Final workflow result accepted." },
@@ -457,71 +326,8 @@ export function createPiJsonV1Extension(
   validate: ResultValidator = validateOverSocket,
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
-    const capturedResultArguments = new Map<string, ResultArguments>();
-    const finalizedResultGroups = new Map<string, ResultToolCallGroup>();
-    const resultArgumentsByToolCallId = new Map<string, ResultArguments>();
     const seenResultToolCallIds = new Set<string>();
-    const consumeResultArguments = (
-      toolCallId: string,
-    ): ResultArguments | undefined => {
-      const resultArguments = resultArgumentsByToolCallId.get(toolCallId);
-      resultArgumentsByToolCallId.delete(toolCallId);
-      return resultArguments;
-    };
-
-    pi.on("message_update", (event) => {
-      const assistantEvent = event.assistantMessageEvent as unknown as Record<
-        string,
-        unknown
-      >;
-      const contentIndex = assistantEvent.contentIndex;
-      const content = isRecord(event.message)
-        ? event.message.content
-        : undefined;
-      const updatedCall =
-        typeof contentIndex === "number" && Array.isArray(content)
-          ? content[contentIndex]
-          : undefined;
-      const isResultUpdate =
-        isToolCallBlock(updatedCall) && updatedCall.name === config.toolName;
-
-      for (const value of [
-        event.message,
-        assistantEvent.partial,
-        assistantEvent.toolCall,
-        assistantEvent.message,
-      ]) {
-        captureResultCalls(value, config.toolName, capturedResultArguments);
-      }
-      for (const value of [
-        event.message,
-        assistantEvent.partial,
-        assistantEvent.toolCall,
-        assistantEvent.message,
-      ]) {
-        captureAndRedactResultCalls(
-          value,
-          config.toolName,
-          capturedResultArguments,
-        );
-      }
-      if (isResultUpdate && typeof assistantEvent.delta === "string") {
-        assistantEvent.delta = "";
-      }
-    });
-
-    pi.on("message_end", (event) => {
-      if (event.message.role !== "assistant") {
-        return;
-      }
-      for (const [toolCallId, group] of classifyFinalResultCalls(
-        event.message,
-        config.toolName,
-        capturedResultArguments,
-      )) {
-        finalizedResultGroups.set(toolCallId, group);
-      }
-    });
+    let acceptedResult = false;
 
     pi.on("tool_call", (event, ctx) => {
       if (event.toolName !== config.toolName) {
@@ -529,7 +335,6 @@ export function createPiJsonV1Extension(
       }
 
       if (seenResultToolCallIds.has(event.toolCallId)) {
-        resultArgumentsByToolCallId.delete(event.toolCallId);
         return {
           block: true,
           reason:
@@ -538,18 +343,15 @@ export function createPiJsonV1Extension(
       }
       seenResultToolCallIds.add(event.toolCallId);
 
-      const group =
-        finalizedResultGroups.get(event.toolCallId) ??
-        classifyResultToolCallGroup(ctx, event.toolCallId, config.toolName);
-      finalizedResultGroups.delete(event.toolCallId);
-      capturedResultArguments.delete(event.toolCallId);
+      const group = classifyResultToolCallGroup(
+        ctx,
+        event.toolCallId,
+        config.toolName,
+      );
       if (group.kind === "singleton") {
-        resultArgumentsByToolCallId.set(event.toolCallId, group.arguments);
-        replaceToolInput(event.input, group.arguments);
         return;
       }
 
-      resultArgumentsByToolCallId.delete(event.toolCallId);
       return {
         block: true,
         reason:
@@ -559,7 +361,15 @@ export function createPiJsonV1Extension(
       };
     });
 
-    pi.registerTool(createResultTool(config, validate, consumeResultArguments));
+    pi.on("session_before_compact", () =>
+      acceptedResult ? { cancel: true } : undefined,
+    );
+
+    pi.registerTool(
+      createResultTool(config, validate, () => {
+        acceptedResult = true;
+      }),
+    );
   };
 }
 

@@ -56,6 +56,10 @@ fn status_json(run_directory: &Path) -> (std::process::Output, serde_json::Value
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wall time only prevents external-process quiescence polling from busy-spinning"
+)]
 fn wait_for_process_group_quiescence(process_group: i32) {
     const POLL_ATTEMPTS: usize = 2_000;
     const POLL_INTERVAL: Duration = Duration::from_millis(5);

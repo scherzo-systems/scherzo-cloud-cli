@@ -68,8 +68,8 @@ into the documented schema-version-1 output rather than printing generated debug
 `runner serve` writes one newline-delimited JSON event for each gateway connection
 attempt and effect transport acknowledgement. The same reviewed attributes are attached
 to a local OpenTelemetry span. Remote export is absent by default and is constructed
-only by `runner serve`, after its gateway configuration and machine credential are
-valid.
+only by `runner serve`, after its closed operator configuration and protected enrolled
+state are valid.
 
 Users may opt in to OTLP/HTTP protobuf export with a standard trace-specific or generic
 OpenTelemetry endpoint environment variable. The trace-specific endpoint takes
@@ -130,12 +130,22 @@ resolution and supplies only those temporary paths, deterministic no-color contr
 and Pi's offline, no-update-check, and no-install-telemetry controls. The absolute Pi
 path remains fixed throughout both probes. Temporary state is removed after validation.
 
-The validator does not request provider or model data, check authentication, execute a
+The Pi validator does not request provider or model data, check authentication, execute a
 workflow or caller project, install or update Pi, or substitute another executable. The
 help probe verifies the one-run `--approve` flag without reading `defaultProjectTrust` or
 reading or mutating the operator's `trust.json`.
 
-Each probe has a five-second deadline, runs in an owned process group, drains both child
+The operator-selected ClaudeCodeStreamJsonV1 check applies the same first-executable,
+canonical-path, no-fallback rule to executable name `claude`. Its probes run from fresh
+private project, home, Claude configuration, and XDG directories with a cleared child
+environment, inherited `PATH` only for launcher interpreter resolution, fixed update and
+nonessential-traffic disables, and deterministic no-color controls. It requires exact
+version `2.1.222` and the closed non-model capabilities used by the production adapter.
+The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
+settings; query a provider or model catalog; execute the caller project; install or update
+Claude Code; or expose any of those values in doctor output.
+
+Each probe has a bounded deadline, runs in an owned process group, drains both child
 output streams so a child cannot block on a full pipe, bounds retained standard output,
 and terminates and reaps the group before joining those streams. Truncated output is
 rejected. Reports never copy raw standard output, standard error, operating-system error

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
+use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
 use crate::execution::pi::{
     PI_JSON_V1_SUPPORTED_RANGE, PiIncompatibility, PiInstallationFailure, PiProbe,
     discover_and_validate_pi_installation,
@@ -19,45 +19,18 @@ impl DoctorCheck for PiCheck {
 
     fn run(&self) -> Outcome {
         match discover_and_validate_pi_installation() {
-            Ok(installation) => {
-                let mut details = BTreeMap::from([
-                    (
-                        "capabilities".to_owned(),
-                        installation
-                            .capabilities()
-                            .required()
-                            .iter()
-                            .map(|capability| capability.as_str())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    ),
-                    (
-                        "profile".to_owned(),
-                        installation.profile().as_str().to_owned(),
-                    ),
-                    (
-                        "supportedRange".to_owned(),
-                        PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
-                    ),
-                    (
-                        "version".to_owned(),
-                        installation.version().as_str().to_owned(),
-                    ),
-                ]);
-                if let Some(executable) = installation.executable().to_str() {
-                    details.insert("executablePath".to_owned(), executable.to_owned());
-                }
-                Outcome {
-                    status: Status::Pass,
-                    code: "ok",
-                    message: format!(
-                        "Pi {} is compatible with {}.",
-                        installation.version().as_str(),
-                        installation.profile().as_str()
-                    ),
-                    details,
-                }
-            }
+            Ok(installation) => compatible_harness_outcome(
+                "Pi",
+                installation.version().as_str(),
+                installation.profile().as_str(),
+                installation
+                    .capabilities()
+                    .required()
+                    .iter()
+                    .map(|capability| capability.as_str()),
+                installation.executable(),
+                supported_range_details(),
+            ),
             Err(failure) => failure_outcome(failure),
         }
     }

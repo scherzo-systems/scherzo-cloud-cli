@@ -111,6 +111,7 @@ struct QueuedRecord {
 
 enum QueueMessage {
     Record(QueuedRecord),
+    Flush(SyncSender<io::Result<()>>),
     Drain(SyncSender<()>),
 }
 
@@ -135,6 +136,9 @@ impl QueuedWriter {
                                 );
                             }
                         }
+                        QueueMessage::Flush(completed) => {
+                            let _ = completed.send(stderr.flush());
+                        }
                         QueueMessage::Drain(completed) => {
                             let _ = completed.send(());
                             break;
@@ -152,6 +156,22 @@ impl QueuedWriter {
         Self {
             sender: Some(sender),
         }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let Some(sender) = &self.sender else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runner event writer unavailable",
+            ));
+        };
+        let (completed, completion) = sync_channel(0);
+        sender.send(QueueMessage::Flush(completed)).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "runner event writer stopped")
+        })?;
+        completion
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "runner event writer stopped"))?
     }
 }
 
@@ -186,6 +206,10 @@ impl EventWriter for QueuedWriter {
 }
 
 impl Drop for QueuedWriter {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "QueuedWriter owns the production deadline for draining telemetry"
+    )]
     fn drop(&mut self) {
         let Some(sender) = self.sender.take() else {
             return;
@@ -221,6 +245,10 @@ impl<W: Write> FramedWriter<W> {
         }
         Ok(())
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 pub(crate) struct Recorder {
@@ -242,12 +270,15 @@ impl Recorder {
     pub(crate) fn stderr(service_instance_id: &str) -> Arc<Self> {
         let service_version = crate::build_info::VERSION;
         let dropped_count = Arc::new(AtomicU64::new(0));
-        let writer: Arc<dyn EventWriter> =
-            Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
+        let queued_writer = Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
+        let writer: Arc<dyn EventWriter> = queued_writer.clone();
         let mut provider = SdkTracerProvider::builder();
         if let Some(processor) = otlp::configured_processor(Arc::clone(&writer)) {
             provider = provider.with_span_processor(processor);
         }
+        // Configuration diagnostics are startup output. Establish that every accepted
+        // record has reached stderr before Runner Serve can terminate on a later error.
+        let _ = queued_writer.flush();
         let resource = runner_resource(service_version, service_instance_id);
         let provider = provider.with_resource(resource).build();
         Arc::new(Self::with_dropped_count(

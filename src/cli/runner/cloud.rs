@@ -227,6 +227,16 @@ pub(super) fn write_runner_rename(
     write_runner(deployment, result, "renamed", "✓ Runner renamed.", json)
 }
 
+pub(super) fn write_runner_transition(
+    deployment: &str,
+    result: &Result<RunnerRegistration, RunnerFailure>,
+    outcome: &'static str,
+    heading: &'static str,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    write_runner(deployment, result, outcome, heading, json)
+}
+
 fn write_runner(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
@@ -416,6 +426,18 @@ pub(super) fn write_failure(
             "activation_unavailable",
             None,
             "error: runner activation is no longer available\n\nList activations and issue a replacement when needed.".to_owned(),
+            ExitCode::GeneralFailure,
+        ),
+        RunnerFailure::CredentialTransitionUnavailable => (
+            "credential_transition_unavailable",
+            None,
+            "error: runner credential transition is unavailable\n\nList credentials and choose an active or retiring credential.".to_owned(),
+            ExitCode::GeneralFailure,
+        ),
+        RunnerFailure::PoolMoveUnavailable => (
+            "pool_move_unavailable",
+            None,
+            "error: runner cannot move while it has active work\n\nDrain or disable the runner, then wait for its reservation and assignments to finish.".to_owned(),
             ExitCode::GeneralFailure,
         ),
         RunnerFailure::Unreachable(category) => (

@@ -1,0 +1,29 @@
+schemaVersion: 1
+description: Shared Cloud and Runner source-closure fixture.
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+steps:
+  agent:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: ../prompts/system.md
+      message:
+        text:
+          - file: ../prompts/message.md
+          - ref: imports.prompt
+          - file: ../prompts/message.md
+        attachments:
+          - file: ../attachments/data.bin
+    outputs:
+      result:
+        kind: agent_result
+        schema: ../schemas/result.schema.json
+exports:
+  result:
+    ref: outputs.agent.result

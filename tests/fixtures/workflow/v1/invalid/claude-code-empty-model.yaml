@@ -1,11 +1,11 @@
 schemaVersion: 1
 agentProfiles:
-  unavailable:
+  invalid:
     harness:
       kind: claude_code
       config:
-        model: claude-opus-4-1
-        effort: xhigh
+        model: ""
+        effort: high
 steps:
   command:
     kind: cmd

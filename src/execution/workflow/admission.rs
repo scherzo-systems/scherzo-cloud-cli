@@ -462,7 +462,6 @@ impl ExecutionContext {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_claude_code_installation(
         mut self,
         installation: ValidatedClaudeCodeInstallation,
@@ -691,6 +690,7 @@ impl AdmittedWorkflow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionFailureKind {
+    WorkflowFinalizersUnsupported,
     MissingRequiredPrompt,
     InvalidAttachmentMediaType,
     AgentStepRuntimeUnsupported,
@@ -720,6 +720,7 @@ pub(crate) enum AdmissionFailureKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionLocation {
+    Workflow,
     PromptImport,
     AttachmentImport { index: usize },
     Step { step: String },
@@ -795,6 +796,13 @@ pub(crate) fn admit_workflow(
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    if !workflow.definition.finalizers.is_empty() {
+        return Err(AdmissionFailure::new(
+            AdmissionFailureKind::WorkflowFinalizersUnsupported,
+            AdmissionLocation::Workflow,
+        ));
+    }
+
     if workflow.required_imports().prompt && imports.prompt().is_none() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::MissingRequiredPrompt,
@@ -1007,6 +1015,13 @@ fn admit_agent_steps(
         .definition
         .steps
         .iter()
+        .chain(
+            workflow
+                .definition
+                .finalizers
+                .iter()
+                .map(|(name, finalizer)| (name, &finalizer.body)),
+        )
         .filter_map(|(step_name, step)| {
             let ValidatedStep::Agent(step) = step else {
                 return None;

@@ -24,12 +24,18 @@ mod account_signup;
 mod artifact_validate;
 #[path = "cli/auth_login.rs"]
 mod auth_login;
+#[path = "cli/claude_code_installation.rs"]
+mod claude_code_installation;
 #[path = "cli/organization.rs"]
 mod organization;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
 #[path = "cli/runner_administration.rs"]
 mod runner_administration;
+#[path = "cli/runner_enrollment.rs"]
+mod runner_enrollment;
+#[path = "cli/runner_status.rs"]
+mod runner_status;
 #[path = "cli/workflow_retry.rs"]
 mod workflow_retry;
 #[path = "cli/workflow_run.rs"]
@@ -159,6 +165,10 @@ impl OneShotServer {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the external HTTP fixture's readiness message"
+    )]
     fn finish(self) -> String {
         let request = self
             .request
@@ -224,6 +234,10 @@ impl ScriptedServer {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the external HTTP fixture's readiness message"
+    )]
     fn next_request(&mut self) -> String {
         let request = self
             .requests
@@ -363,16 +377,51 @@ fn private_credential_directory() -> tempfile::TempDir {
     directory
 }
 
-fn write_runner_credential(directory: &tempfile::TempDir) -> String {
-    let path = directory.path().join("runner.credential");
+fn write_runner_config(directory: &tempfile::TempDir, connection_url: &str) -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let state_path = directory.path().join("runner-state.json");
+    let config_path = directory.path().join("runner.json");
+    let mode = if connection_url.starts_with("ws://") {
+        "development"
+    } else {
+        "production"
+    };
     fs::write(
-        &path,
-        "rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678",
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "connectionUrl": connection_url,
+            "currentCredential": {
+                "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "enrolledAt": "2026-08-06T12:00:00Z"
+            },
+            "updatedAt": "2026-08-06T12:00:00Z"
+        }))
+        .expect("encode runner state"),
     )
-    .expect("write runner credential");
-    fs::set_permissions(&path, Permissions::from_mode(0o600))
-        .expect("make runner credential private");
-    path.to_string_lossy().into_owned()
+    .expect("write runner state");
+    fs::set_permissions(&state_path, Permissions::from_mode(0o600)).expect("protect runner state");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 1,
+            "deploymentMode": mode,
+            "runnerStatePath": state_path,
+            "controlSocketPath": directory.path().join("runner.sock"),
+            "workRoot": manifest.join("tests"),
+            "developmentWorkflow": {
+                "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+                "sourceRoot": manifest.join("schemas"),
+                "workflowPath": "workflow-v1.schema.json"
+            }
+        }))
+        .expect("encode runner config"),
+    )
+    .expect("write runner config");
+    config_path.to_string_lossy().into_owned()
 }
 
 fn deployment_environment<'a>(
@@ -517,6 +566,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     let runner = run(&["runner", "--help"]);
     let doctor = run(&["runner", "doctor", "--help"]);
     let serve = run(&["runner", "serve", "--help"]);
+    let runner_status = run(&["runner", "status", "--help"]);
     let workflow_status = run(&["workflow", "status", "--help"]);
     let workflow_validate = run(&["workflow", "validate", "--help"]);
     let workflow_view = run(&["workflow", "view", "--help"]);
@@ -553,6 +603,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(
         runner_stdout.contains("serve       Connect to Scherzo Cloud and serve run assignments")
     );
+    assert!(runner_stdout.contains("status      Show live Runner Serve status"));
     assert!(runner.stderr.is_empty());
 
     assert!(doctor.status.success());
@@ -566,17 +617,27 @@ fn nested_help_flags_use_the_composed_command_tree() {
 
     assert!(serve.status.success());
     let serve_stdout = String::from_utf8_lossy(&serve.stdout);
-    assert!(serve_stdout.contains("Usage: scherzo-cloud runner serve"));
-    for required in [
-        "--workflow-id <WORKFLOW_ID>",
-        "--workflow-source-root <ROOT>",
-        "--workflow-path <PATH>",
-        "--work-root <ROOT>",
+    assert!(serve_stdout.contains("Usage: scherzo-cloud runner serve --config <PATH>"));
+    assert!(serve_stdout.contains("--config <PATH>"));
+    for removed in [
+        "--gateway-url",
+        "--credential-file",
+        "--allow-insecure-http",
+        "--workflow-id",
+        "--workflow-source-root",
+        "--workflow-path",
+        "--work-root",
+        "--pi-executable",
     ] {
-        assert!(serve_stdout.contains(required));
+        assert!(!serve_stdout.contains(removed));
     }
-    assert!(!serve_stdout.contains("--pi-executable"));
     assert!(serve.stderr.is_empty());
+
+    assert!(runner_status.status.success());
+    let runner_status_stdout = String::from_utf8_lossy(&runner_status.stdout);
+    assert!(runner_status_stdout.contains("Usage: scherzo-cloud runner status --config <PATH>"));
+    assert!(runner_status_stdout.contains("--config <PATH>"));
+    assert!(runner_status.stderr.is_empty());
 
     assert!(workflow_status.status.success());
     let workflow_status_stdout = String::from_utf8_lossy(&workflow_status.stdout);
@@ -1345,7 +1406,7 @@ fn runner_doctor_lists_registered_checks_without_running_git() {
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        b"environment.command.git\nexecution.harness.pi-json-v1\n"
+        b"environment.command.git\nexecution.harness.pi-json-v1\nexecution.harness.claude-code-stream-json-v1\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -1538,33 +1599,16 @@ fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("HEADER-SENTINEL"));
     }
 
-    let credential_directory = private_credential_directory();
-    let credential_path = write_runner_credential(&credential_directory);
-    let invalid_config = run_with_env(
-        &[
-            "runner",
-            "serve",
-            "--gateway-url",
-            "https://not-a-websocket.example.test",
-            "--credential-file",
-            &credential_path,
-            "--workflow-id",
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-            "--workflow-source-root",
-            "schemas",
-            "--workflow-path",
-            "workflow-v1.schema.json",
-            "--work-root",
-            "tests",
-        ],
-        &environment,
+    let runner_directory = private_credential_directory();
+    let config_path = write_runner_config(
+        &runner_directory,
+        "https://not-a-websocket.example.test/v1/runner/connect",
     );
+    let invalid_config = run_with_env(&["runner", "serve", "--config", &config_path], &environment);
     assert_eq!(invalid_config.status.code(), Some(1));
     let invalid_stderr = String::from_utf8_lossy(&invalid_config.stderr);
-    assert!(invalid_stderr.starts_with(
-        "Error: configure runner gateway endpoint https://not-a-websocket.example.test: "
-    ));
-    assert!(invalid_stderr.contains("invalid runner gateway URL"));
+    assert!(invalid_stderr.starts_with("Error: load runner operator configuration "));
+    assert!(invalid_stderr.contains("operator configuration or protected state is invalid"));
 
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -1591,10 +1635,20 @@ fn privacy_and_malformed_configuration_make_no_otlp_request() {
                 ""
             }
         );
-        let gateway = OneShotServer::respond("401 Unauthorized", None, &[]);
-        let gateway_url = gateway.api_url.replacen("http://", "ws://", 1);
-        let credential_directory = private_credential_directory();
-        let credential_path = write_runner_credential(&credential_directory);
+        // This telemetry fixture needs Runner Serve to terminate; credential
+        // rejection now intentionally leaves the local control service alive.
+        let gateway = OneShotServer::respond("400 Bad Request", None, &[]);
+        let gateway_url = gateway.api_url.replacen("http://", "ws://", 1).replacen(
+            "/api",
+            "/v1/runner/connect",
+            1,
+        );
+        // Runner control sockets require a short lexical Unix path; this
+        // fixture exercises telemetry rather than hostile socket paths.
+        let runner_directory = tempfile::tempdir_in("/tmp").expect("short runner directory");
+        fs::set_permissions(runner_directory.path(), Permissions::from_mode(0o700))
+            .expect("protect short runner directory");
+        let config_path = write_runner_config(&runner_directory, &gateway_url);
         let mut environment = vec![
             ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint.as_str()),
             ("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "50"),
@@ -1603,26 +1657,7 @@ fn privacy_and_malformed_configuration_make_no_otlp_request() {
             environment.push(("OTEL_SDK_DISABLED", privacy));
         }
 
-        let output = run_with_env(
-            &[
-                "runner",
-                "serve",
-                "--gateway-url",
-                &gateway_url,
-                "--credential-file",
-                &credential_path,
-                "--allow-insecure-http",
-                "--workflow-id",
-                "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-                "--workflow-source-root",
-                "schemas",
-                "--workflow-path",
-                "workflow-v1.schema.json",
-                "--work-root",
-                "tests",
-            ],
-            &environment,
-        );
+        let output = run_with_env(&["runner", "serve", "--config", &config_path], &environment);
 
         assert_eq!(output.status.code(), Some(1));
         gateway.finish();
@@ -1642,57 +1677,51 @@ fn privacy_and_malformed_configuration_make_no_otlp_request() {
 }
 
 #[test]
-fn runner_serve_requires_configuration_and_redacts_invalid_credentials() {
+fn runner_serve_requires_one_configuration_and_rejects_removed_flags() {
     let missing = run(&["runner", "serve"]);
     assert_eq!(missing.status.code(), Some(2));
     assert!(missing.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("--gateway-url"));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--config <PATH>"));
 
-    let directory = tempfile::tempdir().expect("temporary runner credential directory");
-    let credential_path = directory.path().join("runner.credential");
-    let resolved_credential_path = fs::canonicalize(directory.path())
-        .expect("temporary runner credential directory should resolve")
-        .join("runner.credential");
-    let secret_marker = "RUNNER-CREDENTIAL-MUST-NOT-LEAK";
-    fs::write(&credential_path, secret_marker).expect("write invalid runner credential");
-    fs::set_permissions(&credential_path, Permissions::from_mode(0o600))
-        .expect("set runner credential permissions");
-    let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
-    command
-        .current_dir(directory.path())
-        .env("PATH", empty_path.path())
-        .args([
-            "runner",
-            "serve",
+    let directory = private_credential_directory();
+    let config_path =
+        write_runner_config(&directory, "wss://gateway.example.test/v1/runner/connect");
+    for arguments in [
+        vec![
             "--gateway-url",
-            "wss://gateway.example.test/v1/connect",
-            "--credential-file",
-            "runner.credential",
-            "--workflow-id",
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-            "--workflow-source-root",
-            "schemas",
-            "--workflow-path",
-            "workflow-v1.schema.json",
-            "--work-root",
-            "tests",
-        ]);
-    for variable in RUNNER_TELEMETRY_VARIABLES {
-        command.env_remove(variable);
+            "wss://gateway.example.test/v1/runner/connect",
+        ],
+        vec!["--credential-file", "runner.credential"],
+        vec!["--allow-insecure-http"],
+        vec!["--workflow-id", "wfl_01k0z6r1w8f4jy2m7q9v3x5abr"],
+        vec!["--workflow-source-root", "schemas"],
+        vec!["--workflow-path", "workflow-v1.schema.json"],
+        vec!["--work-root", "tests"],
+    ] {
+        let mut command = vec!["runner", "serve", "--config", config_path.as_str()];
+        command.extend(arguments);
+        let output = run(&command);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
-    let output = command.output().expect("scherzo-cloud should run");
+}
 
+#[test]
+fn runner_serve_redacts_invalid_protected_state() {
+    let directory = private_credential_directory();
+    let config_path =
+        write_runner_config(&directory, "wss://gateway.example.test/v1/runner/connect");
+    let state_path = directory.path().join("runner-state.json");
+    let secret_marker = "RUNNER-CREDENTIAL-MUST-NOT-LEAK";
+    fs::write(&state_path, secret_marker).expect("replace runner state with invalid content");
+    fs::set_permissions(&state_path, Permissions::from_mode(0o600))
+        .expect("protect invalid runner state");
+
+    let output = run(&["runner", "serve", "--config", &config_path]);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr,
-        format!(
-            "Error: load runner credential file {}: content or permissions are invalid\n\nReplace it with a valid runner credential and make the file readable only by its owner.\n",
-            resolved_credential_path.display()
-        )
-    );
+    assert!(stderr.contains("operator configuration or protected state is invalid"));
     assert!(!stderr.contains(secret_marker));
 }
 

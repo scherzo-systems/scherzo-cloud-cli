@@ -530,8 +530,12 @@ fn established_fixture(transcript: &DeterminismTranscript) -> EstablishedFixture
 }
 
 fn deterministic_config() -> Config {
-    Config::fixture("ws://127.0.0.1:1/v1/connect", test_credential(), true)
-        .expect("configure deterministic gateway")
+    Config::fixture(
+        "ws://127.0.0.1:1/v1/runner/connect",
+        test_credential(),
+        true,
+    )
+    .expect("configure deterministic gateway")
 }
 
 fn deterministic_connection_loop_dependencies(

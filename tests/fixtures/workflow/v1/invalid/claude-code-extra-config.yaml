@@ -1,0 +1,14 @@
+schemaVersion: 1
+agentProfiles:
+  invalid:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+        effort: high
+        fallbackModel: claude-sonnet-4
+steps:
+  command:
+    kind: cmd
+    command:
+      argv: ["true"]

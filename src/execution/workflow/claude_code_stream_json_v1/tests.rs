@@ -552,6 +552,75 @@ fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
 }
 
 #[test]
+fn result_candidate_requires_correlated_success_acknowledgement() {
+    let envelope = json!({"result": 7});
+    let call_id = "tool-structured-output";
+    let mut terminal_result = result(SESSION_ID);
+    terminal_result["structured_output"] = envelope.clone();
+    let values = [
+        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        message_start("msg-result"),
+        stream_event(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": call_id,
+                "name": "StructuredOutput",
+                "input": envelope,
+            },
+        })),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-result",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "StructuredOutput",
+                    "input": {"result": 7},
+                }],
+                "model": MODEL,
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+        }),
+        stream_event(json!({"type": "content_block_stop", "index": 0})),
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "is_error": true,
+                    "content": "Structured output failed",
+                }],
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+        }),
+        stream_event(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        })),
+        stream_event(json!({"type": "message_stop"})),
+        terminal_result,
+    ];
+
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser.push_stdout(&framed(&values), drop).unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::AmbiguousCandidate),
+        "a failed StructuredOutput acknowledgement must disqualify its candidate",
+    );
+}
+
+#[test]
 fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let native_error = framed(&[
         init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
@@ -570,6 +639,47 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
             detail: AgentHarnessFailureDetail::ModelError,
         },
     );
+
+    let api_error = framed(&[
+        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-api-error",
+                "model": "<synthetic>",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "API Error: controlled rejection"}],
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+            "error": "unknown",
+            "request_id": "req-controlled",
+            "is_api_error_message": true,
+        }),
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "terminal_reason": "api_error",
+            "result": "API Error: controlled rejection",
+            "session_id": SESSION_ID,
+        }),
+    ]);
+    let (observations, outcome) = replay(&api_error, AgentValueKind::None, 1024);
+    assert_failed(
+        outcome,
+        AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::ModelError,
+        },
+    );
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Error,
+            message,
+        } if message.as_ref() == "API Error: controlled rejection"
+    )));
 
     let mut parser = parser(AgentValueKind::None, 1024);
     parser

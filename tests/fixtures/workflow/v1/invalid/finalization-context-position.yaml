@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    inputs:
+      context:
+        ref: finalization.context
+    command:
+      argv: ["true"]

@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.scherzo.dev/runner-control-v1.schema.json",
+  "title": "Scherzo Runner Local Control Protocol V1",
+  "description": "One closed request or response JSON object. The wire protocol appends exactly one LF and limits requests to 4096 bytes and responses to 65536 bytes, including that LF.",
+  "oneOf": [
+    { "$ref": "#/$defs/statusRequest" },
+    { "$ref": "#/$defs/reloadRequest" },
+    { "$ref": "#/$defs/statusResponse" },
+    { "$ref": "#/$defs/reloadedResponse" },
+    { "$ref": "#/$defs/errorResponse" }
+  ],
+  "$defs": {
+    "statusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "operation"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "status" }
+      }
+    },
+    "reloadRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "operation"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "reload_credential" }
+      }
+    },
+    "assignmentCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preparing", "accepted", "running", "finishing", "reporting"],
+      "properties": {
+        "preparing": { "enum": [0, 1] },
+        "accepted": { "enum": [0, 1] },
+        "running": { "enum": [0, 1] },
+        "finishing": { "enum": [0, 1] },
+        "reporting": { "enum": [0, 1] }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["preparing", "accepted"], "properties": { "preparing": { "const": 1 }, "accepted": { "const": 1 } } },
+          { "required": ["preparing", "running"], "properties": { "preparing": { "const": 1 }, "running": { "const": 1 } } },
+          { "required": ["preparing", "finishing"], "properties": { "preparing": { "const": 1 }, "finishing": { "const": 1 } } },
+          { "required": ["preparing", "reporting"], "properties": { "preparing": { "const": 1 }, "reporting": { "const": 1 } } },
+          { "required": ["accepted", "running"], "properties": { "accepted": { "const": 1 }, "running": { "const": 1 } } },
+          { "required": ["accepted", "finishing"], "properties": { "accepted": { "const": 1 }, "finishing": { "const": 1 } } },
+          { "required": ["accepted", "reporting"], "properties": { "accepted": { "const": 1 }, "reporting": { "const": 1 } } },
+          { "required": ["running", "finishing"], "properties": { "running": { "const": 1 }, "finishing": { "const": 1 } } },
+          { "required": ["running", "reporting"], "properties": { "running": { "const": 1 }, "reporting": { "const": 1 } } },
+          { "required": ["finishing", "reporting"], "properties": { "finishing": { "const": 1 }, "reporting": { "const": 1 } } }
+        ]
+      }
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["processState", "bootId", "uptimeMilliseconds", "connectionState", "assignmentCounts"],
+      "properties": {
+        "processState": { "enum": ["running", "stopping"] },
+        "bootId": { "type": "string", "pattern": "^rbt_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "uptimeMilliseconds": { "type": "integer", "minimum": 0 },
+        "connectionState": { "enum": ["connecting", "connected", "backing_off", "authentication_failed", "protocol_failed", "stopping"] },
+        "lastConnectedAt": { "type": "string", "format": "date-time" },
+        "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "pendingCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "assignmentCounts": { "$ref": "#/$defs/assignmentCounts" },
+        "lastConnectionFailure": { "enum": ["network", "rate_limited", "cloud_unavailable", "authentication", "protocol"] }
+      }
+    },
+    "statusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "outcome", "status"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "ok" },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "reloadedResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "outcome", "credentialId"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "reloaded" },
+        "credentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" }
+      }
+    },
+    "errorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "outcome", "error"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "error" },
+        "error": {
+          "enum": [
+            "invalid_request",
+            "unsupported_version",
+            "no_pending_credential",
+            "pending_registration_mismatch",
+            "pending_authentication_failed",
+            "pending_protocol_failed",
+            "pending_connection_failed",
+            "state_update_failed"
+          ]
+        }
+      }
+    }
+  }
+}

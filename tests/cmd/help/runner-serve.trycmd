@@ -2,16 +2,10 @@
 $ scherzo-cloud runner serve --help
 Connect to Scherzo Cloud and serve run assignments
 
-Usage: scherzo-cloud runner serve [OPTIONS] --gateway-url <URL> --credential-file <PATH> --workflow-id <WORKFLOW_ID> --workflow-source-root <ROOT> --workflow-path <PATH> --work-root <ROOT>
+Usage: scherzo-cloud runner serve --config <PATH>
 
 Options:
-      --gateway-url <URL>            WebSocket URL of the runner gateway
-      --credential-file <PATH>       Path to the private development runner credential file
-      --allow-insecure-http          Permit ws:// only for an explicit loopback development gateway URL
-      --workflow-id <WORKFLOW_ID>    Cloud workflow ID mapped by this development runner
-      --workflow-source-root <ROOT>  Directory boundary for the registered workflow's local sources (must already exist)
-      --workflow-path <PATH>         Workflow YAML path selected within the workflow source root
-      --work-root <ROOT>             Directory for runner-owned execution roots (must already exist)
-  -h, --help                         Print help
+      --config <PATH>  Read the closed runner operator configuration and enrolled state
+  -h, --help           Print help
 
 ```

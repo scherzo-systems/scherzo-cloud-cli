@@ -196,6 +196,70 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
 }
 
 #[test]
+fn finalizer_static_sources_join_the_same_immutable_closure() {
+    let bundle = FixtureBundle::new();
+    fs::write(
+        bundle.root.join("prompts/finalizer-system.md"),
+        b"Finalizer system.\n",
+    )
+    .unwrap();
+    fs::write(
+        bundle.root.join("prompts/finalizer-message.md"),
+        b"Finalizer message.\n",
+    )
+    .unwrap();
+    fs::write(bundle.root.join("attachments/finalizer.bin"), [0x01, 0xff]).unwrap();
+    fs::write(
+        bundle.root.join("schemas/finalizer.schema.json"),
+        RESULT_SCHEMA,
+    )
+    .unwrap();
+    let workflow = WORKFLOW.replace(
+        "exports:\n",
+        "finalizers:\n  report:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: ../prompts/finalizer-system.md\n      message:\n        text:\n          - file: ../prompts/finalizer-message.md\n        attachments:\n          - file: ../attachments/finalizer.bin\n          - ref: finalization.context\n    outputs:\n      result:\n        kind: agent_result\n        schema: ../schemas/finalizer.schema.json\n      changes:\n        kind: git_branch\nexports:\n",
+    );
+    fs::write(bundle.workflow_path(), workflow).unwrap();
+
+    let resolved = bundle.resolve().unwrap();
+    assert!(resolved.requires_git_capture());
+    for path in [
+        "prompts/finalizer-system.md",
+        "prompts/finalizer-message.md",
+        "attachments/finalizer.bin",
+        "schemas/finalizer.schema.json",
+    ] {
+        assert!(resolved.source_bytes(path).is_some(), "missing {path}");
+    }
+    let finalizer = &resolved.definition.finalizers["report"];
+    let ValidatedStep::Agent(finalizer) = &finalizer.body else {
+        panic!("report must remain an agent finalizer");
+    };
+    assert_eq!(finalizer.agent.system_prompt, "prompts/finalizer-system.md");
+    assert_eq!(
+        finalizer.agent.message.text[0],
+        ValidatedMessageSource::File {
+            path: "prompts/finalizer-message.md".to_owned(),
+        }
+    );
+    assert_eq!(
+        finalizer.agent.message.attachments[0],
+        ValidatedMessageSource::File {
+            path: "attachments/finalizer.bin".to_owned(),
+        }
+    );
+    assert_eq!(
+        finalizer.common.outputs["result"].definition,
+        Output::AgentResult {
+            schema: "schemas/finalizer.schema.json".to_owned(),
+        }
+    );
+    assert_eq!(
+        resolved.result_schema("report", "result").unwrap().bytes(),
+        RESULT_SCHEMA
+    );
+}
+
+#[test]
 fn oversized_retained_source_is_rejected_before_it_can_exhaust_the_closure_budget() {
     let bundle = FixtureBundle::new();
     let attachment_path = bundle.root.join("attachments/data.bin");
@@ -210,6 +274,53 @@ fn oversized_retained_source_is_rejected_before_it_can_exhaust_the_closure_budge
             step: "agent".to_owned(),
             index: 0,
         },
+    );
+}
+
+#[test]
+fn shared_cloud_and_runner_rejection_fixtures_fail_resolution() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/workflow/v1/resolution-invalid");
+
+    for fixture in ["unknown-dependency", "nested-result-schema-resource"] {
+        let root = fixtures.join(fixture);
+        assert!(
+            resolve_workflow_file(&root, &root.join("workflow.yaml")).is_err(),
+            "shared rejection fixture {fixture} unexpectedly resolved"
+        );
+    }
+}
+
+#[test]
+fn shared_cloud_and_runner_closure_fixture_has_the_normative_digest() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/workflow/v1/closure/complete");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("expected.json")).unwrap()).unwrap();
+    let workflow_path = expected["workflowPath"].as_str().unwrap();
+    let resolved = resolve_workflow_file(&root, &root.join(workflow_path)).unwrap();
+    let expected_paths = expected["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        resolved
+            .source_closure
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected_paths
+    );
+    assert_eq!(
+        resolved.content_digest.algorithm.as_str(),
+        expected["algorithm"].as_str().unwrap()
+    );
+    assert_eq!(
+        resolved.content_digest.value,
+        expected["value"].as_str().unwrap()
     );
 }
 

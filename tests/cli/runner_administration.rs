@@ -9,6 +9,8 @@ const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
 const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+// rrc_ values are public IDs, not credential secrets.
+const CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn prepared_runner(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
@@ -58,6 +60,26 @@ fn activation_issuance_body() -> serde_json::Value {
             "expiresAt": "2026-08-09T13:00:00Z"
         }
     })
+}
+
+fn credential_body(state: &str) -> serde_json::Value {
+    let mut credential = serde_json::json!({
+        "id": CREDENTIAL_ID,
+        "storedState": state,
+        "effectiveState": state,
+        "createdAt": "2026-08-09T12:02:00Z",
+        "lastAuthenticatedAt": "2026-08-09T12:04:00Z"
+    });
+    match state {
+        "retiring" => {
+            credential["retireAt"] = serde_json::json!("2026-08-09T13:05:00Z");
+        }
+        "revoked" => {
+            credential["revokedAt"] = serde_json::json!("2026-08-09T12:05:00Z");
+        }
+        _ => {}
+    }
+    credential
 }
 
 fn registration_body() -> serde_json::Value {
@@ -283,6 +305,96 @@ fn activation_stdout_contains_only_the_transferable_artifact() {
 }
 
 #[test]
+fn credential_list_returns_only_lifecycle_metadata() {
+    let credentials = serde_json::json!({
+        "items": [credential_body("active")],
+        "nextCursor": "next-credentials"
+    });
+    let (server, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        json_http_response("200 OK", credentials),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "credential",
+            "list",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--limit",
+            "1",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "listed");
+    assert_eq!(result["items"][0], credential_body("active"));
+    let encoded = String::from_utf8(output.stdout).unwrap();
+    assert!(!encoded.contains("verifier"));
+    assert!(!encoded.contains("secret"));
+
+    let requests = server.finish();
+    assert!(requests[1].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/credentials?limit=1 HTTP/1.1\r\n"
+    )));
+}
+
+#[test]
+fn credential_mutations_send_empty_bodies_and_idempotency_keys() {
+    for (command, subresource, state) in [
+        ("retire", "retirement", "retiring"),
+        ("revoke", "revocation", "revoked"),
+    ] {
+        let response = http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&credential_body(state)).unwrap(),
+        );
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            response,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "runner",
+                "credential",
+                command,
+                ORGANIZATION,
+                RUNNER_ID,
+                CREDENTIAL_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["credential"], credential_body(state));
+
+        let requests = server.finish();
+        assert!(requests[1].starts_with(&format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/credentials/{CREDENTIAL_ID}/{subresource} HTTP/1.1\r\n"
+        )));
+        assert_eq!(request_body(&requests[1]), "{}");
+        let key = header_value(&requests[1], "idempotency-key");
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+}
+
+#[test]
 fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     let enrollment = serde_json::json!({
         "schemaVersion": 1,
@@ -402,6 +514,100 @@ fn enrollment_rejects_terminal_stdin_before_reading_configuration() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("terminal stdin cannot supply an activation artifact"));
     assert!(!stderr.contains("operator configuration is invalid"));
+}
+
+#[test]
+fn runner_mode_commands_send_closed_targets_with_idempotency() {
+    for (command, mode) in [
+        ("enable", "enabled"),
+        ("drain", "draining"),
+        ("disable", "disabled"),
+    ] {
+        let response = http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&registration_body()).unwrap(),
+        );
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            response,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "runner",
+                command,
+                ORGANIZATION,
+                RUNNER_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], mode);
+        let requests = server.finish();
+        assert!(requests[1].starts_with(&format!(
+            "PUT /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/mode HTTP/1.1\r\n"
+        )));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(request_body(&requests[1])).unwrap(),
+            serde_json::json!({"mode": mode})
+        );
+        assert_eq!(
+            header_value(&requests[1], "content-type"),
+            "application/json"
+        );
+        assert_eq!(header_value(&requests[1], "idempotency-key").len(), 64);
+    }
+}
+
+#[test]
+fn runner_move_resolves_the_destination_and_sends_only_its_id() {
+    let response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&registration_body()).unwrap(),
+    );
+    let (server, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        json_http_response("200 OK", pool_body()),
+        response,
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "move",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--pool",
+            POOL_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "moved");
+    let requests = server.finish();
+    assert!(requests[2].starts_with(&format!(
+        "PUT /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/pool HTTP/1.1\r\n"
+    )));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&requests[2])).unwrap(),
+        serde_json::json!({"runnerPoolId": POOL_ID})
+    );
 }
 
 #[test]

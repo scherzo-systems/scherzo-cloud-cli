@@ -43,6 +43,10 @@ impl ScriptedServer {
         Deployment::for_test("http://api.fixture.example".to_owned(), self.issuer.clone())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the external HTTP fixture's readiness messages"
+    )]
     fn finish(self) -> Vec<String> {
         let requests = (0..self.expected_requests)
             .map(|_| {

@@ -86,6 +86,10 @@ impl ScriptedHttpServer {
         requests.remove(0)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the external HTTP fixture's readiness messages"
+    )]
     pub(crate) fn finish(self) -> Vec<String> {
         assert!(
             self.response_release.is_none(),

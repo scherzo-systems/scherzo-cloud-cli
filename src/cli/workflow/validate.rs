@@ -66,6 +66,11 @@ fn write_human_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     writeln!(stdout, "steps: {}", workflow.definition.steps.len())?;
     writeln!(
         stdout,
+        "finalizers: {}",
+        workflow.definition.finalizers.len()
+    )?;
+    writeln!(
+        stdout,
         "optional imports: {}",
         human_required_imports(workflow)
     )?;
@@ -114,6 +119,7 @@ fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
                 value: &workflow.content_digest.value,
             },
             step_count: workflow.definition.steps.len(),
+            finalizer_count: workflow.definition.finalizers.len(),
             required_imports,
         },
     };
@@ -155,6 +161,8 @@ enum JsonResult<'a> {
         digest: JsonDigest<'a>,
         #[serde(rename = "stepCount")]
         step_count: usize,
+        #[serde(rename = "finalizerCount")]
+        finalizer_count: usize,
         #[serde(rename = "requiredImports")]
         required_imports: Vec<&'static str>,
     },

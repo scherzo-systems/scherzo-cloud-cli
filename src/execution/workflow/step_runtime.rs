@@ -2297,7 +2297,7 @@ fn resolve_agent_upstream_outputs(
             } => Some(source.clone()),
             ValidatedMessageSource::File { .. }
             | ValidatedMessageSource::Reference {
-                source: ResolvedValueSource::Import(_),
+                source: ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext,
                 ..
             } => None,
         })

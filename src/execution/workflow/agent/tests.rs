@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::dispatch::invoke_agent_dispatcher;
 use super::scripted::{
-    ScriptedAgentAdapter, ScriptedAgentControl, ScriptedAgentError, ScriptedAgentValue,
+    ScriptedAgentControl, ScriptedAgentError, ScriptedAgentValue, scripted_agent_dispatcher,
 };
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, EnvironmentSnapshot};
@@ -179,7 +179,7 @@ async fn start_script(
 ) {
     let expected_value_kind = fixture.invocation.value_mode().kind();
     let terminal_probe = fixture.terminal_callback.clone();
-    let (adapter, mut control) = ScriptedAgentAdapter::new();
+    let (adapter, mut control) = scripted_agent_dispatcher();
     let task = tokio::spawn(async move {
         invoke_agent_dispatcher(
             &adapter,
@@ -579,7 +579,7 @@ async fn scripted_adapter_observes_initial_and_idle_cancellation() {
             .cancellation
             .request_cancellation(CancellationReason::RunnerShutdown)
     );
-    let (adapter, mut initial_control) = ScriptedAgentAdapter::new();
+    let (adapter, mut initial_control) = scripted_agent_dispatcher();
     let initial_task = tokio::spawn(async move {
         invoke_agent_dispatcher(
             &adapter,

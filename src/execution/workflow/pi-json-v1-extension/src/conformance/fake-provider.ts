@@ -23,7 +23,11 @@ if (configuredSocketPath === undefined) {
 }
 const socketPath: string = configuredSocketPath;
 
-interface TextResponse {
+interface ResponseUsage {
+  inputTokens: number | undefined;
+}
+
+interface TextResponse extends ResponseUsage {
   kind: "text";
   blocks: string[];
   stopReason: "stop" | "length";
@@ -35,17 +39,23 @@ interface ToolCallResponse {
   arguments: Record<string, unknown>;
 }
 
-interface ToolCallsResponse {
+interface ToolCallsResponse extends ResponseUsage {
   kind: "toolCalls";
   calls: ToolCallResponse[];
 }
 
-interface TruncatedToolCallResponse {
+interface StreamedToolCallResponse extends ResponseUsage {
+  kind: "streamedToolCall";
+  thinking: string[];
+  call: ToolCallResponse;
+}
+
+interface TruncatedToolCallResponse extends ResponseUsage {
   kind: "truncatedToolCall";
   call: ToolCallResponse;
 }
 
-interface FailureResponse {
+interface FailureResponse extends ResponseUsage {
   kind: "failure";
   stopReason: "error" | "aborted";
   message: string;
@@ -54,11 +64,19 @@ interface FailureResponse {
 type ProviderResponse =
   | TextResponse
   | ToolCallsResponse
+  | StreamedToolCallResponse
   | TruncatedToolCallResponse
   | FailureResponse;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validInputTokens(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+  );
 }
 
 function decodeResponse(value: unknown): ProviderResponse {
@@ -71,12 +89,14 @@ function decodeResponse(value: unknown): ProviderResponse {
     value.kind === "text" &&
     Array.isArray(value.blocks) &&
     value.blocks.every((block) => typeof block === "string") &&
-    (value.stopReason === "stop" || value.stopReason === "length")
+    (value.stopReason === "stop" || value.stopReason === "length") &&
+    validInputTokens(value.inputTokens)
   ) {
     return {
       kind: "text",
       blocks: value.blocks,
       stopReason: value.stopReason,
+      inputTokens: value.inputTokens as number | undefined,
     };
   }
   if (
@@ -88,11 +108,34 @@ function decodeResponse(value: unknown): ProviderResponse {
         typeof call.id === "string" &&
         typeof call.name === "string" &&
         isRecord(call.arguments),
-    )
+    ) &&
+    validInputTokens(value.inputTokens)
   ) {
     return {
       kind: "toolCalls",
       calls: value.calls as ToolCallsResponse["calls"],
+      inputTokens: value.inputTokens as number | undefined,
+    };
+  }
+  if (
+    value.kind === "streamedToolCall" &&
+    Array.isArray(value.thinking) &&
+    value.thinking.every((chunk) => typeof chunk === "string") &&
+    isRecord(value.call) &&
+    typeof value.call.id === "string" &&
+    typeof value.call.name === "string" &&
+    isRecord(value.call.arguments) &&
+    validInputTokens(value.inputTokens)
+  ) {
+    return {
+      kind: "streamedToolCall",
+      thinking: value.thinking,
+      inputTokens: value.inputTokens as number | undefined,
+      call: {
+        id: value.call.id,
+        name: value.call.name,
+        arguments: value.call.arguments,
+      },
     };
   }
   if (
@@ -100,10 +143,12 @@ function decodeResponse(value: unknown): ProviderResponse {
     isRecord(value.call) &&
     typeof value.call.id === "string" &&
     typeof value.call.name === "string" &&
-    isRecord(value.call.arguments)
+    isRecord(value.call.arguments) &&
+    validInputTokens(value.inputTokens)
   ) {
     return {
       kind: "truncatedToolCall",
+      inputTokens: value.inputTokens as number | undefined,
       call: {
         id: value.call.id,
         name: value.call.name,
@@ -114,12 +159,14 @@ function decodeResponse(value: unknown): ProviderResponse {
   if (
     value.kind === "failure" &&
     (value.stopReason === "error" || value.stopReason === "aborted") &&
-    typeof value.message === "string"
+    typeof value.message === "string" &&
+    validInputTokens(value.inputTokens)
   ) {
     return {
       kind: "failure",
       stopReason: value.stopReason,
       message: value.message,
+      inputTokens: value.inputTokens as number | undefined,
     };
   }
   throw new Error("The fake-provider controller returned an invalid response");
@@ -310,6 +357,86 @@ function emitToolCalls(
   });
 }
 
+async function emitStreamedToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  response: StreamedToolCallResponse,
+): Promise<void> {
+  const thinkingIndex = output.content.length;
+  const thinking = { type: "thinking" as const, thinking: "" };
+  output.content.push(thinking);
+  stream.push({
+    type: "thinking_start",
+    contentIndex: thinkingIndex,
+    partial: snapshot(output),
+  });
+  await Promise.resolve();
+  for (const delta of response.thinking) {
+    thinking.thinking += delta;
+    stream.push({
+      type: "thinking_delta",
+      contentIndex: thinkingIndex,
+      delta,
+      partial: snapshot(output),
+    });
+    await Promise.resolve();
+  }
+  stream.push({
+    type: "thinking_end",
+    contentIndex: thinkingIndex,
+    content: thinking.thinking,
+    partial: snapshot(output),
+  });
+  await Promise.resolve();
+
+  const contentIndex = output.content.length;
+  const toolCall: ToolCall = {
+    type: "toolCall",
+    id: response.call.id,
+    name: response.call.name,
+    arguments: {},
+  };
+  output.content.push(toolCall);
+  stream.push({
+    type: "toolcall_start",
+    contentIndex,
+    partial: snapshot(output),
+  });
+  await Promise.resolve();
+  const encodedArguments = JSON.stringify(response.call.arguments);
+  let partialJson = "";
+  for (let offset = 0; offset < encodedArguments.length; offset += 1024) {
+    const delta = encodedArguments.slice(offset, offset + 1024);
+    partialJson += delta;
+    try {
+      toolCall.arguments = JSON.parse(partialJson) as Record<string, unknown>;
+    } catch {
+      // OpenAI Codex exposes the last parseable partial argument object.
+    }
+    stream.push({
+      type: "toolcall_delta",
+      contentIndex,
+      delta,
+      partial: snapshot(output),
+    });
+    await Promise.resolve();
+  }
+  toolCall.arguments = response.call.arguments;
+  stream.push({
+    type: "toolcall_end",
+    contentIndex,
+    toolCall: structuredClone(toolCall),
+    partial: snapshot(output),
+  });
+  await Promise.resolve();
+  output.stopReason = "toolUse";
+  stream.push({
+    type: "done",
+    reason: "toolUse",
+    message: snapshot(output),
+  });
+}
+
 function emitTruncatedToolCall(
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
@@ -370,10 +497,17 @@ function streamFakeProvider(
         ),
       );
 
+      if (response.inputTokens !== undefined) {
+        output.usage.input = response.inputTokens;
+        output.usage.totalTokens = response.inputTokens + output.usage.output;
+      }
+
       if (response.kind === "text") {
         emitText(stream, output, response);
       } else if (response.kind === "toolCalls") {
         emitToolCalls(stream, output, response.calls);
+      } else if (response.kind === "streamedToolCall") {
+        await emitStreamedToolCall(stream, output, response);
       } else if (response.kind === "truncatedToolCall") {
         emitTruncatedToolCall(stream, output, response.call);
       } else {

@@ -4,8 +4,10 @@ use std::path::{Component, Path, PathBuf};
 
 use url::Url;
 
+use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::runner::credential::Credential;
+use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
 
 #[derive(Clone)]
 pub(crate) struct AssignmentConfig {
@@ -74,11 +76,16 @@ impl AssignmentConfig {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Config {
     endpoint: Url,
     credential: Credential,
+    startup_pending: Option<PendingCredential>,
+    state_access: Option<RunnerStateAccess>,
+    control_socket_path: Option<PathBuf>,
     assignment: AssignmentConfig,
     pi_installation: Option<ValidatedPiInstallation>,
+    claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
 }
 
 impl fmt::Debug for Config {
@@ -88,14 +95,20 @@ impl fmt::Debug for Config {
             .field("endpoint", &self.endpoint)
             .field("credential", &self.credential)
             .field("workflow_id", &self.assignment.workflow_id)
-            .field("agent_capable", &self.pi_installation.is_some())
+            .field(
+                "agent_capable",
+                &(self.pi_installation.is_some() || self.claude_code_installation.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ConfigError {
+    InvalidOperatorConfiguration,
+    #[cfg(test)]
     InvalidGatewayUrl,
+    #[cfg(test)]
     InsecureGatewayUrl,
     InvalidWorkflowId,
     WorkflowSourceRootUnavailable,
@@ -107,7 +120,12 @@ pub(crate) enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidOperatorConfiguration => {
+                formatter.write_str("runner operator configuration or protected state is invalid")
+            }
+            #[cfg(test)]
             Self::InvalidGatewayUrl => formatter.write_str("invalid runner gateway URL"),
+            #[cfg(test)]
             Self::InsecureGatewayUrl => {
                 formatter.write_str("insecure runner gateway URL is not allowed")
             }
@@ -131,6 +149,40 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
+    pub(crate) fn load(path: &Path) -> Result<Self, ConfigError> {
+        let enrolled = crate::runner::enrollment::load_runner_service_configuration(path)
+            .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        let credential = Credential::from_enrolled_state(
+            &enrolled.runner_id,
+            &enrolled.credential_id,
+            &enrolled.credential_secret,
+        )
+        .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        let endpoint = Url::parse(&enrolled.connection_url)
+            .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        if let Some(pending) = enrolled.pending_credential.clone() {
+            let _ = validate_pending_credential(pending)?;
+        }
+        let startup_pending = enrolled.pending_credential;
+        let assignment = AssignmentConfig::new(
+            enrolled.workflow_id,
+            &enrolled.workflow_source_root,
+            &enrolled.workflow_path,
+            &enrolled.work_root,
+        )?;
+        Ok(Self {
+            endpoint,
+            credential,
+            startup_pending,
+            state_access: Some(enrolled.state_access),
+            control_socket_path: Some(enrolled.control_socket_path),
+            assignment,
+            pi_installation: None,
+            claude_code_installation: None,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         gateway_url: &str,
         credential: Credential,
@@ -153,8 +205,12 @@ impl Config {
         Ok(Self {
             endpoint,
             credential,
+            startup_pending: None,
+            state_access: None,
+            control_socket_path: None,
             assignment,
             pi_installation: None,
+            claude_code_installation: None,
         })
     }
 
@@ -182,6 +238,30 @@ impl Config {
         &self.credential
     }
 
+    pub(crate) fn startup_pending(&self) -> Option<&PendingCredential> {
+        self.startup_pending.as_ref()
+    }
+
+    pub(crate) fn state_access(&self) -> Option<&RunnerStateAccess> {
+        self.state_access.as_ref()
+    }
+
+    pub(crate) fn control_socket_path(&self) -> Option<&Path> {
+        self.control_socket_path.as_deref()
+    }
+
+    pub(crate) fn with_pending_credential(
+        &self,
+        pending: PendingCredential,
+    ) -> Result<Self, ConfigError> {
+        let (endpoint, credential) = validate_pending_credential(pending)?;
+        let mut config = self.clone();
+        config.endpoint = endpoint;
+        config.credential = credential;
+        config.startup_pending = None;
+        Ok(config)
+    }
+
     pub(crate) fn assignment(&self) -> &AssignmentConfig {
         &self.assignment
     }
@@ -194,6 +274,32 @@ impl Config {
         self.pi_installation = Some(installation);
         self
     }
+
+    pub(crate) fn claude_code_installation(&self) -> Option<&ValidatedClaudeCodeInstallation> {
+        self.claude_code_installation.as_ref()
+    }
+
+    pub(crate) fn with_claude_code_installation(
+        mut self,
+        installation: ValidatedClaudeCodeInstallation,
+    ) -> Self {
+        self.claude_code_installation = Some(installation);
+        self
+    }
+}
+
+fn validate_pending_credential(
+    pending: PendingCredential,
+) -> Result<(Url, Credential), ConfigError> {
+    let endpoint = Url::parse(&pending.connection_url)
+        .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+    let credential = Credential::from_enrolled_state(
+        &pending.runner_id,
+        &pending.credential_id,
+        &pending.credential_secret,
+    )
+    .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+    Ok((endpoint, credential))
 }
 
 fn canonical_directory(path: &Path, failure: ConfigError) -> Result<PathBuf, ConfigError> {
@@ -254,7 +360,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         assert!(
             Config::new(
-                "wss://gateway.example.test/v1/connect",
+                "wss://gateway.example.test/v1/runner/connect",
                 test_credential(),
                 false,
                 assignment_fixture(&temporary),
@@ -263,7 +369,7 @@ mod tests {
         );
         assert!(
             Config::new(
-                "ws://127.0.0.1:8081/v1/connect",
+                "ws://127.0.0.1:8081/v1/runner/connect",
                 test_credential(),
                 true,
                 assignment_fixture(&temporary),
@@ -272,7 +378,7 @@ mod tests {
         );
         assert_eq!(
             Config::new(
-                "ws://127.0.0.1:8081/v1/connect",
+                "ws://127.0.0.1:8081/v1/runner/connect",
                 test_credential(),
                 false,
                 assignment_fixture(&temporary),
@@ -282,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             Config::new(
-                "ws://gateway.example.test/v1/connect",
+                "ws://gateway.example.test/v1/runner/connect",
                 test_credential(),
                 true,
                 assignment_fixture(&temporary),

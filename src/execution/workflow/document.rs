@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,9 +8,40 @@ pub(crate) struct WorkflowDocument {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
     pub(crate) agent_profiles: BTreeMap<String, AgentProfile>,
-    pub(crate) steps: BTreeMap<String, Step>,
+    pub(crate) steps: BTreeMap<String, StepDefinition>,
     pub(crate) step_order: Vec<String>,
+    pub(crate) finalizers: BTreeMap<String, FinalizerDefinition>,
+    pub(crate) finalizer_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, OutputReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StepDefinition {
+    pub(crate) body: NodeBody,
+    pub(crate) control_dependencies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FinalizerDefinition {
+    pub(crate) body: NodeBody,
+    pub(crate) after: Vec<String>,
+    pub(crate) when: BTreeSet<FinalizationTrigger>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalizationTrigger {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl FinalizationTrigger {
+    pub(crate) fn all() -> BTreeSet<Self> {
+        [Self::Succeeded, Self::Failed, Self::Cancelled]
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,21 +50,21 @@ pub(crate) struct AgentProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Step {
-    Command(CommandStep),
-    Agent(AgentStep),
+pub(crate) enum NodeBody {
+    Command(CommandNode),
+    Agent(AgentNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommandStep {
-    pub(crate) common: CommonStep,
+pub(crate) struct CommandNode {
+    pub(crate) common: CommonNode,
     pub(crate) inputs: BTreeMap<String, ValueReference>,
     pub(crate) argv: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentStep {
-    pub(crate) common: CommonStep,
+pub(crate) struct AgentNode {
+    pub(crate) common: CommonNode,
     pub(crate) agent: Agent,
 }
 
@@ -46,9 +77,8 @@ pub(crate) enum FailurePolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommonStep {
+pub(crate) struct CommonNode {
     pub(crate) failure_policy: FailurePolicy,
-    pub(crate) control_dependencies: Vec<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, Output>,
 }
@@ -57,11 +87,12 @@ pub(crate) struct CommonStep {
 pub(crate) enum ValueReference {
     Import { name: String },
     Output(OutputReference),
+    FinalizationContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutputReference {
-    pub(crate) step: String,
+    pub(crate) node: String,
     pub(crate) output: String,
 }
 
@@ -95,4 +126,5 @@ pub(crate) enum MessageSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HarnessDefinition {
     Pi { config: Value },
+    ClaudeCode { config: Value },
 }

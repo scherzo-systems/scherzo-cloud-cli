@@ -2,6 +2,7 @@ mod assignment;
 mod backoff;
 mod config;
 mod connection;
+mod control;
 #[cfg(test)]
 mod conversation;
 #[cfg(test)]
@@ -17,9 +18,12 @@ use std::sync::{Arc, Mutex};
 
 use opentelemetry::KeyValue;
 
-pub(crate) use config::{AssignmentConfig, Config};
+#[cfg(test)]
+pub(crate) use config::AssignmentConfig;
+pub(crate) use config::Config;
 
 use crate::execution::workflow::cancellation::MAXIMUM_CANCELLATION_GRACE;
+use crate::runner::control_protocol::{ConnectionFailure, ControlError};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentManager, SystemWallClockHealth, WallClockHealth};
 use backoff::Backoff;
@@ -28,11 +32,47 @@ use connection::{
     ConnectionProgress, FailureKind, FrameSource, OpeningHello, SystemFrameSource, opening_hello,
     record_progress,
 };
+use control::{ControlServer, ControlServerError, LiveStatus, ReloadRequest};
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ConnectionProgress, ConnectionError>> + Send + 'a>>;
 type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+struct Sequence {
+    next: Mutex<u64>,
+    emission: tokio::sync::Mutex<()>,
+}
+
+impl Sequence {
+    const fn new(next: u64) -> Self {
+        Self {
+            next: Mutex::new(next),
+            emission: tokio::sync::Mutex::const_new(()),
+        }
+    }
+
+    fn next(&self) -> Result<u64, ConnectionError> {
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = *next;
+        *next = next.checked_add(1).ok_or_else(sequence_overflow)?;
+        Ok(value)
+    }
+
+    fn peek(&self) -> u64 {
+        *self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn lock_emission(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.emission.lock().await
+    }
+}
 
 const SHUTDOWN_DELIVERY_AND_CLEANUP_RESERVE: std::time::Duration =
     std::time::Duration::from_secs(15);
@@ -101,7 +141,53 @@ impl Sleeper for TokioSleeper {
 struct ConnectionAttempt<'a> {
     dependencies: ConnectionDependencies<'a>,
     opening: OpeningHello<'a>,
-    next_sequence: &'a mut u64,
+    next_sequence: &'a Sequence,
+}
+
+struct PromotedAttempt {
+    config: Config,
+    opening: Vec<u8>,
+    opening_message_id: String,
+    opening_sequence: u64,
+    attempt: u64,
+    connection: connection::CandidateConnection,
+    connection_event: Event,
+    active_effect_event: ActiveEffectEvent,
+}
+
+enum ActiveAttemptResult {
+    Finished(Result<ConnectionProgress, ConnectionError>),
+    Promoted(Box<PromotedAttempt>),
+}
+
+enum ActiveEvent {
+    ManualReload(ReloadRequest),
+    StartupReload,
+    Shutdown,
+    Finished(Result<ConnectionProgress, ConnectionError>),
+}
+
+enum ConnectedReloadResult {
+    Continue,
+    Promoted(Box<PromotedAttempt>),
+    Shutdown,
+    Finished(Result<ConnectionProgress, ConnectionError>),
+}
+
+struct PreparedReload {
+    state_access: crate::runner::enrollment::RunnerStateAccess,
+    expected_runner_id: String,
+    expected_current_credential_id: String,
+    candidate: PromotedAttempt,
+}
+
+struct ReloadDependencies {
+    boot_id: String,
+    frame_source: Arc<dyn FrameSource>,
+    sleeper: Arc<dyn Sleeper>,
+    recorder: Arc<Recorder>,
+    assignment_manager: Arc<Mutex<AssignmentManager>>,
+    live_status: Arc<LiveStatus>,
 }
 
 trait Connector: Send + Sync {
@@ -156,6 +242,7 @@ pub(crate) enum ServiceError {
     ShutdownForced,
     ShutdownDeadlineExceeded,
     Connection(ConnectionError),
+    Control(ControlServerError),
 }
 
 impl fmt::Display for ServiceError {
@@ -172,6 +259,7 @@ impl fmt::Display for ServiceError {
             Self::Connection(error) => {
                 write!(formatter, "runner service stopped unexpectedly: {error}")
             }
+            Self::Control(error) => write!(formatter, "start runner local control: {error}"),
         }
     }
 }
@@ -184,6 +272,7 @@ impl std::error::Error for ServiceError {
             | Self::ShutdownForced
             | Self::ShutdownDeadlineExceeded => None,
             Self::Connection(error) => Some(error),
+            Self::Control(error) => Some(error),
         }
     }
 }
@@ -269,21 +358,49 @@ async fn run_connection_loop(
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
     let ConnectionLoopDependencies {
-        config,
+        mut config,
         frame_source,
         sleeper,
         recorder,
         wall_clock,
         boot_id,
     } = dependencies;
-    let assignment_manager = Mutex::new(AssignmentManager::new_with_sleeper(
+    let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new_with_sleeper(
         &config,
         boot_id.clone(),
         wall_clock,
         Arc::clone(&sleeper),
+    )));
+    let live_status = Arc::new(LiveStatus::new(
+        boot_id.clone(),
+        config.credential().credential_id().to_owned(),
+        config
+            .startup_pending()
+            .map(|pending| pending.credential_id.clone()),
     ));
+    let reload_dependencies = ReloadDependencies {
+        boot_id: boot_id.clone(),
+        frame_source: Arc::clone(&frame_source),
+        sleeper: Arc::clone(&sleeper),
+        recorder: Arc::clone(&recorder),
+        assignment_manager: Arc::clone(&assignment_manager),
+        live_status: Arc::clone(&live_status),
+    };
+    let (reload_sender, mut reload_requests) = tokio::sync::mpsc::channel::<ReloadRequest>(1);
+    let _control_server = config
+        .control_socket_path()
+        .map(|path| {
+            ControlServer::bind(
+                path,
+                Arc::clone(&live_status),
+                Arc::clone(&assignment_manager),
+                reload_sender,
+            )
+        })
+        .transpose()
+        .map_err(ServiceError::Control)?;
     let mut opening_sequence = 1;
-    let mut sequence = opening_sequence;
+    let sequence = Sequence::new(2);
     let mut opening_message_id = frame_source.public_id("rmsg_");
     let mut opening = opening_hello(
         frame_source.as_ref(),
@@ -294,10 +411,9 @@ async fn run_connection_loop(
         crate::build_info::VERSION,
     )
     .map_err(ServiceError::Connection)?;
-    sequence = sequence
-        .checked_add(1)
-        .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
     let mut attempt = 1_u64;
+    let mut startup_reload_pending = config.startup_pending().is_some();
+    let mut promoted_attempt: Option<PromotedAttempt> = None;
     let mut shutting_down = false;
     let mut shutdown_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
@@ -310,28 +426,51 @@ async fn run_connection_loop(
         {
             return Ok(());
         }
-        let connection_event = connection_event(&recorder, &config, &boot_id, attempt);
-        let active_effect_event = ActiveEffectEvent::new();
+        live_status.connecting();
+        let promoted = promoted_attempt.take();
+        let (connection_event, active_effect_event, candidate) = match promoted {
+            Some(promoted) => (
+                promoted.connection_event,
+                promoted.active_effect_event,
+                Some(promoted.connection),
+            ),
+            None => (
+                connection_event(&recorder, &config, &boot_id, attempt),
+                ActiveEffectEvent::new(),
+                None,
+            ),
+        };
         let result = {
-            let connection = connector.connect(ConnectionAttempt {
-                dependencies: ConnectionDependencies::new(
-                    &config,
-                    frame_source.as_ref(),
-                    sleeper.as_ref(),
-                    &recorder,
-                    &connection_event,
-                    &active_effect_event,
-                    &assignment_manager,
-                    attempt,
-                ),
-                opening: OpeningHello {
-                    boot_id: &boot_id,
-                    encoded: &opening,
-                    message_id: &opening_message_id,
-                    sequence: opening_sequence,
-                },
-                next_sequence: &mut sequence,
-            });
+            let dependencies = ConnectionDependencies::new(
+                &config,
+                frame_source.as_ref(),
+                sleeper.as_ref(),
+                &recorder,
+                &connection_event,
+                &active_effect_event,
+                &assignment_manager,
+                attempt,
+            )
+            .with_live_status(&live_status);
+            let opening_frame = OpeningHello {
+                boot_id: &boot_id,
+                encoded: &opening,
+                message_id: &opening_message_id,
+                sequence: opening_sequence,
+            };
+            let connection: ConnectionFuture<'_> = match candidate {
+                Some(candidate) => Box::pin(connection::run_promoted(
+                    dependencies,
+                    opening_frame,
+                    &sequence,
+                    candidate,
+                )),
+                None => connector.connect(ConnectionAttempt {
+                    dependencies,
+                    opening: opening_frame,
+                    next_sequence: &sequence,
+                }),
+            };
             tokio::pin!(connection);
             loop {
                 if shutting_down
@@ -359,7 +498,9 @@ async fn run_connection_loop(
                             cancel_attempt(&connection_event, &active_effect_event);
                             return Err(ServiceError::ShutdownForced);
                         }
-                        result = &mut connection => break result,
+                        result = &mut connection => {
+                            break ActiveAttemptResult::Finished(result);
+                        }
                         () = &mut notified => continue,
                         () = deadline => {
                             cancel_attempt(&connection_event, &active_effect_event);
@@ -367,23 +508,82 @@ async fn run_connection_loop(
                         }
                     }
                 } else {
-                    tokio::select! {
+                    let event = tokio::select! {
                         biased;
-                        _ = shutdown.wait() => {
-                            assignment_manager
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .begin_shutdown()
-                                .map_err(|_| ServiceError::AssignmentShutdown)?;
-                            shutting_down = true;
-                            let deadline_sleeper = Arc::clone(&sleeper);
-                            shutdown_deadline = Some(Box::pin(async move {
-                                deadline_sleeper.sleep(SHUTDOWN_TIMEOUT).await;
-                            }));
+                        Some(request) = reload_requests.recv() => {
+                            ActiveEvent::ManualReload(request)
                         }
-                        result = &mut connection => break result,
+                        () = live_status.wait_until_connected(), if startup_reload_pending => {
+                            ActiveEvent::StartupReload
+                        }
+                        _ = shutdown.wait() => ActiveEvent::Shutdown,
+                        result = &mut connection => ActiveEvent::Finished(result),
+                    };
+                    match event {
+                        event @ (ActiveEvent::ManualReload(_) | ActiveEvent::StartupReload) => {
+                            let (request, startup) = match event {
+                                ActiveEvent::ManualReload(request) => (Some(request), false),
+                                ActiveEvent::StartupReload => (None, true),
+                                ActiveEvent::Shutdown | ActiveEvent::Finished(_) => unreachable!(),
+                            };
+                            if startup {
+                                startup_reload_pending = false;
+                            }
+                            match reload_dependencies
+                                .perform_while_connected(
+                                    &config,
+                                    &sequence,
+                                    attempt.saturating_add(1),
+                                    request,
+                                    &mut connection,
+                                    shutdown,
+                                )
+                                .await
+                            {
+                                ConnectedReloadResult::Continue => {}
+                                ConnectedReloadResult::Promoted(promoted) => {
+                                    cancel_attempt(&connection_event, &active_effect_event);
+                                    startup_reload_pending = false;
+                                    break ActiveAttemptResult::Promoted(promoted);
+                                }
+                                ConnectedReloadResult::Shutdown => {
+                                    shutdown_deadline = Some(begin_shutdown(
+                                        &live_status,
+                                        &assignment_manager,
+                                        &sleeper,
+                                    )?);
+                                    shutting_down = true;
+                                }
+                                ConnectedReloadResult::Finished(result) => {
+                                    break ActiveAttemptResult::Finished(result);
+                                }
+                            }
+                        }
+                        ActiveEvent::Shutdown => {
+                            shutdown_deadline =
+                                Some(begin_shutdown(&live_status, &assignment_manager, &sleeper)?);
+                            shutting_down = true;
+                        }
+                        ActiveEvent::Finished(result) => {
+                            break ActiveAttemptResult::Finished(result);
+                        }
                     }
                 }
+            }
+        };
+        let result = match result {
+            ActiveAttemptResult::Finished(result) => result,
+            ActiveAttemptResult::Promoted(promoted) => {
+                install_promoted_attempt(
+                    *promoted,
+                    &mut config,
+                    &mut opening,
+                    &mut opening_message_id,
+                    &mut opening_sequence,
+                    &mut attempt,
+                    &mut promoted_attempt,
+                );
+                continue;
             }
         };
         let (progress, cause, kind) = match result {
@@ -393,6 +593,37 @@ async fn run_connection_loop(
                 FailureKind::Retryable,
             ),
             Err(error) if error.is_terminal() => {
+                if error.kind() == FailureKind::TerminalAuthentication && startup_reload_pending {
+                    startup_reload_pending = false;
+                    if let Some(promoted) = reload_dependencies
+                        .perform(&config, &sequence, attempt.saturating_add(1), None)
+                        .await
+                    {
+                        finish_connection_event(
+                            &connection_event,
+                            error.progress,
+                            error.kind(),
+                            error.connection_cause(),
+                            None,
+                            Outcome::Failure,
+                        );
+                        install_promoted_attempt(
+                            promoted,
+                            &mut config,
+                            &mut opening,
+                            &mut opening_message_id,
+                            &mut opening_sequence,
+                            &mut attempt,
+                            &mut promoted_attempt,
+                        );
+                        continue;
+                    }
+                }
+                match error.kind() {
+                    FailureKind::TerminalAuthentication => live_status.authentication_failed(),
+                    FailureKind::TerminalProtocol => live_status.protocol_failed(),
+                    FailureKind::Retryable => {}
+                }
                 finish_connection_event(
                     &connection_event,
                     error.progress,
@@ -401,13 +632,52 @@ async fn run_connection_loop(
                     None,
                     Outcome::Failure,
                 );
-                return Err(ServiceError::Connection(error));
+                if error.kind() != FailureKind::TerminalAuthentication {
+                    return Err(ServiceError::Connection(error));
+                }
+                loop {
+                    tokio::select! {
+                        Some(request) = reload_requests.recv() => {
+                            if let Some(promoted) = reload_dependencies
+                                .perform(
+                                    &config,
+                                    &sequence,
+                                    attempt.saturating_add(1),
+                                    Some(request),
+                                )
+                                .await
+                            {
+                                install_promoted_attempt(
+                                    promoted,
+                                    &mut config,
+                                    &mut opening,
+                                    &mut opening_message_id,
+                                    &mut opening_sequence,
+                                    &mut attempt,
+                                    &mut promoted_attempt,
+                                );
+                                break;
+                            }
+                        }
+                        _ = shutdown.wait() => {
+                            shutdown_deadline = Some(begin_shutdown(
+                                &live_status,
+                                &assignment_manager,
+                                &sleeper,
+                            )?);
+                            shutting_down = true;
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
             Err(error) => (error.progress, error.connection_cause(), error.kind()),
         };
         if progress.handshake_completed {
             backoff.reset();
         }
+        live_status.backing_off(connection_failure(cause));
         let delay = backoff.next_delay();
         let outcome = if cause.is_timeout() {
             Outcome::Timeout
@@ -424,7 +694,7 @@ async fn run_connection_loop(
         );
         if progress.opening_acknowledged {
             opening_message_id = frame_source.public_id("rmsg_");
-            opening_sequence = sequence;
+            opening_sequence = sequence.next().map_err(ServiceError::Connection)?;
             opening = opening_hello(
                 frame_source.as_ref(),
                 config.credential().runner_id(),
@@ -434,9 +704,6 @@ async fn run_connection_loop(
                 crate::build_info::VERSION,
             )
             .map_err(ServiceError::Connection)?;
-            sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
         }
         attempt = attempt.saturating_add(1);
         if shutting_down {
@@ -449,28 +716,394 @@ async fn run_connection_loop(
             };
             tokio::select! {
                 biased;
-                () = shutdown.wait() => return Err(ServiceError::ShutdownForced),
+                () = shutdown.wait() => {
+                    live_status.stopping();
+                    return Err(ServiceError::ShutdownForced);
+                },
                 () = deadline => return Err(ServiceError::ShutdownDeadlineExceeded),
                 () = notification.notified() => {}
                 () = sleeper.sleep(delay) => {}
             }
         } else {
             tokio::select! {
+                Some(request) = reload_requests.recv() => {
+                    if let Some(promoted) = reload_dependencies
+                        .perform(
+                            &config,
+                            &sequence,
+                            attempt.saturating_add(1),
+                            Some(request),
+                        )
+                        .await
+                    {
+                        // Both connected and backoff reload entry points install the
+                        // same prepared transport through the shared state transition.
+                        // jscpd:ignore-start
+                        install_promoted_attempt(
+                            promoted,
+                            &mut config,
+                            &mut opening,
+                            &mut opening_message_id,
+                            &mut opening_sequence,
+                            &mut attempt,
+                            &mut promoted_attempt,
+                        );
+                        // jscpd:ignore-end
+                        continue;
+                    }
+                }
                 _ = shutdown.wait() => {
-                    assignment_manager
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .begin_shutdown()
-                        .map_err(|_| ServiceError::AssignmentShutdown)?;
+                    shutdown_deadline = Some(begin_shutdown(
+                        &live_status,
+                        &assignment_manager,
+                        &sleeper,
+                    )?);
                     shutting_down = true;
-                    let deadline_sleeper = Arc::clone(&sleeper);
-                    shutdown_deadline = Some(Box::pin(async move {
-                        deadline_sleeper.sleep(SHUTDOWN_TIMEOUT).await;
-                    }));
                 }
                 _ = sleeper.sleep(delay) => {}
             }
         }
+    }
+}
+
+fn begin_shutdown(
+    live_status: &LiveStatus,
+    assignment_manager: &Mutex<AssignmentManager>,
+    sleeper: &Arc<dyn Sleeper>,
+) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, ServiceError> {
+    live_status.stopping();
+    assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_shutdown()
+        .map_err(|_| ServiceError::AssignmentShutdown)?;
+    let deadline_sleeper = Arc::clone(sleeper);
+    Ok(Box::pin(async move {
+        deadline_sleeper.sleep(SHUTDOWN_TIMEOUT).await;
+    }))
+}
+
+fn install_promoted_attempt(
+    promoted: PromotedAttempt,
+    config: &mut Config,
+    opening: &mut Vec<u8>,
+    opening_message_id: &mut String,
+    opening_sequence: &mut u64,
+    attempt: &mut u64,
+    promoted_attempt: &mut Option<PromotedAttempt>,
+) {
+    *config = promoted.config.clone();
+    opening.clone_from(&promoted.opening);
+    opening_message_id.clone_from(&promoted.opening_message_id);
+    *opening_sequence = promoted.opening_sequence;
+    *attempt = promoted.attempt;
+    *promoted_attempt = Some(promoted);
+}
+
+impl ReloadDependencies {
+    async fn perform(
+        &self,
+        config: &Config,
+        sequence: &Sequence,
+        attempt: u64,
+        mut request: Option<ReloadRequest>,
+    ) -> Option<PromotedAttempt> {
+        let result = self.reload_candidate(config, sequence, attempt).await;
+        respond_to_reload(&mut request, &result);
+        result.ok()
+    }
+
+    async fn perform_while_connected<F>(
+        &self,
+        config: &Config,
+        sequence: &Sequence,
+        attempt: u64,
+        request: Option<ReloadRequest>,
+        connection: &mut F,
+        shutdown: &mut dyn Shutdown,
+    ) -> ConnectedReloadResult
+    where
+        F: Future<Output = Result<ConnectionProgress, ConnectionError>> + Unpin,
+    {
+        let mut request = request;
+        if !self.live_status.is_connected() {
+            tokio::select! {
+                biased;
+                () = self.live_status.wait_until_connected() => {}
+                result = &mut *connection => {
+                    let failure = Err(ControlError::PendingConnectionFailed);
+                    respond_to_reload(&mut request, &failure);
+                    return ConnectedReloadResult::Finished(result);
+                }
+                _ = shutdown.wait() => {
+                    let failure = Err(ControlError::PendingConnectionFailed);
+                    respond_to_reload(&mut request, &failure);
+                    return ConnectedReloadResult::Shutdown;
+                }
+            }
+        }
+        let preparation = self.prepare_candidate(config, sequence, attempt);
+        tokio::pin!(preparation);
+        let prepared = tokio::select! {
+            biased;
+            result = &mut preparation => result,
+            result = &mut *connection => {
+                let failure = Err(ControlError::PendingConnectionFailed);
+                respond_to_reload(&mut request, &failure);
+                return ConnectedReloadResult::Finished(result);
+            }
+            _ = shutdown.wait() => {
+                let failure = Err(ControlError::PendingConnectionFailed);
+                respond_to_reload(&mut request, &failure);
+                return ConnectedReloadResult::Shutdown;
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let failure = Err(error);
+                respond_to_reload(&mut request, &failure);
+                return ConnectedReloadResult::Continue;
+            }
+        };
+        match self.commit_candidate(prepared).await {
+            Ok(promoted) => {
+                let success = Ok(promoted);
+                respond_to_reload(&mut request, &success);
+                let Ok(promoted) = success else {
+                    unreachable!("successful reload result changed before installation")
+                };
+                ConnectedReloadResult::Promoted(Box::new(promoted))
+            }
+            Err(error) => {
+                let recovery = self
+                    .prepare_connection(config.clone(), sequence, attempt.saturating_add(1))
+                    .await;
+                let failure = Err(error);
+                respond_to_reload(&mut request, &failure);
+                match recovery {
+                    Ok(recovered) => ConnectedReloadResult::Promoted(Box::new(recovered)),
+                    Err(_) => ConnectedReloadResult::Continue,
+                }
+            }
+        }
+    }
+
+    async fn reload_candidate(
+        &self,
+        config: &Config,
+        sequence: &Sequence,
+        attempt: u64,
+    ) -> Result<PromotedAttempt, ControlError> {
+        let prepared = self.prepare_candidate(config, sequence, attempt).await?;
+        self.commit_candidate(prepared).await
+    }
+
+    async fn prepare_candidate(
+        &self,
+        config: &Config,
+        sequence: &Sequence,
+        attempt: u64,
+    ) -> Result<PreparedReload, ControlError> {
+        let state_access = config
+            .state_access()
+            .cloned()
+            .ok_or(ControlError::NoPendingCredential)?;
+        let expected_runner_id = config.credential().runner_id().to_owned();
+        let load_access = state_access.clone();
+        let load_runner_id = expected_runner_id.clone();
+        let pending =
+            tokio::task::spawn_blocking(move || load_access.load_pending(&load_runner_id))
+                .await
+                .map_err(|_| ControlError::StateUpdateFailed)?
+                .map_err(control_state_error)?;
+        let Some(pending) = pending else {
+            self.live_status.pending(None);
+            return Err(ControlError::NoPendingCredential);
+        };
+        if pending.runner_id != expected_runner_id {
+            return Err(ControlError::PendingRegistrationMismatch);
+        }
+        self.live_status
+            .pending(Some(pending.credential_id.clone()));
+        let pending_config = config
+            .with_pending_credential(pending)
+            .map_err(|_| ControlError::StateUpdateFailed)?;
+        let candidate = self
+            .prepare_connection(pending_config, sequence, attempt)
+            .await?;
+        Ok(PreparedReload {
+            state_access,
+            expected_runner_id,
+            expected_current_credential_id: config.credential().credential_id().to_owned(),
+            candidate,
+        })
+    }
+
+    async fn prepare_connection(
+        &self,
+        config: Config,
+        sequence: &Sequence,
+        attempt: u64,
+    ) -> Result<PromotedAttempt, ControlError> {
+        let connection_event = connection_event(&self.recorder, &config, &self.boot_id, attempt);
+        let active_effect_event = ActiveEffectEvent::new();
+        let dependencies = ConnectionDependencies::new(
+            &config,
+            self.frame_source.as_ref(),
+            self.sleeper.as_ref(),
+            &self.recorder,
+            &connection_event,
+            &active_effect_event,
+            &self.assignment_manager,
+            attempt,
+        );
+        let transport = connection::connect_candidate_transport(dependencies)
+            .await
+            .map_err(|error| candidate_control_error(&connection_event, error))?;
+        let emission = sequence.lock_emission().await;
+        let opening_sequence = sequence
+            .next()
+            .map_err(|error| candidate_control_error(&connection_event, error))?;
+        let opening_message_id = self.frame_source.public_id("rmsg_");
+        let opening = opening_hello(
+            self.frame_source.as_ref(),
+            config.credential().runner_id(),
+            &self.boot_id,
+            opening_message_id.clone(),
+            opening_sequence,
+            crate::build_info::VERSION,
+        )
+        .map_err(|error| candidate_control_error(&connection_event, error))?;
+        let candidate = connection::authenticate_candidate(
+            dependencies,
+            transport,
+            OpeningHello {
+                boot_id: &self.boot_id,
+                encoded: &opening,
+                message_id: &opening_message_id,
+                sequence: opening_sequence,
+            },
+        )
+        .await
+        .map_err(|error| candidate_control_error(&connection_event, error))?;
+        drop(emission);
+        Ok(PromotedAttempt {
+            config,
+            opening,
+            opening_message_id,
+            opening_sequence,
+            attempt,
+            connection: candidate,
+            connection_event,
+            active_effect_event,
+        })
+    }
+
+    async fn commit_candidate(
+        &self,
+        prepared: PreparedReload,
+    ) -> Result<PromotedAttempt, ControlError> {
+        let state_access = prepared.state_access.clone();
+        let expected_runner_id = prepared.expected_runner_id.clone();
+        let expected_current_credential_id = prepared.expected_current_credential_id.clone();
+        let expected_pending_credential_id = prepared
+            .candidate
+            .config
+            .credential()
+            .credential_id()
+            .to_owned();
+        let promotion = tokio::task::spawn_blocking(move || {
+            state_access.promote(
+                &expected_runner_id,
+                &expected_current_credential_id,
+                &expected_pending_credential_id,
+            )
+        })
+        .await
+        .map_err(|_| ControlError::StateUpdateFailed)
+        .and_then(|result| result.map_err(control_state_error));
+        if let Err(error) = promotion {
+            prepared.candidate.connection_event.finish(Outcome::Failure);
+            return Err(error);
+        }
+        self.live_status.promoted(
+            prepared
+                .candidate
+                .config
+                .credential()
+                .credential_id()
+                .to_owned(),
+        );
+        Ok(prepared.candidate)
+    }
+}
+
+fn candidate_control_error(connection_event: &Event, error: ConnectionError) -> ControlError {
+    let category = match error.kind() {
+        FailureKind::TerminalAuthentication => ControlError::PendingAuthenticationFailed,
+        FailureKind::TerminalProtocol => ControlError::PendingProtocolFailed,
+        FailureKind::Retryable => ControlError::PendingConnectionFailed,
+    };
+    finish_connection_event(
+        connection_event,
+        error.progress,
+        error.kind(),
+        error.connection_cause(),
+        None,
+        if error.connection_cause().is_timeout() {
+            Outcome::Timeout
+        } else {
+            Outcome::Failure
+        },
+    );
+    category
+}
+
+fn respond_to_reload(
+    request: &mut Option<ReloadRequest>,
+    result: &Result<PromotedAttempt, ControlError>,
+) {
+    if let Some(request) = request.take() {
+        let response = result
+            .as_ref()
+            .map(|promoted| promoted.config.credential().credential_id().to_owned())
+            .map_err(|error| *error);
+        let _ = request.response.send(response);
+    }
+}
+
+const fn control_state_error(error: crate::runner::enrollment::ReloadStateError) -> ControlError {
+    match error {
+        crate::runner::enrollment::ReloadStateError::RegistrationMismatch => {
+            ControlError::PendingRegistrationMismatch
+        }
+        crate::runner::enrollment::ReloadStateError::StateUpdate => ControlError::StateUpdateFailed,
+    }
+}
+
+const fn connection_failure(cause: ConnectionCause) -> ConnectionFailure {
+    match cause {
+        ConnectionCause::CredentialRejected => ConnectionFailure::Authentication,
+        ConnectionCause::GatewayRateLimited => ConnectionFailure::RateLimited,
+        ConnectionCause::GatewayUnavailable | ConnectionCause::GatewayHttpError => {
+            ConnectionFailure::CloudUnavailable
+        }
+        ConnectionCause::GatewayPolicyViolation
+        | ConnectionCause::GatewayUnsupportedFrames
+        | ConnectionCause::GatewayOversizedFrames
+        | ConnectionCause::RequiredSubprotocolNotSelected
+        | ConnectionCause::OversizedGatewayFrame
+        | ConnectionCause::UndecodableGatewayFrame
+        | ConnectionCause::UnexpectedObservationAcknowledgement
+        | ConnectionCause::MismatchedEffectAcknowledgement
+        | ConnectionCause::UnexpectedGatewayFrame
+        | ConnectionCause::BinaryGatewayFrame
+        | ConnectionCause::UnexpectedRawGatewayFrame
+        | ConnectionCause::InvalidExecutionLeasePolicy
+        | ConnectionCause::ChangedExecutionLeasePolicy
+        | ConnectionCause::ConflictingAssignmentOffer => ConnectionFailure::Protocol,
+        _ => ConnectionFailure::Network,
     }
 }
 
@@ -548,13 +1181,21 @@ const fn sequence_overflow() -> ConnectionError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
+    use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as HandshakeRequest, Response as HandshakeResponse,
+    };
+    use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -569,10 +1210,12 @@ mod tests {
         terminal_observation_acknowledgement, welcome, with_watchdog,
     };
     use super::{
-        AssignmentConfig, Config, SHUTDOWN_TIMEOUT, ServiceError, Sleeper,
-        run_until_cancelled_with_dependencies,
+        AssignmentConfig, Config, LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT,
+        Sequence, ServiceError, Sleeper, TokioSleeper, run_until_cancelled_with_dependencies,
     };
+    use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
+    use crate::runner::service::assignment::AssignmentManager;
     use crate::runner::telemetry::{TestCapture, test_recorder};
 
     #[test]
@@ -590,6 +1233,839 @@ mod tests {
             error.to_string(),
             "runner service stopped unexpectedly: runner gateway connection failed: runner sequence overflow"
         );
+    }
+
+    fn current_credential_secret() -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32])
+    }
+
+    fn pending_credential_secret() -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([2_u8; 32])
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite's handshake callback requires its large error type"
+    )]
+    async fn accept_fixture_stream(stream: tokio::net::TcpStream) -> FixtureSocket {
+        accept_hdr_async(
+            stream,
+            |_request: &HandshakeRequest, mut response: HandshakeResponse| {
+                response.headers_mut().insert(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_static("scherzo.runner.v1"),
+                );
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    struct RotationFixture {
+        _root: tempfile::TempDir,
+        _runtime: tempfile::TempDir,
+        config: Config,
+        config_path: PathBuf,
+        state_path: PathBuf,
+    }
+
+    impl RotationFixture {
+        fn new(endpoint: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir_in("/tmp").unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let state_directory = root.path().join("state");
+            let source = root.path().join("source");
+            let work = root.path().join("work");
+            fs::create_dir(&state_directory).unwrap();
+            fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&work).unwrap();
+            fs::write(
+                source.join("workflow.yaml"),
+                "schemaVersion: 1\nsteps: {}\n",
+            )
+            .unwrap();
+            let state_path = state_directory.join("runner.json");
+            let connection_endpoint = endpoint.to_owned();
+            fs::write(
+                &state_path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "connectionUrl": connection_endpoint,
+                    "currentCredential": {
+                        "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "secret": current_credential_secret(),
+                        "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "enrolledAt": "2026-08-06T12:00:00Z"
+                    },
+                    "pendingCredential": {
+                        "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abd",
+                        "secret": pending_credential_secret(),
+                        "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abd",
+                        "enrolledAt": "2026-08-06T13:00:00Z"
+                    },
+                    "updatedAt": "2026-08-06T13:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let config_path = root.path().join("config.json");
+            fs::write(
+                &config_path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "deploymentMode": "development",
+                    "runnerStatePath": state_path,
+                    "controlSocketPath": runtime.path().join("runner.sock"),
+                    "workRoot": work,
+                    "developmentWorkflow": {
+                        "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "sourceRoot": source,
+                        "workflowPath": "workflow.yaml"
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            crate::runner::enrollment::load_runner_service_configuration(&config_path).unwrap();
+            let config = Config::load(&config_path).unwrap();
+            Self {
+                _root: root,
+                _runtime: runtime,
+                config,
+                config_path,
+                state_path,
+            }
+        }
+        fn without_pending(endpoint: &str) -> Self {
+            let mut fixture = Self::new(endpoint);
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+            state.as_object_mut().unwrap().remove("pendingCredential");
+            fs::write(
+                &fixture.state_path,
+                serde_json::to_vec_pretty(&state).unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(&fixture.state_path, fs::Permissions::from_mode(0o600)).unwrap();
+            fixture.config = Config::load(&fixture.config_path).unwrap();
+            fixture
+        }
+
+        fn stage_pending(&self) {
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&self.state_path).unwrap()).unwrap();
+            state["pendingCredential"] = serde_json::json!({
+                "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "secret": pending_credential_secret(),
+                "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "enrolledAt": "2026-08-06T13:00:00Z"
+            });
+            fs::write(&self.state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+            fs::set_permissions(&self.state_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    async fn reload_fixture(
+        config: &Config,
+    ) -> (
+        Option<super::PromotedAttempt>,
+        Result<String, ControlError>,
+        TestCapture,
+    ) {
+        let frame_source = deterministic_frame_source();
+        let (recorder, capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
+        let assignments = Arc::new(std::sync::Mutex::new(AssignmentManager::new_with_sleeper(
+            config,
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            healthy_wall_clock(),
+            Arc::new(TokioSleeper),
+        )));
+        let status = Arc::new(LiveStatus::new(
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            config.credential().credential_id().to_owned(),
+            config
+                .startup_pending()
+                .map(|pending| pending.credential_id.clone()),
+        ));
+        let reload = ReloadDependencies {
+            boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            frame_source,
+            sleeper: Arc::new(TokioSleeper),
+            recorder,
+            assignment_manager: assignments,
+            live_status: status,
+        };
+        let (response, receive) = tokio::sync::oneshot::channel();
+        let promoted = reload
+            .perform(
+                config,
+                &Sequence::new(2),
+                2,
+                Some(ReloadRequest { response }),
+            )
+            .await;
+        (promoted, receive.await.unwrap(), capture)
+    }
+
+    async fn request_control(socket_path: PathBuf, operation: Operation) -> Response {
+        tokio::task::spawn_blocking(move || {
+            crate::runner::control_client::request(&socket_path, operation)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn request_staged_reload(fixture: &RotationFixture, socket_path: PathBuf) -> Response {
+        fixture.stage_pending();
+        request_control(socket_path, Operation::ReloadCredential).await
+    }
+
+    async fn accept_rotation_connections(
+        listener: &tokio::net::TcpListener,
+        current_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> (FixtureSocket, FixtureSocket) {
+        let (mut current, current_headers) = accept_fixture_socket_with_headers(listener).await;
+        assert!(
+            current_headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abc."))
+        );
+        let Some(Ok(Message::Text(current_hello))) = current.next().await else {
+            panic!("current connection omitted hello");
+        };
+        let current_hello: serde_json::Value = serde_json::from_str(&current_hello).unwrap();
+        current.send(welcome()).await.unwrap();
+        current
+            .send(observation_acknowledgement(
+                current_hello["messageId"].as_str().unwrap(),
+                current_hello["sequence"].as_u64().unwrap(),
+            ))
+            .await
+            .unwrap();
+        if let Some(current_ready) = current_ready {
+            current_ready.send(()).unwrap();
+        }
+
+        let (mut pending, pending_headers) = accept_fixture_socket_with_headers(listener).await;
+        assert!(
+            pending_headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abd."))
+        );
+        let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
+            panic!("pending connection omitted hello");
+        };
+        let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
+        assert_eq!(pending_hello["bootId"], current_hello["bootId"]);
+        pending.send(welcome()).await.unwrap();
+        pending
+            .send(observation_acknowledgement(
+                pending_hello["messageId"].as_str().unwrap(),
+                pending_hello["sequence"].as_u64().unwrap(),
+            ))
+            .await
+            .unwrap();
+        (current, pending)
+    }
+
+    #[tokio::test]
+    async fn reload_promotes_a_valid_pending_credential_without_changing_boot() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let server = tokio::spawn(async move {
+            let (mut socket, headers) = accept_fixture_socket_with_headers(&listener).await;
+            let expected_authorization = format!(
+                "Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abd.{}",
+                pending_credential_secret()
+            );
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_authorization.as_str())
+            );
+            let Some(Ok(Message::Text(hello))) = socket.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+            assert_eq!(hello["bootId"], "rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
+            socket.send(welcome()).await.unwrap();
+        });
+
+        let (promoted, response, capture) = reload_fixture(&fixture.config).await;
+        assert_eq!(response, Ok("rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()));
+        let promoted = promoted.unwrap();
+        assert_eq!(
+            promoted.config.credential().credential_id(),
+            "rrc_01k0z6r1w8f4jy2m7q9v3x5abd"
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+        assert_eq!(
+            state["currentCredential"]["id"],
+            "rrc_01k0z6r1w8f4jy2m7q9v3x5abd"
+        );
+        assert!(state.get("pendingCredential").is_none());
+        let telemetry = serde_json::to_string(&capture.records()).unwrap();
+        for secret in [current_credential_secret(), pending_credential_secret()] {
+            assert!(!telemetry.contains(&secret));
+        }
+        drop(promoted);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_socket_reload_promotes_the_live_same_boot_connection() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (current_sent, current_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (current, mut pending) =
+                accept_rotation_connections(&listener, Some(current_sent)).await;
+            while pending.next().await.is_some() {}
+            drop(current);
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(current_received).await.unwrap().unwrap();
+        assert_eq!(
+            request_staged_reload(&fixture, socket_path).await,
+            Response::Reloaded {
+                credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()
+            }
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+        assert!(state.get("pendingCredential").is_none());
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_reload_retains_the_boot_and_accepted_assignment_manager() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        fs::write(
+            fixture
+                .config
+                .assignment()
+                .workflow_source_root()
+                .join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        )
+        .unwrap();
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut current = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(current_hello))) = current.next().await else {
+                panic!("current connection omitted hello");
+            };
+            let current_hello: serde_json::Value = serde_json::from_str(&current_hello).unwrap();
+            current.send(welcome()).await.unwrap();
+            current
+                .send(observation_acknowledgement(
+                    current_hello["messageId"].as_str().unwrap(),
+                    current_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            current.send(assignment_offer()).await.unwrap();
+            loop {
+                let Some(Ok(Message::Text(frame))) = current.next().await else {
+                    panic!("current connection closed before assignment acceptance");
+                };
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if frame["type"] == "assignment_accepted" {
+                    accepted_sent.send(()).unwrap();
+                    break;
+                }
+            }
+
+            let mut pending = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
+            assert_eq!(pending_hello["bootId"], current_hello["bootId"]);
+            pending.send(welcome()).await.unwrap();
+            pending
+                .send(observation_acknowledgement(
+                    pending_hello["messageId"].as_str().unwrap(),
+                    pending_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(Message::Text(frame))) = pending.next().await {
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if matches!(
+                    frame["type"].as_str(),
+                    Some("assignment_accepted" | "assignment_interrupted")
+                ) {
+                    pending
+                        .send(observation_acknowledgement(
+                            frame["messageId"].as_str().unwrap(),
+                            frame["sequence"].as_u64().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                if frame["type"] == "assignment_interrupted" {
+                    break;
+                }
+            }
+            drop(current);
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(accepted_received).await.unwrap().unwrap();
+        let Response::Status(before) =
+            request_control(socket_path.clone(), Operation::Status).await
+        else {
+            panic!("control status was not available before reload");
+        };
+        assert_eq!(before.assignment_counts.accepted, 1);
+
+        assert_eq!(
+            request_staged_reload(&fixture, socket_path.clone()).await,
+            Response::Reloaded {
+                credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()
+            }
+        );
+        let Response::Status(after) = request_control(socket_path, Operation::Status).await else {
+            panic!("control status was not available after reload");
+        };
+        assert_eq!(after.boot_id, before.boot_id);
+        assert_eq!(after.assignment_counts, before.assignment_counts);
+        assert_eq!(after.assignment_counts.accepted, 1);
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_authentication_remains_locally_inspectable() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (rejected_sent, rejected_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut current, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = current.read(&mut request).await.unwrap();
+            current
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            rejected_sent.send(()).unwrap();
+
+            let (mut pending, headers) = accept_fixture_socket_with_headers(&listener).await;
+            assert!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.starts_with("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abd.")
+                    })
+            );
+            let Some(Ok(Message::Text(hello))) = pending.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+            pending.send(welcome()).await.unwrap();
+            pending
+                .send(observation_acknowledgement(
+                    hello["messageId"].as_str().unwrap(),
+                    hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            while pending.next().await.is_some() {}
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(rejected_received).await.unwrap().unwrap();
+
+        with_watchdog(async {
+            loop {
+                let response = request_control(socket_path.clone(), Operation::Status).await;
+                if let Response::Status(status) = response
+                    && status.connection_state == ConnectionState::AuthenticationFailed
+                {
+                    break;
+                }
+                TokioSleeper.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            request_staged_reload(&fixture, socket_path).await,
+            Response::Reloaded {
+                credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()
+            }
+        );
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    // These integration proofs intentionally exercise different interleavings
+    // against the same closed handshake; keeping each scenario explicit makes
+    // its ordering contract auditable.
+    // jscpd:ignore-start
+    #[tokio::test]
+    async fn pending_handshake_preserves_contiguous_current_boot_sequences() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (current_sent, current_received) = tokio::sync::oneshot::channel();
+        let (sequences_sent, sequences_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut current = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(current_hello))) = current.next().await else {
+                panic!("current connection omitted hello");
+            };
+            let current_hello: serde_json::Value = serde_json::from_str(&current_hello).unwrap();
+            current.send(welcome()).await.unwrap();
+            current
+                .send(observation_acknowledgement(
+                    current_hello["messageId"].as_str().unwrap(),
+                    current_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            current_sent.send(()).unwrap();
+
+            let (pending_stream, _) = listener.accept().await.unwrap();
+            current.send(assignment_offer()).await.unwrap();
+            let Some(Ok(Message::Text(current_observation))) = current.next().await else {
+                panic!("current connection omitted assignment observation");
+            };
+            let current_observation: serde_json::Value =
+                serde_json::from_str(&current_observation).unwrap();
+            let latest_current_sequence = current_observation["sequence"].as_u64().unwrap();
+
+            let mut pending = accept_fixture_stream(pending_stream).await;
+            let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
+            sequences_sent
+                .send((
+                    latest_current_sequence,
+                    pending_hello["sequence"].as_u64().unwrap(),
+                ))
+                .unwrap();
+            pending
+                .send(Message::Text("invalid-pending-frame".into()))
+                .await
+                .unwrap();
+            while current.next().await.is_some() {}
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(current_received).await.unwrap().unwrap();
+        assert_eq!(
+            request_staged_reload(&fixture, socket_path).await,
+            Response::Error(ControlError::PendingProtocolFailed)
+        );
+        let (latest_current_sequence, pending_hello_sequence) =
+            with_watchdog(sequences_received).await.unwrap().unwrap();
+        assert!(
+            pending_hello_sequence > latest_current_sequence,
+            "pending hello sequence {pending_hello_sequence} regressed behind current sequence {latest_current_sequence}"
+        );
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_handshake_keeps_the_current_transport_live() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (current_sent, current_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut current = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(current_hello))) = current.next().await else {
+                panic!("current connection omitted hello");
+            };
+            let current_hello: serde_json::Value = serde_json::from_str(&current_hello).unwrap();
+            current.send(welcome()).await.unwrap();
+            current
+                .send(observation_acknowledgement(
+                    current_hello["messageId"].as_str().unwrap(),
+                    current_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            current_sent.send(()).unwrap();
+
+            let mut pending = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut pending).await;
+            current
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
+            loop {
+                match with_watchdog(current.next()).await.unwrap() {
+                    Some(Ok(Message::Pong(payload))) => {
+                        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => panic!("current connection failed: {error}"),
+                    None => panic!("current connection closed during pending handshake"),
+                }
+            }
+            pending
+                .send(Message::Text("invalid-pending-frame".into()))
+                .await
+                .unwrap();
+            while current.next().await.is_some() {}
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(current_received).await.unwrap().unwrap();
+        assert_eq!(
+            request_staged_reload(&fixture, socket_path).await,
+            Response::Error(ControlError::PendingProtocolFailed)
+        );
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_establishes_current_before_promoting_pending_in_the_same_boot() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let state_path = fixture.state_path.clone();
+        let (promoted_sent, promoted_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (current, mut pending) = accept_rotation_connections(&listener, None).await;
+            promoted_sent.send(()).unwrap();
+            while pending.next().await.is_some() {}
+            drop(current);
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config, Arc::new(TokioSleeper));
+        with_watchdog(promoted_received).await.unwrap().unwrap();
+        loop {
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+            if state.get("pendingCredential").is_none() {
+                break;
+            }
+            TokioSleeper.sleep(Duration::from_millis(1)).await;
+        }
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_state_write_failure_preserves_current_and_pending_state() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let original = fs::read(&fixture.state_path).unwrap();
+        let state_path = fixture.state_path.clone();
+        let hard_link = state_path.with_extension("hard-link");
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut socket).await;
+            fs::hard_link(&state_path, &hard_link).unwrap();
+            socket.send(welcome()).await.unwrap();
+            hard_link
+        });
+
+        let (promoted, response, _capture) = reload_fixture(&fixture.config).await;
+        assert!(promoted.is_none());
+        assert_eq!(response, Err(ControlError::StateUpdateFailed));
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), original);
+        let hard_link = server.await.unwrap();
+        fs::remove_file(hard_link).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_state_write_failure_restores_current_transport() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        fixture.stage_pending();
+        let staged_state = fs::read(&fixture.state_path).unwrap();
+        let state_path = fixture.state_path.clone();
+        let hard_link = state_path.with_extension("hard-link");
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (current_sent, current_received) = tokio::sync::oneshot::channel();
+        let (recovered_sent, recovered_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut current, _) = accept_fixture_socket_with_headers(&listener).await;
+            let Some(Ok(Message::Text(current_hello))) = current.next().await else {
+                panic!("current connection omitted hello");
+            };
+            let current_hello: serde_json::Value = serde_json::from_str(&current_hello).unwrap();
+            current.send(welcome()).await.unwrap();
+            current
+                .send(observation_acknowledgement(
+                    current_hello["messageId"].as_str().unwrap(),
+                    current_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            current_sent.send(()).unwrap();
+
+            let (mut pending, pending_headers) =
+                accept_fixture_socket_with_headers(&listener).await;
+            assert!(
+                pending_headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.starts_with("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abd.")
+                    })
+            );
+            let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
+            fs::hard_link(&state_path, &hard_link).unwrap();
+            pending.send(welcome()).await.unwrap();
+            pending
+                .send(observation_acknowledgement(
+                    pending_hello["messageId"].as_str().unwrap(),
+                    pending_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            drop(current);
+
+            let (mut recovered, recovered_headers) =
+                accept_fixture_socket_with_headers(&listener).await;
+            assert!(
+                recovered_headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.starts_with("Bearer rrc_01k0z6r1w8f4jy2m7q9v3x5abc.")
+                    })
+            );
+            let Some(Ok(Message::Text(recovered_hello))) = recovered.next().await else {
+                panic!("recovered current connection omitted hello");
+            };
+            let recovered_hello: serde_json::Value =
+                serde_json::from_str(&recovered_hello).unwrap();
+            assert_eq!(recovered_hello["bootId"], pending_hello["bootId"]);
+            assert!(
+                recovered_hello["sequence"].as_u64().unwrap()
+                    > pending_hello["sequence"].as_u64().unwrap()
+            );
+            recovered.send(welcome()).await.unwrap();
+            recovered
+                .send(observation_acknowledgement(
+                    recovered_hello["messageId"].as_str().unwrap(),
+                    recovered_hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            recovered_sent.send(()).unwrap();
+            while recovered.next().await.is_some() {}
+            hard_link
+        });
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        with_watchdog(current_received).await.unwrap().unwrap();
+        assert_eq!(
+            request_control(socket_path, Operation::ReloadCredential).await,
+            Response::Error(ControlError::StateUpdateFailed)
+        );
+        with_watchdog(recovered_received).await.unwrap().unwrap();
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), staged_state);
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        let hard_link = with_watchdog(server).await.unwrap().unwrap();
+        fs::remove_file(hard_link).unwrap();
+    }
+
+    // jscpd:ignore-end
+    #[tokio::test]
+    async fn reload_authentication_failure_preserves_pending_state() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let original = fs::read(&fixture.state_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (promoted, response, capture) = reload_fixture(&fixture.config).await;
+        assert!(promoted.is_none());
+        assert_eq!(response, Err(ControlError::PendingAuthenticationFailed));
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), original);
+        let telemetry = serde_json::to_string(&capture.records()).unwrap();
+        assert!(!telemetry.contains(&pending_credential_secret()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_network_failure_preserves_pending_state() {
+        let fixture = RotationFixture::new("ws://127.0.0.1:1/v1/runner/connect");
+        let original = fs::read(&fixture.state_path).unwrap();
+        let (promoted, response, capture) = reload_fixture(&fixture.config).await;
+        assert!(promoted.is_none());
+        assert_eq!(response, Err(ControlError::PendingConnectionFailed));
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), original);
+        let telemetry = serde_json::to_string(&capture.records()).unwrap();
+        assert!(!telemetry.contains(&pending_credential_secret()));
+    }
+
+    #[tokio::test]
+    async fn reload_protocol_failure_preserves_pending_state_without_raw_diagnostics() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let original = fs::read(&fixture.state_path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut socket).await;
+            socket
+                .send(Message::Text(
+                    "RAW-PROTOCOL-DIAGNOSTIC-MUST-NOT-LEAK".into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let (promoted, response, capture) = reload_fixture(&fixture.config).await;
+        assert!(promoted.is_none());
+        assert_eq!(response, Err(ControlError::PendingProtocolFailed));
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), original);
+        assert!(
+            !serde_json::to_string(&capture.records())
+                .unwrap()
+                .contains("RAW-PROTOCOL-DIAGNOSTIC-MUST-NOT-LEAK")
+        );
+        server.await.unwrap();
     }
 
     fn accepted_assignment_config(endpoint: &str) -> (tempfile::TempDir, Config) {
@@ -809,7 +2285,10 @@ mod tests {
         let event = &events[0];
         assert_eq!(event["event.name"], "runner.gateway_connection");
         assert_eq!(event["scherzo.connection.attempt"], 1);
-        assert_eq!(event["scherzo.connection.failure_kind"], "terminal");
+        assert_eq!(
+            event["scherzo.connection.failure_kind"],
+            "terminal_protocol"
+        );
         assert_eq!(event["error.type"], "gateway_policy_violation");
         assert_eq!(event["scherzo.outcome"], "failure");
         assert_eq!(event["scherzo.cloud.text_frames_received"], 0);
@@ -881,10 +2360,6 @@ mod tests {
             let effect_acknowledgement = effect_acknowledgement(&mut socket).await;
             assert_eq!(effect_acknowledgement["sequence"], 2);
 
-            socket
-                .send(Message::Text("not valid JSON".into()))
-                .await
-                .expect("send invalid frame");
             failure_sent
                 .send(())
                 .expect("report first connection failure");
@@ -929,7 +2404,7 @@ mod tests {
         let event = connection_events[0];
         assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
         assert_eq!(event["scherzo.runner.version"], crate::build_info::VERSION);
-        assert_eq!(event["error.type"], "undecodable_gateway_frame");
+        assert_eq!(event["error.type"], "read_gateway_frame");
         assert_eq!(event["scherzo.outcome"], "disconnected");
         assert_eq!(
             event["scherzo.connection.backoff_ms"],
@@ -941,11 +2416,6 @@ mod tests {
         assert_eq!(event["scherzo.runner.text_frames_sent"], 3);
         assert_eq!(event["scherzo.runner.effects_received"], 1);
         assert_eq!(event["scherzo.runner.effect_acknowledgements_confirmed"], 0);
-        assert!(
-            !serde_json::to_string(event)
-                .expect("encode retryable connection event")
-                .contains("not valid JSON")
-        );
         assert_eq!(
             events
                 .iter()

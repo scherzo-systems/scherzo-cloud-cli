@@ -1,0 +1,11 @@
+```console
+$ scherzo-cloud runner status --help
+Show live Runner Serve status
+
+Usage: scherzo-cloud runner status --config <PATH>
+
+Options:
+      --config <PATH>  Read the control socket path from the closed runner operator configuration
+  -h, --help           Print help
+
+```

@@ -23,7 +23,7 @@ use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
-use crate::execution::workflow::validated::ValidatedHarness;
+use crate::execution::workflow::validated::{ValidatedHarness, WorkflowNode, WorkflowNodeRole};
 
 const SYSTEM_PROMPT: &str = "System @ exact.\n";
 const STATIC_MESSAGE: &str = "static - text\n";
@@ -316,7 +316,10 @@ fn execution_context(execution_root: &Path) -> ExecutionContext {
 
 fn output_source(step: &str, output: &str, value_type: WorkflowValueType) -> ResolvedOutputSource {
     ResolvedOutputSource {
-        step: step.to_owned(),
+        node: WorkflowNode {
+            id: step.to_owned(),
+            role: WorkflowNodeRole::Step,
+        },
         output: output.to_owned(),
         value_type,
     }

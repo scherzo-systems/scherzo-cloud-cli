@@ -342,9 +342,17 @@ mod tests {
             "runner activation list",
             "runner activation revoke",
             "runner create",
+            "runner credential",
+            "runner credential list",
+            "runner credential retire",
+            "runner credential revoke",
+            "runner disable",
             "runner doctor",
+            "runner drain",
+            "runner enable",
             "runner enroll",
             "runner list",
+            "runner move",
             "runner pool",
             "runner pool create",
             "runner pool list",
@@ -353,6 +361,7 @@ mod tests {
             "runner rename",
             "runner serve",
             "runner show",
+            "runner status",
             "version",
             "workflow",
             "workflow retry",
@@ -451,6 +460,7 @@ mod tests {
         assert!(help.contains("rename      Rename a Scherzo Cloud runner registration"));
         assert!(help.contains("doctor      Check local runner prerequisites"));
         assert!(help.contains("serve       Connect to Scherzo Cloud and serve run assignments"));
+        assert!(help.contains("status      Show live Runner Serve status"));
 
         let activation = command_help(&["runner", "activation"]);
         assert!(activation.contains("create  Create a single-use runner activation"));

@@ -240,6 +240,19 @@ struct RealPiFixture {
 
 impl RealPiFixture {
     fn new(value_mode: AgentValueMode, retry: bool, hold_settlement: bool) -> Option<Self> {
+        Self::new_with_options(value_mode, retry, hold_settlement, false)
+    }
+
+    fn with_threshold_compaction(value_mode: AgentValueMode) -> Option<Self> {
+        Self::new_with_options(value_mode, false, false, true)
+    }
+
+    fn new_with_options(
+        value_mode: AgentValueMode,
+        retry: bool,
+        hold_settlement: bool,
+        force_compaction: bool,
+    ) -> Option<Self> {
         let executable = conformance_executable()?;
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -270,7 +283,12 @@ impl RealPiFixture {
         fs::set_permissions(&result_endpoint, fs::Permissions::from_mode(0o700)).unwrap();
 
         materialize_project(&project_directory, retry);
-        let global_settings = b"{\"defaultProjectTrust\":\"ask\"}\n".to_vec();
+        let mut settings = json!({"defaultProjectTrust": "ask"});
+        if force_compaction {
+            settings["compaction"] = json!({"keepRecentTokens": 100});
+        }
+        let mut global_settings = serde_json::to_vec(&settings).unwrap();
+        global_settings.push(b'\n');
         let global_auth = b"{}\n".to_vec();
         fs::write(agent_directory.join("settings.json"), &global_settings).unwrap();
         fs::write(agent_directory.join("auth.json"), &global_auth).unwrap();
@@ -325,7 +343,6 @@ impl RealPiFixture {
                 OsString::from("1"),
             );
         }
-
         let admitted_root = AdmittedExecutionRoot::admit(&execution_root).unwrap();
         let working_directory = admitted_root
             .select_working_directory(Some("worktree"))
@@ -596,11 +613,79 @@ fn result_mode() -> AgentValueMode {
         "required": ["count"],
         "additionalProperties": false
     });
+    result_value_mode(document)
+}
+
+fn result_value_mode(document: Value) -> AgentValueMode {
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&document).unwrap());
     AgentValueMode::Result {
         output: Arc::from("result"),
         schema: RetainedResultSchema::compile(bytes, Arc::new(document)).unwrap(),
     }
+}
+
+fn streamed_nested_result_mode() -> AgentValueMode {
+    let document = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "heading": {"type": "string"},
+                        "tickets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ordinal": {"type": "integer"},
+                                    "title": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "labels": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                },
+                                "required": ["ordinal", "title", "description", "labels"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["heading", "tickets"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["summary", "sections"],
+        "additionalProperties": false
+    });
+    result_value_mode(document)
+}
+
+fn streamed_nested_result() -> Value {
+    let sections = (0..32)
+        .map(|ordinal| {
+            json!({
+                "heading": format!("Section {ordinal:02}"),
+                "tickets": [{
+                    "ordinal": ordinal,
+                    "title": format!("Nested work item {ordinal:02}"),
+                    "description": format!(
+                        "{}-{ordinal:02}",
+                        "qualification-payload-".repeat(10)
+                    ),
+                    "labels": ["workflow", "deterministic"]
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": "Deterministic streamed result retained without semantic transformation.",
+        "sections": sections
+    })
 }
 
 struct RunningRealPi {
@@ -650,6 +735,23 @@ impl RunningRealPi {
         let outcome = self.terminal.receive().await.unwrap();
         self.task.await.unwrap();
         (self.fixture, outcome)
+    }
+
+    fn into_finishing(
+        self,
+    ) -> (
+        RealPiFixture,
+        tokio::task::JoinHandle<()>,
+        AgentTerminalReceiver,
+    ) {
+        let Self {
+            fixture,
+            task,
+            started,
+            terminal,
+        } = self;
+        assert!(started.is_none());
+        (fixture, task, terminal)
     }
 }
 
@@ -701,6 +803,35 @@ fn result_tool_name(request: &Value) -> &str {
         .into_iter()
         .find(|name| name.starts_with("scherzo_result_"))
         .unwrap()
+}
+
+fn retained_assistant_tool_call(
+    fixture: &RealPiFixture,
+    tool_name: &str,
+    tool_call_id: &str,
+) -> Value {
+    for session in fixture.native_sessions() {
+        let bytes = fs::read(session).unwrap();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            let Some(content) = entry["message"]["content"].as_array() else {
+                continue;
+            };
+            if entry["type"] == "message"
+                && entry["message"]["role"] == "assistant"
+                && content.iter().any(|block| {
+                    block["type"] == "toolCall"
+                        && block["id"] == tool_call_id
+                        && block["name"] == tool_name
+                })
+            {
+                return entry["message"].clone();
+            }
+        }
+    }
+    panic!("retained Pi session did not contain the expected assistant tool call");
 }
 
 async fn run_terminal_case(
@@ -1078,6 +1209,213 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
+    if conformance_executable().is_none() {
+        return;
+    }
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::with_threshold_compaction(result_mode()).unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let model_request = running.fixture.controller.next("model").await;
+        let tool_name = result_tool_name(&model_request.value).to_owned();
+        model_request.release(json!({
+            "kind": "toolCalls",
+            "calls": [{
+                "id": "call-compaction-history",
+                "name": "conformance_gate",
+                "arguments": {"value": "compaction-history".repeat(1024)}
+            }]
+        }));
+        let tool_request = running.fixture.controller.next("tool").await;
+        assert_eq!(
+            tool_request.value["toolCallId"],
+            "call-compaction-history"
+        );
+        tool_request.release(json!({"kind": "release"}));
+        let result_request = running.fixture.controller.next("model").await;
+        result_request.release(json!({
+            "kind": "toolCalls",
+            "inputTokens": 127_000,
+            "calls": [{
+                "id": "call-threshold-result",
+                "name": tool_name,
+                "arguments": {"result": {"count": 1}}
+            }]
+        }));
+
+        running.await_started().await;
+        let (mut fixture, outcome) = running.finish().await;
+        let milestones = std::iter::from_fn(|| fixture.observations.try_recv().ok())
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::Lifecycle { milestone } => Some(*milestone),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let compaction_started = milestones
+            .iter()
+            .position(|milestone| {
+                *milestone
+                    == crate::execution::workflow::agent::AgentLifecycleMilestone::CompactionStarted
+            })
+            .expect("Pi must attempt threshold compaction after the accepted result");
+        let compaction_completed = milestones
+            .iter()
+            .position(|milestone| {
+                *milestone
+                    == crate::execution::workflow::agent::AgentLifecycleMilestone::CompactionCompleted
+            })
+            .expect("the extension must cancel threshold compaction cleanly");
+        let harness_quiescent = milestones
+            .iter()
+            .position(|milestone| {
+                *milestone
+                    == crate::execution::workflow::agent::AgentLifecycleMilestone::HarnessQuiescent
+            })
+            .expect("Pi must settle after canceled threshold compaction");
+        assert!(compaction_started < compaction_completed);
+        assert!(compaction_completed < harness_quiescent);
+        assert_count_one_result(fixture, outcome).await;
+    })
+    .await
+    .expect("pinned real-Pi threshold-compaction settlement watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persistence() {
+    if conformance_executable().is_none() {
+        return;
+    }
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::new(streamed_nested_result_mode(), false, false).unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let model_request = running.fixture.controller.next("model").await;
+        let tool_name = result_tool_name(&model_request.value).to_owned();
+        let registered_tool = model_request.value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap();
+        assert_eq!(registered_tool["parameters"]["type"], "object");
+        assert_eq!(registered_tool["parameters"]["required"], json!(["result"]));
+        assert_eq!(
+            registered_tool["parameters"]["additionalProperties"],
+            false
+        );
+
+        let result_value = streamed_nested_result();
+        let provider_arguments = json!({"result": result_value.clone()});
+        let provider_bytes = serde_json::to_vec(&provider_arguments).unwrap();
+        assert!(
+            (10 * 1024..=12 * 1024).contains(&provider_bytes.len()),
+            "representative provider arguments were {} bytes",
+            provider_bytes.len()
+        );
+        model_request.release(json!({
+            "kind": "streamedToolCall",
+            "thinking": [
+                "Inspecting the requested result shape. ",
+                "Submitting one nested result call."
+            ],
+            "call": {
+                "id": "call-streamed-nested-result",
+                "name": tool_name,
+                "arguments": provider_arguments
+            }
+        }));
+        running.await_started().await;
+
+        let (mut fixture, task, terminal) = running.into_finishing();
+        let mut terminal = Box::pin(terminal.receive());
+        let outcome = tokio::select! {
+            biased;
+            correction = fixture.controller.next("model") => {
+                let rejected_assistant = correction.value["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| {
+                        message["role"] == "assistant"
+                            && message["content"].as_array().is_some_and(|content| {
+                                content.iter().any(|block| {
+                                    block["type"] == "toolCall"
+                                        && block["id"] == "call-streamed-nested-result"
+                                })
+                            })
+                    })
+                    .cloned()
+                    .unwrap();
+                correction.release(json!({
+                    "kind": "text",
+                    "blocks": ["No corrected result is provided."],
+                    "stopReason": "stop"
+                }));
+                let outcome = terminal.await.unwrap();
+                task.await.unwrap();
+                fixture.controller.shutdown().await;
+                panic!(
+                    "streamed result requested correction instead of settling; provider context assistant={rejected_assistant}; outcome={outcome:?}"
+                );
+            }
+            outcome = &mut terminal => outcome.unwrap(),
+        };
+        task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("streamed nested result did not complete: {outcome:?}");
+        };
+
+        let retained = retained_assistant_tool_call(
+            &fixture,
+            &tool_name,
+            "call-streamed-nested-result",
+        );
+        let content = retained["content"].as_array().unwrap();
+        let tool_call_index = content
+            .iter()
+            .position(|block| block["id"] == "call-streamed-nested-result")
+            .unwrap();
+        assert!(content[..tool_call_index].iter().any(|block| {
+            block["type"] == "thinking"
+                && block["thinking"]
+                    .as_str()
+                    .is_some_and(|thinking| thinking.contains("one nested result call"))
+        }));
+        assert_eq!(
+            content[tool_call_index]["arguments"],
+            json!({"result": result_value.clone()})
+        );
+
+        assert_eq!(result.value(), &result_value);
+        let mut expected_canonical = Vec::new();
+        crate::execution::workflow::canonical_json::to_writer(
+            &mut expected_canonical,
+            &result_value,
+        )
+        .unwrap();
+        assert_eq!(result.canonical_json(), expected_canonical);
+        println!(
+            "streamed result outcome=CompletedAgentInvocation::Result provider_arguments_bytes={}",
+            provider_bytes.len()
+        );
+
+        fixture.assert_configuration_unchanged();
+        fixture.controller.shutdown().await;
+    })
+    .await
+    .expect("pinned real-Pi streamed-result conformance watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
 async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
     if conformance_executable().is_none() {
         return;
@@ -1094,13 +1432,7 @@ async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
         }));
         running.await_started().await;
 
-        let RunningRealPi {
-            mut fixture,
-            task,
-            started,
-            terminal,
-        } = running;
-        assert!(started.is_none());
+        let (mut fixture, task, terminal) = running.into_finishing();
         let mut terminal = Box::pin(terminal.receive());
         let corrected = tokio::select! {
             request = fixture.controller.next("model") => request,

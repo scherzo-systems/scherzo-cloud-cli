@@ -120,6 +120,43 @@ struct DevelopmentWorkflow {
     workflow_path: PathBuf,
 }
 
+// RunnerServiceConfiguration is the validated startup projection shared by
+// enrollment and Runner Serve. Secret material remains private to the runner
+// domain and is exposed only to construct the outbound Authorization header.
+pub(crate) struct RunnerServiceConfiguration {
+    pub(super) runner_id: String,
+    pub(super) connection_url: String,
+    pub(super) credential_id: String,
+    pub(super) credential_secret: String,
+    pub(super) pending_credential: Option<PendingCredential>,
+    pub(super) state_access: RunnerStateAccess,
+    pub(super) control_socket_path: PathBuf,
+    pub(super) workflow_id: String,
+    pub(super) workflow_source_root: PathBuf,
+    pub(super) workflow_path: PathBuf,
+    pub(super) work_root: PathBuf,
+}
+
+#[derive(Clone)]
+pub(crate) struct RunnerStateAccess {
+    path: PathBuf,
+    deployment_mode: DeploymentMode,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingCredential {
+    pub(super) runner_id: String,
+    pub(super) connection_url: String,
+    pub(super) credential_id: String,
+    pub(super) credential_secret: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReloadStateError {
+    RegistrationMismatch,
+    StateUpdate,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct EnrollmentJournal {
@@ -184,6 +221,8 @@ struct RunnerState {
     current_credential: StoredRunnerCredential,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_credential: Option<StoredRunnerCredential>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_promotion: Option<CredentialPromotion>,
     updated_at: String,
 }
 
@@ -197,6 +236,14 @@ struct StoredRunnerCredential {
     enrolled_at: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CredentialPromotion {
+    credential_id: String,
+    activation_id: String,
+    promoted_at: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedRunnerState<'a> {
@@ -206,6 +253,8 @@ struct PersistedRunnerState<'a> {
     current_credential: PersistedRunnerCredential<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_credential: Option<PersistedRunnerCredential<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_promotion: Option<&'a CredentialPromotion>,
     updated_at: &'a str,
 }
 
@@ -240,6 +289,7 @@ impl<'a> From<&'a RunnerState> for PersistedRunnerState<'a> {
                 .pending_credential
                 .as_ref()
                 .map(PersistedRunnerCredential::from),
+            last_promotion: state.last_promotion.as_ref(),
             updated_at: &state.updated_at,
         }
     }
@@ -295,9 +345,20 @@ pub(crate) enum EnrollmentOutcome {
         response: EnrollmentResponse,
         replacement: bool,
     },
+    ReplacementCredential {
+        runner_id: String,
+        credential_id: String,
+    },
     Gone {
         activation_id: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementDisposition {
+    Current,
+    Pending,
+    Missing,
 }
 
 pub(crate) fn write_activation_file(
@@ -356,7 +417,7 @@ pub(crate) fn enroll(
     let journal = if resume {
         read_journal(&journal_path)?
     } else {
-        let artifact = read_activation_artifact(
+        let artifact = read_activation_artifact_allow_expired(
             activation_file.ok_or(EnrollmentError::InvalidCommand)?,
             config.deployment_mode,
         )?;
@@ -368,16 +429,40 @@ pub(crate) fn enroll(
                 if state.runner_id != artifact.runner_id {
                     return Err(EnrollmentError::RunnerMismatch);
                 }
-                if state.pending_credential.is_some() {
-                    return Err(EnrollmentError::PendingCredentialExists);
+                let artifact_activation_id = activation_id(&artifact)?;
+                let local_credential = if let Some(pending) = &state.pending_credential {
+                    if pending.activation_id != artifact_activation_id {
+                        return Err(EnrollmentError::PendingCredentialExists);
+                    }
+                    Some(pending)
+                } else if state.last_promotion.as_ref().is_some_and(|promotion| {
+                    promotion.credential_id == state.current_credential.id
+                        && promotion.activation_id == artifact_activation_id
+                }) {
+                    Some(&state.current_credential)
+                } else {
+                    None
+                };
+                if let Some(credential) = local_credential {
+                    require_resolved_journal(&journal_path)?;
+                    let outcome = EnrollmentOutcome::ReplacementCredential {
+                        runner_id: state.runner_id.clone(),
+                        credential_id: credential.id.clone(),
+                    };
+                    drop(lock);
+                    return Ok(outcome);
                 }
             }
             (None, false) => {}
         }
+        require_unexpired_artifact(&artifact)?;
         stage_journal(&journal_path, artifact, replace_credential)?
     };
 
     validate_journal(&journal, config.deployment_mode)?;
+    if journal.replace_credential {
+        validate_replacement_journal_local_state(&state_path, config.deployment_mode, &journal)?;
+    }
 
     let request = EnrollmentRequest {
         schema_version: 1,
@@ -475,6 +560,148 @@ fn send_enrollment(
     Ok(EnrollmentHTTPOutcome::Success(decoded))
 }
 
+pub(crate) fn load_runner_service_configuration(
+    path: &Path,
+) -> Result<RunnerServiceConfiguration, EnrollmentError> {
+    let config = load_operator_config(path)?;
+    let (lock, state) = load_locked_runner_state(&config)?;
+    drop(lock);
+
+    let pending_credential = state
+        .pending_credential
+        .map(|credential| PendingCredential {
+            runner_id: state.runner_id.clone(),
+            connection_url: state.connection_url.clone(),
+            credential_id: credential.id,
+            credential_secret: credential.secret,
+        });
+    Ok(RunnerServiceConfiguration {
+        runner_id: state.runner_id,
+        connection_url: state.connection_url,
+        credential_id: state.current_credential.id,
+        credential_secret: state.current_credential.secret,
+        pending_credential,
+        state_access: RunnerStateAccess {
+            path: config.runner_state_path,
+            deployment_mode: config.deployment_mode,
+        },
+        control_socket_path: config.control_socket_path,
+        workflow_id: config.development_workflow.workflow_id,
+        workflow_source_root: config.development_workflow.source_root,
+        workflow_path: config.development_workflow.workflow_path,
+        work_root: config.work_root,
+    })
+}
+
+pub(crate) fn load_control_socket_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
+    Ok(load_operator_config(path)?.control_socket_path)
+}
+
+pub(crate) fn replacement_disposition(
+    config_path: &Path,
+    expected_runner_id: &str,
+    expected_credential_id: &str,
+) -> Result<ReplacementDisposition, EnrollmentError> {
+    let config = load_operator_config(config_path)?;
+    let (lock, state) = load_locked_runner_state(&config)?;
+    if state.runner_id != expected_runner_id {
+        return Err(EnrollmentError::RunnerMismatch);
+    }
+    let disposition = if state.current_credential.id == expected_credential_id {
+        ReplacementDisposition::Current
+    } else if state
+        .pending_credential
+        .as_ref()
+        .is_some_and(|credential| credential.id == expected_credential_id)
+    {
+        ReplacementDisposition::Pending
+    } else {
+        ReplacementDisposition::Missing
+    };
+    drop(lock);
+    Ok(disposition)
+}
+
+fn load_locked_runner_state(
+    config: &OperatorConfig,
+) -> Result<(StateLock, RunnerState), EnrollmentError> {
+    let state_directory = config
+        .runner_state_path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .ok_or(EnrollmentError::InvalidConfig)?;
+    ensure_private_directory(state_directory)?;
+    let lock = acquire_state_lock(&state_directory.join(LOCK_FILE))?;
+    let state = read_runner_state_if_present(&config.runner_state_path, config.deployment_mode)?
+        .ok_or(EnrollmentError::InvalidState)?;
+    Ok((lock, state))
+}
+
+impl RunnerStateAccess {
+    pub(crate) fn load_pending(
+        &self,
+        expected_runner_id: &str,
+    ) -> Result<Option<PendingCredential>, ReloadStateError> {
+        let directory = self.path.parent().ok_or(ReloadStateError::StateUpdate)?;
+        ensure_private_directory(directory).map_err(|_| ReloadStateError::StateUpdate)?;
+        let lock = acquire_state_lock(&directory.join(LOCK_FILE))
+            .map_err(|_| ReloadStateError::StateUpdate)?;
+        let state = read_runner_state_if_present(&self.path, self.deployment_mode)
+            .map_err(|_| ReloadStateError::StateUpdate)?
+            .ok_or(ReloadStateError::StateUpdate)?;
+        drop(lock);
+        if state.runner_id != expected_runner_id {
+            return Err(ReloadStateError::RegistrationMismatch);
+        }
+        Ok(state
+            .pending_credential
+            .map(|credential| PendingCredential {
+                runner_id: state.runner_id,
+                connection_url: state.connection_url,
+                credential_id: credential.id,
+                credential_secret: credential.secret,
+            }))
+    }
+
+    pub(crate) fn promote(
+        &self,
+        expected_runner_id: &str,
+        expected_current_credential_id: &str,
+        expected_pending_credential_id: &str,
+    ) -> Result<(), ReloadStateError> {
+        let directory = self.path.parent().ok_or(ReloadStateError::StateUpdate)?;
+        ensure_private_directory(directory).map_err(|_| ReloadStateError::StateUpdate)?;
+        let lock = acquire_state_lock(&directory.join(LOCK_FILE))
+            .map_err(|_| ReloadStateError::StateUpdate)?;
+        let mut state = read_runner_state_if_present(&self.path, self.deployment_mode)
+            .map_err(|_| ReloadStateError::StateUpdate)?
+            .ok_or(ReloadStateError::StateUpdate)?;
+        if state.runner_id != expected_runner_id {
+            return Err(ReloadStateError::RegistrationMismatch);
+        }
+        if state.current_credential.id != expected_current_credential_id {
+            return Err(ReloadStateError::StateUpdate);
+        }
+        let pending = state
+            .pending_credential
+            .take()
+            .filter(|credential| credential.id == expected_pending_credential_id)
+            .ok_or(ReloadStateError::StateUpdate)?;
+        let promoted_at = now_rfc3339().map_err(|_| ReloadStateError::StateUpdate)?;
+        state.last_promotion = Some(CredentialPromotion {
+            credential_id: pending.id.clone(),
+            activation_id: pending.activation_id.clone(),
+            promoted_at: promoted_at.clone(),
+        });
+        state.current_credential = pending;
+        state.updated_at = promoted_at;
+        atomic_write_json(&self.path, &PersistedRunnerState::from(&state))
+            .map_err(|_| ReloadStateError::StateUpdate)?;
+        drop(lock);
+        Ok(())
+    }
+}
+
 fn load_operator_config(path: &Path) -> Result<OperatorConfig, EnrollmentError> {
     let bytes = read_bounded_regular_file(path, CONFIG_LIMIT, false)
         .map_err(|_| EnrollmentError::InvalidConfig)?;
@@ -508,7 +735,17 @@ fn load_operator_config(path: &Path) -> Result<OperatorConfig, EnrollmentError> 
     Ok(config)
 }
 
+#[cfg(test)]
 fn read_activation_artifact(
+    path: &Path,
+    mode: DeploymentMode,
+) -> Result<ActivationArtifact, EnrollmentError> {
+    let artifact = read_activation_artifact_allow_expired(path, mode)?;
+    require_unexpired_artifact(&artifact)?;
+    Ok(artifact)
+}
+
+fn read_activation_artifact_allow_expired(
     path: &Path,
     mode: DeploymentMode,
 ) -> Result<ActivationArtifact, EnrollmentError> {
@@ -529,12 +766,16 @@ fn read_activation_artifact(
     }
     let artifact = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::InvalidArtifact)?;
     validate_artifact(&artifact, mode)?;
+    Ok(artifact)
+}
+
+fn require_unexpired_artifact(artifact: &ActivationArtifact) -> Result<(), EnrollmentError> {
     if parse_rfc3339(&artifact.expires_at)
         .is_none_or(|expires_at| expires_at <= crate::timing::utc_now())
     {
         return Err(EnrollmentError::ExpiredArtifact);
     }
-    Ok(artifact)
+    Ok(())
 }
 
 fn validate_artifact(
@@ -677,13 +918,7 @@ fn stage_journal(
     artifact: ActivationArtifact,
     replace_credential: bool,
 ) -> Result<EnrollmentJournal, EnrollmentError> {
-    if let Some(bytes) = read_private_file_if_present(path, STATE_LIMIT)? {
-        let receipt = serde_json::from_slice::<TerminalReceipt>(&bytes)
-            .map_err(|_| EnrollmentError::UnresolvedJournal)?;
-        if !valid_terminal_receipt(&receipt) {
-            return Err(EnrollmentError::UnresolvedJournal);
-        }
-    }
+    require_resolved_journal(path)?;
     let mut secret_bytes = [0_u8; 32];
     getrandom::fill(&mut secret_bytes).map_err(|_| EnrollmentError::EntropyUnavailable)?;
     let credential_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret_bytes);
@@ -702,6 +937,17 @@ fn stage_journal(
     };
     atomic_write_json(path, &PersistedEnrollmentJournal::from(&journal))?;
     Ok(journal)
+}
+
+fn require_resolved_journal(path: &Path) -> Result<(), EnrollmentError> {
+    if let Some(bytes) = read_private_file_if_present(path, STATE_LIMIT)? {
+        let receipt = serde_json::from_slice::<TerminalReceipt>(&bytes)
+            .map_err(|_| EnrollmentError::UnresolvedJournal)?;
+        if !valid_terminal_receipt(&receipt) {
+            return Err(EnrollmentError::UnresolvedJournal);
+        }
+    }
+    Ok(())
 }
 
 fn read_journal(path: &Path) -> Result<EnrollmentJournal, EnrollmentError> {
@@ -729,6 +975,32 @@ fn validate_journal(
         || parse_rfc3339(&journal.staged_at).is_none()
     {
         return Err(EnrollmentError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn validate_replacement_journal_local_state(
+    path: &Path,
+    mode: DeploymentMode,
+    journal: &EnrollmentJournal,
+) -> Result<(), EnrollmentError> {
+    let state = read_runner_state_if_present(path, mode)?
+        .ok_or(EnrollmentError::ReplacementStateMissing)?;
+    if state.runner_id != journal.activation_artifact.runner_id {
+        return Err(EnrollmentError::RunnerMismatch);
+    }
+    let activation_id = activation_id(&journal.activation_artifact)?;
+    let staged = state.pending_credential.as_ref().or_else(|| {
+        state
+            .last_promotion
+            .as_ref()
+            .filter(|promotion| promotion.activation_id == activation_id)
+            .map(|_| &state.current_credential)
+    });
+    if staged.is_some_and(|credential| {
+        credential.activation_id != activation_id || credential.secret != journal.credential_secret
+    }) {
+        return Err(EnrollmentError::PendingCredentialExists);
     }
     Ok(())
 }
@@ -777,6 +1049,7 @@ fn persist_enrollment_state(
             connection_url: response.connection_url.clone(),
             current_credential: credential,
             pending_credential: None,
+            last_promotion: None,
             updated_at: enrolled_at,
         }
     };
@@ -793,7 +1066,16 @@ fn enrollment_already_persisted(
         return false;
     }
     let persisted = if journal.replace_credential {
-        state.pending_credential.as_ref()
+        state.pending_credential.as_ref().or_else(|| {
+            state
+                .last_promotion
+                .as_ref()
+                .filter(|promotion| {
+                    promotion.credential_id == response.credential_id
+                        && promotion.activation_id == activation_id
+                })
+                .map(|_| &state.current_credential)
+        })
     } else if state.pending_credential.is_none() {
         Some(&state.current_credential)
     } else {
@@ -822,6 +1104,11 @@ fn read_runner_state_if_present(
         || !valid_stored_credential(&state.current_credential)
         || state.pending_credential.as_ref().is_some_and(|credential| {
             !valid_stored_credential(credential) || credential.id == state.current_credential.id
+        })
+        || state.last_promotion.as_ref().is_some_and(|promotion| {
+            promotion.credential_id != state.current_credential.id
+                || promotion.activation_id != state.current_credential.activation_id
+                || parse_rfc3339(&promotion.promoted_at).is_none()
         })
         || parse_rfc3339(&state.updated_at).is_none()
     {

@@ -6,7 +6,6 @@ import {
   createResultTool,
   decodeFrame,
   encodeFrame,
-  resultDigest,
   type PiJsonV1ExtensionConfig,
   type ValidatePiResultV1Request,
 } from "../fixtures/generated/pi-json-v1-extension.ts";
@@ -44,6 +43,7 @@ type ToolCallGate = (
   },
   context: { sessionManager: { getBranch(): readonly unknown[] } },
 ) => unknown;
+type CompactionGate = () => unknown;
 interface RegisteredResultTool {
   name: string;
   execute(
@@ -58,13 +58,20 @@ interface RegisteredResultTool {
 function loadResultExtension(
   config: PiJsonV1ExtensionConfig,
   validate: ResultValidator,
-): { gate: ToolCallGate; tool: RegisteredResultTool } {
+): {
+  gate: ToolCallGate;
+  compact: CompactionGate;
+  tool: RegisteredResultTool;
+} {
   let gate: ToolCallGate | undefined;
+  let compact: CompactionGate | undefined;
   let tool: RegisteredResultTool | undefined;
   const pi = {
     on(eventName: string, handler: unknown) {
       if (eventName === "tool_call") {
         gate = handler as ToolCallGate;
+      } else if (eventName === "session_before_compact") {
+        compact = handler as CompactionGate;
       }
     },
     registerTool(registeredTool: unknown) {
@@ -74,8 +81,9 @@ function loadResultExtension(
 
   createPiJsonV1Extension(config, validate)(pi);
   assert.ok(gate !== undefined);
+  assert.ok(compact !== undefined);
   assert.ok(tool !== undefined);
-  return { gate, tool };
+  return { gate, compact, tool };
 }
 
 function branchContext(messages: readonly Record<string, unknown>[]): {
@@ -109,7 +117,6 @@ test("a valid fixed payload produces a terminating tool result", async () => {
       capturedRequest = request;
       return { kind: "Valid" };
     },
-    () => ({ result: fixedPayload }),
   );
 
   const result = await tool.execute(
@@ -130,14 +137,10 @@ test("a valid fixed payload produces a terminating tool result", async () => {
 });
 
 test("validator feedback is returned as a tool error", async () => {
-  const tool = createResultTool(
-    fixedConfig,
-    async () => ({
-      kind: "Rejected",
-      feedback: "The fixed payload does not satisfy the retained schema.",
-    }),
-    () => ({ result: fixedPayload }),
-  );
+  const tool = createResultTool(fixedConfig, async () => ({
+    kind: "Rejected",
+    feedback: "The fixed payload does not satisfy the retained schema.",
+  }));
 
   await assert.rejects(
     tool.execute(
@@ -153,52 +156,72 @@ test("validator feedback is returned as a tool error", async () => {
   );
 });
 
-test("validation sends the assistant's uncoerced candidate to Rust", async () => {
-  const config: PiJsonV1ExtensionConfig = {
-    ...fixedConfig,
-    toolName: "scherzo_result_coercion_fixed",
-    parameters: {
-      type: "object",
-      properties: { result: { type: "number" } },
-      required: ["result"],
-      additionalProperties: false,
-    },
-  };
-  const assistantArguments = { result: "42" };
-  const piCoercedArguments = { result: 42 };
+test("validation forwards Pi's registered-tool arguments unchanged", async () => {
+  const assistantArguments = { result: fixedPayload };
   let capturedRequest: ValidatePiResultV1Request | undefined;
   const { gate, tool } = loadResultExtension(
-    config,
+    fixedConfig,
     async (_socketPath, request) => {
       capturedRequest = request;
       return { kind: "Valid" };
     },
   );
-  const toolCallId = "tool-call-coercion-fixed";
+  const toolCallId = "tool-call-unchanged-fixed";
 
   assert.equal(
     gate(
       {
         toolCallId,
-        toolName: config.toolName,
-        input: piCoercedArguments,
+        toolName: fixedConfig.toolName,
+        input: assistantArguments,
       },
       toolCallContext([
         {
           type: "toolCall",
           id: toolCallId,
-          name: config.toolName,
+          name: fixedConfig.toolName,
           arguments: assistantArguments,
         },
       ]),
     ),
     undefined,
   );
-  await tool.execute(toolCallId, piCoercedArguments, undefined, undefined, {
+  await tool.execute(toolCallId, assistantArguments, undefined, undefined, {
     abort() {},
   });
 
   assert.deepEqual(capturedRequest?.arguments, assistantArguments);
+});
+
+test("compaction remains available until one result is accepted", async () => {
+  let decision: "Rejected" | "Valid" = "Rejected";
+  const { compact, tool } = loadResultExtension(fixedConfig, async () =>
+    decision === "Valid"
+      ? { kind: "Valid" }
+      : { kind: "Rejected", feedback: "Correct the result." },
+  );
+
+  assert.equal(compact(), undefined);
+  await assert.rejects(
+    tool.execute(
+      "tool-call-rejected-fixed",
+      { result: fixedPayload },
+      undefined,
+      undefined,
+      resultToolContext(() => assert.fail("rejection must not abort Pi")),
+    ),
+  );
+  assert.equal(compact(), undefined);
+
+  decision = "Valid";
+  await tool.execute(
+    "tool-call-accepted-fixed",
+    { result: fixedPayload },
+    undefined,
+    undefined,
+    resultToolContext(() => assert.fail("acceptance must not abort Pi")),
+  );
+  assert.deepEqual(compact(), { cancel: true });
 });
 
 test("a sibling result is blocked without affecting ordinary work or correction", async () => {
@@ -375,13 +398,9 @@ test("reused call identities and ambiguous argument objects are blocked", () => 
 
 test("a validator transport failure aborts Pi instead of becoming recoverable", async () => {
   let aborted = false;
-  const tool = createResultTool(
-    fixedConfig,
-    async () => {
-      throw new Error("The validation socket closed unexpectedly.");
-    },
-    () => ({ result: fixedPayload }),
-  );
+  const tool = createResultTool(fixedConfig, async () => {
+    throw new Error("The validation socket closed unexpectedly.");
+  });
 
   await assert.rejects(
     tool.execute(
@@ -438,41 +457,6 @@ test("a fatal validator response aborts Pi before surfacing the failure", async 
   );
 
   assert.equal(aborted, true);
-});
-
-test("missing assistant correlation aborts before validation", async () => {
-  let aborted = false;
-  let validated = false;
-  const tool = createResultTool(
-    fixedConfig,
-    async () => {
-      validated = true;
-      return { kind: "Valid" };
-    },
-    () => undefined,
-  );
-
-  await assert.rejects(
-    tool.execute(
-      "tool-call-missing-fixed",
-      { result: fixedPayload },
-      undefined,
-      undefined,
-      resultToolContext(() => {
-        aborted = true;
-      }),
-    ),
-  );
-
-  assert.equal(aborted, true);
-  assert.equal(validated, false);
-});
-
-test("result digests order object keys by UTF-8 bytes", () => {
-  assert.equal(
-    resultDigest({ result: { "\u{1f600}": 1, "\u{ff21}": 2 } }),
-    "839d53c4925bd46f7f2c9ef02954387ae076eb5e74b6c889e26ed568b018a62e",
-  );
 });
 
 test("protocol framing preserves a fixed request payload", () => {

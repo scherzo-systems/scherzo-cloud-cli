@@ -10,12 +10,14 @@ use serde_json::{Map, Value, json};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentLifecycleMilestone,
     AgentObservation, AgentOutcome, AgentToolCallPhase, AgentValueKind, BoundedAgentResponse,
-    CompletedAgentInvocation, tool_call_observation,
+    BoundedSchemaValidAgentResult, CompletedAgentInvocation, tool_call_observation,
 };
 use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const PERMISSION_MODE: &str = "bypassPermissions";
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
+pub(crate) const RESULT_ENVELOPE_SCHEMA: &str = r#"{"type":"object","required":["result"],"properties":{"result":{}},"additionalProperties":true}"#;
 
 pub(crate) const FIXED_INVOCATION_ENVIRONMENT: [(&str, &str); 5] = [
     ("DISABLE_UPDATES", "1"),
@@ -85,19 +87,44 @@ pub(crate) fn normal_mode_arguments(
     .into()
 }
 
-pub(crate) fn initial_user_text_frame(message: &str) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn result_mode_arguments(
+    model: &str,
+    effort: &str,
+    system_prompt_file: &Path,
+) -> Vec<OsString> {
+    let mut arguments = normal_mode_arguments(model, effort, system_prompt_file);
+    arguments.extend([
+        OsString::from("--json-schema"),
+        OsString::from(RESULT_ENVELOPE_SCHEMA),
+    ]);
+    arguments
+}
+
+pub(crate) fn user_content_frame(content: Vec<Value>) -> Result<Vec<u8>, serde_json::Error> {
     let mut frame = serde_json::to_vec(&json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": [{
-                "type": "text",
-                "text": message,
-            }],
+            "content": content,
         },
     }))?;
     frame.push(b'\n');
     Ok(frame)
+}
+
+pub(crate) fn initial_user_text_frame(message: &str) -> Result<Vec<u8>, serde_json::Error> {
+    user_content_frame(vec![json!({
+        "type": "text",
+        "text": message,
+    })])
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CompletedResultExchange {
+    Candidate(Arc<Value>),
+    AmbiguousCandidate,
+    MissingCandidate,
+    NativeFailure,
 }
 
 pub(crate) struct ClaudeCodeStreamJsonV1Parser {
@@ -113,6 +140,10 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     completed_exchanges: u64,
     active_message: Option<StreamedMessage>,
     final_main_message: Option<CompletedMainMessage>,
+    exchange_structured_output_candidates: u64,
+    completed_result_exchange: Option<CompletedResultExchange>,
+    result_decision_pending: bool,
+    accepted_result: Option<BoundedSchemaValidAgentResult>,
     native_failure: Option<AgentHarnessFailureDetail>,
     retry_active: bool,
     observations: Vec<AgentObservation>,
@@ -155,6 +186,10 @@ impl ClaudeCodeStreamJsonV1Parser {
             completed_exchanges: 0,
             active_message: None,
             final_main_message: None,
+            exchange_structured_output_candidates: 0,
+            completed_result_exchange: None,
+            result_decision_pending: false,
+            accepted_result: None,
             native_failure: None,
             retry_active: false,
             observations: Vec::new(),
@@ -172,6 +207,38 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.completed_exchanges
     }
 
+    pub(crate) fn take_completed_result_exchange(&mut self) -> Option<CompletedResultExchange> {
+        self.completed_result_exchange.take()
+    }
+
+    pub(crate) fn reject_result_candidate(&mut self) -> Result<(), AgentFailureCause> {
+        if self.value_kind != AgentValueKind::Result
+            || !self.result_decision_pending
+            || self.accepted_result.is_some()
+        {
+            return self.fail_protocol();
+        }
+        self.result_decision_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn accept_result(
+        &mut self,
+        result: BoundedSchemaValidAgentResult,
+    ) -> Result<(), AgentFailureCause> {
+        if self.value_kind != AgentValueKind::Result
+            || !self.result_decision_pending
+            || self.accepted_result.is_some()
+            || self.exchange_active
+            || self.exchange_initialized
+        {
+            return self.fail_protocol();
+        }
+        self.result_decision_pending = false;
+        self.accepted_result = Some(result);
+        Ok(())
+    }
+
     /// Begins the next serialized user exchange after the preceding result was rejected.
     /// The same process and session remain authoritative for the invocation.
     pub(crate) fn begin_exchange(&mut self) -> Result<(), AgentFailureCause> {
@@ -182,11 +249,15 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.exchange_active
             || self.exchange_initialized
             || self.active_message.is_some()
+            || self.completed_result_exchange.is_some()
+            || self.result_decision_pending
+            || self.accepted_result.is_some()
         {
             return self.fail_protocol();
         }
         self.exchange_active = true;
         self.final_main_message = None;
+        self.exchange_structured_output_candidates = 0;
         self.native_failure = None;
         Ok(())
     }
@@ -243,6 +314,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         if self.exchange_active
             || self.exchange_initialized
             || self.active_message.is_some()
+            || self.completed_result_exchange.is_some()
+            || self.result_decision_pending
             || self.completed_exchanges == 0
         {
             return failed(AgentFailureCause::HarnessProtocolFailed);
@@ -269,7 +342,10 @@ impl ClaudeCodeStreamJsonV1Parser {
                     BoundedAgentResponse::from_bounded(Arc::from(message.response)),
                 ))
             }
-            AgentValueKind::Result => failed(AgentFailureCause::MissingResult),
+            AgentValueKind::Result => self.accepted_result.map_or_else(
+                || failed(AgentFailureCause::MissingResult),
+                |result| AgentOutcome::Completed(CompletedAgentInvocation::Result(result)),
+            ),
         }
     }
 
@@ -440,17 +516,18 @@ impl ClaudeCodeStreamJsonV1Parser {
         {
             return Err(self.protocol_failure());
         }
-        if self.retry_active {
-            self.retry_active = false;
-            self.observations
-                .push(lifecycle(AgentLifecycleMilestone::RetryCompleted));
-        }
+        self.complete_retry();
         self.active_message = Some(StreamedMessage {
             id: Arc::from(id),
             parent_tool_use_id: parent_tool_use_id.map(Arc::from),
             next_index: 0,
             active_block: None,
+            completed_blocks: 0,
             text_blocks: 0,
+            structured_output_candidates: Vec::new(),
+            structured_output_call_ids: Vec::new(),
+            structured_output_acknowledgements: 0,
+            successful_structured_output_acknowledgements: 0,
             response: String::new(),
             input_tokens,
             output_tokens,
@@ -676,20 +753,48 @@ impl ClaudeCodeStreamJsonV1Parser {
         event: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
         let index = required_u64(event, "index").ok_or_else(|| self.protocol_failure())?;
+        let failure = self.protocol_failure();
         let Some(message) = self.active_message.as_mut() else {
-            return Err(self.protocol_failure());
+            return Err(failure);
         };
         if index != message.next_index {
-            return Err(self.protocol_failure());
+            return Err(failure.clone());
         }
         let Some(block) = message.active_block.take() else {
-            return Err(self.protocol_failure());
+            return Err(failure.clone());
         };
         let Some(next_index) = message.next_index.checked_add(1) else {
             return Err(AgentFailureCause::HarnessProtocolFailed);
         };
+        let Some(completed_blocks) = message.completed_blocks.checked_add(1) else {
+            return Err(AgentFailureCause::HarnessProtocolFailed);
+        };
         message.next_index = next_index;
-        if let ActiveContentBlock::ToolUse { call_id, name, .. } = block {
+        message.completed_blocks = completed_blocks;
+        if let ActiveContentBlock::ToolUse {
+            call_id,
+            name,
+            initial_input,
+            input_json,
+            input_delta_seen,
+            ..
+        } = block
+        {
+            if name.as_ref() == STRUCTURED_OUTPUT_TOOL_NAME {
+                let candidate = if input_delta_seen {
+                    serde_json::from_str::<Value>(&input_json).map_err(|_| failure.clone())?
+                } else {
+                    initial_input
+                };
+                message.structured_output_candidates.push(candidate);
+                message
+                    .structured_output_call_ids
+                    .push(Arc::clone(&call_id));
+                self.exchange_structured_output_candidates = self
+                    .exchange_structured_output_candidates
+                    .checked_add(1)
+                    .ok_or_else(|| failure.clone())?;
+            }
             self.observations.push(AgentObservation::ToolCall {
                 call_id,
                 name,
@@ -748,7 +853,12 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         if message.parent_tool_use_id.is_none() {
             self.final_main_message = Some(CompletedMainMessage {
+                completed_blocks: message.completed_blocks,
                 text_blocks: message.text_blocks,
+                structured_output_candidates: message.structured_output_candidates,
+                structured_output_acknowledgements: message.structured_output_acknowledgements,
+                successful_structured_output_acknowledgements: message
+                    .successful_structured_output_acknowledgements,
                 response: message.response,
             });
         }
@@ -793,8 +903,30 @@ impl ClaudeCodeStreamJsonV1Parser {
         let content = required_array(message, "content").ok_or_else(|| self.protocol_failure())?;
         if required_string(message, "type") != Some("message")
             || required_string(message, "role") != Some("assistant")
-            || required_string(message, "model") != Some(self.expected_model.as_ref())
         {
+            return Err(self.protocol_failure());
+        }
+        if parent.is_none() && required_bool(object, "is_api_error_message") == Some(true) {
+            let [block] = content else {
+                return Err(self.protocol_failure());
+            };
+            let block = block.as_object().ok_or_else(|| self.protocol_failure())?;
+            let diagnostic = required_nonempty_string(block, "text")
+                .filter(|_| required_string(block, "type") == Some("text"))
+                .ok_or_else(|| self.protocol_failure())?;
+            if self.active_message.is_some()
+                || required_nonempty_string(object, "error").is_none()
+                || required_nonempty_string(object, "request_id").is_none()
+            {
+                return Err(self.protocol_failure());
+            }
+            self.observations.push(AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Error,
+                message: Arc::from(diagnostic),
+            });
+            return Ok(());
+        }
+        if required_string(message, "model") != Some(self.expected_model.as_ref()) {
             return Err(self.protocol_failure());
         }
 
@@ -887,12 +1019,39 @@ impl ClaudeCodeStreamJsonV1Parser {
             }
             let call_id = required_nonempty_string(block, "tool_use_id")
                 .ok_or_else(|| self.protocol_failure())?;
-            let is_error =
-                required_bool(block, "is_error").ok_or_else(|| self.protocol_failure())?;
             let result = block
                 .get("content")
                 .and_then(normalized_tool_result_content)
                 .ok_or_else(|| self.protocol_failure())?;
+            let acknowledges_structured_output =
+                self.active_message.as_ref().is_some_and(|message| {
+                    message
+                        .structured_output_call_ids
+                        .iter()
+                        .any(|expected| expected.as_ref() == call_id)
+                });
+            let omitted_structured_output_success = acknowledges_structured_output
+                && result == "Structured output provided successfully"
+                && required_string(object, "tool_use_result") == Some(result.as_str());
+            let is_error = required_bool(block, "is_error")
+                .or_else(|| omitted_structured_output_success.then_some(false))
+                .ok_or_else(|| self.protocol_failure())?;
+            if acknowledges_structured_output {
+                let message = self
+                    .active_message
+                    .as_mut()
+                    .ok_or(AgentFailureCause::HarnessProtocolFailed)?;
+                message.structured_output_acknowledgements = message
+                    .structured_output_acknowledgements
+                    .checked_add(1)
+                    .ok_or(AgentFailureCause::HarnessProtocolFailed)?;
+                if !is_error {
+                    message.successful_structured_output_acknowledgements = message
+                        .successful_structured_output_acknowledgements
+                        .checked_add(1)
+                        .ok_or(AgentFailureCause::HarnessProtocolFailed)?;
+                }
+            }
             self.observations.push(AgentObservation::ToolResult {
                 call_id: Arc::from(call_id),
                 is_error,
@@ -970,7 +1129,12 @@ impl ClaudeCodeStreamJsonV1Parser {
     }
 
     fn parse_result(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if !self.exchange_initialized || self.active_message.is_some() {
+        if !self.exchange_initialized
+            || self.active_message.is_some()
+            || self.completed_result_exchange.is_some()
+            || self.result_decision_pending
+            || self.accepted_result.is_some()
+        {
             return Err(self.protocol_failure());
         }
         self.require_matching_session(object)?;
@@ -979,23 +1143,38 @@ impl ClaudeCodeStreamJsonV1Parser {
         let is_error = required_bool(object, "is_error").ok_or_else(|| self.protocol_failure())?;
         let terminal_reason = required_nonempty_string(object, "terminal_reason")
             .ok_or_else(|| self.protocol_failure())?;
-        if !is_error {
+        let successful = !is_error;
+        if successful {
             if subtype != "success"
                 || terminal_reason != "completed"
                 || required_string(object, "result").is_none()
             {
                 return Err(self.protocol_failure());
             }
-        } else if subtype == "success" {
-            return Err(self.protocol_failure());
         } else {
+            if terminal_reason == "completed" {
+                return Err(self.protocol_failure());
+            }
             self.native_failure = Some(AgentHarnessFailureDetail::ModelError);
         }
-        if self.retry_active {
-            self.retry_active = false;
-            self.observations
-                .push(lifecycle(AgentLifecycleMilestone::RetryCompleted));
+
+        let completes_harness = self.value_kind != AgentValueKind::Result;
+        if !completes_harness {
+            self.completed_result_exchange = Some(if successful {
+                self.extract_result_candidate(object)
+            } else {
+                CompletedResultExchange::NativeFailure
+            });
+            self.result_decision_pending = successful
+                && !matches!(
+                    self.completed_result_exchange,
+                    Some(CompletedResultExchange::MissingCandidate)
+                );
+        } else if object.contains_key("structured_output") {
+            return Err(self.protocol_failure());
         }
+
+        self.complete_retry();
         self.exchange_initialized = false;
         self.exchange_active = false;
         self.completed_exchanges = self
@@ -1004,9 +1183,44 @@ impl ClaudeCodeStreamJsonV1Parser {
             .ok_or_else(|| self.protocol_failure())?;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
-        self.observations
-            .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
+        if completes_harness {
+            self.observations
+                .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
+        }
         Ok(())
+    }
+
+    fn extract_result_candidate(&self, object: &Map<String, Value>) -> CompletedResultExchange {
+        let Some(structured_output) = object.get("structured_output") else {
+            return CompletedResultExchange::MissingCandidate;
+        };
+        let Some(envelope) = structured_output.as_object() else {
+            return CompletedResultExchange::AmbiguousCandidate;
+        };
+        let Some(candidate) = envelope.get("result") else {
+            return CompletedResultExchange::AmbiguousCandidate;
+        };
+        let Some(message) = self.final_main_message.as_ref() else {
+            return CompletedResultExchange::AmbiguousCandidate;
+        };
+        if self.exchange_structured_output_candidates != 1
+            || message.completed_blocks != 1
+            || message.structured_output_candidates.len() != 1
+            || message.structured_output_candidates.first() != Some(structured_output)
+            || message.structured_output_acknowledgements != 1
+            || message.successful_structured_output_acknowledgements != 1
+        {
+            return CompletedResultExchange::AmbiguousCandidate;
+        }
+        CompletedResultExchange::Candidate(Arc::new(candidate.clone()))
+    }
+
+    fn complete_retry(&mut self) {
+        if self.retry_active {
+            self.retry_active = false;
+            self.observations
+                .push(lifecycle(AgentLifecycleMilestone::RetryCompleted));
+        }
     }
 
     fn require_matching_session(
@@ -1032,6 +1246,9 @@ impl ClaudeCodeStreamJsonV1Parser {
     fn invalidate_values(&mut self) {
         self.active_message = None;
         self.final_main_message = None;
+        self.completed_result_exchange = None;
+        self.result_decision_pending = false;
+        self.accepted_result = None;
     }
 
     // Claude initialization, rather than Pi's session-plus-agent-start sequence, owns the
@@ -1059,7 +1276,12 @@ struct StreamedMessage {
     parent_tool_use_id: Option<Arc<str>>,
     next_index: u64,
     active_block: Option<ActiveContentBlock>,
+    completed_blocks: u64,
     text_blocks: u64,
+    structured_output_candidates: Vec<Value>,
+    structured_output_call_ids: Vec<Arc<str>>,
+    structured_output_acknowledgements: u64,
+    successful_structured_output_acknowledgements: u64,
     response: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -1150,7 +1372,11 @@ impl ActiveContentBlock {
 }
 
 struct CompletedMainMessage {
+    completed_blocks: u64,
     text_blocks: u64,
+    structured_output_candidates: Vec<Value>,
+    structured_output_acknowledgements: u64,
+    successful_structured_output_acknowledgements: u64,
     response: String,
 }
 

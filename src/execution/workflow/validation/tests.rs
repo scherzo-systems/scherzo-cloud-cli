@@ -1,9 +1,13 @@
+use super::super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::super::decode;
-use super::super::document::{FailurePolicy, HarnessDefinition, Output, Step, ValueReference};
+use super::super::document::{
+    FailurePolicy, FinalizationTrigger, HarnessDefinition, NodeBody, Output, ValueReference,
+};
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
     ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueSource, ValidatedHarness,
-    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
+    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowNode,
+    WorkflowNodeRole, WorkflowValueType,
 };
 use super::{ValidationFailureKind, ValidationLocation};
 
@@ -163,11 +167,10 @@ fn dependency_graph_failures_are_classified_at_owned_locations() {
         .as_bytes(),
     )
     .unwrap();
-    let Step::Command(consumer) = duplicate.steps.get_mut("consumer").unwrap() else {
-        panic!("consumer must be a command step");
-    };
-    consumer
-        .common
+    duplicate
+        .steps
+        .get_mut("consumer")
+        .unwrap()
         .control_dependencies
         .push("producer".to_owned());
     let duplicate_failure = super::validate(duplicate).unwrap_err();
@@ -371,6 +374,40 @@ steps:
         &ValidationLocation::AgentProfile {
             profile: "unused".to_owned(),
         }
+    );
+}
+
+#[test]
+fn claude_code_profiles_resolve_without_installation_or_model_lookup() {
+    let source = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: claude_code
+      config:
+        model: future-claude-model
+        effort: xhigh
+steps:
+  agent:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+";
+
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
+        panic!("agent must be an agent step");
+    };
+    assert_eq!(
+        agent.agent.harness,
+        ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+            model: "future-claude-model".to_owned(),
+            effort: ClaudeCodeEffort::XHigh,
+        })
     );
 }
 
@@ -793,7 +830,10 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "responseProducer".to_owned(),
+                    node: WorkflowNode {
+                        id: "responseProducer".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                    },
                     output: "response".to_owned(),
                     value_type: WorkflowValueType::Text,
                 }),
@@ -810,7 +850,10 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "resultProducer".to_owned(),
+                    node: WorkflowNode {
+                        id: "resultProducer".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                    },
                     output: "result".to_owned(),
                     value_type: WorkflowValueType::Json,
                 }),
@@ -818,7 +861,10 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "responseProducer".to_owned(),
+                    node: WorkflowNode {
+                        id: "responseProducer".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                    },
                     output: "file".to_owned(),
                     value_type: WorkflowValueType::File,
                 }),
@@ -854,7 +900,8 @@ exports:
         ("result", "resultProducer", WorkflowValueType::Json),
         ("file", "responseProducer", WorkflowValueType::File),
     ] {
-        assert_eq!(workflow.exports[name].step, step);
+        assert_eq!(workflow.exports[name].node.id, step);
+        assert_eq!(workflow.exports[name].node.role, WorkflowNodeRole::Step);
         assert_eq!(workflow.exports[name].output, name);
         assert_eq!(workflow.exports[name].value_type, expected_type);
     }
@@ -959,7 +1006,8 @@ fn output_kind_and_agent_cardinality_rules_are_enforced() {
     let mut command =
         decode(b"schemaVersion: 1\nsteps: {command: {kind: cmd, command: {argv: [\"true\"]}}}\n")
             .unwrap();
-    let Step::Command(command_step) = command.steps.get_mut("command").unwrap() else {
+    let NodeBody::Command(command_step) = &mut command.steps.get_mut("command").unwrap().body
+    else {
         panic!("command must be a command step");
     };
     command_step
@@ -1069,7 +1117,7 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     let mut document =
         decode(b"schemaVersion: 1\nsteps: {command: {kind: cmd, command: {argv: [\"true\"]}}}\n")
             .unwrap();
-    let Step::Command(command) = document.steps.get_mut("command").unwrap() else {
+    let NodeBody::Command(command) = &mut document.steps.get_mut("command").unwrap().body else {
         panic!("command must be a command step");
     };
     command.inputs.insert(
@@ -1086,5 +1134,455 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     assert_eq!(
         command.inputs["prompt"].source,
         ResolvedValueSource::Import(WorkflowImport::Prompt)
+    );
+}
+
+#[test]
+fn combined_node_limit_and_shared_namespace_are_enforced_before_validation() {
+    fn workflow_with_counts(step_count: usize, finalizer_count: usize) -> String {
+        let mut source = String::from("schemaVersion: 1\nsteps:\n");
+        for index in 0..step_count {
+            source.push_str(&command_step(&format!("s{index}"), ""));
+        }
+        source.push_str("finalizers:\n");
+        for index in 0..finalizer_count {
+            source.push_str(&format!(
+                "  f{index}:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+            ));
+        }
+        source
+    }
+
+    let accepted = validate_yaml(&workflow_with_counts(128, 128)).unwrap();
+    assert_eq!(accepted.steps.len() + accepted.finalizers.len(), 256);
+
+    let too_many = validate_yaml(&workflow_with_counts(128, 129)).unwrap_err();
+    assert_eq!(too_many.kind(), ValidationFailureKind::TooManyNodes);
+    assert_eq!(too_many.location(), &ValidationLocation::WorkflowNamespace);
+
+    assert_failure(
+        "schemaVersion: 1
+steps:
+  shared:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  shared:
+    kind: cmd
+    command: { argv: [\"true\"] }
+",
+        ValidationFailureKind::DuplicateNodeId,
+        ValidationLocation::WorkflowNamespace,
+    );
+
+    let mut duplicate_step_order = decode(workflow_with_counts(2, 1).as_bytes()).unwrap();
+    duplicate_step_order.step_order[1] = duplicate_step_order.step_order[0].clone();
+    assert_eq!(
+        super::validate(duplicate_step_order).unwrap_err().kind(),
+        ValidationFailureKind::InvalidSourceOrder
+    );
+
+    let mut duplicate_finalizer_order = decode(workflow_with_counts(1, 2).as_bytes()).unwrap();
+    duplicate_finalizer_order.finalizer_order[1] =
+        duplicate_finalizer_order.finalizer_order[0].clone();
+    assert_eq!(
+        super::validate(duplicate_finalizer_order)
+            .unwrap_err()
+            .kind(),
+        ValidationFailureKind::InvalidSourceOrder
+    );
+}
+
+#[test]
+fn valid_finalizers_resolve_separate_role_aware_graphs() {
+    let source = "schemaVersion: 1
+steps:
+  later:
+    kind: cmd
+    dependsOn: [producer]
+    command: { argv: [\"true\"] }
+  producer:
+    kind: cmd
+    command: { argv: [\"true\"] }
+    outputs:
+      value:
+        kind: file
+        path: value.json
+        mediaType: application/json
+finalizers:
+  report:
+    kind: cmd
+    after: [cleanup]
+    when: [succeeded]
+    inputs:
+      result:
+        ref: outputs.cleanup.result
+      context:
+        ref: finalization.context
+    command: { argv: [\"true\"] }
+  cleanup:
+    kind: cmd
+    inputs:
+      value:
+        ref: outputs.producer.value
+    command: { argv: [\"true\"] }
+    outputs:
+      result:
+        kind: file
+        path: result.json
+        mediaType: application/json
+exports:
+  report:
+    ref: outputs.report.result
+";
+    let source = source.replace(
+        "    command: { argv: [\"true\"] }\n  cleanup:",
+        "    command: { argv: [\"true\"] }\n    outputs:\n      result:\n        kind: file\n        path: report.json\n        mediaType: application/json\n  cleanup:",
+    );
+    let workflow = validate_yaml(&source).unwrap();
+
+    assert_eq!(workflow.source_order, ["later", "producer"]);
+    assert_eq!(workflow.presentation_order, ["producer", "later"]);
+    assert_eq!(workflow.finalizer_source_order, ["report", "cleanup"]);
+    assert_eq!(workflow.finalizer_presentation_order, ["cleanup", "report"]);
+    let report = &workflow.finalizers["report"];
+    assert_eq!(
+        report.when,
+        [FinalizationTrigger::Succeeded].into_iter().collect()
+    );
+    let ValidatedStep::Command(report) = &report.body else {
+        panic!("report must be a command finalizer");
+    };
+    assert_eq!(
+        prerequisite_shape(&report.common.prerequisites),
+        [("cleanup", true, true)]
+    );
+    assert_eq!(
+        report.inputs["context"],
+        super::super::validated::ResolvedValueReference {
+            source: ResolvedValueSource::FinalizationContext,
+            value_type: WorkflowValueType::Json,
+        }
+    );
+    let ValidatedStep::Command(cleanup) = &workflow.finalizers["cleanup"].body else {
+        panic!("cleanup must be a command finalizer");
+    };
+    assert!(cleanup.common.prerequisites.is_empty());
+    assert_eq!(
+        workflow.exports["report"].node.role,
+        WorkflowNodeRole::Finalizer
+    );
+    assert_eq!(workflow.exports["report"].node.id, "report");
+}
+
+#[test]
+fn finalizer_graph_rejects_cross_phase_edges_self_edges_duplicates_and_cycles() {
+    let after_step = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  cleanup:
+    kind: cmd
+    after: [work]
+    command: { argv: [\"true\"] }
+";
+    assert_failure(
+        after_step,
+        ValidationFailureKind::InvalidFinalizerAfterTarget,
+        ValidationLocation::FinalizerAfter {
+            finalizer: "cleanup".to_owned(),
+            index: 0,
+        },
+    );
+
+    let self_edge = after_step.replace("after: [work]", "after: [cleanup]");
+    assert_failure(
+        &self_edge,
+        ValidationFailureKind::SelfDependency,
+        ValidationLocation::FinalizerAfter {
+            finalizer: "cleanup".to_owned(),
+            index: 0,
+        },
+    );
+
+    let mut duplicate = decode(
+        after_step
+            .replace("after: [work]", "")
+            .replace(
+                "  cleanup:\n",
+                "  before:\n    kind: cmd\n    command: { argv: [\"true\"] }\n  cleanup:\n",
+            )
+            .as_bytes(),
+    )
+    .unwrap();
+    duplicate.finalizers.get_mut("cleanup").unwrap().after =
+        vec!["before".to_owned(), "before".to_owned()];
+    assert_eq!(
+        super::validate(duplicate).unwrap_err().kind(),
+        ValidationFailureKind::DuplicateDependency
+    );
+
+    let control_cycle = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  one:
+    kind: cmd
+    after: [two]
+    command: { argv: [\"true\"] }
+  two:
+    kind: cmd
+    after: [one]
+    command: { argv: [\"true\"] }
+";
+    assert_failure(
+        control_cycle,
+        ValidationFailureKind::DependencyCycle,
+        ValidationLocation::WorkflowGraph,
+    );
+
+    let data_cycle = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  one:
+    kind: cmd
+    inputs: { value: { ref: outputs.two.value } }
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: one.txt, mediaType: text/plain }
+  two:
+    kind: cmd
+    inputs: { value: { ref: outputs.one.value } }
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: two.txt, mediaType: text/plain }
+";
+    assert_failure(
+        data_cycle,
+        ValidationFailureKind::DependencyCycle,
+        ValidationLocation::WorkflowGraph,
+    );
+}
+
+#[test]
+fn output_references_obey_phase_trigger_and_failure_impact_rules() {
+    let ordinary_reads_finalizer = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    inputs: { value: { ref: outputs.cleanup.value } }
+    command: { argv: [\"true\"] }
+finalizers:
+  cleanup:
+    kind: cmd
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: value.txt, mediaType: text/plain }
+";
+    assert_failure(
+        ordinary_reads_finalizer,
+        ValidationFailureKind::CrossPhaseOutputReference,
+        ValidationLocation::StepInput {
+            step: "work".to_owned(),
+            input: "value".to_owned(),
+        },
+    );
+
+    let incompatible_trigger = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  produce:
+    kind: cmd
+    when: [succeeded]
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: value.txt, mediaType: text/plain }
+  consume:
+    kind: cmd
+    inputs: { value: { ref: outputs.produce.value } }
+    command: { argv: [\"true\"] }
+";
+    assert_failure(
+        incompatible_trigger,
+        ValidationFailureKind::IncompatibleFinalizerTriggers,
+        ValidationLocation::FinalizerInput {
+            finalizer: "consume".to_owned(),
+            input: "value".to_owned(),
+        },
+    );
+
+    let advisory_ordinary = "schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    failurePolicy: advisory
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: value.txt, mediaType: text/plain }
+finalizers:
+  consume:
+    kind: cmd
+    inputs: { value: { ref: outputs.produce.value } }
+    command: { argv: [\"true\"] }
+";
+    assert_failure(
+        advisory_ordinary,
+        ValidationFailureKind::AdvisoryDataDependency,
+        ValidationLocation::FinalizerInput {
+            finalizer: "consume".to_owned(),
+            input: "value".to_owned(),
+        },
+    );
+
+    let advisory_finalizer = incompatible_trigger
+        .replace("    when: [succeeded]\n", "    failurePolicy: advisory\n")
+        .replace(
+            "  consume:\n    kind: cmd\n",
+            "  consume:\n    kind: cmd\n    when: [succeeded]\n",
+        );
+    assert_failure(
+        &advisory_finalizer,
+        ValidationFailureKind::AdvisoryDataDependency,
+        ValidationLocation::FinalizerInput {
+            finalizer: "consume".to_owned(),
+            input: "value".to_owned(),
+        },
+    );
+
+    let control_only = advisory_finalizer.replace(
+        "    inputs: { value: { ref: outputs.produce.value } }\n",
+        "    after: [produce]\n",
+    );
+    validate_yaml(&control_only).unwrap();
+}
+
+#[test]
+fn finalizer_exports_require_required_success_eligibility() {
+    let base = "schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  report:
+    kind: cmd
+    POLICY
+    when: [TRIGGER]
+    command: { argv: [\"true\"] }
+    outputs:
+      value: { kind: file, path: value.txt, mediaType: text/plain }
+exports:
+  value: { ref: outputs.report.value }
+";
+    assert_failure(
+        &base
+            .replace("POLICY", "failurePolicy: advisory")
+            .replace("TRIGGER", "succeeded"),
+        ValidationFailureKind::AdvisoryExportTarget,
+        ValidationLocation::Export {
+            name: "value".to_owned(),
+        },
+    );
+    assert_failure(
+        &base
+            .replace("POLICY", "failurePolicy: required")
+            .replace("TRIGGER", "failed"),
+        ValidationFailureKind::FinalizerExportTrigger,
+        ValidationLocation::Export {
+            name: "value".to_owned(),
+        },
+    );
+    let accepted = base
+        .replace("POLICY", "failurePolicy: required")
+        .replace("TRIGGER", "succeeded");
+    assert_eq!(
+        validate_yaml(&accepted).unwrap().exports["value"].node.role,
+        WorkflowNodeRole::Finalizer
+    );
+}
+
+#[test]
+fn finalization_context_is_json_and_only_valid_in_declared_finalizer_positions() {
+    let source = "schemaVersion: 1
+agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config: { model: openai/gpt-5, thinking: high }
+steps:
+  work:
+    kind: cmd
+    command: { argv: [\"true\"] }
+finalizers:
+  command:
+    kind: cmd
+    inputs: { context: { ref: finalization.context } }
+    command: { argv: [\"true\"] }
+  agent:
+    kind: agent
+    agent:
+      profile: reporting
+      systemPrompt: system.md
+      message:
+        text: [{ file: message.md }]
+        attachments: [{ ref: finalization.context }]
+";
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Command(command) = &workflow.finalizers["command"].body else {
+        panic!("command must remain a command finalizer");
+    };
+    assert_eq!(
+        command.inputs["context"].value_type,
+        WorkflowValueType::Json
+    );
+    assert_eq!(
+        command.inputs["context"].source,
+        ResolvedValueSource::FinalizationContext
+    );
+    let ValidatedStep::Agent(agent) = &workflow.finalizers["agent"].body else {
+        panic!("agent must remain an agent finalizer");
+    };
+    assert_eq!(
+        agent.agent.message.attachments[0],
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::FinalizationContext,
+            value_type: WorkflowValueType::Json,
+        }
+    );
+
+    let mut ordinary = decode(
+        b"schemaVersion: 1\nsteps: { work: { kind: cmd, command: { argv: [\"true\"] } } }\n",
+    )
+    .unwrap();
+    let NodeBody::Command(work) = &mut ordinary.steps.get_mut("work").unwrap().body else {
+        panic!("work must be a command step");
+    };
+    work.inputs
+        .insert("context".to_owned(), ValueReference::FinalizationContext);
+    assert_eq!(
+        super::validate(ordinary).unwrap_err().kind(),
+        ValidationFailureKind::InvalidFinalizationContext
+    );
+
+    let mut finalizer_text = decode(source.as_bytes()).unwrap();
+    let NodeBody::Agent(agent) = &mut finalizer_text.finalizers.get_mut("agent").unwrap().body
+    else {
+        panic!("agent must be an agent finalizer");
+    };
+    agent.agent.message.text[0] =
+        super::super::document::MessageSource::Reference(ValueReference::FinalizationContext);
+    assert_eq!(
+        super::validate(finalizer_text).unwrap_err().kind(),
+        ValidationFailureKind::InvalidFinalizationContext
     );
 }

@@ -444,6 +444,10 @@ impl ExportSpanProcessor {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the span processor owns the production export-control deadline"
+    )]
     fn send_control(
         &self,
         message: impl FnOnce(SyncSender<OTelSdkResult>) -> ProcessorMessage,
@@ -781,6 +785,10 @@ mod tests {
     }
 
     impl OtlpReceiver {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "wall time only prevents the external socket fixture from busy-spinning"
+        )]
         fn start(status: &'static str) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind OTLP receiver");
             listener
@@ -1119,6 +1127,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the test fixture's export-start readiness message"
+    )]
     fn stalled_export_has_bounded_shutdown() {
         let (recorder, capture, export_started, release) = stalled_recorder(EXPORT_QUEUE_CAPACITY);
         recorder
@@ -1137,6 +1149,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the test fixture's export-start readiness messages"
+    )]
     fn saturated_export_queue_drops_without_blocking_runner_events() {
         let (recorder, capture, export_started, release) = stalled_recorder(1);
         recorder

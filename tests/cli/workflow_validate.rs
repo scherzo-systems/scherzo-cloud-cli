@@ -210,6 +210,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
     assert!(stdout.contains("steps: 3"));
+    assert!(stdout.contains("finalizers: 0"));
     assert!(stdout.contains("optional imports: prompt"));
     assert!(human.stderr.is_empty());
     assert_static_contents_absent(&human);
@@ -233,11 +234,78 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
     assert_eq!(report["stepCount"], 3);
+    assert_eq!(report["finalizerCount"], 0);
     assert_eq!(report["requiredImports"], serde_json::json!(["prompt"]));
     assert!(report.get("diagnostics").is_none());
     assert!(json.stdout.ends_with(b"\n"));
     assert!(json.stderr.is_empty());
     assert_static_contents_absent(&json);
+}
+
+#[test]
+fn valid_finalizers_are_resolved_without_execution() {
+    let bundle = WorkflowBundle::valid();
+    let source = fs::read_to_string(bundle.workflow_path()).expect("workflow should be readable");
+    bundle.replace_workflow(&source.replace(
+        "exports:\n",
+        "finalizers:\n  cleanup:\n    kind: cmd\n    inputs:\n      result: { ref: outputs.agent.result }\n      context: { ref: finalization.context }\n    command:\n      argv: [\"true\"]\nexports:\n",
+    ));
+
+    let human = validate(&bundle, false);
+    assert!(human.status.success());
+    let stdout = String::from_utf8(human.stdout).expect("human output should be UTF-8");
+    assert!(stdout.contains("steps: 3"));
+    assert!(stdout.contains("finalizers: 1"));
+
+    let json = validate(&bundle, true);
+    assert!(json.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("validation output should be JSON");
+    assert_eq!(report["stepCount"], 3);
+    assert_eq!(report["finalizerCount"], 1);
+}
+
+#[test]
+fn finalizer_diagnostics_preserve_the_node_role() {
+    let bundle = WorkflowBundle::valid();
+    let workflow = |profile: &str, system_prompt: &str| {
+        format!(
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config: {{ model: openai/gpt-5, thinking: high }}\nsteps:\n  work:\n    kind: cmd\n    command: {{ argv: [\"true\"] }}\nfinalizers:\n  report:\n    kind: agent\n    agent:\n      profile: {profile}\n      systemPrompt: {system_prompt}\n      message:\n        text: [{{ file: ../prompts/message.md }}]\n"
+        )
+    };
+
+    let actual_roles = [
+        (
+            workflow("missing", "../prompts/system.md"),
+            "unknown_agent_profile",
+        ),
+        (
+            workflow("coding", "../prompts/missing-finalizer-system.md"),
+            "source_unavailable",
+        ),
+    ]
+    .map(|(source, expected_code)| {
+        bundle.replace_workflow(&source);
+        let output = validate(&bundle, true);
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let diagnostic = &report["diagnostics"][0];
+        assert_eq!(diagnostic["code"], expected_code);
+        (
+            diagnostic["location"]["finalizer"]
+                .as_str()
+                .map(str::to_owned),
+            diagnostic["location"]["step"].as_str().map(str::to_owned),
+        )
+    });
+
+    assert_eq!(
+        actual_roles,
+        [
+            (Some("report".to_owned()), None),
+            (Some("report".to_owned()), None)
+        ]
+    );
 }
 
 #[test]
@@ -323,6 +391,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         assert_eq!(diagnostics[0]["location"]["kind"], expected_location);
         assert!(report.get("digest").is_none());
         assert!(report.get("stepCount").is_none());
+        assert!(report.get("finalizerCount").is_none());
         assert!(report.get("requiredImports").is_none());
         assert!(json.stdout.len() < 2048);
         assert!(json.stdout.ends_with(b"\n"));

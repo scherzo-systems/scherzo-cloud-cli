@@ -1,0 +1,12 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  cleanup:
+    kind: cmd
+    when: []
+    command:
+      argv: ["true"]

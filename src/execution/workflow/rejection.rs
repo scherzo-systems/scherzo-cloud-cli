@@ -8,6 +8,10 @@ use super::admission::{AdmissionFailure, AdmissionFailureKind, AdmissionLocation
 use super::presentation_feed::normalize_terminal_scalar;
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolutionLocation};
 use super::validation::{ValidationFailureKind, ValidationLocation};
+use crate::execution::AgentHarnessInstallationFailure;
+use crate::execution::claude_code::{
+    ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
+};
 use crate::execution::pi::{PiIncompatibility, PiInstallationFailure, PiProbe};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -36,13 +40,24 @@ impl<'a> RejectionDiagnostic<'a> {
         })
     }
 
-    pub(crate) fn from_pi_installation(failure: &PiInstallationFailure) -> Self {
-        let (code, message) = pi_installation_classification(failure);
+    pub(crate) fn from_agent_harness_installation(
+        failure: &AgentHarnessInstallationFailure,
+    ) -> Self {
+        let (code, message, profile) = match failure {
+            AgentHarnessInstallationFailure::Pi(failure) => {
+                let (code, message) = pi_installation_classification(failure);
+                (code, message, "PiJsonV1")
+            }
+            AgentHarnessInstallationFailure::ClaudeCode(failure) => {
+                let (code, message) = claude_code_installation_classification(failure);
+                (code, message, "ClaudeCodeStreamJsonV1")
+            }
+        };
         Self {
             code,
             message,
             location: RejectionLocation {
-                profile: Some("PiJsonV1"),
+                profile: Some(profile),
                 ..RejectionLocation::simple("agent_harness")
             },
         }
@@ -55,6 +70,8 @@ pub(crate) struct RejectionLocation<'a> {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     step: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finalizer: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +89,7 @@ impl<'a> RejectionLocation<'a> {
         Self {
             kind,
             step: None,
+            finalizer: None,
             index: None,
             input: None,
             output: None,
@@ -83,6 +101,13 @@ impl<'a> RejectionLocation<'a> {
     fn for_step(kind: &'static str, step: &'a str) -> Self {
         Self {
             step: Some(step),
+            ..Self::simple(kind)
+        }
+    }
+
+    fn for_finalizer(kind: &'static str, finalizer: &'a str) -> Self {
+        Self {
+            finalizer: Some(finalizer),
             ..Self::simple(kind)
         }
     }
@@ -105,6 +130,21 @@ impl<'a> RejectionLocation<'a> {
                 output: Some(output),
                 ..Self::for_step("result_schema", step)
             },
+            ResolutionLocation::FinalizerSystemPrompt { finalizer } => {
+                Self::for_finalizer("system_prompt", finalizer)
+            }
+            ResolutionLocation::FinalizerMessageText { finalizer, index } => Self {
+                index: Some(*index),
+                ..Self::for_finalizer("message_text", finalizer)
+            },
+            ResolutionLocation::FinalizerMessageAttachment { finalizer, index } => Self {
+                index: Some(*index),
+                ..Self::for_finalizer("message_attachment", finalizer)
+            },
+            ResolutionLocation::FinalizerResultSchema { finalizer, output } => Self {
+                output: Some(output),
+                ..Self::for_finalizer("result_schema", finalizer)
+            },
             ResolutionLocation::ContentDigest => Self::simple("content_digest"),
         }
     }
@@ -112,12 +152,16 @@ impl<'a> RejectionLocation<'a> {
     fn from_validation(location: &'a ValidationLocation) -> Self {
         match location {
             ValidationLocation::WorkflowGraph => Self::simple("workflow_graph"),
+            ValidationLocation::WorkflowNamespace => Self::simple("workflow_namespace"),
             ValidationLocation::AgentProfile { profile } => Self {
                 profile: Some(profile),
                 ..Self::simple("agent_profile")
             },
             ValidationLocation::AgentProfileReference { step } => {
                 Self::for_step("agent_profile_reference", step)
+            }
+            ValidationLocation::FinalizerAgentProfileReference { finalizer } => {
+                Self::for_finalizer("agent_profile_reference", finalizer)
             }
             ValidationLocation::StepDependency { step, index } => Self {
                 index: Some(*index),
@@ -139,6 +183,26 @@ impl<'a> RejectionLocation<'a> {
                 output: Some(output),
                 ..Self::for_step("step_output", step)
             },
+            ValidationLocation::FinalizerAfter { finalizer, index } => Self {
+                index: Some(*index),
+                ..Self::for_finalizer("finalizer_after", finalizer)
+            },
+            ValidationLocation::FinalizerInput { finalizer, input } => Self {
+                input: Some(input),
+                ..Self::for_finalizer("finalizer_input", finalizer)
+            },
+            ValidationLocation::FinalizerMessageText { finalizer, index } => Self {
+                index: Some(*index),
+                ..Self::for_finalizer("finalizer_message_text", finalizer)
+            },
+            ValidationLocation::FinalizerMessageAttachment { finalizer, index } => Self {
+                index: Some(*index),
+                ..Self::for_finalizer("finalizer_message_attachment", finalizer)
+            },
+            ValidationLocation::FinalizerOutput { finalizer, output } => Self {
+                output: Some(output),
+                ..Self::for_finalizer("finalizer_output", finalizer)
+            },
             ValidationLocation::Export { name } => Self {
                 export: Some(name),
                 ..Self::simple("export")
@@ -148,6 +212,7 @@ impl<'a> RejectionLocation<'a> {
 
     fn from_admission(location: &'a AdmissionLocation) -> Option<Self> {
         match location {
+            AdmissionLocation::Workflow => Some(Self::simple("workflow")),
             AdmissionLocation::PromptImport => Some(Self::simple("prompt_import")),
             AdmissionLocation::AttachmentImport { index } => Some(Self {
                 index: Some(*index),
@@ -173,21 +238,29 @@ impl<'a> RejectionLocation<'a> {
     }
 }
 
+impl RejectionLocation<'_> {
+    fn write_node(&self, formatter: &mut fmt::Formatter<'_>, role: &str, id: &str) -> fmt::Result {
+        write!(formatter, " ({role} {id}")?;
+        if let Some(index) = self.index {
+            write!(formatter, ", index {index}")?;
+        }
+        if let Some(input) = self.input {
+            write!(formatter, ", input {input}")?;
+        }
+        if let Some(output) = self.output {
+            write!(formatter, ", output {output}")?;
+        }
+        formatter.write_str(")")
+    }
+}
+
 impl fmt::Display for RejectionLocation<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.kind)?;
         if let Some(step) = self.step {
-            write!(formatter, " (step {step}")?;
-            if let Some(index) = self.index {
-                write!(formatter, ", index {index}")?;
-            }
-            if let Some(input) = self.input {
-                write!(formatter, ", input {input}")?;
-            }
-            if let Some(output) = self.output {
-                write!(formatter, ", output {output}")?;
-            }
-            formatter.write_str(")")?;
+            self.write_node(formatter, "step", step)?;
+        } else if let Some(finalizer) = self.finalizer {
+            self.write_node(formatter, "finalizer", finalizer)?;
         } else if let Some(index) = self.index {
             write!(formatter, " (index {index})")?;
         } else if let Some(profile) = self.profile {
@@ -320,7 +393,7 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::InvalidAgentProfileConfig => (
             "invalid_agent_profile_config",
-            "Correct the agent profile's Pi configuration.",
+            "Correct the agent profile's harness configuration.",
         ),
         ValidationFailureKind::UnknownAgentProfile => (
             "unknown_agent_profile",
@@ -372,7 +445,43 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::AdvisoryExportTarget => (
             "advisory_export_target",
-            "Export an output from a required step.",
+            "Export an output from a required workflow node.",
+        ),
+        ValidationFailureKind::TooManyNodes => (
+            "too_many_workflow_nodes",
+            "Reduce the combined number of steps and finalizers to 256.",
+        ),
+        ValidationFailureKind::DuplicateNodeId => (
+            "duplicate_workflow_node_id",
+            "Give every step and finalizer a globally unique ID.",
+        ),
+        ValidationFailureKind::InvalidSourceOrder => (
+            "invalid_workflow_source_order",
+            "Declare every workflow node exactly once.",
+        ),
+        ValidationFailureKind::CrossPhaseOutputReference => (
+            "cross_phase_output_reference",
+            "Ordinary steps cannot reference finalizer outputs.",
+        ),
+        ValidationFailureKind::InvalidFinalizerAfterTarget => (
+            "invalid_finalizer_after_target",
+            "Reference only declared finalizers from after.",
+        ),
+        ValidationFailureKind::InvalidFinalizerTrigger => (
+            "invalid_finalizer_trigger",
+            "Select at least one finalization trigger.",
+        ),
+        ValidationFailureKind::IncompatibleFinalizerTriggers => (
+            "incompatible_finalizer_triggers",
+            "Make the consumer trigger set a subset of its output producer's trigger set.",
+        ),
+        ValidationFailureKind::InvalidFinalizationContext => (
+            "invalid_finalization_context",
+            "Reference finalization.context only from a finalizer command input or agent attachment.",
+        ),
+        ValidationFailureKind::FinalizerExportTrigger => (
+            "finalizer_export_trigger",
+            "Export from a required finalizer that is eligible after ordinary success.",
         ),
     }
 }
@@ -406,8 +515,43 @@ fn pi_installation_classification(failure: &PiInstallationFailure) -> (&'static 
     }
 }
 
+fn claude_code_installation_classification(
+    failure: &ClaudeCodeInstallationFailure,
+) -> (&'static str, &'static str) {
+    match failure {
+        ClaudeCodeInstallationFailure::Missing => (
+            "missing_claude_code_installation",
+            "Install the exact supported `claude` executable in the inherited PATH.",
+        ),
+        ClaudeCodeInstallationFailure::Unexecutable => (
+            "unexecutable_claude_code_installation",
+            "The selected `claude` executable could not complete its validation probes.",
+        ),
+        ClaudeCodeInstallationFailure::Malformed(ClaudeCodeProbe::Version) => (
+            "malformed_claude_code_version",
+            "The selected `claude` executable returned a malformed version.",
+        ),
+        ClaudeCodeInstallationFailure::Malformed(ClaudeCodeProbe::Capabilities) => (
+            "malformed_claude_code_capabilities",
+            "The selected `claude` executable returned malformed capability help.",
+        ),
+        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Version(_)) => (
+            "unsupported_claude_code_version",
+            "The selected `claude` version is not the exact ClaudeCodeStreamJsonV1 release.",
+        ),
+        ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability(_)) => (
+            "unsupported_claude_code_capability",
+            "The selected `claude` executable lacks a capability required by ClaudeCodeStreamJsonV1.",
+        ),
+    }
+}
+
 fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str, &'static str)> {
     match kind {
+        AdmissionFailureKind::WorkflowFinalizersUnsupported => Some((
+            "workflow_finalizers_execution_unsupported",
+            "Validate this workflow now, but wait for finalizer execution support before running it.",
+        )),
         AdmissionFailureKind::MissingRequiredPrompt => Some((
             "missing_required_prompt",
             "Supply --prompt-file because this workflow requires imports.prompt.",
@@ -418,7 +562,7 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         )),
         AdmissionFailureKind::AgentStepRuntimeUnsupported => Some((
             "agent_step_runtime_unsupported",
-            "Use a command-only workflow with this runtime.",
+            "Supply the validated installation required by this agent step.",
         )),
         AdmissionFailureKind::ExecutionRootUnavailable => Some((
             "execution_root_unavailable",

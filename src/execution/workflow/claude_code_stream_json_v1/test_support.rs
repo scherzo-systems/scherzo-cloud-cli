@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::FIXED_INVOCATION_ENVIRONMENT;
+use super::adapter::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
 use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
 use crate::execution::workflow::admission::EnvironmentSnapshot;
 use crate::execution::workflow::agent::{
@@ -30,6 +31,9 @@ const PLACEHOLDER_API_KEY: &str = "scherzo-loopback-placeholder";
 #[derive(Clone, Copy)]
 pub(super) struct PendingClock;
 
+// Exact-binary profiles keep independent clocks because their process probes coexist with
+// different native validation and settlement channels.
+// jscpd:ignore-start
 impl CoordinatorClock for PendingClock {
     type Instant = Duration;
 
@@ -37,10 +41,16 @@ impl CoordinatorClock for PendingClock {
         Duration::ZERO
     }
 
-    async fn wait_until(&self, _deadline: Self::Instant) {
-        pending().await
+    async fn wait_until(&self, deadline: Self::Instant) {
+        if deadline == PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
+            let probe = tokio::spawn(async {});
+            let _ = probe.await;
+        } else {
+            pending().await
+        }
     }
 }
+// jscpd:ignore-end
 
 #[derive(Clone, Default)]
 pub(super) struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
@@ -209,11 +219,41 @@ impl ControlledProviderRequest {
             .send(LoopbackProviderResponse::Text(text.to_owned()))
             .unwrap();
     }
+
+    pub(super) fn release_structured_output(mut self, envelope: Value) {
+        self.response
+            .take()
+            .unwrap()
+            .send(LoopbackProviderResponse::StructuredOutput(envelope))
+            .unwrap();
+    }
+
+    pub(super) fn release_tool_use(mut self, name: &str, input: Value) {
+        self.response
+            .take()
+            .unwrap()
+            .send(LoopbackProviderResponse::ToolUse {
+                name: name.to_owned(),
+                input,
+            })
+            .unwrap();
+    }
+
+    pub(super) fn release_invalid_request(mut self) {
+        self.response
+            .take()
+            .unwrap()
+            .send(LoopbackProviderResponse::InvalidRequest)
+            .unwrap();
+    }
 }
 
 #[derive(Debug)]
 enum LoopbackProviderResponse {
     Text(String),
+    StructuredOutput(Value),
+    ToolUse { name: String, input: Value },
+    InvalidRequest,
 }
 
 pub(super) struct LoopbackProvider {
@@ -304,9 +344,24 @@ async fn serve_connection(
         return;
     };
     // jscpd:ignore-end
-    let payload = response_payload(response);
+    let (status, content_type, payload) = match response {
+        LoopbackProviderResponse::InvalidRequest => (
+            "400 Bad Request",
+            "application/json",
+            serde_json::to_vec(&json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "synthetic provider rejection",
+                },
+                "request_id": "req_scherzo_loopback",
+            }))
+            .unwrap(),
+        ),
+        response => ("200 OK", "text/event-stream", response_payload(response)),
+    };
     let header = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: no-cache\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
         payload.len()
     );
     if stream.write_all(header.as_bytes()).await.is_err() {
@@ -394,29 +449,29 @@ fn find_subslice(bytes: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
-    let LoopbackProviderResponse::Text(text) = response;
-    let events = [
-        (
-            "message_start",
-            json!({
-                "type": "message_start",
-                "message": {
-                    "id": "msg_scherzo_loopback",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": "scherzo-loopback",
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": 1,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
-                },
-            }),
-        ),
+    let events = match response {
+        LoopbackProviderResponse::Text(text) => text_response_events(text),
+        LoopbackProviderResponse::StructuredOutput(envelope) => {
+            structured_output_response_events(envelope)
+        }
+        LoopbackProviderResponse::ToolUse { name, input } => tool_use_response_events(name, input),
+        LoopbackProviderResponse::InvalidRequest => {
+            unreachable!("invalid requests use a non-SSE response")
+        }
+    };
+
+    let mut payload = Vec::new();
+    for (name, event) in events {
+        payload.extend_from_slice(format!("event: {name}\ndata: ").as_bytes());
+        serde_json::to_writer(&mut payload, &event).unwrap();
+        payload.extend_from_slice(b"\n\n");
+    }
+    payload
+}
+
+fn text_response_events(text: String) -> Vec<(&'static str, Value)> {
+    let mut events = vec![
+        message_start_event("msg_scherzo_loopback"),
         (
             "content_block_start",
             json!({
@@ -433,6 +488,74 @@ fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
                 "delta": {"type": "text_delta", "text": text},
             }),
         ),
+    ];
+    events.extend(terminal_response_events("end_turn"));
+    events
+}
+
+fn structured_output_response_events(envelope: Value) -> Vec<(&'static str, Value)> {
+    tool_use_response_events("StructuredOutput".to_owned(), envelope)
+}
+
+fn tool_use_response_events(name: String, input: Value) -> Vec<(&'static str, Value)> {
+    let partial_json = serde_json::to_string(&input).unwrap();
+    let mut events = vec![
+        message_start_event("msg_scherzo_tool_use"),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool_scherzo_loopback",
+                    "name": name,
+                    "input": {},
+                },
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial_json,
+                },
+            }),
+        ),
+    ];
+    events.extend(terminal_response_events("tool_use"));
+    events
+}
+
+fn message_start_event(message_id: &str) -> (&'static str, Value) {
+    (
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "scherzo-loopback",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        }),
+    )
+}
+
+fn terminal_response_events(stop_reason: &str) -> [(&'static str, Value); 3] {
+    [
         (
             "content_block_stop",
             json!({"type": "content_block_stop", "index": 0}),
@@ -441,20 +564,12 @@ fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
             "message_delta",
             json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                 "usage": {"output_tokens": 3},
             }),
         ),
         ("message_stop", json!({"type": "message_stop"})),
-    ];
-
-    let mut payload = Vec::new();
-    for (name, event) in events {
-        payload.extend_from_slice(format!("event: {name}\ndata: ").as_bytes());
-        serde_json::to_writer(&mut payload, &event).unwrap();
-        payload.extend_from_slice(b"\n\n");
-    }
-    payload
+    ]
 }
 
 pub(super) fn version_probe_environment(root: &Path) -> [(OsString, OsString); 2] {

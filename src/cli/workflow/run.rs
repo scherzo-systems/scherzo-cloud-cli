@@ -16,7 +16,9 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use time::OffsetDateTime;
 use tokio::io::unix::AsyncFd;
 
-use crate::execution::pi::{PiInstallationFailure, discover_and_validate_pi_installation};
+use crate::execution::AgentHarnessInstallationFailure;
+use crate::execution::claude_code::discover_and_validate_claude_code_installation;
+use crate::execution::pi::discover_and_validate_pi_installation;
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
@@ -24,10 +26,9 @@ use crate::execution::workflow::admission::{
     ResolvedAttachment, ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
-use crate::execution::workflow::agent::dispatch::ClosedAgentDispatcher;
+use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
 use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::ArtifactStaging;
-use crate::execution::workflow::claude_code_stream_json_v1::adapter::ClaudeCodeStreamJsonV1Adapter;
 use crate::execution::workflow::coordinator::CoordinationError;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
@@ -38,7 +39,6 @@ use crate::execution::workflow::local_run::{
     PublicationFailurePhaseV1,
 };
 use crate::execution::workflow::observation::{ExecutionObservation, ExecutionObserver};
-use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
 use crate::execution::workflow::presentation::{
     ColorChoice, PresentationConfig, PresentationFailure, PresentationFailureOperation,
     PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
@@ -170,7 +170,7 @@ impl Command {
             Err(failure) => {
                 signal_task.abort();
                 return rejection_output(presentation_config, |output| {
-                    output.render_pi_installation_rejection(&workflow, &failure)
+                    output.render_agent_harness_installation_rejection(&workflow, &failure)
                 });
             }
         };
@@ -461,30 +461,21 @@ pub(super) async fn execute_owned_attempt(
     let diagnostics = StepDiagnosticLog::default();
     let agents = match (&agent_staging, agent_diagnostic_sessions) {
         (Some(staging), Some(diagnostic_sessions)) => {
-            let pi_adapter = match PiJsonV1Adapter::new(
+            let maximum_log_bytes = admitted.execution().limits().maximum_step_log_bytes();
+            let Ok(dispatcher) = production_agent_dispatcher(
                 diagnostics.clone(),
-                admitted.execution().limits().maximum_step_log_bytes(),
+                maximum_log_bytes,
                 SystemExecutionClock,
                 observer.clone(),
-            ) {
-                Ok(adapter) => adapter,
-                Err(_) => {
-                    signal_task.abort();
-                    settle_before_execution_failure(&owned_run);
-                    let cleanup_failed =
-                        release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                    record_private_cleanup_failure(&owned_run, cleanup_failed);
-                    host.stop_terminal().await;
-                    return diagnose("prepare local PiJsonV1 runtime");
-                }
+            ) else {
+                signal_task.abort();
+                settle_before_execution_failure(&owned_run);
+                let cleanup_failed =
+                    release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                record_private_cleanup_failure(&owned_run, cleanup_failed);
+                host.stop_terminal().await;
+                return diagnose("prepare local agent runtimes");
             };
-            let claude_code_adapter = ClaudeCodeStreamJsonV1Adapter::new(
-                diagnostics.clone(),
-                admitted.execution().limits().maximum_step_log_bytes(),
-                SystemExecutionClock,
-                observer.clone(),
-            );
-            let dispatcher = ClosedAgentDispatcher::new(pi_adapter, claude_code_adapter);
             AgentExecution::enabled(
                 WorkflowRunId::from(Arc::from(run_directory.as_str())),
                 staging.clone(),
@@ -686,7 +677,7 @@ pub(super) fn execution_context_for_workflow(
     root: PathBuf,
     maximum_parallel_steps: usize,
     cancellation: CancellationSource,
-) -> Result<ExecutionContext, PiInstallationFailure> {
+) -> Result<ExecutionContext, AgentHarnessInstallationFailure> {
     let environment = EnvironmentSnapshot::new(env::vars_os());
     let mut context = ExecutionContext::new(
         root,
@@ -698,17 +689,35 @@ pub(super) fn execution_context_for_workflow(
     if workflow.requires_git_capture() {
         context = context.with_local_git_capture();
     }
-    if workflow.definition.steps.values().any(|step| {
-        matches!(
-            step,
-            crate::execution::workflow::validated::ValidatedStep::Agent(_)
-        )
-    }) {
-        let installation = discover_and_validate_pi_installation()?;
-        Ok(context.with_pi_installation(installation))
-    } else {
-        Ok(context)
+
+    let mut pi_validated = false;
+    let mut claude_code_validated = false;
+    for step_name in &workflow.definition.source_order {
+        let Some(crate::execution::workflow::validated::ValidatedStep::Agent(step)) =
+            workflow.definition.steps.get(step_name)
+        else {
+            continue;
+        };
+        match &step.agent.harness {
+            crate::execution::workflow::validated::ValidatedHarness::Pi(_) if !pi_validated => {
+                let installation = discover_and_validate_pi_installation()
+                    .map_err(AgentHarnessInstallationFailure::Pi)?;
+                context = context.with_pi_installation(installation);
+                pi_validated = true;
+            }
+            crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_)
+                if !claude_code_validated =>
+            {
+                let installation = discover_and_validate_claude_code_installation()
+                    .map_err(AgentHarnessInstallationFailure::ClaudeCode)?;
+                context = context.with_claude_code_installation(installation);
+                claude_code_validated = true;
+            }
+            crate::execution::workflow::validated::ValidatedHarness::Pi(_)
+            | crate::execution::workflow::validated::ValidatedHarness::ClaudeCode(_) => {}
+        }
     }
+    Ok(context)
 }
 
 async fn acquire_imports(

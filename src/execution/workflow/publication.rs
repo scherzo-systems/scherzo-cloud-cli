@@ -873,7 +873,7 @@ fn publish_prepared_with_observer(
             .export_sources
             .get(name)
             .ok_or_else(invalid_run_result)?;
-        let identity = (source.step.clone(), source.output.clone());
+        let identity = (source.node.id.clone(), source.output.clone());
         let metadata = match export {
             ExportValue::Available { output } => {
                 if !captured_type_matches(source.value_type, output) {

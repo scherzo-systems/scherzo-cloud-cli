@@ -8,6 +8,7 @@ const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
 const OTHER_ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abd";
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
+const REPLACEMENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abd";
 const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[test]
@@ -159,6 +160,13 @@ fn successful_enrollment_commits_protected_state_without_transmitting_credential
     assert_eq!(state.current_credential.id, CREDENTIAL_ID);
     assert!(valid_secret(&state.current_credential.secret));
 
+    let service = load_runner_service_configuration(&fixture.config_path)
+        .expect("load Runner Serve configuration from enrolled state");
+    assert_eq!(service.runner_id, RUNNER_ID);
+    assert_eq!(service.connection_url, state.connection_url);
+    assert_eq!(service.credential_id, CREDENTIAL_ID);
+    assert_eq!(service.credential_secret, state.current_credential.secret);
+
     let request = server.finish_one();
     let body = request_body(&request);
     let decoded: serde_json::Value = serde_json::from_str(body).expect("decode request body");
@@ -178,6 +186,118 @@ fn successful_enrollment_commits_protected_state_without_transmitting_credential
     let complete_credential = format!("{CREDENTIAL_ID}.{}", state.current_credential.secret);
     assert!(!request.contains(&state.current_credential.secret));
     assert!(!request.contains(&complete_credential));
+}
+
+#[test]
+fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_credential() {
+    let server = ScriptedHttpServer::respond(enrollment_response_with_credential(
+        REPLACEMENT_CREDENTIAL_ID,
+    ));
+    let fixture = EnrollmentFixture::new(&server, OTHER_ACTIVATION_ID, future_time());
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    ensure_private_directory(state_directory).expect("create state directory");
+    atomic_write_json(
+        &fixture.state_path,
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": RUNNER_ID,
+            "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+            "currentCredential": {
+                "id": CREDENTIAL_ID,
+                "secret": ACTIVATION_SECRET,
+                "activationId": ACTIVATION_ID,
+                "enrolledAt": "2026-08-06T12:00:00Z"
+            },
+            "updatedAt": "2026-08-06T12:00:00Z"
+        }),
+    )
+    .expect("write current runner state");
+
+    let outcome = enroll(
+        Some(&fixture.activation_path),
+        &fixture.config_path,
+        true,
+        false,
+    )
+    .expect("enroll replacement credential");
+    assert!(matches!(
+        outcome,
+        EnrollmentOutcome::Enrolled {
+            replacement: true,
+            ..
+        }
+    ));
+    server.finish_one();
+
+    let state: RunnerState =
+        serde_json::from_slice(&fs::read(&fixture.state_path).expect("read replacement state"))
+            .expect("decode replacement state");
+    assert_eq!(state.runner_id, RUNNER_ID);
+    assert_eq!(state.current_credential.id, CREDENTIAL_ID);
+    assert_eq!(
+        state
+            .pending_credential
+            .as_ref()
+            .map(|value| value.id.as_str()),
+        Some(REPLACEMENT_CREDENTIAL_ID)
+    );
+    assert!(!fixture.journal_path().exists());
+    assert_eq!(
+        replacement_disposition(&fixture.config_path, RUNNER_ID, REPLACEMENT_CREDENTIAL_ID)
+            .expect("read replacement disposition"),
+        ReplacementDisposition::Pending
+    );
+
+    let staged_state = fs::read(&fixture.state_path).expect("read staged state");
+    let retry = enroll(
+        Some(&fixture.activation_path),
+        &fixture.config_path,
+        true,
+        false,
+    )
+    .expect("reuse staged pending credential without another Cloud request");
+    assert!(matches!(
+        retry,
+        EnrollmentOutcome::ReplacementCredential {
+            runner_id,
+            credential_id,
+        } if runner_id == RUNNER_ID && credential_id == REPLACEMENT_CREDENTIAL_ID
+    ));
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("read retried state"),
+        staged_state
+    );
+
+    let service =
+        load_runner_service_configuration(&fixture.config_path).expect("load pending state");
+    service
+        .state_access
+        .promote(RUNNER_ID, CREDENTIAL_ID, REPLACEMENT_CREDENTIAL_ID)
+        .expect("promote replacement state");
+    assert_eq!(
+        replacement_disposition(&fixture.config_path, RUNNER_ID, REPLACEMENT_CREDENTIAL_ID)
+            .expect("read promoted disposition"),
+        ReplacementDisposition::Current
+    );
+    let promoted_state = fs::read(&fixture.state_path).expect("read promoted state");
+    let retry = enroll(
+        Some(&fixture.activation_path),
+        &fixture.config_path,
+        true,
+        false,
+    )
+    .expect("recover a lost promotion response without another Cloud request");
+    assert!(matches!(
+        retry,
+        EnrollmentOutcome::ReplacementCredential {
+            runner_id,
+            credential_id,
+        } if runner_id == RUNNER_ID && credential_id == REPLACEMENT_CREDENTIAL_ID
+    ));
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("read recovered promoted state"),
+        promoted_state
+    );
 }
 
 #[test]
@@ -319,6 +439,69 @@ fn resume_finishes_after_state_commits_before_journal_removal() {
 }
 
 #[test]
+fn replacement_resume_recognizes_a_startup_promotion_before_journal_cleanup() {
+    let server = ScriptedHttpServer::respond(enrollment_response_with_credential(
+        REPLACEMENT_CREDENTIAL_ID,
+    ));
+    let fixture = EnrollmentFixture::new(&server, OTHER_ACTIVATION_ID, future_time());
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    ensure_private_directory(state_directory).expect("create state directory");
+    atomic_write_json(
+        &fixture.state_path,
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": RUNNER_ID,
+            "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+            "currentCredential": {
+                "id": CREDENTIAL_ID,
+                "secret": ACTIVATION_SECRET,
+                "activationId": ACTIVATION_ID,
+                "enrolledAt": "2026-08-06T12:00:00Z"
+            },
+            "updatedAt": "2026-08-06T12:00:00Z"
+        }),
+    )
+    .expect("write current runner state");
+    let journal = stage_journal(&fixture.journal_path(), fixture.artifact.clone(), true)
+        .expect("stage replacement journal");
+    let response: EnrollmentResponse = serde_json::from_value(
+        enrollment_response_document_with_credential(REPLACEMENT_CREDENTIAL_ID),
+    )
+    .expect("decode replacement response");
+    persist_enrollment_state(
+        &fixture.state_path,
+        &journal,
+        &response,
+        DeploymentMode::Development,
+    )
+    .expect("stage pending replacement");
+    let service =
+        load_runner_service_configuration(&fixture.config_path).expect("load pending state");
+    service
+        .state_access
+        .promote(RUNNER_ID, CREDENTIAL_ID, REPLACEMENT_CREDENTIAL_ID)
+        .expect("simulate startup promotion");
+    let promoted_state = fs::read(&fixture.state_path).expect("read promoted state");
+    assert!(fixture.journal_path().exists());
+
+    let outcome = enroll(None, &fixture.config_path, false, true)
+        .expect("resume replacement after startup promotion");
+    assert!(matches!(
+        outcome,
+        EnrollmentOutcome::Enrolled {
+            replacement: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("read resumed promoted state"),
+        promoted_state
+    );
+    assert!(!fixture.journal_path().exists());
+    server.finish_one();
+}
+
+#[test]
 fn journal_rejects_a_verifier_that_does_not_match_its_secret() {
     let journal = EnrollmentJournal {
         schema_version: 1,
@@ -447,10 +630,18 @@ fn write_artifact(path: &Path, artifact: &ActivationArtifact) {
 }
 
 fn enrollment_response() -> Vec<u8> {
-    json_response(&enrollment_response_document())
+    enrollment_response_with_credential(CREDENTIAL_ID)
+}
+
+fn enrollment_response_with_credential(credential_id: &str) -> Vec<u8> {
+    json_response(&enrollment_response_document_with_credential(credential_id))
 }
 
 fn enrollment_response_document() -> serde_json::Value {
+    enrollment_response_document_with_credential(CREDENTIAL_ID)
+}
+
+fn enrollment_response_document_with_credential(credential_id: &str) -> serde_json::Value {
     serde_json::json!({
         "schemaVersion": 1,
         "runnerId": RUNNER_ID,
@@ -463,7 +654,7 @@ fn enrollment_response_document() -> serde_json::Value {
             "id": "rpl_01k0z6r1w8f4jy2m7q9v3x5abc",
             "name": "builders"
         },
-        "credentialId": CREDENTIAL_ID,
+        "credentialId": credential_id,
         "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect"
     })
 }

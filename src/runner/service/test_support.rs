@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
 use crate::runner::service::assignment::{WallClockHealth, WallClockHealthFailure};
-use crate::runner::service::connection::{ConnectionError, FrameSource, run_established};
+use crate::runner::service::connection::{ConnectionError, FrameSource, run_established_shared};
 use crate::runner::service::{
     ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
 };
@@ -374,7 +374,7 @@ impl Connector for ScriptedConnector {
             self.attempts
                 .send(ScriptedConnection { inbound, outbound })
                 .expect("scripted connection receiver should remain open");
-            let outcome = run_established(
+            let outcome = run_established_shared(
                 attempt.dependencies,
                 attempt.opening,
                 attempt.next_sequence,
@@ -460,7 +460,7 @@ pub(crate) async fn fixture_listener() -> (TcpListener, String) {
         .await
         .expect("bind fixture listener");
     let endpoint = format!(
-        "ws://{}/v1/connect",
+        "ws://{}/v1/runner/connect",
         listener.local_addr().expect("fixture address")
     );
     (listener, endpoint)

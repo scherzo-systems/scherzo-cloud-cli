@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use super::result_validation::{ResultSchemaSupportFailure, RetainedResultSchema};
 use super::schema_common::lowercase_hex;
-use super::validated::{RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow};
+use super::validated::{
+    RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
+};
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use super::{DecodeFailureKind, decode, validation};
 use crate::execution::workflow::document::Output;
@@ -49,6 +51,10 @@ pub(crate) enum ResolutionLocation {
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
     ResultSchema { step: String, output: String },
+    FinalizerSystemPrompt { finalizer: String },
+    FinalizerMessageText { finalizer: String, index: usize },
+    FinalizerMessageAttachment { finalizer: String, index: usize },
+    FinalizerResultSchema { finalizer: String, output: String },
     ContentDigest,
 }
 
@@ -158,15 +164,24 @@ impl ResolvedWorkflow {
     }
 
     pub(crate) fn requires_git_capture(&self) -> bool {
-        self.definition.steps.values().any(|step| {
-            let outputs = match step {
-                ValidatedStep::Command(step) => &step.common.outputs,
-                ValidatedStep::Agent(step) => &step.common.outputs,
-            };
-            outputs
-                .values()
-                .any(|output| matches!(output.definition, Output::GitBranch))
-        })
+        self.definition
+            .steps
+            .values()
+            .chain(
+                self.definition
+                    .finalizers
+                    .values()
+                    .map(|finalizer| &finalizer.body),
+            )
+            .any(|node| {
+                let outputs = match node {
+                    ValidatedStep::Command(node) => &node.common.outputs,
+                    ValidatedStep::Agent(node) => &node.common.outputs,
+                };
+                outputs
+                    .values()
+                    .any(|output| matches!(output.definition, Output::GitBranch))
+            })
     }
 }
 
@@ -541,51 +556,93 @@ fn resolve_static_sources(
     sources: &mut SourceResolver,
 ) -> Result<BTreeMap<(String, String), RetainedResultSchema>, ResolutionFailure> {
     let mut result_schemas = BTreeMap::new();
-    for (step_name, step) in &mut definition.steps {
-        let ValidatedStep::Agent(agent_step) = step else {
-            continue;
-        };
-
-        let system_location = ResolutionLocation::SystemPrompt {
-            step: step_name.clone(),
-        };
-        agent_step.agent.system_prompt = resolve_text_source(
-            &agent_step.agent.system_prompt,
+    for (node_name, node) in &mut definition.steps {
+        resolve_node_static_sources(
+            node_name,
+            WorkflowNodeRole::Step,
+            node,
             workflow_directory,
             sources,
-            system_location,
+            &mut result_schemas,
         )?;
-
-        resolve_message_files(
-            step_name,
-            &mut agent_step.agent.message.text,
-            MessageFileKind::Text,
+    }
+    for (node_name, finalizer) in &mut definition.finalizers {
+        resolve_node_static_sources(
+            node_name,
+            WorkflowNodeRole::Finalizer,
+            &mut finalizer.body,
             workflow_directory,
             sources,
+            &mut result_schemas,
         )?;
-        resolve_message_files(
-            step_name,
-            &mut agent_step.agent.message.attachments,
-            MessageFileKind::Attachment,
-            workflow_directory,
-            sources,
-        )?;
-
-        for (output_name, output) in &mut agent_step.common.outputs {
-            let Output::AgentResult { schema } = &mut output.definition else {
-                continue;
-            };
-            let location = ResolutionLocation::ResultSchema {
-                step: step_name.clone(),
-                output: output_name.clone(),
-            };
-            let (canonical_path, retained) =
-                resolve_result_schema(schema, workflow_directory, sources, location)?;
-            *schema = canonical_path;
-            result_schemas.insert((step_name.clone(), output_name.clone()), retained);
-        }
     }
     Ok(result_schemas)
+}
+
+fn resolve_node_static_sources(
+    node_name: &str,
+    role: WorkflowNodeRole,
+    node: &mut ValidatedStep,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    result_schemas: &mut BTreeMap<(String, String), RetainedResultSchema>,
+) -> Result<(), ResolutionFailure> {
+    let ValidatedStep::Agent(agent_node) = node else {
+        return Ok(());
+    };
+
+    let system_location = match role {
+        WorkflowNodeRole::Step => ResolutionLocation::SystemPrompt {
+            step: node_name.to_owned(),
+        },
+        WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerSystemPrompt {
+            finalizer: node_name.to_owned(),
+        },
+    };
+    agent_node.agent.system_prompt = resolve_text_source(
+        &agent_node.agent.system_prompt,
+        workflow_directory,
+        sources,
+        system_location,
+    )?;
+
+    resolve_message_files(
+        node_name,
+        role,
+        &mut agent_node.agent.message.text,
+        MessageFileKind::Text,
+        workflow_directory,
+        sources,
+    )?;
+    resolve_message_files(
+        node_name,
+        role,
+        &mut agent_node.agent.message.attachments,
+        MessageFileKind::Attachment,
+        workflow_directory,
+        sources,
+    )?;
+
+    for (output_name, output) in &mut agent_node.common.outputs {
+        let Output::AgentResult { schema } = &mut output.definition else {
+            continue;
+        };
+        let location = match role {
+            WorkflowNodeRole::Step => ResolutionLocation::ResultSchema {
+                step: node_name.to_owned(),
+                output: output_name.clone(),
+            },
+            WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerResultSchema {
+                finalizer: node_name.to_owned(),
+                output: output_name.clone(),
+            },
+        };
+        let (canonical_path, retained) =
+            resolve_result_schema(schema, workflow_directory, sources, location)?;
+        *schema = canonical_path;
+        result_schemas.insert((node_name.to_owned(), output_name.clone()), retained);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -595,7 +652,8 @@ enum MessageFileKind {
 }
 
 fn resolve_message_files(
-    step: &str,
+    node_name: &str,
+    role: WorkflowNodeRole,
     message_sources: &mut [ValidatedMessageSource],
     kind: MessageFileKind,
     workflow_directory: &Path,
@@ -605,15 +663,29 @@ fn resolve_message_files(
         let ValidatedMessageSource::File { path } = source else {
             continue;
         };
-        let location = match kind {
-            MessageFileKind::Text => ResolutionLocation::MessageText {
-                step: step.to_owned(),
+        let location = match (role, kind) {
+            (WorkflowNodeRole::Step, MessageFileKind::Text) => ResolutionLocation::MessageText {
+                step: node_name.to_owned(),
                 index,
             },
-            MessageFileKind::Attachment => ResolutionLocation::MessageAttachment {
-                step: step.to_owned(),
-                index,
-            },
+            (WorkflowNodeRole::Step, MessageFileKind::Attachment) => {
+                ResolutionLocation::MessageAttachment {
+                    step: node_name.to_owned(),
+                    index,
+                }
+            }
+            (WorkflowNodeRole::Finalizer, MessageFileKind::Text) => {
+                ResolutionLocation::FinalizerMessageText {
+                    finalizer: node_name.to_owned(),
+                    index,
+                }
+            }
+            (WorkflowNodeRole::Finalizer, MessageFileKind::Attachment) => {
+                ResolutionLocation::FinalizerMessageAttachment {
+                    finalizer: node_name.to_owned(),
+                    index,
+                }
+            }
         };
         *path = match kind {
             MessageFileKind::Text => {

@@ -19,6 +19,9 @@ const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency
 const CREDENTIAL_LIMIT: &str = "https://api.scherzo.dev/problems/runner-credential-limit-reached";
 const ACTIVATION_UNAVAILABLE: &str =
     "https://api.scherzo.dev/problems/runner-activation-unavailable";
+const CREDENTIAL_TRANSITION_UNAVAILABLE: &str =
+    "https://api.scherzo.dev/problems/runner-credential-transition-unavailable";
+const POOL_MOVE_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/runner-pool-move-unavailable";
 
 pub(crate) type RunnerPool = models::RunnerPool;
 pub(crate) type RunnerPoolList = models::RunnerPoolList;
@@ -29,6 +32,17 @@ pub(crate) type RunnerActivationList = models::RunnerActivationList;
 pub(crate) type RunnerActivationState = models::runner_activation::State;
 pub(crate) type RunnerActivationArtifact = models::RunnerActivationArtifact;
 pub(crate) type RunnerActivationIssuance = models::RunnerActivationIssuance;
+pub(crate) type RunnerCredential = models::RunnerCredential;
+pub(crate) type RunnerCredentialList = models::RunnerCredentialList;
+pub(crate) type RunnerCredentialStoredState = models::runner_credential::StoredState;
+pub(crate) type RunnerCredentialEffectiveState = models::runner_credential::EffectiveState;
+
+#[derive(Clone, Copy)]
+pub(crate) enum RunnerRegistrationMode {
+    Enabled,
+    Draining,
+    Disabled,
+}
 
 pub(crate) struct RunnerApi {
     configuration: apis::configuration::Configuration,
@@ -202,6 +216,59 @@ impl RunnerApi {
         .map_err(classify_runner_error)
     }
 
+    pub(crate) fn list_credentials(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        limit: Option<u16>,
+        cursor: Option<&str>,
+    ) -> Result<RunnerCredentialList, RunnerFailure> {
+        runners_api::list_runner_credentials(
+            &self.configuration,
+            organization,
+            runner_id,
+            limit.map(i32::from),
+            cursor,
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn retire_credential(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        credential_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerCredential, RunnerFailure> {
+        runners_api::retire_runner_credential(
+            &self.configuration,
+            organization,
+            runner_id,
+            credential_id,
+            idempotency_key,
+            models::RetireRunnerCredentialRequest::new(),
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn revoke_credential(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        credential_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerCredential, RunnerFailure> {
+        runners_api::revoke_runner_credential(
+            &self.configuration,
+            organization,
+            runner_id,
+            credential_id,
+            idempotency_key,
+            models::RevokeRunnerCredentialRequest::new(),
+        )
+        .map_err(classify_runner_error)
+    }
+
     pub(crate) fn list_registrations(
         &self,
         organization: &str,
@@ -254,6 +321,54 @@ impl RunnerApi {
         )
         .map_err(classify_runner_error)
     }
+
+    pub(crate) fn update_registration_mode(
+        &self,
+        organization: &str,
+        runner_ref: &str,
+        idempotency_key: &str,
+        mode: RunnerRegistrationMode,
+    ) -> Result<RunnerRegistration, RunnerFailure> {
+        let runner = self.get_registration(organization, runner_ref)?;
+        let mode = match mode {
+            RunnerRegistrationMode::Enabled => {
+                models::update_runner_registration_mode_request::Mode::Enabled
+            }
+            RunnerRegistrationMode::Draining => {
+                models::update_runner_registration_mode_request::Mode::Draining
+            }
+            RunnerRegistrationMode::Disabled => {
+                models::update_runner_registration_mode_request::Mode::Disabled
+            }
+        };
+        runners_api::update_runner_registration_mode(
+            &self.configuration,
+            organization,
+            &runner.id,
+            idempotency_key,
+            models::UpdateRunnerRegistrationModeRequest::new(mode),
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn move_registration(
+        &self,
+        organization: &str,
+        runner_ref: &str,
+        pool_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerRegistration, RunnerFailure> {
+        let runner = self.get_registration(organization, runner_ref)?;
+        let pool = self.get_pool(organization, pool_ref)?;
+        runners_api::move_runner_registration(
+            &self.configuration,
+            organization,
+            &runner.id,
+            idempotency_key,
+            models::MoveRunnerRegistrationRequest::new(pool.id),
+        )
+        .map_err(classify_runner_error)
+    }
 }
 
 fn find_named_resource<T>(
@@ -297,6 +412,8 @@ pub(crate) enum RunnerFailure {
     IdempotencyConflict,
     CredentialLimit,
     ActivationUnavailable,
+    CredentialTransitionUnavailable,
+    PoolMoveUnavailable,
     Unreachable(UnreachableCategory),
     Protocol,
 }
@@ -334,6 +451,10 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => RunnerFailure::IdempotencyConflict,
         (StatusCode::CONFLICT, CREDENTIAL_LIMIT) => RunnerFailure::CredentialLimit,
         (StatusCode::CONFLICT, ACTIVATION_UNAVAILABLE) => RunnerFailure::ActivationUnavailable,
+        (StatusCode::CONFLICT, CREDENTIAL_TRANSITION_UNAVAILABLE) => {
+            RunnerFailure::CredentialTransitionUnavailable
+        }
+        (StatusCode::CONFLICT, POOL_MOVE_UNAVAILABLE) => RunnerFailure::PoolMoveUnavailable,
         (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT) => RunnerFailure::RateLimited,
         _ => RunnerFailure::Protocol,
     }

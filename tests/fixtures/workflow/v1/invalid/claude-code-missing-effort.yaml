@@ -1,0 +1,12 @@
+schemaVersion: 1
+agentProfiles:
+  invalid:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+steps:
+  command:
+    kind: cmd
+    command:
+      argv: ["true"]

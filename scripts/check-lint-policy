@@ -130,12 +130,15 @@ cp tests/fixtures/lint-policy/*.rs "$lint_fixture/src/"
 lint_output=$lint_fixture/clippy-output.json
 clippy_stderr=$lint_fixture/clippy-stderr
 set +e
+# Compile the binary test target directly so every intentional violation is
+# diagnosed in one compiler invocation. With --all-targets, Cargo may stop after
+# the intentionally failing production target before scheduling its cfg(test) target.
 CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$public_root/target} \
   cargo clippy \
     --quiet \
     --locked \
     --manifest-path "$lint_fixture/Cargo.toml" \
-    --all-targets \
+    --tests \
     --all-features \
     --message-format=json \
     >"$lint_output" 2>"$clippy_stderr"
@@ -171,7 +174,7 @@ for expected_code in \
   fi
 done
 
-elapsed_violation_files=$(
+timing_violation_files=$(
   jq -r '
     select(
       .reason == "compiler-message"
@@ -185,12 +188,22 @@ elapsed_violation_files=$(
 )
 for expected_source in ordinary_production.rs ordinary_test.rs; do
   if ! grep --extended-regexp --quiet "(^|/)${expected_source//./\\.}$" \
-    <<<"$elapsed_violation_files"; then
-    echo "Clippy did not reject the representative direct elapsed-time read in $expected_source." >&2
+    <<<"$timing_violation_files"; then
+    echo "Clippy did not reject the representative direct timing use in $expected_source." >&2
     cat "$clippy_stderr" >&2
     exit 1
   fi
 done
+
+ordinary_test_violations=$(
+  grep --extended-regexp --count '(^|/)ordinary_test\.rs$' \
+    <<<"$timing_violation_files"
+)
+if ((ordinary_test_violations < 2)); then
+  echo "Clippy did not reject both test elapsed-time reads and timeout delays." >&2
+  cat "$clippy_stderr" >&2
+  exit 1
+fi
 
 macro_violation_files=$(
   jq -r '
@@ -211,4 +224,4 @@ if ! grep --extended-regexp --quiet '(^|/)ordinary_production\.rs$' \
   exit 1
 fi
 
-printf 'Checked-in Rust lint policy rejects broad timing suppressions, direct elapsed-time reads, and production eprintln! use by default.\n'
+printf 'Checked-in Rust lint policy rejects broad timing suppressions, direct elapsed-time reads and timeout delays, and production eprintln! use by default.\n'
