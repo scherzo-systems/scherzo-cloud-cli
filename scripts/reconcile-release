@@ -224,28 +224,44 @@ def refreshed_release(inspection: Inspection) -> object:
     )
 
 
+def create_tag(inspection: Inspection) -> None:
+    verification = inspection.verification
+    inspection.github.run(
+        "api",
+        "--method",
+        "POST",
+        "-f",
+        f"ref=refs/tags/{verification.tag}",
+        "-f",
+        f"sha={verification.allocated_mirror}",
+        f"repos/{inspection.github.repository}/git/refs",
+    )
+    if tag_target(inspection.github, inspection.github.repository, verification.tag) != (
+        verification.allocated_mirror
+    ):
+        fail("GitHub did not create the stable tag at the allocated mirror")
+
+
 def create_draft(inspection: Inspection) -> None:
     verification = inspection.verification
+    if verification.release_state == "absent":
+        create_tag(inspection)
     with tempfile.TemporaryDirectory(prefix="scherzo-release-notes.") as temporary:
         notes = Path(temporary) / "rendered-notes.md"
         notes.write_bytes(verification.notes)
-        command = [
+        inspection.github.run(
             "release",
             "create",
             verification.tag,
             "--repo",
             inspection.github.repository,
-            "--target",
-            verification.allocated_mirror,
+            "--verify-tag",
             "--title",
             f"Scherzo Cloud CLI {verification.tag}",
             "--notes-file",
             os.fspath(notes),
             "--draft",
-        ]
-        if verification.release_state == "tag-only":
-            command.append("--verify-tag")
-        inspection.github.run(*command)
+        )
     fetch_allocated_tag(inspection)
     state = refreshed_release(inspection)
     if state.state != "draft" or state.assets:

@@ -539,6 +539,14 @@ def die404():
 def option(name):
     return args[args.index(name) + 1]
 
+def fields():
+    result = {}
+    for index, argument in enumerate(args):
+        if argument == "-f":
+            name, value = args[index + 1].split("=", 1)
+            result[name] = value
+    return result
+
 if args[:2] == ["attestation", "verify"]:
     raise SystemExit(0)
 
@@ -553,6 +561,21 @@ if args[0] == "api":
                     sys.stdout.buffer.write(base64.b64decode(asset["bytes"]))
                     raise SystemExit(0)
         die404()
+    if endpoint.endswith("/git/refs") and option("--method") == "POST":
+        values = fields()
+        ref = values.get("ref", "")
+        target = values.get("sha", "")
+        if not ref.startswith("refs/tags/") or not target:
+            raise SystemExit("malformed stable-tag creation")
+        tag = ref.removeprefix("refs/tags/")
+        if tag in state["tags"]:
+            raise SystemExit("tag already exists")
+        state["tags"][tag] = target
+        subprocess.run(["git", f"--git-dir={state['git_remote']}", "update-ref", ref, target], check=True)
+        state["writes"].append("create-tag")
+        save()
+        print(json.dumps({"ref": ref, "object": {"type": "commit", "sha": target}}))
+        raise SystemExit(0)
     if "/git/ref/tags/" in endpoint:
         tag = endpoint.rsplit("/", 1)[1]
         target = state["tags"].get(tag)
@@ -586,15 +609,11 @@ if args[:2] == ["release", "create"]:
     tag = args[2]
     if any(release["tag_name"] == tag for release in state["releases"]):
         raise SystemExit("release already exists")
-    target = option("--target")
-    if "--verify-tag" in args:
-        if state["tags"].get(tag) != target:
-            raise SystemExit("tag target differs")
-    else:
-        if tag in state["tags"]:
-            raise SystemExit("tag already exists")
-        state["tags"][tag] = target
-        subprocess.run(["git", f"--git-dir={state['git_remote']}", "update-ref", f"refs/tags/{tag}", target], check=True)
+    if "--target" in args or "--verify-tag" not in args:
+        raise SystemExit("release creation must use the existing stable tag")
+    target = state["tags"].get(tag)
+    if target is None:
+        raise SystemExit("tag does not exist")
     release = {
         "id": state["next_release_id"],
         "tag_name": tag,
