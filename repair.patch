@@ -1,0 +1,64 @@
+diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
+index e1f5a513218352012dfd2869137bbd56e690af61..67120ff174bc645a83a782b153ea251d37224726 100644
+--- a/.github/workflows/check.yml
++++ b/.github/workflows/check.yml
+@@ -24,7 +24,7 @@ jobs:
+   check:
+     name: Public source
+     runs-on: ubuntu-latest
+-    timeout-minutes: 10
++    timeout-minutes: 15
+     steps:
+       - name: Check out source
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+diff --git a/scripts/test-release-allocation b/scripts/test-release-allocation
+index c06bc16365737f5aaf9d20e55e6370976e1c8bbf..58559fbd06eac649fd1b743c29310d16d909d706 100644
+--- a/scripts/test-release-allocation
++++ b/scripts/test-release-allocation
+@@ -1011,6 +1011,19 @@ def prove_recovery(module: ModuleType, root: Path) -> None:
+     )
+ 
+ 
++def prove_stable_manifest_order(module: ModuleType) -> None:
++    refs = {
++        "v0.2.1": "1" * 40,
++        "v0.2.10": "2" * 40,
++    }
++    expected = (
++        f"refs/tags/v0.2.10={'2' * 40}\n"
++        f"refs/tags/v0.2.1={'1' * 40}\n"
++    ).encode("ascii")
++    if module.stable_manifest(refs) != expected:
++        fail("stable-ref manifest is not C-sorted by complete rendered records")
++
++
+ def prove_workflow_contract(module: ModuleType) -> None:
+     workflow = ROOT.joinpath(".github/workflows/check.yml").read_text()
+     required = (
+@@ -1047,6 +1060,7 @@ def prove_workflow_contract(module: ModuleType) -> None:
+ 
+ def main() -> int:
+     module = load_verifier()
++    prove_stable_manifest_order(module)
+     prove_workflow_contract(module)
+     with tempfile.TemporaryDirectory(prefix="scherzo-public-release.") as temporary:
+         root = Path(temporary)
+diff --git a/scripts/verify-release-allocation b/scripts/verify-release-allocation
+index 481a21f48bd03facdbb3bad3914d2db05e998452..7a699e8fa2a28d4c47a11fb1d882184ce7689e08 100755
+--- a/scripts/verify-release-allocation
++++ b/scripts/verify-release-allocation
+@@ -808,8 +808,12 @@ def stable_refs(repository: GitRepository) -> dict[str, str]:
+ 
+ def stable_manifest(refs: Mapping[str, str]) -> bytes:
+     return b"".join(
+-        f"refs/tags/{tag}={refs[tag]}\n".encode("ascii")
+-        for tag in sorted(refs, key=os.fsencode)
++        sorted(
++            (
++                f"refs/tags/{tag}={commit}\n".encode("ascii")
++                for tag, commit in refs.items()
++            )
++        )
+     )
+ 
+ 
