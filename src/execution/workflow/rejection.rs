@@ -554,7 +554,7 @@ fn claude_code_installation_classification(
     match failure {
         ClaudeCodeInstallationFailure::Missing => (
             "missing_claude_code_installation",
-            "Install the exact supported `claude` executable in the inherited PATH.",
+            "Install a supported stable `claude` executable in the inherited PATH.",
         ),
         ClaudeCodeInstallationFailure::Unexecutable => (
             "unexecutable_claude_code_installation",
@@ -570,7 +570,7 @@ fn claude_code_installation_classification(
         ),
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Version(_)) => (
             "unsupported_claude_code_version",
-            "The selected `claude` version is not the exact ClaudeCodeStreamJsonV1 release.",
+            "The selected `claude` version is outside the supported ClaudeCodeStreamJsonV1 range.",
         ),
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability(_)) => (
             "unsupported_claude_code_capability",
@@ -695,7 +695,7 @@ mod tests {
     fn codex_installation_rejection_uses_the_closed_profile_identity() {
         let failure =
             AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
-                incompatibility: CodexIncompatibility::Version("0.148.0".to_owned()),
+                incompatibility: CodexIncompatibility::Version("0.149.0".to_owned()),
                 identity: None,
             });
 

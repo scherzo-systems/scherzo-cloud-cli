@@ -1,17 +1,14 @@
 pub(crate) mod adapter;
 mod input;
-mod rollout;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
-use self::rollout::{CodexRolloutCorrelation, is_codex_thread_id};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentHarnessSetupStage,
     AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProtocolRejectionDiagnostic,
@@ -300,7 +297,6 @@ pub(super) struct CodexAppServerV1Parser {
     pending_outbound_bytes: u64,
     thread_id: Option<ThreadId>,
     turn_id: Option<TurnId>,
-    rollout: Option<CodexRolloutCorrelation>,
     effective_model_provider: Option<Arc<str>>,
     thread_started_seen: bool,
     active_items: BTreeMap<ItemId, ActiveItem>,
@@ -367,7 +363,6 @@ impl CodexAppServerV1Parser {
             pending_outbound_bytes: 0,
             thread_id: None,
             turn_id: None,
-            rollout: None,
             effective_model_provider: None,
             thread_started_seen: false,
             active_items: BTreeMap::new(),
@@ -444,10 +439,6 @@ impl CodexAppServerV1Parser {
 
     pub(super) const fn start_acknowledged(&self) -> bool {
         self.invocation_start_acknowledged
-    }
-
-    fn rollout_correlation(&self) -> Option<CodexRolloutCorrelation> {
-        self.rollout.clone()
     }
 
     pub(super) fn take_result_candidate(&mut self) -> Option<Arc<Value>> {
@@ -707,7 +698,7 @@ impl CodexAppServerV1Parser {
                     "approvalPolicy": "never",
                     "sandbox": "danger-full-access",
                     "developerInstructions": developer_instructions,
-                    "ephemeral": false,
+                    "ephemeral": true,
                     "config": {
                         "bypass_hook_trust": true,
                     },
@@ -997,9 +988,6 @@ impl CodexAppServerV1Parser {
                 .filter(|id| is_codex_thread_id(id))
                 .ok_or_else(|| self.failure_for_current_phase())?,
         )?;
-        let native_path = required_nonempty_string(thread, "path")
-            .filter(|path| PathBuf::from(path).is_absolute())
-            .ok_or_else(|| self.failure_for_current_phase())?;
         let provider = required_nonempty_string(result, "modelProvider")
             .ok_or_else(|| self.failure_for_current_phase())?;
         let sandbox =
@@ -1008,7 +996,8 @@ impl CodexAppServerV1Parser {
             || required_string(result, "cwd") != Some(self.expected_cwd.as_ref())
             || required_string(result, "approvalPolicy") != Some("never")
             || required_string(sandbox, "type") != Some("dangerFullAccess")
-            || required_bool(thread, "ephemeral") != Some(false)
+            || required_bool(thread, "ephemeral") != Some(true)
+            || optional_string(thread, "path") != Some(None)
             || required_string(thread, "sessionId") != Some(thread_id.0.as_ref())
             || optional_string(thread, "forkedFromId") != Some(None)
             || optional_string(thread, "parentThreadId") != Some(None)
@@ -1023,11 +1012,6 @@ impl CodexAppServerV1Parser {
         {
             return Err(self.failure_for_current_phase());
         }
-        self.rollout = Some(CodexRolloutCorrelation {
-            thread_id: Arc::clone(&thread_id.0),
-            reported_path: PathBuf::from(native_path),
-            materialized: false,
-        });
         self.thread_id = Some(thread_id);
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::SessionEstablished));
@@ -1049,9 +1033,6 @@ impl CodexAppServerV1Parser {
             return Err(self.failure_for_current_phase());
         }
         self.turn_id = Some(turn_id);
-        if let Some(rollout) = &mut self.rollout {
-            rollout.materialized = true;
-        }
         Ok(())
     }
 
@@ -1184,14 +1165,10 @@ impl CodexAppServerV1Parser {
             .thread_id
             .as_ref()
             .ok_or_else(|| self.failure_for_current_phase())?;
-        let rollout = self
-            .rollout
-            .as_ref()
-            .ok_or_else(|| self.failure_for_current_phase())?;
         if required_string(thread, "id") != Some(expected.0.as_ref())
             || required_string(thread, "sessionId") != Some(expected.0.as_ref())
-            || required_bool(thread, "ephemeral") != Some(false)
-            || required_string(thread, "path") != rollout.reported_path.to_str()
+            || required_bool(thread, "ephemeral") != Some(true)
+            || optional_string(thread, "path") != Some(None)
             || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
             || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
         {
@@ -2288,6 +2265,17 @@ fn has_notification_fields(object: &Map<String, Value>) -> bool {
 
 fn required_array<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a [Value]> {
     object.get(key)?.as_array().map(Vec::as_slice)
+}
+
+fn is_codex_thread_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        })
+        && bytes[14] == b'7'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
 fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

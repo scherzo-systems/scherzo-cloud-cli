@@ -1222,12 +1222,12 @@ fn structured_agent_failure_projects_the_protocol_rejection_without_content() {
         "\"timestamp\":\"2026-07-30T12:00:00Z\",",
         "\"cwd\":\"/execution/worktree\"}\n",
         "{\"type\":\"agent_start\"}\n",
-        "{\"type\":\"turn_end\",\"content\":\"sensitive sentinel\"}\n",
+        "{\"type\":\"agent_start\",\"content\":\"sensitive sentinel\"}\n",
     );
     assert!(parser.push_stdout(frames.as_bytes(), drop).is_err());
     let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
     else {
-        panic!("invalid turn transition must fail");
+        panic!("invalid agent lifecycle must fail");
     };
 
     let projected = execution_failure_cause(&StepExecutionFailure::Agent(failure));
@@ -1236,7 +1236,7 @@ fn structured_agent_failure_projects_the_protocol_rejection_without_content() {
     assert_eq!(projected["protocolRejection"]["profile"], "PiJsonV1");
     assert_eq!(
         projected["protocolRejection"]["detail"]["outerEvent"],
-        "turn_end"
+        "agent_start"
     );
     assert!(!projected.to_string().contains("sensitive sentinel"));
 }

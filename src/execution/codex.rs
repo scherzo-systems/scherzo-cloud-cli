@@ -12,10 +12,10 @@ use super::harness_installation::{
 };
 use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
 
-pub(crate) const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.148.0";
-pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.147.0";
+pub(crate) const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.149.0";
+pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.148.0";
 const CODEX_APP_SERVER_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 147, 0);
-const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 148, 0);
+const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 149, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 4] =
     ["app-server", "generate-json-schema", "--out", "../schemas"];
 const MAXIMUM_SCHEMA_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -96,22 +96,17 @@ pub(crate) type CodexVersion = StableVersion;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexCapability {
     AppServerSchemaV1,
-    NativeRolloutDiagnostics,
 }
 
 impl CodexCapability {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::AppServerSchemaV1 => "app_server_schema_v1",
-            Self::NativeRolloutDiagnostics => "native_rollout_diagnostics",
         }
     }
 }
 
-const REQUIRED_CAPABILITIES: [CodexCapability; 2] = [
-    CodexCapability::AppServerSchemaV1,
-    CodexCapability::NativeRolloutDiagnostics,
-];
+const REQUIRED_CAPABILITIES: [CodexCapability; 1] = [CodexCapability::AppServerSchemaV1];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CodexAppServerV1Capabilities {
@@ -483,6 +478,7 @@ fn validate_schema_directory(directory: &Path) -> Result<(), CodexInstallationFa
             .iter()
             .all(|method| has_method(server_notification, method))
         && has_properties(thread_start, &THREAD_START_PROPERTIES)
+        && has_ephemeral_thread_contract(thread_start_response)
         && schema_allows_literal(
             thread_start.pointer("/definitions/SandboxMode"),
             "danger-full-access",
@@ -494,37 +490,22 @@ fn validate_schema_directory(directory: &Path) -> Result<(), CodexInstallationFa
             .all(|input_type| has_input_type(turn_start, input_type))
         && is_nonempty_reasoning_effort(turn_start);
 
-    if !compatible {
-        return Err(CodexInstallationFailure::Unsupported {
-            incompatibility: CodexIncompatibility::Capability(CodexCapability::AppServerSchemaV1),
-            identity: None,
-        });
-    }
-    has_native_rollout_diagnostics(thread_start_response)
+    compatible
         .then_some(())
         .ok_or(CodexInstallationFailure::Unsupported {
-            incompatibility: CodexIncompatibility::Capability(
-                CodexCapability::NativeRolloutDiagnostics,
-            ),
+            incompatibility: CodexIncompatibility::Capability(CodexCapability::AppServerSchemaV1),
             identity: None,
         })
 }
 
-fn has_native_rollout_diagnostics(thread_start_response: &Value) -> bool {
+fn has_ephemeral_thread_contract(thread_start_response: &Value) -> bool {
     has_properties(thread_start_response, &["thread"])
         && thread_start_response
             .pointer("/definitions/Thread")
             .is_some_and(|thread| {
                 has_properties(
                     thread,
-                    &[
-                        "cliVersion",
-                        "ephemeral",
-                        "id",
-                        "path",
-                        "sessionId",
-                        "turns",
-                    ],
+                    &["cliVersion", "ephemeral", "id", "sessionId", "turns"],
                 )
             })
 }
@@ -634,7 +615,6 @@ mod tests {
         invocations: Mutex<Vec<Vec<String>>>,
         version: CommandOutput,
         schema_compatible: bool,
-        native_rollout_compatible: bool,
         capability_success: bool,
     }
 
@@ -665,9 +645,6 @@ mod tests {
                         if !self.schema_compatible {
                             fs::write(schemas.join("ServerNotification.json"), b"{}").unwrap();
                         }
-                        if !self.native_rollout_compatible {
-                            fs::write(schemas.join("v2/ThreadStartResponse.json"), b"{}").unwrap();
-                        }
                     }
                     Ok(CommandOutput {
                         success: self.capability_success,
@@ -693,7 +670,6 @@ mod tests {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("codex-cli {version}\n").as_bytes()),
             schema_compatible: true,
-            native_rollout_compatible: true,
             capability_success: true,
         }
     }
@@ -739,7 +715,14 @@ mod tests {
     #[test]
     fn stable_release_line_and_schema_construct_the_exact_installation_identity() {
         let executable = std::env::current_exe().unwrap();
-        for version in ["0.147.0", "0.147.1", "0.147.999"] {
+        for version in [
+            "0.147.0",
+            "0.147.1",
+            "0.147.999",
+            "0.148.0",
+            "0.148.1",
+            "0.148.999",
+        ] {
             let runner = compatible_runner(version);
             let installation = validate_codex_installation_with(
                 &executable,
@@ -774,7 +757,7 @@ mod tests {
     #[test]
     fn admission_rejects_versions_outside_the_undecorated_stable_release_line() {
         let executable = std::env::current_exe().unwrap();
-        for unsupported in ["0.146.999", "0.148.0", "1.147.0"] {
+        for unsupported in ["0.146.999", "0.149.0", "1.147.0"] {
             let runner = compatible_runner(unsupported);
             assert_eq!(
                 validate_codex_installation_with(
@@ -841,24 +824,6 @@ mod tests {
             Err(CodexInstallationFailure::Unsupported {
                 incompatibility: CodexIncompatibility::Capability(
                     CodexCapability::AppServerSchemaV1,
-                ),
-                identity: identity(),
-            })
-        );
-
-        let missing_rollout = FakeRunner {
-            native_rollout_compatible: false,
-            ..compatible_runner("0.147.0")
-        };
-        assert_eq!(
-            validate_codex_installation_with(
-                &executable,
-                OsStr::new("/controlled/bin"),
-                &missing_rollout,
-            ),
-            Err(CodexInstallationFailure::Unsupported {
-                incompatibility: CodexIncompatibility::Capability(
-                    CodexCapability::NativeRolloutDiagnostics,
                 ),
                 identity: identity(),
             })

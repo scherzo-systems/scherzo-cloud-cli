@@ -110,7 +110,7 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         AdmittedAgentAdapter::new(
             AgentCompatibilityProfile::PiJsonV1,
             "/validated/pi".into(),
-            Arc::from("0.83.0"),
+            Arc::from("0.84.2"),
             PiConfig {
                 model: "openai/gpt-5".to_owned(),
                 thinking: Thinking::XHigh,
@@ -226,7 +226,7 @@ fn invocation_retains_the_complete_immutable_engine_input() {
         invocation.adapter().executable(),
         Path::new("/validated/pi")
     );
-    assert_eq!(invocation.adapter().version(), "0.83.0");
+    assert_eq!(invocation.adapter().version(), "0.84.2");
     assert_eq!(
         invocation.adapter().native_configuration(),
         &PiConfig {

@@ -28,23 +28,13 @@
           "schemaVersion": 1,
           "profile": "PiJsonV1",
           "detail": {
-            "reason": "assistant_update_open_block_mismatch",
-            "stage": "assistant_transition",
-            "outerEvent": "message_update",
-            "assistantUpdate": "thinking_delta",
-            "contentIndex": 0,
+            "reason": "event_transition_invalid",
+            "stage": "event_payload",
+            "outerEvent": "agent_end",
             "state": {
               "sessionHeaderSeen": true,
               "agentStarted": true,
-              "activeAttempt": true,
-              "activeTurn": true,
-              "activeMessage": "assistant",
-              "activeAssistantContentBlocks": 1,
-              "assistantUpdateSeen": true,
-              "openBlock": {
-                "kind": "text",
-                "contentIndex": 0
-              },
+              "terminalCandidateRetained": false,
               "resultAccepted": false,
               "settled": false
             }

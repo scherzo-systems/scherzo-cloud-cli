@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::{Future, pending};
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Add as _;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -17,7 +18,6 @@ use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, oneshot};
 
 use super::input::initial_turn_input;
-use super::rollout::{CodexRolloutBridge, CodexRolloutCorrelation};
 use super::{CodexAppServerV1Parser, CodexAppServerV1ProtocolLimits, ParserProgress};
 use crate::execution::codex::{CodexCompatibilityProfile, compatibility_profile_for_version};
 use crate::execution::workflow::admission::CancellationSource;
@@ -28,10 +28,8 @@ use crate::execution::workflow::agent::{
     AgentStartCallback, AgentTerminalCallback, AgentValueMode, PositiveDuration,
     check_agent_input_bound, failed_agent_outcome, finish_agent_diagnostic_capture,
 };
-use crate::execution::workflow::agent_diagnostics::{
-    AgentDiagnosticSession, CodexRolloutRejectionReason,
-};
-use crate::execution::workflow::child_guard::{BOUND_DIRECTORY_PLACEHOLDER, StoppedChildGuard};
+use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
+use crate::execution::workflow::child_guard::StoppedChildGuard;
 use crate::execution::workflow::codex::CodexConfig;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
@@ -226,19 +224,8 @@ where
         );
         let configuration = invocation.adapter().native_configuration();
         let expected_cwd = Arc::clone(&plan.expected_cwd);
-        let Some(codex_home) = plan
-            .native_rollout
-            .codex_home_path()
-            .to_str()
-            .map(Arc::from)
-        else {
-            let mut process = process;
-            let _ = process.child.force_stop(process.process_group).await;
-            diagnostic.abort();
-            diagnostic.finish().await;
-            return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
-        };
-        let sqlite_home = Arc::clone(&process.sqlite_home);
+        let codex_home = Arc::clone(&plan.codex_home);
+        let sqlite_home = Arc::clone(&plan.sqlite_home);
         let initial_input = std::mem::take(&mut plan.initial_input);
         let parser = match CodexAppServerV1Parser::profile(
             expected_cwd,
@@ -263,7 +250,7 @@ where
                 return failed_agent_outcome(cause);
             }
         };
-        let driven = drive_process(
+        let outcome = drive_process(
             &invocation,
             started,
             process,
@@ -276,28 +263,8 @@ where
             },
         )
         .await;
-        let DrivenCodexProcess { outcome, rollout } = driven;
-        if let Some(correlation) = rollout
-            && invocation
-                .diagnostic_session()
-                .retain_codex_thread_correlation(&correlation.thread_id)
-                .is_ok()
-        {
-            let diagnostic_session = invocation.diagnostic_session().clone();
-            let retention_session = diagnostic_session.clone();
-            let retention = tokio::task::spawn_blocking(move || {
-                plan.native_rollout.retain(&retention_session, &correlation)
-            })
-            .await
-            .unwrap_or(Err(CodexRolloutRejectionReason::RetainedStorageUnavailable));
-            if let Err(reason) = retention {
-                let _ = diagnostic_session.retain_codex_rollout_rejection(reason);
-            }
-        }
-        invocation
-            .diagnostic_session()
-            .retain_protocol_rejection_from(&outcome);
-        finish_agent_diagnostic_capture(diagnostic, &outcome).await;
+        finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
+            .await;
         outcome
     }
 }
@@ -306,8 +273,10 @@ where
 pub(super) struct CodexAppServerV1LaunchPlan {
     arguments: Vec<OsString>,
     expected_cwd: Arc<str>,
+    codex_home: Arc<str>,
+    sqlite_home: Arc<str>,
     initial_input: Vec<serde_json::Value>,
-    native_rollout: CodexRolloutBridge,
+    _sqlite_state: tempfile::TempDir,
 }
 
 impl CodexAppServerV1LaunchPlan {
@@ -319,6 +288,11 @@ impl CodexAppServerV1LaunchPlan {
     #[cfg(test)]
     pub(super) fn initial_input(&self) -> &[serde_json::Value] {
         &self.initial_input
+    }
+
+    #[cfg(test)]
+    pub(super) fn sqlite_home(&self) -> &Path {
+        self._sqlite_state.path()
     }
 }
 
@@ -348,7 +322,7 @@ where
         || !invocation.adapter().executable().is_absolute()
         || invocation
             .diagnostic_session()
-            .verify_codex_native_session_path_binding()
+            .verify_path_binding()
             .is_err()
     {
         return Err(AgentFailureCause::HarnessSetupFailed {
@@ -369,16 +343,22 @@ where
             .ok_or(AgentFailureCause::HarnessSetupFailed {
                 stage: AgentHarnessSetupStage::ExecutableLaunch,
             })?;
-    let native_rollout = CodexRolloutBridge::prepare(
-        invocation.process().environment().variables(),
+    let codex_home = codex_home_from_environment(invocation.process().environment().variables())?;
+    let sqlite_state = prepare_sqlite_state(
         invocation.staging().result_endpoint_directory(),
+        Path::new(codex_home.as_ref()),
     )?;
+    let sqlite_home: Arc<str> = sqlite_state
+        .path()
+        .to_str()
+        .map(Arc::from)
+        .ok_or_else(|| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
     let quoted_cwd = serde_json::to_string(expected_cwd.as_ref()).map_err(|_| {
         AgentFailureCause::HarnessSetupFailed {
             stage: AgentHarnessSetupStage::ExecutableLaunch,
         }
     })?;
-    let quoted_sqlite_home = serde_json::to_string(BOUND_DIRECTORY_PLACEHOLDER)
+    let quoted_sqlite_home = serde_json::to_string(sqlite_home.as_ref())
         .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
     let project_trust = format!("projects={{{quoted_cwd}={{trust_level=\"trusted\"}}}}");
     let sqlite_override = format!("sqlite_home={quoted_sqlite_home}");
@@ -398,9 +378,53 @@ where
     Ok(CodexAppServerV1LaunchPlan {
         arguments,
         expected_cwd,
+        codex_home,
+        sqlite_home,
         initial_input,
-        native_rollout,
+        _sqlite_state: sqlite_state,
     })
+}
+
+fn codex_home_from_environment(
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<Arc<str>, AgentFailureCause> {
+    let path = environment
+        .get(OsStr::new("CODEX_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment
+                .get(OsStr::new("HOME"))
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+        })
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+    path.to_str()
+        .map(Arc::from)
+        .ok_or_else(|| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))
+}
+
+fn prepare_sqlite_state(
+    staging: &Path,
+    codex_home: &Path,
+) -> Result<tempfile::TempDir, AgentFailureCause> {
+    let canonical_staging = std::fs::canonicalize(staging)
+        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+    let canonical_codex_home = std::fs::canonicalize(codex_home)
+        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+    if canonical_staging != staging
+        || !canonical_staging.is_absolute()
+        || canonical_staging.starts_with(canonical_codex_home)
+    {
+        return Err(setup_failure(AgentHarnessSetupStage::ExecutableLaunch));
+    }
+    let sqlite_state = tempfile::Builder::new()
+        .prefix("codex-sqlite-")
+        .tempdir_in(canonical_staging)
+        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+    std::fs::set_permissions(sqlite_state.path(), std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+    Ok(sqlite_state)
 }
 
 struct LaunchedCodexProcess {
@@ -408,7 +432,6 @@ struct LaunchedCodexProcess {
     process_group: Pid,
     standard_input: UnixStream,
     standard_output: ChildStdout,
-    sqlite_home: Arc<str>,
 }
 
 struct CodexChild {
@@ -450,11 +473,10 @@ where
     // and setup-stage attribution instead of creating a cross-harness launch abstraction.
     // jscpd:ignore-start
     let environment = invocation_environment(invocation);
-    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin_and_bound_directory(
+    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin(
         invocation.adapter().executable(),
         &plan.arguments,
         &environment,
-        plan.native_rollout.sqlite_home(),
         |command| {
             invocation
                 .process()
@@ -466,16 +488,6 @@ where
         stage: AgentHarnessSetupStage::ExecutableLaunch,
     })?;
     let process_group = child.identity().process_group();
-    let Some(sqlite_home) = child
-        .bound_directory_path()
-        .and_then(Path::to_str)
-        .map(Arc::from)
-    else {
-        let _ = child.force_stop().await;
-        return Err(AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        });
-    };
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
         let _ = child.force_stop().await;
@@ -496,14 +508,10 @@ where
             });
         }
     };
-    if release_guarded_codex(
-        invocation.diagnostic_session(),
-        &plan.native_rollout,
-        || {
-            child.continue_execution().map_err(|_| ())?;
-            registration.mark_released()
-        },
-    )
+    if release_guarded_codex(invocation.diagnostic_session(), || {
+        child.continue_execution().map_err(|_| ())?;
+        registration.mark_released()
+    })
     .is_err()
     {
         let _ = child.force_stop().await;
@@ -522,7 +530,6 @@ where
             process_group,
             standard_input,
             standard_output,
-            sqlite_home,
         },
         standard_error,
     ))
@@ -530,15 +537,8 @@ where
 
 fn release_guarded_codex(
     diagnostic_session: &AgentDiagnosticSession,
-    native_rollout: &CodexRolloutBridge,
     release: impl FnOnce() -> Result<(), ()>,
 ) -> Result<(), AgentFailureCause> {
-    diagnostic_session
-        .verify_codex_native_session_path_binding()
-        .map_err(|_| AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        })?;
-    native_rollout.verify_bindings()?;
     diagnostic_session.verify_path_binding().map_err(|_| {
         AgentFailureCause::HarnessSetupFailed {
             stage: AgentHarnessSetupStage::ExecutableLaunch,
@@ -573,11 +573,6 @@ struct ResultSettlementConfiguration<Clock> {
 
 type ResultSettlementWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-struct DrivenCodexProcess {
-    outcome: AgentOutcome,
-    rollout: Option<CodexRolloutCorrelation>,
-}
-
 async fn drive_process<Clock, Worker, Sink>(
     invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
     started: &AgentStartCallback,
@@ -586,7 +581,7 @@ async fn drive_process<Clock, Worker, Sink>(
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
     mut result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
     settlement: ResultSettlementConfiguration<Clock>,
-) -> DrivenCodexProcess
+) -> AgentOutcome
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
@@ -597,7 +592,6 @@ where
         process_group,
         standard_input,
         mut standard_output,
-        sqlite_home: _,
     } = process;
     let cancellation = invocation.cancellation().clone();
     let (cooperative_interrupt, mut cooperative_interrupts) = mpsc::unbounded_channel();
@@ -945,7 +939,6 @@ where
     if cancelled.is_none() {
         cancelled = cancellation.cancellation_reason();
     }
-    let rollout = parser.rollout_correlation();
     let protocol_rejection = parser.protocol_rejection();
     let outcome = if let Some(reason) = cancelled {
         AgentOutcome::Cancelled { reason }
@@ -970,7 +963,7 @@ where
     } else {
         failed_agent_outcome(parser.failure_for_current_phase())
     };
-    let outcome = match outcome {
+    match outcome {
         AgentOutcome::Failed(failure)
             if matches!(
                 failure.cause(),
@@ -984,8 +977,7 @@ where
             ))
         }
         outcome => outcome,
-    };
-    DrivenCodexProcess { outcome, rollout }
+    }
 }
 
 async fn begin_cooperative_interrupt<Clock: CoordinatorClock>(

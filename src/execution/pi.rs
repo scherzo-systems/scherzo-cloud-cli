@@ -9,10 +9,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.83.0 <0.84.0";
-pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.83.0";
-const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 83, 0);
-const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 84, 0);
+pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.85.0";
+pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.84.2";
+const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 84, 2);
+const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 85, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
     "--no-approve",
     "--no-extensions",

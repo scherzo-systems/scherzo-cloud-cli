@@ -154,15 +154,8 @@
         "reason": {
           "enum": [
             "frame_too_large", "frame_decode_failed", "frame_not_object",
-            "session_header_invalid", "event_type_invalid", "session_event_repeated",
-            "event_after_settlement", "event_after_result_acceptance", "event_shape_invalid",
-            "event_transition_invalid", "assistant_message_invalid", "assistant_update_invalid",
-            "assistant_update_subtype_invalid", "assistant_update_content_index_invalid",
-            "assistant_update_partial_mismatch", "assistant_active_message_mismatch",
-            "assistant_stable_fields_changed", "assistant_update_open_block_mismatch",
-            "assistant_update_content_index_mismatch", "assistant_content_transition_invalid",
-            "thinking_finalization_rewrite", "message_end_open_block_mismatch",
-            "message_end_content_mismatch", "tool_correlation_invalid",
+            "session_header_invalid", "session_event_repeated", "event_after_settlement",
+            "event_after_result_acceptance", "event_shape_invalid", "event_transition_invalid",
             "result_correlation_invalid", "terminal_invariant_invalid",
             "end_of_stream_invariant_invalid", "partial_frame_at_end_of_stream",
             "retained_state_limit_exceeded"
@@ -171,8 +164,7 @@
         "stage": {
           "enum": [
             "frame_read", "frame_decode", "session_header", "event_envelope",
-            "event_payload", "assistant_update", "assistant_transition",
-            "result_correlation", "terminal_validation", "end_of_stream"
+            "event_payload", "result_correlation", "terminal_validation", "end_of_stream"
           ]
         },
         "outerEvent": {
@@ -187,37 +179,17 @@
             "unrecognized"
           ]
         },
-        "assistantUpdate": {
-          "enum": [
-            "text_start", "text_delta", "text_end", "thinking_start", "thinking_delta",
-            "thinking_end", "toolcall_start", "toolcall_delta", "toolcall_end", "unrecognized"
-          ]
-        },
-        "contentIndex": { "type": "integer", "minimum": 0 },
         "state": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "sessionHeaderSeen", "agentStarted", "activeAttempt", "activeTurn",
-            "activeMessage", "assistantUpdateSeen", "resultAccepted", "settled"
+            "sessionHeaderSeen", "agentStarted", "terminalCandidateRetained",
+            "resultAccepted", "settled"
           ],
           "properties": {
             "sessionHeaderSeen": { "type": "boolean" },
             "agentStarted": { "type": "boolean" },
-            "activeAttempt": { "type": "boolean" },
-            "activeTurn": { "type": "boolean" },
-            "activeMessage": { "enum": ["none", "assistant", "other"] },
-            "activeAssistantContentBlocks": { "type": "integer", "minimum": 0 },
-            "assistantUpdateSeen": { "type": "boolean" },
-            "openBlock": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["kind", "contentIndex"],
-              "properties": {
-                "kind": { "enum": ["text", "thinking", "tool_call"] },
-                "contentIndex": { "type": "integer", "minimum": 0 }
-              }
-            },
+            "terminalCandidateRetained": { "type": "boolean" },
             "resultAccepted": { "type": "boolean" },
             "settled": { "type": "boolean" }
           }

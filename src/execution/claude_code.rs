@@ -5,15 +5,18 @@ use std::path::{Path, PathBuf};
 // This harness consumes the shared installation lifecycle but owns all profile policy below.
 // jscpd:ignore-start
 use super::harness_installation::{
-    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation,
-    ValidatedInstallationParts, discover_and_validate_installation, parse_numeric_component,
-    parse_probe_line, parse_probe_text, validate_installation_with as validate_shared_installation,
+    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
+    ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
+    parse_probe_text, validate_installation_with as validate_shared_installation,
     validate_selected_installation,
 };
 use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
 // jscpd:ignore-end
 
-pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_VERSION: &str = "2.1.234";
+pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
+pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.234";
+const CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 234);
+const CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (2, 2, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 1] = ["--help"];
 
 const REQUIRED_CAPABILITIES: [ClaudeCodeCapability; 13] = [
@@ -45,31 +48,7 @@ impl ClaudeCodeCompatibilityProfile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClaudeCodeVersion(Box<str>);
-
-impl ClaudeCodeVersion {
-    fn parse(observed: &str) -> Option<Self> {
-        let version = observed.strip_suffix(" (Claude Code)")?;
-        let mut components = version.split('.');
-        for _ in 0..3 {
-            parse_numeric_component(components.next()?)?;
-        }
-        if components.next().is_some() {
-            return None;
-        }
-        Some(Self(version.into()))
-    }
-
-    #[cfg(test)]
-    fn exact() -> Self {
-        Self(CLAUDE_CODE_STREAM_JSON_V1_VERSION.into())
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub(crate) type ClaudeCodeVersion = StableVersion;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaudeCodeCapability {
@@ -156,7 +135,8 @@ impl ValidatedClaudeCodeInstallation {
     pub(crate) fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: ClaudeCodeVersion::exact(),
+            version: ClaudeCodeVersion::parse(CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION)
+                .expect("the qualification version is a canonical stable version"),
             profile: ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1,
             capabilities: ClaudeCodeStreamJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
@@ -220,7 +200,7 @@ impl fmt::Display for ClaudeCodeInstallationFailure {
         match self {
             Self::Missing => write!(
                 formatter,
-                "Claude Code was not found in inherited PATH; install exact Claude Code {CLAUDE_CODE_STREAM_JSON_V1_VERSION}"
+                "Claude Code was not found in inherited PATH; install a stable Claude Code release in range {CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE}"
             ),
             Self::Unexecutable => formatter.write_str(
                 "Claude Code selected from inherited PATH could not complete its validation probes",
@@ -232,7 +212,7 @@ impl fmt::Display for ClaudeCodeInstallationFailure {
             ),
             Self::Unsupported(ClaudeCodeIncompatibility::Version(version)) => write!(
                 formatter,
-                "Claude Code version {version} selected from inherited PATH is unsupported; install exact Claude Code {CLAUDE_CODE_STREAM_JSON_V1_VERSION}"
+                "Claude Code version {version} selected from inherited PATH is unsupported; install a stable Claude Code release in range {CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE}"
             ),
             Self::Unsupported(ClaudeCodeIncompatibility::Capability(capability)) => write!(
                 formatter,
@@ -370,14 +350,27 @@ fn parse_version_output(
     let observed = parse_probe_line(output).ok_or(ClaudeCodeInstallationFailure::Malformed(
         ClaudeCodeProbe::Version,
     ))?;
-    ClaudeCodeVersion::parse(observed).ok_or(ClaudeCodeInstallationFailure::Malformed(
+    let version =
+        observed
+            .strip_suffix(" (Claude Code)")
+            .ok_or(ClaudeCodeInstallationFailure::Malformed(
+                ClaudeCodeProbe::Version,
+            ))?;
+    ClaudeCodeVersion::parse(version).ok_or(ClaudeCodeInstallationFailure::Malformed(
         ClaudeCodeProbe::Version,
     ))
 }
 
 fn compatibility_profile(version: &ClaudeCodeVersion) -> Option<ClaudeCodeCompatibilityProfile> {
-    (version.as_str() == CLAUDE_CODE_STREAM_JSON_V1_VERSION)
+    (version.numeric() >= CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION
+        && version.numeric() < CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION)
         .then_some(ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1)
+}
+
+pub(crate) fn compatibility_profile_for_version(
+    observed: &str,
+) -> Option<ClaudeCodeCompatibilityProfile> {
+    compatibility_profile(&ClaudeCodeVersion::parse(observed)?)
 }
 
 fn validate_capability_output(output: &CommandOutput) -> Result<(), ClaudeCodeInstallationFailure> {

@@ -27,7 +27,7 @@ use super::{
     FIXED_INVOCATION_ENVIRONMENT, initial_user_text_frame, normal_mode_arguments,
     result_mode_arguments, user_content_frame,
 };
-use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
+use crate::execution::claude_code::compatibility_profile_for_version;
 use crate::execution::workflow::admission::{CancellationReason, CancellationSource};
 use crate::execution::workflow::agent::{
     AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
@@ -241,6 +241,7 @@ where
             Arc::clone(&plan.expected_cwd),
             Arc::from(invocation.adapter().native_configuration().model.as_str()),
             Arc::clone(&plan.session_id),
+            Arc::from(invocation.adapter().version()),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
         );
@@ -256,10 +257,8 @@ where
             invocation.limits().result_settlement_grace(),
         )
         .await;
-        invocation
-            .diagnostic_session()
-            .retain_protocol_rejection_from(&outcome);
-        finish_agent_diagnostic_capture(diagnostic, &outcome).await;
+        finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
+            .await;
         outcome
     }
 }
@@ -312,7 +311,7 @@ where
         AgentInputKind::Message,
     )?;
     if invocation.adapter().profile() != AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
-        || invocation.adapter().version() != CLAUDE_CODE_STREAM_JSON_V1_VERSION
+        || compatibility_profile_for_version(invocation.adapter().version()).is_none()
         || !invocation.adapter().executable().is_absolute()
         || invocation
             .diagnostic_session()

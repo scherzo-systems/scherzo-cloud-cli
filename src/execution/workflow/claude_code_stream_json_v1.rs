@@ -14,7 +14,9 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
-use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
+#[cfg(test)]
+const QUALIFICATION_VERSION: &str =
+    crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTIC_SEQUENCE: u64 = i64::MAX as u64;
@@ -318,6 +320,7 @@ pub(crate) enum CompletedResultExchange {
 pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     expected_cwd: Arc<str>,
     expected_model: Arc<str>,
+    expected_claude_code_version: Arc<str>,
     value_kind: AgentValueKind,
     maximum_response_bytes: NonZeroU64,
     limits: ClaudeCodeStreamJsonV1ProtocolLimits,
@@ -347,6 +350,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         expected_cwd: Arc<str>,
         expected_model: Arc<str>,
         expected_session_id: Arc<str>,
+        expected_claude_code_version: Arc<str>,
         value_kind: AgentValueKind,
         maximum_response_bytes: NonZeroU64,
     ) -> Self {
@@ -354,6 +358,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             expected_cwd,
             expected_model,
             expected_session_id,
+            expected_claude_code_version,
             value_kind,
             maximum_response_bytes,
             ClaudeCodeStreamJsonV1ProtocolLimits::profile(),
@@ -364,6 +369,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         expected_cwd: Arc<str>,
         expected_model: Arc<str>,
         expected_session_id: Arc<str>,
+        expected_claude_code_version: Arc<str>,
         value_kind: AgentValueKind,
         maximum_response_bytes: NonZeroU64,
         limits: ClaudeCodeStreamJsonV1ProtocolLimits,
@@ -371,6 +377,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         Self {
             expected_cwd,
             expected_model,
+            expected_claude_code_version,
             value_kind,
             maximum_response_bytes,
             limits,
@@ -710,7 +717,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || required_string(object, "type") != Some("system")
             || required_string(object, "subtype") != Some("init")
             || required_string(object, "claude_code_version")
-                != Some(CLAUDE_CODE_STREAM_JSON_V1_VERSION)
+                != Some(self.expected_claude_code_version.as_ref())
             || required_string(object, "cwd") != Some(self.expected_cwd.as_ref())
             || required_string(object, "model") != Some(self.expected_model.as_ref())
             || required_string(object, "permissionMode") != Some(PERMISSION_MODE)

@@ -55,7 +55,10 @@ const PINNED_TEST_WATCHDOG: Duration = Duration::from_secs(20);
 const MODEL_NAME: &str = "scherzo-fake/conformance";
 
 fn conformance_executable() -> Option<PathBuf> {
-    option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE").map(PathBuf::from)
+    let expected_suffix = format!("-pi-{PI_JSON_V1_QUALIFICATION_VERSION}/bin/pi");
+    std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|path| path.to_string_lossy().ends_with(&expected_suffix))
 }
 
 #[derive(Clone, Copy)]
@@ -474,7 +477,7 @@ impl RealPiFixture {
         self.assert_retained_diagnostic_state();
         assert!(
             self.native_sessions().is_empty(),
-            "Pi 0.83 must not synthesize a session file before an assistant message completes"
+            "Pi 0.84 must not synthesize a session file before an assistant message completes"
         );
     }
 
@@ -515,7 +518,7 @@ impl RealPiFixture {
                 "stepId": "agent-step",
                 "invocationId": 0,
                 "profile": "PiJsonV1",
-                "piVersion": "0.83.0",
+                "piVersion": "0.84.2",
                 "nativeSession": {
                     "relativeDirectory": "session",
                     "formatVersion": 3
@@ -1445,7 +1448,7 @@ async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_real_pi_04_rejects_thinking_end_snapshot_disagreement() {
+async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
     if conformance_executable().is_none() {
         return;
     }
@@ -1466,44 +1469,50 @@ async fn pinned_real_pi_04_rejects_thinking_end_snapshot_disagreement() {
             "call": {
                 "id": "call-mismatched-thinking-end",
                 "name": "conformance_gate",
-                "arguments": {"value": "must-not-execute"}
+                "arguments": {"value": "continues"}
             }
         }));
 
-        let (fixture, outcome) = running.finish().await;
-        let AgentOutcome::Failed(failure) = outcome else {
-            panic!("mismatched thinking-end snapshots must fail: {outcome:?}");
-        };
-        assert!(matches!(
-            failure.cause(),
-            AgentFailureCause::HarnessProtocolFailed
-        ));
-        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        let tool_request = running.fixture.controller.next("tool").await;
         assert_eq!(
-            rejection["detail"]["reason"],
-            "thinking_finalization_rewrite"
+            tool_request.value["toolCallId"],
+            "call-mismatched-thinking-end"
         );
-        assert_eq!(rejection["detail"]["stage"], "assistant_transition");
-        assert_eq!(rejection["detail"]["assistantUpdate"], "thinking_end");
-        let serialized = rejection.to_string();
-        for content in [
-            STREAMED_THINKING,
-            FINALIZED_THINKING,
-            MISMATCHED_EVENT_CONTENT,
-        ] {
-            assert!(!serialized.contains(content));
-        }
-        assert!(serialized.len() < 16 * 1024);
+        tool_request.release(json!({"kind": "release"}));
+        let final_request = running.fixture.controller.next("model").await;
+        final_request.release(json!({
+            "kind": "text",
+            "blocks": ["completed after observational mismatch"],
+            "stopReason": "stop"
+        }));
+
+        let (mut fixture, outcome) = running.finish().await;
+        assert!(matches!(
+            outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+        ));
+        let reasoning = std::iter::from_fn(|| fixture.observations.try_recv().ok())
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::Reasoning { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reasoning
+                .iter()
+                .any(|text| text.as_ref() == STREAMED_THINKING)
+        );
+        assert!(
+            !reasoning
+                .iter()
+                .any(|text| text.as_ref() == FINALIZED_THINKING)
+        );
 
         fixture.assert_retained_diagnostic_state();
-        assert!(
-            fixture.native_sessions().len() <= 1,
-            "a protocol-rejected invocation may retain at most one native Pi session artifact"
-        );
         fixture.controller.shutdown().await;
     })
     .await
-    .expect("pinned real-Pi thinking-end rejection watchdog expired");
+    .expect("pinned real-Pi thinking-end tolerance watchdog expired");
 }
 
 #[expect(
@@ -1568,8 +1577,6 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
 
         let mut provider_error = false;
         let mut retry_lifecycle = Vec::new();
-        let mut interrupted_started = false;
-        let mut interrupted_updated = false;
         while let Ok(envelope) = fixture.observations.try_recv() {
             match envelope.observation() {
                 AgentObservation::Diagnostic { message, .. }
@@ -1583,22 +1590,10 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
                         crate::execution::workflow::agent::AgentLifecycleMilestone::RetryStarted
                             | crate::execution::workflow::agent::AgentLifecycleMilestone::RetryCompleted
                     ) => retry_lifecycle.push(*milestone),
-                AgentObservation::ToolCall {
-                    call_id,
-                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Started,
-                    ..
-                } if call_id.as_ref() == "call-interrupted" => interrupted_started = true,
-                AgentObservation::ToolCall {
-                    call_id,
-                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Updated,
-                    ..
-                } if call_id.as_ref() == "call-interrupted" => interrupted_updated = true,
-                AgentObservation::ToolCall {
-                    call_id,
-                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Completed,
-                    ..
-                } if call_id.as_ref() == "call-interrupted" => {
-                    panic!("the interrupted tool call was reported complete")
+                AgentObservation::ToolCall { call_id, .. }
+                    if call_id.as_ref() == "call-interrupted" =>
+                {
+                    panic!("delta-only updates exposed an interrupted call without final identity")
                 }
                 AgentObservation::ToolResult { call_id, .. }
                     if call_id.as_ref() == "call-interrupted" =>
@@ -1609,7 +1604,6 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
             }
         }
         assert!(provider_error);
-        assert!(interrupted_started && interrupted_updated);
         assert_eq!(
             retry_lifecycle,
             [

@@ -249,11 +249,11 @@ fn pinned_claude_code_00_qualification_anchor_is_exact() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         output.stdout,
-        format!("{CLAUDE_CODE_STREAM_JSON_V1_VERSION} (Claude Code)\n").as_bytes()
+        format!("{QUALIFICATION_VERSION} (Claude Code)\n").as_bytes()
     );
     println!(
         "qualified Claude Code version={} profile=ClaudeCodeStreamJsonV1 host={}-{}",
-        CLAUDE_CODE_STREAM_JSON_V1_VERSION,
+        QUALIFICATION_VERSION,
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
@@ -319,6 +319,7 @@ async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_ro
             Arc::from(expected_cwd.to_str().unwrap()),
             Arc::from(MODEL),
             Arc::from(DIRECT_SESSION_ID),
+            Arc::from(QUALIFICATION_VERSION),
             crate::execution::workflow::agent::AgentValueKind::Response,
             NonZeroU64::new(1024).unwrap(),
         );

@@ -97,7 +97,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
     let executable = std::env::current_exe().unwrap();
     let runner = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.83.7\n"),
+        version: output(b"0.84.7\n"),
         capabilities: output(COMPLETE_HELP.as_bytes()),
     };
 
@@ -108,7 +108,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
         installation.executable(),
         fs::canonicalize(executable).unwrap()
     );
-    assert_eq!(installation.version().as_str(), "0.83.7");
+    assert_eq!(installation.version().as_str(), "0.84.7");
     assert_eq!(installation.profile().as_str(), "PiJsonV1");
     assert_eq!(
         installation.capabilities().required(),
@@ -126,7 +126,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
 #[test]
 fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();
-    for unsupported in ["0.82.1", "0.84.0"] {
+    for unsupported in ["0.83.0", "0.84.1", "0.85.0"] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{unsupported}\n").as_bytes()),
@@ -144,7 +144,7 @@ fn version_range_and_capabilities_are_both_required() {
         );
     }
 
-    for malformed in ["0.83.0-rc.1", "0.083.0", "0.83"] {
+    for malformed in ["0.84.2-rc.1", "0.084.2", "0.84"] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{malformed}\n").as_bytes()),
@@ -158,7 +158,7 @@ fn version_range_and_capabilities_are_both_required() {
 
     let missing_session_directory = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.83.0\n"),
+        version: output(b"0.84.2\n"),
         capabilities: output(
             COMPLETE_HELP
                 .replace("--session-dir <dir>", "--session-root <dir>")
@@ -178,7 +178,7 @@ fn version_range_and_capabilities_are_both_required() {
 
     let missing_trust = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.83.0\n"),
+        version: output(b"0.84.2\n"),
         capabilities: output(
             COMPLETE_HELP
                 .replace("--approve, -a", "--permit, -p")

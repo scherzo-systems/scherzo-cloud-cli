@@ -210,11 +210,9 @@ where
             },
         )
         .await;
-        invocation
-            .diagnostic_session()
-            .retain_protocol_rejection_from(&outcome);
         let bridge_shutdown = shutdown_result_bridge(result_bridge).await;
-        finish_agent_diagnostic_capture(diagnostic, &outcome).await;
+        finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
+            .await;
         if bridge_shutdown.is_err() && matches!(outcome, AgentOutcome::Completed(_)) {
             failed(AgentFailureCause::HarnessProtocolFailed)
         } else {
@@ -529,7 +527,7 @@ where
     ))
 }
 
-// Pi 0.83 treats the CLI append value as a replacement for the trusted
+// Pi 0.84 treats the CLI append value as a replacement for the trusted
 // project's APPEND_SYSTEM.md, so preserve both inputs in the one native flag.
 fn combined_system_prompt(
     working_directory: &Path,

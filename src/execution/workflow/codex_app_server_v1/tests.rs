@@ -8,7 +8,6 @@ use super::*;
 const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
 const CODEX_HOME: &str = "/synthetic/codex-home";
 const SQLITE_HOME: &str = "/synthetic/sqlite-home";
-const ROLLOUT_PATH: &str = "/synthetic/codex-home/sessions/2026/08/18/rollout-2026-08-18T00-00-00-018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12.jsonl";
 
 fn parser(
     value_kind: AgentValueKind,
@@ -144,8 +143,8 @@ fn thread_response(parser: &mut CodexAppServerV1Parser, provider: &str) {
                 "thread": {
                     "id": "thread-1",
                     "sessionId": "thread-1",
-                    "ephemeral": false,
-                    "path": ROLLOUT_PATH,
+                    "ephemeral": true,
+                    "path": null,
                     "cliVersion": "0.147.0",
                     "turns": [],
                     "cwd": "/synthetic/project",
@@ -186,8 +185,8 @@ fn turn_response(parser: &mut CodexAppServerV1Parser) {
             "params": {"thread": {
                 "id": "thread-1",
                 "sessionId": "thread-1",
-                "ephemeral": false,
-                "path": ROLLOUT_PATH,
+                "ephemeral": true,
+                "path": null,
                 "cliVersion": "0.147.0",
                 "cwd": "/synthetic/project",
             }}
@@ -232,7 +231,7 @@ fn running_parser(
         thread["params"]["developerInstructions"],
         "native developer\n\nscherzo system"
     );
-    assert_eq!(thread["params"]["ephemeral"], false);
+    assert_eq!(thread["params"]["ephemeral"], true);
     assert_eq!(
         thread["params"]["config"],
         json!({"bypass_hook_trust": true})
@@ -330,8 +329,8 @@ fn admitted_text_attachment_fits_the_initial_native_turn() {
                 "thread": {
                     "id": "thread-1",
                     "sessionId": "thread-1",
-                    "ephemeral": false,
-                    "path": ROLLOUT_PATH,
+                    "ephemeral": true,
+                    "path": null,
                     "cliVersion": "0.147.0",
                     "turns": [],
                     "cwd": "/synthetic/project",
@@ -1004,8 +1003,8 @@ fn malformed_oversized_truncated_and_correlation_inputs_are_bounded_by_phase() {
                     "thread": {
                         "id": "thread-1",
                         "sessionId": "thread-1",
-                        "ephemeral": false,
-                        "path": ROLLOUT_PATH,
+                        "ephemeral": true,
+                        "path": null,
                         "cliVersion": "0.147.0",
                         "turns": [],
                         "cwd": "/synthetic/project",

@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
 use crate::execution::claude_code::{
-    CLAUDE_CODE_STREAM_JSON_V1_VERSION, ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure,
-    ClaudeCodeProbe, discover_and_validate_claude_code_installation,
+    CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION, CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE,
+    ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
+    discover_and_validate_claude_code_installation,
 };
 
 pub(super) struct ClaudeCodeCheck;
@@ -31,7 +32,7 @@ impl DoctorCheck for ClaudeCodeCheck {
                     .iter()
                     .map(|capability| capability.as_str()),
                 installation.executable(),
-                expected_version_details(),
+                compatibility_details(),
             ),
             Err(failure) => failure_outcome(failure),
         }
@@ -43,13 +44,13 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
     match failure {
         ClaudeCodeInstallationFailure::Missing => Outcome::fail(
             "missing_claude_code_installation",
-            "Claude Code was not found in inherited PATH; install the exact supported release.",
-            expected_version_details(),
+            "Claude Code was not found in inherited PATH; install a stable release in the supported range.",
+            compatibility_details(),
         ),
         ClaudeCodeInstallationFailure::Unexecutable => Outcome::fail(
             "unexecutable_claude_code_installation",
             "Claude Code selected from inherited PATH could not complete its validation probes.",
-            expected_version_details(),
+            compatibility_details(),
         ),
         ClaudeCodeInstallationFailure::Malformed(probe) => {
             let (code, message) = match probe {
@@ -62,50 +63,42 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
                     "Claude Code selected from inherited PATH returned malformed capability help.",
                 ),
             };
-            Outcome::fail(
-                code,
-                message,
-                BTreeMap::from([
-                    (
-                        "expectedVersion".to_owned(),
-                        CLAUDE_CODE_STREAM_JSON_V1_VERSION.to_owned(),
-                    ),
-                    ("probe".to_owned(), probe.as_str().to_owned()),
-                ]),
-            )
+            let mut details = compatibility_details();
+            details.insert("probe".to_owned(), probe.as_str().to_owned());
+            Outcome::fail(code, message, details)
         }
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Version(version)) => {
+            let mut details = compatibility_details();
+            details.insert("version".to_owned(), version);
             Outcome::fail(
                 "unsupported_claude_code_version",
-                "The Claude Code version selected from inherited PATH is not the exact supported release.",
-                BTreeMap::from([
-                    (
-                        "expectedVersion".to_owned(),
-                        CLAUDE_CODE_STREAM_JSON_V1_VERSION.to_owned(),
-                    ),
-                    ("version".to_owned(), version),
-                ]),
+                "The Claude Code version selected from inherited PATH is outside the supported stable release range.",
+                details,
             )
         }
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Capability(
             capability,
-        )) => Outcome::fail(
-            "unsupported_claude_code_capability",
-            "Claude Code selected from inherited PATH does not provide every capability required by ClaudeCodeStreamJsonV1.",
-            BTreeMap::from([
-                ("capability".to_owned(), capability.as_str().to_owned()),
-                (
-                    "expectedVersion".to_owned(),
-                    CLAUDE_CODE_STREAM_JSON_V1_VERSION.to_owned(),
-                ),
-            ]),
-        ),
+        )) => {
+            let mut details = compatibility_details();
+            details.insert("capability".to_owned(), capability.as_str().to_owned());
+            Outcome::fail(
+                "unsupported_claude_code_capability",
+                "Claude Code selected from inherited PATH does not provide every capability required by ClaudeCodeStreamJsonV1.",
+                details,
+            )
+        }
     }
 }
 
-fn expected_version_details() -> BTreeMap<String, String> {
-    BTreeMap::from([(
-        "expectedVersion".to_owned(),
-        CLAUDE_CODE_STREAM_JSON_V1_VERSION.to_owned(),
-    )])
+fn compatibility_details() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "qualificationVersion".to_owned(),
+            CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION.to_owned(),
+        ),
+        (
+            "supportedRange".to_owned(),
+            CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE.to_owned(),
+        ),
+    ])
 }

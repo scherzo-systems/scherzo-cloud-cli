@@ -186,8 +186,10 @@ credential-helper configuration remain available for local repository setup and 
 The local caller owns that authority; Runner Serve applies a separate managed credential-isolation policy. The CLI
 inspects the resolved agent steps and validates each required harness once: `pi` for
 PiJsonV1 and `claude` for ClaudeCodeStreamJsonV1. Each search selects the first executable candidate in inherited
-`PATH` and pins its canonical absolute path, exact version, profile, and capabilities for
-the run. Later `PATH` changes cannot switch either executable. Command-only workflows
+`PATH` and pins its canonical absolute path, exact observed version, profile, and
+capabilities for the run. Claude Code must be a canonical stable release in
+`>=2.1.234 <2.2.0`, and every native initialization frame must report the pinned observed
+version exactly. Later `PATH` changes cannot switch either executable. Command-only workflows
 probe neither harness; Pi-only and Claude-only workflows do not require the unrelated
 installation. A mixed workflow requires both and never substitutes or falls back between
 them. Workflow definitions, imports, and remote values cannot supply an executable or
@@ -433,7 +435,7 @@ probe and one capability-help probe. The probes clear the child environment exce
 the captured inherited `PATH`, fresh temporary Pi state and working-directory paths, and
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
-canonical stable versions in the range `>=0.83.0 <0.84.0` with the JSON event,
+canonical stable versions in the range `>=0.84.2 <0.85.0` with the JSON event,
 custom-session-directory, extension, system-prompt append, and invocation-scoped
 `--approve` capabilities required by `PiJsonV1`. It retains the exact observed release, never falls
 through to another candidate after selection, and does not inspect model metadata or
@@ -442,13 +444,15 @@ decisions. Missing, unexecutable, malformed, unsupported-version, and missing-ca
 outcomes have distinct report codes.
 
 The Claude Code check follows the same first-candidate and immutable-path rules for
-`claude`, but accepts only exact release `2.1.234`. Scherzo does not install or upgrade
-that executable. Its isolated `--version` and `--help` probes require the closed stream
+`claude`, admitting canonical stable releases in `>=2.1.234 <2.2.0`. Scherzo does not
+install or upgrade that executable. Its isolated `--version` and `--help` probes require the closed stream
 input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
-capabilities used by `ClaudeCodeStreamJsonV1`. The report
-contains only status, profile, expected and observed version, closed capabilities, and
-the selected absolute path. It never exposes environment values, credentials, or loaded
+capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
+observed version, supported range, exact repository qualification version, closed
+capabilities, and the selected absolute path. Qualification remains pinned to `2.1.234`
+and does not claim that every admitted release or unexecuted host received exact-binary
+conformance. The report never exposes environment values, credentials, or loaded
 Claude settings. The JSON report has no `ready` field.
 
 ## Runner serve
@@ -510,16 +514,19 @@ grace or revoke it immediately if compromise is suspected. Never print an activa
 artifact or runner state while transferring or verifying it.
 
 Runner startup selects `pi` and `claude` independently from its inherited
-operator-controlled `PATH`. Install exact Claude Code 2.1.234 in that service
-environment before starting a runner that should accept Claude work; Scherzo never
-installs it automatically. Each successful initialization is validated once and retained
-as an immutable snapshot for the process lifetime: Pi requires a version in
-`>=0.83.0 <0.84.0`, while Claude Code requires exact `2.1.234`. Admission and invocation
+operator-controlled `PATH`. Install one stable Claude Code release in
+`>=2.1.234 <2.2.0` in that service environment before starting a runner that should
+accept Claude work; Scherzo never installs it automatically. Each successful installation
+is validated once and retained as an immutable snapshot for the process lifetime: Pi
+requires a version in `>=0.84.2 <0.85.0`, while Claude Code requires a version in
+`>=2.1.234 <2.2.0`. Admission and invocation
 never repeat either lookup or probe. A missing or incompatible installation leaves only
 that harness unavailable, so Runner Serve remains available for command-only and
 unrelated-harness assignments. An assignment requiring the unavailable harness is rejected
 before launch, and selection never falls through to another executable. Assignments and
-workflow data cannot influence selection. Claude runs in the profile's fixed unattended
+workflow data cannot influence selection. Each Claude execution requires every native
+initialization frame to report the exact version retained at startup; a contradiction
+fails closed without committing workflow output. Claude runs in the profile's fixed unattended
 `bypassPermissions` mode, which is not a sandbox. The runner owner remains responsible
 for filesystem, process, network, resource, and secret isolation and for trusted user,
 project, and local Claude settings, instructions, skills, hooks, MCP servers, and plugins.

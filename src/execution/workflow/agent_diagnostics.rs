@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,14 +24,9 @@ const NATIVE_SESSION_DIRECTORY: &str = "session";
 const CLAUDE_CODE_TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const CLAUDE_CODE_RESOURCES_DIRECTORY: &str = "resources";
 const CLAUDE_CODE_NATIVE_SESSION_FORMAT_VERSION: u8 = 1;
-const CODEX_NATIVE_SESSION_FORMAT_VERSION: u8 = 1;
-const CODEX_THREAD_CORRELATION_FILE: &str = "thread.json";
-const CODEX_ROLLOUT_FILE: &str = "rollout.jsonl";
-const CODEX_ROLLOUT_REJECTION_FILE: &str = "rollout-rejection.json";
 const METADATA_FILE: &str = "metadata.json";
 const PROTOCOL_REJECTION_FILE: &str = "protocol-rejection.json";
 const MAXIMUM_PROTOCOL_REJECTION_BYTES: usize = 16 * 1024;
-const MAXIMUM_CODEX_ROLLOUT_REJECTION_BYTES: usize = 4 * 1024;
 const IDENTITY_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +51,6 @@ pub(crate) struct AgentDiagnosticSession {
     directory_handle: Arc<OwnedFd>,
     pi_native_session: Option<PiNativeDiagnosticSession>,
     claude_code_native_session: Option<ClaudeCodeNativeDiagnosticSession>,
-    codex_native_session: Option<CodexNativeDiagnosticSession>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,35 +65,6 @@ struct ClaudeCodeNativeDiagnosticSession {
     directory_handle: Arc<OwnedFd>,
     resources_directory_handle: Arc<OwnedFd>,
     session_id: Arc<str>,
-}
-
-#[derive(Clone, Debug)]
-struct CodexNativeDiagnosticSession {
-    directory: PathBuf,
-    directory_handle: Arc<OwnedFd>,
-}
-
-pub(crate) struct PendingCodexRollout {
-    directory_handle: Arc<OwnedFd>,
-    device: libc::dev_t,
-    inode: libc::ino_t,
-    keep: bool,
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CodexRolloutRejectionReason {
-    StateBoundaryUnavailable,
-    PathOutsideStateBoundary,
-    PathShapeInvalid,
-    PathComponentInvalid,
-    RolloutMissing,
-    UnexpectedFileKind,
-    ThreadIdentityMismatch,
-    PathReplaced,
-    RetainedStorageUnavailable,
-    AmbientRemovalFailed,
-    RolloutTooLarge,
 }
 
 #[derive(Serialize)]
@@ -145,29 +110,6 @@ struct CodexDiagnosticSessionMetadata<'a> {
     invocation_id: u64,
     profile: &'static str,
     codex_version: &'a str,
-    native_session: NativeSessionMetadata,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexThreadCorrelation<'a> {
-    schema_version: u8,
-    thread_id: &'a str,
-    native_rollout: CodexNativeRolloutMetadata,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexNativeRolloutMetadata {
-    relative_file: &'static str,
-    format_version: u8,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexRolloutRejection {
-    schema_version: u8,
-    reason: CodexRolloutRejectionReason,
 }
 
 impl AgentCompatibilityProfile {
@@ -313,7 +255,7 @@ impl AgentDiagnosticSessionStore {
                     directory_handle,
                 ))
             };
-        let (pi_native_session, claude_code_native_session, codex_native_session) = match profile {
+        let (pi_native_session, claude_code_native_session) = match profile {
             AgentCompatibilityProfile::PiJsonV1 => {
                 let (directory, directory_handle) = create_native_session()?;
                 (
@@ -321,7 +263,6 @@ impl AgentDiagnosticSessionStore {
                         directory,
                         directory_handle: Arc::new(directory_handle),
                     }),
-                    None,
                     None,
                 )
             }
@@ -346,20 +287,9 @@ impl AgentDiagnosticSessionStore {
                         resources_directory_handle: Arc::new(resources_directory_handle),
                         session_id: generate_claude_code_session_id()?,
                     }),
-                    None,
                 )
             }
-            AgentCompatibilityProfile::CodexAppServerV1 => {
-                let (directory, directory_handle) = create_native_session()?;
-                (
-                    None,
-                    None,
-                    Some(CodexNativeDiagnosticSession {
-                        directory,
-                        directory_handle: Arc::new(directory_handle),
-                    }),
-                )
-            }
+            AgentCompatibilityProfile::CodexAppServerV1 => (None, None),
         };
 
         if let Some(owner) = &self.local_owner {
@@ -373,9 +303,6 @@ impl AgentDiagnosticSessionStore {
             sync_directory(native_session.resources_directory_handle.as_ref())?;
             sync_directory(native_session.directory_handle.as_ref())?;
         }
-        if let Some(native_session) = &codex_native_session {
-            sync_directory(native_session.directory_handle.as_ref())?;
-        }
         sync_directory(invocation)?;
         sync_directory(profile_directory)?;
         sync_directory(self.root.as_ref())?;
@@ -385,7 +312,6 @@ impl AgentDiagnosticSessionStore {
             directory_handle: Arc::new(dup(invocation).map_err(|_| AgentDiagnosticSessionError)?),
             pi_native_session,
             claude_code_native_session,
-            codex_native_session,
         };
         session.verify_path_binding()?;
         match profile {
@@ -395,9 +321,7 @@ impl AgentDiagnosticSessionStore {
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
                 session.verify_claude_code_native_session_path_binding()?;
             }
-            AgentCompatibilityProfile::CodexAppServerV1 => {
-                session.verify_codex_native_session_path_binding()?;
-            }
+            AgentCompatibilityProfile::CodexAppServerV1 => {}
         }
         Ok(session)
     }
@@ -449,10 +373,6 @@ fn metadata_bytes(
                 invocation_id: identity.invocation().transition_sequence.get(),
                 profile: "CodexAppServerV1",
                 codex_version: harness_version,
-                native_session: NativeSessionMetadata {
-                    relative_directory: NATIVE_SESSION_DIRECTORY,
-                    format_version: CODEX_NATIVE_SESSION_FORMAT_VERSION,
-                },
             })
         }
     }
@@ -492,12 +412,6 @@ impl AgentDiagnosticSession {
     pub(crate) fn claude_code_native_resources_directory(&self) -> Option<PathBuf> {
         self.claude_code_native_session_directory()
             .map(|directory| directory.join(CLAUDE_CODE_RESOURCES_DIRECTORY))
-    }
-
-    pub(crate) fn codex_native_session_directory(&self) -> Option<&Path> {
-        self.codex_native_session
-            .as_ref()
-            .map(|session| session.directory.as_path())
     }
 
     pub(crate) fn verify_path_binding(&self) -> Result<(), AgentDiagnosticSessionError> {
@@ -566,117 +480,6 @@ impl AgentDiagnosticSession {
         )
     }
 
-    pub(crate) fn verify_codex_native_session_path_binding(
-        &self,
-    ) -> Result<(), AgentDiagnosticSessionError> {
-        let native_session = self
-            .codex_native_session
-            .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
-        verify_directory_binding(
-            &native_session.directory,
-            native_session.directory_handle.as_ref(),
-        )
-    }
-
-    pub(crate) fn retain_codex_thread_correlation(
-        &self,
-        thread_id: &str,
-    ) -> Result<(), AgentDiagnosticSessionError> {
-        self.verify_codex_native_session_path_binding()?;
-        let native_session = self
-            .codex_native_session
-            .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
-        let mut bytes = serde_json::to_vec_pretty(&CodexThreadCorrelation {
-            schema_version: 1,
-            thread_id,
-            native_rollout: CodexNativeRolloutMetadata {
-                relative_file: CODEX_ROLLOUT_FILE,
-                format_version: CODEX_NATIVE_SESSION_FORMAT_VERSION,
-            },
-        })
-        .map_err(|_| AgentDiagnosticSessionError)?;
-        bytes.push(b'\n');
-        write_immutable_file(
-            native_session.directory_handle.as_ref(),
-            CODEX_THREAD_CORRELATION_FILE,
-            &bytes,
-        )?;
-        sync_directory(native_session.directory_handle.as_ref())
-    }
-
-    pub(crate) fn retain_codex_rollout_rejection(
-        &self,
-        reason: CodexRolloutRejectionReason,
-    ) -> Result<(), AgentDiagnosticSessionError> {
-        self.verify_codex_native_session_path_binding()?;
-        let native_session = self
-            .codex_native_session
-            .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
-        let mut bytes = serde_json::to_vec_pretty(&CodexRolloutRejection {
-            schema_version: 1,
-            reason,
-        })
-        .map_err(|_| AgentDiagnosticSessionError)?;
-        bytes.push(b'\n');
-        if bytes.len() > MAXIMUM_CODEX_ROLLOUT_REJECTION_BYTES {
-            return Err(AgentDiagnosticSessionError);
-        }
-        write_immutable_file(
-            native_session.directory_handle.as_ref(),
-            CODEX_ROLLOUT_REJECTION_FILE,
-            &bytes,
-        )?;
-        sync_directory(native_session.directory_handle.as_ref())
-    }
-
-    pub(crate) fn write_codex_rollout_from(
-        &self,
-        source: &mut File,
-        maximum_bytes: u64,
-    ) -> Result<(PendingCodexRollout, bool), AgentDiagnosticSessionError> {
-        self.verify_codex_native_session_path_binding()?;
-        let native_session = self
-            .codex_native_session
-            .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
-        let descriptor = openat(
-            native_session.directory_handle.as_ref(),
-            CODEX_ROLLOUT_FILE,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|_| AgentDiagnosticSessionError)?;
-        let identity = fstat(&descriptor).map_err(|_| AgentDiagnosticSessionError)?;
-        let pending = PendingCodexRollout {
-            directory_handle: Arc::clone(&native_session.directory_handle),
-            device: identity.st_dev,
-            inode: identity.st_ino,
-            keep: false,
-        };
-        let mut destination = File::from(descriptor);
-        let copied = std::io::copy(&mut (&mut *source).take(maximum_bytes), &mut destination)
-            .map_err(|_| AgentDiagnosticSessionError)?;
-        let complete = if copied < maximum_bytes {
-            true
-        } else {
-            let mut trailing = [0_u8; 1];
-            source
-                .read(&mut trailing)
-                .map(|read| read == 0)
-                .map_err(|_| AgentDiagnosticSessionError)?
-        };
-        destination
-            .flush()
-            .and_then(|()| destination.sync_all())
-            .and_then(|()| fchmod(destination.as_fd(), Mode::RUSR).map_err(std::io::Error::from))
-            .map_err(|_| AgentDiagnosticSessionError)?;
-        sync_directory(native_session.directory_handle.as_ref())?;
-        Ok((pending, complete))
-    }
-
     #[cfg(test)]
     pub(crate) fn fixture(native_session_directory: PathBuf) -> Self {
         std::fs::create_dir_all(&native_session_directory).unwrap();
@@ -692,7 +495,6 @@ impl AgentDiagnosticSession {
                 directory: native_session_directory,
             }),
             claude_code_native_session: None,
-            codex_native_session: None,
         }
     }
 
@@ -719,41 +521,21 @@ impl AgentDiagnosticSession {
                 directory: native_session_directory,
                 session_id: Arc::from(FIXTURE_CLAUDE_CODE_SESSION_ID),
             }),
-            codex_native_session: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn codex_fixture(native_session_directory: PathBuf) -> Self {
-        std::fs::create_dir_all(&native_session_directory).unwrap();
-        let (directory, directory_handle) = fixture_diagnostic_directory(&native_session_directory);
+    pub(crate) fn codex_fixture(directory: PathBuf) -> Self {
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory_handle = Arc::new(
+            open_directory_path(&directory)
+                .expect("the Codex diagnostic-session fixture must be openable"),
+        );
         Self {
             directory_handle,
             directory,
             pi_native_session: None,
             claude_code_native_session: None,
-            codex_native_session: Some(CodexNativeDiagnosticSession {
-                directory_handle: Arc::new(
-                    open_directory_path(&native_session_directory)
-                        .expect("the Codex native diagnostic-session fixture must be openable"),
-                ),
-                directory: native_session_directory,
-            }),
-        }
-    }
-}
-
-impl PendingCodexRollout {
-    pub(crate) fn keep(mut self) {
-        self.keep = true;
-    }
-}
-
-impl Drop for PendingCodexRollout {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ =
-                remove_owned_codex_rollout(self.directory_handle.as_ref(), self.device, self.inode);
         }
     }
 }
@@ -832,24 +614,6 @@ fn remove_protocol_rejection_residue(
                 .map_err(|_| AgentDiagnosticSessionError)
         }
     }
-}
-
-fn remove_owned_codex_rollout(
-    directory: &OwnedFd,
-    device: libc::dev_t,
-    inode: libc::ino_t,
-) -> Result<(), AgentDiagnosticSessionError> {
-    let metadata = statat(directory, CODEX_ROLLOUT_FILE, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|_| AgentDiagnosticSessionError)?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
-        || metadata.st_dev != device
-        || metadata.st_ino != inode
-    {
-        return Err(AgentDiagnosticSessionError);
-    }
-    unlinkat(directory, CODEX_ROLLOUT_FILE, AtFlags::empty())
-        .map_err(|_| AgentDiagnosticSessionError)?;
-    sync_directory(directory)
 }
 
 fn write_immutable_file(
@@ -940,7 +704,7 @@ mod tests {
         let (attempt_path, store) = diagnostic_store(&temporary);
         let identity = invocation_identity();
         let allocated = store
-            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.83.0")
+            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2")
             .unwrap();
         allocated.verify_path_binding().unwrap();
         allocated.verify_pi_native_session_path_binding().unwrap();
@@ -950,7 +714,7 @@ mod tests {
         std::fs::create_dir_all(&attempt_path).unwrap();
 
         assert!(matches!(
-            store.allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.83.0"),
+            store.allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2"),
             Err(AgentDiagnosticSessionError)
         ));
     }
@@ -962,7 +726,7 @@ mod tests {
         let identity = invocation_identity();
 
         let first = store
-            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.83.0")
+            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2")
             .unwrap();
         std::fs::write(
             first
@@ -973,7 +737,7 @@ mod tests {
         )
         .unwrap();
         let second = store
-            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.83.0")
+            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2")
             .unwrap();
 
         let first_directory = first.pi_native_session_directory().unwrap();
@@ -998,7 +762,7 @@ mod tests {
                     "stepId": "agent-step",
                     "invocationId": 0,
                     "profile": "PiJsonV1",
-                    "piVersion": "0.83.0",
+                    "piVersion": "0.84.2",
                     "nativeSession": {
                         "relativeDirectory": "session",
                         "formatVersion": 3
@@ -1014,7 +778,7 @@ mod tests {
         let (_, store) = diagnostic_store(&temporary);
         let identity = invocation_identity();
         let allocated = store
-            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.83.0")
+            .allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2")
             .unwrap();
 
         let mut parser =
@@ -1150,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_diagnostics_allocate_distinct_correlated_native_rollout_locations() {
+    fn codex_diagnostics_retain_invocation_metadata_without_native_session_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let (_, store) = diagnostic_store(&temporary);
         let identity = invocation_identity();
@@ -1158,14 +922,14 @@ mod tests {
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::CodexAppServerV1,
-                "0.147.0",
+                "0.147.23",
             )
             .unwrap();
         let second = store
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::CodexAppServerV1,
-                "0.147.0",
+                "0.147.23",
             )
             .unwrap();
         let (_, retry_store) = diagnostic_store_for_attempt(&temporary, 2);
@@ -1173,32 +937,15 @@ mod tests {
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::CodexAppServerV1,
-                "0.147.0",
+                "0.147.23",
             )
             .unwrap();
 
-        assert_ne!(
-            first.codex_native_session_directory(),
-            second.codex_native_session_directory()
-        );
-        assert_ne!(
-            first.codex_native_session_directory(),
-            retried.codex_native_session_directory()
-        );
-        first.verify_codex_native_session_path_binding().unwrap();
-        first
-            .retain_codex_thread_correlation("018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12")
-            .unwrap();
-        assert!(
-            !first
-                .codex_native_session_directory()
-                .unwrap()
-                .join(CODEX_ROLLOUT_FILE)
-                .exists()
-        );
-
-        // Keep the complete Codex correlation document explicit; sharing another
-        // profile's metadata fixture would hide its exact version and rollout format.
+        assert_ne!(first.directory(), second.directory());
+        assert_ne!(first.directory(), retried.directory());
+        assert_eq!(std::fs::read_dir(first.directory()).unwrap().count(), 1);
+        // Keep Codex's complete no-native-session metadata explicit so profile fields
+        // remain reviewable without coupling this fixture to Pi's native-session shape.
         // jscpd:ignore-start
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(first.directory().join(METADATA_FILE)).unwrap())
@@ -1212,33 +959,12 @@ mod tests {
                 "stepId": "agent-step",
                 "invocationId": 0,
                 "profile": "CodexAppServerV1",
-                "codexVersion": "0.147.0",
-                "nativeSession": {
-                    "relativeDirectory": "session",
-                    "formatVersion": 1
-                }
+                "codexVersion": "0.147.23"
             })
         );
-        // jscpd:ignore-end
-        let correlation: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(
-                first
-                    .codex_native_session_directory()
-                    .unwrap()
-                    .join(CODEX_THREAD_CORRELATION_FILE),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            correlation["threadId"],
-            "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12"
-        );
-        assert_eq!(
-            correlation["nativeRollout"]["relativeFile"],
-            CODEX_ROLLOUT_FILE
-        );
         assert!(metadata.get("environment").is_none());
+        assert!(metadata.get("nativeSession").is_none());
+        // jscpd:ignore-end
         let retry_metadata: serde_json::Value = serde_json::from_slice(
             &std::fs::read(retried.directory().join(METADATA_FILE)).unwrap(),
         )

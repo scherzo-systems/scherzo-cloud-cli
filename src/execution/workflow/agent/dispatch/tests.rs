@@ -180,7 +180,7 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
             &temporary,
             AgentCompatibilityProfile::PiJsonV1,
             "/validated/pi",
-            "0.83.0",
+            "0.84.2",
             pi_config.clone(),
             PiJsonV1ProtocolLimits::profile(),
         )),

@@ -79,13 +79,16 @@ executable's native version and help probes. The isolated probes retain inherite
 only so an environment-based launcher can resolve its interpreter; they never use it to
 select another harness candidate.
 
-Pi maps canonical stable versions in `>=0.83.0 <0.84.0` into
-`ValidatedPiInstallation`. Claude Code accepts only exact `2.1.234` and maps it into
-`ValidatedClaudeCodeInstallation`. Each immutable value carries the absolute path, exact
+Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
+`ValidatedPiInstallation`. Claude Code maps canonical stable versions in
+`>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
+qualifies exact release `2.1.234`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission
 inspect the resolved workflow and require only the installation selected by each agent
 step. Shared admission and later execution use those values without another `PATH` lookup
 or native probe, so later `PATH` changes cannot switch an active operation's executable.
+Claude execution also requires every native initialization frame to equal the retained
+observed version rather than a compile-time qualification release.
 Command-only work requires neither harness; Pi-only and Claude-only work require no
 unrelated installation. Runner Serve retains independent optional Pi and Claude Code
 snapshots for its process lifetime and exposes neither through the runner protocol.

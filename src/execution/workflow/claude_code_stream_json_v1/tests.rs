@@ -57,10 +57,19 @@ fn framed(values: &[Value]) -> Vec<u8> {
 }
 
 fn parser(kind: AgentValueKind, maximum_response_bytes: u64) -> ClaudeCodeStreamJsonV1Parser {
+    parser_for_version(kind, maximum_response_bytes, QUALIFICATION_VERSION)
+}
+
+fn parser_for_version(
+    kind: AgentValueKind,
+    maximum_response_bytes: u64,
+    version: &str,
+) -> ClaudeCodeStreamJsonV1Parser {
     ClaudeCodeStreamJsonV1Parser::profile(
         Arc::from(CWD),
         Arc::from(MODEL),
         Arc::from(SESSION_ID),
+        Arc::from(version),
         kind,
         NonZeroU64::new(maximum_response_bytes).unwrap(),
     )
@@ -132,7 +141,7 @@ fn text_message(id: &str, deltas: &[&str], present: bool) -> Vec<Value> {
 }
 
 fn completed_text_transcript(deltas: &[&str], present: bool) -> Vec<u8> {
-    let mut values = vec![init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID)];
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
     values.extend(text_message("msg-final", deltas, present));
     values.push(result(SESSION_ID));
     framed(&values)
@@ -211,7 +220,7 @@ fn normal_mode_arguments_and_input_frame_are_exact() {
 fn parser_requires_matching_initialization_and_serialized_exchange_results() {
     let mut parser = parser(AgentValueKind::None, 1024);
     let first = framed(&[
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        init(QUALIFICATION_VERSION, SESSION_ID),
         status(SESSION_ID),
         result(SESSION_ID),
     ]);
@@ -222,10 +231,7 @@ fn parser_requires_matching_initialization_and_serialized_exchange_results() {
     parser.begin_exchange().unwrap();
     parser
         .push_stdout(
-            &framed(&[
-                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-                result(SESSION_ID),
-            ]),
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
             drop,
         )
         .unwrap();
@@ -234,6 +240,41 @@ fn parser_requires_matching_initialization_and_serialized_exchange_results() {
     assert_eq!(
         parser.finish(true),
         AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+}
+
+#[test]
+fn every_initialization_must_match_the_validated_installation_version() {
+    let admitted_version = "2.1.235";
+    let mut matching = parser_for_version(AgentValueKind::None, 1024, admitted_version);
+    matching
+        .push_stdout(
+            &framed(&[init(admitted_version, SESSION_ID), result(SESSION_ID)]),
+            drop,
+        )
+        .unwrap();
+    assert_eq!(
+        matching.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+
+    let mut contradictory = parser_for_version(AgentValueKind::None, 1024, admitted_version);
+    contradictory
+        .push_stdout(
+            &framed(&[init(admitted_version, SESSION_ID), result(SESSION_ID)]),
+            drop,
+        )
+        .unwrap();
+    contradictory.begin_exchange().unwrap();
+    assert_eq!(
+        contradictory
+            .push_stdout(&framed(&[init(QUALIFICATION_VERSION, SESSION_ID,)]), drop,)
+            .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed
+    );
+    assert_failed(
+        contradictory.finish(true),
+        AgentFailureCause::HarnessProtocolFailed,
     );
 }
 
@@ -256,7 +297,7 @@ fn recorded_response_uses_only_final_main_thread_deltas_once() {
 
 #[test]
 fn contradictory_nominal_assistant_text_rejects_the_response() {
-    let mut values = vec![init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID)];
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
     values.extend([
         message_start("msg-contradictory"),
         stream_event(json!({
@@ -298,7 +339,7 @@ fn contradictory_nominal_assistant_text_rejects_the_response() {
 #[test]
 fn stream_continuations_from_another_thread_reject_the_response() {
     let values = [
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        init(QUALIFICATION_VERSION, SESSION_ID),
         message_start("msg-main"),
         json!({
             "type": "stream_event",
@@ -381,7 +422,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
         })
     );
 
-    let mut initialization = init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID);
+    let mut initialization = init(QUALIFICATION_VERSION, SESSION_ID);
     initialization["cwd"] = json!("/contradictory");
     let (_, invalid_initialization) =
         replay(&framed(&[initialization]), AgentValueKind::None, 1024);
@@ -393,10 +434,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     let mut missing_exchange_init = parser(AgentValueKind::None, 1024);
     missing_exchange_init
         .push_stdout(
-            &framed(&[
-                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-                result(SESSION_ID),
-            ]),
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
             drop,
         )
         .unwrap();
@@ -428,7 +466,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     });
     let (_, wrong_parent) = replay(
         &framed(&[
-            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            init(QUALIFICATION_VERSION, SESSION_ID),
             message_start("msg-main"),
             wrong_parent,
         ]),
@@ -448,7 +486,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
 
     let (_, message_transition) = replay(
         &framed(&[
-            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            init(QUALIFICATION_VERSION, SESSION_ID),
             message_start("msg-incomplete"),
             stream_event(json!({"type": "message_stop"})),
         ]),
@@ -486,7 +524,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     rejected_delta["oversized"] = json!("x".repeat(100_000));
     let (_, rejected_delta) = replay(
         &framed(&[
-            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            init(QUALIFICATION_VERSION, SESSION_ID),
             message_start("msg-content"),
             stream_event(json!({
                 "type": "content_block_start",
@@ -535,7 +573,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
 
     let (_, result_correlation) = replay(
         &framed(&[
-            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            init(QUALIFICATION_VERSION, SESSION_ID),
             message_start("msg-active"),
             result(SESSION_ID),
         ]),
@@ -555,7 +593,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
 
     let (_, terminal_drain) = replay(
         &framed(&[
-            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            init(QUALIFICATION_VERSION, SESSION_ID),
             result(SESSION_ID),
             result(SESSION_ID),
         ]),
@@ -571,7 +609,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     assert_eq!(terminal_drain["detail"]["outerEvent"], "result");
 
     let (_, eof) = replay(
-        &framed(&[init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID)]),
+        &framed(&[init(QUALIFICATION_VERSION, SESSION_ID)]),
         AgentValueKind::None,
         1024,
     );
@@ -591,7 +629,7 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
         ("session_id", json!("00000000-0000-4000-8000-000000000002")),
     ];
     for (field, replacement) in contradictory {
-        let mut initialization = init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID);
+        let mut initialization = init(QUALIFICATION_VERSION, SESSION_ID);
         initialization[field] = replacement;
         let (_, outcome) = replay(&framed(&[initialization]), AgentValueKind::Response, 1024);
         assert_failed(outcome, AgentFailureCause::HarnessStartFailed);
@@ -600,10 +638,7 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
     let mut duplicate_result = parser(AgentValueKind::Response, 1024);
     duplicate_result
         .push_stdout(
-            &framed(&[
-                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-                result(SESSION_ID),
-            ]),
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
             drop,
         )
         .unwrap();
@@ -621,10 +656,7 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
     let mut missing_exchange_init = parser(AgentValueKind::Response, 1024);
     missing_exchange_init
         .push_stdout(
-            &framed(&[
-                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-                result(SESSION_ID),
-            ]),
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
             drop,
         )
         .unwrap();
@@ -643,10 +675,7 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
 
 #[test]
 fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
-    let mut transcript = framed(&[
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-        result(SESSION_ID),
-    ]);
+    let mut transcript = framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]);
     transcript.pop();
     let (_, outcome) = replay(&transcript, AgentValueKind::Response, 1024);
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
@@ -657,6 +686,7 @@ fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
         Arc::from(CWD),
         Arc::from(MODEL),
         Arc::from(SESSION_ID),
+        Arc::from(QUALIFICATION_VERSION),
         AgentValueKind::Response,
         NonZeroU64::new(1024).unwrap(),
         limits,
@@ -708,7 +738,7 @@ fn response_utf8_limit_succeeds_exactly_and_fails_before_first_excess_byte() {
 
 #[test]
 fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
-    let mut values = vec![init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID)];
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
     values.extend([
         message_start("msg-tools"),
         stream_event(json!({
@@ -815,7 +845,7 @@ fn result_candidate_requires_correlated_success_acknowledgement() {
     let mut terminal_result = result(SESSION_ID);
     terminal_result["structured_output"] = envelope.clone();
     let values = [
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        init(QUALIFICATION_VERSION, SESSION_ID),
         message_start("msg-result"),
         stream_event(json!({
             "type": "content_block_start",
@@ -880,7 +910,7 @@ fn result_candidate_requires_correlated_success_acknowledgement() {
 #[test]
 fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let native_error = framed(&[
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        init(QUALIFICATION_VERSION, SESSION_ID),
         json!({
             "type": "result",
             "subtype": "error_during_execution",
@@ -898,7 +928,7 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     );
 
     let api_error = framed(&[
-        init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+        init(QUALIFICATION_VERSION, SESSION_ID),
         json!({
             "type": "assistant",
             "message": {
@@ -941,10 +971,7 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let mut parser = parser(AgentValueKind::None, 1024);
     parser
         .push_stdout(
-            &framed(&[
-                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
-                result(SESSION_ID),
-            ]),
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
             drop,
         )
         .unwrap();

@@ -2870,12 +2870,12 @@ mod tests {
             "\"timestamp\":\"2026-07-30T12:00:00Z\",",
             "\"cwd\":\"/execution/worktree\"}\n",
             "{\"type\":\"agent_start\"}\n",
-            "{\"type\":\"turn_end\"}\n",
+            "{\"type\":\"agent_start\"}\n",
         );
         assert!(parser.push_stdout(frames.as_bytes(), drop).is_err());
         let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
         else {
-            panic!("invalid turn transition must fail");
+            panic!("invalid agent lifecycle must fail");
         };
         assert_agent_protocol_rejection_evidence(failure);
     }
@@ -2886,6 +2886,7 @@ mod tests {
             Arc::from("/execution/worktree"),
             Arc::from("scherzo-loopback"),
             Arc::from("00000000-0000-4000-8000-000000000001"),
+            Arc::from("2.1.234"),
             AgentValueKind::None,
             NonZeroU64::new(1024).unwrap(),
         );
@@ -2913,55 +2914,11 @@ mod tests {
     }
 
     #[test]
-    fn runner_failure_evidence_accepts_large_native_content_index() {
-        let usage = json!({
-            "input": 1,
-            "output": 1,
-            "cacheRead": 0,
-            "cacheWrite": 0,
-            "totalTokens": 2,
-            "cost": {
-                "input": 0,
-                "output": 0,
-                "cacheRead": 0,
-                "cacheWrite": 0,
-                "total": 0
-            }
-        });
-        let empty = json!({
-            "role": "assistant",
-            "content": [],
-            "api": "test-api",
-            "provider": "test-provider",
-            "model": "test-model",
-            "usage": usage,
-            "stopReason": "pending",
-            "timestamp": 2
-        });
-        let started = json!({
-            "role": "assistant",
-            "content": [{"type": "text", "text": ""}],
-            "api": "test-api",
-            "provider": "test-provider",
-            "model": "test-model",
-            "usage": usage,
-            "stopReason": "pending",
-            "timestamp": 2
-        });
+    fn runner_failure_evidence_accepts_revised_pi_rejection() {
         let events = [
             json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000d", "timestamp": "2026-07-30T12:00:00Z", "cwd": "/execution/worktree"}),
             json!({"type": "agent_start"}),
-            json!({"type": "turn_start"}),
-            json!({"type": "message_start", "message": empty}),
-            json!({
-                "type": "message_update",
-                "message": started,
-                "assistantMessageEvent": {
-                    "type": "text_start",
-                    "contentIndex": 9_223_372_036_854_775_808_u64,
-                    "partial": started
-                }
-            }),
+            json!({"type": "agent_start"}),
         ];
         let mut parser =
             PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
@@ -2974,14 +2931,20 @@ mod tests {
         }
         let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
         else {
-            panic!("invalid content index must fail");
+            panic!("contradictory agent lifecycle must fail");
         };
         let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(rejection["detail"]["reason"], "event_transition_invalid");
         assert_eq!(
-            rejection["detail"]["reason"],
-            "assistant_update_content_index_invalid"
+            rejection["detail"]["state"],
+            json!({
+                "sessionHeaderSeen": true,
+                "agentStarted": true,
+                "terminalCandidateRetained": false,
+                "resultAccepted": false,
+                "settled": false
+            })
         );
-        assert!(rejection["detail"].get("contentIndex").is_none());
 
         let evidence = failure_evidence(
             FailurePhase::Execution,

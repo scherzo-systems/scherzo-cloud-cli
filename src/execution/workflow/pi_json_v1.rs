@@ -8,8 +8,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use super::admission::CancellationReason;
 use super::agent::{
@@ -22,9 +20,6 @@ use super::agent::{
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_RESPONSE_BYTES: u64 = 1024 * 1024;
-const MAXIMUM_DIAGNOSTIC_SEQUENCE: u64 = i64::MAX as u64;
-const COMPACT_UPDATE_PROPERTY: &str = "scherzoCompact";
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PiJsonV1ProtocolRejection {
@@ -32,10 +27,6 @@ pub(crate) struct PiJsonV1ProtocolRejection {
     stage: PiJsonV1ProtocolStage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     outer_event: Option<PiJsonV1EventType>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    assistant_update: Option<PiJsonV1AssistantUpdateType>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content_index: Option<u64>,
     state: PiJsonV1RejectionState,
 }
 
@@ -47,8 +38,6 @@ pub(crate) enum PiJsonV1ProtocolStage {
     SessionHeader,
     EventEnvelope,
     EventPayload,
-    AssistantUpdate,
-    AssistantTransition,
     ResultCorrelation,
     TerminalValidation,
     EndOfStream,
@@ -61,26 +50,11 @@ pub(crate) enum PiJsonV1RejectionReason {
     FrameDecodeFailed,
     FrameNotObject,
     SessionHeaderInvalid,
-    EventTypeInvalid,
     SessionEventRepeated,
     EventAfterSettlement,
     EventAfterResultAcceptance,
     EventShapeInvalid,
     EventTransitionInvalid,
-    AssistantMessageInvalid,
-    AssistantUpdateInvalid,
-    AssistantUpdateSubtypeInvalid,
-    AssistantUpdateContentIndexInvalid,
-    AssistantUpdatePartialMismatch,
-    AssistantActiveMessageMismatch,
-    AssistantStableFieldsChanged,
-    AssistantUpdateOpenBlockMismatch,
-    AssistantUpdateContentIndexMismatch,
-    AssistantContentTransitionInvalid,
-    ThinkingFinalizationRewrite,
-    MessageEndOpenBlockMismatch,
-    MessageEndContentMismatch,
-    ToolCorrelationInvalid,
     ResultCorrelationInvalid,
     TerminalInvariantInvalid,
     EndOfStreamInvariantInvalid,
@@ -118,67 +92,20 @@ pub(crate) enum PiJsonV1EventType {
     Unrecognized,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PiJsonV1AssistantUpdateType {
-    TextStart,
-    TextDelta,
-    TextEnd,
-    ThinkingStart,
-    ThinkingDelta,
-    ThinkingEnd,
-    ToolcallStart,
-    ToolcallDelta,
-    ToolcallEnd,
-    Unrecognized,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PiJsonV1RejectionState {
     session_header_seen: bool,
     agent_started: bool,
-    active_attempt: bool,
-    active_turn: bool,
-    active_message: PiJsonV1ActiveMessageState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_assistant_content_blocks: Option<u64>,
-    assistant_update_seen: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    open_block: Option<PiJsonV1OpenBlockState>,
+    terminal_candidate_retained: bool,
     result_accepted: bool,
     settled: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PiJsonV1ActiveMessageState {
-    None,
-    Assistant,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PiJsonV1OpenBlockState {
-    kind: PiJsonV1OpenBlockKind,
-    content_index: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PiJsonV1OpenBlockKind {
-    Text,
-    Thinking,
-    ToolCall,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PiJsonV1RejectionContext {
     stage: PiJsonV1ProtocolStage,
     outer_event: Option<PiJsonV1EventType>,
-    assistant_update: Option<PiJsonV1AssistantUpdateType>,
-    content_index: Option<u64>,
 }
 
 impl Default for PiJsonV1RejectionContext {
@@ -186,8 +113,6 @@ impl Default for PiJsonV1RejectionContext {
         Self {
             stage: PiJsonV1ProtocolStage::FrameRead,
             outer_event: None,
-            assistant_update: None,
-            content_index: None,
         }
     }
 }
@@ -265,10 +190,11 @@ pub(crate) struct PiJsonV1Parser {
     limits: PiJsonV1ProtocolLimits,
     frame: Vec<u8>,
     protocol: ProtocolState,
+    reconstruction: Option<ActiveMessage>,
     observations: Vec<AgentObservation>,
     expected_result_tool_name: Option<Arc<str>>,
-    seen_tool_call_ids: HashMap<String, bool>,
-    retained_tool_call_id_bytes: u64,
+    result_calls: HashMap<String, ResultCallState>,
+    retained_result_state_bytes: u64,
     active_validation_request: Option<(Arc<str>, Arc<str>)>,
     accepted_result: Option<AcceptedResultState>,
     rejection_context: PiJsonV1RejectionContext,
@@ -305,10 +231,11 @@ impl PiJsonV1Parser {
             limits,
             frame: Vec::new(),
             protocol: ProtocolState::default(),
+            reconstruction: None,
             observations: Vec::new(),
             expected_result_tool_name,
-            seen_tool_call_ids: HashMap::new(),
-            retained_tool_call_id_bytes: 0,
+            result_calls: HashMap::new(),
+            retained_result_state_bytes: 0,
             active_validation_request: None,
             accepted_result: None,
             rejection_context: PiJsonV1RejectionContext::default(),
@@ -388,30 +315,23 @@ impl PiJsonV1Parser {
             return self.fail_protocol();
         }
 
-        let Some(turn) = self
-            .protocol
-            .active_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.turn.as_ref())
-        else {
-            return Ok(false);
-        };
-        let Some(assistant) = turn.assistant.as_ref() else {
-            return Ok(false);
-        };
-        let Some(call) = assistant.only_tool_call() else {
+        if self
+            .result_calls
+            .iter()
+            .any(|(other_id, call)| other_id != call_id && call.started && !call.ended)
+        {
             return self.fail_protocol();
-        };
-        let Some(call_state) = turn.calls.first() else {
+        }
+        let Some(call) = self.result_calls.get(call_id) else {
             return Ok(false);
         };
-        if !call_state.started {
+        if !call.started {
             return Ok(false);
         }
-        if call_state.ended.is_some()
-            || call.id != call_id
-            || call.name != tool_name
-            || !semantically_equal_json(&call.arguments, arguments)
+        if call.blocked_by_sibling
+            || call.ended
+            || call.call.name != tool_name
+            || !semantically_equal_json(&call.call.arguments, arguments)
         {
             return self.fail_protocol();
         }
@@ -430,34 +350,23 @@ impl PiJsonV1Parser {
             return self.fail_protocol();
         }
 
-        let Some(attempt) = self.protocol.active_attempt.as_ref() else {
-            return self.fail_protocol();
-        };
-        let Some(turn) = attempt.turn.as_ref() else {
-            return self.fail_protocol();
-        };
-        let Some(assistant) = turn.assistant.as_ref() else {
-            return self.fail_protocol();
-        };
-        let Some(call) = assistant.only_tool_call() else {
-            return self.fail_protocol();
-        };
-        let Some(call_state) = turn.calls.first() else {
-            return self.fail_protocol();
-        };
         let validation_request_matches =
             self.active_validation_request
                 .as_ref()
                 .is_some_and(|(call_id, tool_name)| {
                     call_id == &accepted.call_id && tool_name == &accepted.tool_name
                 });
-        if !validation_request_matches
-            || !call_state.started
-            || call_state.ended.is_some()
-            || call.id.as_str() != accepted.call_id.as_ref()
-            || call.name.as_str() != accepted.tool_name.as_ref()
-            || !semantically_equal_json(&call.arguments, accepted.arguments.as_ref())
-        {
+        let call_matches = self
+            .result_calls
+            .get(accepted.call_id.as_ref())
+            .is_some_and(|call| {
+                call.started
+                    && !call.ended
+                    && !call.blocked_by_sibling
+                    && call.call.name.as_str() == accepted.tool_name.as_ref()
+                    && semantically_equal_json(&call.call.arguments, accepted.arguments.as_ref())
+            });
+        if !validation_request_matches || !call_matches {
             return self.fail_protocol();
         }
 
@@ -493,6 +402,24 @@ impl PiJsonV1Parser {
         if let Some(failure) = self.failure {
             return super::agent::AgentOutcome::Failed(failure);
         }
+        if self.has_unfinished_result_call() {
+            self.record_rejection(
+                PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                PiJsonV1ProtocolStage::ResultCorrelation,
+            );
+            return super::agent::AgentOutcome::Failed(
+                self.agent_failure(AgentFailureCause::HarnessProtocolFailed),
+            );
+        }
+        if self.active_validation_request.is_some() {
+            self.record_rejection(
+                PiJsonV1RejectionReason::EndOfStreamInvariantInvalid,
+                PiJsonV1ProtocolStage::EndOfStream,
+            );
+            return super::agent::AgentOutcome::Failed(
+                self.agent_failure(AgentFailureCause::HarnessProtocolFailed),
+            );
+        }
         if let Err(cause) = self.protocol.validate_eof() {
             self.record_rejection(
                 PiJsonV1RejectionReason::EndOfStreamInvariantInvalid,
@@ -525,12 +452,8 @@ impl PiJsonV1Parser {
                 PiJsonV1ProtocolStage::SessionHeader => {
                     PiJsonV1RejectionReason::SessionHeaderInvalid
                 }
-                PiJsonV1ProtocolStage::EventEnvelope => PiJsonV1RejectionReason::EventTypeInvalid,
-                PiJsonV1ProtocolStage::AssistantUpdate => {
-                    PiJsonV1RejectionReason::AssistantUpdateInvalid
-                }
-                PiJsonV1ProtocolStage::AssistantTransition => {
-                    PiJsonV1RejectionReason::AssistantContentTransitionInvalid
+                PiJsonV1ProtocolStage::EventEnvelope => {
+                    PiJsonV1RejectionReason::EventTransitionInvalid
                 }
                 PiJsonV1ProtocolStage::ResultCorrelation => {
                     PiJsonV1RejectionReason::ResultCorrelationInvalid
@@ -579,7 +502,10 @@ impl PiJsonV1Parser {
         }
 
         self.rejection_context.stage = PiJsonV1ProtocolStage::EventEnvelope;
-        let event_type = required_string(object, "type").ok_or_else(|| self.protocol_failure())?;
+        let Some(event_type) = required_string(object, "type") else {
+            self.observe_unrecognized(value);
+            return Ok(());
+        };
         self.rejection_context.outer_event = Some(normalized_pi_event_type(event_type));
         if event_type == "session" {
             return self.reject(
@@ -587,25 +513,13 @@ impl PiJsonV1Parser {
                 PiJsonV1ProtocolStage::EventEnvelope,
             );
         }
-        if self.protocol.settled && known_event_type(event_type) {
+        if self.protocol.settled && work_bearing_after_boundary(event_type, object, true) {
             return self.reject(
                 PiJsonV1RejectionReason::EventAfterSettlement,
                 PiJsonV1ProtocolStage::EventEnvelope,
             );
         }
-        if self.accepted_result.is_some()
-            && known_event_type(event_type)
-            && !matches!(
-                event_type,
-                "tool_execution_end"
-                    | "message_start"
-                    | "message_end"
-                    | "turn_end"
-                    | "agent_end"
-                    | "agent_settled"
-                    | "compaction_start"
-                    | "compaction_end"
-            )
+        if self.accepted_result.is_some() && work_bearing_after_boundary(event_type, object, false)
         {
             return self.reject(
                 PiJsonV1RejectionReason::EventAfterResultAcceptance,
@@ -614,48 +528,99 @@ impl PiJsonV1Parser {
         }
 
         self.rejection_context.stage = PiJsonV1ProtocolStage::EventPayload;
+        if self.result_tool_event_is_authoritative(event_type, object) {
+            return match event_type {
+                "tool_execution_start" => self.tool_execution_start(object),
+                "tool_execution_end" => self.tool_execution_end(object),
+                _ => unreachable!("authority classification is limited to result lifecycle events"),
+            };
+        }
+        if observation_event_has_unknown_fields(event_type, object) {
+            self.observe_unrecognized(value);
+            return Ok(());
+        }
+        macro_rules! observation {
+            ($handler:expr) => {{
+                let before = self.observations.len();
+                let result = $handler;
+                self.finish_observation_event(&value, before, result)
+            }};
+        }
         match event_type {
             "agent_start" => self.agent_start(object),
             "agent_end" => self.agent_end(object),
             "agent_settled" => self.agent_settled(object),
-            "turn_start" => self.turn_start(object),
-            "turn_end" => self.turn_end(object),
-            "message_start" => self.message_start(object),
-            "message_update" => self.message_update(object),
-            "message_end" => self.message_end(object),
-            "tool_execution_start" => self.tool_execution_start(object),
-            "tool_execution_update" => self.tool_execution_update(object),
-            "tool_execution_end" => self.tool_execution_end(object),
-            "auto_retry_start" => self.auto_retry_start(object),
-            "auto_retry_end" => self.auto_retry_end(object),
-            "compaction_start" => self.compaction_start(object),
-            "compaction_end" => self.compaction_end(object),
-            "summarization_retry_scheduled" => self.summarization_retry_scheduled(object),
-            "summarization_retry_attempt_start" => self.summarization_retry_attempt_start(object),
-            "summarization_retry_finished" => self.summarization_retry_finished(object),
-            "queue_update" => self.queue_update(object),
-            "entry_appended" => self.entry_appended(object),
-            "session_info_changed" => self.session_info_changed(object),
-            "thinking_level_changed" => self.thinking_level_changed(object),
-            "bash_execution_update" => self.bash_execution_update(object),
+            "turn_start" => observation!(self.turn_start(object)),
+            "turn_end" => observation!(self.turn_end(object)),
+            "message_start" => observation!(self.message_start(object)),
+            "message_update" => observation!(self.message_update(object)),
+            "message_end" => observation!(self.message_end(object)),
+            "tool_execution_start" => observation!(self.tool_execution_start(object)),
+            "tool_execution_update" => observation!(self.tool_execution_update(object)),
+            "tool_execution_end" => observation!(self.tool_execution_end(object)),
+            "auto_retry_start" => observation!(self.auto_retry_start(object)),
+            "auto_retry_end" => observation!(self.auto_retry_end(object)),
+            "compaction_start" => observation!(self.compaction_start(object)),
+            "compaction_end" => observation!(self.compaction_end(object)),
+            "summarization_retry_scheduled" => {
+                observation!(self.summarization_retry_scheduled(object))
+            }
+            "summarization_retry_attempt_start" => {
+                observation!(self.summarization_retry_attempt_start(object))
+            }
+            "summarization_retry_finished" => {
+                observation!(self.summarization_retry_finished(object))
+            }
+            "queue_update" => observation!(self.queue_update(object)),
+            "entry_appended" => observation!(self.entry_appended(object)),
+            "session_info_changed" => observation!(self.session_info_changed(object)),
+            "thinking_level_changed" => observation!(self.thinking_level_changed(object)),
+            "bash_execution_update" => observation!(self.bash_execution_update(object)),
             _ => {
-                self.observations
-                    .push(AgentObservation::UnrecognizedHarnessEvent {
-                        event: Arc::new(value),
-                    });
+                self.observe_unrecognized(value);
                 Ok(())
             }
         }
+    }
+
+    fn finish_observation_event(
+        &mut self,
+        raw: &Value,
+        observation_count: usize,
+        result: Result<(), AgentFailureCause>,
+    ) -> Result<(), AgentFailureCause> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(cause)
+                if cause == AgentFailureCause::CapturedValueTooLarge
+                    || self.protocol_rejection.is_some() =>
+            {
+                Err(cause)
+            }
+            Err(_) => {
+                self.observations.truncate(observation_count);
+                self.observe_unrecognized(raw.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn observe_unrecognized(&mut self, event: Value) {
+        self.observations
+            .push(AgentObservation::UnrecognizedHarnessEvent {
+                event: Arc::new(event),
+            });
     }
 
     fn parse_session_header(
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        if required_string(object, "type") != Some("session")
+        if !has_only_required_shape(object, &["type", "version", "id", "timestamp", "cwd"])
+            || required_string(object, "type") != Some("session")
             || required_u64(object, "version") != Some(SESSION_VERSION)
-            || !required_string(object, "id").is_some_and(valid_session_id)
-            || !required_string(object, "timestamp").is_some_and(valid_timestamp)
+            || required_string(object, "id").is_none()
+            || required_string(object, "timestamp").is_none()
             || required_string(object, "cwd") != Some(self.expected_cwd.as_ref())
         {
             return Err(AgentFailureCause::HarnessStartFailed);
@@ -664,89 +629,103 @@ impl PiJsonV1Parser {
         Ok(())
     }
 
-    fn agent_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if !has_only_required_shape(object, &["type"])
-            || self.protocol.settled
-            || self.protocol.active_attempt.is_some()
-            || self
-                .protocol
-                .last_agent_end
-                .as_ref()
-                .is_some_and(|end| end.will_retry && !self.protocol.continuation_allowed)
-        {
-            return Err(self.protocol_failure());
+    fn require_authority_event_shape(
+        &mut self,
+        object: &Map<String, Value>,
+        required: &[&str],
+    ) -> Result<(), AgentFailureCause> {
+        if has_only_required_shape(object, required) {
+            Ok(())
+        } else {
+            self.reject(
+                PiJsonV1RejectionReason::EventShapeInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            )
         }
-        let queued_message_required = self
-            .protocol
-            .last_agent_end
-            .as_ref()
-            .is_some_and(|end| !end.will_retry)
-            && !self.protocol.continuation_allowed;
-        self.protocol.active_attempt = Some(ActiveAttempt {
-            queued_message_required,
-            ..ActiveAttempt::default()
-        });
+    }
+
+    fn agent_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.require_authority_event_shape(object, &["type"])?;
+        if !self.protocol.can_start_agent() {
+            return self.reject(
+                PiJsonV1RejectionReason::EventTransitionInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
+        }
+        self.protocol.agent_active = true;
         self.protocol.ever_started = true;
-        self.protocol.continuation_allowed = false;
+        self.reconstruction = None;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::HarnessStarted));
         Ok(())
     }
 
     fn agent_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let messages = required_array(object, "messages")
-            .and_then(|messages| parse_messages(messages, true))
-            .ok_or_else(|| self.protocol_failure())?;
-        let will_retry =
-            required_bool(object, "willRetry").ok_or_else(|| self.protocol_failure())?;
-        let Some(attempt) = self.protocol.active_attempt.take() else {
-            return Err(self.protocol_failure());
+        self.require_authority_event_shape(object, &["type", "messages", "willRetry"])?;
+        let (Some(messages), Some(will_retry)) = (
+            required_array(object, "messages"),
+            required_bool(object, "willRetry"),
+        ) else {
+            return self.reject(
+                PiJsonV1RejectionReason::EventShapeInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
         };
-        if attempt.turn.is_some() || attempt.completed_messages != messages {
-            return Err(self.protocol_failure());
+        if !self.protocol.agent_active {
+            return self.reject(
+                PiJsonV1RejectionReason::EventTransitionInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
+        }
+        if self.has_unfinished_result_call() {
+            return self.reject(
+                PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                PiJsonV1ProtocolStage::ResultCorrelation,
+            );
         }
         let Some(final_assistant) = messages
             .iter()
             .rev()
-            .find_map(ParsedMessage::assistant)
-            .cloned()
+            .filter_map(|message| parse_message(message, true))
+            .find_map(|message| match message {
+                ParsedMessage::Assistant(assistant) => Some(assistant),
+                ParsedMessage::ToolResult(_) | ParsedMessage::Other(_) => None,
+            })
         else {
-            return Err(self.protocol_failure());
+            return self.reject(
+                PiJsonV1RejectionReason::TerminalInvariantInvalid,
+                PiJsonV1ProtocolStage::TerminalValidation,
+            );
         };
-        if attempt.last_completed_assistant.as_ref() != Some(&final_assistant)
-            || attempt.last_turn_assistant.as_ref() != Some(&final_assistant)
-            || (attempt.interrupted_tool_call && !will_retry)
-        {
-            return Err(self.protocol_failure());
-        }
-        if self.accepted_result.is_some() && will_retry {
-            return Err(self.protocol_failure());
+        self.check_response_bound(&final_assistant)?;
+        if self.accepted_result.is_some() {
+            if will_retry {
+                return self.reject(
+                    PiJsonV1RejectionReason::EventTransitionInvalid,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            }
+            self.validate_accepted_terminal(&final_assistant)?;
         }
 
+        self.protocol.agent_active = false;
         self.protocol.last_agent_end = Some(AgentEndState {
             final_assistant,
             will_retry,
         });
-        self.protocol.continuation_allowed = false;
+        self.reconstruction = None;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
         Ok(())
     }
 
     fn agent_settled(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if !has_only_required_shape(object, &["type"])
-            || self.protocol.settled
-            || self.protocol.active_attempt.is_some()
-            || self.protocol.compaction.is_some()
-            || self.protocol.retry_attempt.is_some()
-            || self.protocol.continuation_allowed
-            || self
-                .protocol
-                .last_agent_end
-                .as_ref()
-                .is_none_or(|end| end.will_retry)
-        {
-            return Err(self.protocol_failure());
+        self.require_authority_event_shape(object, &["type"])?;
+        if !self.protocol.can_settle() {
+            return self.reject(
+                PiJsonV1RejectionReason::EventTransitionInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
         }
         self.protocol.settled = true;
         self.observations
@@ -755,51 +734,23 @@ impl PiJsonV1Parser {
     }
 
     fn turn_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if !has_only_required_shape(object, &["type"])
-            || self.accepted_result.is_some()
-            || self.protocol.settled
-        {
+        if !has_only_required_shape(object, &["type"]) {
             return Err(self.protocol_failure());
         }
-        let Some(attempt) = self.protocol.active_attempt.as_mut() else {
-            return Err(self.protocol_failure());
-        };
-        if attempt.turn.is_some() || attempt.interrupted_tool_call {
-            return Err(self.protocol_failure());
-        }
-        attempt.turn = Some(ActiveTurn::default());
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnStarted));
         Ok(())
     }
 
     fn turn_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let assistant = required_value(object, "message")
+        required_value(object, "message")
             .and_then(|message| parse_message(message, true))
             .and_then(|message| message.assistant().cloned())
             .ok_or_else(|| self.protocol_failure())?;
-        let tool_results = required_array(object, "toolResults")
+        required_array(object, "toolResults")
             .and_then(parse_tool_results)
             .ok_or_else(|| self.protocol_failure())?;
-        let Some(attempt) = self.protocol.active_attempt.as_mut() else {
-            return Err(self.protocol_failure());
-        };
-        let Some(turn) = attempt.turn.take() else {
-            return Err(self.protocol_failure());
-        };
-        if turn.active_message.is_some()
-            || turn.assistant.as_ref() != Some(&assistant)
-            || !turn.calls.iter().all(ToolCallState::complete)
-            || turn
-                .calls
-                .iter()
-                .filter_map(|call| call.result_message.clone())
-                .collect::<Vec<_>>()
-                != tool_results
-        {
-            return Err(self.protocol_failure());
-        }
-        attempt.last_turn_assistant = Some(assistant);
+        self.reconstruction = None;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
         Ok(())
@@ -808,333 +759,202 @@ impl PiJsonV1Parser {
     fn message_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
         let value = required_value(object, "message").ok_or_else(|| self.protocol_failure())?;
         let message = parse_message(value, false).ok_or_else(|| self.protocol_failure())?;
-        if let ParsedMessage::Assistant(assistant) = &message {
-            if self
-                .protocol
-                .active_attempt
-                .as_ref()
-                .is_some_and(|attempt| attempt.queued_message_required)
-            {
-                return Err(self.protocol_failure());
-            }
-            self.check_response_bound(assistant)?;
-        }
-        let Some(turn) = self.active_turn_mut() else {
-            return Err(self.protocol_failure());
-        };
-        if turn.active_message.is_some() {
-            return Err(self.protocol_failure());
-        }
-        match &message {
+        self.reconstruction = match message {
             ParsedMessage::Assistant(assistant) => {
-                if turn.assistant.is_some() || !turn.result_messages_complete() {
-                    return Err(self.protocol_failure());
-                }
-                turn.active_message = Some(ActiveMessage::Assistant {
-                    last: assistant.clone(),
+                self.check_response_bound(&assistant)?;
+                Some(ActiveMessage::Assistant {
+                    last: assistant,
                     open_block: None,
                     had_update: false,
-                });
+                })
             }
-            ParsedMessage::ToolResult(result) => {
-                if turn.assistant.is_none() || !turn.can_start_tool_result(result) {
-                    return Err(self.protocol_failure());
-                }
-                turn.active_message = Some(ActiveMessage::Fixed(message));
-            }
-            ParsedMessage::Other(_) => {
-                if turn.assistant.is_some() {
-                    return Err(self.protocol_failure());
-                }
-                turn.active_message = Some(ActiveMessage::Fixed(message));
-            }
-        }
+            ParsedMessage::ToolResult(_) | ParsedMessage::Other(_) => None,
+        };
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::MessageStarted));
         Ok(())
     }
 
     fn message_update(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        self.rejection_context.stage = PiJsonV1ProtocolStage::AssistantUpdate;
-        let update_object = required_object(object, "assistantMessageEvent");
-        self.rejection_context.assistant_update = update_object
-            .and_then(|event| required_string(event, "type"))
-            .map(normalized_pi_assistant_update_type);
-        let content_index = update_object.and_then(|event| required_u64(event, "contentIndex"));
-        self.rejection_context.content_index =
-            content_index.filter(|index| *index <= MAXIMUM_DIAGNOSTIC_SEQUENCE);
-        if content_index.is_some_and(|index| index > MAXIMUM_DIAGNOSTIC_SEQUENCE) {
-            return self.reject(
-                PiJsonV1RejectionReason::AssistantUpdateContentIndexInvalid,
-                PiJsonV1ProtocolStage::AssistantUpdate,
-            );
+        if object.contains_key("message") {
+            return Err(self.protocol_failure());
         }
-
-        let message = required_value(object, "message")
-            .and_then(|message| parse_message(message, false))
-            .and_then(|message| message.assistant().cloned());
-        let Some(message) = message else {
-            return self.reject(
-                PiJsonV1RejectionReason::AssistantMessageInvalid,
-                PiJsonV1ProtocolStage::AssistantUpdate,
-            );
-        };
-        let Some(update_object) = update_object else {
-            return self.reject(
-                PiJsonV1RejectionReason::AssistantUpdateInvalid,
-                PiJsonV1ProtocolStage::AssistantUpdate,
-            );
-        };
-        let event = match parse_assistant_event(update_object, &message) {
-            Ok(event) => event,
-            Err(ParseAssistantEventError::Shape) => {
-                return self.reject(
-                    PiJsonV1RejectionReason::AssistantUpdateInvalid,
-                    PiJsonV1ProtocolStage::AssistantUpdate,
-                );
-            }
-            Err(ParseAssistantEventError::Subtype) => {
-                return self.reject(
-                    PiJsonV1RejectionReason::AssistantUpdateSubtypeInvalid,
-                    PiJsonV1ProtocolStage::AssistantUpdate,
-                );
-            }
-            Err(ParseAssistantEventError::ContentIndex) => {
-                return self.reject(
-                    PiJsonV1RejectionReason::AssistantUpdateContentIndexInvalid,
-                    PiJsonV1ProtocolStage::AssistantUpdate,
-                );
-            }
-            Err(ParseAssistantEventError::PartialMismatch) => {
-                return self.reject(
-                    PiJsonV1RejectionReason::AssistantUpdatePartialMismatch,
-                    PiJsonV1ProtocolStage::AssistantUpdate,
-                );
-            }
-        };
-        self.check_response_bound(&message)?;
-        self.rejection_context.stage = PiJsonV1ProtocolStage::AssistantTransition;
-
-        let Some(turn) = self.active_turn_mut() else {
-            return self.reject(
-                PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
-                PiJsonV1ProtocolStage::AssistantTransition,
-            );
-        };
+        let usage = required_object(object, "usage")
+            .and_then(parse_usage)
+            .ok_or_else(|| self.protocol_failure())?;
+        let event = required_object(object, "assistantMessageEvent")
+            .ok_or_else(|| self.protocol_failure())
+            .and_then(|event| parse_assistant_event(event).map_err(|_| self.protocol_failure()))?;
         let Some(ActiveMessage::Assistant {
             last,
             open_block,
-            had_update,
-        }) = turn.active_message.as_mut()
+            had_update: _,
+        }) = self.reconstruction.as_ref()
         else {
-            return self.reject(
-                PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
-                PiJsonV1ProtocolStage::AssistantTransition,
-            );
+            return Err(self.protocol_failure());
         };
-        if !last.stable_with(&message) {
+        let mut next_last = last.clone();
+        let mut next_open_block = open_block.clone();
+        let mut observations = match event.apply(
+            &mut next_last,
+            &mut next_open_block,
+            self.limits.maximum_frame_bytes().get(),
+        ) {
+            Ok(observations) => observations,
+            Err(ApplyAssistantUpdateError::Transition) => {
+                return Err(self.protocol_failure());
+            }
+            Err(ApplyAssistantUpdateError::CapturedValueTooLarge) => {
+                return Err(AgentFailureCause::CapturedValueTooLarge);
+            }
+            Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded) => {
+                return self.reject(
+                    PiJsonV1RejectionReason::RetainedStateLimitExceeded,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            }
+        };
+        if self.value_kind == AgentValueKind::Response
+            && next_last.text_bytes() > self.maximum_response_bytes.get()
+        {
+            return Err(AgentFailureCause::CapturedValueTooLarge);
+        }
+        if retained_update_bytes(&next_last, &next_open_block)
+            > self.limits.maximum_frame_bytes().get()
+        {
             return self.reject(
-                PiJsonV1RejectionReason::AssistantStableFieldsChanged,
-                PiJsonV1ProtocolStage::AssistantTransition,
+                PiJsonV1RejectionReason::RetainedStateLimitExceeded,
+                PiJsonV1ProtocolStage::EventPayload,
             );
         }
-        if !event.valid_transition(last, &message, open_block) {
-            let reason = event.transition_failure_reason(last, open_block);
-            return self.reject(reason, PiJsonV1ProtocolStage::AssistantTransition);
-        }
-
-        let observations = event.normalized_observations(last, &message);
-        *last = message;
-        *had_update = true;
+        next_last.usage = usage.clone();
+        self.reconstruction = Some(ActiveMessage::Assistant {
+            last: next_last,
+            open_block: next_open_block,
+            had_update: true,
+        });
+        observations.push(AgentObservation::Usage {
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+        });
         self.observations.extend(observations);
         Ok(())
     }
 
     fn message_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let expected_result_tool_name = self.expected_result_tool_name.clone();
         let value = required_value(object, "message").ok_or_else(|| self.protocol_failure())?;
         let message = parse_message(value, true).ok_or_else(|| self.protocol_failure())?;
-        let active_message = self
-            .protocol
-            .active_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.turn.as_ref())
-            .and_then(|turn| turn.active_message.as_ref());
-        let interrupted_tool_call = message.assistant().is_some_and(|assistant| {
-            assistant.stop_reason == StopReason::Error
-                && matches!(
-                    active_message,
-                    Some(ActiveMessage::Assistant {
-                        open_block: Some(OpenBlock::ToolCall(_)),
-                        ..
-                    })
-                )
-        });
         if let ParsedMessage::Assistant(assistant) = &message {
-            let Some(ActiveMessage::Assistant {
-                last, open_block, ..
-            }) = active_message
-            else {
-                return self.reject(
-                    PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
-                    PiJsonV1ProtocolStage::EventPayload,
-                );
-            };
-            if !valid_message_end_open_block(*open_block, last, assistant) {
-                return self.reject(
-                    PiJsonV1RejectionReason::MessageEndOpenBlockMismatch,
-                    PiJsonV1ProtocolStage::EventPayload,
-                );
-            }
-            if !last.stable_with(assistant)
-                || !finalized_content_correlates(
-                    &last.content,
-                    &assistant.content,
-                    expected_result_tool_name.as_deref(),
-                )
-            {
-                return self.reject(
-                    PiJsonV1RejectionReason::MessageEndContentMismatch,
-                    PiJsonV1ProtocolStage::EventPayload,
-                );
-            }
             self.check_response_bound(assistant)?;
-            if !interrupted_tool_call {
-                self.retain_result_identity_context(assistant)?;
-            }
-        }
-        let retained_message_bytes = self
-            .protocol
-            .active_attempt
-            .as_ref()
-            .and_then(|attempt| {
-                attempt
-                    .retained_message_bytes
-                    .checked_add(json_bytes(value)?)
-            })
-            .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get());
-        let Some(retained_message_bytes) = retained_message_bytes else {
-            return self.reject(
-                PiJsonV1RejectionReason::RetainedStateLimitExceeded,
-                PiJsonV1ProtocolStage::EventPayload,
+            self.retain_result_identity_context(assistant)?;
+            let streamed = self.reconstruction.take().map(
+                |ActiveMessage::Assistant {
+                     last,
+                     open_block,
+                     had_update,
+                 }| (last, open_block, had_update),
             );
-        };
-        let Some(attempt) = self.protocol.active_attempt.as_mut() else {
-            return Err(self.protocol_failure());
-        };
-        let Some(turn) = attempt.turn.as_mut() else {
-            return Err(self.protocol_failure());
-        };
-        let Some(active) = turn.active_message.take() else {
-            return Err(self.protocol_failure());
-        };
-
-        let mut completed_queued_message = false;
-        match (active, &message) {
-            (
-                ActiveMessage::Assistant {
-                    last,
-                    open_block,
-                    had_update,
-                },
-                ParsedMessage::Assistant(assistant),
-            ) => {
-                debug_assert!(valid_message_end_open_block(open_block, &last, assistant));
-                debug_assert!(last.stable_with(assistant));
-                debug_assert!(finalized_content_correlates(
-                    &last.content,
-                    &assistant.content,
-                    expected_result_tool_name.as_deref(),
-                ));
-                if !had_update {
-                    for block in &assistant.content {
-                        match block {
-                            ContentBlock::Text(text) if !text.is_empty() => {
-                                self.observations.push(AgentObservation::AssistantText {
-                                    text: Arc::from(text.as_str()),
-                                });
-                            }
-                            ContentBlock::Thinking(text) if !text.is_empty() => {
-                                self.observations.push(AgentObservation::Reasoning {
-                                    text: Arc::from(text.as_str()),
-                                });
-                            }
-                            ContentBlock::Text(_)
-                            | ContentBlock::Thinking(_)
-                            | ContentBlock::ToolCall(_) => {}
-                        }
-                    }
-                }
-                if !interrupted_tool_call {
-                    turn.calls = assistant
-                        .tool_calls()
-                        .cloned()
-                        .map(ToolCallState::new)
-                        .collect();
-                }
-                turn.assistant = Some(assistant.clone());
-                attempt.last_completed_assistant = Some(assistant.clone());
-                attempt.interrupted_tool_call |= interrupted_tool_call;
-            }
-            (ActiveMessage::Fixed(started), ParsedMessage::ToolResult(result)) => {
-                if started != message || !turn.finish_tool_result(result) {
-                    return Err(self.protocol_failure());
-                }
-            }
-            (ActiveMessage::Fixed(started), ParsedMessage::Other(_)) => {
-                if started != message {
-                    return Err(self.protocol_failure());
-                }
-                completed_queued_message = true;
-            }
-            (ActiveMessage::Fixed(_), ParsedMessage::Assistant(_))
-            | (ActiveMessage::Assistant { .. }, ParsedMessage::ToolResult(_))
-            | (ActiveMessage::Assistant { .. }, ParsedMessage::Other(_)) => {
-                return Err(self.protocol_failure());
-            }
-        }
-        if completed_queued_message {
-            attempt.queued_message_required = false;
-        }
-        let completed_assistant = message.assistant().cloned();
-        attempt.completed_messages.push(message);
-        attempt.retained_message_bytes = retained_message_bytes;
-        if let Some(assistant) = completed_assistant.as_ref() {
+            self.observe_finalized_content(assistant, streamed.as_ref());
             self.observe_assistant_completion(assistant);
+        } else {
+            self.reconstruction = None;
         }
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::MessageCompleted));
         Ok(())
     }
 
+    fn observe_finalized_content(
+        &mut self,
+        assistant: &AssistantMessage,
+        streamed: Option<&(AssistantMessage, Option<OpenBlock>, bool)>,
+    ) {
+        let had_update = streamed.is_some_and(|(_, _, had_update)| *had_update);
+        if !had_update {
+            for block in &assistant.content {
+                match block {
+                    ContentBlock::Text(text) if !text.is_empty() => {
+                        self.observations.push(AgentObservation::AssistantText {
+                            text: Arc::from(text.as_str()),
+                        });
+                    }
+                    ContentBlock::Thinking(text) if !text.is_empty() => {
+                        self.observations.push(AgentObservation::Reasoning {
+                            text: Arc::from(text.as_str()),
+                        });
+                    }
+                    ContentBlock::Text(_)
+                    | ContentBlock::Thinking(_)
+                    | ContentBlock::ToolCall(_) => {}
+                }
+            }
+        }
+        for call in assistant.tool_calls() {
+            let already_observed = streamed.is_some_and(|(streamed, open_block, _)| {
+                matches!(open_block, Some(OpenBlock::ToolCall { .. }))
+                    || streamed.tool_calls().any(|observed| {
+                        observed.id == call.id
+                            && observed.name == call.name
+                            && semantically_equal_json(&observed.arguments, &call.arguments)
+                    })
+            });
+            if !already_observed {
+                self.observations.push(tool_call_observation(
+                    &call.id,
+                    &call.name,
+                    AgentToolCallPhase::Started,
+                ));
+                self.observations.push(tool_call_observation(
+                    &call.id,
+                    &call.name,
+                    AgentToolCallPhase::Completed,
+                ));
+            }
+        }
+    }
+
     fn retain_result_identity_context(
         &mut self,
         assistant: &AssistantMessage,
     ) -> Result<(), AgentFailureCause> {
-        let Some(expected_result_tool_name) = self.expected_result_tool_name.as_ref() else {
+        let Some(expected_result_tool_name) = self.expected_result_tool_name.clone() else {
             return Ok(());
         };
-        for call in assistant.tool_calls() {
-            let is_result_tool = call.name == expected_result_tool_name.as_ref();
-            if let Some(previous_was_result_tool) = self.seen_tool_call_ids.get(&call.id) {
-                if *previous_was_result_tool || is_result_tool {
-                    return Err(self.protocol_failure());
-                }
-                continue;
+        let tool_call_count = assistant.tool_calls().count();
+        for call in assistant
+            .tool_calls()
+            .filter(|call| call.name == expected_result_tool_name.as_ref())
+        {
+            if self.accepted_result.is_some() || self.result_calls.contains_key(&call.id) {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
             }
-            let retained_bytes = self
-                .retained_tool_call_id_bytes
-                .checked_add(u64::try_from(call.id.len()).unwrap_or(u64::MAX))
-                .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get());
-            let Some(retained_bytes) = retained_bytes else {
+            let retained_bytes = u64::try_from(call.id.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(call.name.len()).unwrap_or(u64::MAX))
+                .saturating_add(json_bytes(&call.arguments).unwrap_or(u64::MAX));
+            let Some(total_retained_bytes) = self
+                .retained_result_state_bytes
+                .checked_add(retained_bytes)
+                .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get())
+            else {
                 return self.reject(
                     PiJsonV1RejectionReason::RetainedStateLimitExceeded,
-                    PiJsonV1ProtocolStage::EventPayload,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
                 );
             };
-            self.seen_tool_call_ids
-                .insert(call.id.clone(), is_result_tool);
-            self.retained_tool_call_id_bytes = retained_bytes;
+            self.result_calls.insert(
+                call.id.clone(),
+                ResultCallState {
+                    call: call.clone(),
+                    blocked_by_sibling: tool_call_count != 1,
+                    started: false,
+                    ended: false,
+                },
+            );
+            self.retained_result_state_bytes = total_retained_bytes;
         }
         Ok(())
     }
@@ -1143,25 +963,34 @@ impl PiJsonV1Parser {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        if self.protocol.settled {
-            return Err(self.protocol_failure());
-        }
-        let call_id = required_nonempty_string(object, "toolCallId")
-            .ok_or_else(|| self.protocol_failure())?;
-        let name =
-            required_nonempty_string(object, "toolName").ok_or_else(|| self.protocol_failure())?;
-        let arguments = required_value(object, "args").ok_or_else(|| self.protocol_failure())?;
-        let Some(turn) = self.active_turn_mut() else {
-            return Err(self.protocol_failure());
+        let (authoritative, call_id, name) =
+            self.result_tool_event_identity("tool_execution_start", object)?;
+        let Some(arguments) = required_value(object, "args") else {
+            return self.reject_result_tool_shape(authoritative);
         };
-        if turn.active_message.is_some() || !turn.start_call(call_id, name, arguments) {
-            return Err(self.protocol_failure());
+        if authoritative {
+            let matches = self.result_calls.get_mut(call_id).is_some_and(|call| {
+                let matches = !call.started
+                    && !call.ended
+                    && call.call.name == name
+                    && semantically_equal_json(&call.call.arguments, arguments);
+                if matches {
+                    call.started = true;
+                }
+                matches
+            });
+            if !matches {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
+            }
         }
-        self.observations.push(AgentObservation::ToolCall {
-            call_id: Arc::from(call_id),
-            name: Arc::from(name),
-            phase: AgentToolCallPhase::Started,
-        });
+        self.observations.push(tool_call_observation(
+            call_id,
+            name,
+            AgentToolCallPhase::Started,
+        ));
         Ok(())
     }
 
@@ -1169,105 +998,99 @@ impl PiJsonV1Parser {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        // Pi and Claude progress envelopes are independent native contracts; sharing their
+        // similarly shaped field extraction would couple profiles that evolve separately.
+        // jscpd:ignore-start
         let call_id = required_nonempty_string(object, "toolCallId")
             .ok_or_else(|| self.protocol_failure())?;
         let name =
             required_nonempty_string(object, "toolName").ok_or_else(|| self.protocol_failure())?;
-        let arguments = required_value(object, "args").ok_or_else(|| self.protocol_failure())?;
-        if required_value(object, "partialResult")
+        required_value(object, "args").ok_or_else(|| self.protocol_failure())?;
+        required_value(object, "partialResult")
             .and_then(parse_tool_execution_result)
-            .is_none()
-            || self
-                .active_turn_mut()
-                .is_none_or(|turn| !turn.update_call(call_id, name, arguments))
-        {
-            return Err(self.protocol_failure());
-        }
+            .ok_or_else(|| self.protocol_failure())?;
         self.observations.push(tool_call_observation(
             call_id,
             name,
             AgentToolCallPhase::Updated,
         ));
+        // jscpd:ignore-end
         Ok(())
     }
 
     fn tool_execution_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let call_id = required_nonempty_string(object, "toolCallId")
-            .ok_or_else(|| self.protocol_failure())?;
-        let name =
-            required_nonempty_string(object, "toolName").ok_or_else(|| self.protocol_failure())?;
-        let result_value =
-            required_value(object, "result").ok_or_else(|| self.protocol_failure())?;
-        let result =
-            parse_tool_execution_result(result_value).ok_or_else(|| self.protocol_failure())?;
-        let is_error = required_bool(object, "isError").ok_or_else(|| self.protocol_failure())?;
-        let is_expected_result_tool = self
-            .expected_result_tool_name
-            .as_ref()
-            .is_some_and(|expected| expected.as_ref() == name);
-        let retained_tool_bytes = self
-            .protocol
-            .active_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.turn.as_ref())
-            .and_then(|turn| {
-                turn.retained_tool_bytes
-                    .checked_add(json_bytes(result_value)?)
-            })
-            .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get())
-            .ok_or_else(|| self.protocol_failure())?;
-        let Some(turn) = self.active_turn_mut() else {
-            return Err(self.protocol_failure());
+        let (authoritative, call_id, name) =
+            self.result_tool_event_identity("tool_execution_end", object)?;
+        let result = required_value(object, "result").and_then(parse_tool_execution_result);
+        let is_error = required_bool(object, "isError");
+        let (Some(result), Some(is_error)) = (result, is_error) else {
+            return self.reject_result_tool_shape(authoritative);
         };
-        let truncated_call = turn
-            .assistant
-            .as_ref()
-            .is_some_and(|assistant| assistant.stop_reason == StopReason::Length);
-        if (truncated_call && (!is_error || result.terminate == Some(true)))
-            || !turn.end_call(call_id, name, result.clone(), is_error)
-        {
-            return Err(self.protocol_failure());
-        }
-        turn.retained_tool_bytes = retained_tool_bytes;
 
-        let active_validation_matches = match self.active_validation_request.as_ref() {
-            Some((active_id, active_name)) => {
-                if active_id.as_ref() != call_id || active_name.as_ref() != name {
-                    return Err(self.protocol_failure());
-                }
-                true
+        if authoritative {
+            let Some(call) = self.result_calls.get(call_id) else {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
+            };
+            if !call.started || call.ended || call.call.name != name {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
             }
-            None => false,
-        };
-        if active_validation_matches {
+            let blocked_by_sibling = call.blocked_by_sibling;
+            let active_validation_matches =
+                self.active_validation_request
+                    .as_ref()
+                    .is_some_and(|(active_id, active_name)| {
+                        active_id.as_ref() == call_id && active_name.as_ref() == name
+                    });
             let accepted_validation_matches =
                 self.accepted_result.as_ref().is_some_and(|accepted| {
                     accepted.accepted.call_id.as_ref() == call_id
                         && accepted.accepted.tool_name.as_ref() == name
                 });
-            if !accepted_validation_matches && (!is_error || result.terminate == Some(true)) {
-                return Err(self.protocol_failure());
+            let successful_termination = !is_error && result.terminate == Some(true);
+            let recoverable_rejection = is_error && result.terminate != Some(true);
+            if blocked_by_sibling && !recoverable_rejection
+                || active_validation_matches
+                    && !(accepted_validation_matches && successful_termination
+                        || !accepted_validation_matches && recoverable_rejection)
+                || !active_validation_matches && !recoverable_rejection
+            {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
             }
-            self.active_validation_request = None;
-        } else if is_expected_result_tool && (!is_error || result.terminate == Some(true)) {
-            return Err(self.protocol_failure());
+            if active_validation_matches {
+                self.active_validation_request = None;
+            }
+            let Some(call) = self.result_calls.get_mut(call_id) else {
+                return self.reject(
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                    PiJsonV1ProtocolStage::ResultCorrelation,
+                );
+            };
+            call.ended = true;
+            if accepted_validation_matches {
+                let Some(accepted) = self.accepted_result.as_mut() else {
+                    return self.reject(
+                        PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                        PiJsonV1ProtocolStage::ResultCorrelation,
+                    );
+                };
+                accepted.native_execution_completed = true;
+            }
         }
 
-        if let Some(accepted) = self.accepted_result.as_mut()
-            && accepted.accepted.call_id.as_ref() == call_id
-            && accepted.accepted.tool_name.as_ref() == name
-        {
-            if is_error || result.terminate != Some(true) {
-                return Err(self.protocol_failure());
-            }
-            accepted.native_execution_completed = true;
-        }
-
-        self.observations.push(AgentObservation::ToolCall {
-            call_id: Arc::from(call_id),
-            name: Arc::from(name),
-            phase: AgentToolCallPhase::Completed,
-        });
+        self.observations.push(tool_call_observation(
+            call_id,
+            name,
+            AgentToolCallPhase::Completed,
+        ));
         self.observations.push(AgentObservation::ToolResult {
             call_id: Arc::from(call_id),
             is_error,
@@ -1276,50 +1099,93 @@ impl PiJsonV1Parser {
         Ok(())
     }
 
-    fn auto_retry_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+    fn reject_result_tool_shape<T>(&mut self, authoritative: bool) -> Result<T, AgentFailureCause> {
+        if authoritative {
+            self.reject(
+                PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                PiJsonV1ProtocolStage::ResultCorrelation,
+            )
+        } else {
+            Err(self.protocol_failure())
+        }
+    }
+
+    fn result_tool_event_identity<'a>(
+        &mut self,
+        event_type: &str,
+        object: &'a Map<String, Value>,
+    ) -> Result<(bool, &'a str, &'a str), AgentFailureCause> {
+        let authoritative = self.result_tool_event_is_authoritative(event_type, object);
+        let required = match event_type {
+            "tool_execution_start" => &["type", "toolCallId", "toolName", "args"][..],
+            "tool_execution_end" => &["type", "toolCallId", "toolName", "result", "isError"][..],
+            _ => unreachable!("result-tool identity is limited to lifecycle events"),
+        };
+        if authoritative && !has_only_required_shape(object, required) {
+            return self.reject_result_tool_shape(true);
+        }
+        let Some(call_id) = required_nonempty_string(object, "toolCallId") else {
+            return self.reject_result_tool_shape(authoritative);
+        };
+        let Some(name) = required_nonempty_string(object, "toolName") else {
+            return self.reject_result_tool_shape(authoritative);
+        };
+        Ok((authoritative, call_id, name))
+    }
+
+    fn result_tool_event_is_authoritative(
+        &self,
+        event_type: &str,
+        object: &Map<String, Value>,
+    ) -> bool {
+        if !matches!(event_type, "tool_execution_start" | "tool_execution_end") {
+            return false;
+        }
+        required_nonempty_string(object, "toolCallId")
+            .is_some_and(|call_id| self.result_calls.contains_key(call_id))
+            || required_nonempty_string(object, "toolName").is_some_and(|name| {
+                self.expected_result_tool_name
+                    .as_ref()
+                    .is_some_and(|expected| expected.as_ref() == name)
+            })
+    }
+
+    fn has_unfinished_result_call(&self) -> bool {
+        self.result_calls
+            .values()
+            .any(|call| call.started && !call.ended)
+    }
+
+    fn observe_retry_schedule(
+        &mut self,
+        object: &Map<String, Value>,
+        label: &str,
+    ) -> Result<(), AgentFailureCause> {
         let (attempt, max_attempts, delay, error) =
             retry_schedule(object).ok_or_else(|| self.protocol_failure())?;
-        if attempt > max_attempts
-            || self.protocol.active_attempt.is_some()
-            || self.protocol.settled
-            || self
-                .protocol
-                .last_agent_end
-                .as_ref()
-                .is_none_or(|end| !end.will_retry)
-            || self
-                .protocol
-                .retry_attempt
-                .is_some_and(|previous| attempt != previous + 1)
-        {
+        if attempt > max_attempts {
             return Err(self.protocol_failure());
         }
-        self.protocol.retry_attempt = Some(attempt);
-        self.protocol.continuation_allowed = true;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::RetryStarted));
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Warning,
             message: Arc::from(format!(
-                "retry {attempt}/{max_attempts} after {delay} ms: {error}"
+                "{label}retry {attempt}/{max_attempts} after {delay} ms: {error}"
             )),
         });
         Ok(())
     }
 
+    fn auto_retry_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.observe_retry_schedule(object, "")
+    }
+
     fn auto_retry_end(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let success = required_bool(object, "success").ok_or_else(|| self.protocol_failure())?;
-        let attempt =
-            required_positive_u64(object, "attempt").ok_or_else(|| self.protocol_failure())?;
+        required_bool(object, "success").ok_or_else(|| self.protocol_failure())?;
+        required_positive_u64(object, "attempt").ok_or_else(|| self.protocol_failure())?;
         let final_error =
             optional_string(object, "finalError").ok_or_else(|| self.protocol_failure())?;
-        if self.protocol.retry_attempt != Some(attempt)
-            || (success && self.protocol.active_attempt.is_none())
-            || (!success && self.protocol.active_attempt.is_some())
-        {
-            return Err(self.protocol_failure());
-        }
-        self.protocol.retry_attempt = None;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::RetryCompleted));
         self.observe_optional_error(final_error);
@@ -1327,25 +1193,7 @@ impl PiJsonV1Parser {
     }
 
     fn compaction_start(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let reason = required_compaction_reason(object).ok_or_else(|| self.protocol_failure())?;
-        let accepted_result_can_cancel_threshold = self
-            .accepted_result
-            .as_ref()
-            .is_some_and(|accepted| accepted.native_execution_completed)
-            && reason == CompactionReason::Threshold;
-        if self.protocol.active_attempt.is_some()
-            || self.protocol.compaction.is_some()
-            || self
-                .protocol
-                .last_agent_end
-                .as_ref()
-                .is_none_or(|end| end.will_retry)
-            || self.protocol.settled
-            || (self.accepted_result.is_some() && !accepted_result_can_cancel_threshold)
-        {
-            return Err(self.protocol_failure());
-        }
-        self.protocol.compaction = Some(reason);
+        required_compaction_reason(object).ok_or_else(|| self.protocol_failure())?;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::CompactionStarted));
         Ok(())
@@ -1358,23 +1206,13 @@ impl PiJsonV1Parser {
             required_bool(object, "willRetry").ok_or_else(|| self.protocol_failure())?;
         let error =
             optional_string(object, "errorMessage").ok_or_else(|| self.protocol_failure())?;
-        let accepted_result_cancelled_threshold = self.accepted_result.is_some()
-            && reason == CompactionReason::Threshold
-            && aborted
-            && !will_retry
-            && error.is_none()
-            && object.get("result").is_none_or(Value::is_null);
-        if self.protocol.compaction != Some(reason)
-            || object
-                .get("result")
-                .is_some_and(|result| !result.is_null() && !result.is_object())
-            || (aborted && will_retry)
-            || (self.accepted_result.is_some() && !accepted_result_cancelled_threshold)
+        let _ = (reason, aborted, will_retry);
+        if object
+            .get("result")
+            .is_some_and(|result| !result.is_null() && !result.is_object())
         {
             return Err(self.protocol_failure());
         }
-        self.protocol.compaction = None;
-        self.protocol.continuation_allowed = will_retry;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::CompactionCompleted));
         self.observe_optional_error(error);
@@ -1385,21 +1223,7 @@ impl PiJsonV1Parser {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        let (attempt, max_attempts, delay, error) =
-            retry_schedule(object).ok_or_else(|| self.protocol_failure())?;
-        if self.protocol.compaction.is_none() || attempt > max_attempts {
-            return Err(self.protocol_failure());
-        }
-        self.protocol.summarization_retry_pending = true;
-        self.observations
-            .push(lifecycle(AgentLifecycleMilestone::RetryStarted));
-        self.observations.push(AgentObservation::Diagnostic {
-            level: AgentDiagnosticLevel::Warning,
-            message: Arc::from(format!(
-                "summarization retry {attempt}/{max_attempts} after {delay} ms: {error}"
-            )),
-        });
-        Ok(())
+        self.observe_retry_schedule(object, "summarization ")
     }
 
     fn summarization_retry_attempt_start(
@@ -1412,7 +1236,7 @@ impl PiJsonV1Parser {
             "compaction" => required_compaction_reason(object).is_some(),
             _ => false,
         };
-        if !valid_source || !self.protocol.summarization_retry_pending {
+        if !valid_source {
             return Err(self.protocol_failure());
         }
         self.observations
@@ -1424,11 +1248,9 @@ impl PiJsonV1Parser {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        if !has_only_required_shape(object, &["type"]) || !self.protocol.summarization_retry_pending
-        {
+        if !has_only_required_shape(object, &["type"]) {
             return Err(self.protocol_failure());
         }
-        self.protocol.summarization_retry_pending = false;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::RetryCompleted));
         Ok(())
@@ -1500,10 +1322,6 @@ impl PiJsonV1Parser {
         Ok(())
     }
 
-    fn active_turn_mut(&mut self) -> Option<&mut ActiveTurn> {
-        self.protocol.active_attempt.as_mut()?.turn.as_mut()
-    }
-
     fn observe_optional_error(&mut self, error: Option<&str>) {
         if let Some(error) = error {
             self.observations.push(AgentObservation::Diagnostic {
@@ -1550,6 +1368,32 @@ impl PiJsonV1Parser {
                 level: AgentDiagnosticLevel::Error,
                 message: Arc::from(error.as_str()),
             });
+        }
+    }
+
+    fn validate_accepted_terminal(
+        &mut self,
+        assistant: &AssistantMessage,
+    ) -> Result<(), AgentFailureCause> {
+        let matches = self.accepted_result.as_ref().is_some_and(|accepted| {
+            assistant.stop_reason == StopReason::ToolUse
+                && accepted.native_execution_completed
+                && assistant.only_tool_call().is_some_and(|call| {
+                    call.id.as_str() == accepted.accepted.call_id.as_ref()
+                        && call.name.as_str() == accepted.accepted.tool_name.as_ref()
+                        && semantically_equal_json(
+                            &call.arguments,
+                            accepted.accepted.arguments.as_ref(),
+                        )
+                })
+        });
+        if matches {
+            Ok(())
+        } else {
+            self.reject(
+                PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                PiJsonV1ProtocolStage::TerminalValidation,
+            )
         }
     }
 
@@ -1681,8 +1525,6 @@ impl PiJsonV1Parser {
             reason,
             stage,
             outer_event: self.rejection_context.outer_event,
-            assistant_update: self.rejection_context.assistant_update,
-            content_index: self.rejection_context.content_index,
             state: self
                 .rejection_state_snapshot
                 .clone()
@@ -1691,42 +1533,10 @@ impl PiJsonV1Parser {
     }
 
     fn rejection_state(&self) -> PiJsonV1RejectionState {
-        let active_message = self
-            .protocol
-            .active_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.turn.as_ref())
-            .and_then(|turn| turn.active_message.as_ref());
-        let (active_message, active_assistant_content_blocks, assistant_update_seen, open_block) =
-            match active_message {
-                Some(ActiveMessage::Assistant {
-                    last,
-                    open_block,
-                    had_update,
-                }) => (
-                    PiJsonV1ActiveMessageState::Assistant,
-                    Some(bounded_count(last.content.len())),
-                    *had_update,
-                    open_block.map(pi_open_block_state),
-                ),
-                Some(ActiveMessage::Fixed(_)) => {
-                    (PiJsonV1ActiveMessageState::Other, None, false, None)
-                }
-                None => (PiJsonV1ActiveMessageState::None, None, false, None),
-            };
         PiJsonV1RejectionState {
             session_header_seen: self.protocol.header_seen,
             agent_started: self.protocol.ever_started,
-            active_attempt: self.protocol.active_attempt.is_some(),
-            active_turn: self
-                .protocol
-                .active_attempt
-                .as_ref()
-                .is_some_and(|attempt| attempt.turn.is_some()),
-            active_message,
-            active_assistant_content_blocks,
-            assistant_update_seen,
-            open_block,
+            terminal_candidate_retained: self.protocol.last_agent_end.is_some(),
             result_accepted: self.accepted_result.is_some(),
             settled: self.protocol.settled,
         }
@@ -1747,16 +1557,30 @@ impl PiJsonV1Parser {
 struct ProtocolState {
     header_seen: bool,
     ever_started: bool,
-    active_attempt: Option<ActiveAttempt>,
+    agent_active: bool,
     last_agent_end: Option<AgentEndState>,
-    continuation_allowed: bool,
-    retry_attempt: Option<u64>,
-    compaction: Option<CompactionReason>,
-    summarization_retry_pending: bool,
     settled: bool,
 }
 
 impl ProtocolState {
+    fn can_start_agent(&self) -> bool {
+        !self.settled
+            && !self.agent_active
+            && self
+                .last_agent_end
+                .as_ref()
+                .is_none_or(|end| end.will_retry)
+    }
+
+    fn can_settle(&self) -> bool {
+        !self.settled
+            && !self.agent_active
+            && self
+                .last_agent_end
+                .as_ref()
+                .is_some_and(|end| !end.will_retry)
+    }
+
     fn validate_eof(&self) -> Result<(), AgentFailureCause> {
         let failure = if self.ever_started {
             AgentFailureCause::HarnessProtocolFailed
@@ -1767,11 +1591,7 @@ impl ProtocolState {
             return Err(AgentFailureCause::HarnessStartFailed);
         }
         if !self.settled
-            || self.active_attempt.is_some()
-            || self.retry_attempt.is_some()
-            || self.compaction.is_some()
-            || self.summarization_retry_pending
-            || self.continuation_allowed
+            || self.agent_active
             || self
                 .last_agent_end
                 .as_ref()
@@ -1783,118 +1603,40 @@ impl ProtocolState {
     }
 }
 
-#[derive(Default)]
-struct ActiveAttempt {
-    queued_message_required: bool,
-    interrupted_tool_call: bool,
-    turn: Option<ActiveTurn>,
-    completed_messages: Vec<ParsedMessage>,
-    retained_message_bytes: u64,
-    last_completed_assistant: Option<AssistantMessage>,
-    last_turn_assistant: Option<AssistantMessage>,
-}
-
-#[derive(Default)]
-struct ActiveTurn {
-    active_message: Option<ActiveMessage>,
-    assistant: Option<AssistantMessage>,
-    calls: Vec<ToolCallState>,
-    retained_tool_bytes: u64,
-}
-
-impl ActiveTurn {
-    fn result_messages_complete(&self) -> bool {
-        self.calls.iter().all(|call| call.result_message.is_some())
-    }
-
-    fn start_call(&mut self, id: &str, name: &str, arguments: &Value) -> bool {
-        let Some(call) = self.calls.iter_mut().find(|call| !call.started) else {
-            return false;
-        };
-        if call.call.id != id
-            || call.call.name != name
-            || !semantically_equal_json(&call.call.arguments, arguments)
-        {
-            return false;
-        }
-        call.started = true;
-        true
-    }
-
-    fn update_call(&self, id: &str, name: &str, arguments: &Value) -> bool {
-        self.calls.iter().any(|call| {
-            call.started
-                && call.ended.is_none()
-                && call.call.id == id
-                && call.call.name == name
-                && semantically_equal_json(&call.call.arguments, arguments)
-        })
-    }
-
-    fn end_call(
-        &mut self,
-        id: &str,
-        name: &str,
-        result: ToolExecutionResult,
-        is_error: bool,
-    ) -> bool {
-        let Some(call) = self.calls.iter_mut().find(|call| call.call.id == id) else {
-            return false;
-        };
-        if !call.started || call.ended.is_some() || call.call.name != name {
-            return false;
-        }
-        call.ended = Some(CompletedToolExecution { result, is_error });
-        true
-    }
-
-    fn can_start_tool_result(&self, result: &ToolResultMessage) -> bool {
-        let Some(expected) = self.calls.iter().find(|call| call.result_message.is_none()) else {
-            return false;
-        };
-        expected.matches_result_message(result)
-    }
-
-    fn finish_tool_result(&mut self, result: &ToolResultMessage) -> bool {
-        let Some(expected) = self
-            .calls
-            .iter_mut()
-            .find(|call| call.result_message.is_none())
-        else {
-            return false;
-        };
-        if !expected.matches_result_message(result) {
-            return false;
-        }
-        expected.result_message = Some(result.clone());
-        true
-    }
-}
-
+#[derive(Clone)]
 enum ActiveMessage {
     Assistant {
         last: AssistantMessage,
         open_block: Option<OpenBlock>,
         had_update: bool,
     },
-    Fixed(ParsedMessage),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OpenBlock {
     Text(usize),
     Thinking(usize),
-    ToolCall(usize),
+    ToolCall {
+        index: usize,
+        arguments: String,
+        had_delta: bool,
+    },
 }
 
 impl OpenBlock {
-    fn same_kind(self, other: Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Text(_), Self::Text(_))
-                | (Self::Thinking(_), Self::Thinking(_))
-                | (Self::ToolCall(_), Self::ToolCall(_))
-        )
+    fn index(&self) -> usize {
+        match self {
+            Self::Text(index) | Self::Thinking(index) => *index,
+            Self::ToolCall { index, .. } => *index,
+        }
+    }
+
+    fn block_kind(&self) -> BlockKind {
+        match self {
+            Self::Text(_) => BlockKind::Text,
+            Self::Thinking(_) => BlockKind::Thinking,
+            Self::ToolCall { .. } => BlockKind::ToolCall,
+        }
     }
 }
 
@@ -1902,6 +1644,13 @@ impl OpenBlock {
 struct AgentEndState {
     final_assistant: AssistantMessage,
     will_retry: bool,
+}
+
+struct ResultCallState {
+    call: ToolCall,
+    blocked_by_sibling: bool,
+    started: bool,
+    ended: bool,
 }
 
 struct AcceptedResultState {
@@ -1941,13 +1690,6 @@ struct AssistantMessage {
 }
 
 impl AssistantMessage {
-    fn stable_with(&self, other: &Self) -> bool {
-        self.api == other.api
-            && self.provider == other.provider
-            && self.model == other.model
-            && self.timestamp == other.timestamp
-    }
-
     fn text_bytes(&self) -> u64 {
         self.content.iter().fold(0_u64, |total, block| {
             let bytes = match block {
@@ -1976,6 +1718,56 @@ impl AssistantMessage {
         let mut calls = self.tool_calls();
         let call = calls.next()?;
         calls.next().is_none().then_some(call)
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let mut bytes = [
+            self.api.len(),
+            self.provider.len(),
+            self.model.len(),
+            self.response_model.as_deref().map_or(0, str::len),
+            self.response_id.as_deref().map_or(0, str::len),
+            self.error_message.as_deref().map_or(0, str::len),
+        ]
+        .into_iter()
+        .fold(0_u64, |total, bytes| {
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+        for block in &self.content {
+            let structural_bytes =
+                u64::try_from(std::mem::size_of::<ContentBlock>()).unwrap_or(u64::MAX);
+            bytes = bytes
+                .saturating_add(structural_bytes)
+                .saturating_add(match block {
+                    ContentBlock::Text(text) | ContentBlock::Thinking(text) => {
+                        u64::try_from(text.len()).unwrap_or(u64::MAX)
+                    }
+                    ContentBlock::ToolCall(call) => u64::try_from(call.id.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(call.name.len()).unwrap_or(u64::MAX))
+                        .saturating_add(json_bytes(&call.arguments).unwrap_or(u64::MAX)),
+                });
+        }
+        for diagnostic in &self.diagnostics {
+            bytes = bytes
+                .saturating_add(u64::try_from(diagnostic.kind.len()).unwrap_or(u64::MAX))
+                .saturating_add(diagnostic.error_message.as_deref().map_or(0, |message| {
+                    u64::try_from(message.len()).unwrap_or(u64::MAX)
+                }))
+                .saturating_add(
+                    diagnostic
+                        .error
+                        .as_ref()
+                        .map_or(0, |value| json_bytes(value).unwrap_or(u64::MAX)),
+                )
+                .saturating_add(
+                    diagnostic
+                        .details
+                        .as_ref()
+                        .map_or(0, |value| json_bytes(value).unwrap_or(u64::MAX)),
+                );
+        }
+        bytes
     }
 }
 
@@ -2072,46 +1864,6 @@ impl ToolExecutionResult {
     }
 }
 
-struct ToolCallState {
-    call: ToolCall,
-    started: bool,
-    ended: Option<CompletedToolExecution>,
-    result_message: Option<ToolResultMessage>,
-}
-
-impl ToolCallState {
-    fn new(call: ToolCall) -> Self {
-        Self {
-            call,
-            started: false,
-            ended: None,
-            result_message: None,
-        }
-    }
-
-    fn complete(&self) -> bool {
-        self.started && self.ended.is_some() && self.result_message.is_some()
-    }
-
-    fn matches_result_message(&self, message: &ToolResultMessage) -> bool {
-        let Some(execution) = &self.ended else {
-            return false;
-        };
-        self.call.id == message.call_id
-            && self.call.name == message.name
-            && execution.is_error == message.is_error
-            && execution.result.content == message.content
-            && execution.result.details == message.details
-            && execution.result.usage == message.usage
-            && execution.result.added_tool_names == message.added_tool_names
-    }
-}
-
-struct CompletedToolExecution {
-    result: ToolExecutionResult,
-    is_error: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompactionReason {
     Manual,
@@ -2126,197 +1878,202 @@ struct AssistantUpdateEvent {
 
 enum AssistantUpdateKind {
     TextStart,
-    TextDelta(Option<String>),
-    TextEnd(Option<String>),
+    TextDelta(String),
+    TextEnd(String),
     ThinkingStart,
-    ThinkingDelta(Option<String>),
+    ThinkingDelta(String),
     ThinkingEnd(String),
     ToolCallStart,
-    ToolCallDelta,
+    ToolCallDelta(String),
     ToolCallEnd(ToolCall),
 }
 
+enum ApplyAssistantUpdateError {
+    Transition,
+    CapturedValueTooLarge,
+    RetainedStateLimitExceeded,
+}
+
 impl AssistantUpdateEvent {
-    fn valid_transition(
+    fn apply(
         &self,
-        previous: &AssistantMessage,
-        current: &AssistantMessage,
+        message: &mut AssistantMessage,
         open: &mut Option<OpenBlock>,
-    ) -> bool {
+        maximum_retained_bytes: u64,
+    ) -> Result<Vec<AgentObservation>, ApplyAssistantUpdateError> {
         match &self.kind {
             AssistantUpdateKind::TextStart => {
-                start_block(previous, current, self.index, BlockKind::Text)
-                    && set_open(open, OpenBlock::Text(self.index))
+                self.start_block(message, open, ContentBlock::Text(String::new()))?;
+                Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::TextDelta(delta) => {
-                *open == Some(OpenBlock::Text(self.index))
-                    && append_text(
-                        previous,
-                        current,
-                        self.index,
-                        delta.as_deref(),
-                        BlockKind::Text,
-                    )
+                self.require_open(open, BlockKind::Text)?;
+                if retained_update_bytes(message, open)
+                    .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX))
+                    > maximum_retained_bytes
+                {
+                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
+                }
+                let Some(ContentBlock::Text(text)) = message.content.get_mut(self.index) else {
+                    return Err(ApplyAssistantUpdateError::Transition);
+                };
+                text.push_str(delta);
+                Ok(vec![AgentObservation::AssistantText {
+                    text: Arc::from(delta.as_str()),
+                }])
             }
             AssistantUpdateKind::TextEnd(content) => {
-                *open == Some(OpenBlock::Text(self.index))
-                    && finalize_text(previous, current, self.index, content.as_deref())
-                    && clear_open(open)
+                self.require_open(open, BlockKind::Text)?;
+                if !matches!(message.content.get(self.index), Some(ContentBlock::Text(text)) if text == content)
+                {
+                    return Err(ApplyAssistantUpdateError::Transition);
+                }
+                *open = None;
+                Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ThinkingStart => {
-                start_block(previous, current, self.index, BlockKind::Thinking)
-                    && set_open(open, OpenBlock::Thinking(self.index))
+                self.start_block(message, open, ContentBlock::Thinking(String::new()))?;
+                Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ThinkingDelta(delta) => {
-                *open == Some(OpenBlock::Thinking(self.index))
-                    && append_text(
-                        previous,
-                        current,
-                        self.index,
-                        delta.as_deref(),
-                        BlockKind::Thinking,
-                    )
+                self.require_open(open, BlockKind::Thinking)?;
+                if retained_update_bytes(message, open)
+                    .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX))
+                    > maximum_retained_bytes
+                {
+                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
+                }
+                let Some(ContentBlock::Thinking(thinking)) = message.content.get_mut(self.index)
+                else {
+                    return Err(ApplyAssistantUpdateError::Transition);
+                };
+                thinking.push_str(delta);
+                Ok(vec![AgentObservation::Reasoning {
+                    text: Arc::from(delta.as_str()),
+                }])
             }
             AssistantUpdateKind::ThinkingEnd(content) => {
-                *open == Some(OpenBlock::Thinking(self.index))
-                    && finalize_thinking(previous, current, self.index, content)
-                    && clear_open(open)
+                self.require_open(open, BlockKind::Thinking)?;
+                let Some(ContentBlock::Thinking(thinking)) = message.content.get_mut(self.index)
+                else {
+                    return Err(ApplyAssistantUpdateError::Transition);
+                };
+                *thinking = content.clone();
+                *open = None;
+                Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ToolCallStart => {
-                start_block(previous, current, self.index, BlockKind::ToolCall)
-                    && set_open(open, OpenBlock::ToolCall(self.index))
+                self.require_start(message, open)?;
+                *open = Some(OpenBlock::ToolCall {
+                    index: self.index,
+                    arguments: String::new(),
+                    had_delta: false,
+                });
+                Ok(Vec::new())
             }
-            AssistantUpdateKind::ToolCallDelta => {
-                *open == Some(OpenBlock::ToolCall(self.index))
-                    && matches!(
-                        current.content.get(self.index),
-                        Some(ContentBlock::ToolCall(_))
-                    )
-                    && unchanged_except(previous, current, self.index)
+            AssistantUpdateKind::ToolCallDelta(delta) => {
+                self.require_open(open, BlockKind::ToolCall)?;
+                let Some(OpenBlock::ToolCall {
+                    arguments,
+                    had_delta,
+                    ..
+                }) = open.as_mut()
+                else {
+                    unreachable!();
+                };
+                let prospective = arguments
+                    .len()
+                    .checked_add(delta.len())
+                    .and_then(|bytes| u64::try_from(bytes).ok());
+                if prospective.is_none_or(|bytes| {
+                    message.retained_bytes().saturating_add(bytes) > maximum_retained_bytes
+                }) {
+                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
+                }
+                arguments.push_str(delta);
+                *had_delta = true;
+                Ok(Vec::new())
             }
             AssistantUpdateKind::ToolCallEnd(call) => {
-                *open == Some(OpenBlock::ToolCall(self.index))
-                    && current.content.get(self.index)
-                        == Some(&ContentBlock::ToolCall(call.clone()))
-                    && unchanged_except(previous, current, self.index)
-                    && clear_open(open)
-            }
-        }
-    }
-
-    fn transition_failure_reason(
-        &self,
-        previous: &AssistantMessage,
-        open: &Option<OpenBlock>,
-    ) -> PiJsonV1RejectionReason {
-        let expected_open = match self.kind {
-            AssistantUpdateKind::TextStart
-            | AssistantUpdateKind::ThinkingStart
-            | AssistantUpdateKind::ToolCallStart => None,
-            AssistantUpdateKind::TextDelta(_) | AssistantUpdateKind::TextEnd(_) => {
-                Some(OpenBlock::Text(self.index))
-            }
-            AssistantUpdateKind::ThinkingDelta(_) | AssistantUpdateKind::ThinkingEnd(_) => {
-                Some(OpenBlock::Thinking(self.index))
-            }
-            AssistantUpdateKind::ToolCallDelta | AssistantUpdateKind::ToolCallEnd(_) => {
-                Some(OpenBlock::ToolCall(self.index))
-            }
-        };
-        match expected_open {
-            None if open.is_some() => PiJsonV1RejectionReason::AssistantUpdateOpenBlockMismatch,
-            None if self.index != previous.content.len() => {
-                PiJsonV1RejectionReason::AssistantUpdateContentIndexMismatch
-            }
-            Some(expected) if *open != Some(expected) => {
-                if open.is_some_and(|actual| actual.same_kind(expected)) {
-                    PiJsonV1RejectionReason::AssistantUpdateContentIndexMismatch
-                } else {
-                    PiJsonV1RejectionReason::AssistantUpdateOpenBlockMismatch
+                self.require_open(open, BlockKind::ToolCall)?;
+                let Some(OpenBlock::ToolCall { had_delta, .. }) = open.as_ref() else {
+                    unreachable!();
+                };
+                let had_delta = *had_delta;
+                if self.index != message.content.len() {
+                    return Err(ApplyAssistantUpdateError::Transition);
                 }
-            }
-            _ if matches!(self.kind, AssistantUpdateKind::ThinkingEnd(_)) => {
-                PiJsonV1RejectionReason::ThinkingFinalizationRewrite
-            }
-            _ => PiJsonV1RejectionReason::AssistantContentTransitionInvalid,
-        }
-    }
-
-    fn normalized_observations(
-        &self,
-        previous: &AssistantMessage,
-        message: &AssistantMessage,
-    ) -> Vec<AgentObservation> {
-        match &self.kind {
-            AssistantUpdateKind::TextDelta(_) => {
-                appended_text(previous, message, self.index, BlockKind::Text)
-                    .map(|delta| AgentObservation::AssistantText {
-                        text: Arc::from(delta),
-                    })
-                    .into_iter()
-                    .collect()
-            }
-            AssistantUpdateKind::ThinkingDelta(_) => {
-                appended_text(previous, message, self.index, BlockKind::Thinking)
-                    .map(|delta| AgentObservation::Reasoning {
-                        text: Arc::from(delta),
-                    })
-                    .into_iter()
-                    .collect()
-            }
-            AssistantUpdateKind::ToolCallStart => message
-                .content
-                .get(self.index)
-                .and_then(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(AgentObservation::ToolCall {
-                        call_id: Arc::from(call.id.as_str()),
-                        name: Arc::from(call.name.as_str()),
-                        phase: AgentToolCallPhase::Started,
-                    }),
-                    ContentBlock::Text(_) | ContentBlock::Thinking(_) => None,
-                })
-                .into_iter()
-                .collect(),
-            AssistantUpdateKind::ToolCallDelta => message
-                .content
-                .get(self.index)
-                .and_then(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(AgentObservation::ToolCall {
+                message.content.push(ContentBlock::ToolCall(call.clone()));
+                *open = None;
+                let mut observations = vec![AgentObservation::ToolCall {
+                    call_id: Arc::from(call.id.as_str()),
+                    name: Arc::from(call.name.as_str()),
+                    phase: AgentToolCallPhase::Started,
+                }];
+                if had_delta {
+                    observations.push(AgentObservation::ToolCall {
                         call_id: Arc::from(call.id.as_str()),
                         name: Arc::from(call.name.as_str()),
                         phase: AgentToolCallPhase::Updated,
-                    }),
-                    ContentBlock::Text(_) | ContentBlock::Thinking(_) => None,
-                })
-                .into_iter()
-                .collect(),
-            AssistantUpdateKind::ToolCallEnd(call) => vec![AgentObservation::ToolCall {
-                call_id: Arc::from(call.id.as_str()),
-                name: Arc::from(call.name.as_str()),
-                phase: AgentToolCallPhase::Completed,
-            }],
-            AssistantUpdateKind::TextStart
-            | AssistantUpdateKind::TextEnd(_)
-            | AssistantUpdateKind::ThinkingStart
-            | AssistantUpdateKind::ThinkingEnd(_) => {
-                vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)]
+                    });
+                }
+                observations.push(AgentObservation::ToolCall {
+                    call_id: Arc::from(call.id.as_str()),
+                    name: Arc::from(call.name.as_str()),
+                    phase: AgentToolCallPhase::Completed,
+                });
+                Ok(observations)
             }
         }
     }
+
+    fn start_block(
+        &self,
+        message: &mut AssistantMessage,
+        open: &mut Option<OpenBlock>,
+        block: ContentBlock,
+    ) -> Result<(), ApplyAssistantUpdateError> {
+        self.require_start(message, open)?;
+        message.content.push(block);
+        *open = Some(match self.kind {
+            AssistantUpdateKind::TextStart => OpenBlock::Text(self.index),
+            AssistantUpdateKind::ThinkingStart => OpenBlock::Thinking(self.index),
+            _ => unreachable!(),
+        });
+        Ok(())
+    }
+
+    fn require_start(
+        &self,
+        message: &AssistantMessage,
+        open: &Option<OpenBlock>,
+    ) -> Result<(), ApplyAssistantUpdateError> {
+        if open.is_some() || self.index != message.content.len() {
+            return Err(ApplyAssistantUpdateError::Transition);
+        }
+        Ok(())
+    }
+
+    fn require_open(
+        &self,
+        open: &Option<OpenBlock>,
+        expected: BlockKind,
+    ) -> Result<(), ApplyAssistantUpdateError> {
+        let Some(actual) = open else {
+            return Err(ApplyAssistantUpdateError::Transition);
+        };
+        if actual.block_kind() != expected || actual.index() != self.index {
+            return Err(ApplyAssistantUpdateError::Transition);
+        }
+        Ok(())
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum BlockKind {
     Text,
     Thinking,
     ToolCall,
-}
-
-fn parse_messages(values: &[Value], complete: bool) -> Option<Vec<ParsedMessage>> {
-    values
-        .iter()
-        .map(|value| parse_message(value, complete))
-        .collect()
 }
 
 fn parse_tool_results(values: &[Value]) -> Option<Vec<ToolResultMessage>> {
@@ -2629,29 +2386,16 @@ enum ParseAssistantEventError {
     Shape,
     Subtype,
     ContentIndex,
-    PartialMismatch,
 }
 
 fn parse_assistant_event(
     object: &Map<String, Value>,
-    current: &AssistantMessage,
 ) -> Result<AssistantUpdateEvent, ParseAssistantEventError> {
-    let compact = match object.get(COMPACT_UPDATE_PROPERTY) {
-        None => false,
-        Some(Value::Bool(true)) => true,
-        Some(_) => return Err(ParseAssistantEventError::Shape),
-    };
-    if compact {
-        if object.contains_key("partial") || object.contains_key("message") {
-            return Err(ParseAssistantEventError::Shape);
-        }
-    } else if required_value(object, "partial")
-        .and_then(|value| parse_message(value, false))
-        .and_then(|message| message.assistant().cloned())
-        .as_ref()
-        != Some(current)
+    if object.contains_key("partial")
+        || object.contains_key("message")
+        || object.contains_key("scherzoCompact")
     {
-        return Err(ParseAssistantEventError::PartialMismatch);
+        return Err(ParseAssistantEventError::Shape);
     }
     let index = required_u64(object, "contentIndex")
         .and_then(|index| usize::try_from(index).ok())
@@ -2660,27 +2404,32 @@ fn parse_assistant_event(
     let kind = match event_type {
         "text_start" => AssistantUpdateKind::TextStart,
         "text_delta" => AssistantUpdateKind::TextDelta(
-            compactable_string(object, "delta", compact).ok_or(ParseAssistantEventError::Shape)?,
+            required_string(object, "delta")
+                .ok_or(ParseAssistantEventError::Shape)?
+                .to_owned(),
         ),
         "text_end" => AssistantUpdateKind::TextEnd(
-            compactable_string(object, "content", compact)
-                .ok_or(ParseAssistantEventError::Shape)?,
+            required_string(object, "content")
+                .ok_or(ParseAssistantEventError::Shape)?
+                .to_owned(),
         ),
         "thinking_start" => AssistantUpdateKind::ThinkingStart,
         "thinking_delta" => AssistantUpdateKind::ThinkingDelta(
-            compactable_string(object, "delta", compact).ok_or(ParseAssistantEventError::Shape)?,
+            required_string(object, "delta")
+                .ok_or(ParseAssistantEventError::Shape)?
+                .to_owned(),
         ),
-        "thinking_end" if compact => return Err(ParseAssistantEventError::Shape),
         "thinking_end" => AssistantUpdateKind::ThinkingEnd(
             required_string(object, "content")
                 .ok_or(ParseAssistantEventError::Shape)?
                 .to_owned(),
         ),
         "toolcall_start" => AssistantUpdateKind::ToolCallStart,
-        "toolcall_delta" => {
-            required_string(object, "delta").ok_or(ParseAssistantEventError::Shape)?;
-            AssistantUpdateKind::ToolCallDelta
-        }
+        "toolcall_delta" => AssistantUpdateKind::ToolCallDelta(
+            required_string(object, "delta")
+                .ok_or(ParseAssistantEventError::Shape)?
+                .to_owned(),
+        ),
         "toolcall_end" => AssistantUpdateKind::ToolCallEnd(
             required_object(object, "toolCall")
                 .and_then(|call| parse_tool_call(call, true))
@@ -2691,173 +2440,17 @@ fn parse_assistant_event(
     Ok(AssistantUpdateEvent { kind, index })
 }
 
-fn compactable_string(
-    object: &Map<String, Value>,
-    key: &str,
-    compact: bool,
-) -> Option<Option<String>> {
-    if compact {
-        return (!object.contains_key(key)).then_some(None);
-    }
-    required_string(object, key).map(|value| Some(value.to_owned()))
-}
-
-fn start_block(
-    previous: &AssistantMessage,
-    current: &AssistantMessage,
-    index: usize,
-    kind: BlockKind,
-) -> bool {
-    if index != previous.content.len() || current.content.len() != previous.content.len() + 1 {
-        return false;
-    }
-    let expected = match kind {
-        BlockKind::Text => {
-            matches!(current.content.get(index), Some(ContentBlock::Text(text)) if text.is_empty())
+fn retained_update_bytes(message: &AssistantMessage, open: &Option<OpenBlock>) -> u64 {
+    message.retained_bytes().saturating_add(match open {
+        Some(OpenBlock::ToolCall { arguments, .. }) => {
+            u64::try_from(arguments.len()).unwrap_or(u64::MAX)
         }
-        BlockKind::Thinking => {
-            matches!(current.content.get(index), Some(ContentBlock::Thinking(text)) if text.is_empty())
-        }
-        BlockKind::ToolCall => {
-            matches!(current.content.get(index), Some(ContentBlock::ToolCall(_)))
-        }
-    };
-    expected && previous.content == current.content[..index]
-}
-
-fn block_texts<'a>(
-    previous: &'a AssistantMessage,
-    current: &'a AssistantMessage,
-    index: usize,
-    kind: BlockKind,
-) -> Option<(&'a str, &'a str)> {
-    if !unchanged_except(previous, current, index) {
-        return None;
-    }
-    match (
-        previous.content.get(index),
-        current.content.get(index),
-        kind,
-    ) {
-        (Some(ContentBlock::Text(before)), Some(ContentBlock::Text(after)), BlockKind::Text)
-        | (
-            Some(ContentBlock::Thinking(before)),
-            Some(ContentBlock::Thinking(after)),
-            BlockKind::Thinking,
-        ) => Some((before, after)),
-        _ => None,
-    }
-}
-
-fn appended_text<'a>(
-    previous: &'a AssistantMessage,
-    current: &'a AssistantMessage,
-    index: usize,
-    kind: BlockKind,
-) -> Option<&'a str> {
-    block_texts(previous, current, index, kind)
-        .and_then(|(before, after)| after.strip_prefix(before))
-}
-
-fn append_text(
-    previous: &AssistantMessage,
-    current: &AssistantMessage,
-    index: usize,
-    expected_delta: Option<&str>,
-    kind: BlockKind,
-) -> bool {
-    appended_text(previous, current, index, kind)
-        .is_some_and(|delta| expected_delta.is_none_or(|expected| delta == expected))
-}
-
-fn finalize_text(
-    previous: &AssistantMessage,
-    current: &AssistantMessage,
-    index: usize,
-    expected_finalized: Option<&str>,
-) -> bool {
-    block_texts(previous, current, index, BlockKind::Text).is_some_and(|(previous, current)| {
-        previous == current && expected_finalized.is_none_or(|expected| current == expected)
+        Some(OpenBlock::Text(_) | OpenBlock::Thinking(_)) | None => 0,
     })
-}
-
-fn finalize_thinking(
-    previous: &AssistantMessage,
-    current: &AssistantMessage,
-    index: usize,
-    expected_finalized: &str,
-) -> bool {
-    // Pi exposes provider-finalized thinking at `thinking_end`; providers may
-    // summarize or otherwise replace their streamed reasoning before closing it.
-    block_texts(previous, current, index, BlockKind::Thinking)
-        .is_some_and(|(_, current)| current == expected_finalized)
-}
-
-fn unchanged_except(previous: &AssistantMessage, current: &AssistantMessage, index: usize) -> bool {
-    previous.content.len() == current.content.len()
-        && previous
-            .content
-            .iter()
-            .zip(&current.content)
-            .enumerate()
-            .all(|(candidate, (before, after))| candidate == index || before == after)
-}
-
-fn valid_message_end_open_block(
-    open: Option<OpenBlock>,
-    streamed: &AssistantMessage,
-    completed: &AssistantMessage,
-) -> bool {
-    match open {
-        None => true,
-        Some(OpenBlock::ToolCall(index)) => {
-            streamed.stop_reason == StopReason::Pending
-                && matches!(
-                    completed.stop_reason,
-                    StopReason::Length | StopReason::Error
-                )
-                && matches!(
-                    completed.content.get(index),
-                    Some(ContentBlock::ToolCall(_))
-                )
-        }
-        Some(OpenBlock::Text(_) | OpenBlock::Thinking(_)) => false,
-    }
-}
-
-fn set_open(open: &mut Option<OpenBlock>, value: OpenBlock) -> bool {
-    if open.is_some() {
-        return false;
-    }
-    *open = Some(value);
-    true
-}
-
-fn clear_open(open: &mut Option<OpenBlock>) -> bool {
-    *open = None;
-    true
 }
 
 fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
     AgentObservation::Lifecycle { milestone }
-}
-
-fn bounded_count(value: usize) -> u64 {
-    u64::try_from(value)
-        .unwrap_or(u64::MAX)
-        .min(MAXIMUM_DIAGNOSTIC_SEQUENCE)
-}
-
-fn pi_open_block_state(block: OpenBlock) -> PiJsonV1OpenBlockState {
-    let (kind, content_index) = match block {
-        OpenBlock::Text(index) => (PiJsonV1OpenBlockKind::Text, index),
-        OpenBlock::Thinking(index) => (PiJsonV1OpenBlockKind::Thinking, index),
-        OpenBlock::ToolCall(index) => (PiJsonV1OpenBlockKind::ToolCall, index),
-    };
-    PiJsonV1OpenBlockState {
-        kind,
-        content_index: bounded_count(content_index),
-    }
 }
 
 fn harness_failure(detail: AgentHarnessFailureDetail) -> super::agent::AgentOutcome {
@@ -2868,27 +2461,6 @@ fn json_bytes(value: &Value) -> Option<u64> {
     serde_json::to_vec(value)
         .ok()
         .and_then(|bytes| u64::try_from(bytes.len()).ok())
-}
-
-fn finalized_content_correlates(
-    streamed: &[ContentBlock],
-    finalized: &[ContentBlock],
-    expected_result_tool_name: Option<&str>,
-) -> bool {
-    streamed.len() == finalized.len()
-        && streamed
-            .iter()
-            .zip(finalized)
-            .all(|(streamed, finalized)| match (streamed, finalized) {
-                (ContentBlock::ToolCall(streamed), ContentBlock::ToolCall(finalized))
-                    if expected_result_tool_name == Some(streamed.name.as_str()) =>
-                {
-                    streamed.id == finalized.id
-                        && streamed.name == finalized.name
-                        && semantically_equal_json(&streamed.arguments, &finalized.arguments)
-                }
-                _ => streamed == finalized,
-            })
 }
 
 fn semantically_equal_json(left: &Value, right: &Value) -> bool {
@@ -3088,48 +2660,53 @@ fn normalized_pi_event_type(event_type: &str) -> PiJsonV1EventType {
     }
 }
 
-fn normalized_pi_assistant_update_type(event_type: &str) -> PiJsonV1AssistantUpdateType {
-    match event_type {
-        "text_start" => PiJsonV1AssistantUpdateType::TextStart,
-        "text_delta" => PiJsonV1AssistantUpdateType::TextDelta,
-        "text_end" => PiJsonV1AssistantUpdateType::TextEnd,
-        "thinking_start" => PiJsonV1AssistantUpdateType::ThinkingStart,
-        "thinking_delta" => PiJsonV1AssistantUpdateType::ThinkingDelta,
-        "thinking_end" => PiJsonV1AssistantUpdateType::ThinkingEnd,
-        "toolcall_start" => PiJsonV1AssistantUpdateType::ToolcallStart,
-        "toolcall_delta" => PiJsonV1AssistantUpdateType::ToolcallDelta,
-        "toolcall_end" => PiJsonV1AssistantUpdateType::ToolcallEnd,
-        _ => PiJsonV1AssistantUpdateType::Unrecognized,
-    }
-}
-
-fn known_event_type(event_type: &str) -> bool {
+fn work_bearing_after_boundary(
+    event_type: &str,
+    object: &Map<String, Value>,
+    include_agent_end: bool,
+) -> bool {
     matches!(
         event_type,
-        "agent_start"
-            | "agent_end"
-            | "agent_settled"
-            | "turn_start"
-            | "turn_end"
-            | "message_start"
-            | "message_update"
-            | "message_end"
-            | "tool_execution_start"
-            | "tool_execution_update"
-            | "tool_execution_end"
-            | "auto_retry_start"
-            | "auto_retry_end"
-            | "compaction_start"
-            | "compaction_end"
-            | "summarization_retry_scheduled"
-            | "summarization_retry_attempt_start"
-            | "summarization_retry_finished"
-            | "queue_update"
-            | "entry_appended"
-            | "session_info_changed"
-            | "thinking_level_changed"
-            | "bash_execution_update"
-    )
+        "agent_start" | "turn_start" | "tool_execution_start"
+    ) || include_agent_end && event_type == "agent_end"
+        || event_type == "message_start"
+            && required_object(object, "message")
+                .and_then(|message| required_string(message, "role"))
+                == Some("assistant")
+}
+
+fn observation_event_has_unknown_fields(event_type: &str, object: &Map<String, Value>) -> bool {
+    let allowed: &[&str] = match event_type {
+        "turn_start" => &["type"],
+        "turn_end" => &["type", "message", "toolResults"],
+        "message_start" | "message_end" => &["type", "message"],
+        "message_update" => &["type", "usage", "assistantMessageEvent"],
+        "tool_execution_start" => &["type", "toolCallId", "toolName", "args"],
+        "tool_execution_update" => &["type", "toolCallId", "toolName", "args", "partialResult"],
+        "tool_execution_end" => &["type", "toolCallId", "toolName", "result", "isError"],
+        "auto_retry_start" | "summarization_retry_scheduled" => {
+            &["type", "attempt", "maxAttempts", "delayMs", "errorMessage"]
+        }
+        "auto_retry_end" => &["type", "success", "attempt", "finalError"],
+        "compaction_start" => &["type", "reason"],
+        "compaction_end" => &[
+            "type",
+            "reason",
+            "result",
+            "aborted",
+            "willRetry",
+            "errorMessage",
+        ],
+        "summarization_retry_attempt_start" => &["type", "source", "reason"],
+        "summarization_retry_finished" => &["type"],
+        "queue_update" => &["type", "steering", "followUp"],
+        "entry_appended" => &["type", "entry"],
+        "session_info_changed" => &["type", "name"],
+        "thinking_level_changed" => &["type", "level"],
+        "bash_execution_update" => &["type", "id", "delta"],
+        _ => return false,
+    };
+    object.keys().any(|key| !allowed.contains(&key.as_str()))
 }
 
 fn required_compaction_reason(object: &Map<String, Value>) -> Option<CompactionReason> {
@@ -3146,26 +2723,7 @@ fn array_of_strings(values: &[Value]) -> bool {
 }
 
 fn has_only_required_shape(object: &Map<String, Value>, required: &[&str]) -> bool {
-    required.iter().all(|key| object.contains_key(*key))
-}
-
-fn valid_timestamp(value: &str) -> bool {
-    OffsetDateTime::parse(value, &Rfc3339).is_ok()
-}
-
-fn valid_session_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && [8, 13, 18, 23]
-            .into_iter()
-            .all(|index| bytes.get(index) == Some(&b'-'))
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
-        && bytes
-            .iter()
-            .any(|byte| byte.is_ascii_hexdigit() && *byte != b'0')
+    object.len() == required.len() && required.iter().all(|key| object.contains_key(*key))
 }
 
 fn parse_optional_usage(object: &Map<String, Value>) -> Option<Option<Usage>> {

@@ -382,7 +382,7 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             step.installation().executable(),
             recorder.path().join("validated-pi")
         );
-        assert_eq!(step.installation().version().as_str(), "0.83.0");
+        assert_eq!(step.installation().version().as_str(), "0.84.2");
         assert_eq!(
             step.installation().profile(),
             PiCompatibilityProfile::PiJsonV1

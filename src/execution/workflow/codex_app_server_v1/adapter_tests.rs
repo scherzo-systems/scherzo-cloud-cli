@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::adapter::{CodexAppServerV1Adapter, prepare_launch};
 use super::*;
+use crate::execution::codex::CODEX_APP_SERVER_V1_QUALIFICATION_VERSION;
 use crate::execution::workflow::admission::{
     CancellationReason, CancellationSource, EnvironmentSnapshot,
 };
@@ -188,6 +189,14 @@ fn assert_started_failure(
     assert_failure_cause(outcome, expected, scenario);
 }
 
+fn assert_completed_without_value(outcome: AgentOutcome, started: bool) {
+    assert!(started, "terminal outcome: {outcome:?}");
+    assert_eq!(
+        outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+}
+
 fn assert_failure_cause(outcome: AgentOutcome, expected: AgentFailureCause, scenario: &str) {
     let AgentOutcome::Failed(failure) = outcome else {
         panic!("{scenario}: expected failure");
@@ -256,13 +265,19 @@ struct ProcessFixture {
     descendant: PathBuf,
     codex_home: PathBuf,
     diagnostic_session: PathBuf,
-    sqlite_home: PathBuf,
+    sqlite_staging: PathBuf,
     expected_cwd: PathBuf,
 }
 
 impl ProcessFixture {
     fn new(scenario: &str, value_mode: AgentValueMode, maximum_response_bytes: u64) -> Self {
-        Self::with_provider(scenario, value_mode, maximum_response_bytes, None)
+        Self::with_version(
+            scenario,
+            value_mode,
+            maximum_response_bytes,
+            None,
+            "0.147.0",
+        )
     }
 
     fn with_provider(
@@ -271,12 +286,30 @@ impl ProcessFixture {
         maximum_response_bytes: u64,
         provider_address: Option<std::net::SocketAddr>,
     ) -> Self {
-        Self::with_provider_and_attachments(
+        Self::with_version(
+            scenario,
+            value_mode,
+            maximum_response_bytes,
+            provider_address,
+            "0.147.0",
+        )
+    }
+
+    fn with_version(
+        scenario: &str,
+        value_mode: AgentValueMode,
+        maximum_response_bytes: u64,
+        provider_address: Option<std::net::SocketAddr>,
+        version: &str,
+    ) -> Self {
+        Self::with_provider_attachments_and_codex_home(
             scenario,
             value_mode,
             maximum_response_bytes,
             provider_address,
             &[],
+            false,
+            version,
         )
     }
 
@@ -291,6 +324,38 @@ impl ProcessFixture {
         provider_address: Option<std::net::SocketAddr>,
         attachments: &[(&[u8], &str, &str)],
     ) -> Self {
+        Self::with_provider_attachments_and_codex_home(
+            scenario,
+            value_mode,
+            maximum_response_bytes,
+            provider_address,
+            attachments,
+            false,
+            "0.147.0",
+        )
+    }
+
+    fn with_codex_home_containing_staging() -> Self {
+        Self::with_provider_attachments_and_codex_home(
+            "absent",
+            AgentValueMode::None,
+            1024,
+            None,
+            &[],
+            true,
+            "0.147.0",
+        )
+    }
+
+    fn with_provider_attachments_and_codex_home(
+        scenario: &str,
+        value_mode: AgentValueMode,
+        maximum_response_bytes: u64,
+        provider_address: Option<std::net::SocketAddr>,
+        attachments: &[(&[u8], &str, &str)],
+        codex_home_contains_staging: bool,
+        version: &str,
+    ) -> Self {
         // Codex owns fresh native process, control, and state roots; sharing another
         // harness fixture would invalidate profile-specific persistence evidence.
         // jscpd:ignore-start
@@ -303,8 +368,12 @@ impl ProcessFixture {
         let result_endpoint = staging.join("result-endpoint");
         let controls = temporary_root.join("controls");
         let home = temporary_root.join("home");
-        let codex_home = temporary_root.join("codex-home");
-        let diagnostic_session = temporary_root.join("diagnostics/session");
+        let codex_home = if codex_home_contains_staging {
+            temporary_root.clone()
+        } else {
+            temporary_root.join("codex-home")
+        };
+        let diagnostic_session = temporary_root.join("diagnostics");
         for directory in [
             &cwd,
             &staging,
@@ -345,10 +414,6 @@ impl ProcessFixture {
                 codex_home.as_os_str().to_owned(),
             ),
             (
-                OsString::from("CODEX_FIXTURE_SQLITE_HOME_PATH"),
-                result_endpoint.as_os_str().to_owned(),
-            ),
-            (
                 OsString::from("CODEX_FIXTURE_HELPER"),
                 std::env::current_exe().unwrap().into_os_string(),
             ),
@@ -379,6 +444,10 @@ impl ProcessFixture {
             (
                 OsString::from("CODEX_FIXTURE_SCENARIO"),
                 OsString::from(scenario),
+            ),
+            (
+                OsString::from("CODEX_FIXTURE_VERSION"),
+                OsString::from(version),
             ),
             (
                 OsString::from("CODEX_FIXTURE_RESPONSE"),
@@ -449,7 +518,7 @@ impl ProcessFixture {
             AdmittedAgentAdapter::new(
                 AgentCompatibilityProfile::CodexAppServerV1,
                 executable.clone(),
-                Arc::from("0.147.0"),
+                Arc::from(version),
                 CodexConfig {
                     model: MODEL.to_owned(),
                     effort: "high".to_owned(),
@@ -491,17 +560,21 @@ impl ProcessFixture {
             descendant,
             codex_home,
             diagnostic_session,
-            sqlite_home: result_endpoint,
+            sqlite_staging: result_endpoint,
             expected_cwd,
         }
     }
 
-    fn with_exact_binary(provider_address: std::net::SocketAddr) -> Self {
-        let fixture = Self::with_provider(
+    fn with_exact_binary(
+        provider_address: std::net::SocketAddr,
+        value_mode: AgentValueMode,
+    ) -> Self {
+        let fixture = Self::with_version(
             "exact-binary",
-            response_mode(),
+            value_mode,
             1024,
             Some(provider_address),
+            CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
         );
         let exact = PathBuf::from(
             std::env::var_os("SCHERZO_CODEX_APP_SERVER_CONFORMANCE_EXECUTABLE").unwrap(),
@@ -522,25 +595,39 @@ impl ProcessFixture {
         fixture
     }
 
-    fn ambient_rollout(&self) -> PathBuf {
-        self.codex_home.join(format!(
-            "sessions/2026/08/18/rollout-2026-08-18T00-00-00-{THREAD_ID}.jsonl"
-        ))
+    fn with_exact_binary_stdin_capture(
+        provider_address: std::net::SocketAddr,
+        value_mode: AgentValueMode,
+    ) -> (Self, PathBuf) {
+        let fixture = Self::with_exact_binary(provider_address, value_mode);
+        let exact = std::fs::read_link(&fixture.executable).unwrap();
+        let stdin_capture = fixture
+            .arguments
+            .parent()
+            .unwrap()
+            .join("exact-stdin.jsonl");
+        std::fs::remove_file(&fixture.executable).unwrap();
+        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"));
+        std::fs::write(
+            &fixture.executable,
+            format!(
+                "#!/bin/sh\nset -eu\ntee {} | {} \"$@\"\n",
+                quote(&stdin_capture),
+                quote(&exact),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture.executable, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        (fixture, stdin_capture)
     }
 
-    fn retained_rollout(&self) -> PathBuf {
-        self.diagnostic_session.join("rollout.jsonl")
-    }
-
-    fn thread_correlation(&self) -> PathBuf {
-        self.diagnostic_session.join("thread.json")
+    fn sqlite_home(&self) -> Option<PathBuf> {
+        captured_sqlite_home(&self.arguments)
     }
 
     fn protocol_rejection(&self) -> PathBuf {
-        self.diagnostic_session
-            .parent()
-            .unwrap()
-            .join("protocol-rejection.json")
+        self.diagnostic_session.join("protocol-rejection.json")
     }
 }
 
@@ -633,6 +720,7 @@ async fn run_fixture(mut fixture: ProcessFixture) -> (ProcessFixture, AgentOutco
         let process = fixture_process(&fixture.process);
         assert!(process_group_is_quiescent(process));
     }
+    assert_transient_sqlite_cleaned(&fixture);
     (fixture, outcome, started)
 }
 // jscpd:ignore-end
@@ -655,20 +743,20 @@ fn assert_fixture_quiescent(fixture: &ProcessFixture) {
     )));
 }
 
-fn assert_rollout_retained(fixture: &ProcessFixture) {
-    assert!(fixture.retained_rollout().is_file());
+fn assert_transient_sqlite_cleaned(fixture: &ProcessFixture) {
+    let Some(sqlite_home) = fixture.sqlite_home() else {
+        return;
+    };
+    assert!(sqlite_home.is_absolute());
+    assert_eq!(sqlite_home.parent(), Some(fixture.sqlite_staging.as_path()));
+    assert!(!sqlite_home.exists());
+    assert!(!fixture.codex_home.join("state_5.sqlite").exists());
+}
+
+fn assert_no_native_rollout(fixture: &ProcessFixture) {
     assert!(!contains_rollout(&fixture.codex_home));
-    let correlation: Value =
-        serde_json::from_slice(&std::fs::read(fixture.thread_correlation()).unwrap()).unwrap();
-    assert!(
-        correlation["threadId"]
-            .as_str()
-            .is_some_and(super::is_codex_thread_id)
-    );
-    assert_eq!(
-        correlation["nativeRollout"]["relativeFile"],
-        "rollout.jsonl"
-    );
+    assert!(!contains_rollout(&fixture.diagnostic_session));
+    assert!(!fixture.diagnostic_session.join("thread.json").exists());
     assert!(
         !fixture
             .diagnostic_session
@@ -701,6 +789,17 @@ fn fixture_process(path: &Path) -> Pid {
     Pid::from_raw(raw).unwrap()
 }
 
+fn captured_sqlite_home(path: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(path).ok()?;
+    bytes.split(|byte| *byte == 0).find_map(|argument| {
+        let argument = std::str::from_utf8(argument).ok()?;
+        argument
+            .strip_prefix("sqlite_home=\"")
+            .and_then(|value| value.strip_suffix('\"'))
+            .map(PathBuf::from)
+    })
+}
+
 fn captured_requests(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -731,6 +830,23 @@ async fn wait_for_fixture_file(path: &Path) {
     }
 }
 
+// The exact subprocess exposes no in-process request channel. This bounded OS-boundary
+// poll observes bytes flushed by its transparent stdin capture; the watchdog remains the
+// anti-hang bound rather than the event that makes release safe.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "captured subprocess input is the readiness event; the delay only spaces OS polls"
+)]
+async fn wait_for_fixture_bytes(path: &Path, expected: &[u8]) {
+    while !std::fs::read(path).is_ok_and(|bytes| {
+        bytes
+            .windows(expected.len())
+            .any(|window| window == expected)
+    }) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 fn write_server_frame(output: &mut impl Write, value: Value) {
     serde_json::to_writer(&mut *output, &value).unwrap();
     output.write_all(b"\n").unwrap();
@@ -751,65 +867,19 @@ fn expect_client_eof(input: &mut impl std::io::Read) {
     assert!(trailing.is_empty());
 }
 
-fn native_rollout_path() -> PathBuf {
-    if std::env::var("CODEX_FIXTURE_SCENARIO").as_deref() == Ok("rollout-outside") {
-        return PathBuf::from(std::env::var_os("CODEX_FIXTURE_REQUESTS").unwrap())
-            .parent()
-            .unwrap()
-            .join("attacker-rollout.jsonl");
-    }
-    PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join(format!(
-        "sessions/2026/08/18/rollout-2026-08-18T00-00-00-{THREAD_ID}.jsonl"
-    ))
-}
-
-fn thread_document(cwd: &str) -> Value {
+fn thread_document(cwd: &str, version: &str) -> Value {
     json!({
         "id": THREAD_ID,
         "sessionId": THREAD_ID,
         "forkedFromId": null,
         "parentThreadId": null,
-        "ephemeral": false,
-        "path": native_rollout_path(),
-        "cliVersion": "0.147.0",
+        "ephemeral": true,
+        "path": null,
+        "cliVersion": version,
         "turns": [],
         "cwd": cwd,
         "modelProvider": PROVIDER,
     })
-}
-
-fn materialize_native_rollout(cwd: &str, scenario: &str) {
-    let path = native_rollout_path();
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let retained_thread_id = if scenario == "rollout-identity-mismatch" {
-        "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e13"
-    } else {
-        THREAD_ID
-    };
-    let session_meta = json!({
-        "timestamp": "2026-08-18T00:00:00Z",
-        "type": "session_meta",
-        "payload": {
-            "id": retained_thread_id,
-            "session_id": retained_thread_id,
-            "cwd": cwd,
-            "cli_version": "0.147.0",
-        }
-    });
-    let bytes = format!(
-        "{}\n{{\"fixture\":{scenario:?}}}\n",
-        serde_json::to_string(&session_meta).unwrap()
-    );
-    if scenario == "rollout-symlink" {
-        let target = PathBuf::from(std::env::var_os("CODEX_FIXTURE_REQUESTS").unwrap())
-            .parent()
-            .unwrap()
-            .join("attacker-rollout.jsonl");
-        std::fs::write(&target, bytes).unwrap();
-        symlink(target, path).unwrap();
-    } else {
-        std::fs::write(path, bytes).unwrap();
-    }
 }
 
 fn turn_document(status: &str, items: Vec<Value>) -> Value {
@@ -1000,6 +1070,15 @@ fn provider_response(thread: &Value) -> String {
 )]
 fn codex_process_fixture() {
     let scenario = std::env::var("CODEX_FIXTURE_SCENARIO").unwrap();
+    let sqlite_home = PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap());
+    assert!(sqlite_home.is_absolute());
+    assert!(!sqlite_home.starts_with("/dev/fd"));
+    assert!(!sqlite_home.starts_with("/proc/self/fd"));
+    std::fs::write(
+        sqlite_home.join("state_5.sqlite"),
+        b"transient fixture state\n",
+    )
+    .unwrap();
     std::fs::write(
         std::env::var_os("CODEX_FIXTURE_PROCESS").unwrap(),
         format!("{}\n", std::process::id()),
@@ -1018,6 +1097,7 @@ fn codex_process_fixture() {
         .open("/dev/fd/3")
         .unwrap();
 
+    let version = std::env::var("CODEX_FIXTURE_VERSION").unwrap();
     let initialize = read_client_frame(&mut input, &mut capture);
     assert_eq!(initialize["id"], 1);
     if scenario == "cancel-before-initialize" {
@@ -1040,7 +1120,7 @@ fn codex_process_fixture() {
         json!({
             "id": 1,
             "result": {
-                "userAgent": "codex/0.147.0",
+                "userAgent": format!("codex/{version}"),
                 "codexHome": std::env::var("CODEX_HOME").unwrap(),
             }
         }),
@@ -1084,20 +1164,6 @@ fn codex_process_fixture() {
             }
         }),
     );
-    if scenario == "sqlite-home-replaced" {
-        let sqlite_home =
-            PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME_PATH").unwrap());
-        let displaced = sqlite_home.with_file_name("displaced-sqlite-home");
-        std::fs::rename(&sqlite_home, &displaced).unwrap();
-        symlink(std::env::var_os("CODEX_HOME").unwrap(), &sqlite_home).unwrap();
-        std::fs::write(
-            PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap())
-                .join("state_5.sqlite"),
-            b"transient resumable state\n",
-        )
-        .unwrap();
-    }
-
     let thread = read_client_frame(&mut input, &mut capture);
     assert_eq!(thread["id"], 3);
     let cwd = thread["params"]["cwd"].as_str().unwrap();
@@ -1118,7 +1184,7 @@ fn codex_process_fixture() {
         json!({
             "id": 3,
             "result": {
-                "thread": thread_document(cwd),
+                "thread": thread_document(cwd, &version),
                 "model": MODEL,
                 "modelProvider": PROVIDER,
                 "cwd": cwd,
@@ -1137,10 +1203,9 @@ fn codex_process_fixture() {
         );
         return;
     }
-    materialize_native_rollout(cwd, &scenario);
     write_server_frame(
         &mut output,
-        json!({"method": "thread/started", "params": {"thread": thread_document(cwd)}}),
+        json!({"method": "thread/started", "params": {"thread": thread_document(cwd, &version)}}),
     );
     if scenario == "premature-turn-started" {
         write_server_frame(
@@ -1762,6 +1827,11 @@ struct ProviderRequest {
     body: Value,
 }
 
+enum LoopbackProviderResponse {
+    Completed(String),
+    ServerError,
+}
+
 struct LoopbackResponsesProvider {
     address: std::net::SocketAddr,
     request: mpsc::UnboundedReceiver<ProviderRequest>,
@@ -1771,18 +1841,52 @@ struct LoopbackResponsesProvider {
 
 impl LoopbackResponsesProvider {
     async fn start(response: &str) -> Self {
+        Self::start_with_response_release(
+            LoopbackProviderResponse::Completed(response.to_owned()),
+            None,
+        )
+        .await
+    }
+
+    async fn start_error_blocked() -> (Self, oneshot::Sender<()>) {
+        let (release, released) = oneshot::channel();
+        (
+            Self::start_with_response_release(
+                LoopbackProviderResponse::ServerError,
+                Some(released),
+            )
+            .await,
+            release,
+        )
+    }
+
+    async fn start_blocked(response: &str) -> (Self, oneshot::Sender<()>) {
+        let (release, released) = oneshot::channel();
+        (
+            Self::start_with_response_release(
+                LoopbackProviderResponse::Completed(response.to_owned()),
+                Some(released),
+            )
+            .await,
+            release,
+        )
+    }
+
+    async fn start_with_response_release(
+        response: LoopbackProviderResponse,
+        response_release: Option<oneshot::Receiver<()>>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (requests, request) = mpsc::unbounded_channel();
         let (stop, mut shutdown) = oneshot::channel();
-        let response = response.to_owned();
         let task = tokio::spawn(async move {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {}
                 accepted = listener.accept() => {
                     let (stream, _) = accepted.unwrap();
-                    serve_provider_request(stream, requests, response).await;
+                    serve_provider_request(stream, requests, response, response_release).await;
                 }
             }
         });
@@ -1807,7 +1911,8 @@ impl LoopbackResponsesProvider {
 async fn serve_provider_request(
     mut stream: TcpStream,
     requests: mpsc::UnboundedSender<ProviderRequest>,
-    response: String,
+    response: LoopbackProviderResponse,
+    response_release: Option<oneshot::Receiver<()>>,
 ) {
     let mut bytes = Vec::new();
     let header_end = loop {
@@ -1854,50 +1959,87 @@ async fn serve_provider_request(
             body,
         })
         .unwrap();
-    let events = [
-        json!({
-            "type": "response.created",
-            "response": {"id": "response-loopback"}
-        }),
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "message",
-                "role": "assistant",
-                "id": "message-loopback",
-                "content": [{"type": "output_text", "text": response}]
-            }
-        }),
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": "response-loopback",
-                "usage": {
-                    "input_tokens": 0,
-                    "input_tokens_details": null,
-                    "output_tokens": 0,
-                    "output_tokens_details": null,
-                    "total_tokens": 0
+    if let Some(response_release) = response_release {
+        response_release.await.unwrap();
+    }
+    let (status, content_type, payload) = match response {
+        LoopbackProviderResponse::Completed(response) => {
+            let events = [
+                json!({
+                    "type": "response.created",
+                    "response": {"id": "response-loopback"}
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "message-loopback",
+                        "content": [{"type": "output_text", "text": response}]
+                    }
+                }),
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-loopback",
+                        "usage": {
+                            "input_tokens": 0,
+                            "input_tokens_details": null,
+                            "output_tokens": 0,
+                            "output_tokens_details": null,
+                            "total_tokens": 0
+                        }
+                    }
+                }),
+            ];
+            let payload = events
+                .into_iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>();
+            ("200 OK", "text/event-stream", payload)
+        }
+        LoopbackProviderResponse::ServerError => (
+            "500 Internal Server Error",
+            "application/json",
+            json!({
+                "error": {
+                    "message": "synthetic provider failure",
+                    "type": "server_error",
+                    "param": null,
+                    "code": "server_error"
                 }
-            }
-        }),
-    ];
-    let payload = events
-        .into_iter()
-        .map(|event| {
-            format!(
-                "event: {}\ndata: {event}\n\n",
-                event["type"].as_str().unwrap()
-            )
-        })
-        .collect::<String>();
+            })
+            .to_string(),
+        ),
+    };
     let header = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         payload.len()
     );
-    stream.write_all(header.as_bytes()).await.unwrap();
-    stream.write_all(payload.as_bytes()).await.unwrap();
-    stream.shutdown().await.unwrap();
+    for bytes in [header.as_bytes(), payload.as_bytes()] {
+        match stream.write_all(bytes).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("loopback provider write failed: {error:?}"),
+        }
+    }
+    match stream.shutdown().await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(error) => panic!("loopback provider shutdown failed: {error:?}"),
+    }
 }
 
 pub(super) mod normal {
@@ -1915,14 +2057,21 @@ pub(super) mod normal {
         assert!(trust.contains("trust_level=\"trusted\""));
         assert!(trust.contains(fixture.expected_cwd.to_str().unwrap()));
         assert_eq!(arguments[3], OsStr::new("-c"));
+        let sqlite_home = plan.sqlite_home();
+        assert!(sqlite_home.is_absolute());
+        assert_eq!(sqlite_home.parent(), Some(fixture.sqlite_staging.as_path()));
+        assert!(!sqlite_home.starts_with(&fixture.expected_cwd));
+        assert_eq!(
+            std::fs::metadata(sqlite_home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!sqlite_home.starts_with("/dev/fd"));
+        assert!(!sqlite_home.starts_with("/proc/self/fd"));
         assert_eq!(
             arguments[4],
             OsStr::new(&format!(
                 "sqlite_home={}",
-                serde_json::to_string(
-                    crate::execution::workflow::child_guard::BOUND_DIRECTORY_PLACEHOLDER
-                )
-                .unwrap()
+                serde_json::to_string(sqlite_home).unwrap()
             ))
         );
         assert_eq!(
@@ -1934,6 +2083,21 @@ pub(super) mod normal {
                 OsStr::new("stdio://"),
             ]
         );
+    }
+
+    #[test]
+    fn transient_sqlite_state_is_never_nested_in_codex_home() {
+        let fixture = ProcessFixture::with_codex_home_containing_staging();
+        let codex_home = std::fs::canonicalize(&fixture.codex_home).unwrap();
+        match prepare_launch(fixture.invocation.as_ref().unwrap()) {
+            Err(_) => {}
+            Ok(plan) => {
+                let sqlite_home = std::fs::canonicalize(plan.sqlite_home()).unwrap();
+                panic!(
+                    "sqlite_home {sqlite_home:?} must remain outside ambient CODEX_HOME {codex_home:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2101,7 +2265,7 @@ pub(super) mod normal {
                 panic!("bounded normal response must complete");
             };
             assert_eq!(response.as_str(), RESPONSE);
-            assert_rollout_retained(&fixture);
+            assert_no_native_rollout(&fixture);
 
             let captured = captured_requests(&requests);
             assert_eq!(captured.len(), 5);
@@ -2118,7 +2282,7 @@ pub(super) mod normal {
             }));
             let thread = &captured[3]["params"];
             assert_eq!(thread["approvalPolicy"], "never");
-            assert_eq!(thread["ephemeral"], false);
+            assert_eq!(thread["ephemeral"], true);
             assert_eq!(thread["sandbox"], "danger-full-access");
             assert_eq!(thread["modelProvider"], PROVIDER);
             assert_eq!(thread["config"], json!({"bypass_hook_trust": true}));
@@ -2194,6 +2358,28 @@ pub(super) mod normal {
     }
 
     #[tokio::test]
+    async fn accepted_non_anchor_version_is_retained_through_native_setup() {
+        with_watchdog(async {
+            let fixture = ProcessFixture::with_version(
+                "no-value",
+                AgentValueMode::None,
+                1024,
+                None,
+                "0.147.23",
+            );
+            assert_eq!(
+                fixture.invocation.as_ref().unwrap().adapter().version(),
+                "0.147.23"
+            );
+
+            let (_, outcome, started) = run_fixture(fixture).await;
+
+            assert_completed_without_value(outcome, started);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn ordinary_no_value_turn_has_the_same_clean_settlement_boundary() {
         with_watchdog(async {
             let fixture = ProcessFixture::new("no-value", AgentValueMode::None, 5);
@@ -2222,14 +2408,26 @@ pub(super) mod normal {
 pub(super) mod exact_binary {
     use super::*;
 
+    async fn release_provider_and_settle(
+        provider: &mut LoopbackResponsesProvider,
+        release_response: oneshot::Sender<()>,
+        run: tokio::task::JoinHandle<(ProcessFixture, AgentOutcome, bool)>,
+    ) -> (ProcessFixture, AgentOutcome, bool) {
+        let request = provider.next_request().await;
+        assert_eq!(request.path, "/responses");
+        release_response.send(()).unwrap();
+        run.await.unwrap()
+    }
+
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.147.0 executable"]
-    async fn retained_rollout_uses_native_configuration_without_ambient_history() {
+    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    async fn ephemeral_thread_preserves_native_resources_and_cleans_sqlite_state() {
         with_watchdog(async {
-            let mut provider = LoopbackResponsesProvider::start(RESPONSE).await;
-            let fixture = ProcessFixture::with_exact_binary(provider.address);
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
             let codex_home = fixture.codex_home.clone();
-            let sqlite_home = fixture.sqlite_home.clone();
+            let sqlite_staging = fixture.sqlite_staging.clone();
             let config = std::fs::read(codex_home.join("config.toml")).unwrap();
             let mut run = tokio::spawn(run_fixture(fixture));
             let request = tokio::select! {
@@ -2246,6 +2444,20 @@ pub(super) mod exact_binary {
             };
             assert_eq!(request.path, "/responses");
             assert_eq!(request.authorization, format!("Bearer {PLACEHOLDER_KEY}"));
+            let sqlite_homes = std::fs::read_dir(&sqlite_staging)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|name| name.starts_with("codex-sqlite-"))
+                })
+                .collect::<Vec<_>>();
+            let [sqlite_home] = sqlite_homes.as_slice() else {
+                panic!("exact Codex must use one transient SQLite directory: {sqlite_homes:?}");
+            };
+            assert!(sqlite_home.join("state_5.sqlite").is_file());
+            release_response.send(()).unwrap();
             let (fixture, outcome, started) = run.await.unwrap();
             assert!(started, "exact Codex outcome: {outcome:?}");
             let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
@@ -2253,18 +2465,96 @@ pub(super) mod exact_binary {
                 panic!("exact Codex must complete one loopback response: {outcome:?}");
             };
             assert_eq!(response.as_str(), RESPONSE);
-            assert_rollout_retained(&fixture);
+            assert_no_native_rollout(&fixture);
             assert_eq!(
                 std::fs::read(codex_home.join("config.toml")).unwrap(),
                 config
             );
             assert!(!codex_home.join("state_5.sqlite").exists());
-            assert!(sqlite_home.join("state_5.sqlite").is_file());
-            let correlation = std::fs::read(fixture.thread_correlation()).unwrap();
-            assert!(
-                !correlation
-                    .windows(PLACEHOLDER_KEY.len())
-                    .any(|window| window == PLACEHOLDER_KEY.as_bytes())
+            assert!(!sqlite_home.exists());
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    async fn structured_result_uses_authoritative_validation_and_settles() {
+        with_watchdog(async {
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_blocked(r#"{"result":7}"#).await;
+            let fixture = ProcessFixture::with_exact_binary(
+                provider.address,
+                result_mode(json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "integer",
+                    "minimum": 1,
+                })),
+            );
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let (_, outcome, started) =
+                release_provider_and_settle(&mut provider, release_response, run).await;
+
+            assert!(started, "exact Codex outcome: {outcome:?}");
+            let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+                panic!("exact Codex must complete one structured result: {outcome:?}");
+            };
+            assert_eq!(result.value(), &json!(7));
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    async fn native_provider_failure_settles_without_a_value() {
+        with_watchdog(async {
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_error_blocked().await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let (_, outcome, started) =
+                release_provider_and_settle(&mut provider, release_response, run).await;
+
+            assert_started_failure(
+                "exact-provider-failure",
+                outcome,
+                started,
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                },
+            );
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    async fn cancellation_interrupts_the_native_turn_and_quiesces() {
+        with_watchdog(async {
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let (fixture, stdin_capture) =
+                ProcessFixture::with_exact_binary_stdin_capture(provider.address, response_mode());
+            let cancellation = fixture.invocation.as_ref().unwrap().cancellation().clone();
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let request = provider.next_request().await;
+            assert_eq!(request.path, "/responses");
+            assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+            wait_for_fixture_bytes(&stdin_capture, br#""method":"turn/interrupt""#).await;
+            release_response.send(()).unwrap();
+            let (_, outcome, started) = run.await.unwrap();
+
+            assert!(started, "exact Codex outcome: {outcome:?}");
+            assert_eq!(
+                outcome,
+                AgentOutcome::Cancelled {
+                    reason: CancellationReason::UserRequest,
+                }
             );
             provider.shutdown().await;
         })
@@ -2552,16 +2842,7 @@ pub(super) mod start_failure {
                     scenario,
                 );
                 assert!(fixture.protocol_rejection().is_file());
-                if scenario == "turn-start-rejected" {
-                    assert!(fixture.thread_correlation().is_file());
-                    assert!(!fixture.retained_rollout().exists());
-                    assert!(!fixture.ambient_rollout().exists());
-                } else if matches!(
-                    scenario,
-                    "premature-turn-started" | "mismatched-turn-started"
-                ) {
-                    assert_rollout_retained(&fixture);
-                }
+                assert_no_native_rollout(&fixture);
             }
         })
         .await;
@@ -2705,7 +2986,7 @@ pub(super) mod failure_ordering {
                     "{scenario}",
                 );
                 assert_fixture_quiescent(&fixture);
-                assert_rollout_retained(&fixture);
+                assert_no_native_rollout(&fixture);
             }
         })
         .await;
@@ -2753,7 +3034,7 @@ pub(super) mod adversarial_lifecycle {
                 assert!(started, "{scenario}: {outcome:?}");
                 assert_failure_cause(outcome, AgentFailureCause::HarnessProtocolFailed, scenario);
                 assert_fixture_quiescent(&fixture);
-                assert_rollout_retained(&fixture);
+                assert_no_native_rollout(&fixture);
                 assert!(fixture.protocol_rejection().is_file());
             }
         })
@@ -2761,57 +3042,23 @@ pub(super) mod adversarial_lifecycle {
     }
 
     #[tokio::test]
-    async fn adversarial_native_paths_are_diagnostic_only_and_never_imported() {
+    async fn transient_sqlite_home_uses_an_ordinary_staging_path_and_is_removed() {
         with_watchdog(async {
-            for (scenario, expected_reason) in [
-                ("rollout-outside", "path_outside_state_boundary"),
-                ("rollout-symlink", "unexpected_file_kind"),
-                ("rollout-identity-mismatch", "thread_identity_mismatch"),
-            ] {
-                let fixture = ProcessFixture::new(scenario, response_mode(), 1024);
-                let (fixture, outcome, started) = run_fixture(fixture).await;
-                assert!(started, "{scenario}: {outcome:?}");
-                let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-                else {
-                    panic!("{scenario}: path retention must not change workflow authority");
-                };
-                assert_eq!(response.as_str(), RESPONSE);
-                assert!(fixture.thread_correlation().is_file());
-                assert!(!fixture.retained_rollout().exists());
-                let rejection: Value = serde_json::from_slice(
-                    &std::fs::read(fixture.diagnostic_session.join("rollout-rejection.json"))
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(rejection["reason"], expected_reason);
-            }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn transient_sqlite_home_remains_bound_for_the_process_lifetime() {
-        with_watchdog(async {
-            let fixture = ProcessFixture::new("sqlite-home-replaced", response_mode(), 1024);
+            let fixture = ProcessFixture::new("absent", response_mode(), 1024);
             let (fixture, outcome, started) = run_fixture(fixture).await;
             assert!(started, "outcome: {outcome:?}");
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("SQLite path replacement must not change workflow authority");
-            };
-            assert_eq!(response.as_str(), RESPONSE);
-            assert_rollout_retained(&fixture);
-            assert!(
-                !fixture.codex_home.join("state_5.sqlite").exists(),
-                "replacing sqlite_home must not create an ambient resumable index"
+            assert_eq!(
+                outcome,
+                AgentOutcome::Completed(CompletedAgentInvocation::NoResponse)
             );
-            assert!(
-                fixture
-                    .sqlite_home
-                    .with_file_name("displaced-sqlite-home")
-                    .join("state_5.sqlite")
-                    .is_file()
-            );
+            let sqlite_home = fixture.sqlite_home().unwrap();
+            assert!(sqlite_home.is_absolute());
+            assert_eq!(sqlite_home.parent(), Some(fixture.sqlite_staging.as_path()));
+            assert!(!sqlite_home.starts_with("/dev/fd"));
+            assert!(!sqlite_home.starts_with("/proc/self/fd"));
+            assert!(!sqlite_home.exists());
+            assert!(!fixture.codex_home.join("state_5.sqlite").exists());
+            assert_no_native_rollout(&fixture);
         })
         .await;
     }
@@ -2857,11 +3104,7 @@ pub(super) mod adversarial_lifecycle {
             let fixture = ProcessFixture::new("stderr-flood", AgentValueMode::None, 1024);
             let diagnostics = fixture.diagnostics.clone();
             let (_, outcome, started) = run_fixture(fixture).await;
-            assert!(started);
-            assert_eq!(
-                outcome,
-                AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
-            );
+            assert_completed_without_value(outcome, started);
             let diagnostic = diagnostics.get("agent-step").unwrap();
             let stream = diagnostic.standard_error();
             assert_eq!(stream.bytes().len(), 1024);
@@ -2928,10 +3171,10 @@ pub(super) mod cancellation {
         );
     }
 
-    fn assert_cancelled_rollout_retained(fixture: &ProcessFixture, outcome: AgentOutcome) {
+    fn assert_cancelled_without_native_rollout(fixture: &ProcessFixture, outcome: AgentOutcome) {
         assert_user_cancelled(outcome);
         assert_fixture_quiescent(fixture);
-        assert_rollout_retained(fixture);
+        assert_no_native_rollout(fixture);
     }
 
     async fn assert_prestart_cancellation(scenario: &str, expected_requests: usize) {
@@ -2966,7 +3209,7 @@ pub(super) mod cancellation {
                 captured_requests(&fixture.requests).last().unwrap()["method"],
                 "turn/interrupt",
             );
-            assert_cancelled_rollout_retained(&fixture, outcome);
+            assert_cancelled_without_native_rollout(&fixture, outcome);
 
             let fixture =
                 ProcessFixture::new("cancellation-pending-request", AgentValueMode::None, 1024);
@@ -2982,7 +3225,7 @@ pub(super) mod cancellation {
             } else {
                 assert_eq!(requests.len(), 6, "{requests:?}");
             }
-            assert_cancelled_rollout_retained(&fixture, outcome);
+            assert_cancelled_without_native_rollout(&fixture, outcome);
         })
         .await;
     }
@@ -2996,7 +3239,7 @@ pub(super) mod cancellation {
             wait_for_fixture_file(&running.fixture.ready).await;
             running.cancel();
             let (fixture, outcome) = running.finish().await;
-            assert_cancelled_rollout_retained(&fixture, outcome);
+            assert_cancelled_without_native_rollout(&fixture, outcome);
 
             let fixture = ProcessFixture::new("cancellation-stubborn", AgentValueMode::None, 1024);
             let mut running = RunningCancellationFixture::start(fixture);
@@ -3007,7 +3250,7 @@ pub(super) mod cancellation {
             assert!(!running.task.is_finished());
             running.process_control.force();
             let (fixture, outcome) = running.finish().await;
-            assert_cancelled_rollout_retained(&fixture, outcome);
+            assert_cancelled_without_native_rollout(&fixture, outcome);
         })
         .await;
     }

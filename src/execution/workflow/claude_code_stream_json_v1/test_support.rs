@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 
 use super::FIXED_INVOCATION_ENVIRONMENT;
 use super::adapter::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
-use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
+use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION as QUALIFICATION_VERSION;
 use crate::execution::workflow::admission::EnvironmentSnapshot;
 use crate::execution::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity, AgentObservation,
@@ -150,7 +150,7 @@ pub(super) fn admitted_adapter(
     AdmittedAgentAdapter::new(
         AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
         executable,
-        Arc::from(CLAUDE_CODE_STREAM_JSON_V1_VERSION),
+        Arc::from(QUALIFICATION_VERSION),
         ClaudeCodeConfig {
             model: model.to_owned(),
             effort: ClaudeCodeEffort::XHigh,

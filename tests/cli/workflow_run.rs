@@ -517,6 +517,13 @@ printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s"
 printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"convenience duplicate","session_id":"%s"}\n' "$session""#
 }
 
+fn response_claude_code_execution_for_version(version: &str) -> String {
+    response_claude_code_execution().replace(
+        "\"claude_code_version\":\"2.1.234\"",
+        &format!("\"claude_code_version\":\"{version}\""),
+    )
+}
+
 fn corrected_claude_code_result_execution() -> &'static str {
     r#"set -eu
 model=
@@ -1293,7 +1300,7 @@ fn agent_step_captures_and_publishes_a_changed_git_branch() {
         "printf 'agent change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m agent-change; {}",
         response_pi_execution()
     );
-    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &execution);
+    let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &execution);
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
         std::iter::once(pi.path_directory().to_path_buf())
@@ -1353,7 +1360,7 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
     assert!(!missing_destination.exists());
 
     let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
-    let fallback = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let fallback = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     let ordered_path =
         std::env::join_paths([incompatible.path_directory(), fallback.path_directory()]).unwrap();
     let incompatible_bundle = RunBundle::new(response_agent_source());
@@ -1383,11 +1390,12 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
         quote(probe_barrier.ready_path.to_str().unwrap()),
         quote(probe_barrier.release_path.to_str().unwrap()),
     );
+    let execution = response_claude_code_execution_for_version("2.1.235");
     let claude = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.234 (Claude Code)",
+        "2.1.235 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
-        response_claude_code_execution(),
+        &execution,
         &capability_hook,
     );
     let ordered_path =
@@ -1470,7 +1478,7 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
     let metadata_bytes = fs::read(diagnostic.join("metadata.json")).unwrap();
     let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
     assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
-    assert_eq!(metadata["claudeCodeVersion"], "2.1.234");
+    assert_eq!(metadata["claudeCodeVersion"], "2.1.235");
     assert_eq!(
         metadata["nativeSession"],
         serde_json::json!({"relativeDirectory": "session", "formatVersion": 1})
@@ -1514,8 +1522,60 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
 }
 
 #[test]
+fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snapshot() {
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.235 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+    );
+    let bundle = RunBundle::new(response_claude_code_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("claude-version-mismatch");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args)
+        .env(
+            "PATH",
+            fixture_path_with_host_tools(&[claude.path_directory()]),
+        )
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["result"]["outcome"], "failed");
+    assert_eq!(
+        terminal["result"]["primaryFailure"]["cause"]["code"],
+        "harness_start_failed"
+    );
+    assert_eq!(
+        terminal["result"]["primaryFailure"]["cause"]["protocolRejection"]["profile"],
+        "ClaudeCodeStreamJsonV1"
+    );
+    assert_eq!(
+        terminal["result"]["primaryFailure"]["cause"]["protocolRejection"]["detail"]["reason"],
+        "initialization_invalid"
+    );
+    assert_eq!(
+        terminal["result"]["exports"]["response"]["state"],
+        "unavailable"
+    );
+    assert!(!attempt_result(&destination).join("exports/0001").exists());
+}
+
+#[test]
 fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
-    let pi = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let pi = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     let claude = ClaudeCodeFixture::new("2.1.234 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
 
     let claude_bundle = RunBundle::new(response_claude_code_agent_source());
@@ -1559,7 +1619,7 @@ fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     let incompatible_claude =
         ClaudeCodeFixture::new("2.1.221 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
     let available_pi =
-        PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+        PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let path = std::env::join_paths([
         incompatible_claude.path_directory(),
         available_pi.path_directory(),
@@ -1588,7 +1648,7 @@ fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
 
 #[test]
 fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
-    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+    let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
         "2.1.234 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
@@ -1703,7 +1763,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
         ("failure", 1, "failed", "source_failed"),
         ("cancellation", 130, "cancelled", "source_cancelled"),
     ] {
-        let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+        let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
         let claude = ClaudeCodeFixture::with_execution(
             "2.1.234 (Claude Code)",
             CLAUDE_CODE_COMPLETE_HELP,
@@ -1789,7 +1849,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
 
 #[test]
 fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
-    let replacement = PiFixture::new("0.83.0", COMPLETE_HELP, false);
+    let replacement = PiFixture::new("0.84.2", COMPLETE_HELP, false);
     let mut probe_barrier = AgentBarrierFixture::new();
     let capability_hook = format!(
         "printf '\\001' > {}; IFS= read -r _ < {}",
@@ -1797,7 +1857,7 @@ fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
         quote(probe_barrier.release_path.to_str().unwrap()),
     );
     let pi = PiFixture::with_execution_and_capability_hook(
-        "0.83.0",
+        "0.84.2",
         COMPLETE_HELP,
         true,
         &response_pi_execution(),
@@ -1897,7 +1957,7 @@ fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
             .is_some_and(|value| value > 0)
     );
     assert_eq!(metadata["profile"], "PiJsonV1");
-    assert_eq!(metadata["piVersion"], "0.83.0");
+    assert_eq!(metadata["piVersion"], "0.84.2");
     assert_eq!(
         metadata["nativeSession"],
         serde_json::json!({"relativeDirectory": "session", "formatVersion": 3})
@@ -1987,7 +2047,7 @@ IFS= read -r _ < "$WORKFLOW_HOLD_FIFO""#
 
 #[test]
 fn running_agent_process_group_is_durably_guarded() {
-    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, barrier_pi_execution());
+    let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, barrier_pi_execution());
     let bundle = RunBundle::new(response_agent_source());
     bundle.write_source("system.md", "system");
     bundle.write_source("message.md", "prompt");
@@ -2029,7 +2089,7 @@ fn agent_signal_and_output_failure_cancel_and_quiesce_the_pi_group() {
         ("signal", "user_request", 130),
         ("output", "caller_output_failure", 1),
     ] {
-        let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, barrier_pi_execution());
+        let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, barrier_pi_execution());
         let bundle = RunBundle::new(response_agent_source());
         bundle.write_source("system.md", "system");
         bundle.write_source("message.md", "prompt");
@@ -2203,7 +2263,10 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 
 #[test]
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
-    let Some(pinned_pi) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
+    let Some(pinned_pi) = std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.2/bin/pi"))
+    else {
         return;
     };
     let bundle = RunBundle::new(mixed_agent_source());
@@ -3694,7 +3757,6 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
         ],
         "environment": Vec::<(Vec<u8>, Vec<u8>)>::new(),
         "streamingStandardInput": false,
-        "boundDirectory": false,
     });
     fs::write(
         staging.path().join("launch.json"),

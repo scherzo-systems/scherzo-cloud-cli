@@ -158,6 +158,12 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
     directory
 }
 
+fn conformance_executable() -> Option<PathBuf> {
+    std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.2/bin/pi"))
+}
+
 fn report_code(output: &std::process::Output) -> String {
     serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["checks"][0]["code"]
         .as_str()
@@ -171,7 +177,7 @@ fn assert_invalid_runner_gateway(output: &std::process::Output) {
 
 #[test]
 fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
-    let fixture = PiFixture::new("0.83.7", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.84.7", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"never"}"#;
@@ -213,11 +219,11 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[0]["checks"][0]["id"], PI_CHECK_ID);
     assert_eq!(reports[0]["checks"][0]["status"], "pass");
-    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.83.7");
+    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.84.7");
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
     assert_eq!(
         reports[0]["checks"][0]["details"]["supportedRange"],
-        ">=0.83.0 <0.84.0"
+        ">=0.84.2 <0.85.0"
     );
     assert_eq!(
         reports[0]["checks"][0]["details"]["capabilities"],
@@ -260,9 +266,9 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
 
 #[test]
 fn doctor_path_lookup_skips_candidates_not_executable_by_current_user() {
-    let inaccessible = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let inaccessible = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     fs::set_permissions(inaccessible.executable(), fs::Permissions::from_mode(0o001)).unwrap();
-    let compatible = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let compatible = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     let ordered_path =
         std::env::join_paths([inaccessible.path_directory(), compatible.path_directory()]).unwrap();
 
@@ -280,7 +286,7 @@ fn doctor_path_lookup_skips_candidates_not_executable_by_current_user() {
 
 #[test]
 fn doctor_preserves_selected_path_for_env_interpreter_resolution() {
-    let fixture = PiFixture::with_env_node_interpreter("0.83.0", COMPLETE_HELP);
+    let fixture = PiFixture::with_env_node_interpreter("0.84.2", COMPLETE_HELP);
 
     let output = pi_doctor_json(fixture.path_directory(), &[]);
 
@@ -319,37 +325,43 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
             b"--version\n".as_slice(),
         ),
         (
-            "0.82.1",
+            "0.83.0",
             COMPLETE_HELP,
             "unsupported_pi_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.84.0",
+            "0.84.1",
             COMPLETE_HELP,
             "unsupported_pi_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.83.0-rc.1",
+            "0.85.0",
+            COMPLETE_HELP,
+            "unsupported_pi_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "0.84.2-rc.1",
             COMPLETE_HELP,
             "malformed_pi_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.83.0",
+            "0.84.2",
             "not Pi help\n",
             "malformed_pi_capabilities",
             CLOSED_PROBES,
         ),
         (
-            "0.83.0",
+            "0.84.2",
             "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n",
             "unsupported_pi_capability",
             CLOSED_PROBES,
         ),
         (
-            "0.83.0",
+            "0.84.2",
             "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n",
             "unsupported_pi_capability",
             CLOSED_PROBES,
@@ -388,7 +400,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     assert!(output.stdout.is_empty());
     assert_invalid_runner_gateway(&output);
 
-    let fixture = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     let output = run_with_env(
         &serve_args,
         &[("PATH", fixture.path_directory().to_str().unwrap())],
@@ -397,7 +409,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     assert_invalid_runner_gateway(&output);
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 
-    let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
+    let incompatible = PiFixture::new("0.85.0", COMPLETE_HELP, true);
     let output = run_with_env(
         &serve_args,
         &[("PATH", incompatible.path_directory().to_str().unwrap())],
@@ -410,11 +422,11 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
 
 #[test]
 fn pinned_conformance_validation_ignores_ambient_force_color() {
-    let Some(executable) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
+    let Some(executable) = conformance_executable() else {
         return;
     };
 
-    let path = controlled_path_for(Path::new(executable));
+    let path = controlled_path_for(&executable);
     let baseline = pi_doctor_json(path.path(), &[]);
     let force_color = pi_doctor_json(path.path(), &[("FORCE_COLOR", "1")]);
 
@@ -428,7 +440,7 @@ fn pinned_conformance_validation_ignores_ambient_force_color() {
 
 #[test]
 fn validation_does_not_read_trust_or_execute_project_extensions() {
-    let Some(executable) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
+    let Some(executable) = conformance_executable() else {
         return;
     };
     let project_directory = tempfile::tempdir().expect("temporary Pi project directory");
@@ -464,7 +476,7 @@ fn validation_does_not_read_trust_or_execute_project_extensions() {
     )
     .expect("saved trust should be written");
 
-    let path = controlled_path_for(Path::new(executable));
+    let path = controlled_path_for(&executable);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
         .args(["runner", "doctor", "--check", PI_CHECK_ID, "--json"])
         .current_dir(project_directory.path())
@@ -482,7 +494,7 @@ fn validation_does_not_read_trust_or_execute_project_extensions() {
 
 #[test]
 fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
-    let Some(executable) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
+    let Some(executable) = conformance_executable() else {
         return;
     };
     let first_agent_directory = tempfile::tempdir().expect("first pinned Pi agent directory");
@@ -506,8 +518,8 @@ fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
         fs::write(directory.path().join("settings.json"), settings).unwrap();
         fs::write(directory.path().join("trust.json"), trust).unwrap();
     }
-    let first_path = controlled_path_for(Path::new(executable));
-    let second_path = controlled_path_for(Path::new(executable));
+    let first_path = controlled_path_for(&executable);
+    let second_path = controlled_path_for(&executable);
 
     let reports = [
         (first_path.path(), first_agent_directory.path()),
@@ -525,9 +537,9 @@ fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "0.83.0");
+    assert_eq!(details["version"], "0.84.2");
     assert_eq!(details["profile"], "PiJsonV1");
-    assert_eq!(details["supportedRange"], ">=0.83.0 <0.84.0");
+    assert_eq!(details["supportedRange"], ">=0.84.2 <0.85.0");
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
         Path::new(details["executablePath"].as_str().unwrap()),

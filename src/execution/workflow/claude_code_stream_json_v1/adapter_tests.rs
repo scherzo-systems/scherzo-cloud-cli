@@ -293,7 +293,7 @@ impl ProcessFixture {
         .allocate(
             &identity,
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-            CLAUDE_CODE_STREAM_JSON_V1_VERSION,
+            QUALIFICATION_VERSION,
         )
         .unwrap();
         let native_session = diagnostic_session
@@ -1963,10 +1963,7 @@ async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_meta
     assert_eq!(metadata["stepId"], "agent-step");
     assert!(metadata["invocationId"].is_u64());
     assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
-    assert_eq!(
-        metadata["claudeCodeVersion"],
-        CLAUDE_CODE_STREAM_JSON_V1_VERSION
-    );
+    assert_eq!(metadata["claudeCodeVersion"], QUALIFICATION_VERSION);
     assert_eq!(
         metadata["nativeSession"],
         json!({

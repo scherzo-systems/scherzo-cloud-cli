@@ -465,7 +465,7 @@ async fn read_request_frame<Clock: CoordinatorClock>(
         return FrameRead::ProtocolFailure;
     }
 
-    // Pi 0.83's Bun node:net compatibility closes both socket halves on end(),
+    // Pi 0.84's Bun node:net compatibility closes both socket halves on end(),
     // so a request-side EOF would also discard the response. Reject any already
     // buffered trailing frame bytes, then let the length prefix delimit the one
     // request while the server owns closing the connection after its response.

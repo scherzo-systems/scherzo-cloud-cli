@@ -150,9 +150,11 @@ canonical-path, no-fallback rule to executable name `claude`. Scherzo does not i
 upgrade, repair, or substitute that executable. Its probes run from a fresh private
 project, home, Claude configuration, and XDG directories with a cleared child
 environment, inherited `PATH` only for launcher interpreter resolution, fixed update and
-nonessential-traffic disables, and deterministic no-color controls. It requires exact
-version `2.1.234` and the closed non-model capabilities used by the production adapter.
-The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
+nonessential-traffic disables, and deterministic no-color controls. It requires a
+canonical stable version in `>=2.1.234 <2.2.0` and the closed non-model capabilities used
+by the production adapter. The repository's exact qualification package remains
+`2.1.234`; accepting the range does not claim exact-binary conformance for every release
+or host. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
 
@@ -164,8 +166,10 @@ text, or process exit text. They expose only strictly parsed versions, closed ca
 identifiers, and the normalized path of a compatible installation. Workflow data,
 assignments, imports, and
 remote values cannot supply or alter the search path. Once validation succeeds,
-admission and execution retain the absolute installation identity and never search
-`PATH` again, so a later `PATH` change cannot redirect an admitted invocation.
+admission and execution retain the absolute installation identity and exact observed version and never search `PATH` again,
+so a later `PATH` change cannot redirect an admitted invocation. Every native
+initialization frame must report that retained version exactly; a mismatch fails through
+the typed harness path before any workflow output can commit.
 
 ## Claude Code execution authority
 
@@ -176,7 +180,7 @@ confine filesystem paths, filter network access, isolate processes, restrict res
 or protect ambient secrets. Scherzo's update, nonessential-traffic, marketplace, memory,
 Git-instruction, and fresh retained-session controls are deterministic profile behavior,
 not a sandbox. The profile removes `CLAUDE_CODE_PROJECT_DIR_NAME` so an inherited native
-path override cannot redirect the pinned release away from Scherzo's fresh retained-session
+path override cannot redirect the validated release away from Scherzo's fresh retained-session
 links.
 
 Local users and runner operators own the security boundary around Claude Code. They must

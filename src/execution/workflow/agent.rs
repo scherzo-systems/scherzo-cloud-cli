@@ -913,9 +913,11 @@ pub(crate) fn failed_agent_outcome(cause: AgentFailureCause) -> AgentOutcome {
 }
 
 pub(super) async fn finish_agent_diagnostic_capture(
+    diagnostic_session: &AgentDiagnosticSession,
     diagnostic: super::diagnostic::PendingStepDiagnostic,
     outcome: &AgentOutcome,
 ) {
+    diagnostic_session.retain_protocol_rejection_from(outcome);
     if matches!(
         outcome,
         AgentOutcome::Failed(failure)

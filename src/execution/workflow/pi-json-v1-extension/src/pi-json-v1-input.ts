@@ -20,35 +20,6 @@ interface LoadedInput {
   text: string;
 }
 
-function compactMessageUpdate(event: { assistantMessageEvent: unknown }): void {
-  if (
-    typeof event.assistantMessageEvent !== "object" ||
-    event.assistantMessageEvent === null ||
-    Array.isArray(event.assistantMessageEvent)
-  ) {
-    return;
-  }
-
-  const assistantEvent = event.assistantMessageEvent as Record<string, unknown>;
-  // Preserve the provider-finalized content and Pi partial snapshot so the
-  // parser can enforce their agreement.
-  if (assistantEvent.type === "thinking_end") {
-    return;
-  }
-
-  assistantEvent.scherzoCompact = true;
-  delete assistantEvent.partial;
-  delete assistantEvent.message;
-  if (
-    assistantEvent.type === "text_delta" ||
-    assistantEvent.type === "thinking_delta"
-  ) {
-    delete assistantEvent.delta;
-  } else if (assistantEvent.type === "text_end") {
-    delete assistantEvent.content;
-  }
-}
-
 function loadInput(
   config: StagedInputConfig | undefined,
 ): LoadedInput | undefined {
@@ -81,8 +52,6 @@ export function createPiJsonV1InputExtension(
   const systemPrompt = loadInput(config.systemPrompt);
 
   return (pi) => {
-    pi.on("message_update", compactMessageUpdate);
-
     if (message !== undefined) {
       let pending = true;
       pi.on("input", (event) => {

@@ -92,35 +92,40 @@ fn output(bytes: &[u8]) -> CommandOutput {
 }
 
 #[test]
-fn exact_release_and_every_capability_construct_the_pinned_installation() {
+fn stable_releases_in_range_with_every_capability_construct_pinned_installations() {
     let executable = std::env::current_exe().unwrap();
-    let runner = FakeRunner {
-        invocations: Mutex::new(Vec::new()),
-        version: output(b"2.1.234 (Claude Code)\n"),
-        capabilities: output(COMPLETE_HELP.as_bytes()),
-    };
+    for version in ["2.1.234", "2.1.235"] {
+        let runner = FakeRunner {
+            invocations: Mutex::new(Vec::new()),
+            version: output(format!("{version} (Claude Code)\n").as_bytes()),
+            capabilities: output(COMPLETE_HELP.as_bytes()),
+        };
 
-    let installation =
-        validate_claude_code_installation_with(&executable, OsStr::new("/controlled/bin"), &runner)
-            .unwrap();
+        let installation = validate_claude_code_installation_with(
+            &executable,
+            OsStr::new("/controlled/bin"),
+            &runner,
+        )
+        .unwrap();
 
-    assert_eq!(
-        installation.executable(),
-        fs::canonicalize(executable).unwrap()
-    );
-    assert_eq!(installation.version().as_str(), "2.1.234");
-    assert_eq!(
-        installation.profile(),
-        ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
-    );
-    assert_eq!(
-        installation.capabilities().required(),
-        REQUIRED_CAPABILITIES
-    );
-    assert_eq!(
-        *runner.invocations.lock().unwrap(),
-        [vec!["--version".to_owned()], vec!["--help".to_owned()]]
-    );
+        assert_eq!(
+            installation.executable(),
+            fs::canonicalize(&executable).unwrap()
+        );
+        assert_eq!(installation.version().as_str(), version);
+        assert_eq!(
+            installation.profile(),
+            ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+        );
+        assert_eq!(
+            installation.capabilities().required(),
+            REQUIRED_CAPABILITIES
+        );
+        assert_eq!(
+            *runner.invocations.lock().unwrap(),
+            [vec!["--version".to_owned()], vec!["--help".to_owned()]]
+        );
+    }
 }
 
 #[test]
@@ -130,6 +135,7 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
         "not-a-version",
         "2.1.234",
         "2.1.234-rc.1 (Claude Code)",
+        "2.1.234+build (Claude Code)",
         "02.1.234 (Claude Code)",
     ] {
         let runner = FakeRunner {
@@ -149,7 +155,7 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
         );
     }
 
-    for version in ["2.1.222", "2.1.233", "2.1.235"] {
+    for version in ["2.1.222", "2.1.233", "2.2.0", "3.0.0"] {
         let incompatible = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{version} (Claude Code)\n").as_bytes()),

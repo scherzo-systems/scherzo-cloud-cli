@@ -560,7 +560,7 @@ function emitTruncatedToolCall(
     delta,
     partial: snapshot(output),
   });
-  // Pi 0.83 must receive the terminal length event while this tool-call
+  // Pi 0.84 must receive the terminal length event while this tool-call
   // block is still open; emitting toolcall_end would not reproduce its
   // truncated-call recovery path.
   output.stopReason = "length";

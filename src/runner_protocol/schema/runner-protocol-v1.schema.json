@@ -3307,26 +3307,11 @@
             "frame_decode_failed",
             "frame_not_object",
             "session_header_invalid",
-            "event_type_invalid",
             "session_event_repeated",
             "event_after_settlement",
             "event_after_result_acceptance",
             "event_shape_invalid",
             "event_transition_invalid",
-            "assistant_message_invalid",
-            "assistant_update_invalid",
-            "assistant_update_subtype_invalid",
-            "assistant_update_content_index_invalid",
-            "assistant_update_partial_mismatch",
-            "assistant_active_message_mismatch",
-            "assistant_stable_fields_changed",
-            "assistant_update_open_block_mismatch",
-            "assistant_update_content_index_mismatch",
-            "assistant_content_transition_invalid",
-            "thinking_finalization_rewrite",
-            "message_end_open_block_mismatch",
-            "message_end_content_mismatch",
-            "tool_correlation_invalid",
             "result_correlation_invalid",
             "terminal_invariant_invalid",
             "end_of_stream_invariant_invalid",
@@ -3341,8 +3326,6 @@
             "session_header",
             "event_envelope",
             "event_payload",
-            "assistant_update",
-            "assistant_transition",
             "result_correlation",
             "terminal_validation",
             "end_of_stream"
@@ -3377,55 +3360,20 @@
             "unrecognized"
           ]
         },
-        "assistantUpdate": {
-          "enum": [
-            "text_start",
-            "text_delta",
-            "text_end",
-            "thinking_start",
-            "thinking_delta",
-            "thinking_end",
-            "toolcall_start",
-            "toolcall_delta",
-            "toolcall_end",
-            "unrecognized"
-          ]
-        },
-        "contentIndex": {
-          "$ref": "#/$defs/nonnegativeSequence"
-        },
         "state": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "sessionHeaderSeen": { "type": "boolean" },
             "agentStarted": { "type": "boolean" },
-            "activeAttempt": { "type": "boolean" },
-            "activeTurn": { "type": "boolean" },
-            "activeMessage": { "enum": ["none", "assistant", "other"] },
-            "activeAssistantContentBlocks": {
-              "$ref": "#/$defs/nonnegativeSequence"
-            },
-            "assistantUpdateSeen": { "type": "boolean" },
-            "openBlock": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": { "enum": ["text", "thinking", "tool_call"] },
-                "contentIndex": { "$ref": "#/$defs/nonnegativeSequence" }
-              },
-              "required": ["kind", "contentIndex"]
-            },
+            "terminalCandidateRetained": { "type": "boolean" },
             "resultAccepted": { "type": "boolean" },
             "settled": { "type": "boolean" }
           },
           "required": [
             "sessionHeaderSeen",
             "agentStarted",
-            "activeAttempt",
-            "activeTurn",
-            "activeMessage",
-            "assistantUpdateSeen",
+            "terminalCandidateRetained",
             "resultAccepted",
             "settled"
           ]
