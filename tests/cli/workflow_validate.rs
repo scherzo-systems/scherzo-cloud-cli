@@ -177,6 +177,67 @@ fn validate(bundle: &WorkflowBundle, json: bool) -> std::process::Output {
     output
 }
 
+#[test]
+fn checked_in_workflow_examples_remain_valid() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/workflows");
+    for relative_path in ["README.md", "attachments/aurora-brief.txt"] {
+        assert!(
+            root.join(relative_path).is_file(),
+            "workflow example asset should exist: {relative_path}"
+        );
+    }
+
+    let mut workflows = fs::read_dir(&root)
+        .expect("workflow examples directory should be readable")
+        .map(|entry| {
+            entry
+                .expect("workflow example entry should be readable")
+                .path()
+        })
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "yaml")
+        })
+        .collect::<Vec<_>>();
+    workflows.sort();
+    assert!(
+        !workflows.is_empty(),
+        "workflow examples should not be empty"
+    );
+
+    let source_root = root
+        .to_str()
+        .expect("workflow examples path should be UTF-8");
+    for workflow in workflows {
+        let workflow_path = workflow
+            .to_str()
+            .expect("workflow example path should be UTF-8");
+        let output = run(&[
+            "workflow",
+            "validate",
+            "--source-root",
+            source_root,
+            workflow_path,
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "workflow example should validate: {}\nstdout: {}\nstderr: {}",
+            workflow.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("workflow example validation output should be JSON");
+        assert_eq!(
+            report["outcome"],
+            "valid",
+            "workflow: {}",
+            workflow.display()
+        );
+    }
+}
+
 fn assert_static_contents_absent(output: &std::process::Output) {
     for sentinel in [
         WORKFLOW_SENTINEL,

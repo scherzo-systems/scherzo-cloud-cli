@@ -174,6 +174,7 @@ pub(super) struct ArtifactDeliveryBroker {
     outbox: ObservationOutbox,
     uploads: mpsc::UnboundedSender<UploadCompleted>,
     sleeper: Arc<dyn Sleeper>,
+    allow_insecure_loopback: bool,
 }
 
 struct ArtifactDeliveryState {
@@ -227,7 +228,11 @@ enum RetryAction {
 }
 
 impl ArtifactDeliveryBroker {
-    pub(super) fn new(outbox: ObservationOutbox, sleeper: Arc<dyn Sleeper>) -> Self {
+    pub(super) fn new(
+        outbox: ObservationOutbox,
+        sleeper: Arc<dyn Sleeper>,
+        allow_insecure_loopback: bool,
+    ) -> Self {
         let (uploads, upload_results) = mpsc::unbounded_channel();
         Self {
             state: Arc::new(Mutex::new(ArtifactDeliveryState {
@@ -238,7 +243,13 @@ impl ArtifactDeliveryBroker {
             outbox,
             uploads,
             sleeper,
+            allow_insecure_loopback,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn allows_insecure_loopback(&self) -> bool {
+        self.allow_insecure_loopback
     }
 
     pub(super) fn start(
@@ -593,7 +604,8 @@ impl ArtifactDeliveryBroker {
         }
     }
 
-    fn spawn_upload(&self, upload: UploadWork) {
+    fn spawn_upload(&self, mut upload: UploadWork) {
+        upload.allow_insecure_loopback = self.allow_insecure_loopback;
         let sender = self.uploads.clone();
         let notification = self.outbox.notification();
         tokio::task::spawn_blocking(move || {
@@ -877,6 +889,7 @@ struct UploadWork {
     size_bytes: u64,
     sha256: String,
     capability: ArtifactUploadCapability,
+    allow_insecure_loopback: bool,
 }
 
 impl UploadWork {
@@ -892,6 +905,7 @@ impl UploadWork {
             size_bytes: spec.size_bytes,
             sha256: spec.sha256.clone(),
             capability,
+            allow_insecure_loopback: false,
         }
     }
 
@@ -901,6 +915,7 @@ impl UploadWork {
             self.size_bytes,
             &self.media_type,
             &self.sha256,
+            self.allow_insecure_loopback,
         )?;
         let body = self.body.open().map_err(|_| ())?;
         let mut headers = HeaderMap::new();
@@ -943,15 +958,11 @@ fn validate_capability(
     size_bytes: u64,
     media_type: &str,
     sha256: &str,
+    allow_insecure_loopback: bool,
 ) -> Result<(), ()> {
     let url = url::Url::parse(&capability.url).map_err(|_| ())?;
-    let secure = url.scheme() == "https";
-    #[cfg(test)]
-    let secure = secure
-        || (url.scheme() == "http"
-            && url
-                .host_str()
-                .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost")));
+    let secure = url.scheme() == "https"
+        || (allow_insecure_loopback && url.scheme() == "http" && crate::runner::is_loopback(&url));
     if !secure
         || capability.content_length != size_bytes.to_string()
         || capability.content_type != media_type
@@ -1060,7 +1071,7 @@ mod tests {
         ArtifactDeliveryBroker,
         oneshot::Receiver<ArtifactDeliveryOutcome>,
     ) {
-        let broker = ArtifactDeliveryBroker::new(outbox.clone(), sleeper);
+        let broker = ArtifactDeliveryBroker::new(outbox.clone(), sleeper, true);
         let completion = broker
             .start(ArtifactDeliverySpec::result(
                 "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
@@ -1173,5 +1184,40 @@ mod tests {
         })
         .await
         .expect("registration was not re-enqueued after released backoff");
+    }
+
+    #[test]
+    fn http_loopback_capability_requires_insecure_runner_connection() {
+        let bytes = b"artifact bytes";
+        let sha256 = hex_digest(digest(&SHA256, bytes).as_ref());
+        let capability = ArtifactUploadCapability {
+            url: "http://127.0.0.1:9000/artifact".to_owned(),
+            content_length: bytes.len().to_string(),
+            content_type: "application/octet-stream".to_owned(),
+            if_none_match: "*".to_owned(),
+            checksum_sha256: checksum_base64(&sha256).unwrap(),
+            expires_at: "2026-08-20T00:05:00Z".to_owned(),
+        };
+
+        assert!(
+            validate_capability(
+                &capability,
+                u64::try_from(bytes.len()).unwrap(),
+                "application/octet-stream",
+                &sha256,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_capability(
+                &capability,
+                u64::try_from(bytes.len()).unwrap(),
+                "application/octet-stream",
+                &sha256,
+                true,
+            )
+            .is_ok()
+        );
     }
 }

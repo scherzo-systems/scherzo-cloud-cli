@@ -299,6 +299,7 @@ pub(super) struct CodexAppServerV1Parser {
     turn_id: Option<TurnId>,
     effective_model_provider: Option<Arc<str>>,
     thread_started_seen: bool,
+    turn_started_seen: bool,
     active_items: BTreeMap<ItemId, ActiveItem>,
     completed_items: BTreeMap<ItemId, CompletedItem>,
     active_hooks: BTreeMap<Arc<str>, ActiveHook>,
@@ -365,6 +366,7 @@ impl CodexAppServerV1Parser {
             turn_id: None,
             effective_model_provider: None,
             thread_started_seen: false,
+            turn_started_seen: false,
             active_items: BTreeMap::new(),
             completed_items: BTreeMap::new(),
             active_hooks: BTreeMap::new(),
@@ -675,6 +677,7 @@ impl CodexAppServerV1Parser {
             .ok_or_else(|| self.failure_for_current_phase())?;
         self.completed_requests.insert(id);
         self.outstanding_request = None;
+        let mut progress = ParserProgress::default();
         match id {
             INITIALIZE_REQUEST_ID if self.state == SetupState::Initialize => {
                 self.parse_initialize_response(result)?;
@@ -719,7 +722,11 @@ impl CodexAppServerV1Parser {
                 if request == self.turn_start_request && self.state == SetupState::TurnStart =>
             {
                 self.parse_turn_start_response(result)?;
-                self.state = SetupState::StartAcknowledgement;
+                if self.turn_started_seen {
+                    progress = self.acknowledge_turn_started();
+                } else {
+                    self.state = SetupState::StartAcknowledgement;
+                }
             }
             TURN_INTERRUPT_REQUEST_ID
                 if self.interrupt_requested
@@ -732,7 +739,7 @@ impl CodexAppServerV1Parser {
                     && result.is_empty() => {}
             _ => return Err(self.failure_for_current_phase()),
         }
-        Ok(ParserProgress::default())
+        Ok(progress)
     }
 
     fn parse_server_request(
@@ -983,11 +990,16 @@ impl CodexAppServerV1Parser {
     ) -> Result<(), AgentFailureCause> {
         let thread =
             required_object(result, "thread").ok_or_else(|| self.failure_for_current_phase())?;
-        let thread_id = self.retain_thread_id(
-            required_nonempty_string(thread, "id")
-                .filter(|id| is_codex_thread_id(id))
-                .ok_or_else(|| self.failure_for_current_phase())?,
-        )?;
+        let raw_thread_id = required_nonempty_string(thread, "id")
+            .filter(|id| is_codex_thread_id(id))
+            .ok_or_else(|| self.failure_for_current_phase())?;
+        if self
+            .thread_id
+            .as_ref()
+            .is_some_and(|started| started.0.as_ref() != raw_thread_id)
+        {
+            return Err(self.failure_for_current_phase());
+        }
         let provider = required_nonempty_string(result, "modelProvider")
             .ok_or_else(|| self.failure_for_current_phase())?;
         let sandbox =
@@ -998,7 +1010,7 @@ impl CodexAppServerV1Parser {
             || required_string(sandbox, "type") != Some("dangerFullAccess")
             || required_bool(thread, "ephemeral") != Some(true)
             || optional_string(thread, "path") != Some(None)
-            || required_string(thread, "sessionId") != Some(thread_id.0.as_ref())
+            || required_string(thread, "sessionId") != Some(raw_thread_id)
             || optional_string(thread, "forkedFromId") != Some(None)
             || optional_string(thread, "parentThreadId") != Some(None)
             || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
@@ -1012,7 +1024,9 @@ impl CodexAppServerV1Parser {
         {
             return Err(self.failure_for_current_phase());
         }
-        self.thread_id = Some(thread_id);
+        if self.thread_id.is_none() {
+            self.thread_id = Some(self.retain_thread_id(raw_thread_id)?);
+        }
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::SessionEstablished));
         Ok(())
@@ -1024,15 +1038,20 @@ impl CodexAppServerV1Parser {
     ) -> Result<(), AgentFailureCause> {
         let turn =
             required_object(result, "turn").ok_or_else(|| self.failure_for_current_phase())?;
-        let turn_id = self.retain_turn_id(
-            required_nonempty_string(turn, "id").ok_or_else(|| self.failure_for_current_phase())?,
-        )?;
+        let raw_turn_id =
+            required_nonempty_string(turn, "id").ok_or_else(|| self.failure_for_current_phase())?;
+        if let Some(started_turn_id) = &self.turn_id {
+            if started_turn_id.0.as_ref() != raw_turn_id {
+                return Err(self.failure_for_current_phase());
+            }
+        } else {
+            self.turn_id = Some(self.retain_turn_id(raw_turn_id)?);
+        }
         if required_string(turn, "status") != Some("inProgress")
             || !required_array(turn, "items").is_some_and(<[_]>::is_empty)
         {
             return Err(self.failure_for_current_phase());
         }
-        self.turn_id = Some(turn_id);
         Ok(())
     }
 
@@ -1119,15 +1138,39 @@ impl CodexAppServerV1Parser {
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<ParserProgress, AgentFailureCause> {
-        if self.state != SetupState::StartAcknowledgement {
-            return Err(AgentFailureCause::HarnessSetupFailed {
-                stage: AgentHarnessSetupStage::StartAcknowledgement,
-            });
+        if self.turn_started_seen
+            || !matches!(
+                self.state,
+                SetupState::TurnStart | SetupState::StartAcknowledgement
+            )
+        {
+            return Err(self.failure_for_current_phase());
         }
         self.require_thread(params)?;
         let turn =
             required_object(params, "turn").ok_or_else(|| self.failure_for_current_phase())?;
-        self.require_turn_object(turn, "inProgress")?;
+        let raw_turn_id =
+            required_nonempty_string(turn, "id").ok_or_else(|| self.failure_for_current_phase())?;
+        if let Some(turn_id) = &self.turn_id {
+            if turn_id.0.as_ref() != raw_turn_id {
+                return Err(self.failure_for_current_phase());
+            }
+        } else {
+            self.turn_id = Some(self.retain_turn_id(raw_turn_id)?);
+        }
+        if required_string(turn, "status") != Some("inProgress")
+            || required_array(turn, "items").is_none()
+        {
+            return Err(self.failure_for_current_phase());
+        }
+        self.turn_started_seen = true;
+        if self.state == SetupState::TurnStart {
+            return Ok(ParserProgress::default());
+        }
+        Ok(self.acknowledge_turn_started())
+    }
+
+    fn acknowledge_turn_started(&mut self) -> ParserProgress {
         self.state = SetupState::Running;
         let first_turn = !self.invocation_start_acknowledged;
         if first_turn {
@@ -1137,10 +1180,10 @@ impl CodexAppServerV1Parser {
         }
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnStarted));
-        Ok(ParserProgress {
+        ParserProgress {
             start_acknowledged: first_turn,
             close_standard_input: false,
-        })
+        }
     }
 
     fn parse_thread_started(
@@ -1150,7 +1193,8 @@ impl CodexAppServerV1Parser {
         if self.thread_started_seen
             || !matches!(
                 self.state,
-                SetupState::TurnStart
+                SetupState::ThreadStart
+                    | SetupState::TurnStart
                     | SetupState::StartAcknowledgement
                     | SetupState::Running
                     | SetupState::ResultValidation
@@ -1161,12 +1205,11 @@ impl CodexAppServerV1Parser {
         }
         let thread =
             required_object(params, "thread").ok_or_else(|| self.failure_for_current_phase())?;
-        let expected = self
-            .thread_id
-            .as_ref()
+        let raw_thread_id = required_nonempty_string(thread, "id")
+            .filter(|id| is_codex_thread_id(id))
             .ok_or_else(|| self.failure_for_current_phase())?;
-        if required_string(thread, "id") != Some(expected.0.as_ref())
-            || required_string(thread, "sessionId") != Some(expected.0.as_ref())
+        self.correlate_thread_value(raw_thread_id)?;
+        if required_string(thread, "sessionId") != Some(raw_thread_id)
             || required_bool(thread, "ephemeral") != Some(true)
             || optional_string(thread, "path") != Some(None)
             || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
@@ -1532,7 +1575,7 @@ impl CodexAppServerV1Parser {
         if let Some(thread_id) =
             optional_string(params, "threadId").ok_or_else(|| self.failure_for_current_phase())?
         {
-            self.require_thread_value(thread_id)?;
+            self.correlate_thread_value(thread_id)?;
         }
         let message = required_nonempty_string(params, "message")
             .ok_or_else(|| self.failure_for_current_phase())?;
@@ -1711,6 +1754,7 @@ impl CodexAppServerV1Parser {
 
     fn reset_completed_turn(&mut self) {
         self.turn_id = None;
+        self.turn_started_seen = false;
         self.completed_items.clear();
         self.selected_response = None;
         self.final_answer_seen = false;
@@ -1743,6 +1787,17 @@ impl CodexAppServerV1Parser {
         } else {
             Err(self.failure_for_current_phase())
         }
+    }
+
+    fn correlate_thread_value(&mut self, thread_id: &str) -> Result<(), AgentFailureCause> {
+        if self.thread_id.is_some() {
+            return self.require_thread_value(thread_id);
+        }
+        if self.state != SetupState::ThreadStart || !is_codex_thread_id(thread_id) {
+            return Err(self.failure_for_current_phase());
+        }
+        self.thread_id = Some(self.retain_thread_id(thread_id)?);
+        Ok(())
     }
 
     fn require_running_correlation(

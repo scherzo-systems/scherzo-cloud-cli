@@ -1125,6 +1125,9 @@ impl GitCaptureContext {
             OsString::from("pack-objects"),
             OsString::from("--stdout"),
             OsString::from("--revs"),
+            // Git's default sparse object walk may add redundant objects for direct tree copies.
+            // Keep the pack aligned with the fully walked object set checked before generation.
+            OsString::from("--no-sparse"),
             OsString::from("--window=0"),
             OsString::from("--depth=0"),
         ];

@@ -587,7 +587,9 @@ impl ExecutionJob {
                 prepare_cloud_workflow_result(
                     &run,
                     self.accepted.project_id().to_owned(),
-                    self.accepted.workflow_id().to_owned(),
+                    self.accepted.repository_connection_id().to_owned(),
+                    self.accepted.source_object_format().to_owned(),
+                    self.accepted.source_commit_oid().to_owned(),
                 )
                 .ok()
             });

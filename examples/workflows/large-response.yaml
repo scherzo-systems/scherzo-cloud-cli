@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Emit a deterministic, bounded 200-line output stream.
+
+steps:
+  manyLines:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+
+          i=1
+          while [ "$i" -le 200 ]; do
+            printf 'ROW %03d — The quick brown fox jumps over the lazy dog.\n' "$i"
+            i=$((i + 1))
+          done

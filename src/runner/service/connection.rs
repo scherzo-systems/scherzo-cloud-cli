@@ -2332,7 +2332,11 @@ mod tests {
 
     impl EstablishedTestContext {
         fn new() -> Self {
-            let config = test_config("wss://gateway.example.test/v1/runner/connect");
+            Self::with_endpoint("wss://gateway.example.test/v1/runner/connect")
+        }
+
+        fn with_endpoint(endpoint: &str) -> Self {
+            let config = test_config(endpoint);
             let frame_source = deterministic_frame_source();
             let opening = test_opening(&config, frame_source.as_ref());
             let (sleeper, sleep_requests) = controlled_sleeper();
@@ -2643,7 +2647,8 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upload_url = format!("http://{}/carrier", listener.local_addr().unwrap());
-        let context = EstablishedTestContext::new();
+        let context =
+            EstablishedTestContext::with_endpoint("ws://127.0.0.1:9444/v1/runner/connect");
         let broker = context
             .assignment_manager
             .lock()

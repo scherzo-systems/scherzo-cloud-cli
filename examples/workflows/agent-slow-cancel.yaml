@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Hold an agent in a long-running tool call for cancellation testing.
+
+agentProfiles:
+  luna:
+    harness:
+      kind: pi
+      config:
+        model: openai-codex/gpt-5.6-luna
+        thinking: low
+
+steps:
+  wait:
+    kind: agent
+    agent:
+      profile: luna
+      systemPrompt: prompts/slow-cancel-system.md
+      message:
+        text:
+          - file: prompts/slow-cancel.md
+    outputs:
+      response:
+        kind: agent_response
+
+exports:
+  response:
+    ref: outputs.wait.response

@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Fail agent startup with an intentionally nonexistent model.
+
+agentProfiles:
+  missingModel:
+    harness:
+      kind: pi
+      config:
+        model: openai-codex/model-does-not-exist
+        thinking: low
+
+steps:
+  failToStart:
+    kind: agent
+    agent:
+      profile: missingModel
+      systemPrompt: prompts/basic-agent-system.md
+      message:
+        text:
+          - file: prompts/basic-agent-question.md
+    outputs:
+      response:
+        kind: agent_response

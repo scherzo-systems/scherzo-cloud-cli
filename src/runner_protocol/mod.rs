@@ -227,7 +227,6 @@ pub(crate) struct ExecutionSourceV1RunnerProjection {
 pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) execution_spec_id: String,
     pub(crate) schema_version: u64,
-    pub(crate) registered_workflow_id: String,
     pub(crate) execution_limits: ExecutionLimitsV1RunnerProjection,
     pub(crate) source: ExecutionSourceV1RunnerProjection,
 }
@@ -974,7 +973,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 execution_spec: Box::new(ExecutionSpecV1RunnerProjection {
                     execution_spec_id: execution_spec.execution_spec_id.to_string(),
                     schema_version,
-                    registered_workflow_id: execution_spec.registered_workflow_id.to_string(),
                     execution_limits: ExecutionLimitsV1RunnerProjection {
                         maximum_parallel_steps,
                         cancellation_grace_seconds,

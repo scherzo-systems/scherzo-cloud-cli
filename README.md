@@ -10,10 +10,11 @@ executable.
 ## Current capabilities
 
 The current release supports help, version inspection, OAuth Device Authorization,
-server-confirmed human authentication status, explicit human-principal signup, renewable
-human sessions and revoking logout, organization profile management and one-page member-directory
-reads, local Workflow V1 definition validation, portable artifact-set validation, mixed
-command and agent execution, durable run status inspection, runner diagnostics, and an
+server-confirmed human authentication status, explicit human-principal signup,
+renewable human sessions and revoking logout, organization profile management and
+one-page member-directory reads, local Workflow V1 definition validation and structural
+schema output, portable artifact-set validation, mixed command and agent execution,
+durable run status inspection, runner diagnostics, and an
 enrolled outbound runner transport. `runner serve` connects only to the Cloud-issued
 endpoint retained in protected state and resolves, admits, and executes one configured
 inputless Workflow V1 command, Pi, Claude Code, or mixed assignment after explicit start
@@ -35,6 +36,12 @@ scherzo-cloud workflow validate \
   ./my-repository/.scherzo/workflows/check.yaml
 ```
 
+Ready-to-run command and agent bundles are available under
+[`examples/workflows/`](examples/workflows/). They cover basic DAGs, output presentation,
+expected failures, cancellation, structured agent results, attachments, and workflow
+finalizers. Definition validation is offline; running an agent example requires its
+selected harness and provider credentials and may consume billed tokens.
+
 `--source-root` is required and defines the complete directory boundary for the
 selected workflow YAML and all static prompts, message files, attachments, and result
 schemas. The workflow file is an ordinary host path resolved from the process's initial
@@ -43,16 +50,26 @@ The CLI does not infer the boundary from an enclosing repository or the YAML fil
 directory.
 
 The source distribution publishes the self-contained Workflow V1 JSON Schema at
-[`schemas/workflow-v1.schema.json`](schemas/workflow-v1.schema.json). Configure a JSON
-Schema-aware YAML editor or validation tool to use that checked-out file for Workflow
-V1 documents; every schema reference resolves within the file, so normal use does not
-need the private monorepo contract tree. Do not add a `$schema` property to the workflow
+[`schemas/workflow-v1.schema.json`](schemas/workflow-v1.schema.json). An installed
+executable emits its exact embedded copy offline:
+
+```sh
+scherzo-cloud workflow schema
+```
+
+The command writes raw JSON Schema bytes to standard output without a wrapper or
+preamble and preserves the canonical asset's single terminal newline. It needs no
+workflow file, source checkout, configuration, credentials, or network access.
+Configure a JSON Schema-aware YAML editor or validation tool to use either the
+checked-out file or this command's output for Workflow V1 documents; every schema
+reference resolves within the document. Do not add a `$schema` property to the workflow
 document.
 
-The schema checks document structure. `workflow validate` additionally checks the step
-graph, references, path containment, static files, types, and policy. Passing a schema
-check alone therefore does not establish that the CLI will accept the complete workflow
-bundle.
+The emitted schema checks document structure only. `workflow validate` remains the
+complete workflow definition validator: it additionally checks the step graph,
+references, path containment, static files, types, and policy. Passing a schema check
+alone therefore does not establish that the CLI will accept the complete workflow
+definition and its referenced files.
 
 A successful human result reports the normalized source-root-relative workflow path,
 the SHA-256 digest of the resolved source closure, step count, and required optional
@@ -116,25 +133,27 @@ normalizes it from its nearest existing parent and creates any missing parent su
 First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable state root
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and import bytes, durable closed run and attempt
-state, and attempt 1's atomic result beneath `attempts/000001/result`. Every PiJsonV1
-and ClaudeCodeStreamJsonV1 invocation receives fresh native session storage beneath its
-profile directory under `attempts/<attempt>/diagnostics/`. It remains after normal
-private-staging cleanup together with metadata identifying the attempt, step,
-invocation, immutable profile, exact harness version, and native format. Claude sessions
-are never resumed and are removed from ambient Claude history when the invocation
-quiesces. Codex instead starts one fresh ephemeral thread and uses one transient
-owner-private SQLite directory beneath invocation staging. App Server events remain
-authoritative, the transient directory is removed after settlement, and no Codex-native
-thread or file is retained. The run-directory path is the local run handle. Add `--json` for one
-terminal schema-version-1 object on stdout while the live presentation remains on
-stderr, or `--plain` to force the line presentation on stdout.
+state, and attempt 1's atomic result beneath `attempts/000001/result`. Every agent
+invocation receives a fresh profile directory under
+`attempts/<attempt>/diagnostics/` with immutable attempt, step, invocation, profile, and
+exact-version metadata. PiJsonV1 and ClaudeCodeStreamJsonV1 additionally retain fresh
+native session storage there; those sessions are never resumed, and Claude's temporary
+ambient history links are removed when the invocation quiesces. CodexAppServerV1 starts
+one fresh ephemeral thread and uses one transient owner-private SQLite directory beneath
+invocation staging. App Server events remain authoritative, the SQLite directory is
+removed after settlement, and no Codex-native thread or file is retained. A Codex
+protocol failure may retain the same bounded structural rejection document as the other
+profiles. The run-directory path is the local run handle. Add `--json` for one terminal
+schema-version-1 object on stdout while the live presentation remains on stderr, or
+`--plain` to force the line presentation on stdout.
 
-Retained Pi and Claude Code harness diagnostics can contain sensitive prompts, model
-output, tool activity, paths, and extension or provider state. Native sessions may be
-incomplete or malformed after a failure or forced stop and are diagnostic only: workflow
-status, results, retry, and recovery never read them as authority. They are owner-private
-on Unix, are not included in published attempt results, have no stable viewer or download
-interface, and disappear when the owning run directory is removed.
+Retained harness diagnostics can contain sensitive prompts, model output, tool activity,
+paths, and extension or provider state. Native sessions or diagnostic files may be
+incomplete or malformed after failure, cancellation, or forced termination and are
+diagnostic only: workflow status, results, retry, and recovery never read or reopen them
+as authority. They remain owner-private after every terminal outcome, are not included in
+published attempt results, have no stable viewer or download interface, and disappear
+only when the owning durable run directory is removed.
 
 Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
 `--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
@@ -486,7 +505,7 @@ and does not claim that every admitted release or unexecuted host received exact
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
 
-The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.148.0`, and
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.149.0`, and
 requires the generated App Server schema capability used by CodexAppServerV1. Its
 isolated version and schema probes do not read ambient `CODEX_HOME`, provider
 credentials, or native configuration. The report contains the exact observed version,
@@ -551,26 +570,28 @@ old Cloud credential active until local status shows the replacement current and
 grace or revoke it immediately if compromise is suspected. Never print an activation
 artifact or runner state while transferring or verifying it.
 
-Runner startup selects `pi` and `claude` independently from its inherited
-operator-controlled `PATH`. Install one stable Claude Code release in
-`>=2.1.234 <2.2.0` in that service environment before starting a runner that should
-accept Claude work; Scherzo never installs it automatically. Each successful installation
-is validated once and retained as an immutable snapshot for the process lifetime: Pi
-requires a version in `>=0.84.2 <0.85.0`, while Claude Code requires a version in
-`>=2.1.234 <2.2.0`. Admission and invocation
-never repeat either lookup or probe. A missing or incompatible installation leaves only
-that harness unavailable, so Runner Serve remains available for command-only and
-unrelated-harness assignments. An assignment requiring the unavailable harness is rejected
-before launch, and selection never falls through to another executable. Assignments and
-workflow data cannot influence selection. Each Claude execution requires every native
-initialization frame to report the exact version retained at startup; a contradiction
-fails closed without committing workflow output. Claude runs in the profile's fixed unattended
-`bypassPermissions` mode, which is not a sandbox. The runner owner remains responsible
-for filesystem, process, network, resource, and secret isolation and for trusted user,
-project, and local Claude settings, instructions, skills, hooks, MCP servers, and plugins.
-An operator rollout installs and validates Claude in the existing service environment,
-restarts that runner, canaries one deterministic Claude assignment, stops new Claude work
-on failure, and rolls back by restoring the previous service environment or runner release.
+Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
+operator-controlled `PATH`. Scherzo installs none of them. Each successful installation
+is validated once and retained as an immutable executable, exact-version, profile, and
+capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.85.0`, Claude Code
+requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
+`>=0.147.0 <0.149.0`. Admission and invocation never repeat a lookup or probe. A missing
+or incompatible installation leaves only that harness unavailable, so Runner Serve
+continues to accept command-only and other available-harness assignments. An assignment
+requiring the unavailable harness is rejected before launch, and selection never falls
+through to another executable or harness. Assignments and workflow data cannot influence
+selection.
+
+Runner agent steps use the same production dispatcher, cancellation precedence, process
+containment, descendant-quiescence boundary, result authority, and atomic publication
+path as local execution; no runner protocol or credential boundary changes by harness.
+Claude execution still requires native initialization to report the startup version and
+uses fixed unattended `bypassPermissions`. Codex execution uses the closed ephemeral
+App Server profile and fixed no-approval policy. Neither is a sandbox. The runner owner
+remains responsible for trusted native configuration and filesystem, process, network,
+resource, credential, and secret isolation. Follow the harness rollout runbook, including
+the required native qualification boundary, service restart, selected-harness no-fallback
+recovery, and the separately deferred first credentialed production-runner canary.
 
 The runner reconnects after retryable network, timeout, rate-limit, Gateway restart, and
 server failures with jittered backoff while retaining boot-scoped assignment state.

@@ -602,7 +602,6 @@ pub(crate) fn assignment_offer() -> Message {
                 "executionSpec": {
                     "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
                     "schemaVersion": 1,
-                    "registeredWorkflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
                     "executionLimits": {
                         "maximumParallelSteps": 1,
                         "cancellationGraceSeconds": 1

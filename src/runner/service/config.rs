@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
+use crate::execution::codex::ValidatedCodexInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::runner::credential::Credential;
 use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
@@ -38,6 +39,7 @@ pub(crate) struct Config {
     fixture_materialized_source: Option<(PathBuf, PathBuf)>,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<ValidatedCodexInstallation>,
 }
 
 impl fmt::Debug for Config {
@@ -48,7 +50,9 @@ impl fmt::Debug for Config {
             .field("credential", &self.credential)
             .field(
                 "agent_capable",
-                &(self.pi_installation.is_some() || self.claude_code_installation.is_some()),
+                &(self.pi_installation.is_some()
+                    || self.claude_code_installation.is_some()
+                    || self.codex_installation.is_some()),
             )
             .finish_non_exhaustive()
     }
@@ -113,6 +117,7 @@ impl Config {
             fixture_materialized_source: None,
             pi_installation: None,
             claude_code_installation: None,
+            codex_installation: None,
         })
     }
 
@@ -146,6 +151,7 @@ impl Config {
             fixture_materialized_source: None,
             pi_installation: None,
             claude_code_installation: None,
+            codex_installation: None,
         })
     }
 
@@ -225,6 +231,9 @@ impl Config {
         self
     }
 
+    // Runner service configuration snapshots and workflow admission intentionally retain
+    // parallel typed builders; sharing their containers would merge separate lifecycle layers.
+    // jscpd:ignore-start
     pub(crate) fn claude_code_installation(&self) -> Option<&ValidatedClaudeCodeInstallation> {
         self.claude_code_installation.as_ref()
     }
@@ -236,6 +245,19 @@ impl Config {
         self.claude_code_installation = Some(installation);
         self
     }
+
+    pub(crate) fn codex_installation(&self) -> Option<&ValidatedCodexInstallation> {
+        self.codex_installation.as_ref()
+    }
+
+    pub(crate) fn with_codex_installation(
+        mut self,
+        installation: ValidatedCodexInstallation,
+    ) -> Self {
+        self.codex_installation = Some(installation);
+        self
+    }
+    // jscpd:ignore-end
 }
 
 fn validate_pending_credential(

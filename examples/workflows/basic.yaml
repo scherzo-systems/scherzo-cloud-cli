@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Run a small, deterministic command-only DAG without changing the execution root.
+
+steps:
+  hello:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\\n' 'hello from Scherzo Cloud'"
+
+  explain:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\\n' 'this workflow only prints fixed text'"
+
+  finish:
+    kind: cmd
+    dependsOn: [hello, explain]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\\n' 'workflow complete'"

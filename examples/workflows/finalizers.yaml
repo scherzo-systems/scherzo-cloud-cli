@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Show finalizer triggers, ordering, context, and advisory failure handling.
+
+steps:
+  work:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'ordinary work complete'; sleep 0.10"
+
+finalizers:
+  cleanup:
+    kind: cmd
+    inputs:
+      context:
+        ref: finalization.context
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s' 'cleanup received finalization context: '; while IFS= read -r line || [ -n \"$line\" ]; do printf '%s' \"$line\"; done < \"$SCHERZO_STEP_INPUTS/values/context\"; printf '\n'; sleep 0.10"
+
+  successReport:
+    kind: cmd
+    after: [cleanup]
+    when: [succeeded]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'ordinary execution succeeded; cleanup was attempted'"
+
+  failureReport:
+    kind: cmd
+    when: [failed]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'ordinary execution failed'"
+
+  optionalNotify:
+    kind: cmd
+    after: [successReport]
+    when: [succeeded]
+    failurePolicy: advisory
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'simulating an advisory notification failure' >&2; exit 23"

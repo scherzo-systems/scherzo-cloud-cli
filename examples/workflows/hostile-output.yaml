@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Emit deterministic long, Unicode, Markdown, control, and unterminated output.
+
+steps:
+  renderStress:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+
+          printf 'PATHOLOGICAL-'
+          i=0
+          while [ "$i" -lt 2048 ]; do
+            printf x
+            i=$((i + 1))
+          done
+          printf '\n'
+
+          printf '%s\n' 'Unicode: café | café | العربية | עברית | 中文 | 👩‍💻 | 🏳️‍🌈'
+          printf '%s\n' '# Heading'
+          printf '%s\n' '> quoted text'
+          printf '%s\n' 'Inline `code` follows.'
+          printf '%s\n' '| left | center | right |'
+          printf '%s\n' '| --- | --- | --- |'
+          printf '%s\n' '| one | two | three |'
+          printf '%s\n' '```text'
+          printf '%s\n' 'fenced content'
+          printf '%s\n' '```'
+          printf 'Control: \033[31mred\033[0m\n'
+          printf END

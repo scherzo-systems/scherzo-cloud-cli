@@ -7,6 +7,7 @@ Usage: scherzo-cloud workflow [COMMAND]
 Commands:
   retry     Retry a local workflow run
   run       Run a local command and agent workflow
+  schema    Show the workflow structural schema
   status    Show local workflow run status
   validate  Validate a local workflow definition
   view      View a published local workflow attempt

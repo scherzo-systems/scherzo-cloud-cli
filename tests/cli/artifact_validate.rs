@@ -121,7 +121,9 @@ impl ArtifactSet {
         result["workflow"]["provenance"] = json!({
             "kind": "cloud",
             "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc"
+            "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "objectFormat": "sha1",
+            "commitOid": "0123456789abcdef0123456789abcdef01234567"
         });
         result["execution"]
             .as_object_mut()

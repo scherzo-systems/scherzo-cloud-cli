@@ -62,7 +62,7 @@ use serde_json::Value;
 
 use document::WorkflowDocument;
 
-const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
+pub(crate) const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/workflow-v1.schema.json"
 ));

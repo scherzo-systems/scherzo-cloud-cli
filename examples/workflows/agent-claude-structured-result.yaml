@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Produce a schema-validated result with a low-effort Claude Code agent.
+
+agentProfiles:
+  sonnet:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-sonnet-5
+        effort: low
+
+steps:
+  calculate:
+    kind: agent
+    agent:
+      profile: sonnet
+      systemPrompt: prompts/claude-structured-system.md
+      message:
+        text:
+          - file: prompts/claude-structured-question.md
+    outputs:
+      calculation:
+        kind: agent_result
+        schema: schemas/calculation-result.schema.json
+
+exports:
+  calculation:
+    ref: outputs.calculate.calculation

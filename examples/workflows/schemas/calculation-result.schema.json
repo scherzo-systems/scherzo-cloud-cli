@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Calculation result",
+  "type": "object",
+  "properties": {
+    "expression": {
+      "const": "17 + 25"
+    },
+    "answer": {
+      "const": 42
+    },
+    "explanation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "confidence": {
+      "const": 1
+    }
+  },
+  "required": ["expression", "answer", "explanation", "confidence"],
+  "additionalProperties": false
+}

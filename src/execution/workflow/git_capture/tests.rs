@@ -263,6 +263,41 @@ fn changed_capture_has_verified_bundle_profile_metadata_size_and_digest() {
 }
 
 #[test]
+fn capture_accepts_tree_copied_from_baseline() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::create_dir_all(repository.join("source/nested")).unwrap();
+    fs::create_dir_all(repository.join("target/nested")).unwrap();
+    fs::write(repository.join("source/nested/data.txt"), b"reused\n").unwrap();
+    fs::write(repository.join("target/nested/data.txt"), b"target\n").unwrap();
+    git(&repository, &["add", "."]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let fixture = GitFixture::from_prepared(temporary, repository);
+    fs::create_dir(fixture.repository.join("target/copied")).unwrap();
+    fs::copy(
+        fixture.repository.join("source/nested/data.txt"),
+        fixture.repository.join("target/copied/data.txt"),
+    )
+    .unwrap();
+    git(&fixture.repository, &["add", "target/copied"]);
+    git(
+        &fixture.repository,
+        &["commit", "--quiet", "-m", "copy baseline tree"],
+    );
+
+    let candidates = fixture.capture().unwrap();
+
+    assert!(
+        candidates.outputs()["changes"]
+            .as_git_branch()
+            .unwrap()
+            .carrier()
+            .is_some()
+    );
+}
+
+#[test]
 fn zero_delta_carries_metadata_without_a_carrier_or_budget_charge() {
     let fixture = GitFixture::new();
     let baseline = fixture.capture.baseline_oid().to_owned();
@@ -1004,7 +1039,7 @@ fn capture_timeout_names_git_command_and_limit() {
     let wrapper = temporary.path().join("git-with-timeout");
     fs::write(
         &wrapper,
-        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --window=0 --depth=0 \"*) IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;
+        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --no-sparse --window=0 --depth=0 \"*) IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;
 esac\nexec \"$REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
@@ -1033,7 +1068,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
 
     assert_eq!(
         failure.to_string(),
-        "Git branch capture command `git pack-objects --stdout --revs --window=0 --depth=0` exceeded the 1s timeout"
+        "Git branch capture command `git pack-objects --stdout --revs --no-sparse --window=0 --depth=0` exceeded the 1s timeout"
     );
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }

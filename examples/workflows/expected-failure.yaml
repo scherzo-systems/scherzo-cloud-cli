@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Deliberately fail one harmless command to present failed and blocked steps.
+
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'preparing the failure example'; sleep 0.10"
+
+  expectedFailure:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'running the expected failure'; sleep 0.20; printf '%s\n' 'intentional example failure (exit 17)' >&2; exit 17"
+
+  parallelSuccess:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'independent work started'; sleep 0.40; printf '%s\n' 'independent work finished'"
+
+  blockedPreview:
+    kind: cmd
+    dependsOn: [expectedFailure]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'this command should remain blocked'"
+
+  neverReached:
+    kind: cmd
+    dependsOn: [blockedPreview, parallelSuccess]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'this command should not run'"

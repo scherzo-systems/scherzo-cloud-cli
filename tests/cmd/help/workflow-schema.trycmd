@@ -1,0 +1,14 @@
+```console
+$ scherzo-cloud workflow schema --help
+Show the workflow structural schema
+
+Usage: scherzo-cloud workflow schema
+
+Options:
+  -h, --help  Print help
+
+Scope:
+  This schema checks workflow document structure only. Use `scherzo-cloud workflow
+  validate` to validate the complete workflow definition and its referenced files.
+
+```

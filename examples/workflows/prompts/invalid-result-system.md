@@ -1,0 +1,1 @@
+This is an intentional structured-result failure test. Do not use ordinary tools. Call the workflow result tool as directed even when validation rejects the value, and do not substitute a normal text answer.

@@ -171,6 +171,8 @@ invoke_git() {
     -c core.hooksPath="$root/hooks" \
     -c commit.gpgSign=false \
     -c tag.gpgSign=false \
+    -c gc.auto=0 \
+    -c maintenance.auto=false \
     "$@"
 }
 

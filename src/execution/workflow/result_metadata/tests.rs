@@ -81,7 +81,9 @@ fn cloud_result_fixture() -> Value {
     result["workflow"]["provenance"] = json!({
         "kind": "cloud",
         "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-        "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc"
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567"
     });
     result["execution"]
         .as_object_mut()
@@ -171,10 +173,15 @@ fn rejects_unknown_mixed_or_malformed_cloud_origin_profiles() {
         Value::String("prj_81k0z6r1w8f4jy2m7q9v3x5abc".to_owned());
     invalid_results.push(malformed_project);
 
-    let mut malformed_workflow = cloud_metadata_only_result_fixture();
-    malformed_workflow["workflow"]["provenance"]["workflowId"] =
-        Value::String("wfl_01K0z6r1w8f4jy2m7q9v3x5abc".to_owned());
-    invalid_results.push(malformed_workflow);
+    let mut malformed_connection = cloud_metadata_only_result_fixture();
+    malformed_connection["workflow"]["provenance"]["repositoryConnectionId"] =
+        Value::String("rpc_01K0z6r1w8f4jy2m7q9v3x5abc".to_owned());
+    invalid_results.push(malformed_connection);
+
+    let mut malformed_commit = cloud_metadata_only_result_fixture();
+    malformed_commit["workflow"]["provenance"]["commitOid"] =
+        Value::String("0123456789abcdef0123456789abcdef0123456G".to_owned());
+    invalid_results.push(malformed_commit);
 
     let mut runner_execution_root = cloud_metadata_only_result_fixture();
     runner_execution_root["execution"]["executionRoot"] = Value::String("/runner/work".to_owned());

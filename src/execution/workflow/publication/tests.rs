@@ -326,7 +326,9 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     let captured = prepare_cloud_workflow_result(
         &run,
         "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-        "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "sha1".to_owned(),
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
     )
     .unwrap();
     assert_eq!(captured.carriers.len(), 4);
@@ -340,7 +342,9 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     let prepared = prepare_cloud_workflow_result(
         &metadata_only,
         "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-        "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "sha1".to_owned(),
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
     )
     .unwrap();
     assert!(prepared.carriers.is_empty());

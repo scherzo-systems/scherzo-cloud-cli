@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Show the smallest successful workflow as a single command step.
+
+steps:
+  greet:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'one small step, one successful workflow'"

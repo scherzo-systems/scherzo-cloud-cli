@@ -1,0 +1,6 @@
+Project: Aurora
+Launch date: 2026-10-14
+Owner: Mina Patel
+Goal: Release the first public workflow gallery.
+Primary risk: Vendor security approval may arrive late.
+Mitigation: Submit the review package two weeks before the normal deadline.

@@ -1834,7 +1834,9 @@ mod tests {
             prepare_cloud_workflow_result(
                 &run,
                 "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                projection.repository_connection_id.clone(),
+                projection.object_format.clone(),
+                projection.commit_oid.clone(),
             )
             .unwrap()
         };

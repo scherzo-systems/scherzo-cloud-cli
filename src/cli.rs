@@ -356,6 +356,7 @@ mod tests {
             "workflow",
             "workflow retry",
             "workflow run",
+            "workflow schema",
             "workflow status",
             "workflow validate",
             "workflow view",

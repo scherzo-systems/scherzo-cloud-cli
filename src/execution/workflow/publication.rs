@@ -381,8 +381,12 @@ pub(crate) enum WorkflowProvenanceV1 {
     Cloud {
         #[serde(rename = "projectId")]
         project_id: String,
-        #[serde(rename = "workflowId")]
-        workflow_id: String,
+        #[serde(rename = "repositoryConnectionId")]
+        repository_connection_id: String,
+        #[serde(rename = "objectFormat")]
+        object_format: String,
+        #[serde(rename = "commitOid")]
+        commit_oid: String,
     },
 }
 
@@ -1021,7 +1025,9 @@ pub(crate) fn publish_workflow_result(
 pub(crate) fn prepare_cloud_workflow_result(
     run: &WorkflowRunResult,
     project_id: String,
-    workflow_id: String,
+    repository_connection_id: String,
+    object_format: String,
+    commit_oid: String,
 ) -> Result<PreparedCloudWorkflowResult, LocalPublicationError> {
     if !run.exports.keys().eq(run.export_sources.keys()) {
         return Err(invalid_run_result());
@@ -1064,7 +1070,9 @@ pub(crate) fn prepare_cloud_workflow_result(
         run,
         WorkflowProvenanceV1::Cloud {
             project_id,
-            workflow_id,
+            repository_connection_id,
+            object_format,
+            commit_oid,
         },
         exports,
     )?;

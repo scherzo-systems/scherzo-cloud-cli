@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Ask a low-effort Claude Code agent a basic arithmetic question.
+
+agentProfiles:
+  basic:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-haiku-4-5-20251001
+        effort: low
+
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: basic
+      systemPrompt: prompts/basic-agent-system.md
+      message:
+        text:
+          - file: prompts/basic-agent-question.md
+    outputs:
+      response:
+        kind: agent_response
+
+exports:
+  response:
+    ref: outputs.answer.response

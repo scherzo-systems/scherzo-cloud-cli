@@ -96,10 +96,14 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
         }
         WorkflowProvenanceV1::Cloud {
             project_id,
-            workflow_id,
+            repository_connection_id,
+            object_format,
+            commit_oid,
         } => {
             valid_typed_id(project_id, "prj_")
-                && valid_typed_id(workflow_id, "wfl_")
+                && valid_typed_id(repository_connection_id, "rpc_")
+                && object_format == "sha1"
+                && is_lowercase_hex(commit_oid, 40)
                 && result.execution.execution_root.is_none()
         }
     };

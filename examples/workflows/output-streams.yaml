@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Exercise stdout, stderr, quiet commands, and an unterminated final line.
+
+steps:
+  announce:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'starting stream presentation'; printf '%s\n' 'a harmless example warning' >&2; sleep 0.20; printf '%s\n' 'streaming step complete'"
+
+  quietCheck:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; sleep 0.10; :"
+
+  finalLine:
+    kind: cmd
+    dependsOn: [announce, quietCheck]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s' 'final output without a trailing newline'"

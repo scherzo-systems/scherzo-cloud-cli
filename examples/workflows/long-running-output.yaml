@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Emit one progress update per second for 15 minutes to exercise live following.
+
+steps:
+  streamProgress:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - |-
+          set -eu
+          update=1
+          while [ "$update" -le 900 ]; do
+            printf 'stream update %03d/900\n' "$update"
+            sleep 1
+            update=$((update + 1))
+          done
+
+  finish:
+    kind: cmd
+    dependsOn: [streamProgress]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'long-running output complete'"

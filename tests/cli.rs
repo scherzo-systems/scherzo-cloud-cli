@@ -44,6 +44,8 @@ mod runner_status;
 mod workflow_retry;
 #[path = "cli/workflow_run.rs"]
 mod workflow_run;
+#[path = "cli/workflow_schema.rs"]
+mod workflow_schema;
 #[path = "cli/workflow_status.rs"]
 mod workflow_status;
 #[path = "cli/workflow_validate.rs"]
@@ -2209,7 +2211,6 @@ fn runner_serve_requires_one_configuration_and_rejects_removed_flags() {
         ],
         vec!["--credential-file", "runner.credential"],
         vec!["--allow-insecure-http"],
-        vec!["--workflow-id", "wfl_01k0z6r1w8f4jy2m7q9v3x5abr"],
         vec!["--workflow-source-root", "schemas"],
         vec!["--workflow-path", "workflow-v1.schema.json"],
         vec!["--work-root", "tests"],

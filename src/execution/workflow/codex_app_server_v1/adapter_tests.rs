@@ -41,7 +41,7 @@ use crate::execution::workflow::result_validation::{
 };
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 
-const MODEL: &str = "scherzo-loopback";
+const MODEL: &str = "gpt-5.4";
 const PROVIDER: &str = "loopback";
 const RESPONSE: &str = "driver response";
 const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
@@ -359,7 +359,10 @@ impl ProcessFixture {
         // Codex owns fresh native process, control, and state roots; sharing another
         // harness fixture would invalidate profile-specific persistence evidence.
         // jscpd:ignore-start
-        let temporary = tempfile::tempdir().unwrap();
+        // The workflow-provided TMPDIR can be nested beneath a repository checkout.
+        // Keep exact native project discovery outside that ancestor so Codex cannot load
+        // repository state that is not part of this synthetic conformance fixture.
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let temporary_root = std::fs::canonicalize(temporary.path()).unwrap();
         let execution_root = temporary_root.join("execution");
         let cwd = execution_root.join("worktree");
@@ -368,6 +371,7 @@ impl ProcessFixture {
         let result_endpoint = staging.join("result-endpoint");
         let controls = temporary_root.join("controls");
         let home = temporary_root.join("home");
+        let native_temporary = temporary_root.join("native-tmp");
         let codex_home = if codex_home_contains_staging {
             temporary_root.clone()
         } else {
@@ -381,6 +385,7 @@ impl ProcessFixture {
             &result_endpoint,
             &controls,
             &home,
+            &native_temporary,
             &codex_home,
         ] {
             std::fs::create_dir_all(directory).unwrap();
@@ -409,6 +414,7 @@ impl ProcessFixture {
                 std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
             ),
             (OsString::from("HOME"), home.into_os_string()),
+            (OsString::from("TMPDIR"), native_temporary.into_os_string()),
             (
                 OsString::from("CODEX_HOME"),
                 codex_home.as_os_str().to_owned(),
@@ -706,6 +712,50 @@ fn start_fixture_with_clock<Clock: CoordinatorClock>(
     (task, start, outcome)
 }
 // jscpd:ignore-end
+
+struct RunningCancellationFixture {
+    fixture: ProcessFixture,
+    task: tokio::task::JoinHandle<()>,
+    start: Option<AgentStartReceiver>,
+    outcome: AgentTerminalReceiver,
+    cancellation: CancellationSource,
+    process_control: AgentProcessControl,
+}
+
+impl RunningCancellationFixture {
+    fn start(mut fixture: ProcessFixture) -> Self {
+        let invocation = fixture.invocation.take().unwrap();
+        let cancellation = invocation.cancellation().clone();
+        let process_control = invocation.process_control().clone();
+        let (task, start, outcome) = start_fixture(invocation, fixture.diagnostics.clone());
+        Self {
+            fixture,
+            task,
+            start: Some(start),
+            outcome,
+            cancellation,
+            process_control,
+        }
+    }
+
+    async fn await_started(&mut self) {
+        self.start.take().unwrap().receive().await.unwrap();
+    }
+
+    fn cancel(&self) {
+        assert!(
+            self.cancellation
+                .request_cancellation(CancellationReason::UserRequest)
+        );
+        self.process_control.interrupt();
+    }
+
+    async fn finish(self) -> (ProcessFixture, AgentOutcome) {
+        self.task.await.unwrap();
+        let outcome = self.outcome.receive().await.unwrap();
+        (self.fixture, outcome)
+    }
+}
 
 // Process-record inspection is specific to this guarded App Server fixture's quiescence
 // proof, so it remains separate from other harness fixture runners.
@@ -1062,12 +1112,24 @@ fn provider_response(thread: &Value) -> String {
         .to_owned()
 }
 
-#[test]
-#[ignore = "launched as the deterministic Codex App Server process fixture"]
 #[expect(
     clippy::zombie_processes,
     reason = "the authenticated fixture guard force-terminates and reaps this deliberate stubborn descendant"
 )]
+fn materialize_stubborn_descendant() {
+    let descendant = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' INT TERM; while :; do sleep 60; done"])
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        std::env::var_os("CODEX_FIXTURE_DESCENDANT").unwrap(),
+        format!("{}\n", descendant.id()),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "launched as the deterministic Codex App Server process fixture"]
 fn codex_process_fixture() {
     let scenario = std::env::var("CODEX_FIXTURE_SCENARIO").unwrap();
     let sqlite_home = PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap());
@@ -1179,6 +1241,22 @@ fn codex_process_fixture() {
         );
         return;
     }
+    let thread_started_before_response = scenario == "thread-started-before-response";
+    if scenario == "thread-warning-before-response" {
+        write_server_frame(
+            &mut output,
+            json!({"method": "warning", "params": {
+                "threadId": THREAD_ID,
+                "message": "synthetic thread startup warning",
+            }}),
+        );
+    }
+    if thread_started_before_response {
+        write_server_frame(
+            &mut output,
+            json!({"method": "thread/started", "params": {"thread": thread_document(cwd, &version)}}),
+        );
+    }
     write_server_frame(
         &mut output,
         json!({
@@ -1203,11 +1281,14 @@ fn codex_process_fixture() {
         );
         return;
     }
-    write_server_frame(
-        &mut output,
-        json!({"method": "thread/started", "params": {"thread": thread_document(cwd, &version)}}),
-    );
-    if scenario == "premature-turn-started" {
+    if !thread_started_before_response {
+        write_server_frame(
+            &mut output,
+            json!({"method": "thread/started", "params": {"thread": thread_document(cwd, &version)}}),
+        );
+    }
+    let turn_started_before_response = scenario == "turn-started-before-response";
+    if scenario == "premature-turn-started" || turn_started_before_response {
         write_server_frame(
             &mut output,
             json!({"method": "turn/started", "params": {
@@ -1215,7 +1296,9 @@ fn codex_process_fixture() {
                 "turn": turn_document("inProgress", vec![])
             }}),
         );
-        return;
+        if scenario == "premature-turn-started" {
+            return;
+        }
     }
     write_server_frame(
         &mut output,
@@ -1237,20 +1320,22 @@ fn codex_process_fixture() {
         expect_client_eof(&mut input);
         return;
     }
-    let started_turn_id = if scenario == "mismatched-turn-started" {
-        "other-turn"
-    } else {
-        TURN_ID
-    };
-    write_server_frame(
-        &mut output,
-        json!({"method": "turn/started", "params": {
-            "threadId": THREAD_ID,
-            "turn": {"id": started_turn_id, "items": [], "status": "inProgress"}
-        }}),
-    );
-    if scenario == "mismatched-turn-started" {
-        return;
+    if !turn_started_before_response {
+        let started_turn_id = if scenario == "mismatched-turn-started" {
+            "other-turn"
+        } else {
+            TURN_ID
+        };
+        write_server_frame(
+            &mut output,
+            json!({"method": "turn/started", "params": {
+                "threadId": THREAD_ID,
+                "turn": {"id": started_turn_id, "items": [], "status": "inProgress"}
+            }}),
+        );
+        if scenario == "mismatched-turn-started" {
+            return;
+        }
     }
 
     if scenario == "stalled-request-responses" {
@@ -1456,15 +1541,7 @@ fn codex_process_fixture() {
         assert_eq!(interrupt["id"], 5);
         assert_eq!(interrupt["method"], "turn/interrupt");
         if scenario == "cancellation-stubborn" {
-            let descendant = std::process::Command::new("/bin/sh")
-                .args(["-c", "trap '' INT TERM; while :; do sleep 60; done"])
-                .spawn()
-                .unwrap();
-            std::fs::write(
-                std::env::var_os("CODEX_FIXTURE_DESCENDANT").unwrap(),
-                format!("{}\n", descendant.id()),
-            )
-            .unwrap();
+            materialize_stubborn_descendant();
             loop {
                 std::thread::park();
             }
@@ -1641,6 +1718,7 @@ fn codex_process_fixture() {
             | "failure-after-start-provider"
             | "failure-after-start-provider-other-prose"
             | "failure-after-start-authentication"
+            | "failure-after-start-stubborn"
             | "failure-after-partial-output"
             | "retry-exhausted"
             | "truncated-provider-stream"
@@ -1681,6 +1759,9 @@ fn codex_process_fixture() {
         let mut items = Vec::new();
         if scenario == "failure-after-partial-output" {
             items.push(completed_provisional_response(&mut output));
+        }
+        if scenario == "failure-after-start-stubborn" {
+            materialize_stubborn_descendant();
         }
         let (message, info) = match scenario.as_str() {
             "failure-after-start-model" => ("model diagnostic", json!("badRequest")),
@@ -1881,12 +1962,17 @@ impl LoopbackResponsesProvider {
         let (requests, request) = mpsc::unbounded_channel();
         let (stop, mut shutdown) = oneshot::channel();
         let task = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => {}
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted.unwrap();
-                    serve_provider_request(stream, requests, response, response_release).await;
+            let mut response_release = response_release;
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let (stream, _) = accepted.unwrap();
+                if serve_provider_request(stream, &requests, &response, &mut response_release).await
+                {
+                    break;
                 }
             }
         });
@@ -1910,15 +1996,20 @@ impl LoopbackResponsesProvider {
 
 async fn serve_provider_request(
     mut stream: TcpStream,
-    requests: mpsc::UnboundedSender<ProviderRequest>,
-    response: LoopbackProviderResponse,
-    response_release: Option<oneshot::Receiver<()>>,
-) {
+    requests: &mpsc::UnboundedSender<ProviderRequest>,
+    response: &LoopbackProviderResponse,
+    response_release: &mut Option<oneshot::Receiver<()>>,
+) -> bool {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 4096];
         let read = stream.read(&mut chunk).await.unwrap();
-        assert!(read > 0);
+        // Exact Codex can discard a byte-empty pooled connection before issuing the
+        // provider request. Partial requests remain fixture failures.
+        if read == 0 && bytes.is_empty() {
+            return false;
+        }
+        assert!(read > 0, "loopback provider request ended mid-header");
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             break position + 4;
@@ -1959,7 +2050,7 @@ async fn serve_provider_request(
             body,
         })
         .unwrap();
-    if let Some(response_release) = response_release {
+    if let Some(response_release) = response_release.take() {
         response_release.await.unwrap();
     }
     let (status, content_type, payload) = match response {
@@ -2030,7 +2121,7 @@ async fn serve_provider_request(
                     std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
                 ) =>
             {
-                return;
+                return true;
             }
             Err(error) => panic!("loopback provider write failed: {error:?}"),
         }
@@ -2040,10 +2131,16 @@ async fn serve_provider_request(
         Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
         Err(error) => panic!("loopback provider shutdown failed: {error:?}"),
     }
+    true
 }
 
 pub(super) mod normal {
     use super::*;
+
+    async fn assert_fixture_completed_without_value(fixture: ProcessFixture) {
+        let (_, outcome, started) = run_fixture(fixture).await;
+        assert_completed_without_value(outcome, started);
+    }
 
     #[test]
     fn launch_is_strict_stdio_with_invocation_scoped_project_and_hook_trust() {
@@ -2358,6 +2455,21 @@ pub(super) mod normal {
     }
 
     #[tokio::test]
+    async fn startup_notifications_may_precede_their_responses() {
+        with_watchdog(async {
+            for scenario in [
+                "thread-warning-before-response",
+                "thread-started-before-response",
+                "turn-started-before-response",
+            ] {
+                let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
+                assert_fixture_completed_without_value(fixture).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn accepted_non_anchor_version_is_retained_through_native_setup() {
         with_watchdog(async {
             let fixture = ProcessFixture::with_version(
@@ -2372,9 +2484,7 @@ pub(super) mod normal {
                 "0.147.23"
             );
 
-            let (_, outcome, started) = run_fixture(fixture).await;
-
-            assert_completed_without_value(outcome, started);
+            assert_fixture_completed_without_value(fixture).await;
         })
         .await;
     }
@@ -2539,23 +2649,26 @@ pub(super) mod exact_binary {
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
             let (fixture, stdin_capture) =
                 ProcessFixture::with_exact_binary_stdin_capture(provider.address, response_mode());
-            let cancellation = fixture.invocation.as_ref().unwrap().cancellation().clone();
-            let run = tokio::spawn(run_fixture(fixture));
+            let mut running = RunningCancellationFixture::start(fixture);
 
             let request = provider.next_request().await;
             assert_eq!(request.path, "/responses");
-            assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+            running.await_started().await;
+            running.cancel();
             wait_for_fixture_bytes(&stdin_capture, br#""method":"turn/interrupt""#).await;
             release_response.send(()).unwrap();
-            let (_, outcome, started) = run.await.unwrap();
+            let (fixture, outcome) = running.finish().await;
 
-            assert!(started, "exact Codex outcome: {outcome:?}");
             assert_eq!(
                 outcome,
                 AgentOutcome::Cancelled {
                     reason: CancellationReason::UserRequest,
                 }
             );
+            if fixture.process.is_file() {
+                assert_fixture_quiescent(&fixture);
+            }
+            assert_transient_sqlite_cleaned(&fixture);
             provider.shutdown().await;
         })
         .await;
@@ -2824,10 +2937,7 @@ pub(super) mod start_failure {
                 ),
                 ("thread-start-rejected", AgentHarnessSetupStage::ThreadStart),
                 ("turn-start-rejected", AgentHarnessSetupStage::TurnStart),
-                (
-                    "premature-turn-started",
-                    AgentHarnessSetupStage::StartAcknowledgement,
-                ),
+                ("premature-turn-started", AgentHarnessSetupStage::TurnStart),
                 (
                     "mismatched-turn-started",
                     AgentHarnessSetupStage::StartAcknowledgement,
@@ -3117,50 +3227,6 @@ pub(super) mod adversarial_lifecycle {
 
 pub(super) mod cancellation {
     use super::*;
-
-    struct RunningCancellationFixture {
-        fixture: ProcessFixture,
-        task: tokio::task::JoinHandle<()>,
-        start: Option<AgentStartReceiver>,
-        outcome: AgentTerminalReceiver,
-        cancellation: CancellationSource,
-        process_control: AgentProcessControl,
-    }
-
-    impl RunningCancellationFixture {
-        fn start(mut fixture: ProcessFixture) -> Self {
-            let invocation = fixture.invocation.take().unwrap();
-            let cancellation = invocation.cancellation().clone();
-            let process_control = invocation.process_control().clone();
-            let (task, start, outcome) = start_fixture(invocation, fixture.diagnostics.clone());
-            Self {
-                fixture,
-                task,
-                start: Some(start),
-                outcome,
-                cancellation,
-                process_control,
-            }
-        }
-
-        async fn await_started(&mut self) {
-            self.start.take().unwrap().receive().await.unwrap();
-        }
-
-        fn cancel(&self) {
-            assert!(
-                self.cancellation
-                    .request_cancellation(CancellationReason::UserRequest)
-            );
-            self.process_control.interrupt();
-        }
-
-        async fn finish(self) -> (ProcessFixture, AgentOutcome) {
-            self.task.await.unwrap();
-            let outcome = self.outcome.receive().await.unwrap();
-            (self.fixture, outcome)
-        }
-    }
 
     fn assert_user_cancelled(outcome: AgentOutcome) {
         assert_eq!(

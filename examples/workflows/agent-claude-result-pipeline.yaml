@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Extract validated facts and pass the JSON result to a second Claude Code agent.
+
+agentProfiles:
+  sonnet:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-sonnet-5
+        effort: low
+  haiku:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-haiku-4-5-20251001
+        effort: low
+
+steps:
+  extract:
+    kind: agent
+    agent:
+      profile: sonnet
+      systemPrompt: prompts/claude-structured-system.md
+      message:
+        text:
+          - file: prompts/claude-pipeline-extract.md
+    outputs:
+      facts:
+        kind: agent_result
+        schema: schemas/project-facts.schema.json
+
+  summarize:
+    kind: agent
+    agent:
+      profile: haiku
+      systemPrompt: prompts/basic-agent-system.md
+      message:
+        text:
+          - file: prompts/claude-pipeline-summarize.md
+        attachments:
+          - ref: outputs.extract.facts
+    outputs:
+      response:
+        kind: agent_response
+
+exports:
+  facts:
+    ref: outputs.extract.facts
+  response:
+    ref: outputs.summarize.response

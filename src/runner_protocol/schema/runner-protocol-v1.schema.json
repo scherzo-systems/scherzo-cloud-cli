@@ -117,10 +117,6 @@
       "type": "string",
       "pattern": "^prj_[0-7][0-9a-hjkmnp-tv-z]{25}$"
     },
-    "workflowId": {
-      "type": "string",
-      "pattern": "^wfl_[0-7][0-9a-hjkmnp-tv-z]{25}$"
-    },
     "executionSpecId": {
       "type": "string",
       "pattern": "^xsp_[0-7][0-9a-hjkmnp-tv-z]{25}$"
@@ -248,9 +244,6 @@
         "schemaVersion": {
           "const": 1
         },
-        "registeredWorkflowId": {
-          "$ref": "#/$defs/workflowId"
-        },
         "executionLimits": {
           "$ref": "#/$defs/ExecutionLimits"
         },
@@ -261,7 +254,6 @@
       "required": [
         "executionSpecId",
         "schemaVersion",
-        "registeredWorkflowId",
         "executionLimits",
         "source"
       ]

@@ -1030,8 +1030,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "operator must arrange a dedicated-host suspend and wake through the owning script"]
     async fn lease_clock_real_suspend_probe() {
-        const DUE_AFTER: Duration = Duration::from_secs(10);
+        const DEFAULT_DUE_AFTER_SECONDS: u64 = 10;
+        const MAX_DUE_AFTER_SECONDS: u64 = 600;
         const MIN_OBSERVED_SUSPEND: Duration = Duration::from_secs(1);
+        let due_after_seconds = match std::env::var_os("SCHERZO_LEASE_SUSPEND_DUE_SECONDS") {
+            None => DEFAULT_DUE_AFTER_SECONDS,
+            Some(value) => value
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| (1..=MAX_DUE_AFTER_SECONDS).contains(value))
+                .expect("suspend probe due seconds must be an integer from 1 through 600"),
+        };
+        let due_after = Duration::from_secs(due_after_seconds);
         let ready_path = PathBuf::from(
             std::env::var_os("SCHERZO_LEASE_SUSPEND_READY_FILE")
                 .expect("owning suspend script did not provide its readiness path"),
@@ -1039,7 +1049,7 @@ mod tests {
         let clock = LeaseClock::system().expect("open native suspend-aware lease clock");
         let started = clock.now().expect("read native suspend-aware lease clock");
         let deadline = started
-            .checked_add(DUE_AFTER)
+            .checked_add(due_after)
             .expect("build probe deadline");
         let wait = clock
             .start_wait(deadline)
@@ -1059,7 +1069,7 @@ mod tests {
             .expect("read native clock after resume")
             .checked_duration_since(started)
             .expect("measure suspend-aware elapsed time");
-        assert!(elapsed >= DUE_AFTER);
+        assert!(elapsed >= due_after);
         let suspend_sample_after =
             platform::suspend_clock_sample().expect("sample clocks after resume");
         let observed_suspend = suspend_elapsed(suspend_sample_before, suspend_sample_after)

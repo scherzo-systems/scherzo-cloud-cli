@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Ask a low-effort Claude Code agent to summarize an imported text attachment.
+
+agentProfiles:
+  haiku:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-haiku-4-5-20251001
+        effort: low
+
+steps:
+  summarize:
+    kind: agent
+    agent:
+      profile: haiku
+      systemPrompt: prompts/basic-agent-system.md
+      message:
+        text:
+          - file: prompts/claude-attachment-question.md
+        attachments:
+          - ref: imports.attachments
+    outputs:
+      response:
+        kind: agent_response
+
+exports:
+  response:
+    ref: outputs.summarize.response

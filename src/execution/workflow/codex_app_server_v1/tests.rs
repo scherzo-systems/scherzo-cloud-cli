@@ -134,31 +134,45 @@ fn effective_config(parser: &mut CodexAppServerV1Parser, provider: &str) -> Valu
     take_json(parser)
 }
 
-fn thread_response(parser: &mut CodexAppServerV1Parser, provider: &str) {
-    feed(
-        parser,
-        json!({
-            "id": 3,
-            "result": {
-                "thread": {
-                    "id": "thread-1",
-                    "sessionId": "thread-1",
-                    "ephemeral": true,
-                    "path": null,
-                    "cliVersion": "0.147.0",
-                    "turns": [],
-                    "cwd": "/synthetic/project",
-                    "modelProvider": provider,
-                },
-                "model": "scherzo-loopback",
-                "modelProvider": provider,
+fn thread_start_response(provider: &str) -> Value {
+    json!({
+        "id": 3,
+        "result": {
+            "thread": {
+                "id": "thread-1",
+                "sessionId": "thread-1",
+                "ephemeral": true,
+                "path": null,
+                "cliVersion": "0.147.0",
+                "turns": [],
                 "cwd": "/synthetic/project",
-                "approvalPolicy": "never",
-                "sandbox": {"type": "dangerFullAccess"},
-            }
-        }),
-    )
-    .unwrap();
+                "modelProvider": provider,
+            },
+            "model": "scherzo-loopback",
+            "modelProvider": provider,
+            "cwd": "/synthetic/project",
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"},
+        }
+    })
+}
+
+fn thread_started_notification() -> Value {
+    json!({
+        "method": "thread/started",
+        "params": {"thread": {
+            "id": "thread-1",
+            "sessionId": "thread-1",
+            "ephemeral": true,
+            "path": null,
+            "cliVersion": "0.147.0",
+            "cwd": "/synthetic/project",
+        }}
+    })
+}
+
+fn thread_response(parser: &mut CodexAppServerV1Parser, provider: &str) {
+    feed(parser, thread_start_response(provider)).unwrap();
     let turn = take_json(parser);
     assert_eq!(turn["id"], 4);
     assert_eq!(turn["method"], "turn/start");
@@ -178,21 +192,7 @@ fn thread_response(parser: &mut CodexAppServerV1Parser, provider: &str) {
 }
 
 fn turn_response(parser: &mut CodexAppServerV1Parser) {
-    feed(
-        parser,
-        json!({
-            "method": "thread/started",
-            "params": {"thread": {
-                "id": "thread-1",
-                "sessionId": "thread-1",
-                "ephemeral": true,
-                "path": null,
-                "cliVersion": "0.147.0",
-                "cwd": "/synthetic/project",
-            }}
-        }),
-    )
-    .unwrap();
+    feed(parser, thread_started_notification()).unwrap();
     feed(
         parser,
         json!({
@@ -397,13 +397,115 @@ fn empty_or_oversized_effective_instructions_fail_during_configuration() {
 }
 
 #[test]
-fn matching_post_setup_turn_notification_is_the_only_start_acknowledgement() {
-    let mut accepted = parser(AgentValueKind::None, 1024, None);
-    initialize(&mut accepted);
-    effective_config(&mut accepted, "native-provider");
-    thread_response(&mut accepted, "native-provider");
-    turn_response(&mut accepted);
-    let observations = start(&mut accepted);
+fn matching_thread_notification_and_response_may_arrive_in_either_order() {
+    let mut response_first = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut response_first);
+    effective_config(&mut response_first, "native-provider");
+    let (progress, observations) = feed(
+        &mut response_first,
+        thread_start_response("native-provider"),
+    )
+    .unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::SessionEstablished,
+        }
+    )));
+    assert_eq!(take_json(&mut response_first)["method"], "turn/start");
+    let (progress, observations) =
+        feed(&mut response_first, thread_started_notification()).unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(observations.is_empty());
+
+    let mut notification_first = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut notification_first);
+    effective_config(&mut notification_first, "native-provider");
+    let (progress, observations) =
+        feed(&mut notification_first, thread_started_notification()).unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(observations.is_empty());
+    let (progress, observations) = feed(
+        &mut notification_first,
+        thread_start_response("native-provider"),
+    )
+    .unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::SessionEstablished,
+        }
+    )));
+    assert_eq!(take_json(&mut notification_first)["method"], "turn/start");
+
+    let mut mismatched = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut mismatched);
+    effective_config(&mut mismatched, "native-provider");
+    feed(&mut mismatched, thread_started_notification()).unwrap();
+    let mut response = thread_start_response("native-provider");
+    response["result"]["thread"]["id"] =
+        Value::String("018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e13".to_owned());
+    assert_eq!(
+        feed(&mut mismatched, response).unwrap_err(),
+        AgentFailureCause::HarnessSetupFailed {
+            stage: AgentHarnessSetupStage::ThreadStart,
+        }
+    );
+}
+
+#[test]
+fn thread_scoped_warning_may_precede_thread_response() {
+    let mut matching = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut matching);
+    effective_config(&mut matching, "native-provider");
+    let (progress, observations) = feed(
+        &mut matching,
+        json!({"method": "warning", "params": {
+            "threadId": "thread-1",
+            "message": "native startup warning",
+        }}),
+    )
+    .unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(matches!(
+        observations.as_slice(),
+        [AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Warning,
+            message,
+        }] if message.as_ref() == "native startup warning"
+    ));
+    feed(&mut matching, thread_start_response("native-provider")).unwrap();
+    assert_eq!(take_json(&mut matching)["method"], "turn/start");
+
+    let mut mismatched = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut mismatched);
+    effective_config(&mut mismatched, "native-provider");
+    feed(
+        &mut mismatched,
+        json!({"method": "warning", "params": {
+            "threadId": "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e13",
+            "message": "native startup warning",
+        }}),
+    )
+    .unwrap();
+    assert_eq!(
+        feed(&mut mismatched, thread_start_response("native-provider"),).unwrap_err(),
+        AgentFailureCause::HarnessSetupFailed {
+            stage: AgentHarnessSetupStage::ThreadStart,
+        }
+    );
+}
+
+#[test]
+fn matching_turn_notification_acknowledges_start_after_the_response_in_either_order() {
+    let mut response_first = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut response_first);
+    effective_config(&mut response_first, "native-provider");
+    thread_response(&mut response_first, "native-provider");
+    turn_response(&mut response_first);
+    let observations = start(&mut response_first);
     assert!(observations.iter().any(|observation| matches!(
         observation,
         AgentObservation::Lifecycle {
@@ -411,24 +513,63 @@ fn matching_post_setup_turn_notification_is_the_only_start_acknowledgement() {
         }
     )));
 
-    let mut premature = parser(AgentValueKind::None, 1024, None);
-    initialize(&mut premature);
-    effective_config(&mut premature, "native-provider");
-    thread_response(&mut premature, "native-provider");
-    let failure = feed(
-        &mut premature,
+    let mut notification_first = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut notification_first);
+    effective_config(&mut notification_first, "native-provider");
+    thread_response(&mut notification_first, "native-provider");
+    let (progress, observations) = feed(
+        &mut notification_first,
         json!({
             "method": "turn/started",
             "params": {"threadId": "thread-1", "turn": {
-                "id": "premature", "items": [], "status": "inProgress"
+                "id": "turn-1", "items": [], "status": "inProgress"
             }}
         }),
     )
-    .unwrap_err();
+    .unwrap();
+    assert!(!progress.start_acknowledged);
+    assert!(observations.is_empty());
+    let (progress, observations) = feed(
+        &mut notification_first,
+        json!({
+            "id": 4,
+            "result": {"turn": {"id": "turn-1", "items": [], "status": "inProgress"}}
+        }),
+    )
+    .unwrap();
+    assert!(progress.start_acknowledged);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::HarnessStarted,
+        }
+    )));
+
+    let mut mismatched = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut mismatched);
+    effective_config(&mut mismatched, "native-provider");
+    thread_response(&mut mismatched, "native-provider");
+    feed(
+        &mut mismatched,
+        json!({
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turn": {
+                "id": "turn-1", "items": [], "status": "inProgress"
+            }}
+        }),
+    )
+    .unwrap();
     assert_eq!(
-        failure,
+        feed(
+            &mut mismatched,
+            json!({
+                "id": 4,
+                "result": {"turn": {"id": "other-turn", "items": [], "status": "inProgress"}}
+            }),
+        )
+        .unwrap_err(),
         AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::StartAcknowledgement,
+            stage: AgentHarnessSetupStage::TurnStart,
         }
     );
 

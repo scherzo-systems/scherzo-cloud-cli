@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Show a four-stage sequential workflow with short, visible durations.
+
+steps:
+  discover:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'discovering requirements'; sleep 0.15"
+
+  design:
+    kind: cmd
+    dependsOn: [discover]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'designing the change'; sleep 0.20"
+
+  implement:
+    kind: cmd
+    dependsOn: [design]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'implementing the design'; sleep 0.25"
+
+  verify:
+    kind: cmd
+    dependsOn: [implement]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'verification complete'; sleep 0.10"

@@ -659,8 +659,10 @@ struct AssignmentIdentity {
     run_id: String,
     project_id: String,
     attempt_id: String,
-    workflow_id: String,
     execution_spec_id: String,
+    repository_connection_id: String,
+    source_object_format: String,
+    source_commit_oid: String,
 }
 
 pub(super) struct AssignmentRoot {
@@ -696,8 +698,16 @@ impl AcceptedAssignment {
         &self.identity.project_id
     }
 
-    pub(super) fn workflow_id(&self) -> &str {
-        &self.identity.workflow_id
+    pub(super) fn repository_connection_id(&self) -> &str {
+        &self.identity.repository_connection_id
+    }
+
+    pub(super) fn source_object_format(&self) -> &str {
+        &self.identity.source_object_format
+    }
+
+    pub(super) fn source_commit_oid(&self) -> &str {
+        &self.identity.source_commit_oid
     }
 }
 
@@ -762,6 +772,7 @@ struct AdmissionRuntime {
     pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
     claude_code_installation:
         Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
     outbox: ObservationOutbox,
     guard_processes: bool,
@@ -788,6 +799,7 @@ impl AdmissionRuntime {
             &self.environment,
             self.pi_installation.as_ref(),
             self.claude_code_installation.as_ref(),
+            self.codex_installation.as_ref(),
         )?;
         let admitted = admit_workflow(workflow, ResolvedImports::default(), context)
             .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
@@ -797,8 +809,14 @@ impl AdmissionRuntime {
                 run_id: offer.run_id.clone(),
                 project_id: offer.project_id.clone(),
                 attempt_id: offer.attempt_id.clone(),
-                workflow_id: offer.execution_spec.registered_workflow_id.clone(),
                 execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+                repository_connection_id: offer
+                    .execution_spec
+                    .source
+                    .repository_connection_id
+                    .clone(),
+                source_object_format: offer.execution_spec.source.object_format.clone(),
+                source_commit_oid: offer.execution_spec.source.commit_oid.clone(),
             },
             root,
             admitted,
@@ -814,6 +832,7 @@ pub(super) struct AssignmentManager {
     pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
     claude_code_installation:
         Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
     boot_id: String,
     environment: EnvironmentSnapshot,
     wall_clock: Arc<dyn WallClockHealth>,
@@ -877,11 +896,18 @@ impl AssignmentManager {
     ) -> Self {
         let (event_sender, events) = mpsc::unbounded_channel();
         let outbox = ObservationOutbox::new();
-        let artifact_delivery = ArtifactDeliveryBroker::new(outbox.clone(), Arc::clone(&sleeper));
+        let allow_insecure_artifact_uploads =
+            config.endpoint().scheme() == "ws" && crate::runner::is_loopback(config.endpoint());
+        let artifact_delivery = ArtifactDeliveryBroker::new(
+            outbox.clone(),
+            Arc::clone(&sleeper),
+            allow_insecure_artifact_uploads,
+        );
         Self {
             config: config.assignment().clone(),
             pi_installation: config.pi_installation().cloned(),
             claude_code_installation: config.claude_code_installation().cloned(),
+            codex_installation: config.codex_installation().cloned(),
             boot_id: boot_id.clone(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
             wall_clock,
@@ -1719,6 +1745,7 @@ impl AssignmentManager {
         AdmissionRuntime {
             pi_installation: self.pi_installation.clone(),
             claude_code_installation: self.claude_code_installation.clone(),
+            codex_installation: self.codex_installation.clone(),
             environment: self.environment.clone(),
             outbox: self.outbox.clone(),
             guard_processes: self.guard_processes,
@@ -1895,6 +1922,7 @@ fn build_execution_context(
     claude_code_installation: Option<
         &crate::execution::claude_code::ValidatedClaudeCodeInstallation,
     >,
+    codex_installation: Option<&crate::execution::codex::ValidatedCodexInstallation>,
 ) -> Result<ExecutionContext, AssignmentDecline> {
     let maximum_parallel_steps =
         usize::try_from(execution_spec.execution_limits.maximum_parallel_steps)
@@ -1921,8 +1949,12 @@ fn build_execution_context(
         Some(installation) => context.with_pi_installation(installation.clone()),
         None => context,
     };
-    Ok(match claude_code_installation {
+    let context = match claude_code_installation {
         Some(installation) => context.with_claude_code_installation(installation.clone()),
+        None => context,
+    };
+    Ok(match codex_installation {
+        Some(installation) => context.with_codex_installation(installation.clone()),
         None => context,
     })
 }
@@ -2180,12 +2212,16 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use rustix::process::Pid;
     use serde_json::json;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
+    use crate::execution::codex::{
+        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedCodexInstallation,
+    };
     use crate::execution::pi::ValidatedPiInstallation;
     use crate::runner::credential::test_credential;
     use crate::runner::service::config::Config;
@@ -2202,7 +2238,6 @@ mod tests {
         WorkflowSourceClosureDigestV1RunnerProjection,
     };
 
-    const WORKFLOW_ID: &str = "wfl_01k0z6r1w8f4jy2m7q9v3x5abr";
     const NOW: &str = "2026-07-23T00:00:00Z";
     const COMMAND_FIXTURE_TEST_NAME: &str =
         "runner::service::assignment::tests::command_fixture_process";
@@ -2256,7 +2291,24 @@ steps:
       message:
         text: [{ file: system.md }]
 "#;
-    const MIXED_HARNESS_WORKFLOW: &str = r#"schemaVersion: 1
+    const CODEX_ONLY_WORKFLOW: &str = r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: high
+steps:
+  codex:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: system.md
+      message:
+        text: [{ file: system.md }]
+"#;
+    const ALL_HARNESS_WORKFLOW: &str = r#"schemaVersion: 1
 agentProfiles:
   piCoding:
     harness:
@@ -2270,6 +2322,12 @@ agentProfiles:
       config:
         model: fixture/claude
         effort: xhigh
+  codexCoding:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: high
 steps:
   pi:
     kind: agent
@@ -2286,6 +2344,31 @@ steps:
       systemPrompt: system.md
       message:
         text: [{ file: system.md }]
+  codex:
+    kind: agent
+    dependsOn: [claude]
+    agent:
+      profile: codexCoding
+      systemPrompt: system.md
+      message:
+        text: [{ file: system.md }]
+"#;
+    const SUCCESSFUL_CODEX: &str = r#"#!/bin/sh
+set -eu
+printf '%s\0' "$*" >> "${0%/*}/codex.calls"
+for argument in "$@"; do
+  case "$argument" in
+    sqlite_home=\"*\")
+      CODEX_FIXTURE_SQLITE_HOME=${argument#sqlite_home=\"}
+      CODEX_FIXTURE_SQLITE_HOME=${CODEX_FIXTURE_SQLITE_HOME%\"}
+      export CODEX_FIXTURE_SQLITE_HOME
+      ;;
+  esac
+done
+exec "$CODEX_FIXTURE_HELPER" \
+  --exact execution::workflow::codex_app_server_v1::adapter_tests::codex_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null
 "#;
     const SUCCESSFUL_CLAUDE_CODE: &str = r#"#!/bin/sh
 set -eu
@@ -2427,7 +2510,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             execution_spec: ExecutionSpecV1RunnerProjection {
                 execution_spec_id: format!("xsp_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
                 schema_version: 1,
-                registered_workflow_id: WORKFLOW_ID.to_owned(),
                 execution_limits: ExecutionLimitsV1RunnerProjection {
                     maximum_parallel_steps: 1,
                     cancellation_grace_seconds: 1,
@@ -2480,20 +2562,21 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn manager_fixture(workflow: &str) -> (tempfile::TempDir, AssignmentManager) {
-        manager_fixture_with_harnesses(workflow, None, None)
+        manager_fixture_with_harnesses(workflow, None, None, None)
     }
 
     fn manager_fixture_with_pi(
         workflow: &str,
         pi_source: Option<&str>,
     ) -> (tempfile::TempDir, AssignmentManager) {
-        manager_fixture_with_harnesses(workflow, pi_source, None)
+        manager_fixture_with_harnesses(workflow, pi_source, None, None)
     }
 
     fn manager_fixture_with_harnesses(
         workflow: &str,
         pi_source: Option<&str>,
         claude_code_source: Option<&str>,
+        codex_source: Option<&str>,
     ) -> (tempfile::TempDir, AssignmentManager) {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
@@ -2521,6 +2604,11 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 ValidatedClaudeCodeInstallation::fixture(executable),
             );
         }
+        if let Some(codex_source) = codex_source {
+            let executable = install_fixture_executable(&temporary, "codex-fixture", codex_source);
+            config =
+                config.with_codex_installation(ValidatedCodexInstallation::fixture(executable));
+        }
         let sleeper: Arc<dyn Sleeper> = Arc::new(crate::runner::service::TokioSleeper);
         let mut manager = AssignmentManager::new_for_test_with_sleeper(
             &config,
@@ -2534,6 +2622,50 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         environment.insert(
             OsString::from("CLAUDE_CONFIG_DIR"),
             temporary.path().join("claude-config").into_os_string(),
+        );
+        let codex_home = temporary.path().join("codex-home");
+        fs::create_dir(&codex_home).unwrap();
+        for (name, value) in [
+            ("CODEX_HOME", codex_home),
+            (
+                "CODEX_FIXTURE_HELPER",
+                std::env::current_exe().expect("locate the runner test executable"),
+            ),
+            (
+                "CODEX_FIXTURE_ARGUMENTS",
+                temporary.path().join("codex.arguments"),
+            ),
+            (
+                "CODEX_FIXTURE_REQUESTS",
+                temporary.path().join("codex.requests"),
+            ),
+            (
+                "CODEX_FIXTURE_PROCESS",
+                temporary.path().join("codex.process"),
+            ),
+            ("CODEX_FIXTURE_READY", temporary.path().join("codex.ready")),
+            (
+                "CODEX_FIXTURE_PROCEED",
+                temporary.path().join("codex.proceed"),
+            ),
+            (
+                "CODEX_FIXTURE_DESCENDANT",
+                temporary.path().join("codex.descendant"),
+            ),
+        ] {
+            environment.insert(OsString::from(name), value.into_os_string());
+        }
+        environment.insert(
+            OsString::from("CODEX_FIXTURE_SCENARIO"),
+            OsString::from("no-value"),
+        );
+        environment.insert(
+            OsString::from("CODEX_FIXTURE_VERSION"),
+            OsString::from(CODEX_APP_SERVER_V1_QUALIFICATION_VERSION),
+        );
+        environment.insert(
+            OsString::from("CODEX_FIXTURE_RESPONSE"),
+            OsString::from("runner fixture response"),
         );
         manager.environment = EnvironmentSnapshot::new(environment);
         (temporary, manager)
@@ -2555,6 +2687,84 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_eq!(calls.iter().filter(|byte| **byte == 0).count(), 1);
         assert_eq!(calls.last(), Some(&0));
         String::from_utf8(calls[..calls.len() - 1].to_vec()).unwrap()
+    }
+
+    fn codex_requests(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn select_codex_scenario(manager: &mut AssignmentManager, scenario: &str) {
+        let mut environment = manager.environment.variables().clone();
+        environment.insert(
+            OsString::from("CODEX_FIXTURE_SCENARIO"),
+            OsString::from(scenario),
+        );
+        manager.environment = EnvironmentSnapshot::new(environment);
+    }
+
+    fn replace_manager_path_with_decoy(
+        temporary: &tempfile::TempDir,
+        manager: &mut AssignmentManager,
+        executable_name: &str,
+    ) -> PathBuf {
+        let changed_path = temporary
+            .path()
+            .join(format!("changed-{executable_name}-path"));
+        fs::create_dir(&changed_path).unwrap();
+        let decoy = changed_path.join(executable_name);
+        fs::write(
+            &decoy,
+            "#!/bin/sh\nprintf decoy > \"${0%/*}/decoy.calls\"\nexit 99\n",
+        )
+        .unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut environment = manager.environment.variables().clone();
+        environment.insert(
+            OsString::from("PATH"),
+            changed_path.clone().into_os_string(),
+        );
+        manager.environment = EnvironmentSnapshot::new(environment);
+        changed_path
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the explicit fixture file is the OS-boundary readiness event; the delay only spaces polls"
+    )]
+    async fn wait_for_fixture_path(path: &Path) {
+        with_watchdog(async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("Codex process fixture did not publish its readiness boundary");
+    }
+
+    fn fixture_pid(path: &Path) -> Pid {
+        fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(Pid::from_raw)
+            .expect("Codex fixture PID must be positive")
+    }
+
+    fn assert_codex_fixture_quiescent(temporary: &tempfile::TempDir) {
+        for name in ["codex.process", "codex.descendant"] {
+            let path = temporary.path().join(name);
+            if path.exists() {
+                assert!(
+                    rustix::process::test_kill_process(fixture_pid(&path)).is_err(),
+                    "{name} remained live after runner terminal reporting"
+                );
+            }
+        }
     }
 
     fn start_for(offered: &AssignmentOffer) -> AssignmentStart {
@@ -2671,6 +2881,22 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         with_watchdog(wait_for_terminal(manager))
             .await
             .expect("workflow did not finish")
+    }
+
+    async fn start_then_shut_down_and_wait<Ready>(
+        manager: &mut AssignmentManager,
+        offered: &AssignmentOffer,
+        ready: Ready,
+    ) -> Vec<ExecutionReport>
+    where
+        Ready: std::future::Future<Output = ()>,
+    {
+        spawn_execution(manager, offered);
+        ready.await;
+        manager.begin_shutdown().unwrap();
+        with_watchdog(wait_for_terminal(manager))
+            .await
+            .expect("runner shutdown did not quiesce execution")
     }
 
     fn fail_pending_artifact_registrations(
@@ -2842,12 +3068,26 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         execute_fixture_to_terminal(manager, &offered, &listener, command_count).await
     }
 
-    fn assert_workflow_succeeded(reports: &[ExecutionReport]) {
-        assert!(matches!(
-            reports.last(),
-            Some(ExecutionReport::Finished { outcome, .. })
-                if outcome == &json!({ "outcome": "succeeded" })
-        ));
+    fn runner_shutdown_outcome(reports: &[ExecutionReport]) -> &Value {
+        let Some(ExecutionReport::Interrupted {
+            reason,
+            terminal_outcome,
+            ..
+        }) = reports.last()
+        else {
+            panic!("runner shutdown did not report an interrupted execution");
+        };
+        assert_eq!(reason, "graceful_shutdown");
+        assert_eq!(terminal_outcome["reason"], "runner_shutdown");
+        terminal_outcome
+    }
+
+    #[test]
+    fn secure_runner_endpoint_disallows_insecure_artifact_uploads() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, manager) = manager_fixture(workflow);
+
+        assert!(!manager.artifact_delivery.allows_insecure_loopback());
     }
 
     #[test]
@@ -3082,22 +3322,43 @@ steps:
             assert!(environment.variable(OsStr::new(name)).is_none(), "{name}");
         }
 
-        assert_workflow_succeeded(&execute_to_terminal(&mut manager, &offered).await);
+        assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
     }
 
     #[test]
     fn admission_requires_only_the_harness_selected_by_the_assignment() {
-        let (pi_temporary, mut pi_manager) =
-            manager_fixture_with_harnesses(PI_ONLY_WORKFLOW, None, Some(SUCCESSFUL_CLAUDE_CODE));
+        let (pi_temporary, mut pi_manager) = manager_fixture_with_harnesses(
+            PI_ONLY_WORKFLOW,
+            None,
+            Some(SUCCESSFUL_CLAUDE_CODE),
+            Some(SUCCESSFUL_CODEX),
+        );
         pi_manager.handle_offer(offer("bg")).unwrap();
         assert_workflow_environment_unsupported(&mut pi_manager);
         assert!(!pi_temporary.path().join("claude.calls").exists());
+        assert!(!pi_temporary.path().join("codex.calls").exists());
 
-        let (claude_temporary, mut claude_manager) =
-            manager_fixture_with_harnesses(CLAUDE_CODE_ONLY_WORKFLOW, Some(SUCCESSFUL_PI), None);
+        let (claude_temporary, mut claude_manager) = manager_fixture_with_harnesses(
+            CLAUDE_CODE_ONLY_WORKFLOW,
+            Some(SUCCESSFUL_PI),
+            None,
+            Some(SUCCESSFUL_CODEX),
+        );
         claude_manager.handle_offer(offer("bg")).unwrap();
         assert_workflow_environment_unsupported(&mut claude_manager);
         assert!(!claude_temporary.path().join("pi.calls").exists());
+        assert!(!claude_temporary.path().join("codex.calls").exists());
+
+        let (codex_temporary, mut codex_manager) = manager_fixture_with_harnesses(
+            CODEX_ONLY_WORKFLOW,
+            Some(SUCCESSFUL_PI),
+            Some(SUCCESSFUL_CLAUDE_CODE),
+            None,
+        );
+        codex_manager.handle_offer(offer("bg")).unwrap();
+        assert_workflow_environment_unsupported(&mut codex_manager);
+        assert!(!codex_temporary.path().join("pi.calls").exists());
+        assert!(!codex_temporary.path().join("claude.calls").exists());
     }
 
     #[test]
@@ -3173,27 +3434,23 @@ steps:
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
-        spawn_execution(&mut manager, &offered);
-        manager.begin_shutdown().unwrap();
+        let reports =
+            start_then_shut_down_and_wait(&mut manager, &offered, std::future::ready(())).await;
 
-        let reports = with_watchdog(wait_for_terminal(&mut manager))
-            .await
-            .expect("shutdown did not quiesce execution");
-
-        assert!(matches!(
-            reports.last(),
-            Some(ExecutionReport::Interrupted {
-                reason,
-                terminal_outcome,
-                ..
-            }) if reason == "graceful_shutdown"
-                && terminal_outcome["reason"] == "runner_shutdown"
-                && terminal_outcome["finalization"]["trigger"] == "cancelled"
-                && terminal_outcome["finalization"]["cancellation"]["reason"]
-                    == "runner_shutdown"
-                && terminal_outcome["finalization"]["finalizers"][0]["id"] == "cleanup"
-                && terminal_outcome["finalization"]["finalizers"][0]["state"] == "cancelled"
-        ));
+        let terminal_outcome = runner_shutdown_outcome(&reports);
+        assert_eq!(terminal_outcome["finalization"]["trigger"], "cancelled");
+        assert_eq!(
+            terminal_outcome["finalization"]["cancellation"]["reason"],
+            "runner_shutdown"
+        );
+        assert_eq!(
+            terminal_outcome["finalization"]["finalizers"][0]["id"],
+            "cleanup"
+        );
+        assert_eq!(
+            terminal_outcome["finalization"]["finalizers"][0]["state"],
+            "cancelled"
+        );
     }
 
     #[test]
@@ -3747,7 +4004,7 @@ steps:
     }
 
     #[tokio::test]
-    async fn command_pi_claude_and_mixed_assignment_matrix_invokes_only_declared_harnesses() {
+    async fn command_and_each_harness_assignment_invoke_only_declared_snapshots() {
         let fixture_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
         let command_only_workflow = format!(
             "schemaVersion: 1\nsteps:\n  command:\n    kind: cmd\n    command:\n      argv: {fixture_argv}\n"
@@ -3756,52 +4013,76 @@ steps:
             workflow,
             pi_source,
             claude_code_source,
+            codex_source,
             command_count,
             expected_pi,
             expected_claude,
+            expected_codex,
         ) in [
             (
                 command_only_workflow.as_str(),
-                Some(SUCCESSFUL_PI),
-                Some(SUCCESSFUL_CLAUDE_CODE),
+                None,
+                None,
+                None,
                 1,
+                false,
                 false,
                 false,
             ),
             (
                 PI_ONLY_WORKFLOW,
                 Some(SUCCESSFUL_PI),
-                Some(SUCCESSFUL_CLAUDE_CODE),
+                None,
+                None,
                 0,
                 true,
+                false,
                 false,
             ),
             (
                 CLAUDE_CODE_ONLY_WORKFLOW,
-                Some(SUCCESSFUL_PI),
+                None,
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                None,
                 0,
+                false,
+                true,
+                false,
+            ),
+            (
+                CODEX_ONLY_WORKFLOW,
+                None,
+                None,
+                Some(SUCCESSFUL_CODEX),
+                0,
+                false,
                 false,
                 true,
             ),
             (
-                MIXED_HARNESS_WORKFLOW,
+                ALL_HARNESS_WORKFLOW,
                 Some(SUCCESSFUL_PI),
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                Some(SUCCESSFUL_CODEX),
                 0,
+                true,
                 true,
                 true,
             ),
         ] {
-            let (temporary, mut manager) =
-                manager_fixture_with_harnesses(workflow, pi_source, claude_code_source);
+            let (temporary, mut manager) = manager_fixture_with_harnesses(
+                workflow,
+                pi_source,
+                claude_code_source,
+                codex_source,
+            );
             let reports = if command_count == 0 {
                 offer_and_execute(&mut manager).await
             } else {
                 offer_and_execute_with_command_fixtures(&mut manager, command_count).await
             };
 
-            assert_workflow_succeeded(&reports);
+            assert_succeeded(&reports);
             assert_eq!(
                 reports.iter().filter(|report| report.is_terminal()).count(),
                 1
@@ -3809,16 +4090,24 @@ steps:
             let transcript = format!("{reports:?}");
             assert!(!transcript.contains("stream_event"));
             assert!(!transcript.contains("00000000-0000-4000-8000-00000000009"));
+            assert!(!transcript.contains("018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12"));
             assert_eq!(temporary.path().join("pi.calls").exists(), expected_pi);
             assert_eq!(
                 temporary.path().join("claude.calls").exists(),
                 expected_claude
+            );
+            assert_eq!(
+                temporary.path().join("codex.calls").exists(),
+                expected_codex
             );
             if expected_pi {
                 let _ = only_harness_call(&temporary.path().join("pi.calls"));
             }
             if expected_claude {
                 let _ = only_harness_call(&temporary.path().join("claude.calls"));
+            }
+            if expected_codex {
+                let _ = only_harness_call(&temporary.path().join("codex.calls"));
             }
         }
     }
@@ -3876,52 +4165,60 @@ steps:
             CLAUDE_CODE_ONLY_WORKFLOW,
             None,
             Some(SUCCESSFUL_CLAUDE_CODE),
+            None,
         );
-        let changed_path = temporary.path().join("changed-path");
-        fs::create_dir(&changed_path).unwrap();
-        let decoy = changed_path.join("claude");
-        fs::write(
-            &decoy,
-            "#!/bin/sh\nprintf decoy > \"${0%/*}/decoy.calls\"\nexit 99\n",
-        )
-        .unwrap();
-        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut environment = manager.environment.variables().clone();
-        environment.insert(OsString::from("PATH"), changed_path.into_os_string());
-        manager.environment = EnvironmentSnapshot::new(environment);
+        let changed_path = replace_manager_path_with_decoy(&temporary, &mut manager, "claude");
         let reports = offer_and_execute(&mut manager).await;
 
-        assert_workflow_succeeded(&reports);
+        assert_succeeded(&reports);
         let call = only_harness_call(&temporary.path().join("claude.calls"));
         assert!(call.contains("--model fixture/claude"));
-        assert!(!temporary.path().join("changed-path/decoy.calls").exists());
+        assert!(!changed_path.join("decoy.calls").exists());
     }
 
     #[tokio::test]
-    async fn mixed_assignment_invokes_each_snapshot_with_its_own_configuration() {
+    async fn codex_assignment_uses_its_startup_snapshot_after_path_changes() {
+        let (temporary, mut manager) =
+            manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
+        let changed_path = replace_manager_path_with_decoy(&temporary, &mut manager, "codex");
+        let reports = offer_and_execute(&mut manager).await;
+
+        assert_succeeded(&reports);
+        let _ = only_harness_call(&temporary.path().join("codex.calls"));
+        assert!(!changed_path.join("decoy.calls").exists());
+    }
+
+    #[tokio::test]
+    async fn all_harness_assignment_uses_each_snapshot_with_its_own_configuration() {
         let (temporary, mut manager) = manager_fixture_with_harnesses(
-            MIXED_HARNESS_WORKFLOW,
+            ALL_HARNESS_WORKFLOW,
             Some(SUCCESSFUL_PI),
             Some(SUCCESSFUL_CLAUDE_CODE),
+            Some(SUCCESSFUL_CODEX),
         );
         let reports = offer_and_execute(&mut manager).await;
 
-        assert_workflow_succeeded(&reports);
+        assert_succeeded(&reports);
         let pi_call = only_harness_call(&temporary.path().join("pi.calls"));
         let claude_code_call = only_harness_call(&temporary.path().join("claude.calls"));
+        let _codex_call = only_harness_call(&temporary.path().join("codex.calls"));
+        let codex_turn = &codex_requests(&temporary.path().join("codex.requests"))[4];
         assert!(pi_call.contains("--model fixture/pi"));
         assert!(!pi_call.contains("fixture/claude"));
         assert!(claude_code_call.contains("--model fixture/claude"));
         assert!(claude_code_call.contains("--effort xhigh"));
         assert!(!claude_code_call.contains("fixture/pi"));
+        assert_eq!(codex_turn["params"]["model"], "gpt-5.4");
+        assert_eq!(codex_turn["params"]["effort"], "high");
     }
 
     #[tokio::test]
-    async fn mixed_assignment_attributes_a_claude_failure_to_its_step() {
+    async fn all_harness_assignment_attributes_a_claude_failure_to_its_step() {
         let (temporary, mut manager) = manager_fixture_with_harnesses(
-            MIXED_HARNESS_WORKFLOW,
+            ALL_HARNESS_WORKFLOW,
             Some(SUCCESSFUL_PI),
             Some(SUCCESSFUL_CLAUDE_CODE),
+            Some(SUCCESSFUL_CODEX),
         );
         let mut environment = manager.environment.variables().clone();
         environment.insert(OsString::from("CLAUDE_FIXTURE_FAIL"), OsString::from("1"));
@@ -3930,6 +4227,7 @@ steps:
 
         let _ = only_harness_call(&temporary.path().join("pi.calls"));
         let _ = only_harness_call(&temporary.path().join("claude.calls"));
+        assert!(!temporary.path().join("codex.calls").exists());
         assert!(reports.iter().any(|report| matches!(
             report,
             ExecutionReport::Transition { workflow_event, .. }
@@ -3945,6 +4243,49 @@ steps:
             Some(ExecutionReport::Finished { outcome, .. })
                 if outcome["outcome"] == "failed"
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_failure_reports_only_after_stubborn_descendants_quiesce() {
+        let (temporary, mut manager) =
+            manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
+        select_codex_scenario(&mut manager, "failure-after-start-stubborn");
+        manager.guard_processes = true;
+
+        let reports = offer_and_execute(&mut manager).await;
+
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["eventType"] == "step_state_changed"
+                    && workflow_event["stepId"] == "codex"
+                    && workflow_event["to"] == "failed"
+        )));
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "failed"
+        ));
+        assert_codex_fixture_quiescent(&temporary);
+    }
+
+    #[tokio::test]
+    async fn codex_runner_cancellation_reports_only_after_stubborn_descendants_quiesce() {
+        let (temporary, mut manager) =
+            manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
+        select_codex_scenario(&mut manager, "cancellation-stubborn");
+        manager.guard_processes = true;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        let reports = start_then_shut_down_and_wait(
+            &mut manager,
+            &offered,
+            wait_for_fixture_path(&temporary.path().join("codex.ready")),
+        )
+        .await;
+
+        let _ = runner_shutdown_outcome(&reports);
+        assert_codex_fixture_quiescent(&temporary);
     }
 
     #[tokio::test]

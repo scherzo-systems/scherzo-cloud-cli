@@ -11,9 +11,9 @@ definition validation, and an outbound, enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
 admission boundary, and execution engine for one configured inputless command, Pi,
-Claude Code, or mixed workflow. Local Workflow Run additionally admits Codex; Runner
-Serve Codex snapshots and assignment admission remain deferred. Semantic acceptance reserves the runner's single local
-assignment slot; a matching later start effect authorizes execution. `scherzo-cloud runner doctor` performs one
+Claude Code, Codex, or mixed workflow. Semantic acceptance reserves the runner's single
+local assignment slot; a matching later start effect authorizes execution.
+`scherzo-cloud runner doctor` performs one
 default local Git check and can explicitly check the `pi`, `claude`, and `codex`
 installations selected independently from inherited `PATH`; passing those checks
 establishes only the selected closed harness installation, not complete runner readiness.
@@ -40,11 +40,13 @@ service.
 ## Local workflow validation
 
 `src/cli/workflow/validate.rs` is an offline typed Clap adapter around the shared
-resolver in `src/execution/workflow/resolution.rs`. Structural validation embeds the
-public `schemas/workflow-v1.schema.json` artifact; no implementation-local schema copy
-exists. The adapter requires both an explicit source root and a selected workflow path,
-then renders only normalized provenance, digest, step-count, required-import, and closed
-diagnostic fields. It does not parse or validate workflow definitions independently.
+resolver in `src/execution/workflow/resolution.rs`. The execution component embeds the
+public `schemas/workflow-v1.schema.json` artifact for structural validation; no
+implementation-local schema copy exists. `src/cli/workflow/schema.rs` writes that same
+embedded asset unchanged to standard output. The validation adapter requires both an
+explicit source root and a selected workflow path, then renders only normalized
+provenance, digest, step-count, required-import, and closed diagnostic fields. It does
+not parse or validate workflow definitions independently.
 
 Validation stops at definition resolution. The adapter does not construct run
 admission or runtime state, execute command or agent steps, inspect harness
@@ -71,10 +73,8 @@ read the human credential store, or make a network request. Future runner bootst
 can add compiled-in checks through the same registry without adding a central check-name
 enum, but it must keep those boundaries intact.
 
-The three harness validators live at the execution boundary. Pi and Claude Code validation
-are shared by doctor, local Workflow Run, and agent-capable Runner Serve initialization;
-Codex validation is shared by doctor and local Workflow Run until the runner boundary is
-implemented. Each selects the first executable
+The three harness validators live at the execution boundary and are shared by doctor,
+local Workflow Run, and agent-capable Runner Serve initialization. Each selects the first executable
 with its fixed name in inherited `PATH` and never accepts an executable path from a
 workflow, assignment, import, remote value, dedicated environment variable, or CLI
 option. Validation canonicalizes the selected path and invokes only that absolute
@@ -85,19 +85,18 @@ select another harness candidate.
 Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
 `ValidatedPiInstallation`. Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.234`. Codex maps stable `>=0.147.0 <0.148.0`
+qualifies exact release `2.1.234`. Codex maps stable `>=0.147.0 <0.149.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`. Each immutable value carries the absolute path, exact
-observed version, closed profile, and closed capability set. Local admission inspects
-resolved workflows and requires only each selected installation; runner admission
-remains limited to Pi and Claude Code. Admission and later execution use those values
-without another `PATH` lookup or native probe, so later `PATH` changes cannot switch an
-active operation's executable. Claude execution also requires every native
-initialization frame to equal the retained observed version rather than a compile-time
-qualification release. Command-only work requires no harness, and each local
-single-harness workflow requires no unrelated installation. Runner Serve retains
-independent optional Pi and Claude Code snapshots for its process lifetime and exposes
-neither through the runner protocol.
+observed version, closed profile, and closed capability set. Local and runner admission
+inspect resolved workflows and require only each selected installation. Admission and
+later execution use those values without another `PATH` lookup or native probe, so later
+`PATH` changes cannot switch an active operation's executable. Claude execution also
+requires every native initialization frame to equal the retained observed version rather
+than a compile-time qualification release. Command-only work requires no harness, and
+each single-harness workflow requires no unrelated installation. Runner Serve retains
+independent optional Pi, Claude Code, and Codex snapshots for its process lifetime and
+exposes none through the runner protocol.
 
 ## Runner service observability
 

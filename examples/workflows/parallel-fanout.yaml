@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Fan out into four parallel checks, then join them into one completion path.
+
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'preparing parallel checks'; sleep 0.15"
+
+  apiCheck:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'API check passed'; sleep 0.45"
+
+  uiCheck:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'UI check passed'; sleep 0.30"
+
+  docsCheck:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'documentation check passed'; sleep 0.20"
+
+  policyCheck:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'policy check passed'; sleep 0.35"
+
+  combine:
+    kind: cmd
+    dependsOn: [apiCheck, uiCheck, docsCheck, policyCheck]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'all parallel results received'; sleep 0.15"
+
+  complete:
+    kind: cmd
+    dependsOn: [combine]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'fan-out workflow complete'"

@@ -1,5 +1,6 @@
 mod retry;
 mod run;
+mod schema;
 mod status;
 mod validate;
 mod view;
@@ -84,6 +85,8 @@ enum WorkflowCommand {
     Retry(retry::Command),
     #[command(about = run::ABOUT, after_help = run::AFTER_HELP)]
     Run(run::Command),
+    #[command(about = schema::ABOUT, after_help = schema::AFTER_HELP)]
+    Schema(schema::Command),
     #[command(about = status::ABOUT)]
     Status(status::Command),
     #[command(about = validate::ABOUT)]
@@ -124,6 +127,7 @@ impl Command {
             None => super::print_help(&[NAME]),
             Some(WorkflowCommand::Retry(command)) => command.execute(),
             Some(WorkflowCommand::Run(command)) => command.execute(),
+            Some(WorkflowCommand::Schema(command)) => command.execute(),
             Some(WorkflowCommand::Status(command)) => command.execute(),
             Some(WorkflowCommand::Validate(command)) => command.execute(),
             Some(WorkflowCommand::View(command)) => command.execute(),

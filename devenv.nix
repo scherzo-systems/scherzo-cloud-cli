@@ -31,6 +31,11 @@ in
     pkgs.jq
     pkgs.nodejs_24
     pkgs.python3
+  ]
+  ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+    # Exact Codex conformance must exercise the upstream Linux sandbox prerequisite
+    # rather than its process-global bundled fallback.
+    pkgs.bubblewrap
   ];
 
   enterTest = ''
