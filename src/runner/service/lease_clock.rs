@@ -460,6 +460,10 @@ mod platform {
         fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "mach_continuous_time returns the macOS suspend-aware clock sample"
+    )]
     pub(super) fn now_nanoseconds() -> Result<u64, LeaseClockError> {
         let timebase = timebase()?;
         // SAFETY: mach_continuous_time has no pointer arguments and returns a clock tick count.
@@ -467,6 +471,10 @@ mod platform {
     }
 
     #[cfg(test)]
+    #[allow(
+        unsafe_code,
+        reason = "sampling both Mach clocks proves whether the macOS test host suspended"
+    )]
     pub(super) fn suspend_clock_sample() -> Result<(u64, u64), LeaseClockError> {
         let timebase = timebase()?;
         // mach_absolute_time is sampled only to prove that the operator host actually suspended.

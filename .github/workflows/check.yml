@@ -65,9 +65,6 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$rust_version" >>"$GITHUB_ENV"
       - name: Check macOS compilation
         shell: bash
-        env:
-          # Temporary v0.17.0 recovery: its reviewed Mach clock allowances were scoped incorrectly.
-          RUSTFLAGS: --cap-lints warn
         run: |
           set -euo pipefail
           cargo check --locked --workspace --all-targets --all-features \
@@ -184,8 +181,6 @@ jobs:
         env:
           SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
           SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
-          # Temporary v0.17.0 recovery; Linux retains the strict manifest lint levels.
-          RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '--cap-lints warn' || '' }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
@@ -195,7 +190,6 @@ jobs:
         env:
           SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
           SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
-          RUSTFLAGS: --cap-lints warn
         run: |
           set -euo pipefail
           cargo test --locked --release --target "${{ matrix.target }}" \
