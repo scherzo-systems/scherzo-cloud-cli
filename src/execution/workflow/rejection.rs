@@ -12,6 +12,7 @@ use crate::execution::AgentHarnessInstallationFailure;
 use crate::execution::claude_code::{
     ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
 };
+use crate::execution::codex::{CodexIncompatibility, CodexInstallationFailure, CodexProbe};
 use crate::execution::pi::{PiIncompatibility, PiInstallationFailure, PiProbe};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -41,16 +42,29 @@ impl<'a> RejectionDiagnostic<'a> {
     }
 
     pub(crate) fn from_agent_harness_installation(
-        failure: &AgentHarnessInstallationFailure,
+        failure: &'a AgentHarnessInstallationFailure,
     ) -> Self {
-        let (code, message, profile) = match failure {
+        let (code, message, profile, version, executable_path) = match failure {
             AgentHarnessInstallationFailure::Pi(failure) => {
                 let (code, message) = pi_installation_classification(failure);
-                (code, message, "PiJsonV1")
+                (code, message, "PiJsonV1", None, None)
             }
             AgentHarnessInstallationFailure::ClaudeCode(failure) => {
                 let (code, message) = claude_code_installation_classification(failure);
-                (code, message, "ClaudeCodeStreamJsonV1")
+                (code, message, "ClaudeCodeStreamJsonV1", None, None)
+            }
+            AgentHarnessInstallationFailure::Codex(failure) => {
+                let (code, message) = codex_installation_classification(failure);
+                let identity = failure.identity();
+                (
+                    code,
+                    message,
+                    identity
+                        .map(|identity| identity.profile().as_str())
+                        .unwrap_or("CodexAppServerV1"),
+                    identity.map(|identity| identity.version().as_str()),
+                    identity.and_then(|identity| identity.executable().to_str()),
+                )
             }
         };
         Self {
@@ -58,6 +72,8 @@ impl<'a> RejectionDiagnostic<'a> {
             message,
             location: RejectionLocation {
                 profile: Some(profile),
+                version,
+                executable_path,
                 ..RejectionLocation::simple("agent_harness")
             },
         }
@@ -81,6 +97,10 @@ pub(crate) struct RejectionLocation<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     export: Option<&'a str>,
 }
 
@@ -94,6 +114,8 @@ impl<'a> RejectionLocation<'a> {
             input: None,
             output: None,
             profile: None,
+            version: None,
+            executable_path: None,
             export: None,
         }
     }
@@ -264,7 +286,18 @@ impl fmt::Display for RejectionLocation<'_> {
         } else if let Some(index) = self.index {
             write!(formatter, " (index {index})")?;
         } else if let Some(profile) = self.profile {
-            write!(formatter, " ({profile})")?;
+            write!(formatter, " ({profile}")?;
+            if let Some(version) = self.version {
+                write!(formatter, ", version {version}")?;
+            }
+            if let Some(executable) = self.executable_path {
+                write!(
+                    formatter,
+                    ", executable {}",
+                    normalize_terminal_scalar(executable.as_bytes())
+                )?;
+            }
+            formatter.write_str(")")?;
         } else if let Some(name) = self.export {
             write!(formatter, " ({name})")?;
         }
@@ -546,12 +579,51 @@ fn claude_code_installation_classification(
     }
 }
 
+fn codex_installation_classification(
+    failure: &CodexInstallationFailure,
+) -> (&'static str, &'static str) {
+    match failure {
+        CodexInstallationFailure::Missing => (
+            "missing_codex_installation",
+            "Install a supported stable `codex` executable in the inherited PATH.",
+        ),
+        CodexInstallationFailure::Unexecutable { .. } => (
+            "unexecutable_codex_installation",
+            "The selected `codex` executable could not complete its validation probes.",
+        ),
+        CodexInstallationFailure::Malformed {
+            probe: CodexProbe::Version,
+            ..
+        } => (
+            "malformed_codex_version",
+            "The selected `codex` executable returned a malformed stable version.",
+        ),
+        CodexInstallationFailure::Malformed {
+            probe: CodexProbe::AppServerSchema,
+            ..
+        } => (
+            "malformed_codex_app_server_schema",
+            "The selected `codex` executable returned malformed App Server schemas.",
+        ),
+        CodexInstallationFailure::Unsupported {
+            incompatibility: CodexIncompatibility::Version(_),
+            ..
+        } => (
+            "unsupported_codex_version",
+            "The selected `codex` version is outside the CodexAppServerV1 release line.",
+        ),
+        CodexInstallationFailure::Unsupported {
+            incompatibility: CodexIncompatibility::Capability(_),
+            ..
+        } => (
+            "unsupported_codex_capability",
+            "The selected `codex` executable lacks the App Server schema required by CodexAppServerV1.",
+        ),
+    }
+}
+
 fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str, &'static str)> {
     match kind {
-        AdmissionFailureKind::WorkflowFinalizersUnsupported => Some((
-            "workflow_finalizers_execution_unsupported",
-            "Validate this workflow now, but wait for finalizer execution support before running it.",
-        )),
         AdmissionFailureKind::MissingRequiredPrompt => Some((
             "missing_required_prompt",
             "Supply --prompt-file because this workflow requires imports.prompt.",
@@ -596,7 +668,9 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
             "git_baseline_unavailable",
             "Check out a readable baseline commit before running the workflow.",
         )),
-        AdmissionFailureKind::NonPositiveParallelism
+        AdmissionFailureKind::GitInitialWorkspaceDirty
+        | AdmissionFailureKind::GitWorkflowDigestMismatch
+        | AdmissionFailureKind::NonPositiveParallelism
         | AdmissionFailureKind::NonPositiveCapturedFiles
         | AdmissionFailureKind::NonPositiveCapturedFileBytes
         | AdmissionFailureKind::NonPositiveTotalCapturedBytes
@@ -610,5 +684,62 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         | AdmissionFailureKind::NonPositiveStepLogBytes
         | AdmissionFailureKind::CancellationGraceTooShort
         | AdmissionFailureKind::CancellationGraceTooLong => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_installation_rejection_uses_the_closed_profile_identity() {
+        let failure =
+            AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
+                incompatibility: CodexIncompatibility::Version("0.148.0".to_owned()),
+                identity: None,
+            });
+
+        let diagnostic = RejectionDiagnostic::from_agent_harness_installation(&failure);
+
+        assert_eq!(diagnostic.code, "unsupported_codex_version");
+        assert_eq!(diagnostic.location.kind, "agent_harness");
+        assert_eq!(diagnostic.location.profile, Some("CodexAppServerV1"));
+        assert_eq!(diagnostic.location.version, None);
+        assert_eq!(diagnostic.location.executable_path, None);
+    }
+
+    #[test]
+    fn codex_capability_rejection_retains_the_probed_identity() {
+        use std::path::Path;
+
+        use crate::execution::codex::{
+            CodexCapability, CodexCompatibilityProfile, CodexInstallationIdentity, CodexVersion,
+        };
+
+        let identity = CodexInstallationIdentity::new(
+            Path::new("/canonical/codex"),
+            &CodexVersion::parse("0.147.23").unwrap(),
+            CodexCompatibilityProfile::CodexAppServerV1,
+        );
+        let failure =
+            AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
+                incompatibility: CodexIncompatibility::Capability(
+                    CodexCapability::AppServerSchemaV1,
+                ),
+                identity: Some(identity),
+            });
+
+        let diagnostic = RejectionDiagnostic::from_agent_harness_installation(&failure);
+
+        assert_eq!(diagnostic.code, "unsupported_codex_capability");
+        assert_eq!(
+            serde_json::to_value(&diagnostic.location).unwrap(),
+            serde_json::json!({
+                "kind": "agent_harness",
+                "profile": "CodexAppServerV1",
+                "version": "0.147.23",
+                "executablePath": "/canonical/codex",
+            })
+        );
     }
 }

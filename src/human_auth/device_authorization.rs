@@ -19,7 +19,7 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 const DEVICE_CODE_PATH: [&str; 3] = ["oauth", "device", "code"];
 const TOKEN_PATH: [&str; 2] = ["oauth", "token"];
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const SCOPES: &str = "openid profile email";
+const SCOPES: &str = "openid profile email offline_access";
 
 pub(crate) struct DeviceAuthorization {
     device_code: String,
@@ -81,6 +81,7 @@ pub(crate) enum TokenPoll {
 
 pub(crate) struct IssuedToken {
     access_token: String,
+    refresh_token: String,
     expires_in: Duration,
 }
 
@@ -89,6 +90,7 @@ impl fmt::Debug for IssuedToken {
         formatter
             .debug_struct("IssuedToken")
             .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
             .field("expires_in", &self.expires_in)
             .finish()
     }
@@ -97,6 +99,10 @@ impl fmt::Debug for IssuedToken {
 impl IssuedToken {
     pub(crate) fn access_token(&self) -> &str {
         &self.access_token
+    }
+
+    pub(crate) fn refresh_token(&self) -> &str {
+        &self.refresh_token
     }
 
     pub(crate) fn expires_in(&self) -> Duration {
@@ -245,13 +251,13 @@ impl fmt::Display for AuthorizationLocalError {
     }
 }
 
-struct RawResponse {
-    status: StatusCode,
-    content_type: Option<String>,
-    body: Vec<u8>,
+pub(super) struct RawResponse {
+    pub(super) status: StatusCode,
+    pub(super) content_type: Option<String>,
+    pub(super) body: Vec<u8>,
 }
 
-fn post_form(
+pub(super) fn post_form(
     client: &HttpClient,
     endpoint: Url,
     fields: &[(&str, &str)],
@@ -320,7 +326,7 @@ async fn post_form_async(
     })
 }
 
-fn require_json(response: &RawResponse) -> Result<(), AuthorizationError> {
+pub(super) fn require_json(response: &RawResponse) -> Result<(), AuthorizationError> {
     if response.content_type.as_deref() == Some(JSON_MEDIA_TYPE) {
         Ok(())
     } else {
@@ -408,11 +414,12 @@ fn validate_verification_uri(
 #[derive(Deserialize)]
 struct IssuedTokenResponse {
     access_token: String,
+    refresh_token: String,
     token_type: String,
     expires_in: u64,
 }
 
-fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, AuthorizationError> {
+pub(super) fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, AuthorizationError> {
     let response: IssuedTokenResponse =
         serde_json::from_slice(body).map_err(|_| AuthorizationError::Protocol {
             reason: "the successful token body is invalid",
@@ -427,6 +434,16 @@ fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, AuthorizationError> {
             reason: "the issued access token exceeds 64 KiB",
         });
     }
+    if response.refresh_token.is_empty() {
+        return Err(AuthorizationError::Protocol {
+            reason: "the issued refresh token is empty",
+        });
+    }
+    if response.refresh_token.len() > MAX_ACCESS_TOKEN_BYTES {
+        return Err(AuthorizationError::Protocol {
+            reason: "the issued refresh token exceeds 64 KiB",
+        });
+    }
     if !response.token_type.eq_ignore_ascii_case("Bearer") {
         return Err(AuthorizationError::Protocol {
             reason: "the issued token is not a bearer token",
@@ -439,6 +456,7 @@ fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, AuthorizationError> {
 
     Ok(IssuedToken {
         access_token: response.access_token,
+        refresh_token: response.refresh_token,
         expires_in,
     })
 }

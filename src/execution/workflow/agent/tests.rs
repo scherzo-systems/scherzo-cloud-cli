@@ -319,9 +319,7 @@ async fn adapter_return_without_terminal_report_becomes_protocol_failure() {
 
     assert_eq!(
         fixture.terminal.receive().await.unwrap(),
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed
-        }
+        failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
     );
 }
 
@@ -418,7 +416,7 @@ async fn scripted_adapter_generates_missing_value_failures() {
         control.complete().await.unwrap();
         assert_eq!(
             terminal.receive().await.unwrap(),
-            AgentOutcome::Failed { cause }
+            failed_agent_outcome(cause)
         );
         task.await.unwrap();
     }
@@ -494,7 +492,7 @@ async fn scripted_adapter_preserves_every_closed_failure_cause() {
         control.fail(cause.clone()).await.unwrap();
         assert_eq!(
             terminal.receive().await.unwrap(),
-            AgentOutcome::Failed { cause }
+            failed_agent_outcome(cause)
         );
         task.await.unwrap();
     }
@@ -675,11 +673,9 @@ async fn explicit_barriers_make_cancellation_close_races_deterministic() {
     assert!(cancellation.request_cancellation(CancellationReason::RunnerShutdown));
     assert_eq!(
         terminal.receive().await.unwrap(),
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessFailed {
-                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-            }
-        }
+        failed_agent_outcome(AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+        })
     );
     task.await.unwrap();
 }

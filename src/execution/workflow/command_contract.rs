@@ -1,13 +1,11 @@
 use std::fmt;
 
 use super::resolution::ResolvedWorkflow;
-
-const MAXIMUM_WORKFLOW_STEPS: usize = 256;
+const MAXIMUM_WORKFLOW_NODES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ServeWorkflowContractFailureKind {
-    InvalidStepCount,
-    DeclaredOutput,
+    InvalidNodeCount,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,20 +31,17 @@ impl fmt::Display for ServeWorkflowContractFailure {
 
 impl std::error::Error for ServeWorkflowContractFailure {}
 
-pub(crate) fn require_inputless_workflow_no_outputs(
+pub(crate) fn require_serve_workflow(
     workflow: ResolvedWorkflow,
 ) -> Result<ResolvedWorkflow, ServeWorkflowContractFailure> {
-    if !(1..=MAXIMUM_WORKFLOW_STEPS).contains(&workflow.definition.steps.len()) {
-        return Err(failure(ServeWorkflowContractFailureKind::InvalidStepCount));
-    }
-    if workflow.definition.steps.values().any(|step| {
-        let outputs = match step {
-            super::validated::ValidatedStep::Command(step) => &step.common.outputs,
-            super::validated::ValidatedStep::Agent(step) => &step.common.outputs,
-        };
-        !outputs.is_empty()
-    }) {
-        return Err(failure(ServeWorkflowContractFailureKind::DeclaredOutput));
+    let node_count = workflow
+        .definition
+        .steps
+        .len()
+        .checked_add(workflow.definition.finalizers.len())
+        .ok_or_else(|| failure(ServeWorkflowContractFailureKind::InvalidNodeCount))?;
+    if !(1..=MAXIMUM_WORKFLOW_NODES).contains(&node_count) {
+        return Err(failure(ServeWorkflowContractFailureKind::InvalidNodeCount));
     }
     Ok(workflow)
 }
@@ -67,11 +62,31 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("workflow.yaml"), source).unwrap();
         let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
-        require_inputless_workflow_no_outputs(workflow)
+        require_serve_workflow(workflow)
     }
 
     #[test]
-    fn accepts_outputless_command_and_agent_workflows_but_rejects_outputs_and_exports() {
+    fn accepts_supported_cloud_outputs() {
+        let accepted = contract_result(
+            "schemaVersion: 1\nsteps:\n  capture:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      branch:\n        kind: git_branch\nexports:\n  branch:\n    ref: outputs.capture.branch\n",
+        )
+        .unwrap();
+        assert_eq!(accepted.definition.exports.len(), 1);
+    }
+
+    #[test]
+    fn accepts_outputless_finalizers_and_engine_context() {
+        let accepted = contract_result(
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    inputs:\n      context:\n        ref: finalization.context\n    command:\n      argv: [\"true\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(accepted.definition.steps.len(), 1);
+        assert_eq!(accepted.definition.finalizers.len(), 1);
+    }
+
+    #[test]
+    fn accepts_inputless_command_and_agent_nodes() {
         let accepted = contract_result(
             "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
         )
@@ -83,28 +98,6 @@ mod tests {
         fs::write(temporary.path().join("system.md"), "System.\n").unwrap();
         fs::write(temporary.path().join("workflow.yaml"), agent).unwrap();
         let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
-        require_inputless_workflow_no_outputs(workflow).unwrap();
-
-        for output in [
-            "        kind: file\n        path: result.txt\n        mediaType: text/plain\n",
-            "        kind: git_branch\n",
-        ] {
-            let source = format!(
-                "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      result:\n{output}"
-            );
-            assert_eq!(
-                contract_result(&source).unwrap_err().kind(),
-                ServeWorkflowContractFailureKind::DeclaredOutput,
-            );
-        }
-
-        assert_eq!(
-            contract_result(
-                "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      result:\n        kind: file\n        path: result.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.check.result\n",
-            )
-            .unwrap_err()
-            .kind(),
-            ServeWorkflowContractFailureKind::DeclaredOutput,
-        );
+        require_serve_workflow(workflow).unwrap();
     }
 }

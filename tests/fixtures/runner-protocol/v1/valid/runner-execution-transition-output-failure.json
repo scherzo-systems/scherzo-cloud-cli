@@ -17,6 +17,7 @@
       "eventType": "step_state_changed",
       "transitionSequence": 12,
       "stepId": "capture",
+      "role": "step",
       "failurePolicy": "required",
       "from": "capturing_outputs",
       "to": "failed",

@@ -23,8 +23,8 @@ const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const ROOT_OVERFLOW_ENTRY: usize = 4_097;
 const MAXIMUM_EXPORTS: usize = 4_096;
-const MAXIMUM_CARRIERS: usize = 2_048;
-const EXPORTS_OVERFLOW_ENTRY: usize = 2_049;
+const MAXIMUM_CARRIERS: usize = 4_096;
+const EXPORTS_OVERFLOW_ENTRY: usize = 4_097;
 const MAXIMUM_CARRIER_BYTES: u64 = 1024 * 1024 * 1024;
 const MAXIMUM_TOTAL_CARRIER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTICS: usize = 8_192;
@@ -389,7 +389,7 @@ fn diagnostic_message(code: &str) -> &'static str {
         "result_encoding_invalid" => "result.json does not use the required UTF-8 encoding.",
         "result_json_invalid" => "result.json is not one complete unique-member JSON value.",
         "result_schema_unsupported" => "result.json uses an unsupported schema version.",
-        "result_schema_invalid" => "result.json violates the local workflow result contract.",
+        "result_schema_invalid" => "result.json violates the portable workflow result contract.",
         "exports_directory_missing" => "The artifact set does not contain exports.",
         "exports_directory_symbolic_link" => "exports is a symbolic link.",
         "exports_directory_not_directory" => "exports is not a directory.",
@@ -1086,7 +1086,14 @@ fn valid_unavailable_entry(entry: &Value) -> bool {
     exact_keys(object, &["state", "reason"])
         && matches!(
             object.get("reason").and_then(Value::as_str),
-            Some("source_failed" | "source_blocked" | "source_not_run" | "source_cancelled")
+            Some(
+                "source_failed"
+                    | "source_blocked"
+                    | "source_input_unavailable"
+                    | "source_not_run"
+                    | "source_trigger_not_selected"
+                    | "source_cancelled"
+            )
         )
 }
 

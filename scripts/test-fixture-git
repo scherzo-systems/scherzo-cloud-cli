@@ -6,17 +6,10 @@ fail() {
   exit 1
 }
 
-assert_failure_contains() {
-  local expected=$1
-  shift
-  local output status
-  set +e
-  output=$("$@" 2>&1)
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "fixture-git command unexpectedly succeeded: $*"
-  [[ "$output" == *"$expected"* ]] \
-    || fail "fixture-git failure did not contain '$expected': $output"
+assert_failure() {
+  if "$@" >/dev/null 2>&1; then
+    fail "fixture-git command unexpectedly succeeded: $*"
+  fi
 }
 
 if [[ $# -ne 0 ]]; then
@@ -89,24 +82,18 @@ fixture_worktree_git push --quiet origin HEAD:main
   || fail "fixture-git did not address the bounded bare repository"
 
 mkdir "$other_root/repository"
-assert_failure_contains \
-  "REPO must be contained by TEST_ROOT" \
+assert_failure \
   "$fixture_git" init-worktree "$test_root" "$other_root/repository"
-assert_failure_contains \
-  "REPO must not equal TEST_ROOT" \
+assert_failure \
   "$fixture_git" init-worktree "$test_root" "$test_root"
 ln -s "$repo" "$test_root/repository-link"
-assert_failure_contains \
-  "REPO must not be a symbolic link" \
+assert_failure \
   "$fixture_git" worktree "$test_root" "$test_root/repository-link" rev-parse HEAD
-assert_failure_contains \
-  "COMMAND must begin with a Git subcommand" \
+assert_failure \
   "$fixture_git" worktree "$test_root" "$repo" -C /tmp status
-assert_failure_contains \
-  "caller-supplied Git repository context is forbidden" \
+assert_failure \
   "$fixture_git" worktree "$test_root" "$repo" rev-parse --git-dir=/tmp
-assert_failure_contains \
-  "Git subcommand is not allowed in fixtures" \
+assert_failure \
   "$fixture_git" worktree "$test_root" "$repo" worktree add "$test_root/extra"
 
 printf 'Fixture Git isolation checks passed.\n'

@@ -8,46 +8,45 @@ use crate::api::{
     RunnerRegistrationList,
 };
 use crate::exit_code::ExitCode;
-use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
+use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
-    operation: impl FnOnce(&RunnerApi) -> Result<T, RunnerFailure>,
+    mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
-    // Runner absence is a typed API failure, unlike the organization outcome adapter;
-    // keeping this small acquisition block local avoids coupling those result domains.
-    // jscpd:ignore-start
-    let store = CredentialStore::from_environment()
+    let client = crate::api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
-        .context("access credential store")?;
-    let Some(credential) = store
-        .selected(deployment.fingerprint(), crate::timing::utc_now())
-        .map_err(|error| anyhow!(error))
-        .context("access credential store")?
-    else {
-        return Ok(Err(RunnerFailure::Unauthenticated));
-    };
-    // jscpd:ignore-end
-    let api = RunnerApi::new(
-        deployment.fingerprint().api_url(),
-        credential.access_token(),
-        transport_policy,
-    )
-    .map_err(|error| anyhow!(error))
-    .context("prepare runner administration networking")?;
-    let result = operation(&api);
-    if result
-        .as_ref()
-        .is_err_and(RunnerFailure::credential_rejected)
-    {
-        store
-            .remove_if_access_token_matches(deployment.fingerprint(), credential.access_token())
+        .context("prepare human session networking")?;
+    match session::execute_required(
+        &client,
+        deployment,
+        |access_token| {
+            let api = RunnerApi::new(
+                deployment.fingerprint().api_url(),
+                access_token,
+                transport_policy,
+            )
             .map_err(|error| anyhow!(error))
-            .context("access credential store")?;
+            .context("prepare runner administration networking")?;
+            Ok(operation(&api))
+        },
+        |result| {
+            result.as_ref().is_ok_and(|operation| {
+                operation
+                    .as_ref()
+                    .is_err_and(RunnerFailure::credential_rejected)
+            })
+        },
+    ) {
+        Ok(RequiredOperation::Unauthenticated) => Ok(Err(RunnerFailure::Unauthenticated)),
+        Ok(RequiredOperation::Completed(result)) => result,
+        Err(error) => match error.unreachable_category() {
+            Some(category) => Ok(Err(RunnerFailure::Unreachable(category))),
+            None => Err(anyhow!(error).context("acquire human session")),
+        },
     }
-    Ok(result)
 }
 
 pub(super) fn write_pool_create(
@@ -343,11 +342,6 @@ fn write_runner_human_to(
     if let Some(metadata) = &runner.advertised_metadata {
         writeln!(output, "    Runner version: {}", metadata.runner_version)?;
         writeln!(output, "    Protocol:       {}", metadata.protocol_version)?;
-        writeln!(
-            output,
-            "    Capacity:       {}",
-            metadata.advertised_capacity
-        )?;
     } else {
         writeln!(output, "    Not reported")?;
     }
@@ -568,8 +562,7 @@ mod tests {
             "activity": {"state": "assigned", "currentAssignmentCount": 1},
             "advertisedMetadata": {
                 "runnerVersion": "1.2.3",
-                "protocolVersion": 1,
-                "advertisedCapacity": 7
+                "protocolVersion": 1
             }
         }))
         .expect("runner fixture should match the generated API model");

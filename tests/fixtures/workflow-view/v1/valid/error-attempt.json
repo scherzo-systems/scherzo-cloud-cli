@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow view",
+  "outcome": "error",
+  "exitStatus": 1,
+  "runDirectory": "/tmp/run",
+  "attemptNumber": 3,
+  "error": {
+    "code": "attempt_unknown",
+    "message": "The selected attempt does not exist. Choose a recorded attempt."
+  }
+}

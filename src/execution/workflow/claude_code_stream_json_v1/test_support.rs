@@ -1,11 +1,16 @@
 use std::ffi::OsString;
 use std::fs;
 use std::future::{Future, pending};
+use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use serde_json::{Value, json};
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -17,7 +22,7 @@ use super::adapter::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
 use crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_VERSION;
 use crate::execution::workflow::admission::EnvironmentSnapshot;
 use crate::execution::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity,
+    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity, AgentObservation,
     AgentObservationEnvelope, AgentObservationSink, WorkflowRunId,
 };
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
@@ -27,6 +32,53 @@ use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const PLACEHOLDER_API_KEY: &str = "scherzo-loopback-placeholder";
+/// Opaque placeholder for the native `signature_delta` that accompanies a thinking
+/// block. Claude Code forwards this value without interpreting it in one exchange.
+const THINKING_SIGNATURE: &str = "c2NoZXJ6by1sb29wYmFjay10aGlua2luZy1zaWduYXR1cmU=";
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
+
+#[derive(Clone)]
+pub(super) struct FixtureSignal {
+    path: Arc<Path>,
+    reader: Arc<fs::File>,
+}
+
+impl FixtureSignal {
+    pub(super) fn create(path: PathBuf) -> Self {
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        Self {
+            path: Arc::from(path),
+            reader: Arc::new(reader),
+        }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) async fn receive(&self) -> Vec<u8> {
+        let reader = AsyncFd::new(self.reader.try_clone().unwrap()).unwrap();
+        let mut signal = [0; 64];
+        loop {
+            let mut ready = reader.readable().await.unwrap();
+            match ready.try_io(|reader| {
+                let mut reader = reader.get_ref();
+                reader.read(&mut signal)
+            }) {
+                Ok(Ok(0)) => panic!("fixture signal closed without a value"),
+                Ok(Ok(read)) => return signal[..read].to_vec(),
+                Ok(Err(error)) => panic!("failed to read fixture signal: {error}"),
+                Err(_) => {}
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct PendingClock;
@@ -56,6 +108,19 @@ impl CoordinatorClock for PendingClock {
 pub(super) struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
 
 impl RecordingObservationSink {
+    /// Concatenates, in observation order and without a separator, the text of every
+    /// observation the selector accepts. Native text and reasoning both arrive as
+    /// arbitrarily split deltas, so only the reassembled stream is comparable.
+    pub(super) fn concatenated_text(
+        &self,
+        select: impl Fn(&AgentObservation) -> Option<&str>,
+    ) -> String {
+        self.snapshot()
+            .iter()
+            .filter_map(|envelope| select(envelope.observation()))
+            .collect()
+    }
+
     pub(super) fn snapshot(&self) -> Vec<AgentObservationEnvelope> {
         self.0.lock().unwrap().clone()
     }
@@ -154,12 +219,37 @@ impl SyntheticClaudeCodeRoot {
         &self.private
     }
 
+    pub(super) fn retained_transcript(&self) -> PathBuf {
+        self.private.join("diagnostics/session/transcript.jsonl")
+    }
+
+    pub(super) fn retained_resources(&self) -> PathBuf {
+        self.private.join("diagnostics/session/resources")
+    }
+
+    pub(super) fn ambient_session_paths(&self, session_id: &str) -> [PathBuf; 2] {
+        let project = self
+            .config
+            .join("projects")
+            .join(super::adapter::native_project_slug(
+                self.project.to_str().unwrap(),
+            ));
+        [
+            project.join(format!("{session_id}.jsonl")),
+            project.join(session_id),
+        ]
+    }
+
     pub(super) fn environment_snapshot(&self, provider: &LoopbackProvider) -> EnvironmentSnapshot {
         EnvironmentSnapshot::new([
             (OsString::from("HOME"), self.home.as_os_str().to_owned()),
             (
                 OsString::from("CLAUDE_CONFIG_DIR"),
                 self.config.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_CODE_PROJECT_DIR_NAME"),
+                OsString::from("ambient-project-name"),
             ),
             (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
             (OsString::from("CI"), OsString::from("1")),
@@ -212,30 +302,29 @@ impl ControlledProviderRequest {
         self.used_placeholder_key
     }
 
-    pub(super) fn release_text(mut self, text: &str) {
-        self.response
-            .take()
-            .unwrap()
-            .send(LoopbackProviderResponse::Text(text.to_owned()))
-            .unwrap();
+    pub(super) fn release_text(self, text: &str) {
+        self.release_blocks(vec![LoopbackBlock::text(text)]);
     }
 
-    pub(super) fn release_structured_output(mut self, envelope: Value) {
-        self.response
-            .take()
-            .unwrap()
-            .send(LoopbackProviderResponse::StructuredOutput(envelope))
-            .unwrap();
+    pub(super) fn release_structured_output(self, envelope: Value) {
+        self.release_blocks(vec![LoopbackBlock::tool_use(
+            STRUCTURED_OUTPUT_TOOL_NAME,
+            envelope,
+        )]);
     }
 
-    pub(super) fn release_tool_use(mut self, name: &str, input: Value) {
+    pub(super) fn release_tool_use(self, name: &str, input: Value) {
+        self.release_blocks(vec![LoopbackBlock::tool_use(name, input)]);
+    }
+
+    /// Releases one native assistant message built from the supplied ordered content
+    /// blocks. Callers that need a specific block sequence, rather than one convenience
+    /// shape, use this to fix exactly what Claude Code must correlate.
+    pub(super) fn release_blocks(mut self, blocks: Vec<LoopbackBlock>) {
         self.response
             .take()
             .unwrap()
-            .send(LoopbackProviderResponse::ToolUse {
-                name: name.to_owned(),
-                input,
-            })
+            .send(LoopbackProviderResponse::Blocks(blocks))
             .unwrap();
     }
 
@@ -248,11 +337,46 @@ impl ControlledProviderRequest {
     }
 }
 
+/// One content block of a native assistant message, in the shape the Anthropic
+/// streaming API delivers it. `Thinking` accumulates through deltas, while
+/// `RedactedThinking` arrives complete in its `content_block_start`.
+#[derive(Debug)]
+pub(super) enum LoopbackBlock {
+    Text(String),
+    Thinking(Vec<String>),
+    RedactedThinking(String),
+    ToolUse { name: String, input: Value },
+}
+
+impl LoopbackBlock {
+    pub(super) fn text(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+
+    pub(super) fn thinking(segments: &[&str]) -> Self {
+        Self::Thinking(
+            segments
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect(),
+        )
+    }
+
+    pub(super) fn redacted_thinking(data: &str) -> Self {
+        Self::RedactedThinking(data.to_owned())
+    }
+
+    pub(super) fn tool_use(name: &str, input: Value) -> Self {
+        Self::ToolUse {
+            name: name.to_owned(),
+            input,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum LoopbackProviderResponse {
-    Text(String),
-    StructuredOutput(Value),
-    ToolUse { name: String, input: Value },
+    Blocks(Vec<LoopbackBlock>),
     InvalidRequest,
 }
 
@@ -450,11 +574,7 @@ fn find_subslice(bytes: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
     let events = match response {
-        LoopbackProviderResponse::Text(text) => text_response_events(text),
-        LoopbackProviderResponse::StructuredOutput(envelope) => {
-            structured_output_response_events(envelope)
-        }
-        LoopbackProviderResponse::ToolUse { name, input } => tool_use_response_events(name, input),
+        LoopbackProviderResponse::Blocks(blocks) => block_response_events(&blocks),
         LoopbackProviderResponse::InvalidRequest => {
             unreachable!("invalid requests use a non-SSE response")
         }
@@ -469,64 +589,73 @@ fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
     payload
 }
 
-fn text_response_events(text: String) -> Vec<(&'static str, Value)> {
-    let mut events = vec![
-        message_start_event("msg_scherzo_loopback"),
-        (
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            }),
-        ),
-        (
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text},
-            }),
-        ),
-    ];
-    events.extend(terminal_response_events("end_turn"));
+fn block_response_events(blocks: &[LoopbackBlock]) -> Vec<(&'static str, Value)> {
+    let mut events = vec![message_start_event("msg_scherzo_loopback")];
+    for (index, block) in blocks.iter().enumerate() {
+        events.extend(content_block_events(index, block));
+    }
+    let stop_reason = if blocks
+        .iter()
+        .any(|block| matches!(block, LoopbackBlock::ToolUse { .. }))
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    events.extend(terminal_message_events(stop_reason));
     events
 }
 
-fn structured_output_response_events(envelope: Value) -> Vec<(&'static str, Value)> {
-    tool_use_response_events("StructuredOutput".to_owned(), envelope)
-}
-
-fn tool_use_response_events(name: String, input: Value) -> Vec<(&'static str, Value)> {
-    let partial_json = serde_json::to_string(&input).unwrap();
-    let mut events = vec![
-        message_start_event("msg_scherzo_tool_use"),
-        (
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "tool_scherzo_loopback",
-                    "name": name,
-                    "input": {},
-                },
-            }),
+fn content_block_events(index: usize, block: &LoopbackBlock) -> Vec<(&'static str, Value)> {
+    let (start, deltas) = match block {
+        LoopbackBlock::Text(text) => (
+            json!({"type": "text", "text": ""}),
+            vec![json!({"type": "text_delta", "text": text})],
         ),
+        LoopbackBlock::Thinking(segments) => {
+            let mut deltas = segments
+                .iter()
+                .map(|segment| json!({"type": "thinking_delta", "thinking": segment}))
+                .collect::<Vec<_>>();
+            deltas.push(json!({"type": "signature_delta", "signature": THINKING_SIGNATURE}));
+            (
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+                deltas,
+            )
+        }
+        // The native API delivers a redacted thinking block complete, with no deltas.
+        LoopbackBlock::RedactedThinking(data) => (
+            json!({"type": "redacted_thinking", "data": data}),
+            Vec::new(),
+        ),
+        LoopbackBlock::ToolUse { name, input } => (
+            json!({
+                "type": "tool_use",
+                "id": format!("tool_scherzo_loopback_{index}"),
+                "name": name,
+                "input": {},
+            }),
+            vec![json!({
+                "type": "input_json_delta",
+                "partial_json": serde_json::to_string(input).unwrap(),
+            })],
+        ),
+    };
+
+    let mut events = vec![(
+        "content_block_start",
+        json!({"type": "content_block_start", "index": index, "content_block": start}),
+    )];
+    events.extend(deltas.into_iter().map(|delta| {
         (
             "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": partial_json,
-                },
-            }),
-        ),
-    ];
-    events.extend(terminal_response_events("tool_use"));
+            json!({"type": "content_block_delta", "index": index, "delta": delta}),
+        )
+    }));
+    events.push((
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": index}),
+    ));
     events
 }
 
@@ -554,12 +683,8 @@ fn message_start_event(message_id: &str) -> (&'static str, Value) {
     )
 }
 
-fn terminal_response_events(stop_reason: &str) -> [(&'static str, Value); 3] {
+fn terminal_message_events(stop_reason: &str) -> [(&'static str, Value); 2] {
     [
-        (
-            "content_block_stop",
-            json!({"type": "content_block_stop", "index": 0}),
-        ),
         (
             "message_delta",
             json!({

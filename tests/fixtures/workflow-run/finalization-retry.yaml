@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf work >> work-runs; exit 17"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf cleanup >> cleanup-runs"]

@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -64,6 +65,7 @@ impl AgentInvocationIdentity {
 pub(crate) enum AgentCompatibilityProfile {
     PiJsonV1,
     ClaudeCodeStreamJsonV1,
+    CodexAppServerV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -729,9 +731,9 @@ pub(crate) async fn invoke_agent_adapter<Adapter, Sink>(
 {
     let unreported_return = terminal.clone();
     adapter.invoke(invocation, started, terminal).await;
-    let _ = unreported_return.report(AgentOutcome::Failed {
-        cause: AgentFailureCause::HarnessProtocolFailed,
-    });
+    let _ = unreported_return.report(failed_agent_outcome(
+        AgentFailureCause::HarnessProtocolFailed,
+    ));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -754,6 +756,7 @@ impl BoundedAgentResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CompletedAgentInvocation {
     NoValue,
+    NoResponse,
     Response(BoundedAgentResponse),
     Result(BoundedSchemaValidAgentResult),
 }
@@ -762,7 +765,7 @@ impl CompletedAgentInvocation {
     fn kind(&self) -> AgentValueKind {
         match self {
             Self::NoValue => AgentValueKind::None,
-            Self::Response(_) => AgentValueKind::Response,
+            Self::NoResponse | Self::Response(_) => AgentValueKind::Response,
             Self::Result(_) => AgentValueKind::Result,
         }
     }
@@ -783,9 +786,22 @@ pub(crate) enum AgentHarnessFailureDetail {
     UnsuccessfulExit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentHarnessSetupStage {
+    ExecutableLaunch,
+    Initialization,
+    EffectiveConfiguration,
+    ThreadStart,
+    TurnStart,
+    StartAcknowledgement,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentFailureCause {
     HarnessStartFailed,
+    HarnessSetupFailed {
+        stage: AgentHarnessSetupStage,
+    },
     HarnessInputTooLarge {
         input: AgentInputKind,
         admitted_bytes: NonZeroU64,
@@ -804,8 +820,110 @@ pub(crate) enum AgentFailureCause {
     ResultSettlementFailed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentProtocolRejectionDiagnostic {
+    schema_version: u8,
+    #[serde(flatten)]
+    profile: AgentProtocolRejectionProfile,
+}
+
+impl AgentProtocolRejectionDiagnostic {
+    pub(crate) fn pi_json_v1(diagnostic: super::pi_json_v1::PiJsonV1ProtocolRejection) -> Self {
+        Self {
+            schema_version: 1,
+            profile: AgentProtocolRejectionProfile::PiJsonV1(diagnostic),
+        }
+    }
+
+    pub(crate) fn claude_code_stream_json_v1(
+        diagnostic: super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolRejection,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            profile: AgentProtocolRejectionProfile::ClaudeCodeStreamJsonV1(diagnostic),
+        }
+    }
+
+    pub(crate) fn codex_app_server_v1(
+        diagnostic: super::codex_app_server_v1::CodexAppServerV1ProtocolRejection,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            profile: AgentProtocolRejectionProfile::CodexAppServerV1(diagnostic),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "profile", content = "detail")]
+pub(crate) enum AgentProtocolRejectionProfile {
+    PiJsonV1(super::pi_json_v1::PiJsonV1ProtocolRejection),
+    ClaudeCodeStreamJsonV1(
+        super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolRejection,
+    ),
+    CodexAppServerV1(super::codex_app_server_v1::CodexAppServerV1ProtocolRejection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentFailure {
+    cause: AgentFailureCause,
+    protocol_rejection: Option<Box<AgentProtocolRejectionDiagnostic>>,
+}
+
+impl AgentFailure {
+    pub(crate) fn new(cause: AgentFailureCause) -> Self {
+        Self {
+            cause,
+            protocol_rejection: None,
+        }
+    }
+
+    pub(crate) fn with_protocol_rejection(
+        cause: AgentFailureCause,
+        protocol_rejection: AgentProtocolRejectionDiagnostic,
+    ) -> Self {
+        Self {
+            cause,
+            protocol_rejection: Some(Box::new(protocol_rejection)),
+        }
+    }
+
+    pub(crate) fn cause(&self) -> &AgentFailureCause {
+        &self.cause
+    }
+
+    pub(crate) fn protocol_rejection(&self) -> Option<&AgentProtocolRejectionDiagnostic> {
+        self.protocol_rejection.as_deref()
+    }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.cause.code()
+    }
+}
+
+impl From<AgentFailureCause> for AgentFailure {
+    fn from(cause: AgentFailureCause) -> Self {
+        Self::new(cause)
+    }
+}
+
 pub(crate) fn failed_agent_outcome(cause: AgentFailureCause) -> AgentOutcome {
-    AgentOutcome::Failed { cause }
+    AgentOutcome::Failed(AgentFailure::new(cause))
+}
+
+pub(super) async fn finish_agent_diagnostic_capture(
+    diagnostic: super::diagnostic::PendingStepDiagnostic,
+    outcome: &AgentOutcome,
+) {
+    if matches!(
+        outcome,
+        AgentOutcome::Failed(failure)
+            if matches!(failure.cause(), AgentFailureCause::ResultSettlementFailed)
+    ) {
+        diagnostic.abort();
+    }
+    diagnostic.finish().await;
 }
 
 pub(crate) fn check_agent_input_bound(
@@ -827,7 +945,7 @@ pub(crate) fn check_agent_input_bound(
 impl AgentFailureCause {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::HarnessStartFailed => "harness_start_failed",
+            Self::HarnessStartFailed | Self::HarnessSetupFailed { .. } => "harness_start_failed",
             Self::HarnessInputTooLarge { .. } => "harness_input_too_large",
             Self::HarnessFailed { .. } => "harness_failed",
             Self::HarnessProtocolFailed => "harness_protocol_failed",
@@ -843,7 +961,7 @@ impl AgentFailureCause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentOutcome {
     Completed(CompletedAgentInvocation),
-    Failed { cause: AgentFailureCause },
+    Failed(AgentFailure),
     Cancelled { reason: CancellationReason },
 }
 

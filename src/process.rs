@@ -4,13 +4,67 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process_group};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+pub(crate) struct ManagedProcessGroup {
+    child: Child,
+    process_group: Option<Pid>,
+    reaped: bool,
+}
+
+impl ManagedProcessGroup {
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        command.spawn().map(|child| Self {
+            process_group: i32::try_from(child.id()).ok().and_then(Pid::from_raw),
+            child,
+            reaped: false,
+        })
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.reaped |= status.is_some();
+        Ok(status)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    pub(crate) fn terminate_process_group(&self) {
+        if let Some(process_group) = self.process_group {
+            let _ = kill_process_group(process_group, Signal::KILL);
+        }
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        self.terminate_process_group();
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for ManagedProcessGroup {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
 
 pub(crate) trait CommandRunner: Send + Sync {
     fn run(&self, command: CommandRequest<'_>) -> Result<CommandOutput, CommandProbeError>;
@@ -62,14 +116,17 @@ impl CommandRunner for SystemCommandRunner {
         if let Some(current_directory) = command.current_directory {
             process.current_dir(current_directory);
         }
-        let mut child = process.spawn().map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => CommandProbeError::CommandNotFound,
-            _ => CommandProbeError::Spawn,
-        })?;
-        let process_group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let mut child =
+            ManagedProcessGroup::spawn(&mut process).map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => CommandProbeError::CommandNotFound,
+                _ => CommandProbeError::Spawn,
+            })?;
 
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            terminate(&mut child, process_group);
+        let child_process = child.child_mut();
+        let (Some(stdout), Some(stderr)) =
+            (child_process.stdout.take(), child_process.stderr.take())
+        else {
+            child.terminate();
             return Err(CommandProbeError::PipeRead);
         };
         let stdout_thread =
@@ -81,20 +138,20 @@ impl CommandRunner for SystemCommandRunner {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
                 Ok(None) if crate::timing::elapsed(started) >= command.timeout => {
-                    terminate(&mut child, process_group);
+                    child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);
                     return Err(CommandProbeError::Timeout);
                 }
                 Ok(None) => crate::timing::sleep(WAIT_POLL_INTERVAL),
                 Err(_) => {
-                    terminate(&mut child, process_group);
+                    child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);
                     return Err(CommandProbeError::Wait);
                 }
             }
         };
 
-        terminate_process_group(process_group);
+        child.terminate_process_group();
         let (stdout, truncated) = join_readers(stdout_thread, stderr_thread)?;
         Ok(CommandOutput {
             success,
@@ -139,18 +196,6 @@ fn resolve_program(program: &Path) -> Result<PathBuf, CommandProbeError> {
     }
 }
 
-fn terminate(child: &mut std::process::Child, process_group: Option<Pid>) {
-    terminate_process_group(process_group);
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn terminate_process_group(process_group: Option<Pid>) {
-    if let Some(process_group) = process_group {
-        let _ = kill_process_group(process_group, Signal::KILL);
-    }
-}
-
 fn join_readers(
     stdout_thread: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
     stderr_thread: thread::JoinHandle<io::Result<()>>,
@@ -192,8 +237,12 @@ fn drain(mut reader: impl Read) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::path::Path;
     use std::time::Duration;
+
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
 
     use super::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
@@ -203,14 +252,20 @@ mod tests {
     #[test]
     fn timed_out_command_terminates_pipe_holding_descendants() {
         let runner = SystemCommandRunner;
+        let temporary = tempfile::tempdir().unwrap();
+        let blocker = temporary.path().join("blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
 
         let result = runner.run(CommandRequest {
             program: Path::new("/bin/sh"),
-            args: &["-c", "(while :; do :; done) & while :; do :; done"],
+            args: &[
+                "-c",
+                "(IFS= read -r unexpected < \"$BLOCKER\") & IFS= read -r unexpected < \"$BLOCKER\"",
+            ],
             timeout: Duration::from_millis(50),
             maximum_stdout_bytes: FIXTURE_STDOUT_LIMIT,
             clear_environment: false,
-            environment: &[],
+            environment: &[(OsStr::new("BLOCKER"), blocker.as_os_str())],
             current_directory: None,
         });
 

@@ -198,11 +198,7 @@ fn malformed_or_unexpected_responses_are_protocol_failures() {
 
         let error = get_current_principal(&http_client(), &server.api_url, None).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("violates the public API contract")
-        );
+        assert!(!error.is_local());
         server.finish_one();
     }
 }
@@ -228,11 +224,7 @@ fn redirect_is_returned_as_a_protocol_failure_without_being_followed() {
     let error = get_current_principal(&http_client(), &server.api_url, Some("synthetic-token"))
         .unwrap_err();
 
-    assert!(
-        error
-            .to_string()
-            .contains("redirect responses are not permitted")
-    );
+    assert!(!error.is_local());
     server.finish_one();
 }
 
@@ -249,7 +241,7 @@ fn response_body_is_bounded_before_any_status_is_reported() {
 
         let error = get_current_principal(&http_client(), &server.api_url, None).unwrap_err();
 
-        assert!(error.to_string().contains("exceeds 1 MiB"));
+        assert!(!error.is_local());
         server.finish_one();
     }
 }

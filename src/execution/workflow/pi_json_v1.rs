@@ -6,21 +6,191 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::CancellationReason;
 use super::agent::{
-    AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentLifecycleMilestone,
-    AgentObservation, AgentToolCallPhase, AgentValueKind, BoundedAgentResponse,
-    BoundedSchemaValidAgentResult, CompletedAgentInvocation, tool_call_observation,
+    AgentDiagnosticLevel, AgentFailure, AgentFailureCause, AgentHarnessFailureDetail,
+    AgentLifecycleMilestone, AgentObservation, AgentProtocolRejectionDiagnostic,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
 
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_DIAGNOSTIC_SEQUENCE: u64 = i64::MAX as u64;
 const COMPACT_UPDATE_PROPERTY: &str = "scherzoCompact";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PiJsonV1ProtocolRejection {
+    reason: PiJsonV1RejectionReason,
+    stage: PiJsonV1ProtocolStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outer_event: Option<PiJsonV1EventType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assistant_update: Option<PiJsonV1AssistantUpdateType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_index: Option<u64>,
+    state: PiJsonV1RejectionState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1ProtocolStage {
+    FrameRead,
+    FrameDecode,
+    SessionHeader,
+    EventEnvelope,
+    EventPayload,
+    AssistantUpdate,
+    AssistantTransition,
+    ResultCorrelation,
+    TerminalValidation,
+    EndOfStream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1RejectionReason {
+    FrameTooLarge,
+    FrameDecodeFailed,
+    FrameNotObject,
+    SessionHeaderInvalid,
+    EventTypeInvalid,
+    SessionEventRepeated,
+    EventAfterSettlement,
+    EventAfterResultAcceptance,
+    EventShapeInvalid,
+    EventTransitionInvalid,
+    AssistantMessageInvalid,
+    AssistantUpdateInvalid,
+    AssistantUpdateSubtypeInvalid,
+    AssistantUpdateContentIndexInvalid,
+    AssistantUpdatePartialMismatch,
+    AssistantActiveMessageMismatch,
+    AssistantStableFieldsChanged,
+    AssistantUpdateOpenBlockMismatch,
+    AssistantUpdateContentIndexMismatch,
+    AssistantContentTransitionInvalid,
+    ThinkingFinalizationRewrite,
+    MessageEndOpenBlockMismatch,
+    MessageEndContentMismatch,
+    ToolCorrelationInvalid,
+    ResultCorrelationInvalid,
+    TerminalInvariantInvalid,
+    EndOfStreamInvariantInvalid,
+    PartialFrameAtEndOfStream,
+    RetainedStateLimitExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1EventType {
+    Session,
+    AgentStart,
+    AgentEnd,
+    AgentSettled,
+    TurnStart,
+    TurnEnd,
+    MessageStart,
+    MessageUpdate,
+    MessageEnd,
+    ToolExecutionStart,
+    ToolExecutionUpdate,
+    ToolExecutionEnd,
+    AutoRetryStart,
+    AutoRetryEnd,
+    CompactionStart,
+    CompactionEnd,
+    SummarizationRetryScheduled,
+    SummarizationRetryAttemptStart,
+    SummarizationRetryFinished,
+    QueueUpdate,
+    EntryAppended,
+    SessionInfoChanged,
+    ThinkingLevelChanged,
+    BashExecutionUpdate,
+    Unrecognized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1AssistantUpdateType {
+    TextStart,
+    TextDelta,
+    TextEnd,
+    ThinkingStart,
+    ThinkingDelta,
+    ThinkingEnd,
+    ToolcallStart,
+    ToolcallDelta,
+    ToolcallEnd,
+    Unrecognized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PiJsonV1RejectionState {
+    session_header_seen: bool,
+    agent_started: bool,
+    active_attempt: bool,
+    active_turn: bool,
+    active_message: PiJsonV1ActiveMessageState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_assistant_content_blocks: Option<u64>,
+    assistant_update_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_block: Option<PiJsonV1OpenBlockState>,
+    result_accepted: bool,
+    settled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1ActiveMessageState {
+    None,
+    Assistant,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PiJsonV1OpenBlockState {
+    kind: PiJsonV1OpenBlockKind,
+    content_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiJsonV1OpenBlockKind {
+    Text,
+    Thinking,
+    ToolCall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PiJsonV1RejectionContext {
+    stage: PiJsonV1ProtocolStage,
+    outer_event: Option<PiJsonV1EventType>,
+    assistant_update: Option<PiJsonV1AssistantUpdateType>,
+    content_index: Option<u64>,
+}
+
+impl Default for PiJsonV1RejectionContext {
+    fn default() -> Self {
+        Self {
+            stage: PiJsonV1ProtocolStage::FrameRead,
+            outer_event: None,
+            assistant_update: None,
+            content_index: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PiJsonV1ProtocolLimits {
@@ -101,7 +271,10 @@ pub(crate) struct PiJsonV1Parser {
     retained_tool_call_id_bytes: u64,
     active_validation_request: Option<(Arc<str>, Arc<str>)>,
     accepted_result: Option<AcceptedResultState>,
-    failure: Option<AgentFailureCause>,
+    rejection_context: PiJsonV1RejectionContext,
+    rejection_state_snapshot: Option<PiJsonV1RejectionState>,
+    protocol_rejection: Option<AgentProtocolRejectionDiagnostic>,
+    failure: Option<AgentFailure>,
 }
 
 impl PiJsonV1Parser {
@@ -138,6 +311,9 @@ impl PiJsonV1Parser {
             retained_tool_call_id_bytes: 0,
             active_validation_request: None,
             accepted_result: None,
+            rejection_context: PiJsonV1RejectionContext::default(),
+            rejection_state_snapshot: None,
+            protocol_rejection: None,
             failure: None,
         }
     }
@@ -150,16 +326,16 @@ impl PiJsonV1Parser {
         mut observe: impl FnMut(AgentObservation),
     ) -> Result<(), AgentFailureCause> {
         if let Some(failure) = &self.failure {
-            return Err(failure.clone());
+            return Err(failure.cause().clone());
         }
 
         for &byte in bytes {
             if byte == b'\n' {
                 let frame = std::mem::take(&mut self.frame);
-                if let Err(failure) = self.parse_frame(&frame) {
+                if let Err(cause) = self.parse_frame(&frame) {
                     self.observations.clear();
-                    self.failure = Some(failure.clone());
-                    return Err(failure);
+                    self.failure = Some(self.agent_failure(cause.clone()));
+                    return Err(cause);
                 }
                 for observation in self.observations.drain(..) {
                     observe(observation);
@@ -169,9 +345,13 @@ impl PiJsonV1Parser {
 
             let frame_bytes = u64::try_from(self.frame.len()).unwrap_or(u64::MAX);
             if frame_bytes >= self.limits.maximum_frame_bytes().get() {
-                let failure = self.protocol_failure();
-                self.failure = Some(failure.clone());
-                return Err(failure);
+                let cause = self.protocol_failure();
+                self.record_rejection(
+                    PiJsonV1RejectionReason::FrameTooLarge,
+                    PiJsonV1ProtocolStage::FrameRead,
+                );
+                self.failure = Some(self.agent_failure(cause.clone()));
+                return Err(cause);
             }
             self.frame.push(byte);
         }
@@ -199,7 +379,7 @@ impl PiJsonV1Parser {
         arguments: &Value,
     ) -> Result<bool, AgentFailureCause> {
         if let Some(failure) = &self.failure {
-            return Err(failure.clone());
+            return Err(failure.cause().clone());
         }
         if self.value_kind != AgentValueKind::Result
             || self.accepted_result.is_some()
@@ -244,7 +424,7 @@ impl PiJsonV1Parser {
         accepted: AcceptedPiJsonV1Result,
     ) -> Result<(), AgentFailureCause> {
         if let Some(failure) = &self.failure {
-            return Err(failure.clone());
+            return Err(failure.cause().clone());
         }
         if self.value_kind != AgentValueKind::Result || self.accepted_result.is_some() {
             return self.fail_protocol();
@@ -302,60 +482,138 @@ impl PiJsonV1Parser {
             return super::agent::AgentOutcome::Cancelled { reason };
         }
         if self.failure.is_none() && !self.frame.is_empty() {
-            self.failure = Some(self.protocol_failure());
+            let cause = self.protocol_failure();
+            self.record_rejection(
+                PiJsonV1RejectionReason::PartialFrameAtEndOfStream,
+                PiJsonV1ProtocolStage::EndOfStream,
+            );
+            self.failure = Some(self.agent_failure(cause));
         }
 
         if let Some(failure) = self.failure {
-            return super::agent::AgentOutcome::Failed { cause: failure };
+            return super::agent::AgentOutcome::Failed(failure);
         }
-        if let Err(failure) = self.protocol.validate_eof() {
-            return super::agent::AgentOutcome::Failed { cause: failure };
+        if let Err(cause) = self.protocol.validate_eof() {
+            self.record_rejection(
+                PiJsonV1RejectionReason::EndOfStreamInvariantInvalid,
+                PiJsonV1ProtocolStage::EndOfStream,
+            );
+            return super::agent::AgentOutcome::Failed(self.agent_failure(cause));
         }
         if !completion.exit_success {
-            return super::agent::AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-                },
-            };
+            return failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+            });
         }
         self.classify_terminal()
     }
 
     fn parse_frame(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
+        self.rejection_context = PiJsonV1RejectionContext::default();
+        self.rejection_state_snapshot = Some(self.rejection_state());
+        let result = self.parse_frame_inner(frame);
+        let parser_owned_rejection = result.as_ref().is_err_and(|cause| {
+            matches!(
+                cause,
+                AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessProtocolFailed
+            )
+        });
+        if parser_owned_rejection && self.protocol_rejection.is_none() {
+            let reason = match self.rejection_context.stage {
+                PiJsonV1ProtocolStage::FrameRead => PiJsonV1RejectionReason::FrameTooLarge,
+                PiJsonV1ProtocolStage::FrameDecode => PiJsonV1RejectionReason::FrameDecodeFailed,
+                PiJsonV1ProtocolStage::SessionHeader => {
+                    PiJsonV1RejectionReason::SessionHeaderInvalid
+                }
+                PiJsonV1ProtocolStage::EventEnvelope => PiJsonV1RejectionReason::EventTypeInvalid,
+                PiJsonV1ProtocolStage::AssistantUpdate => {
+                    PiJsonV1RejectionReason::AssistantUpdateInvalid
+                }
+                PiJsonV1ProtocolStage::AssistantTransition => {
+                    PiJsonV1RejectionReason::AssistantContentTransitionInvalid
+                }
+                PiJsonV1ProtocolStage::ResultCorrelation => {
+                    PiJsonV1RejectionReason::ResultCorrelationInvalid
+                }
+                PiJsonV1ProtocolStage::TerminalValidation => {
+                    PiJsonV1RejectionReason::TerminalInvariantInvalid
+                }
+                PiJsonV1ProtocolStage::EndOfStream => {
+                    PiJsonV1RejectionReason::EndOfStreamInvariantInvalid
+                }
+                PiJsonV1ProtocolStage::EventPayload => {
+                    PiJsonV1RejectionReason::EventTransitionInvalid
+                }
+            };
+            self.record_rejection(reason, self.rejection_context.stage);
+        }
+        self.rejection_state_snapshot = None;
+        result
+    }
+
+    fn parse_frame_inner(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
         let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
         if frame_bytes > self.limits.maximum_frame_bytes().get() {
-            return Err(self.protocol_failure());
+            return self.reject(
+                PiJsonV1RejectionReason::FrameTooLarge,
+                PiJsonV1ProtocolStage::FrameRead,
+            );
         }
+        self.rejection_context.stage = PiJsonV1ProtocolStage::FrameDecode;
         let value = serde_json::from_slice::<Value>(frame).map_err(|_| self.protocol_failure())?;
-        let object = value.as_object().ok_or_else(|| self.protocol_failure())?;
+        let Some(object) = value.as_object() else {
+            return self.reject(
+                PiJsonV1RejectionReason::FrameNotObject,
+                PiJsonV1ProtocolStage::FrameDecode,
+            );
+        };
 
         if !self.protocol.header_seen {
+            self.rejection_context.stage = PiJsonV1ProtocolStage::SessionHeader;
+            self.rejection_context.outer_event =
+                required_string(object, "type").map(normalized_pi_event_type);
             self.parse_session_header(object)?;
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::SessionEstablished));
             return Ok(());
         }
 
+        self.rejection_context.stage = PiJsonV1ProtocolStage::EventEnvelope;
         let event_type = required_string(object, "type").ok_or_else(|| self.protocol_failure())?;
-        if event_type == "session"
-            || (self.protocol.settled && known_event_type(event_type))
-            || (self.accepted_result.is_some()
-                && known_event_type(event_type)
-                && !matches!(
-                    event_type,
-                    "tool_execution_end"
-                        | "message_start"
-                        | "message_end"
-                        | "turn_end"
-                        | "agent_end"
-                        | "agent_settled"
-                        | "compaction_start"
-                        | "compaction_end"
-                ))
+        self.rejection_context.outer_event = Some(normalized_pi_event_type(event_type));
+        if event_type == "session" {
+            return self.reject(
+                PiJsonV1RejectionReason::SessionEventRepeated,
+                PiJsonV1ProtocolStage::EventEnvelope,
+            );
+        }
+        if self.protocol.settled && known_event_type(event_type) {
+            return self.reject(
+                PiJsonV1RejectionReason::EventAfterSettlement,
+                PiJsonV1ProtocolStage::EventEnvelope,
+            );
+        }
+        if self.accepted_result.is_some()
+            && known_event_type(event_type)
+            && !matches!(
+                event_type,
+                "tool_execution_end"
+                    | "message_start"
+                    | "message_end"
+                    | "turn_end"
+                    | "agent_end"
+                    | "agent_settled"
+                    | "compaction_start"
+                    | "compaction_end"
+            )
         {
-            return Err(self.protocol_failure());
+            return self.reject(
+                PiJsonV1RejectionReason::EventAfterResultAcceptance,
+                PiJsonV1ProtocolStage::EventEnvelope,
+            );
         }
 
+        self.rejection_context.stage = PiJsonV1ProtocolStage::EventPayload;
         match event_type {
             "agent_start" => self.agent_start(object),
             "agent_end" => self.agent_end(object),
@@ -457,6 +715,7 @@ impl PiJsonV1Parser {
         };
         if attempt.last_completed_assistant.as_ref() != Some(&final_assistant)
             || attempt.last_turn_assistant.as_ref() != Some(&final_assistant)
+            || (attempt.interrupted_tool_call && !will_retry)
         {
             return Err(self.protocol_failure());
         }
@@ -505,7 +764,7 @@ impl PiJsonV1Parser {
         let Some(attempt) = self.protocol.active_attempt.as_mut() else {
             return Err(self.protocol_failure());
         };
-        if attempt.turn.is_some() {
+        if attempt.turn.is_some() || attempt.interrupted_tool_call {
             return Err(self.protocol_failure());
         }
         attempt.turn = Some(ActiveTurn::default());
@@ -596,17 +855,71 @@ impl PiJsonV1Parser {
     }
 
     fn message_update(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.rejection_context.stage = PiJsonV1ProtocolStage::AssistantUpdate;
+        let update_object = required_object(object, "assistantMessageEvent");
+        self.rejection_context.assistant_update = update_object
+            .and_then(|event| required_string(event, "type"))
+            .map(normalized_pi_assistant_update_type);
+        let content_index = update_object.and_then(|event| required_u64(event, "contentIndex"));
+        self.rejection_context.content_index =
+            content_index.filter(|index| *index <= MAXIMUM_DIAGNOSTIC_SEQUENCE);
+        if content_index.is_some_and(|index| index > MAXIMUM_DIAGNOSTIC_SEQUENCE) {
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantUpdateContentIndexInvalid,
+                PiJsonV1ProtocolStage::AssistantUpdate,
+            );
+        }
+
         let message = required_value(object, "message")
             .and_then(|message| parse_message(message, false))
-            .and_then(|message| message.assistant().cloned())
-            .ok_or_else(|| self.protocol_failure())?;
-        let event = required_object(object, "assistantMessageEvent")
-            .and_then(|event| parse_assistant_event(event, &message))
-            .ok_or_else(|| self.protocol_failure())?;
+            .and_then(|message| message.assistant().cloned());
+        let Some(message) = message else {
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantMessageInvalid,
+                PiJsonV1ProtocolStage::AssistantUpdate,
+            );
+        };
+        let Some(update_object) = update_object else {
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantUpdateInvalid,
+                PiJsonV1ProtocolStage::AssistantUpdate,
+            );
+        };
+        let event = match parse_assistant_event(update_object, &message) {
+            Ok(event) => event,
+            Err(ParseAssistantEventError::Shape) => {
+                return self.reject(
+                    PiJsonV1RejectionReason::AssistantUpdateInvalid,
+                    PiJsonV1ProtocolStage::AssistantUpdate,
+                );
+            }
+            Err(ParseAssistantEventError::Subtype) => {
+                return self.reject(
+                    PiJsonV1RejectionReason::AssistantUpdateSubtypeInvalid,
+                    PiJsonV1ProtocolStage::AssistantUpdate,
+                );
+            }
+            Err(ParseAssistantEventError::ContentIndex) => {
+                return self.reject(
+                    PiJsonV1RejectionReason::AssistantUpdateContentIndexInvalid,
+                    PiJsonV1ProtocolStage::AssistantUpdate,
+                );
+            }
+            Err(ParseAssistantEventError::PartialMismatch) => {
+                return self.reject(
+                    PiJsonV1RejectionReason::AssistantUpdatePartialMismatch,
+                    PiJsonV1ProtocolStage::AssistantUpdate,
+                );
+            }
+        };
         self.check_response_bound(&message)?;
+        self.rejection_context.stage = PiJsonV1ProtocolStage::AssistantTransition;
 
         let Some(turn) = self.active_turn_mut() else {
-            return Err(self.protocol_failure());
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
+                PiJsonV1ProtocolStage::AssistantTransition,
+            );
         };
         let Some(ActiveMessage::Assistant {
             last,
@@ -614,10 +927,20 @@ impl PiJsonV1Parser {
             had_update,
         }) = turn.active_message.as_mut()
         else {
-            return Err(self.protocol_failure());
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
+                PiJsonV1ProtocolStage::AssistantTransition,
+            );
         };
-        if !last.stable_with(&message) || !event.valid_transition(last, &message, open_block) {
-            return Err(self.protocol_failure());
+        if !last.stable_with(&message) {
+            return self.reject(
+                PiJsonV1RejectionReason::AssistantStableFieldsChanged,
+                PiJsonV1ProtocolStage::AssistantTransition,
+            );
+        }
+        if !event.valid_transition(last, &message, open_block) {
+            let reason = event.transition_failure_reason(last, open_block);
+            return self.reject(reason, PiJsonV1ProtocolStage::AssistantTransition);
         }
 
         let observations = event.normalized_observations(last, &message);
@@ -631,9 +954,54 @@ impl PiJsonV1Parser {
         let expected_result_tool_name = self.expected_result_tool_name.clone();
         let value = required_value(object, "message").ok_or_else(|| self.protocol_failure())?;
         let message = parse_message(value, true).ok_or_else(|| self.protocol_failure())?;
+        let active_message = self
+            .protocol
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.turn.as_ref())
+            .and_then(|turn| turn.active_message.as_ref());
+        let interrupted_tool_call = message.assistant().is_some_and(|assistant| {
+            assistant.stop_reason == StopReason::Error
+                && matches!(
+                    active_message,
+                    Some(ActiveMessage::Assistant {
+                        open_block: Some(OpenBlock::ToolCall(_)),
+                        ..
+                    })
+                )
+        });
         if let ParsedMessage::Assistant(assistant) = &message {
+            let Some(ActiveMessage::Assistant {
+                last, open_block, ..
+            }) = active_message
+            else {
+                return self.reject(
+                    PiJsonV1RejectionReason::AssistantActiveMessageMismatch,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            };
+            if !valid_message_end_open_block(*open_block, last, assistant) {
+                return self.reject(
+                    PiJsonV1RejectionReason::MessageEndOpenBlockMismatch,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            }
+            if !last.stable_with(assistant)
+                || !finalized_content_correlates(
+                    &last.content,
+                    &assistant.content,
+                    expected_result_tool_name.as_deref(),
+                )
+            {
+                return self.reject(
+                    PiJsonV1RejectionReason::MessageEndContentMismatch,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            }
             self.check_response_bound(assistant)?;
-            self.retain_result_identity_context(assistant)?;
+            if !interrupted_tool_call {
+                self.retain_result_identity_context(assistant)?;
+            }
         }
         let retained_message_bytes = self
             .protocol
@@ -644,8 +1012,13 @@ impl PiJsonV1Parser {
                     .retained_message_bytes
                     .checked_add(json_bytes(value)?)
             })
-            .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get())
-            .ok_or_else(|| self.protocol_failure())?;
+            .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get());
+        let Some(retained_message_bytes) = retained_message_bytes else {
+            return self.reject(
+                PiJsonV1RejectionReason::RetainedStateLimitExceeded,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
+        };
         let Some(attempt) = self.protocol.active_attempt.as_mut() else {
             return Err(self.protocol_failure());
         };
@@ -666,16 +1039,13 @@ impl PiJsonV1Parser {
                 },
                 ParsedMessage::Assistant(assistant),
             ) => {
-                if !valid_message_end_open_block(open_block, &last, assistant)
-                    || !last.stable_with(assistant)
-                    || !finalized_content_correlates(
-                        &last.content,
-                        &assistant.content,
-                        expected_result_tool_name.as_deref(),
-                    )
-                {
-                    return Err(self.protocol_failure());
-                }
+                debug_assert!(valid_message_end_open_block(open_block, &last, assistant));
+                debug_assert!(last.stable_with(assistant));
+                debug_assert!(finalized_content_correlates(
+                    &last.content,
+                    &assistant.content,
+                    expected_result_tool_name.as_deref(),
+                ));
                 if !had_update {
                     for block in &assistant.content {
                         match block {
@@ -695,13 +1065,16 @@ impl PiJsonV1Parser {
                         }
                     }
                 }
-                turn.calls = assistant
-                    .tool_calls()
-                    .cloned()
-                    .map(ToolCallState::new)
-                    .collect();
+                if !interrupted_tool_call {
+                    turn.calls = assistant
+                        .tool_calls()
+                        .cloned()
+                        .map(ToolCallState::new)
+                        .collect();
+                }
                 turn.assistant = Some(assistant.clone());
                 attempt.last_completed_assistant = Some(assistant.clone());
+                attempt.interrupted_tool_call |= interrupted_tool_call;
             }
             (ActiveMessage::Fixed(started), ParsedMessage::ToolResult(result)) => {
                 if started != message || !turn.finish_tool_result(result) {
@@ -752,8 +1125,13 @@ impl PiJsonV1Parser {
             let retained_bytes = self
                 .retained_tool_call_id_bytes
                 .checked_add(u64::try_from(call.id.len()).unwrap_or(u64::MAX))
-                .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get())
-                .ok_or_else(|| self.protocol_failure())?;
+                .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get());
+            let Some(retained_bytes) = retained_bytes else {
+                return self.reject(
+                    PiJsonV1RejectionReason::RetainedStateLimitExceeded,
+                    PiJsonV1ProtocolStage::EventPayload,
+                );
+            };
             self.seen_tool_call_ids
                 .insert(call.id.clone(), is_result_tool);
             self.retained_tool_call_id_bytes = retained_bytes;
@@ -957,7 +1335,11 @@ impl PiJsonV1Parser {
             && reason == CompactionReason::Threshold;
         if self.protocol.active_attempt.is_some()
             || self.protocol.compaction.is_some()
-            || self.protocol.last_agent_end.is_none()
+            || self
+                .protocol
+                .last_agent_end
+                .as_ref()
+                .is_none_or(|end| end.will_retry)
             || self.protocol.settled
             || (self.accepted_result.is_some() && !accepted_result_can_cancel_threshold)
         {
@@ -1173,16 +1555,18 @@ impl PiJsonV1Parser {
 
     fn classify_terminal(&self) -> super::agent::AgentOutcome {
         let Some(end) = self.protocol.last_agent_end.as_ref() else {
-            return super::agent::AgentOutcome::Failed {
-                cause: self.protocol_failure(),
-            };
+            return self.protocol_failure_outcome(
+                PiJsonV1RejectionReason::TerminalInvariantInvalid,
+                PiJsonV1ProtocolStage::TerminalValidation,
+            );
         };
         let assistant = &end.final_assistant;
 
         if self.accepted_result.is_some() && assistant.stop_reason != StopReason::ToolUse {
-            return super::agent::AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            };
+            return self.protocol_failure_outcome(
+                PiJsonV1RejectionReason::TerminalInvariantInvalid,
+                PiJsonV1ProtocolStage::TerminalValidation,
+            );
         }
 
         match assistant.stop_reason {
@@ -1193,9 +1577,7 @@ impl PiJsonV1Parser {
                 AgentValueKind::Response => {
                     let text_blocks = assistant.text_blocks().collect::<Vec<_>>();
                     if text_blocks.is_empty() {
-                        super::agent::AgentOutcome::Failed {
-                            cause: AgentFailureCause::MissingResponse,
-                        }
+                        failed_agent_outcome(AgentFailureCause::MissingResponse)
                     } else {
                         let response = text_blocks.concat();
                         super::agent::AgentOutcome::Completed(CompletedAgentInvocation::Response(
@@ -1203,9 +1585,7 @@ impl PiJsonV1Parser {
                         ))
                     }
                 }
-                AgentValueKind::Result => super::agent::AgentOutcome::Failed {
-                    cause: AgentFailureCause::MissingResult,
-                },
+                AgentValueKind::Result => failed_agent_outcome(AgentFailureCause::MissingResult),
             },
             StopReason::Length => harness_failure(AgentHarnessFailureDetail::ModelOutputTruncated),
             StopReason::ToolUse => match self.value_kind {
@@ -1214,14 +1594,13 @@ impl PiJsonV1Parser {
                 }
                 AgentValueKind::Result => {
                     let Some(accepted) = self.accepted_result.as_ref() else {
-                        return super::agent::AgentOutcome::Failed {
-                            cause: AgentFailureCause::MissingResult,
-                        };
+                        return failed_agent_outcome(AgentFailureCause::MissingResult);
                     };
                     let Some(call) = assistant.only_tool_call() else {
-                        return super::agent::AgentOutcome::Failed {
-                            cause: AgentFailureCause::HarnessProtocolFailed,
-                        };
+                        return self.protocol_failure_outcome(
+                            PiJsonV1RejectionReason::TerminalInvariantInvalid,
+                            PiJsonV1ProtocolStage::TerminalValidation,
+                        );
                     };
                     if !accepted.native_execution_completed
                         || call.id.as_str() != accepted.accepted.call_id.as_ref()
@@ -1231,9 +1610,10 @@ impl PiJsonV1Parser {
                             accepted.accepted.arguments.as_ref(),
                         )
                     {
-                        return super::agent::AgentOutcome::Failed {
-                            cause: AgentFailureCause::HarnessProtocolFailed,
-                        };
+                        return self.protocol_failure_outcome(
+                            PiJsonV1RejectionReason::ResultCorrelationInvalid,
+                            PiJsonV1ProtocolStage::TerminalValidation,
+                        );
                     }
                     super::agent::AgentOutcome::Completed(CompletedAgentInvocation::Result(
                         accepted.accepted.result.clone(),
@@ -1242,9 +1622,10 @@ impl PiJsonV1Parser {
             },
             StopReason::Error => harness_failure(AgentHarnessFailureDetail::ModelError),
             StopReason::Aborted => harness_failure(AgentHarnessFailureDetail::ModelAborted),
-            StopReason::Pending => super::agent::AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            },
+            StopReason::Pending => self.protocol_failure_outcome(
+                PiJsonV1RejectionReason::TerminalInvariantInvalid,
+                PiJsonV1ProtocolStage::TerminalValidation,
+            ),
         }
     }
 
@@ -1256,10 +1637,109 @@ impl PiJsonV1Parser {
         }
     }
 
+    fn agent_failure(&self, cause: AgentFailureCause) -> AgentFailure {
+        match &self.protocol_rejection {
+            Some(rejection) => AgentFailure::with_protocol_rejection(cause, rejection.clone()),
+            None => AgentFailure::new(cause),
+        }
+    }
+
+    fn protocol_failure_outcome(
+        &self,
+        reason: PiJsonV1RejectionReason,
+        stage: PiJsonV1ProtocolStage,
+    ) -> super::agent::AgentOutcome {
+        super::agent::AgentOutcome::Failed(AgentFailure::with_protocol_rejection(
+            self.protocol_failure(),
+            self.make_protocol_rejection(reason, stage),
+        ))
+    }
+
+    fn reject<T>(
+        &mut self,
+        reason: PiJsonV1RejectionReason,
+        stage: PiJsonV1ProtocolStage,
+    ) -> Result<T, AgentFailureCause> {
+        let cause = self.protocol_failure();
+        self.record_rejection(reason, stage);
+        Err(cause)
+    }
+
+    fn record_rejection(&mut self, reason: PiJsonV1RejectionReason, stage: PiJsonV1ProtocolStage) {
+        self.rejection_context.stage = stage;
+        if self.protocol_rejection.is_none() {
+            self.protocol_rejection = Some(self.make_protocol_rejection(reason, stage));
+        }
+    }
+
+    fn make_protocol_rejection(
+        &self,
+        reason: PiJsonV1RejectionReason,
+        stage: PiJsonV1ProtocolStage,
+    ) -> AgentProtocolRejectionDiagnostic {
+        AgentProtocolRejectionDiagnostic::pi_json_v1(PiJsonV1ProtocolRejection {
+            reason,
+            stage,
+            outer_event: self.rejection_context.outer_event,
+            assistant_update: self.rejection_context.assistant_update,
+            content_index: self.rejection_context.content_index,
+            state: self
+                .rejection_state_snapshot
+                .clone()
+                .unwrap_or_else(|| self.rejection_state()),
+        })
+    }
+
+    fn rejection_state(&self) -> PiJsonV1RejectionState {
+        let active_message = self
+            .protocol
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.turn.as_ref())
+            .and_then(|turn| turn.active_message.as_ref());
+        let (active_message, active_assistant_content_blocks, assistant_update_seen, open_block) =
+            match active_message {
+                Some(ActiveMessage::Assistant {
+                    last,
+                    open_block,
+                    had_update,
+                }) => (
+                    PiJsonV1ActiveMessageState::Assistant,
+                    Some(bounded_count(last.content.len())),
+                    *had_update,
+                    open_block.map(pi_open_block_state),
+                ),
+                Some(ActiveMessage::Fixed(_)) => {
+                    (PiJsonV1ActiveMessageState::Other, None, false, None)
+                }
+                None => (PiJsonV1ActiveMessageState::None, None, false, None),
+            };
+        PiJsonV1RejectionState {
+            session_header_seen: self.protocol.header_seen,
+            agent_started: self.protocol.ever_started,
+            active_attempt: self.protocol.active_attempt.is_some(),
+            active_turn: self
+                .protocol
+                .active_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.turn.is_some()),
+            active_message,
+            active_assistant_content_blocks,
+            assistant_update_seen,
+            open_block,
+            result_accepted: self.accepted_result.is_some(),
+            settled: self.protocol.settled,
+        }
+    }
+
     fn fail_protocol<T>(&mut self) -> Result<T, AgentFailureCause> {
-        let failure = self.protocol_failure();
-        self.failure = Some(failure.clone());
-        Err(failure)
+        let cause = self.protocol_failure();
+        self.record_rejection(
+            PiJsonV1RejectionReason::ResultCorrelationInvalid,
+            PiJsonV1ProtocolStage::ResultCorrelation,
+        );
+        self.failure = Some(self.agent_failure(cause.clone()));
+        Err(cause)
     }
 }
 
@@ -1306,6 +1786,7 @@ impl ProtocolState {
 #[derive(Default)]
 struct ActiveAttempt {
     queued_message_required: bool,
+    interrupted_tool_call: bool,
     turn: Option<ActiveTurn>,
     completed_messages: Vec<ParsedMessage>,
     retained_message_bytes: u64,
@@ -1404,6 +1885,17 @@ enum OpenBlock {
     Text(usize),
     Thinking(usize),
     ToolCall(usize),
+}
+
+impl OpenBlock {
+    fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Text(_), Self::Text(_))
+                | (Self::Thinking(_), Self::Thinking(_))
+                | (Self::ToolCall(_), Self::ToolCall(_))
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -1638,7 +2130,7 @@ enum AssistantUpdateKind {
     TextEnd(Option<String>),
     ThinkingStart,
     ThinkingDelta(Option<String>),
-    ThinkingEnd(Option<String>),
+    ThinkingEnd(String),
     ToolCallStart,
     ToolCallDelta,
     ToolCallEnd(ToolCall),
@@ -1687,7 +2179,7 @@ impl AssistantUpdateEvent {
             }
             AssistantUpdateKind::ThinkingEnd(content) => {
                 *open == Some(OpenBlock::Thinking(self.index))
-                    && finalize_thinking(previous, current, self.index, content.as_deref())
+                    && finalize_thinking(previous, current, self.index, content)
                     && clear_open(open)
             }
             AssistantUpdateKind::ToolCallStart => {
@@ -1709,6 +2201,44 @@ impl AssistantUpdateEvent {
                     && unchanged_except(previous, current, self.index)
                     && clear_open(open)
             }
+        }
+    }
+
+    fn transition_failure_reason(
+        &self,
+        previous: &AssistantMessage,
+        open: &Option<OpenBlock>,
+    ) -> PiJsonV1RejectionReason {
+        let expected_open = match self.kind {
+            AssistantUpdateKind::TextStart
+            | AssistantUpdateKind::ThinkingStart
+            | AssistantUpdateKind::ToolCallStart => None,
+            AssistantUpdateKind::TextDelta(_) | AssistantUpdateKind::TextEnd(_) => {
+                Some(OpenBlock::Text(self.index))
+            }
+            AssistantUpdateKind::ThinkingDelta(_) | AssistantUpdateKind::ThinkingEnd(_) => {
+                Some(OpenBlock::Thinking(self.index))
+            }
+            AssistantUpdateKind::ToolCallDelta | AssistantUpdateKind::ToolCallEnd(_) => {
+                Some(OpenBlock::ToolCall(self.index))
+            }
+        };
+        match expected_open {
+            None if open.is_some() => PiJsonV1RejectionReason::AssistantUpdateOpenBlockMismatch,
+            None if self.index != previous.content.len() => {
+                PiJsonV1RejectionReason::AssistantUpdateContentIndexMismatch
+            }
+            Some(expected) if *open != Some(expected) => {
+                if open.is_some_and(|actual| actual.same_kind(expected)) {
+                    PiJsonV1RejectionReason::AssistantUpdateContentIndexMismatch
+                } else {
+                    PiJsonV1RejectionReason::AssistantUpdateOpenBlockMismatch
+                }
+            }
+            _ if matches!(self.kind, AssistantUpdateKind::ThinkingEnd(_)) => {
+                PiJsonV1RejectionReason::ThinkingFinalizationRewrite
+            }
+            _ => PiJsonV1RejectionReason::AssistantContentTransitionInvalid,
         }
     }
 
@@ -2094,18 +2624,26 @@ fn parse_tool_execution_result(value: &Value) -> Option<ToolExecutionResult> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseAssistantEventError {
+    Shape,
+    Subtype,
+    ContentIndex,
+    PartialMismatch,
+}
+
 fn parse_assistant_event(
     object: &Map<String, Value>,
     current: &AssistantMessage,
-) -> Option<AssistantUpdateEvent> {
+) -> Result<AssistantUpdateEvent, ParseAssistantEventError> {
     let compact = match object.get(COMPACT_UPDATE_PROPERTY) {
         None => false,
         Some(Value::Bool(true)) => true,
-        Some(_) => return None,
+        Some(_) => return Err(ParseAssistantEventError::Shape),
     };
     if compact {
         if object.contains_key("partial") || object.contains_key("message") {
-            return None;
+            return Err(ParseAssistantEventError::Shape);
         }
     } else if required_value(object, "partial")
         .and_then(|value| parse_message(value, false))
@@ -2113,33 +2651,44 @@ fn parse_assistant_event(
         .as_ref()
         != Some(current)
     {
-        return None;
+        return Err(ParseAssistantEventError::PartialMismatch);
     }
-    let index = usize::try_from(required_u64(object, "contentIndex")?).ok()?;
-    let kind = match required_string(object, "type")? {
+    let index = required_u64(object, "contentIndex")
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or(ParseAssistantEventError::ContentIndex)?;
+    let event_type = required_string(object, "type").ok_or(ParseAssistantEventError::Subtype)?;
+    let kind = match event_type {
         "text_start" => AssistantUpdateKind::TextStart,
-        "text_delta" => {
-            AssistantUpdateKind::TextDelta(compactable_string(object, "delta", compact)?)
-        }
-        "text_end" => AssistantUpdateKind::TextEnd(compactable_string(object, "content", compact)?),
+        "text_delta" => AssistantUpdateKind::TextDelta(
+            compactable_string(object, "delta", compact).ok_or(ParseAssistantEventError::Shape)?,
+        ),
+        "text_end" => AssistantUpdateKind::TextEnd(
+            compactable_string(object, "content", compact)
+                .ok_or(ParseAssistantEventError::Shape)?,
+        ),
         "thinking_start" => AssistantUpdateKind::ThinkingStart,
-        "thinking_delta" => {
-            AssistantUpdateKind::ThinkingDelta(compactable_string(object, "delta", compact)?)
-        }
-        "thinking_end" => {
-            AssistantUpdateKind::ThinkingEnd(compactable_string(object, "content", compact)?)
-        }
+        "thinking_delta" => AssistantUpdateKind::ThinkingDelta(
+            compactable_string(object, "delta", compact).ok_or(ParseAssistantEventError::Shape)?,
+        ),
+        "thinking_end" if compact => return Err(ParseAssistantEventError::Shape),
+        "thinking_end" => AssistantUpdateKind::ThinkingEnd(
+            required_string(object, "content")
+                .ok_or(ParseAssistantEventError::Shape)?
+                .to_owned(),
+        ),
         "toolcall_start" => AssistantUpdateKind::ToolCallStart,
         "toolcall_delta" => {
-            required_string(object, "delta")?;
+            required_string(object, "delta").ok_or(ParseAssistantEventError::Shape)?;
             AssistantUpdateKind::ToolCallDelta
         }
         "toolcall_end" => AssistantUpdateKind::ToolCallEnd(
-            required_object(object, "toolCall").and_then(|call| parse_tool_call(call, true))?,
+            required_object(object, "toolCall")
+                .and_then(|call| parse_tool_call(call, true))
+                .ok_or(ParseAssistantEventError::Shape)?,
         ),
-        _ => return None,
+        _ => return Err(ParseAssistantEventError::Subtype),
     };
-    Some(AssistantUpdateEvent { kind, index })
+    Ok(AssistantUpdateEvent { kind, index })
 }
 
 fn compactable_string(
@@ -2236,14 +2785,12 @@ fn finalize_thinking(
     previous: &AssistantMessage,
     current: &AssistantMessage,
     index: usize,
-    expected_finalized: Option<&str>,
+    expected_finalized: &str,
 ) -> bool {
-    block_texts(previous, current, index, BlockKind::Thinking).is_some_and(|(streamed, current)| {
-        expected_finalized.is_none_or(|expected| current == expected)
-            && streamed
-                .strip_prefix(current)
-                .is_some_and(|removed| removed.bytes().all(|byte| matches!(byte, b'\r' | b'\n')))
-    })
+    // Pi exposes provider-finalized thinking at `thinking_end`; providers may
+    // summarize or otherwise replace their streamed reasoning before closing it.
+    block_texts(previous, current, index, BlockKind::Thinking)
+        .is_some_and(|(_, current)| current == expected_finalized)
 }
 
 fn unchanged_except(previous: &AssistantMessage, current: &AssistantMessage, index: usize) -> bool {
@@ -2265,7 +2812,10 @@ fn valid_message_end_open_block(
         None => true,
         Some(OpenBlock::ToolCall(index)) => {
             streamed.stop_reason == StopReason::Pending
-                && completed.stop_reason == StopReason::Length
+                && matches!(
+                    completed.stop_reason,
+                    StopReason::Length | StopReason::Error
+                )
                 && matches!(
                     completed.content.get(index),
                     Some(ContentBlock::ToolCall(_))
@@ -2292,10 +2842,26 @@ fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
     AgentObservation::Lifecycle { milestone }
 }
 
-fn harness_failure(detail: AgentHarnessFailureDetail) -> super::agent::AgentOutcome {
-    super::agent::AgentOutcome::Failed {
-        cause: AgentFailureCause::HarnessFailed { detail },
+fn bounded_count(value: usize) -> u64 {
+    u64::try_from(value)
+        .unwrap_or(u64::MAX)
+        .min(MAXIMUM_DIAGNOSTIC_SEQUENCE)
+}
+
+fn pi_open_block_state(block: OpenBlock) -> PiJsonV1OpenBlockState {
+    let (kind, content_index) = match block {
+        OpenBlock::Text(index) => (PiJsonV1OpenBlockKind::Text, index),
+        OpenBlock::Thinking(index) => (PiJsonV1OpenBlockKind::Thinking, index),
+        OpenBlock::ToolCall(index) => (PiJsonV1OpenBlockKind::ToolCall, index),
+    };
+    PiJsonV1OpenBlockState {
+        kind,
+        content_index: bounded_count(content_index),
     }
+}
+
+fn harness_failure(detail: AgentHarnessFailureDetail) -> super::agent::AgentOutcome {
+    failed_agent_outcome(AgentFailureCause::HarnessFailed { detail })
 }
 
 fn json_bytes(value: &Value) -> Option<u64> {
@@ -2489,6 +3055,51 @@ fn optional_string_array(object: &Map<String, Value>, key: &str) -> Option<Optio
             .collect::<Option<Vec<_>>>()
             .map(|values| (!values.is_empty()).then_some(values)),
         Some(_) => None,
+    }
+}
+
+fn normalized_pi_event_type(event_type: &str) -> PiJsonV1EventType {
+    match event_type {
+        "session" => PiJsonV1EventType::Session,
+        "agent_start" => PiJsonV1EventType::AgentStart,
+        "agent_end" => PiJsonV1EventType::AgentEnd,
+        "agent_settled" => PiJsonV1EventType::AgentSettled,
+        "turn_start" => PiJsonV1EventType::TurnStart,
+        "turn_end" => PiJsonV1EventType::TurnEnd,
+        "message_start" => PiJsonV1EventType::MessageStart,
+        "message_update" => PiJsonV1EventType::MessageUpdate,
+        "message_end" => PiJsonV1EventType::MessageEnd,
+        "tool_execution_start" => PiJsonV1EventType::ToolExecutionStart,
+        "tool_execution_update" => PiJsonV1EventType::ToolExecutionUpdate,
+        "tool_execution_end" => PiJsonV1EventType::ToolExecutionEnd,
+        "auto_retry_start" => PiJsonV1EventType::AutoRetryStart,
+        "auto_retry_end" => PiJsonV1EventType::AutoRetryEnd,
+        "compaction_start" => PiJsonV1EventType::CompactionStart,
+        "compaction_end" => PiJsonV1EventType::CompactionEnd,
+        "summarization_retry_scheduled" => PiJsonV1EventType::SummarizationRetryScheduled,
+        "summarization_retry_attempt_start" => PiJsonV1EventType::SummarizationRetryAttemptStart,
+        "summarization_retry_finished" => PiJsonV1EventType::SummarizationRetryFinished,
+        "queue_update" => PiJsonV1EventType::QueueUpdate,
+        "entry_appended" => PiJsonV1EventType::EntryAppended,
+        "session_info_changed" => PiJsonV1EventType::SessionInfoChanged,
+        "thinking_level_changed" => PiJsonV1EventType::ThinkingLevelChanged,
+        "bash_execution_update" => PiJsonV1EventType::BashExecutionUpdate,
+        _ => PiJsonV1EventType::Unrecognized,
+    }
+}
+
+fn normalized_pi_assistant_update_type(event_type: &str) -> PiJsonV1AssistantUpdateType {
+    match event_type {
+        "text_start" => PiJsonV1AssistantUpdateType::TextStart,
+        "text_delta" => PiJsonV1AssistantUpdateType::TextDelta,
+        "text_end" => PiJsonV1AssistantUpdateType::TextEnd,
+        "thinking_start" => PiJsonV1AssistantUpdateType::ThinkingStart,
+        "thinking_delta" => PiJsonV1AssistantUpdateType::ThinkingDelta,
+        "thinking_end" => PiJsonV1AssistantUpdateType::ThinkingEnd,
+        "toolcall_start" => PiJsonV1AssistantUpdateType::ToolcallStart,
+        "toolcall_delta" => PiJsonV1AssistantUpdateType::ToolcallDelta,
+        "toolcall_end" => PiJsonV1AssistantUpdateType::ToolcallEnd,
+        _ => PiJsonV1AssistantUpdateType::Unrecognized,
     }
 }
 

@@ -5,7 +5,7 @@ agentProfiles:
       kind: codex
       config:
         model: gpt-5
-        thinking: high
+        effort: high
 steps:
   implement:
     kind: agent

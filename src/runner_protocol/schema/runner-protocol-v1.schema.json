@@ -38,10 +38,34 @@
       "$ref": "#/$defs/RunnerExecutionAborted"
     },
     {
+      "$ref": "#/$defs/RunnerArtifactCarrierRegister"
+    },
+    {
+      "$ref": "#/$defs/RunnerArtifactCarrierConfirm"
+    },
+    {
+      "$ref": "#/$defs/RunnerArtifactResultRegister"
+    },
+    {
+      "$ref": "#/$defs/RunnerArtifactResultConfirm"
+    },
+    {
       "$ref": "#/$defs/CloudWelcome"
     },
     {
       "$ref": "#/$defs/CloudObservationAck"
+    },
+    {
+      "$ref": "#/$defs/CloudArtifactCarrierRegistration"
+    },
+    {
+      "$ref": "#/$defs/CloudArtifactCarrierConfirmation"
+    },
+    {
+      "$ref": "#/$defs/CloudArtifactResultRegistration"
+    },
+    {
+      "$ref": "#/$defs/CloudArtifactResultConfirmation"
     },
     {
       "$ref": "#/$defs/CloudAssignmentOffer"
@@ -88,6 +112,10 @@
     "runId": {
       "type": "string",
       "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "projectId": {
+      "type": "string",
+      "pattern": "^prj_[0-7][0-9a-hjkmnp-tv-z]{25}$"
     },
     "workflowId": {
       "type": "string",
@@ -139,21 +167,67 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "algorithm": { "const": "sha256" },
-        "value": { "$ref": "#/$defs/sha256" }
+        "algorithm": {
+          "const": "sha256"
+        },
+        "value": {
+          "$ref": "#/$defs/sha256"
+        }
       },
-      "required": ["algorithm", "value"]
+      "required": [
+        "algorithm",
+        "value"
+      ]
     },
     "ExecutionSource": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "repositoryConnectionId": { "$ref": "#/$defs/repositoryConnectionId" },
-        "objectFormat": { "const": "sha1" },
-        "commitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "workflowPath": { "type": "string", "minLength": 1 },
-        "workflowSourceClosureDigest": { "$ref": "#/$defs/WorkflowSourceClosureDigest" },
-        "checkoutCredentialReference": { "$ref": "#/$defs/repositoryConnectionId" }
+        "repositoryConnectionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "objectFormat": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "commitOid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workflowPath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "workflowSourceClosureDigest": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "algorithm",
+            "value"
+          ]
+        },
+        "checkoutCredentialReference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       },
       "required": [
         "repositoryConnectionId",
@@ -188,7 +262,8 @@
         "executionSpecId",
         "schemaVersion",
         "registeredWorkflowId",
-        "executionLimits"
+        "executionLimits",
+        "source"
       ]
     },
     "ExecutionLeasePolicy": {
@@ -254,16 +329,22 @@
     "RunnerUnableReason": {
       "enum": [
         "execution_environment_unavailable",
-        "workflow_mapping_unavailable",
-        "workflow_source_unavailable",
-        "workflow_contract_invalid",
-        "workflow_admission_rejected"
+        "source_service_unavailable",
+        "workflow_environment_unsupported"
       ]
     },
     "ExecutionSpecInvalidReason": {
       "enum": [
         "unsupported_schema_version",
-        "invalid_execution_limits"
+        "invalid_execution_limits",
+        "invalid_source_projection",
+        "unsupported_source_object_format",
+        "source_commit_mismatch",
+        "source_checkout_dirty",
+        "workflow_source_digest_mismatch",
+        "workflow_source_invalid",
+        "workflow_contract_invalid",
+        "workflow_admission_invalid"
       ]
     },
     "AssignmentDecline": {
@@ -379,16 +460,10 @@
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128
-                },
-                "maxConcurrentRuns": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 2147483647
                 }
               },
               "required": [
-                "runnerVersion",
-                "maxConcurrentRuns"
+                "runnerVersion"
               ]
             }
           }
@@ -664,6 +739,9 @@
                 "runId": {
                   "$ref": "#/$defs/runId"
                 },
+                "projectId": {
+                  "$ref": "#/$defs/projectId"
+                },
                 "attemptId": {
                   "$ref": "#/$defs/attemptId"
                 },
@@ -678,6 +756,7 @@
                 "effectId",
                 "assignmentId",
                 "runId",
+                "projectId",
                 "attemptId",
                 "executionSpec",
                 "offerExpiresAt"
@@ -811,6 +890,16 @@
         "termination_request",
         "caller_output_failure",
         "runner_shutdown",
+        "execution_lease_expired",
+        "finalization_force_abort"
+      ]
+    },
+    "OrdinaryCancellationReason": {
+      "enum": [
+        "user_request",
+        "termination_request",
+        "caller_output_failure",
+        "runner_shutdown",
         "execution_lease_expired"
       ]
     },
@@ -838,15 +927,15 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "stepId": {
-          "$ref": "#/$defs/stepId"
+        "node": {
+          "$ref": "#/$defs/WorkflowNode"
         },
         "failure": {
           "$ref": "#/$defs/StepFailureEvidence"
         }
       },
       "required": [
-        "stepId",
+        "node",
         "failure"
       ]
     },
@@ -863,6 +952,12 @@
         },
         {
           "$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowFinalizingCancellingState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowFinalizingOpenState"
         },
         {
           "$ref": "#/$defs/WorkflowSucceededState"
@@ -918,6 +1013,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -925,6 +1023,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to"
@@ -954,6 +1053,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -961,6 +1063,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to"
@@ -990,6 +1093,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -997,6 +1103,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to"
@@ -1026,6 +1133,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -1033,6 +1143,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to"
@@ -1069,6 +1180,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -1076,6 +1190,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to",
@@ -1109,6 +1224,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -1116,6 +1234,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to",
@@ -1149,6 +1268,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
             }
           },
           "required": [
@@ -1156,6 +1278,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to",
@@ -1165,127 +1288,299 @@
       ]
     },
     "BlockedStepTransitionEvent": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "eventVersion": {
-          "const": 1
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "blocked"
+            },
+            "dependency": {
+              "$ref": "#/$defs/stepId"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "step"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "dependency"
+          ]
         },
-        "eventType": {
-          "const": "step_state_changed"
-        },
-        "transitionSequence": {
-          "$ref": "#/$defs/positiveSequence"
-        },
-        "stepId": {
-          "$ref": "#/$defs/stepId"
-        },
-        "from": {
-          "const": "pending"
-        },
-        "to": {
-          "const": "blocked"
-        },
-        "dependency": {
-          "$ref": "#/$defs/stepId"
-        },
-        "failurePolicy": {
-          "$ref": "#/$defs/FailurePolicy"
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "blocked"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "reason": {
+              "const": "input_unavailable"
+            },
+            "unavailableReferences": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1024,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason",
+            "unavailableReferences"
+          ]
         }
-      },
-      "required": [
-        "eventVersion",
-        "eventType",
-        "transitionSequence",
-        "stepId",
-        "failurePolicy",
-        "from",
-        "to",
-        "dependency"
       ]
     },
     "NotRunStepTransitionEvent": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "eventVersion": {
-          "const": 1
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "not_run"
+            },
+            "reason": {
+              "const": "failure_stop"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "step"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
+          ]
         },
-        "eventType": {
-          "const": "step_state_changed"
-        },
-        "transitionSequence": {
-          "$ref": "#/$defs/positiveSequence"
-        },
-        "stepId": {
-          "$ref": "#/$defs/stepId"
-        },
-        "from": {
-          "const": "pending"
-        },
-        "to": {
-          "const": "not_run"
-        },
-        "reason": {
-          "const": "failure_stop"
-        },
-        "failurePolicy": {
-          "$ref": "#/$defs/FailurePolicy"
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "not_run"
+            },
+            "reason": {
+              "const": "finalizer_trigger_not_selected"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "finalizer"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
+          ]
         }
-      },
-      "required": [
-        "eventVersion",
-        "eventType",
-        "transitionSequence",
-        "stepId",
-        "failurePolicy",
-        "from",
-        "to",
-        "reason"
       ]
     },
     "CancellingStepTransitionEvent": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "eventVersion": {
-          "const": 1
-        },
-        "eventType": {
-          "const": "step_state_changed"
-        },
-        "transitionSequence": {
-          "$ref": "#/$defs/positiveSequence"
-        },
-        "stepId": {
-          "$ref": "#/$defs/stepId"
-        },
-        "from": {
-          "enum": [
-            "starting",
-            "running",
-            "capturing_outputs"
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "enum": [
+                "starting",
+                "running",
+                "capturing_outputs"
+              ]
+            },
+            "to": {
+              "const": "cancelling"
+            },
+            "reason": {
+              "$ref": "#/$defs/OrdinaryCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "step"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
           ]
         },
-        "to": {
-          "const": "cancelling"
-        },
-        "reason": {
-          "$ref": "#/$defs/RuntimeCancellationReason"
-        },
-        "failurePolicy": {
-          "$ref": "#/$defs/FailurePolicy"
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "enum": [
+                "starting",
+                "running",
+                "capturing_outputs"
+              ]
+            },
+            "to": {
+              "const": "cancelling"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "finalizer"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
+          ]
         }
-      },
-      "required": [
-        "eventVersion",
-        "eventType",
-        "transitionSequence",
-        "stepId",
-        "failurePolicy",
-        "from",
-        "to",
-        "reason"
       ]
     },
     "CancelledStepTransitionEvent": {
@@ -1313,10 +1608,13 @@
               "const": "cancelled"
             },
             "reason": {
-              "$ref": "#/$defs/RuntimeCancellationReason"
+              "$ref": "#/$defs/OrdinaryCancellationReason"
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "step"
             }
           },
           "required": [
@@ -1324,6 +1622,95 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "finalizer"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "cancelling"
+            },
+            "to": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "$ref": "#/$defs/OrdinaryCancellationReason"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "step"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to",
@@ -1357,6 +1744,9 @@
             },
             "failurePolicy": {
               "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "const": "finalizer"
             }
           },
           "required": [
@@ -1364,6 +1754,7 @@
             "eventType",
             "transitionSequence",
             "stepId",
+            "role",
             "failurePolicy",
             "from",
             "to",
@@ -1569,6 +1960,370 @@
             "from",
             "to"
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingFailureStoppedState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowSucceededState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedAfterCancellationState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowCancelledState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowSucceededState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedAfterCancellationState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowFinalizingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowCancelledState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
         }
       ]
     },
@@ -1586,7 +2341,7 @@
           "$ref": "#/$defs/positiveSequence"
         },
         "reason": {
-          "$ref": "#/$defs/RuntimeCancellationReason"
+          "$ref": "#/$defs/OrdinaryCancellationReason"
         },
         "deadline": {
           "$ref": "#/$defs/utcTimestamp"
@@ -1625,6 +2380,12 @@
         },
         {
           "$ref": "#/$defs/CancellationAcceptedEvent"
+        },
+        {
+          "$ref": "#/$defs/FinalizationCancellationAcceptedEvent"
+        },
+        {
+          "$ref": "#/$defs/ForceAbortAcceptedEvent"
         }
       ]
     },
@@ -1636,6 +2397,9 @@
           "properties": {
             "outcome": {
               "const": "succeeded"
+            },
+            "finalization": {
+              "$ref": "#/$defs/FinalizationSummary"
             }
           },
           "required": [
@@ -1649,6 +2413,9 @@
             "outcome": {
               "const": "failed"
             },
+            "finalization": {
+              "$ref": "#/$defs/FinalizationSummary"
+            },
             "failure": {
               "$ref": "#/$defs/WorkflowFailure"
             }
@@ -1657,6 +2424,519 @@
             "outcome",
             "failure"
           ]
+        }
+      ]
+    },
+    "NodeRole": {
+      "enum": [
+        "step",
+        "finalizer"
+      ]
+    },
+    "WorkflowNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stepId"
+        },
+        "role": {
+          "$ref": "#/$defs/NodeRole"
+        }
+      },
+      "required": [
+        "id",
+        "role"
+      ]
+    },
+    "WorkflowFinalizingOpenState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "finalizing"
+        },
+        "trigger": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "gate": {
+          "const": "open"
+        },
+        "primaryFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        }
+      },
+      "required": [
+        "state",
+        "trigger",
+        "gate"
+      ]
+    },
+    "WorkflowFinalizingCancellingState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "finalizing"
+        },
+        "trigger": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "gate": {
+          "const": "cancelling"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        },
+        "forceStopDeadline": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "forceAbort": {
+          "type": "boolean"
+        },
+        "primaryFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        }
+      },
+      "required": [
+        "state",
+        "trigger",
+        "gate",
+        "reason",
+        "forceAbort"
+      ]
+    },
+    "FinalizationCancellationAcceptedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "finalization_cancellation_accepted"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "reason": {
+          "$ref": "#/$defs/OrdinaryCancellationReason"
+        },
+        "deadline": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "reason",
+        "deadline"
+      ]
+    },
+    "ForceAbortAcceptedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "force_abort_accepted"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "reason": {
+          "const": "finalization_force_abort"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "reason"
+      ]
+    },
+    "FinalizerTerminalResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "state": {
+              "const": "succeeded"
+            }
+          },
+          "required": [
+            "id",
+            "role",
+            "failurePolicy",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "state": {
+              "const": "failed"
+            },
+            "failure": {
+              "$ref": "#/$defs/StepFailureEvidence"
+            }
+          },
+          "required": [
+            "id",
+            "role",
+            "failurePolicy",
+            "state",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "state": {
+              "const": "blocked"
+            },
+            "reason": {
+              "const": "input_unavailable"
+            },
+            "unavailableReferences": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1024,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            }
+          },
+          "required": [
+            "id",
+            "role",
+            "failurePolicy",
+            "state",
+            "reason",
+            "unavailableReferences"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "state": {
+              "const": "not_run"
+            },
+            "reason": {
+              "const": "finalizer_trigger_not_selected"
+            }
+          },
+          "required": [
+            "id",
+            "role",
+            "failurePolicy",
+            "state",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "state": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            }
+          },
+          "required": [
+            "id",
+            "role",
+            "failurePolicy",
+            "state",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "FinalizationIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/stepId"
+            },
+            "role": {
+              "const": "finalizer"
+            }
+          },
+          "required": [
+            "id",
+            "role"
+          ]
+        },
+        "impact": {
+          "$ref": "#/$defs/FailurePolicy"
+        }
+      },
+      "required": [
+        "node",
+        "impact"
+      ]
+    },
+    "FinalizationCancellation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "enum": [
+                "user_request",
+                "termination_request",
+                "caller_output_failure",
+                "runner_shutdown",
+                "execution_lease_expired"
+              ]
+            },
+            "forceStopDeadline": {
+              "$ref": "#/$defs/utcTimestamp"
+            }
+          },
+          "required": [
+            "reason",
+            "forceStopDeadline"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "const": "finalization_force_abort"
+            }
+          },
+          "required": [
+            "reason"
+          ]
+        }
+      ]
+    },
+    "FinalizationSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "trigger": {
+              "enum": [
+                "succeeded",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "finalizers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/FinalizerTerminalResult"
+              }
+            },
+            "issues": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/FinalizationIssue"
+              }
+            },
+            "cancellation": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "user_request",
+                    "termination_request",
+                    "caller_output_failure",
+                    "runner_shutdown",
+                    "execution_lease_expired"
+                  ]
+                },
+                "forceStopDeadline": {
+                  "$ref": "#/$defs/utcTimestamp"
+                }
+              },
+              "required": [
+                "reason",
+                "forceStopDeadline"
+              ]
+            },
+            "forceAbort": {
+              "const": false
+            }
+          },
+          "required": [
+            "trigger",
+            "finalizers",
+            "issues",
+            "forceAbort"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "trigger": {
+              "enum": [
+                "succeeded",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "finalizers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/FinalizerTerminalResult"
+              }
+            },
+            "issues": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/FinalizationIssue"
+              }
+            },
+            "cancellation": {
+              "$ref": "#/$defs/FinalizationCancellation"
+            },
+            "forceAbort": {
+              "const": true
+            }
+          },
+          "required": [
+            "trigger",
+            "finalizers",
+            "issues",
+            "cancellation",
+            "forceAbort"
+          ]
+        }
+      ]
+    },
+    "WorkflowCancelledOutcome": {
+      "allOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "const": "cancelled"
+            },
+            "finalization": {
+              "$ref": "#/$defs/FinalizationSummary"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "RunnerShutdownCancelledOutcome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/WorkflowCancelledOutcome"
+        },
+        {
+          "properties": {
+            "reason": {
+              "const": "runner_shutdown"
+            }
+          }
+        }
+      ]
+    },
+    "ExecutionLeaseExpiredCancelledOutcome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/WorkflowCancelledOutcome"
+        },
+        {
+          "properties": {
+            "reason": {
+              "const": "execution_lease_expired"
+            }
+          }
         }
       ]
     },
@@ -1787,13 +3067,17 @@
                 },
                 "outcome": {
                   "$ref": "#/$defs/WorkflowTerminalOutcome"
+                },
+                "artifactDelivery": {
+                  "$ref": "#/$defs/ArtifactDeliveryResult"
                 }
               },
               "required": [
                 "assignmentId",
                 "attemptId",
                 "finalExecutionEventSequence",
-                "outcome"
+                "outcome",
+                "artifactDelivery"
               ]
             },
             "type": {
@@ -1830,20 +3114,10 @@
                       "const": "graceful_shutdown"
                     },
                     "terminalOutcome": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "properties": {
-                        "outcome": {
-                          "const": "cancelled"
-                        },
-                        "reason": {
-                          "const": "runner_shutdown"
-                        }
-                      },
-                      "required": [
-                        "outcome",
-                        "reason"
-                      ]
+                      "$ref": "#/$defs/RunnerShutdownCancelledOutcome"
+                    },
+                    "artifactDelivery": {
+                      "$ref": "#/$defs/ArtifactDeliveryResult"
                     }
                   },
                   "required": [
@@ -1851,7 +3125,8 @@
                     "attemptId",
                     "finalExecutionEventSequence",
                     "reason",
-                    "terminalOutcome"
+                    "terminalOutcome",
+                    "artifactDelivery"
                   ]
                 },
                 {
@@ -1871,20 +3146,10 @@
                       "const": "execution_lease_expired"
                     },
                     "terminalOutcome": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "properties": {
-                        "outcome": {
-                          "const": "cancelled"
-                        },
-                        "reason": {
-                          "const": "execution_lease_expired"
-                        }
-                      },
-                      "required": [
-                        "outcome",
-                        "reason"
-                      ]
+                      "$ref": "#/$defs/ExecutionLeaseExpiredCancelledOutcome"
+                    },
+                    "artifactDelivery": {
+                      "$ref": "#/$defs/ArtifactDeliveryResult"
                     }
                   },
                   "required": [
@@ -1892,7 +3157,8 @@
                     "attemptId",
                     "finalExecutionEventSequence",
                     "reason",
-                    "terminalOutcome"
+                    "terminalOutcome",
+                    "artifactDelivery"
                   ]
                 }
               ]
@@ -2031,6 +3297,313 @@
       ],
       "unevaluatedProperties": false
     },
+    "PiJsonV1ProtocolRejectionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "frame_too_large",
+            "frame_decode_failed",
+            "frame_not_object",
+            "session_header_invalid",
+            "event_type_invalid",
+            "session_event_repeated",
+            "event_after_settlement",
+            "event_after_result_acceptance",
+            "event_shape_invalid",
+            "event_transition_invalid",
+            "assistant_message_invalid",
+            "assistant_update_invalid",
+            "assistant_update_subtype_invalid",
+            "assistant_update_content_index_invalid",
+            "assistant_update_partial_mismatch",
+            "assistant_active_message_mismatch",
+            "assistant_stable_fields_changed",
+            "assistant_update_open_block_mismatch",
+            "assistant_update_content_index_mismatch",
+            "assistant_content_transition_invalid",
+            "thinking_finalization_rewrite",
+            "message_end_open_block_mismatch",
+            "message_end_content_mismatch",
+            "tool_correlation_invalid",
+            "result_correlation_invalid",
+            "terminal_invariant_invalid",
+            "end_of_stream_invariant_invalid",
+            "partial_frame_at_end_of_stream",
+            "retained_state_limit_exceeded"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "frame_read",
+            "frame_decode",
+            "session_header",
+            "event_envelope",
+            "event_payload",
+            "assistant_update",
+            "assistant_transition",
+            "result_correlation",
+            "terminal_validation",
+            "end_of_stream"
+          ]
+        },
+        "outerEvent": {
+          "enum": [
+            "session",
+            "agent_start",
+            "agent_end",
+            "agent_settled",
+            "turn_start",
+            "turn_end",
+            "message_start",
+            "message_update",
+            "message_end",
+            "tool_execution_start",
+            "tool_execution_update",
+            "tool_execution_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "compaction_start",
+            "compaction_end",
+            "summarization_retry_scheduled",
+            "summarization_retry_attempt_start",
+            "summarization_retry_finished",
+            "queue_update",
+            "entry_appended",
+            "session_info_changed",
+            "thinking_level_changed",
+            "bash_execution_update",
+            "unrecognized"
+          ]
+        },
+        "assistantUpdate": {
+          "enum": [
+            "text_start",
+            "text_delta",
+            "text_end",
+            "thinking_start",
+            "thinking_delta",
+            "thinking_end",
+            "toolcall_start",
+            "toolcall_delta",
+            "toolcall_end",
+            "unrecognized"
+          ]
+        },
+        "contentIndex": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sessionHeaderSeen": { "type": "boolean" },
+            "agentStarted": { "type": "boolean" },
+            "activeAttempt": { "type": "boolean" },
+            "activeTurn": { "type": "boolean" },
+            "activeMessage": { "enum": ["none", "assistant", "other"] },
+            "activeAssistantContentBlocks": {
+              "$ref": "#/$defs/nonnegativeSequence"
+            },
+            "assistantUpdateSeen": { "type": "boolean" },
+            "openBlock": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "enum": ["text", "thinking", "tool_call"] },
+                "contentIndex": { "$ref": "#/$defs/nonnegativeSequence" }
+              },
+              "required": ["kind", "contentIndex"]
+            },
+            "resultAccepted": { "type": "boolean" },
+            "settled": { "type": "boolean" }
+          },
+          "required": [
+            "sessionHeaderSeen",
+            "agentStarted",
+            "activeAttempt",
+            "activeTurn",
+            "activeMessage",
+            "assistantUpdateSeen",
+            "resultAccepted",
+            "settled"
+          ]
+        }
+      },
+      "required": ["reason", "stage", "state"]
+    },
+    "ClaudeCodeStreamJsonV1ProtocolRejectionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "frame_too_large",
+            "frame_decode_failed",
+            "frame_not_object",
+            "initialization_invalid",
+            "exchange_initialization_missing",
+            "exchange_lifecycle_invalid",
+            "event_envelope_invalid",
+            "session_correlation_invalid",
+            "stream_event_envelope_invalid",
+            "active_stream_parent_mismatch",
+            "message_start_invalid",
+            "message_transition_invalid",
+            "content_block_start_invalid",
+            "content_block_delta_invalid",
+            "content_block_stop_invalid",
+            "content_block_index_mismatch",
+            "content_block_type_transition_invalid",
+            "content_block_correlation_invalid",
+            "assistant_event_invalid",
+            "user_event_invalid",
+            "system_event_invalid",
+            "tool_progress_event_invalid",
+            "result_correlation_invalid",
+            "terminal_drain_event_invalid",
+            "end_of_stream_invariant_invalid",
+            "partial_frame_at_end_of_stream",
+            "retained_state_limit_exceeded"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "frame_read",
+            "frame_decode",
+            "initialization",
+            "exchange_lifecycle",
+            "event_envelope",
+            "session_correlation",
+            "stream_event_envelope",
+            "active_stream_parent",
+            "message_start",
+            "message_transition",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "assistant_event",
+            "user_event",
+            "system_event",
+            "tool_progress_event",
+            "result_correlation",
+            "terminal_drain",
+            "end_of_stream"
+          ]
+        },
+        "outerEvent": {
+          "enum": [
+            "system",
+            "stream_event",
+            "assistant",
+            "user",
+            "rate_limit_event",
+            "tool_progress",
+            "result",
+            "unrecognized"
+          ]
+        },
+        "streamEvent": {
+          "enum": [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "unrecognized"
+          ]
+        },
+        "contentIndex": { "$ref": "#/$defs/nonnegativeSequence" },
+        "contentBlock": {
+          "enum": ["text", "thinking", "tool_use", "unrecognized"]
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "initialized": { "type": "boolean" },
+            "exchangeInitialized": { "type": "boolean" },
+            "exchangeActive": { "type": "boolean" },
+            "completedExchanges": { "$ref": "#/$defs/nonnegativeSequence" },
+            "activeMessage": { "enum": ["none", "main", "subagent"] },
+            "nextContentIndex": { "$ref": "#/$defs/nonnegativeSequence" },
+            "completedContentBlocks": { "$ref": "#/$defs/nonnegativeSequence" },
+            "openContentBlock": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["text", "thinking", "tool_use", "unrecognized"]
+                },
+                "contentIndex": { "$ref": "#/$defs/nonnegativeSequence" }
+              },
+              "required": ["kind", "contentIndex"]
+            },
+            "terminalMessageDeltaSeen": { "type": "boolean" },
+            "finalMainMessage": { "type": "boolean" },
+            "exchangeStructuredOutputCandidates": {
+              "$ref": "#/$defs/nonnegativeSequence"
+            },
+            "completedResultExchange": {
+              "enum": [
+                "none",
+                "candidate",
+                "ambiguous_candidate",
+                "missing_candidate",
+                "native_failure"
+              ]
+            },
+            "resultDecisionPending": { "type": "boolean" },
+            "resultAccepted": { "type": "boolean" },
+            "nativeFailure": { "type": "boolean" },
+            "retryActive": { "type": "boolean" }
+          },
+          "required": [
+            "initialized",
+            "exchangeInitialized",
+            "exchangeActive",
+            "completedExchanges",
+            "activeMessage",
+            "finalMainMessage",
+            "exchangeStructuredOutputCandidates",
+            "completedResultExchange",
+            "resultDecisionPending",
+            "resultAccepted",
+            "nativeFailure",
+            "retryActive"
+          ]
+        }
+      },
+      "required": ["reason", "stage", "state"]
+    },
+    "AgentProtocolRejectionDiagnostic": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schemaVersion": { "const": 1 },
+            "profile": { "const": "PiJsonV1" },
+            "detail": { "$ref": "#/$defs/PiJsonV1ProtocolRejectionDiagnostic" }
+          },
+          "required": ["schemaVersion", "profile", "detail"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schemaVersion": { "const": 1 },
+            "profile": { "const": "ClaudeCodeStreamJsonV1" },
+            "detail": {
+              "$ref": "#/$defs/ClaudeCodeStreamJsonV1ProtocolRejectionDiagnostic"
+            }
+          },
+          "required": ["schemaVersion", "profile", "detail"]
+        }
+      ]
+    },
     "StartStepFailureEvidence": {
       "type": "object",
       "additionalProperties": false,
@@ -2095,6 +3668,9 @@
             "agent_captured_value_too_large",
             "agent_result_settlement_failed"
           ]
+        },
+        "protocolRejection": {
+          "$ref": "#/$defs/AgentProtocolRejectionDiagnostic"
         }
       },
       "required": [
@@ -2130,6 +3706,9 @@
                 "agent_captured_value_too_large",
                 "agent_result_settlement_failed"
               ]
+            },
+            "protocolRejection": {
+              "$ref": "#/$defs/AgentProtocolRejectionDiagnostic"
             }
           },
           "required": [
@@ -2208,7 +3787,7 @@
           "const": "cancelling"
         },
         "reason": {
-          "$ref": "#/$defs/RuntimeCancellationReason"
+          "$ref": "#/$defs/OrdinaryCancellationReason"
         }
       },
       "required": [
@@ -2228,7 +3807,7 @@
           "const": "cancelling"
         },
         "reason": {
-          "$ref": "#/$defs/RuntimeCancellationReason"
+          "$ref": "#/$defs/OrdinaryCancellationReason"
         },
         "priorFailure": {
           "$ref": "#/$defs/WorkflowFailure"
@@ -2327,6 +3906,25 @@
             "output_file_count_limit_exceeded",
             "output_file_size_limit_exceeded",
             "output_total_size_limit_exceeded",
+            "output_git_carrier_count_limit_exceeded",
+            "output_git_carrier_size_limit_exceeded",
+            "output_total_git_carrier_size_limit_exceeded",
+            "output_carrier_producer_unavailable",
+            "output_git_execution_root_rebound",
+            "output_git_head_unavailable",
+            "output_git_baseline_not_ancestor",
+            "output_git_cleanliness_unavailable",
+            "output_git_workspace_dirty",
+            "output_git_tree_unavailable",
+            "output_git_required_objects_unavailable",
+            "output_git_source_authority_changed",
+            "output_git_structure_limit_exceeded",
+            "output_git_command_timed_out",
+            "output_git_bundle_generation_failed",
+            "output_git_bundle_profile_invalid",
+            "output_git_bundle_verification_failed",
+            "output_git_workspace_changed",
+            "output_git_temporary_storage_unavailable",
             "output_staging_unavailable",
             "output_task_unavailable"
           ]
@@ -2336,6 +3934,752 @@
         "phase",
         "cause"
       ]
+    },
+    "artifactSetId": {
+      "type": "string",
+      "pattern": "^ats_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "artifactCarrierId": {
+      "type": "string",
+      "pattern": "^acr_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "ArtifactRegistrationFailureCode": {
+      "enum": [
+        "storage_quota_exceeded",
+        "upload_authorization_failed",
+        "stored_object_conflict",
+        "delivery_internal_failure"
+      ]
+    },
+    "ArtifactUploadFailureCode": {
+      "enum": [
+        "upload_authorization_failed",
+        "carrier_upload_failed",
+        "result_upload_failed",
+        "stored_object_integrity_mismatch",
+        "delivery_deadline_exceeded",
+        "delivery_internal_failure"
+      ]
+    },
+    "ArtifactPreparationFailureCode": {
+      "enum": [
+        "stored_object_unavailable",
+        "stored_object_integrity_mismatch",
+        "result_invalid",
+        "artifact_set_invalid",
+        "delivery_deadline_exceeded",
+        "delivery_internal_failure"
+      ]
+    },
+    "ArtifactDeliveryFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "const": "failed" },
+            "phase": { "const": "registration" },
+            "code": { "$ref": "#/$defs/ArtifactRegistrationFailureCode" }
+          },
+          "required": ["outcome", "phase", "code"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "const": "failed" },
+            "phase": { "const": "upload" },
+            "code": { "$ref": "#/$defs/ArtifactUploadFailureCode" }
+          },
+          "required": ["outcome", "phase", "code"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "const": "failed" },
+            "phase": { "const": "preparation" },
+            "code": { "$ref": "#/$defs/ArtifactPreparationFailureCode" }
+          },
+          "required": ["outcome", "phase", "code"]
+        }
+      ]
+    },
+    "ArtifactResultConfirmationFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requestMessageId": { "$ref": "#/$defs/runnerMessageId" },
+            "outcome": { "const": "failed" },
+            "phase": { "const": "upload" },
+            "code": { "$ref": "#/$defs/ArtifactUploadFailureCode" },
+            "artifactSetId": { "$ref": "#/$defs/artifactSetId" }
+          },
+          "required": [
+            "requestMessageId", "outcome", "phase", "code", "artifactSetId"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requestMessageId": { "$ref": "#/$defs/runnerMessageId" },
+            "outcome": { "const": "failed" },
+            "phase": { "const": "preparation" },
+            "code": { "$ref": "#/$defs/ArtifactPreparationFailureCode" },
+            "artifactSetId": { "$ref": "#/$defs/artifactSetId" }
+          },
+          "required": [
+            "requestMessageId", "outcome", "phase", "code", "artifactSetId"
+          ]
+        }
+      ]
+    },
+    "ArtifactDeliveryResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "const": "prepared" },
+            "artifactSetId": { "$ref": "#/$defs/artifactSetId" }
+          },
+          "required": ["outcome", "artifactSetId"]
+        },
+        {
+          "$ref": "#/$defs/ArtifactDeliveryFailure"
+        }
+      ]
+    },
+    "portableOwnerPath": {
+      "type": "string",
+      "pattern": "^exports/[0-9]{4}$"
+    },
+    "artifactIdempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[!-~]+$"
+    },
+    "artifactMediaType": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(\\s*;\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=[^\\r\\n\\t;]+)*$"
+    },
+    "artifactSizeBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1073741824
+    },
+    "artifactResultSizeBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 202027692
+    },
+    "UploadCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "format": "uri"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "Content-Length": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,9})$"
+            },
+            "Content-Type": {
+              "$ref": "#/$defs/artifactMediaType"
+            },
+            "If-None-Match": {
+              "const": "*"
+            },
+            "X-Amz-Checksum-Sha256": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9+/]{43}=$"
+            }
+          },
+          "required": [
+            "Content-Length",
+            "Content-Type",
+            "If-None-Match",
+            "X-Amz-Checksum-Sha256"
+          ]
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "required": [
+        "url",
+        "headers",
+        "expiresAt"
+      ]
+    },
+    "RunnerArtifactCarrierRegister": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "portableOwnerPath": {
+                  "$ref": "#/$defs/portableOwnerPath"
+                },
+                "mediaType": {
+                  "$ref": "#/$defs/artifactMediaType"
+                },
+                "sizeBytes": {
+                  "$ref": "#/$defs/artifactSizeBytes"
+                },
+                "sha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "idempotencyKey": {
+                  "$ref": "#/$defs/artifactIdempotencyKey"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "portableOwnerPath",
+                "mediaType",
+                "sizeBytes",
+                "sha256",
+                "idempotencyKey"
+              ]
+            },
+            "type": {
+              "const": "artifact_carrier_register"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerArtifactCarrierConfirm": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "artifactSetId": {
+                  "$ref": "#/$defs/artifactSetId"
+                },
+                "carrierId": {
+                  "$ref": "#/$defs/artifactCarrierId"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "artifactSetId",
+                "carrierId"
+              ]
+            },
+            "type": {
+              "const": "artifact_carrier_confirm"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerArtifactResultRegister": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "sizeBytes": {
+                  "$ref": "#/$defs/artifactResultSizeBytes"
+                },
+                "sha256": {
+                  "$ref": "#/$defs/sha256"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "sizeBytes",
+                "sha256"
+              ]
+            },
+            "type": {
+              "const": "artifact_result_register"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerArtifactResultConfirm": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "artifactSetId": {
+                  "$ref": "#/$defs/artifactSetId"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "artifactSetId"
+              ]
+            },
+            "type": {
+              "const": "artifact_result_confirm"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ArtifactRegistrationFailureCode": {
+      "enum": [
+        "storage_quota_exceeded",
+        "stored_object_conflict",
+        "stored_object_integrity_mismatch",
+        "upload_authorization_failed",
+        "delivery_internal_failure"
+      ]
+    },
+    "CloudArtifactCarrierRegistration": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "artifact_carrier_registration"
+            },
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "succeeded"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "carrierId": {
+                      "$ref": "#/$defs/artifactCarrierId"
+                    },
+                    "uploadCapability": {
+                      "$ref": "#/$defs/UploadCapability"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "carrierId",
+                    "uploadCapability"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "retryable"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "failed"
+                    },
+                    "code": {
+                      "$ref": "#/$defs/ArtifactRegistrationFailureCode"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "code"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ArtifactConfirmationFailureCode": {
+      "enum": [
+        "stored_object_conflict",
+        "stored_object_integrity_mismatch",
+        "upload_authorization_failed",
+        "delivery_internal_failure"
+      ]
+    },
+    "CloudArtifactCarrierConfirmation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "artifact_carrier_confirmation"
+            },
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "confirmed"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "carrierId": {
+                      "$ref": "#/$defs/artifactCarrierId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "carrierId"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "absent"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "carrierId": {
+                      "$ref": "#/$defs/artifactCarrierId"
+                    },
+                    "uploadCapability": {
+                      "$ref": "#/$defs/UploadCapability"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "carrierId",
+                    "uploadCapability"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "retryable"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "carrierId": {
+                      "$ref": "#/$defs/artifactCarrierId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "carrierId"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "failed"
+                    },
+                    "code": {
+                      "$ref": "#/$defs/ArtifactConfirmationFailureCode"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "carrierId": {
+                      "$ref": "#/$defs/artifactCarrierId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "code",
+                    "artifactSetId",
+                    "carrierId"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudArtifactResultRegistration": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "artifact_result_registration"
+            },
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "succeeded"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "finalizationDeadline": {
+                      "$ref": "#/$defs/utcTimestamp"
+                    },
+                    "uploadCapability": {
+                      "$ref": "#/$defs/UploadCapability"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "finalizationDeadline",
+                    "uploadCapability"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "retryable"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "failed"
+                    },
+                    "code": {
+                      "$ref": "#/$defs/ArtifactRegistrationFailureCode"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "code"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudArtifactResultConfirmation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "artifact_result_confirmation"
+            },
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "confirmed"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "absent"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    },
+                    "uploadCapability": {
+                      "$ref": "#/$defs/UploadCapability"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId",
+                    "uploadCapability"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
+                      "const": "retryable"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId"
+                  ]
+                },
+                {
+                  "$ref": "#/$defs/ArtifactResultConfirmationFailure"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "FailurePolicy": {
       "enum": [

@@ -34,7 +34,18 @@ pub(crate) trait HarnessInstallationProfile {
     fn unsupported_version(version: &Self::Version) -> Self::Failure;
     fn validate_capability_output(
         output: &CommandOutput,
+        isolation: &ProbeIsolation,
+        executable: &Path,
+        version: &Self::Version,
+        profile: &Self::CompatibilityProfile,
     ) -> Result<Self::Capabilities, Self::Failure>;
+    fn capability_probe_failure(
+        _executable: &Path,
+        _version: &Self::Version,
+        _profile: &Self::CompatibilityProfile,
+    ) -> Self::Failure {
+        Self::unexecutable_failure()
+    }
     fn installation(
         parts: ValidatedInstallationParts<
             Self::Version,
@@ -109,8 +120,14 @@ pub(crate) fn validate_installation_with<Profile: HarnessInstallationProfile>(
                 Profile::CAPABILITY_PROBE_ARGUMENTS,
                 MAXIMUM_CAPABILITY_OUTPUT_BYTES,
             )
-            .map_err(|()| Profile::unexecutable_failure())?;
-        let capabilities = Profile::validate_capability_output(&capability_output)?;
+            .map_err(|()| Profile::capability_probe_failure(&executable, &version, &profile))?;
+        let capabilities = Profile::validate_capability_output(
+            &capability_output,
+            &isolation,
+            &executable,
+            &version,
+            &profile,
+        )?;
 
         Ok(Profile::installation(ValidatedInstallationParts {
             executable,
@@ -178,6 +195,10 @@ impl ProbeIsolation {
         ));
     }
 
+    pub(crate) fn directory(&self, name: &str) -> PathBuf {
+        self.filesystem.directory(name)
+    }
+
     pub(crate) fn add_literal_environment(&mut self, name: &str, value: &str) {
         self.environment
             .push((OsString::from(name), OsString::from(value)));
@@ -229,6 +250,40 @@ pub(crate) fn parse_numeric_component(component: &str) -> Option<u64> {
         return None;
     }
     component.parse().ok()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StableVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    observed: Box<str>,
+}
+
+impl StableVersion {
+    pub(crate) fn parse(observed: &str) -> Option<Self> {
+        let mut components = observed.split('.');
+        let major = parse_numeric_component(components.next()?)?;
+        let minor = parse_numeric_component(components.next()?)?;
+        let patch = parse_numeric_component(components.next()?)?;
+        if components.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            major,
+            minor,
+            patch,
+            observed: observed.into(),
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.observed
+    }
+
+    pub(crate) const fn numeric(&self) -> (u64, u64, u64) {
+        (self.major, self.minor, self.patch)
+    }
 }
 
 fn discover_executable(name: &OsStr, search_path: Option<&OsStr>) -> Option<PathBuf> {

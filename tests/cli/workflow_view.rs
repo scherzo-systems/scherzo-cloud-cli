@@ -17,11 +17,13 @@ use std::path::PathBuf;
 use std::process::{Output, Stdio};
 
 #[cfg(target_os = "linux")]
+use nix::fcntl::{FcntlArg, fcntl};
+#[cfg(target_os = "linux")]
 use nix::pty::{Winsize, openpty};
 #[cfg(target_os = "linux")]
 use nix::sys::stat::Mode;
 #[cfg(target_os = "linux")]
-use nix::unistd::mkfifo;
+use nix::unistd::{mkfifo, pipe};
 #[cfg(target_os = "linux")]
 use rustix::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -32,8 +34,18 @@ use rustix::termios::Termios;
 use super::workflow_run::isolated_command;
 #[cfg(target_os = "linux")]
 use super::workflow_run::{
-    RunBundle, open_tui_pty, run, signal_bundle, spawn_tui_run, wait_for_process_poll,
+    RunBundle, finalizer_signal_bundle, open_tui_pty, run, signal_bundle, spawn_tui_run,
+    wait_for_process_poll,
 };
+
+fn workflow_view_schema() -> jsonschema::Validator {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/workflow-view-result-v1.schema.json"
+    )))
+    .unwrap();
+    jsonschema::draft202012::new(&schema).unwrap()
+}
 
 fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
@@ -109,23 +121,216 @@ fn successful_run(name: &str) -> (RunBundle, PathBuf) {
     (bundle, run_directory)
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn view_rejects_noninteractive_presentation_options() {
-    let missing = tempfile::tempdir().unwrap().path().join("missing-run");
-    for option in ["--plain", "--json"] {
-        let output = isolated_command(&view_args(&missing, &[option]))
+fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"printf\", \"unique-retained-payload\"]\n",
+    );
+    let run_directory = bundle.result("noninteractive-success");
+    let produced = run(&bundle.args(&run_directory));
+    assert!(produced.status.success());
+    let before = durable_files(&run_directory);
+
+    let automatic = isolated_command(&view_args(&run_directory, &[]))
+        .env("TERM", "xterm")
+        .output()
+        .unwrap();
+    let explicit = isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
+        .output()
+        .unwrap();
+    assert!(automatic.status.success());
+    assert!(explicit.status.success());
+    assert_eq!(automatic.stdout, explicit.stdout);
+    assert!(automatic.stderr.is_empty());
+    assert!(explicit.stderr.is_empty());
+    assert!(!automatic.stdout.contains(&0x1b));
+    let plain = String::from_utf8(automatic.stdout).unwrap();
+    for expected in [
+        "attempt 1 of 1 · current · initial · state succeeded · outcome succeeded",
+        "workflow workflow.yaml · 1 node · concurrency 1",
+        "ordinary phase",
+        "node complete · role step · kind cmd · policy required · state succeeded",
+        "terminal counts: 1 succeeded",
+        "result succeeded",
+    ] {
+        assert!(plain.contains(expected), "missing {expected:?}: {plain:?}");
+    }
+    for excluded in [
+        "unique-retained-payload",
+        "stdout",
+        "stderr",
+        "argv",
+        "exports",
+        "observed",
+        "transition",
+    ] {
+        assert!(!plain.contains(excluded), "plain exposed {excluded:?}");
+    }
+
+    let colored = isolated_command(&view_args(
+        &run_directory,
+        &["--plain", "--color", "always"],
+    ))
+    .output()
+    .unwrap();
+    assert!(colored.status.success());
+    assert!(colored.stderr.is_empty());
+    assert!(colored.stdout.contains(&0x1b));
+    let no_color = isolated_command(&view_args(&run_directory, &["--plain"]))
+        .env("TERM", "xterm")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(no_color.status.success());
+    assert!(!no_color.stdout.contains(&0x1b));
+
+    let mut json_outputs = Vec::new();
+    for color in ["auto", "always", "never"] {
+        let output = isolated_command(&view_args(&run_directory, &["--json", "--color", color]))
             .output()
             .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(output.stdout.ends_with(b"\n"));
+        assert!(!output.stdout[..output.stdout.len() - 1].ends_with(b"\n"));
+        json_outputs.push(output.stdout);
+    }
+    assert_eq!(json_outputs[0], json_outputs[1]);
+    assert_eq!(json_outputs[1], json_outputs[2]);
+    let view: serde_json::Value = serde_json::from_slice(&json_outputs[0]).unwrap();
+    let selected_result = run_directory.join("attempts/000001/result/result.json");
+    let expected_result: serde_json::Value =
+        serde_json::from_slice(&fs::read(selected_result).unwrap()).unwrap();
+    assert!(workflow_view_schema().is_valid(&view));
+    assert_eq!(view["schemaVersion"], 1);
+    assert_eq!(view["command"], "scherzo-cloud workflow view");
+    assert_eq!(view["outcome"], "view");
+    assert_eq!(view["exitStatus"], 0);
+    assert_eq!(view["currentAttemptNumber"], 1);
+    assert_eq!(view["attemptNumber"], 1);
+    assert_eq!(view["selection"], "current");
+    assert_eq!(view["trigger"], "initial");
+    assert_eq!(view["attemptState"], "succeeded");
+    assert_eq!(view["result"], expected_result);
 
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    let (plain_pty_status, plain_pty) =
+        run_view_to_early_exit(&view_args(&run_directory, &["--plain", "--color", "never"]));
+    assert!(plain_pty_status.success());
+    assert!(plain_pty.contains("ordinary phase"));
+    assert!(!plain_pty.contains("\u{1b}[?1049h"));
+    let (json_pty_status, json_pty) =
+        run_view_to_early_exit(&view_args(&run_directory, &["--json"]));
+    assert!(json_pty_status.success());
+    assert!(serde_json::from_str::<serde_json::Value>(&json_pty).is_ok());
+    assert!(!json_pty.contains("\u{1b}[?1049h"));
+    assert_eq!(durable_files(&run_directory), before);
+}
+
+#[test]
+fn closed_workflow_view_schema_accepts_valid_and_rejects_invalid_fixtures() {
+    let validator = workflow_view_schema();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workflow-view/v1");
+    for (category, valid) in [("valid", true), ("invalid", false)] {
+        let mut fixtures = std::fs::read_dir(root.join(category))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        fixtures.sort_unstable_by_key(std::fs::DirEntry::file_name);
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(fixture.path()).unwrap()).unwrap();
+            assert_eq!(
+                validator.is_valid(&value),
+                valid,
+                "unexpected schema result for {}",
+                fixture.path().display()
+            );
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn view_capability_gate_checks_each_required_terminal_capability_before_run_reads() {
+fn workflow_view_schema_accepts_valid_tilde_workflow_path() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    fs::rename(
+        bundle.source_root().join("workflow.yaml"),
+        bundle.source_root().join("~"),
+    )
+    .unwrap();
+    let run_directory = bundle.result("tilde-workflow-path");
+    let produced = run(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "--source-root".to_owned(),
+        bundle.source_root().to_string_lossy().into_owned(),
+        "--execution-root".to_owned(),
+        bundle.execution_root().to_string_lossy().into_owned(),
+        "--run-dir".to_owned(),
+        run_directory.to_string_lossy().into_owned(),
+        bundle
+            .source_root()
+            .join("~")
+            .to_string_lossy()
+            .into_owned(),
+        "--plain".to_owned(),
+    ]);
+    assert!(
+        produced.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+
+    let viewed = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert!(viewed.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&viewed.stdout).unwrap();
+    assert_eq!(document["result"]["workflow"]["path"], "~");
+    assert!(
+        workflow_view_schema().is_valid(&document),
+        "a successful workflow view document must validate against its public schema"
+    );
+}
+
+#[test]
+fn view_accepts_explicit_noninteractive_modes_and_rejects_their_conflict() {
+    let missing = tempfile::tempdir().unwrap().path().join("missing-run");
+
+    let plain = isolated_command(&view_args(&missing, &["--plain"]))
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("run_directory_unavailable"));
+
+    let json = isolated_command(&view_args(&missing, &["--json"]))
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(1));
+    assert!(json.stderr.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&error));
+    assert_eq!(error["outcome"], "error");
+    assert_eq!(error["error"]["code"], "run_directory_unavailable");
+    assert!(error.get("runDirectory").is_none());
+
+    let conflict = isolated_command(&view_args(&missing, &["--plain", "--json"]))
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_ineligible_automatic_terminal_arrangement_continues_to_plain_loading() {
     let missing = tempfile::tempdir().unwrap().path().join("missing-run");
     let args = view_args(&missing, &[]);
     for (stdin_terminal, stdout_terminal, term) in [
@@ -138,16 +343,14 @@ fn view_capability_gate_checks_each_required_terminal_capability_before_run_read
         let output = run_with_terminal_arrangement(&args, stdin_terminal, stdout_terminal, term);
 
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(
-            output.stderr,
-            b"Error: workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>\n"
-        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("run_directory_unavailable"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("requires terminal"));
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn view_capability_gate_precedes_durable_run_reads() {
+fn an_ineligible_automatic_arrangement_continues_to_plain_loading() {
     let missing = tempfile::tempdir().unwrap().path().join("missing-run");
     let output = isolated_command(&view_args(&missing, &[]))
         .env("TERM", "xterm")
@@ -156,10 +359,7 @@ fn view_capability_gate_precedes_durable_run_reads() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"Error: workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>\n"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("run_directory_unavailable"));
 }
 
 #[cfg(target_os = "linux")]
@@ -227,7 +427,157 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
     let historical_writes = terminal_writes(&historical_transcript);
     assert!(historical_writes.contains("attempt1of2·historical·initial"));
     assert!(historical_writes.contains("attemptstateworkflow_failed·outcomefailed"));
+
+    for (options, attempt_number, selection, state, outcome) in [
+        (vec!["--json"], 2, "current", "succeeded", "succeeded"),
+        (
+            vec!["--json", "--attempt", "1"],
+            1,
+            "historical",
+            "workflow_failed",
+            "failed",
+        ),
+    ] {
+        let output = isolated_command(&view_args(&run_directory, &options))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(workflow_view_schema().is_valid(&value));
+        assert_eq!(value["currentAttemptNumber"], 2);
+        assert_eq!(value["attemptNumber"], attempt_number);
+        assert_eq!(value["selection"], selection);
+        assert_eq!(value["attemptState"], state);
+        assert_eq!(value["result"]["attemptNumber"], attempt_number);
+        assert_eq!(value["result"]["outcome"], outcome);
+    }
+    let failed_plain = isolated_command(&view_args(
+        &run_directory,
+        &["--plain", "--attempt", "1", "--color", "never"],
+    ))
+    .output()
+    .unwrap();
+    assert!(failed_plain.status.success());
+    assert!(failed_plain.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&failed_plain.stdout).contains("primary failure:"));
     assert_eq!(durable_files(&run_directory), settled_before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn archived_finalization_is_ordered_and_presented_as_a_distinct_phase() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  fail:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "exit 17"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#,
+    );
+    let run_directory = bundle.result("finalized");
+    let produced = run(&bundle.args(&run_directory));
+    assert_eq!(
+        produced.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+
+    let view = TuiSession::start(&view_args(&run_directory, &["--color", "never"]));
+    let (status, transcript) = view.finish(b"jq");
+
+    assert!(status.success());
+    let writes = terminal_writes(&transcript);
+    assert!(
+        writes.contains("finalizationtriggerfailed·0issues"),
+        "{writes:?}"
+    );
+    let plain = isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    assert!(plain.stderr.is_empty());
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("ordinary phase"));
+    assert!(plain.contains("finalization phase · trigger failed"));
+    assert!(plain.contains("node cleanup · role finalizer"));
+    assert!(plain.contains("finalization: trigger failed · 0 issues · complete"));
+    let json = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&json));
+    assert!(json["result"]["finalization"].is_object());
+    let ordinary = writes
+        .find("ordinary phase")
+        .unwrap_or_else(|| panic!("{writes:?}"));
+    let finalization = writes
+        .find("finalization phase · trigger failed")
+        .unwrap_or_else(|| panic!("{writes:?}"));
+    let finalizer = writes
+        .find("finalizer · true")
+        .unwrap_or_else(|| panic!("{writes:?}"));
+    assert!(ordinary < finalization, "{writes:?}");
+    assert!(finalization < finalizer, "{writes:?}");
+
+    let state_path = run_directory.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["attempts"][0]["finalization"]["trigger"] = serde_json::json!("succeeded");
+    let mut bytes = serde_json::to_vec_pretty(&state).unwrap();
+    bytes.push(b'\n');
+    fs::write(state_path, bytes).unwrap();
+    let (invalid_status, invalid_transcript) =
+        run_view_to_early_exit(&view_args(&run_directory, &[]));
+    assert_eq!(invalid_status.code(), Some(1));
+    assert!(invalid_transcript.contains("published_result_invalid"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn archived_finalization_cancellation_uses_the_ordinary_trigger() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bundle = finalizer_signal_bundle();
+    let run_directory = bundle.result("cancelled-finalization");
+    let child = isolated_command(&bundle.args(&run_directory))
+        .env(
+            "WORKFLOW_RUN_FIXTURE_SOCKET",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .env("WORKFLOW_RUN_FIXTURE_MODE", "signal-exit")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut control, _) = listener.accept().unwrap();
+    let mut ready = [0_u8; 1];
+    control.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
+    let produced = child.wait_with_output().unwrap();
+    assert_eq!(produced.status.code(), Some(130));
+
+    let view = TuiSession::start(&view_args(&run_directory, &["--color", "never"]));
+    let (status, transcript) = view.finish(b"q");
+
+    assert!(status.success());
+    let writes = terminal_writes(&transcript);
+    assert!(
+        writes.contains("finalizationtriggersucceeded·0issues"),
+        "{writes:?}"
+    );
+    assert!(writes.contains("user_request"), "{writes:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -335,6 +685,25 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     assert!(
         terminal_writes(&interrupted_transcript).contains("attemptstatecancelled·outcomecancelled")
     );
+
+    let plain = isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    assert!(plain.stderr.is_empty());
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("state cancelled · outcome cancelled"));
+    assert!(plain.contains("cancellation: user_request"));
+
+    let json = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&json));
+    assert_eq!(json["attemptState"], "cancelled");
+    assert_eq!(json["result"]["outcome"], "cancelled");
     assert_eq!(durable_files(&run_directory), before);
 }
 
@@ -348,6 +717,15 @@ fn view_reports_unavailable_attempts_and_results_before_terminal_ownership() {
     assert_eq!(unknown_status.code(), Some(1));
     assert!(unknown_transcript.contains("attempt 2: attempt_unknown"));
     assert!(!unknown_transcript.contains("\u{1b}[?1049h"));
+    let unknown_json = isolated_command(&view_args(&run_directory, &["--json", "--attempt", "2"]))
+        .output()
+        .unwrap();
+    assert_eq!(unknown_json.status.code(), Some(1));
+    assert!(unknown_json.stderr.is_empty());
+    let unknown_json: serde_json::Value = serde_json::from_slice(&unknown_json.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&unknown_json));
+    assert_eq!(unknown_json["attemptNumber"], 2);
+    assert_eq!(unknown_json["error"]["code"], "attempt_unknown");
 
     fs::remove_file(run_directory.join("attempts/000001/result/result.json")).unwrap();
     let (missing_status, missing_transcript) =
@@ -355,6 +733,199 @@ fn view_reports_unavailable_attempts_and_results_before_terminal_ownership() {
     assert_eq!(missing_status.code(), Some(1));
     assert!(missing_transcript.contains("published_result_unavailable"));
     assert!(!missing_transcript.contains("\u{1b}[?1049h"));
+    let missing_json = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert_eq!(missing_json.status.code(), Some(1));
+    assert!(missing_json.stderr.is_empty());
+    let missing_json: serde_json::Value = serde_json::from_slice(&missing_json.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&missing_json));
+    assert_eq!(
+        missing_json["error"]["code"],
+        "published_result_unavailable"
+    );
+    assert!(missing_json.get("attemptNumber").is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signals_abandon_blocked_plain_and_json_output_without_replacement() {
+    let mut workflow = String::from("schemaVersion: 1\nsteps:\n");
+    for index in 0..64 {
+        workflow.push_str(&format!(
+            "  node{index:03}LongIdentity:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+        ));
+    }
+    let bundle = RunBundle::new(&workflow);
+    let run_directory = bundle.result("blocked-view-output");
+    let produced = run(&bundle.args(&run_directory));
+    assert!(
+        produced.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+    let before = durable_files(&run_directory);
+
+    let complete_plain =
+        isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
+            .output()
+            .unwrap()
+            .stdout;
+    let complete_json = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(complete_plain.len() > 4096);
+    assert!(complete_json.len() > 4096);
+
+    for (mode, complete) in [
+        ("--plain", complete_plain.as_slice()),
+        ("--json", complete_json.as_slice()),
+    ] {
+        for (signal, expected_status) in [(Signal::INT, 130), (Signal::TERM, 143)] {
+            let (mut reader, writer) = small_output_pipe();
+            let mut child =
+                isolated_command(&view_args(&run_directory, &[mode, "--color", "never"]))
+                    .stdout(Stdio::from(writer))
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+            let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+            let mut prefix = vec![0_u8; 1];
+            reader.read_exact(&mut prefix).unwrap();
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the complete document must not fit in the bounded unread pipe"
+            );
+
+            kill_process(process, signal).unwrap();
+            let status = wait_for_exit(&mut child, "signal during blocked workflow view output");
+            assert_eq!(status.code(), Some(expected_status));
+            reader.read_to_end(&mut prefix).unwrap();
+            assert!(!prefix.is_empty());
+            assert!(prefix.len() < complete.len());
+            assert_eq!(prefix, complete[..prefix.len()]);
+            if mode == "--json" {
+                assert!(serde_json::from_slice::<serde_json::Value>(&prefix).is_err());
+            } else {
+                assert!(!String::from_utf8_lossy(&prefix).contains("result succeeded"));
+            }
+        }
+    }
+    assert_eq!(durable_files(&run_directory), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blocked_json_view_holds_its_snapshot_without_blocking_status_or_retry() {
+    let argv = serde_json::to_string(&[
+        "sh",
+        "-c",
+        "if test -f first-attempt-complete; then printf current-success; else head -c 100000 /dev/zero; : > first-attempt-complete; exit 17; fi",
+    ])
+    .unwrap();
+    let bundle = RunBundle::new(&format!(
+        "schemaVersion: 1\nsteps:\n  execute:\n    kind: cmd\n    command:\n      argv: {argv}\n"
+    ));
+    let run_directory = bundle.result("blocked-view-concurrency");
+    let initial = run(&bundle.args(&run_directory));
+    assert_eq!(initial.status.code(), Some(1));
+
+    let (mut reader, writer) = small_output_pipe();
+    let mut view = isolated_command(&view_args(&run_directory, &["--json"]))
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = vec![0_u8; 1];
+    reader.read_exact(&mut output).unwrap();
+    assert!(view.try_wait().unwrap().is_none());
+
+    let status = isolated_command(&status_args(&run_directory))
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["state"]["currentAttemptNumber"],
+        1
+    );
+    let retried = run(&retry_args(&run_directory, bundle.execution_root()));
+    assert!(
+        retried.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr)
+    );
+
+    reader.read_to_end(&mut output).unwrap();
+    let view_status = wait_for_exit(&mut view, "draining a held workflow view snapshot");
+    assert!(view_status.success());
+    let viewed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(viewed["currentAttemptNumber"], 1);
+    assert_eq!(viewed["attemptNumber"], 1);
+    assert_eq!(viewed["attemptState"], "workflow_failed");
+    assert_eq!(viewed["result"]["attemptNumber"], 1);
+    assert_eq!(viewed["result"]["outcome"], "failed");
+
+    let after = isolated_command(&status_args(&run_directory))
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&after.stdout).unwrap()["state"]["currentAttemptNumber"],
+        2
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn broken_plain_and_json_destinations_fail_without_mutating_the_run() {
+    let (_bundle, run_directory) = successful_run("broken-view-output");
+    let before = durable_files(&run_directory);
+
+    for mode in ["--plain", "--json"] {
+        let (reader, writer) = pipe().unwrap();
+        drop(reader);
+        let output = isolated_command(&view_args(&run_directory, &[mode]))
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("write workflow view output"));
+    }
+    assert_eq!(durable_files(&run_directory), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signals_abandon_blocked_plain_and_json_archive_loading() {
+    for (mode, signal, expected_status) in
+        [("--plain", Signal::INT, 130), ("--json", Signal::TERM, 143)]
+    {
+        let (_bundle, run_directory) = successful_run(&format!("blocked-read-{mode}"));
+        let before = durable_files(&run_directory);
+        let run_file = run_directory.join("run.json");
+        let original_run = fs::read(&run_file).unwrap();
+        fs::remove_file(&run_file).unwrap();
+        mkfifo(&run_file, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        let mut child = isolated_command(&view_args(&run_directory, &[mode]))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        wait_for_loader_worker(process);
+        kill_process(process, signal).unwrap();
+        let status = wait_for_exit(&mut child, "signal during blocked archive loading");
+        assert_eq!(status.code(), Some(expected_status));
+
+        fs::remove_file(&run_file).unwrap();
+        fs::write(&run_file, &original_run).unwrap();
+        assert_eq!(durable_files(&run_directory), before);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -371,22 +942,7 @@ fn signal_interrupts_a_blocked_archive_read_without_waiting_for_filesystem_compl
     let (mut child, master_writer, reader) =
         spawn_tui_run(&view_args(&run_directory, &[]), master, &slave);
     let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-    let tasks = Path::new("/proc")
-        .join(process.as_raw_pid().to_string())
-        .join("task");
-    let loader_started = (0..500).any(|_| {
-        let started = fs::read_dir(&tasks)
-            .ok()
-            .is_some_and(|threads| threads.count() > 1);
-        if !started {
-            wait_for_process_poll();
-        }
-        started
-    });
-    assert!(
-        loader_started,
-        "archive loader did not start its filesystem worker"
-    );
+    wait_for_loader_worker(process);
 
     kill_process(process, Signal::INT).unwrap();
     let status = wait_for_exit(&mut child, "signal during blocked archive read");
@@ -495,6 +1051,34 @@ impl TuiSession {
         assert!(!transcript[restored..].contains("result succeeded · exit 0"));
         (status, transcript)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_loader_worker(process: Pid) {
+    let tasks = Path::new("/proc")
+        .join(process.as_raw_pid().to_string())
+        .join("task");
+    let loader_started = (0..500).any(|_| {
+        let started = fs::read_dir(&tasks)
+            .ok()
+            .is_some_and(|threads| threads.count() > 1);
+        if !started {
+            wait_for_process_poll();
+        }
+        started
+    });
+    assert!(
+        loader_started,
+        "archive loader did not start its filesystem worker"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn small_output_pipe() -> (fs::File, OwnedFd) {
+    let (reader, writer) = pipe().unwrap();
+    let capacity = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
+    assert_eq!(capacity, 4096);
+    (fs::File::from(reader), writer)
 }
 
 #[cfg(target_os = "linux")]

@@ -10,10 +10,20 @@ required_files=(
   CONTRIBUTING.md
   SECURITY.md
   LICENSE
+  .config/nextest.toml
   changes/README.md
   release.toml
   schemas/workflow-status-result-v1.schema.json
   schemas/workflow-v1.schema.json
+  schemas/workflow-view-result-v1.schema.json
+  tests/fixtures/workflow-view/v1/valid/success-current.json
+  tests/fixtures/workflow-view/v1/valid/error-operational.json
+  tests/fixtures/workflow-view/v1/valid/error-attempt.json
+  tests/fixtures/workflow-view/v1/invalid/success-extra-property.json
+  tests/fixtures/workflow-view/v1/invalid/success-inconsistent-outcome.json
+  tests/fixtures/workflow-view/v1/invalid/error-operational-attempt-identity.json
+  tests/fixtures/workflow-view/v1/invalid/error-attempt-missing-identity.json
+  tests/fixtures/workflow-view/v1/invalid/error-empty-message.json
   .github/workflows/check.yml
   Cargo.toml
   Cargo.lock
@@ -22,6 +32,7 @@ required_files=(
   devenv.yaml
   devenv.lock
   scripts/check
+  scripts/check-suite
   scripts/check-change-fragments
   scripts/check-help-output-style
   scripts/check-lint-policy
@@ -29,6 +40,7 @@ required_files=(
   scripts/check-pi-json-v1-extension
   scripts/check-structure
   scripts/strict-devenv
+  scripts/test-strict-devenv
   scripts/classify-release-path
   scripts/format-pi-json-v1-extension
   scripts/reconcile-release
@@ -37,7 +49,6 @@ required_files=(
   scripts/test-release-allocation
   scripts/test-release-impact
   scripts/test-release-path-classifier
-  scripts/test-strict-devenv
   scripts/verify-release-allocation
   src/execution/workflow/pi-json-v1-extension/package.json
   src/execution/workflow/pi-json-v1-extension/package-lock.json
@@ -99,7 +110,6 @@ for raw_path in sys.argv[1:]:
     compile(path.read_text(), str(path), "exec")
 PY
 
-"$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/test-fixture-git"
 "$public_root/scripts/test-git-isolation-check"
 "$public_root/scripts/check-test-git-isolation"

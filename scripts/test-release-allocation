@@ -172,8 +172,20 @@ def canonical_diff(repository: Path, base: str, candidate: str) -> bytes:
     )
 
 
+def legacy_release_asset_names(version: str) -> list[str]:
+    return sorted(
+        [
+            "SHA256SUMS",
+            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
+        ],
+        key=os.fsencode,
+    )
+
+
 def release_document(
-    module: ModuleType,
     tag: str,
     *,
     commit: str,
@@ -181,7 +193,9 @@ def release_document(
     identifier: int,
 ) -> dict[str, object]:
     assets = []
-    for index, name in enumerate(module.expected_asset_names(tag.removeprefix("v")), start=1):
+    for index, name in enumerate(
+        legacy_release_asset_names(tag.removeprefix("v")), start=1
+    ):
         value = f"prior-{name}".encode("ascii")
         assets.append(
             {
@@ -238,7 +252,6 @@ class Fixture:
 
     def reset_provider(self) -> None:
         prior = release_document(
-            self.module,
             "v0.1.0",
             commit=self.base,
             body="Prior fixture release.\n",
@@ -253,6 +266,8 @@ class Fixture:
                 "next_asset_id": 2000,
                 "writes": [],
                 "fail_upload_once": False,
+                "hide_created_tag_queries": 0,
+                "tag_visibility_queries": {},
                 "hide_created_release_queries": 0,
             }
         )
@@ -344,7 +359,6 @@ def build_fixture(module: ModuleType, root: Path, *, recoveries: int = 0, tamper
     git(source, "add", "--all")
     allocated_tree = git(source, "write-tree").decode().strip()
     prior = release_document(
-        module,
         "v0.1.0",
         commit=base,
         body="Prior fixture release.\n",
@@ -588,6 +602,7 @@ if args[0] == "api":
         if tag in state["tags"]:
             raise SystemExit("tag already exists")
         state["tags"][tag] = target
+        state["tag_visibility_queries"][tag] = state["hide_created_tag_queries"]
         subprocess.run(["git", f"--git-dir={state['git_remote']}", "update-ref", ref, target], check=True)
         state["writes"].append("create-tag")
         save()
@@ -596,6 +611,11 @@ if args[0] == "api":
     if "/git/ref/tags/" in endpoint:
         tag = endpoint.rsplit("/", 1)[1]
         target = state["tags"].get(tag)
+        remaining = state["tag_visibility_queries"].get(tag, 0)
+        if remaining > 0:
+            state["tag_visibility_queries"][tag] = remaining - 1
+            save()
+            die404()
         if target is None:
             die404()
         print(json.dumps({"ref": f"refs/tags/{tag}", "object": {"type": "commit", "sha": target}}))
@@ -756,7 +776,6 @@ def make_dist(root: Path, version: str = "0.1.1") -> Path:
     targets = (
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
         "x86_64-unknown-linux-gnu",
     )
     archives: list[Path] = []
@@ -848,6 +867,15 @@ def prove_partial_and_transient(module: ModuleType, root: Path) -> None:
     reconciliation_command(partial, dist, "apply")
     if partial.state()["tags"]["v0.1.1"] != partial.allocated:
         fail("partial-tag reconciliation moved the allocated tag")
+
+    delayed_tag = build_fixture(module, root / "delayed-tag")
+    delayed_tag_dist = make_dist(delayed_tag.root)
+    state = delayed_tag.state()
+    state["hide_created_tag_queries"] = 1
+    delayed_tag.write_state(state)
+    reconciliation_command(delayed_tag, delayed_tag_dist, "apply")
+    if delayed_tag.state()["tags"].get("v0.1.1") != delayed_tag.allocated:
+        fail("eventually visible stable tag did not reconcile")
 
     delayed = build_fixture(module, root / "delayed")
     delayed_dist = make_dist(delayed.root)
@@ -1086,13 +1114,24 @@ def prove_workflow_contract(module: ModuleType) -> None:
         "ref: ${{ needs.verify_release.outputs.allocated_mirror }}",
         "contents: write",
         "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
-        "ubuntu-24.04-arm",
-        "macos-15-intel",
-        "aarch64-apple-darwin",
+        "- runner: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu",
+        "- runner: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu",
+        "- runner: macos-15\n            target: aarch64-apple-darwin",
     )
     for value in required:
         if value not in workflow:
             fail(f"public workflow omits allocation execution boundary: {value}")
+    matrix_targets = sorted(
+        line.partition("target: ")[2]
+        for line in workflow.splitlines()
+        if line.lstrip().startswith("target: ")
+    )
+    if matrix_targets != [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ]:
+        fail("public workflow release matrix differs from the three supported targets")
     if "plan_release:" in workflow or "./scripts/plan-release" in workflow:
         fail("public workflow retains mutable release planning")
     if workflow.count("release-allocations/**") != 1 or workflow.count("release-recoveries/**") != 1:

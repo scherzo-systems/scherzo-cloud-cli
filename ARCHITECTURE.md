@@ -5,17 +5,17 @@
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
-authentication status, explicit human-principal signup, local logout, organization
+authentication status, explicit human-principal signup, revoking logout, organization
 profile management, one-page active member-directory reads, local Workflow V1
 definition validation, and an outbound, enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
-acknowledges received assignment effects, and uses the shared workflow resolver and
-admission boundary to accept one configured local command workflow. Execution remains
-separately authorized by a later start effect and is not part of the current service.
-`scherzo-cloud runner doctor` performs one default local Git check and can explicitly
-check the `pi` and `claude` installations selected independently from inherited `PATH`
-for the closed `PiJsonV1` and `ClaudeCodeStreamJsonV1` profiles; it does not claim that
-the runner is ready to execute assignments.
+acknowledges received assignment effects, and uses the shared workflow resolver,
+admission boundary, and execution engine for one configured inputless command, Pi,
+Claude Code, or mixed workflow. Semantic acceptance reserves the runner's single local
+assignment slot; a matching later start effect authorizes execution. `scherzo-cloud runner doctor` performs one
+default local Git check and can explicitly check the `pi` and `claude` installations
+selected independently from inherited `PATH`; passing those checks establishes only the
+closed `PiJsonV1` or `ClaudeCodeStreamJsonV1` installation, not complete runner readiness.
 
 ## One executable with separate roles
 
@@ -25,8 +25,8 @@ entrypoint will dispatch to components with distinct responsibilities:
 - human-facing commands will perform short-lived public API operations;
 - the public API client will encode requests and decode responses from versioned
   generated assets;
-- the runner service will maintain an outbound connection, advertise capacity, accept
-  assignments, and report observations;
+- the runner service will maintain an outbound connection, enforce its single-assignment
+  limit, accept assignments, and report observations;
 - the runner protocol component will encode, order, acknowledge, and validate runner
   messages; and
 - the new Scherzo Cloud execution engine will implement the one-run contract,
@@ -80,7 +80,7 @@ only so an environment-based launcher can resolve its interpreter; they never us
 select another harness candidate.
 
 Pi maps canonical stable versions in `>=0.83.0 <0.84.0` into
-`ValidatedPiInstallation`. Claude Code accepts only exact `2.1.222` and maps it into
+`ValidatedPiInstallation`. Claude Code accepts only exact `2.1.234` and maps it into
 `ValidatedClaudeCodeInstallation`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission
 inspect the resolved workflow and require only the installation selected by each agent
@@ -141,42 +141,49 @@ isolation, artifact size, or independent release cadence creates a demonstrated 
 Human commands and the runner use different security identities.
 
 Human commands use the credential implementation beneath `src/human_auth/`. The store
-binds each short-lived access token to the exact API URL, issuer, audience, and public
-client ID that issued it. It rejects symbolic links, unexpected ownership or modes,
-malformed schemas, duplicate fingerprints, and oversized tokens; serializes access with
-a bounded inter-process lock; and atomically replaces files using user-private modes.
-Local logout removes only the active deployment's entry and never contacts the network.
+binds each renewable access-and-refresh credential to the exact API URL, issuer,
+audience, and public client ID that issued it. It rejects symbolic links, unexpected
+ownership or modes, malformed schemas, duplicate fingerprints, and oversized tokens;
+serializes file access with a bounded inter-process lock; and atomically replaces files
+using user-private modes. Refresh, replacement login, rejection cleanup, and logout use
+an additional lock derived from the exact deployment fingerprint.
 
 Human login uses OAuth Device Authorization so the browser may run on a different
 machine from the CLI; the CLI does not require an inbound connection or loopback
 callback. It displays the short-lived activation URL and user code, keeps the private
-device code and OAuth tokens out of command output and logs, and polls the authorization
-server until the transaction finishes. Polling honors the server interval, slows down
-when directed, stops at the transaction deadline, and remains interruptible while
-waiting.
+device code and OAuth tokens out of command output and logs, requests `offline_access`,
+and polls the authorization server until the transaction finishes. Polling honors the
+server interval, slows down when directed, stops at the transaction deadline, and remains
+interruptible while waiting. A successful exchange must include a refresh token.
 
 After OAuth login, the CLI asks the public API whether the identity is linked to a
 principal. The successful response is an envelope containing the base principal and
 optional actions. Authentication status preserves complete action values as opaque JSON
 without validating their IDs, kinds, origins, fields, or command-shaped content. It
 never retrieves a guide or executes an action. The CLI persists the short-lived access
-token before confirmation so a temporary API failure does not require another browser
-flow. Login alone never creates a principal. An onboarding agent may invoke the separate
-signup command only after reporting that signup is required and obtaining explicit human
+token, expiration, and refresh token atomically before confirmation so a temporary
+API failure does not require another browser flow. Login alone never creates a principal.
+An onboarding agent may invoke the separate signup command only after reporting that
+signup is required and obtaining explicit human
 approval. `scherzo-cloud account signup` uses the existing human credential, creates
 one opaque idempotency key per invocation, and retries an ambiguous transport failure
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
 
-The `organization create`, `show`, `update`, and `members list` commands use that same
-selected human OAuth credential boundary and no other identity source. A shared command
-adapter selects the exact deployment credential and conditionally removes only the token
-rejected by HTTP 401. Create and update serialize their request once and retry at most
-one ambiguous transport failure under one in-memory idempotency key. Reads make one
+The status, signup, organization, and runner cloud-administration commands use that same
+human-session acquisition path and no other identity source. It silently refreshes
+expired or near-expiry access tokens, refreshes once after HTTP 401, and retries the API
+operation once. A refresher holds deployment-specific authority, re-reads current state,
+and conditionally commits only a rotation of the token it exchanged. One ambiguous
+refresh response may be retried once inside Auth0's bounded overlap. Terminal OAuth
+rejection removes the matching session; transient failures preserve it. Create and
+update serialize their request once and retry at most one ambiguous transport failure under one in-memory idempotency key. Reads make one
 attempt, and member listing returns one server page without following its opaque
 continuation cursor. Private not-found responses remain one indistinguishable CLI
-outcome. These commands do not interpret status actions; action selection and approval
-remain responsibilities of the governing agent guide.
+outcome. Logout removes the local selected session and asks Auth0 to revoke its refresh
+token, reporting when server revocation cannot be confirmed. These commands do not
+interpret status actions; action selection and approval remain responsibilities of the
+governing agent guide.
 
 The runner uses the current `rrc_` machine credential and Cloud-issued connection URL
 from protected enrollment state. `runner enroll` and `runner serve` consume one closed
@@ -201,19 +208,19 @@ refresh logic, or authorization scopes accidentally.
 The runner service coordinates cloud assignments and supplies each run's execution
 context, including its filesystem root and lifecycle. The connection adapter owns frame
 transport and effect receipt only; a service-scoped assignment manager retains the
-welcomed lease policy, one local capacity slot, admitted workflow, execution root, and
-stable semantic decisions across reconnects. Development configuration maps exactly one
+welcomed lease policy, single local assignment slot, admitted workflow, execution root,
+and stable semantic decisions across reconnects. Development configuration maps exactly one
 Cloud workflow ID to a contained local workflow path, while assignment payloads supply
 no host path or diagnostic text.
 
-The runner does not schedule workflow steps, perform retries, manage checkpoints, or
-execute agents. Those responsibilities belong to the execution component implemented in
-this repository and embedded in the Rust executable. A later increment invokes its
-versioned one-run boundary after start authorization and translates structured events and
-outcomes into the cloud runner protocol.
+The runner connectivity layer does not schedule workflow steps, implement retries,
+manage checkpoints, or execute agents directly. The embedded execution component owns
+those responsibilities. After start authorization, the service-scoped assignment manager
+invokes that component's one-run boundary and translates structured events and outcomes
+into the Cloud runner protocol.
 
-The execution component will be organized as an internal source boundary before there
-is evidence that a separately published crate or process is necessary. All of its
+The execution component is organized as an internal source boundary; there is no
+evidence that a separately published crate or process is necessary. All of its
 production code is developed within this public source boundary. The prior single-user
 Scherzo daemon is behavioral and design inspiration only: the Cloud runner does not
 import, embed, invoke, or communicate with it, and its APIs, storage, messages,
@@ -341,13 +348,13 @@ read-only. Provider rules permit each content-addressed metadata ref to be creat
 but forbid updates and deletion. Only the final reconcile job receives `contents: write`
 after exact verification and native builds pass.
 
-The four release builds check out the original allocated mirror, including during
-recovery, and build x86-64 and ARM64 Linux plus Intel and Apple Silicon macOS archives.
-Archives have a canonical inventory and metadata so a transient retry reproduces the
-same asset bytes. The reconcile job accepts only an absent release, an exact tag-only
-partial state, or a matching draft containing an unchanged subset of the five expected
-assets. It creates or completes the draft, verifies archive digests and `SHA256SUMS`,
-attests the five assets, and publishes. A tag at another commit, unrelated stable-tag
+The three release builds check out the original allocated mirror, including during
+recovery, and build x86-64 and ARM64 Linux plus Apple Silicon macOS archives. Archives
+have a canonical inventory and metadata so a transient retry reproduces the same asset
+bytes. The reconcile job accepts only an absent release, an exact tag-only partial state,
+or a matching draft containing an unchanged subset of the four expected assets. It
+creates or completes the draft, verifies archive digests and `SHA256SUMS`, attests the
+four assets, and publishes. A tag at another commit, unrelated stable-tag
 movement, changed notes or identity, unexpected or changed assets, a conflicting draft,
 or a mismatched published release fails before a contents write. An exact published
 release is a successful no-op; stable tags and published releases are never moved or

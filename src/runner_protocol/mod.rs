@@ -39,7 +39,6 @@ pub(crate) enum RunnerFrame {
     Hello {
         envelope: RunnerEnvelope,
         runner_version: String,
-        max_concurrent_runs: u64,
     },
     EffectAcknowledged {
         envelope: RunnerEnvelope,
@@ -87,6 +86,7 @@ pub(crate) enum RunnerFrame {
         attempt_id: String,
         final_execution_event_sequence: u64,
         outcome: Value,
+        artifact_delivery: Value,
     },
     ExecutionInterrupted {
         envelope: RunnerEnvelope,
@@ -95,6 +95,7 @@ pub(crate) enum RunnerFrame {
         final_execution_event_sequence: u64,
         reason: String,
         terminal_outcome: Value,
+        artifact_delivery: Value,
     },
     ExecutionAborted {
         envelope: RunnerEnvelope,
@@ -103,25 +104,51 @@ pub(crate) enum RunnerFrame {
         last_execution_event_sequence: u64,
         reason: String,
     },
+    ArtifactCarrierRegister {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        portable_owner_path: String,
+        media_type: String,
+        size_bytes: u64,
+        sha256: String,
+        idempotency_key: String,
+    },
+    ArtifactCarrierConfirm {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        artifact_set_id: String,
+        carrier_id: String,
+    },
+    ArtifactResultRegister {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    ArtifactResultConfirm {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        artifact_set_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunnerUnableReason {
     ExecutionEnvironmentUnavailable,
-    WorkflowMappingUnavailable,
-    WorkflowSourceUnavailable,
-    WorkflowContractInvalid,
-    WorkflowAdmissionRejected,
+    SourceServiceUnavailable,
+    WorkflowEnvironmentUnsupported,
 }
 
 impl RunnerUnableReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ExecutionEnvironmentUnavailable => "execution_environment_unavailable",
-            Self::WorkflowMappingUnavailable => "workflow_mapping_unavailable",
-            Self::WorkflowSourceUnavailable => "workflow_source_unavailable",
-            Self::WorkflowContractInvalid => "workflow_contract_invalid",
-            Self::WorkflowAdmissionRejected => "workflow_admission_rejected",
+            Self::SourceServiceUnavailable => "source_service_unavailable",
+            Self::WorkflowEnvironmentUnsupported => "workflow_environment_unsupported",
         }
     }
 }
@@ -130,6 +157,14 @@ impl RunnerUnableReason {
 pub(crate) enum ExecutionSpecInvalidReason {
     UnsupportedSchemaVersion,
     InvalidExecutionLimits,
+    InvalidSourceProjection,
+    UnsupportedSourceObjectFormat,
+    SourceCommitMismatch,
+    SourceCheckoutDirty,
+    WorkflowSourceDigestMismatch,
+    WorkflowSourceInvalid,
+    WorkflowContractInvalid,
+    WorkflowAdmissionInvalid,
 }
 
 impl ExecutionSpecInvalidReason {
@@ -137,6 +172,14 @@ impl ExecutionSpecInvalidReason {
         match self {
             Self::UnsupportedSchemaVersion => "unsupported_schema_version",
             Self::InvalidExecutionLimits => "invalid_execution_limits",
+            Self::InvalidSourceProjection => "invalid_source_projection",
+            Self::UnsupportedSourceObjectFormat => "unsupported_source_object_format",
+            Self::SourceCommitMismatch => "source_commit_mismatch",
+            Self::SourceCheckoutDirty => "source_checkout_dirty",
+            Self::WorkflowSourceDigestMismatch => "workflow_source_digest_mismatch",
+            Self::WorkflowSourceInvalid => "workflow_source_invalid",
+            Self::WorkflowContractInvalid => "workflow_contract_invalid",
+            Self::WorkflowAdmissionInvalid => "workflow_admission_invalid",
         }
     }
 }
@@ -146,6 +189,16 @@ pub(crate) enum AssignmentDecline {
     CapacityUnavailable,
     RunnerUnable(RunnerUnableReason),
     ExecutionSpecInvalid(ExecutionSpecInvalidReason),
+}
+
+impl AssignmentDecline {
+    pub(crate) const fn protocol_type_and_reason(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::CapacityUnavailable => ("capacity_unavailable", None),
+            Self::RunnerUnable(reason) => ("runner_unable", Some(reason.as_str())),
+            Self::ExecutionSpecInvalid(reason) => ("execution_spec_invalid", Some(reason.as_str())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,7 +229,7 @@ pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) schema_version: u64,
     pub(crate) registered_workflow_id: String,
     pub(crate) execution_limits: ExecutionLimitsV1RunnerProjection,
-    pub(crate) source: Option<ExecutionSourceV1RunnerProjection>,
+    pub(crate) source: ExecutionSourceV1RunnerProjection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +257,117 @@ pub(crate) struct CloudEnvelope {
     pub(crate) sent_at: String,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ArtifactUploadCapability {
+    pub(crate) url: String,
+    pub(crate) content_length: String,
+    pub(crate) content_type: String,
+    pub(crate) if_none_match: String,
+    pub(crate) checksum_sha256: String,
+    pub(crate) expires_at: String,
+}
+
+impl fmt::Debug for ArtifactUploadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ArtifactUploadCapability(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactRegistrationOutcome {
+    Succeeded {
+        artifact_set_id: String,
+        carrier_id: String,
+        upload_capability: ArtifactUploadCapability,
+    },
+    Retryable,
+    Failed {
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactRegistrationResponse {
+    pub(crate) request_message_id: String,
+    pub(crate) outcome: ArtifactRegistrationOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactConfirmationOutcome {
+    Confirmed {
+        artifact_set_id: String,
+        carrier_id: String,
+    },
+    Absent {
+        artifact_set_id: String,
+        carrier_id: String,
+        upload_capability: ArtifactUploadCapability,
+    },
+    Retryable {
+        artifact_set_id: String,
+        carrier_id: String,
+    },
+    Failed {
+        artifact_set_id: String,
+        carrier_id: String,
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactConfirmationResponse {
+    pub(crate) request_message_id: String,
+    pub(crate) outcome: ArtifactConfirmationOutcome,
+}
+
+// Result freeze responses remain distinct from carrier responses because their
+// deadline participates in a separate result-finalization state machine.
+// jscpd:ignore-start
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactResultRegistrationOutcome {
+    Succeeded {
+        artifact_set_id: String,
+        finalization_deadline: String,
+        upload_capability: ArtifactUploadCapability,
+    },
+    Retryable,
+    Failed {
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactResultRegistrationResponse {
+    pub(crate) request_message_id: String,
+    pub(crate) outcome: ArtifactResultRegistrationOutcome,
+}
+// jscpd:ignore-end
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactResultConfirmationOutcome {
+    Confirmed {
+        artifact_set_id: String,
+    },
+    Absent {
+        artifact_set_id: String,
+        upload_capability: ArtifactUploadCapability,
+    },
+    Retryable {
+        artifact_set_id: String,
+    },
+    Failed {
+        artifact_set_id: String,
+        phase: String,
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactResultConfirmationResponse {
+    pub(crate) request_message_id: String,
+    pub(crate) outcome: ArtifactResultConfirmationOutcome,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CloudFrame {
     Welcome {
@@ -218,11 +382,28 @@ pub(crate) enum CloudFrame {
         acknowledged_message_id: String,
         acknowledged_sequence: u64,
     },
+    ArtifactCarrierRegistration {
+        envelope: CloudEnvelope,
+        response: ArtifactRegistrationResponse,
+    },
+    ArtifactCarrierConfirmation {
+        envelope: CloudEnvelope,
+        response: ArtifactConfirmationResponse,
+    },
+    ArtifactResultRegistration {
+        envelope: CloudEnvelope,
+        response: ArtifactResultRegistrationResponse,
+    },
+    ArtifactResultConfirmation {
+        envelope: CloudEnvelope,
+        response: ArtifactResultConfirmationResponse,
+    },
     AssignmentOffer {
         envelope: CloudEnvelope,
         effect_id: String,
         assignment_id: String,
         run_id: String,
+        project_id: String,
         attempt_id: String,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
         offer_expires_at: String,
@@ -308,14 +489,10 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
         RunnerFrame::Hello {
             envelope,
             runner_version,
-            max_concurrent_runs,
         } => runner_frame_value(
             envelope,
             "hello",
-            json!({
-                "runnerVersion": runner_version,
-                "maxConcurrentRuns": max_concurrent_runs,
-            }),
+            json!({ "runnerVersion": runner_version }),
         ),
         RunnerFrame::EffectAcknowledged {
             envelope,
@@ -345,18 +522,13 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
             assignment_id,
             decline,
         } => {
-            let decline = match decline {
-                AssignmentDecline::CapacityUnavailable => {
-                    json!({ "type": "capacity_unavailable" })
-                }
-                AssignmentDecline::RunnerUnable(reason) => json!({
-                    "type": "runner_unable",
-                    "reason": reason.as_str(),
+            let (decline_type, decline_reason) = decline.protocol_type_and_reason();
+            let decline = match decline_reason {
+                Some(reason) => json!({
+                    "type": decline_type,
+                    "reason": reason,
                 }),
-                AssignmentDecline::ExecutionSpecInvalid(reason) => json!({
-                    "type": "execution_spec_invalid",
-                    "reason": reason.as_str(),
-                }),
+                None => json!({ "type": decline_type }),
             };
             runner_frame_value(
                 envelope,
@@ -427,6 +599,7 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
             attempt_id,
             final_execution_event_sequence,
             outcome,
+            artifact_delivery,
         } => runner_frame_value(
             envelope,
             "execution_finished",
@@ -435,6 +608,7 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
                 "attemptId": attempt_id,
                 "finalExecutionEventSequence": final_execution_event_sequence,
                 "outcome": outcome,
+                "artifactDelivery": artifact_delivery,
             }),
         ),
         RunnerFrame::ExecutionInterrupted {
@@ -444,6 +618,7 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
             final_execution_event_sequence,
             reason,
             terminal_outcome,
+            artifact_delivery,
         } => runner_frame_value(
             envelope,
             "execution_interrupted",
@@ -453,6 +628,7 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
                 "finalExecutionEventSequence": final_execution_event_sequence,
                 "reason": reason,
                 "terminalOutcome": terminal_outcome,
+                "artifactDelivery": artifact_delivery,
             }),
         ),
         RunnerFrame::ExecutionAborted {
@@ -469,6 +645,74 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
                 "attemptId": attempt_id,
                 "lastExecutionEventSequence": last_execution_event_sequence,
                 "reason": reason,
+            }),
+        ),
+        RunnerFrame::ArtifactCarrierRegister {
+            envelope,
+            assignment_id,
+            attempt_id,
+            portable_owner_path,
+            media_type,
+            size_bytes,
+            sha256,
+            idempotency_key,
+        } => runner_frame_value(
+            envelope,
+            "artifact_carrier_register",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "portableOwnerPath": portable_owner_path,
+                "mediaType": media_type,
+                "sizeBytes": size_bytes,
+                "sha256": sha256,
+                "idempotencyKey": idempotency_key,
+            }),
+        ),
+        RunnerFrame::ArtifactCarrierConfirm {
+            envelope,
+            assignment_id,
+            attempt_id,
+            artifact_set_id,
+            carrier_id,
+        } => runner_frame_value(
+            envelope,
+            "artifact_carrier_confirm",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "artifactSetId": artifact_set_id,
+                "carrierId": carrier_id,
+            }),
+        ),
+        RunnerFrame::ArtifactResultRegister {
+            envelope,
+            assignment_id,
+            attempt_id,
+            size_bytes,
+            sha256,
+        } => runner_frame_value(
+            envelope,
+            "artifact_result_register",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "sizeBytes": size_bytes,
+                "sha256": sha256,
+            }),
+        ),
+        RunnerFrame::ArtifactResultConfirm {
+            envelope,
+            assignment_id,
+            attempt_id,
+            artifact_set_id,
+        } => runner_frame_value(
+            envelope,
+            "artifact_result_confirm",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "artifactSetId": artifact_set_id,
             }),
         ),
     };
@@ -592,6 +836,18 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         generated::RunnerProtocolVersion1::RunnerExecutionAborted(frame) => {
             validated_runner_frame!(frame)
         }
+        generated::RunnerProtocolVersion1::RunnerArtifactCarrierRegister(frame) => {
+            validated_runner_frame!(frame)
+        }
+        generated::RunnerProtocolVersion1::RunnerArtifactCarrierConfirm(frame) => {
+            validated_runner_frame!(frame)
+        }
+        generated::RunnerProtocolVersion1::RunnerArtifactResultRegister(frame) => {
+            validated_runner_frame!(frame)
+        }
+        generated::RunnerProtocolVersion1::RunnerArtifactResultConfirm(frame) => {
+            validated_runner_frame!(frame)
+        }
         generated::RunnerProtocolVersion1::CloudWelcome(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             let ping_interval_seconds = frame.payload.ping_interval_seconds.get();
@@ -637,6 +893,38 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 acknowledged_sequence: frame.payload.acknowledged_sequence.0.get(),
             }))
         }
+        generated::RunnerProtocolVersion1::CloudArtifactCarrierRegistration(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            let response = artifact_registration_response(frame.payload)?;
+            Ok(cloud(CloudFrame::ArtifactCarrierRegistration {
+                envelope,
+                response,
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudArtifactCarrierConfirmation(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            let response = artifact_confirmation_response(frame.payload)?;
+            Ok(cloud(CloudFrame::ArtifactCarrierConfirmation {
+                envelope,
+                response,
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudArtifactResultRegistration(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            let response = artifact_result_registration_response(frame.payload)?;
+            Ok(cloud(CloudFrame::ArtifactResultRegistration {
+                envelope,
+                response,
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudArtifactResultConfirmation(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            let response = artifact_result_confirmation_response(frame.payload)?;
+            Ok(cloud(CloudFrame::ArtifactResultConfirmation {
+                envelope,
+                response,
+            }))
+        }
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             let offer_expires_at = validate_timestamp(&frame.payload.offer_expires_at)?;
@@ -651,34 +939,37 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let cancellation_grace_seconds =
                 u64::try_from(execution_spec.execution_limits.cancellation_grace_seconds.0)
                     .map_err(|_| DecodeError::InvalidFrame("cancellationGraceSeconds"))?;
-            let source = execution_spec
-                .source
-                .map(|source| {
-                    let repository_connection_id = source.repository_connection_id.to_string();
-                    let checkout_credential_reference =
-                        source.checkout_credential_reference.to_string();
-                    if checkout_credential_reference != repository_connection_id {
-                        return Err(DecodeError::InvalidFrame("checkoutCredentialReference"));
-                    }
-                    Ok(ExecutionSourceV1RunnerProjection {
-                        repository_connection_id,
-                        object_format: "sha1".to_owned(),
-                        commit_oid: source.commit_oid.to_string(),
-                        workflow_path: source.workflow_path.to_string(),
-                        workflow_source_closure_digest:
-                            WorkflowSourceClosureDigestV1RunnerProjection {
-                                algorithm: "sha256".to_owned(),
-                                value: source.workflow_source_closure_digest.value.to_string(),
-                            },
-                        checkout_credential_reference,
-                    })
-                })
-                .transpose()?;
+            let source = ExecutionSourceV1RunnerProjection {
+                repository_connection_id: execution_spec
+                    .source
+                    .repository_connection_id
+                    .to_string(),
+                object_format: execution_spec.source.object_format.to_string(),
+                commit_oid: execution_spec.source.commit_oid.to_string(),
+                workflow_path: execution_spec.source.workflow_path.to_string(),
+                workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection {
+                    algorithm: execution_spec
+                        .source
+                        .workflow_source_closure_digest
+                        .algorithm
+                        .to_string(),
+                    value: execution_spec
+                        .source
+                        .workflow_source_closure_digest
+                        .value
+                        .to_string(),
+                },
+                checkout_credential_reference: execution_spec
+                    .source
+                    .checkout_credential_reference
+                    .to_string(),
+            };
             Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
+                project_id: frame.payload.project_id.to_string(),
                 attempt_id: frame.payload.attempt_id.to_string(),
                 execution_spec: Box::new(ExecutionSpecV1RunnerProjection {
                     execution_spec_id: execution_spec.execution_spec_id.to_string(),
@@ -742,6 +1033,207 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
     }
 }
 
+fn artifact_registration_response(
+    payload: generated::CloudArtifactCarrierRegistrationPayload,
+) -> Result<ArtifactRegistrationResponse, DecodeError> {
+    use generated::CloudArtifactCarrierRegistrationPayload as Payload;
+
+    let (request_message_id, outcome) = match payload {
+        Payload::Succeeded {
+            artifact_set_id,
+            carrier_id,
+            request_message_id,
+            upload_capability,
+        } => (
+            request_message_id.to_string(),
+            ArtifactRegistrationOutcome::Succeeded {
+                artifact_set_id: artifact_set_id.to_string(),
+                carrier_id: carrier_id.to_string(),
+                upload_capability: artifact_upload_capability(upload_capability)?,
+            },
+        ),
+        Payload::Retryable { request_message_id } => (
+            request_message_id.to_string(),
+            ArtifactRegistrationOutcome::Retryable,
+        ),
+        Payload::Failed {
+            code,
+            request_message_id,
+        } => (
+            request_message_id.to_string(),
+            ArtifactRegistrationOutcome::Failed {
+                code: code.to_string(),
+            },
+        ),
+    };
+    Ok(ArtifactRegistrationResponse {
+        request_message_id,
+        outcome,
+    })
+}
+
+fn artifact_confirmation_response(
+    payload: generated::CloudArtifactCarrierConfirmationPayload,
+) -> Result<ArtifactConfirmationResponse, DecodeError> {
+    use generated::CloudArtifactCarrierConfirmationPayload as Payload;
+
+    let (request_message_id, outcome) = match payload {
+        Payload::Confirmed {
+            artifact_set_id,
+            carrier_id,
+            request_message_id,
+        } => (
+            request_message_id.to_string(),
+            ArtifactConfirmationOutcome::Confirmed {
+                artifact_set_id: artifact_set_id.to_string(),
+                carrier_id: carrier_id.to_string(),
+            },
+        ),
+        Payload::Absent {
+            artifact_set_id,
+            carrier_id,
+            request_message_id,
+            upload_capability,
+        } => (
+            request_message_id.to_string(),
+            ArtifactConfirmationOutcome::Absent {
+                artifact_set_id: artifact_set_id.to_string(),
+                carrier_id: carrier_id.to_string(),
+                upload_capability: artifact_upload_capability(upload_capability)?,
+            },
+        ),
+        Payload::Retryable {
+            artifact_set_id,
+            carrier_id,
+            request_message_id,
+        } => (
+            request_message_id.to_string(),
+            ArtifactConfirmationOutcome::Retryable {
+                artifact_set_id: artifact_set_id.to_string(),
+                carrier_id: carrier_id.to_string(),
+            },
+        ),
+        Payload::Failed {
+            artifact_set_id,
+            carrier_id,
+            code,
+            request_message_id,
+        } => (
+            request_message_id.to_string(),
+            ArtifactConfirmationOutcome::Failed {
+                artifact_set_id: artifact_set_id.to_string(),
+                carrier_id: carrier_id.to_string(),
+                code: code.to_string(),
+            },
+        ),
+    };
+    Ok(ArtifactConfirmationResponse {
+        request_message_id,
+        outcome,
+    })
+}
+
+fn artifact_result_registration_response(
+    payload: generated::CloudArtifactResultRegistrationPayload,
+) -> Result<ArtifactResultRegistrationResponse, DecodeError> {
+    use generated::CloudArtifactResultRegistrationPayload as Payload;
+
+    let (request_message_id, outcome) = match payload {
+        Payload::Succeeded {
+            artifact_set_id,
+            finalization_deadline,
+            request_message_id,
+            upload_capability,
+        } => (
+            request_message_id.to_string(),
+            ArtifactResultRegistrationOutcome::Succeeded {
+                artifact_set_id: artifact_set_id.to_string(),
+                finalization_deadline: validate_timestamp(&finalization_deadline)?,
+                upload_capability: artifact_upload_capability(upload_capability)?,
+            },
+        ),
+        Payload::Retryable { request_message_id } => (
+            request_message_id.to_string(),
+            ArtifactResultRegistrationOutcome::Retryable,
+        ),
+        Payload::Failed {
+            code,
+            request_message_id,
+        } => (
+            request_message_id.to_string(),
+            ArtifactResultRegistrationOutcome::Failed {
+                code: code.to_string(),
+            },
+        ),
+    };
+    Ok(ArtifactResultRegistrationResponse {
+        request_message_id,
+        outcome,
+    })
+}
+
+fn artifact_result_confirmation_response(
+    payload: generated::CloudArtifactResultConfirmationPayload,
+) -> Result<ArtifactResultConfirmationResponse, DecodeError> {
+    let value = serde_json::to_value(payload)
+        .map_err(|_| DecodeError::InvalidFrame("artifact result confirmation"))?;
+    let field = |name| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(DecodeError::InvalidFrame("artifact result confirmation"))
+    };
+    let request_message_id = field("requestMessageId")?;
+    let artifact_set_id = field("artifactSetId")?;
+    let outcome = match field("outcome")?.as_str() {
+        "confirmed" => ArtifactResultConfirmationOutcome::Confirmed { artifact_set_id },
+        "absent" => {
+            let capability = value
+                .get("uploadCapability")
+                .cloned()
+                .ok_or(DecodeError::InvalidFrame("artifact upload capability"))?;
+            let capability = serde_json::from_value::<generated::UploadCapability>(capability)
+                .map_err(|_| DecodeError::InvalidFrame("artifact upload capability"))?;
+            ArtifactResultConfirmationOutcome::Absent {
+                artifact_set_id,
+                upload_capability: artifact_upload_capability(capability)?,
+            }
+        }
+        "retryable" => ArtifactResultConfirmationOutcome::Retryable { artifact_set_id },
+        "failed" => ArtifactResultConfirmationOutcome::Failed {
+            artifact_set_id,
+            phase: field("phase")?,
+            code: field("code")?,
+        },
+        _ => return Err(DecodeError::InvalidFrame("artifact result confirmation")),
+    };
+    Ok(ArtifactResultConfirmationResponse {
+        request_message_id,
+        outcome,
+    })
+}
+
+fn artifact_upload_capability(
+    capability: generated::UploadCapability,
+) -> Result<ArtifactUploadCapability, DecodeError> {
+    let expires_at = validate_timestamp(&capability.expires_at)?;
+    let if_none_match = capability
+        .headers
+        .if_none_match
+        .as_str()
+        .ok_or(DecodeError::InvalidFrame("If-None-Match"))?
+        .to_owned();
+    Ok(ArtifactUploadCapability {
+        url: capability.url,
+        content_length: capability.headers.content_length.to_string(),
+        content_type: capability.headers.content_type.to_string(),
+        if_none_match,
+        checksum_sha256: capability.headers.x_amz_checksum_sha256.to_string(),
+        expires_at,
+    })
+}
+
 fn validate_protocol_schema(value: &Value) -> Result<(), DecodeError> {
     let validator = PROTOCOL_VALIDATOR
         .get_or_init(|| {
@@ -803,7 +1295,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         .and_then(Value::as_object)
         .ok_or(DecodeError::InvalidFrame("payload"))?;
     let payload_keys: &[&str] = match frame_type {
-        "hello" => &["runnerVersion", "maxConcurrentRuns"],
+        "hello" => &["runnerVersion"],
         "effect_acknowledged" => &["effectId"],
         "assignment_accepted" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
         "assignment_rejected" => &["effectId", "assignmentId", "decline"],
@@ -823,6 +1315,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "attemptId",
             "finalExecutionEventSequence",
             "outcome",
+            "artifactDelivery",
         ],
         "execution_interrupted" => &[
             "assignmentId",
@@ -830,6 +1323,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "finalExecutionEventSequence",
             "reason",
             "terminalOutcome",
+            "artifactDelivery",
         ],
         "execution_aborted" => &[
             "assignmentId",
@@ -844,10 +1338,27 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "leasePolicy",
         ],
         "observation_ack" => &["acknowledgedMessageId", "acknowledgedSequence"],
+        "artifact_carrier_register" => &[
+            "assignmentId",
+            "attemptId",
+            "portableOwnerPath",
+            "mediaType",
+            "sizeBytes",
+            "sha256",
+            "idempotencyKey",
+        ],
+        "artifact_carrier_confirm" => &["assignmentId", "attemptId", "artifactSetId", "carrierId"],
+        "artifact_result_register" => &["assignmentId", "attemptId", "sizeBytes", "sha256"],
+        "artifact_result_confirm" => &["assignmentId", "attemptId", "artifactSetId"],
+        "artifact_carrier_registration"
+        | "artifact_carrier_confirmation"
+        | "artifact_result_registration"
+        | "artifact_result_confirmation" => return Ok(()),
         "assignment_offer" => &[
             "effectId",
             "assignmentId",
             "runId",
+            "projectId",
             "attemptId",
             "executionSpec",
             "offerExpiresAt",
@@ -1006,6 +1517,14 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-delivery-failure.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-delivery-internal-failure.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/runner-execution-interrupted.json"
         )),
         include_bytes!(concat!(
@@ -1019,6 +1538,38 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-release.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-artifact-carrier-register.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-artifact-carrier-confirm.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-artifact-carrier-registration.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-artifact-carrier-confirmation.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-artifact-result-register.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-artifact-result-confirm.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-artifact-result-registration.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-artifact-result-confirmation.json"
         )),
     ];
 
@@ -1067,6 +1618,14 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/invalid/execution-aborted-inconsistent-zero.json"
         )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/invalid/delivery-code-phase-mismatch.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/invalid/delivery-open-diagnostic.json"
+        )),
     ];
 
     #[test]
@@ -1114,7 +1673,6 @@ mod tests {
                 sent_at: "2026-07-23T00:00:00Z".to_owned(),
             },
             runner_version: "0.2.0".to_owned(),
-            max_concurrent_runs: 1,
         };
 
         let encoded = encode_runner_frame(&frame).unwrap();
@@ -1166,11 +1724,11 @@ mod tests {
             ),
             (
                 rejected(AssignmentDecline::RunnerUnable(
-                    RunnerUnableReason::WorkflowSourceUnavailable,
+                    RunnerUnableReason::SourceServiceUnavailable,
                 )),
                 rejected_payload(json!({
                     "type": "runner_unable",
-                    "reason": "workflow_source_unavailable",
+                    "reason": "source_service_unavailable",
                 })),
             ),
             (
@@ -1228,6 +1786,27 @@ mod tests {
             decoded,
             CloudFrame::AssignmentOffer { execution_spec, .. }
                 if execution_spec.execution_limits.maximum_parallel_steps == 0
+        ));
+    }
+
+    #[test]
+    fn malformed_source_values_reach_closed_semantic_admission() {
+        let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer.json"
+        )))
+        .unwrap();
+        offer["payload"]["executionSpec"]["source"]["commitOid"] = json!("not-an-oid");
+        offer["payload"]["executionSpec"]["source"]["objectFormat"] = json!("sha256");
+        let encoded = serde_json::to_vec(&offer).unwrap();
+
+        let decoded = decode_cloud_frame(&encoded)
+            .expect("malformed immutable source must receive a semantic rejection");
+        assert!(matches!(
+            decoded,
+            CloudFrame::AssignmentOffer { execution_spec, .. }
+                if execution_spec.source.commit_oid == "not-an-oid"
+                    && execution_spec.source.object_format == "sha256"
         ));
     }
 

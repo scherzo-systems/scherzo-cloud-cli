@@ -1,0 +1,14 @@
+[test-groups]
+# Keep process-heavy integration tests from exhausting host process capacity.
+external-process = { max-threads = 2 }
+
+[profile.default]
+# Report ordinary tests as slow after 30 seconds and terminate them after 60.
+retries = 0
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# Integration tests orchestrate external processes and receive a 120-second backstop.
+filter = "kind(test)"
+test-group = "external-process"
+slow-timeout = { period = "60s", terminate-after = 2 }

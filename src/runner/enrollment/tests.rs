@@ -90,6 +90,27 @@ fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
 }
 
 #[test]
+fn operator_config_uses_the_same_host_paths_in_both_deployment_modes() {
+    let temporary = tempfile::tempdir().expect("create config fixture");
+    let config_path = temporary.path().join("runner.json");
+    for mode in ["production", "development"] {
+        let document = serde_json::json!({
+            "schemaVersion": 1,
+            "deploymentMode": mode,
+            "runnerStatePath": "/var/lib/scherzo-cloud/runner-state.json",
+            "controlSocketPath": "/run/scherzo-cloud/runner.sock",
+            "workRoot": "/var/lib/scherzo-cloud/work"
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&document).expect("encode config"),
+        )
+        .expect("write config");
+        assert!(load_operator_config(&config_path).is_ok(), "{mode}");
+    }
+}
+
+#[test]
 fn activation_artifact_accepts_a_plain_relative_destination() {
     assert_eq!(
         artifact_parent(Path::new("activation.json")),
@@ -568,12 +589,7 @@ impl EnrollmentFixture {
             "deploymentMode": "development",
             "runnerStatePath": state_path,
             "controlSocketPath": root.path().join("run/runner.sock"),
-            "workRoot": root.path().join("work"),
-            "developmentWorkflow": {
-                "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "sourceRoot": root.path().join("source"),
-                "workflowPath": "build/workflow.json"
-            }
+            "workRoot": root.path().join("work")
         });
         fs::write(
             &config_path,

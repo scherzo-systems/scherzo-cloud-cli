@@ -21,7 +21,7 @@ pub(super) enum ExecutionRootAdmissionFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WorkingDirectorySelectionFailure {
+pub(crate) enum WorkingDirectorySelectionFailure {
     ExecutionRootRebound,
     Unavailable,
     EscapesExecutionRoot,
@@ -42,7 +42,7 @@ struct DirectoryIdentity {
 }
 
 #[derive(Clone)]
-pub(super) struct AdmittedExecutionRoot {
+pub(crate) struct AdmittedExecutionRoot {
     inner: Arc<AdmittedExecutionRootInner>,
 }
 
@@ -88,7 +88,7 @@ impl AdmittedExecutionRoot {
         })
     }
 
-    pub(super) fn provenance_path(&self) -> &Path {
+    pub(crate) fn provenance_path(&self) -> &Path {
         &self.inner.provenance_path
     }
 
@@ -106,7 +106,7 @@ impl AdmittedExecutionRoot {
             .is_ok_and(|identity| identity == self.inner.identity)
     }
 
-    pub(super) fn bind_command_ref(
+    pub(crate) fn bind_command_ref(
         &self,
         command: &mut Command,
     ) -> Result<(), WorkingDirectorySelectionFailure> {

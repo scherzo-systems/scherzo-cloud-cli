@@ -167,9 +167,11 @@ fn device_authorization_requests_the_exact_client_audience_and_scopes() {
     let form = request_form(&requests[0]);
     assert_eq!(form.get("client_id").unwrap(), "fixture-public-client");
     assert_eq!(form.get("audience").unwrap(), "https://api.fixture.example");
-    assert_eq!(form.get("scope").unwrap(), "openid profile email");
+    assert_eq!(
+        form.get("scope").unwrap(),
+        "openid profile email offline_access"
+    );
     assert!(!form.contains_key("refresh_token"));
-    assert!(!form.contains_key("offline_access"));
 }
 
 #[test]
@@ -293,14 +295,14 @@ fn token_polling_reuses_one_http_connection() {
 }
 
 #[test]
-fn issued_token_is_validated_and_refresh_token_is_ignored() {
+fn issued_access_and_refresh_tokens_are_validated_and_redacted() {
     let server = ScriptedServer::new(vec![json_response(
         "200 OK",
         serde_json::json!({
             "access_token": "unique-issued-access-token",
             "token_type": "bearer",
             "expires_in": 300,
-            "refresh_token": "unique-ignored-refresh-token"
+            "refresh_token": "unique-issued-refresh-token"
         }),
     )]);
     let deployment = server.deployment();
@@ -312,10 +314,11 @@ fn issued_token_is_validated_and_refresh_token_is_ignored() {
     };
 
     assert_eq!(token.access_token(), "unique-issued-access-token");
+    assert_eq!(token.refresh_token(), "unique-issued-refresh-token");
     assert_eq!(token.expires_in(), Duration::from_secs(300));
     let debug = format!("{token:?}");
     assert!(!debug.contains("unique-issued-access-token"));
-    assert!(!debug.contains("unique-ignored-refresh-token"));
+    assert!(!debug.contains("unique-issued-refresh-token"));
     server.finish();
 }
 
@@ -368,6 +371,7 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
         decode_issued_token(
             &serde_json::to_vec(&serde_json::json!({
                 "access_token": boundary_token,
+                "refresh_token": "refresh-token",
                 "token_type": "Bearer",
                 "expires_in": 60
             }))
@@ -378,22 +382,31 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
 
     for body in [
         serde_json::json!({
+            "access_token": "token",
+            "token_type": "Bearer",
+            "expires_in": 60
+        }),
+        serde_json::json!({
             "access_token": "",
+            "refresh_token": "refresh-token",
             "token_type": "Bearer",
             "expires_in": 60
         }),
         serde_json::json!({
             "access_token": "token",
+            "refresh_token": "refresh-token",
             "token_type": "MAC",
             "expires_in": 60
         }),
         serde_json::json!({
             "access_token": "token",
+            "refresh_token": "refresh-token",
             "token_type": "Bearer",
             "expires_in": 0
         }),
         serde_json::json!({
             "access_token": "x".repeat(MAX_ACCESS_TOKEN_BYTES + 1),
+            "refresh_token": "refresh-token",
             "token_type": "Bearer",
             "expires_in": 60
         }),

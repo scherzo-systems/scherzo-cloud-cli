@@ -15,7 +15,7 @@ use super::observation::{
 use super::pi::Thinking;
 use super::resolution::ResolvedWorkflow;
 use super::runtime::{ActionId, TransitionEvent};
-use super::validated::{ValidatedHarness, ValidatedStep};
+use super::validated::{ValidatedHarness, ValidatedStep, WorkflowNodeRole};
 
 pub(crate) const MAX_NORMALIZED_CHILD_RECORD_BYTES: usize = 16 * 1024;
 const CONTROL_SEQUENCE_BYTES: usize = 4096;
@@ -92,7 +92,9 @@ impl DisplayDeadline for OffsetDateTime {
 pub(crate) struct WorkflowPresentationDefinition {
     pub(crate) workflow_path: String,
     pub(crate) presentation_order: Vec<String>,
+    pub(crate) finalization_start: Option<usize>,
     pub(crate) steps: BTreeMap<String, WorkflowPresentationStep>,
+    pub(crate) node_roles: BTreeMap<String, WorkflowNodeRole>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,58 +158,78 @@ pub(crate) enum AgentPresentationHarness {
 
 impl WorkflowPresentationDefinition {
     pub(crate) fn from_workflow(workflow: &ResolvedWorkflow) -> Self {
-        let steps = workflow
+        let ordinary_count = workflow.definition.presentation_order.len();
+        let presentation_order = workflow
+            .definition
+            .presentation_order
+            .iter()
+            .chain(&workflow.definition.finalizer_presentation_order)
+            .cloned()
+            .collect::<Vec<_>>();
+        let ordinary = workflow
             .definition
             .steps
             .iter()
-            .map(|(id, step)| {
-                let presentation = match step {
-                    ValidatedStep::Command(command) => WorkflowPresentationStep::Command {
-                        argv: command.argv.clone(),
-                        cwd: command.common.cwd.clone(),
-                        failure_policy: command.common.failure_policy,
-                        direct_dependencies: command
-                            .common
-                            .prerequisites
-                            .iter()
-                            .map(|prerequisite| prerequisite.producer.clone())
-                            .collect(),
-                        outputs: presentation_outputs(&command.common.outputs),
-                    },
-                    ValidatedStep::Agent(agent) => {
-                        let harness = match &agent.agent.harness {
-                            ValidatedHarness::Pi(config) => AgentPresentationHarness::Pi {
-                                model: config.model.clone(),
-                                thinking: config.thinking,
-                            },
-                            ValidatedHarness::ClaudeCode(config) => {
-                                AgentPresentationHarness::ClaudeCode {
-                                    model: config.model.clone(),
-                                    effort: config.effort,
-                                }
-                            }
-                        };
-                        WorkflowPresentationStep::Agent {
-                            profile: agent.agent.profile.clone(),
-                            harness,
-                            failure_policy: agent.common.failure_policy,
-                            direct_dependencies: agent
-                                .common
-                                .prerequisites
-                                .iter()
-                                .map(|prerequisite| prerequisite.producer.clone())
-                                .collect(),
-                            outputs: presentation_outputs(&agent.common.outputs),
-                        }
-                    }
-                };
-                (id.clone(), presentation)
-            })
-            .collect();
+            .map(|(id, step)| (id.clone(), WorkflowNodeRole::Step, step));
+        let finalizers = workflow
+            .definition
+            .finalizers
+            .iter()
+            .map(|(id, finalizer)| (id.clone(), WorkflowNodeRole::Finalizer, &finalizer.body));
+        let mut steps = BTreeMap::new();
+        let mut node_roles = BTreeMap::new();
+        for (id, role, step) in ordinary.chain(finalizers) {
+            steps.insert(id.clone(), presentation_step(step));
+            node_roles.insert(id, role);
+        }
         Self {
             workflow_path: workflow.source.workflow_path.clone(),
-            presentation_order: workflow.definition.presentation_order.clone(),
+            presentation_order,
+            finalization_start: (!workflow.definition.finalizers.is_empty())
+                .then_some(ordinary_count),
             steps,
+            node_roles,
+        }
+    }
+}
+
+fn presentation_step(step: &ValidatedStep) -> WorkflowPresentationStep {
+    match step {
+        ValidatedStep::Command(command) => WorkflowPresentationStep::Command {
+            argv: command.argv.clone(),
+            cwd: command.common.cwd.clone(),
+            failure_policy: command.common.failure_policy,
+            direct_dependencies: command
+                .common
+                .prerequisites
+                .iter()
+                .map(|prerequisite| prerequisite.producer.clone())
+                .collect(),
+            outputs: presentation_outputs(&command.common.outputs),
+        },
+        ValidatedStep::Agent(agent) => {
+            let harness = match &agent.agent.harness {
+                ValidatedHarness::Pi(config) => AgentPresentationHarness::Pi {
+                    model: config.model.clone(),
+                    thinking: config.thinking,
+                },
+                ValidatedHarness::ClaudeCode(config) => AgentPresentationHarness::ClaudeCode {
+                    model: config.model.clone(),
+                    effort: config.effort,
+                },
+            };
+            WorkflowPresentationStep::Agent {
+                profile: agent.agent.profile.clone(),
+                harness,
+                failure_policy: agent.common.failure_policy,
+                direct_dependencies: agent
+                    .common
+                    .prerequisites
+                    .iter()
+                    .map(|prerequisite| prerequisite.producer.clone())
+                    .collect(),
+                outputs: presentation_outputs(&agent.common.outputs),
+            }
         }
     }
 }
@@ -482,19 +504,23 @@ fn normalize_transition<Deadline: DisplayDeadline>(
         TransitionEvent::Step {
             sequence,
             step,
+            role,
             failure_policy,
             from,
             to,
         } => TransitionEvent::Step {
             sequence,
             step,
+            role,
             failure_policy,
             from,
             to,
         },
-        TransitionEvent::Workflow { sequence, from, to } => {
-            TransitionEvent::Workflow { sequence, from, to }
-        }
+        TransitionEvent::Workflow { sequence, from, to } => TransitionEvent::Workflow {
+            sequence,
+            from: from.map_deadline(|deadline| deadline.deadline_utc()),
+            to: to.map_deadline(|deadline| deadline.deadline_utc()),
+        },
         TransitionEvent::CancellationAccepted {
             sequence,
             reason,
@@ -504,6 +530,18 @@ fn normalize_transition<Deadline: DisplayDeadline>(
             reason,
             deadline: deadline.deadline_utc(),
         },
+        TransitionEvent::FinalizationCancellationAccepted {
+            sequence,
+            reason,
+            deadline,
+        } => TransitionEvent::FinalizationCancellationAccepted {
+            sequence,
+            reason,
+            deadline: deadline.deadline_utc(),
+        },
+        TransitionEvent::ForceAbortAccepted { sequence, reason } => {
+            TransitionEvent::ForceAbortAccepted { sequence, reason }
+        }
     };
     PresentationTransition {
         event,

@@ -1,7 +1,8 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -10,7 +11,12 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use rustix::io::Errno;
+use rustix::fs::{FileType, fstat};
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+};
 use rustix::process::{
     Pid, Signal, WaitId, WaitIdOptions, WaitOptions, getpid, getppid, kill_process,
     kill_process_group, waitid, waitpid,
@@ -35,6 +41,8 @@ use super::process_group::{
 const INTERNAL_WORKER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_WORKER";
 const INTERNAL_ROOT_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_ROOT";
 const INTERNAL_PARENT_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_PARENT";
+const INTERNAL_BOUND_DIRECTORY_FD_ENVIRONMENT: &str =
+    "SCHERZO_INTERNAL_CHILD_GUARD_BOUND_DIRECTORY_FD";
 const GUARD_WORKER: &str = "guard-v1";
 const LEADER_WORKER: &str = "leader-v1";
 const CONTINUE: u8 = b'C';
@@ -44,7 +52,9 @@ const READY_FILE: &str = "ready.json";
 const RELEASED_FILE: &str = "released";
 const QUIESCED_FILE: &str = "quiesced";
 const EXEC_BOUNDARY_SOCKET: &str = "exec.sock";
+const BOUND_DIRECTORY_SOCKET: &str = "bound-directory.sock";
 const STANDARD_INPUT_SOCKET: &str = "stdin.sock";
+pub(crate) const BOUND_DIRECTORY_PLACEHOLDER: &str = "__SCHERZO_BOUND_DIRECTORY_FD__";
 const EXEC_FAILURE_FILE: &str = "exec.failure";
 const STATUS_FILE: &str = "status";
 const WORKER_FAILURE_FILE: &str = "worker.failure";
@@ -61,6 +71,7 @@ struct LaunchManifest {
     arguments: Vec<Vec<u8>>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
     streaming_standard_input: bool,
+    bound_directory: bool,
 }
 
 impl LaunchManifest {
@@ -69,6 +80,7 @@ impl LaunchManifest {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         streaming_standard_input: bool,
+        bound_directory: bool,
     ) -> Self {
         Self {
             program: program.as_os_str().as_bytes().to_vec(),
@@ -81,6 +93,7 @@ impl LaunchManifest {
                 .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
                 .collect(),
             streaming_standard_input,
+            bound_directory,
         }
     }
 
@@ -88,8 +101,11 @@ impl LaunchManifest {
         OsString::from_vec(self.program.clone())
     }
 
-    fn arguments(&self) -> impl Iterator<Item = OsString> + '_ {
-        self.arguments.iter().cloned().map(OsString::from_vec)
+    fn arguments(&self, bound_directory: Option<&Path>) -> Result<Vec<OsString>, ()> {
+        self.arguments
+            .iter()
+            .map(|argument| replace_bound_directory_placeholder(argument, bound_directory))
+            .collect()
     }
 
     fn environment(&self) -> impl Iterator<Item = (OsString, OsString)> + '_ {
@@ -105,6 +121,7 @@ impl LaunchManifest {
 struct ReadyIdentity {
     process_group_id: i32,
     leader_start_identity: String,
+    bound_directory_path: Option<PathBuf>,
 }
 
 struct ActivityLease {
@@ -125,6 +142,7 @@ pub(crate) struct StoppedChildGuard {
     identity: AuthenticatedProcessGroup,
     owner_control: Option<File>,
     staging: tempfile::TempDir,
+    bound_directory_path: Option<PathBuf>,
     _activity_lease: ActivityLease,
 }
 
@@ -136,7 +154,7 @@ impl StoppedChildGuard {
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Self> {
         let (child, standard_input) =
-            Self::spawn_inner(program, arguments, environment, false, configure)?;
+            Self::spawn_inner(program, arguments, environment, false, None, configure)?;
         debug_assert!(standard_input.is_none());
         Ok(child)
     }
@@ -148,7 +166,27 @@ impl StoppedChildGuard {
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<(Self, tokio::net::UnixStream)> {
         let (child, standard_input) =
-            Self::spawn_inner(program, arguments, environment, true, configure)?;
+            Self::spawn_inner(program, arguments, environment, true, None, configure)?;
+        let standard_input = standard_input
+            .ok_or_else(|| io::Error::other("guarded child standard input unavailable"))?;
+        Ok((child, standard_input))
+    }
+
+    pub(crate) fn spawn_with_stdin_and_bound_directory(
+        program: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        bound_directory: &OwnedFd,
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
+    ) -> io::Result<(Self, tokio::net::UnixStream)> {
+        let (child, standard_input) = Self::spawn_inner(
+            program,
+            arguments,
+            environment,
+            true,
+            Some(bound_directory),
+            configure,
+        )?;
         let standard_input = standard_input
             .ok_or_else(|| io::Error::other("guarded child standard input unavailable"))?;
         Ok((child, standard_input))
@@ -159,6 +197,7 @@ impl StoppedChildGuard {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         streaming_standard_input: bool,
+        bound_directory: Option<&OwnedFd>,
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<(Self, Option<tokio::net::UnixStream>)> {
         if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
@@ -175,8 +214,17 @@ impl StoppedChildGuard {
         let standard_input_listener = streaming_standard_input
             .then(|| UnixListener::bind(staging.path().join(STANDARD_INPUT_SOCKET)))
             .transpose()?;
-        let manifest =
-            LaunchManifest::new(program, arguments, environment, streaming_standard_input);
+        let bound_directory_listener = bound_directory
+            .is_some()
+            .then(|| UnixListener::bind(staging.path().join(BOUND_DIRECTORY_SOCKET)))
+            .transpose()?;
+        let manifest = LaunchManifest::new(
+            program,
+            arguments,
+            environment,
+            streaming_standard_input,
+            bound_directory.is_some(),
+        );
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
         fs::write(staging.path().join(MANIFEST_FILE), manifest_bytes)?;
 
@@ -200,6 +248,10 @@ impl StoppedChildGuard {
             .into_owned_fd()
             .map(File::from)?;
 
+        if let (Some(listener), Some(bound_directory)) = (bound_directory_listener, bound_directory)
+        {
+            send_bound_directory_to_worker(&mut child, listener, bound_directory)?;
+        }
         let ready = wait_for_json::<ReadyIdentity>(&mut child, &staging.path().join(READY_FILE))
             .map_err(|failure| {
                 io::Error::new(
@@ -237,6 +289,7 @@ impl StoppedChildGuard {
                 identity,
                 owner_control: Some(owner_control),
                 staging,
+                bound_directory_path: ready.bound_directory_path,
                 _activity_lease: activity_lease,
             },
             standard_input,
@@ -245,6 +298,10 @@ impl StoppedChildGuard {
 
     pub(crate) fn identity(&self) -> &AuthenticatedProcessGroup {
         &self.identity
+    }
+
+    pub(crate) fn bound_directory_path(&self) -> Option<&Path> {
+        self.bound_directory_path.as_deref()
     }
 
     pub(crate) fn continue_execution(&mut self) -> io::Result<()> {
@@ -331,6 +388,112 @@ fn child_guard_worker_executable() -> io::Result<PathBuf> {
             .filter(|executable| executable.is_file())
             .ok_or_else(|| io::Error::other("test child-guard worker executable unavailable"))?;
         Ok(executable)
+    }
+}
+
+fn send_bound_directory_to_worker(
+    child: &mut Child,
+    listener: UnixListener,
+    directory: &OwnedFd,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    let started = crate::timing::monotonic_now();
+    let socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                check_worker_boundary(child, started)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let descriptors = [directory.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if !control.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(io::Error::other(
+            "failed to construct guarded directory transfer",
+        ));
+    }
+    let payload = [IoSlice::new(b"D")];
+    let sent =
+        sendmsg(&socket, &payload, &mut control, SendFlags::empty()).map_err(io::Error::from)?;
+    (sent == 1)
+        .then_some(())
+        .ok_or_else(|| io::Error::other("failed to transfer guarded directory"))
+}
+
+fn receive_bound_directory(root: &Path) -> Result<OwnedFd, ()> {
+    let socket = UnixStream::connect(root.join(BOUND_DIRECTORY_SOCKET)).map_err(|_| ())?;
+    let mut payload = [0_u8; 1];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = {
+        let mut buffers = [IoSliceMut::new(&mut payload)];
+        recvmsg(&socket, &mut buffers, &mut control, RecvFlags::empty()).map_err(|_| ())?
+    };
+    if received.bytes != 1 || payload != *b"D" || received.flags.contains(ReturnFlags::CTRUNC) {
+        return Err(());
+    }
+    let mut descriptors = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(received) = message {
+            descriptors.extend(received);
+        }
+    }
+    let [directory] = descriptors.try_into().map_err(|_| ())?;
+    let metadata = fstat(&directory).map_err(|_| ())?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return Err(());
+    }
+    fcntl_setfd(&directory, FdFlags::empty()).map_err(|_| ())?;
+    Ok(directory)
+}
+
+fn bound_directory_path(directory: &OwnedFd) -> PathBuf {
+    bound_directory_path_from_raw(directory.as_raw_fd())
+}
+
+fn bound_directory_path_from_raw(descriptor: i32) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let root = "/proc/self/fd";
+    #[cfg(target_vendor = "apple")]
+    let root = "/dev/fd";
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let root = "/dev/fd";
+    Path::new(root).join(descriptor.to_string())
+}
+
+fn replace_bound_directory_placeholder(
+    value: &[u8],
+    bound_directory: Option<&Path>,
+) -> Result<OsString, ()> {
+    let marker = BOUND_DIRECTORY_PLACEHOLDER.as_bytes();
+    let Some(first) = value
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
+        return Ok(OsString::from_vec(value.to_vec()));
+    };
+    let Some(bound_directory) = bound_directory else {
+        return Ok(OsString::from_vec(value.to_vec()));
+    };
+    let replacement = bound_directory.as_os_str().as_bytes();
+    let mut replaced = Vec::with_capacity(value.len() + replacement.len());
+    let mut remaining = value;
+    let mut position = first;
+    loop {
+        replaced.extend_from_slice(&remaining[..position]);
+        replaced.extend_from_slice(replacement);
+        remaining = &remaining[position + marker.len()..];
+        let Some(next) = remaining
+            .windows(marker.len())
+            .position(|window| window == marker)
+        else {
+            replaced.extend_from_slice(remaining);
+            return Ok(OsString::from_vec(replaced));
+        };
+        position = next;
     }
 }
 
@@ -431,6 +594,11 @@ fn run_guard_worker() -> Result<(), ()> {
     let root = internal_root()?;
     let manifest = read_manifest(&root)?;
     enable_child_subreaper().map_err(|_| ())?;
+    let bound_directory = manifest
+        .bound_directory
+        .then(|| receive_bound_directory(&root))
+        .transpose()?;
+    let bound_directory_path = bound_directory.as_ref().map(bound_directory_path);
     let executable = std::env::current_exe().map_err(|_| ())?;
     let exec_boundary = UnixListener::bind(root.join(EXEC_BOUNDARY_SOCKET)).map_err(|_| ())?;
     let mut leader = std::process::Command::new(executable);
@@ -446,7 +614,14 @@ fn run_guard_worker() -> Result<(), ()> {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .process_group(0);
+        .process_group(0)
+        .env_remove(INTERNAL_BOUND_DIRECTORY_FD_ENVIRONMENT);
+    if let Some(directory) = &bound_directory {
+        leader.env(
+            INTERNAL_BOUND_DIRECTORY_FD_ENVIRONMENT,
+            directory.as_raw_fd().to_string(),
+        );
+    }
     let mut leader = leader.spawn().map_err(|_| ())?;
     let leader_pid = i32::try_from(leader.id())
         .ok()
@@ -468,6 +643,7 @@ fn run_guard_worker() -> Result<(), ()> {
         &ReadyIdentity {
             process_group_id: identity.process_group().as_raw_pid(),
             leader_start_identity: identity.leader_start_identity().to_owned(),
+            bound_directory_path,
         },
     )?;
 
@@ -626,6 +802,22 @@ fn observe_owned_leader_with(
 fn run_leader_worker() -> Result<(), ()> {
     let root = internal_root()?;
     let manifest = read_manifest(&root)?;
+    let bound_directory_path = match (
+        manifest.bound_directory,
+        std::env::var(INTERNAL_BOUND_DIRECTORY_FD_ENVIRONMENT),
+    ) {
+        (false, Err(_)) => None,
+        (true, Ok(descriptor)) => {
+            let descriptor = descriptor.parse::<i32>().map_err(|_| ())?;
+            let path = bound_directory_path_from_raw(descriptor);
+            std::fs::metadata(&path)
+                .ok()
+                .filter(std::fs::Metadata::is_dir)
+                .ok_or(())?;
+            Some(path)
+        }
+        (false, Ok(_)) | (true, Err(_)) => return Err(()),
+    };
     let expected_parent = std::env::var(INTERNAL_PARENT_ENVIRONMENT)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
@@ -653,7 +845,7 @@ fn run_leader_worker() -> Result<(), ()> {
 
     let mut command = std::process::Command::new(manifest.program());
     command
-        .args(manifest.arguments())
+        .args(manifest.arguments(bound_directory_path.as_deref())?)
         .env_clear()
         .envs(manifest.environment())
         .stdin(standard_input.map_or_else(Stdio::null, |standard_input| {

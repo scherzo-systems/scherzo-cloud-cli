@@ -193,37 +193,76 @@ fn all_thinking_levels_workflow() -> String {
 }
 
 #[test]
-fn finalizer_bearing_workflows_are_rejected_before_execution_admission() {
-    let fixture = WorkflowFixture::new(
-        "schemaVersion: 1
-steps:
-  work:
-    kind: cmd
-    command: { argv: [\"true\"] }
-finalizers:
-  cleanup:
-    kind: cmd
-    inputs:
-      prompt: { ref: imports.prompt }
-      context: { ref: finalization.context }
-    command: { argv: [\"true\"] }
-",
+fn cancellation_source_rearms_graceful_cancellation_and_authorizes_one_force_abort() {
+    let source = CancellationSource::new();
+    assert!(source.request_cancellation(CancellationReason::UserRequest));
+    assert!(!source.request_cancellation(CancellationReason::RunnerShutdown));
+    let mut operations = source.subscribe_operations();
+    assert_eq!(
+        operations.next_operation(),
+        Some(CancellationOperation::Graceful {
+            id: CancellationOperationId::fixture(1),
+            reason: CancellationReason::UserRequest,
+        })
     );
-    let unavailable_root = fixture.execution_root.join("missing");
 
-    assert_failure(
-        admit_workflow(
-            fixture.resolve(),
-            ResolvedImports::default(),
-            execution_context(
-                unavailable_root,
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            ),
-        ),
-        AdmissionFailureKind::WorkflowFinalizersUnsupported,
-        AdmissionLocation::Workflow,
+    assert!(source.begin_finalization_arm());
+    assert!(!source.begin_finalization_arm());
+    assert!(source.request_cancellation(CancellationReason::RunnerShutdown));
+    assert_eq!(
+        source.cancellation_reason(),
+        Some(CancellationReason::UserRequest)
+    );
+    assert_eq!(operations.next_operation(), None);
+    assert!(source.request_force_abort());
+    assert!(!source.request_force_abort());
+    assert_eq!(operations.next_operation(), None);
+    assert!(source.complete_finalization_arm());
+    assert!(!source.complete_finalization_arm());
+    assert_eq!(
+        source.cancellation_reason(),
+        Some(CancellationReason::RunnerShutdown)
+    );
+    assert_eq!(
+        operations.next_operation(),
+        Some(CancellationOperation::Graceful {
+            id: CancellationOperationId::fixture(2),
+            reason: CancellationReason::RunnerShutdown,
+        })
+    );
+    assert_eq!(
+        source.cancellation_reason(),
+        Some(CancellationReason::RunnerShutdown)
+    );
+    assert_eq!(
+        operations.next_operation(),
+        Some(CancellationOperation::ForceAbort {
+            id: CancellationOperationId::fixture(3),
+        })
+    );
+    assert_eq!(operations.next_operation(), None);
+
+    let direct_force = CancellationSource::new();
+    assert!(direct_force.begin_finalization_arm());
+    assert!(direct_force.complete_finalization_arm());
+    assert!(direct_force.request_force_abort());
+    assert_eq!(
+        direct_force.cancellation_reason(),
+        Some(CancellationReason::FinalizationForceAbort)
+    );
+
+    let aborted = CancellationSource::new();
+    assert!(aborted.request_cancellation(CancellationReason::UserRequest));
+    let mut aborted_operations = aborted.subscribe_operations();
+    assert!(aborted_operations.next_operation().is_some());
+    assert!(aborted.begin_finalization_arm());
+    assert!(aborted.request_cancellation(CancellationReason::RunnerShutdown));
+    assert!(aborted.abort_finalization_arm());
+    assert!(!aborted.complete_finalization_arm());
+    assert_eq!(aborted_operations.next_operation(), None);
+    assert_eq!(
+        aborted.cancellation_reason(),
+        Some(CancellationReason::UserRequest)
     );
 }
 
@@ -468,7 +507,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
         agent.installation().profile(),
         ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
     );
-    assert_eq!(agent.installation().version().as_str(), "2.1.222");
+    assert_eq!(agent.installation().version().as_str(), "2.1.234");
     assert_eq!(agent.configuration().model, "claude-opus-4-1");
     assert_eq!(agent.configuration().effort, ClaudeCodeEffort::XHigh);
     assert_eq!(
@@ -1008,6 +1047,45 @@ fn admitted_root_lifecycle_preserves_each_closed_ownership_variant() {
         .unwrap();
         assert_eq!(admitted.execution().root_lifecycle(), lifecycle);
     }
+}
+
+#[test]
+fn workflow_admission_reserves_only_engine_environment_variables() {
+    let environment = EnvironmentSnapshot::new([
+        ("PATH", "/bin"),
+        ("GIT_ASKPASS", "/local/askpass"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "credential.helper"),
+        ("GIT_CONFIG_VALUE_0", "/local/helper"),
+        ("GIT_SSH_COMMAND", "local-ssh"),
+        ("GH_TOKEN", "local-gh-token"),
+        ("GITHUB_TOKEN", "local-github-token"),
+        ("SCHERZO_SOURCE_TOKEN_FD", "9"),
+    ]);
+
+    let filtered = environment.without_engine_reserved_variables();
+
+    for (name, value) in [
+        ("PATH", "/bin"),
+        ("GIT_ASKPASS", "/local/askpass"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "credential.helper"),
+        ("GIT_CONFIG_VALUE_0", "/local/helper"),
+        ("GIT_SSH_COMMAND", "local-ssh"),
+        ("GH_TOKEN", "local-gh-token"),
+        ("GITHUB_TOKEN", "local-github-token"),
+    ] {
+        assert_eq!(
+            filtered.variable(OsStr::new(name)),
+            Some(OsStr::new(value)),
+            "{name}"
+        );
+    }
+    assert!(
+        filtered
+            .variable(OsStr::new("SCHERZO_SOURCE_TOKEN_FD"))
+            .is_none()
+    );
 }
 
 fn execution_context(

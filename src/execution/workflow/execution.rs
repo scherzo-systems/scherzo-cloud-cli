@@ -22,9 +22,11 @@ use super::step_runtime::{
 use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkflowExecutionResult {
+pub(crate) struct WorkflowExecutionResult<Deadline = ()> {
     pub(crate) outcome: RunOutcome<StepFailureCause>,
     pub(crate) steps: BTreeMap<String, StepState<StepFailureCause, CapturedValue>>,
+    pub(crate) finalization_summary:
+        Option<super::runtime::FinalizationSummary<StepFailureCause, Deadline>>,
     pub(crate) exports: ExportSet<CapturedValue>,
     pub(crate) provenance: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
@@ -81,7 +83,7 @@ where
 
 fn observed_step_transition<Deadline>(
     event: &TransitionEvent<StepFailureCause, Deadline>,
-    state: &RuntimeState<StepFailureCause, CapturedValue>,
+    state: &RuntimeState<StepFailureCause, CapturedValue, Deadline>,
 ) -> Option<ObservedStepTransition> {
     let TransitionEvent::Step { step, to, .. } = event else {
         return None;
@@ -102,6 +104,11 @@ fn observed_step_transition<Deadline>(
         (StepStateKind::Blocked, StepState::Blocked { dependency }) => {
             Some(ObservedStepTransition::Blocked {
                 dependency: dependency.clone(),
+            })
+        }
+        (StepStateKind::Blocked, StepState::InputUnavailable { references }) => {
+            Some(ObservedStepTransition::InputUnavailable {
+                references: references.clone(),
             })
         }
         (StepStateKind::NotRun, StepState::NotRun { reason }) => {
@@ -131,7 +138,7 @@ pub(crate) async fn execute_workflow<Clock, Commits, Observer, Dispatcher>(
     commits: Commits,
     observer: Observer,
     process_guards: ProcessGuardRegistry,
-) -> Result<WorkflowExecutionResult, CoordinationError>
+) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
 // This result projection intentionally repeats the shared runtime's generic port
 // constraints so it can preserve its distinct domain result.
 // jscpd:ignore-start
@@ -170,7 +177,7 @@ where
             later_cancellation,
         },
         WorkflowState::Cancelled { reason } => RunOutcome::Cancelled { reason },
-        WorkflowState::Executing { .. } => {
+        WorkflowState::Executing { .. } | WorkflowState::Finalizing { .. } => {
             return Err(CoordinationError::ReducerStateUnavailable);
         }
     };
@@ -180,6 +187,7 @@ where
         .into_iter()
         .map(|(step, runtime)| (step, runtime.state))
         .collect();
+    let finalization_summary = coordinated.state.finalization_summary;
     let exports = coordinated
         .state
         .exports
@@ -187,6 +195,7 @@ where
     Ok(WorkflowExecutionResult {
         outcome,
         steps,
+        finalization_summary,
         exports,
         provenance,
         content_digest,

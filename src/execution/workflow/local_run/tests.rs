@@ -159,6 +159,7 @@ fn fixture_guarded_attempt() -> LocalAttemptV1 {
         guard_id: "11111111-1111-4111-8111-111111111111".to_owned(),
         action_id: 1,
         step_id: "first".to_owned(),
+        node_role: AttemptNodeRoleV1::Step,
         state: ProcessGuardStateV1::Released,
         execution_host: attempt.owner.execution_host.clone(),
         process_group_id: 41,
@@ -661,6 +662,78 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
 }
 
 #[test]
+fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"false\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run_path = fixture.run_path("finalizer-retry-fresh");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    assert!(
+        read_state(initial.root_handle()).unwrap().attempts[0]
+            .finalization
+            .is_none(),
+        "an untriggered finalizer graph must not synthesize progress"
+    );
+    assert_eq!(initial.finalizers.len(), 1);
+
+    initial
+        .state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.state = AttemptStateV1::WorkflowFailed;
+            attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.finalization = Some(AttemptFinalizationV1::Complete(
+                AttemptFinalizationCompleteV1 {
+                    complete: true,
+                    trigger: FinalizationTriggerV1::Failed,
+                    finalizers: vec![DurableFinalizerV1 {
+                        id: "cleanup".to_owned(),
+                        role: AttemptNodeRoleV1::Finalizer,
+                        failure_policy: FailurePolicy::Required,
+                        state: AttemptStepStateV1::Succeeded,
+                        failure: None,
+                        reason: None,
+                        unavailable_references: None,
+                    }],
+                    issues: Vec::new(),
+                    cancellation: None,
+                    force_abort: false,
+                },
+            ));
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    let predecessor = read_state(initial.root_handle()).unwrap().attempts[0].clone();
+    drop(initial);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed finalizer attempt should be retryable");
+    };
+    let retry = (*pending)
+        .begin(&fixture.admitted)
+        .unwrap_or_else(|_| panic!("eligible finalizer retry should commit"));
+    let state = read_state(retry.root_handle()).unwrap();
+    let attempt = &state.attempts[1];
+
+    assert_eq!(state.attempts[0], predecessor);
+    assert_ne!(attempt.attempt_id, predecessor.attempt_id);
+    assert_ne!(attempt.owner.owner_nonce, predecessor.owner.owner_nonce);
+    assert_eq!(attempt.progress.accepted_occurrence_ordinal, 0);
+    assert_eq!(attempt.progress.last_transition_sequence, 0);
+    assert!(attempt.progress.outstanding_actions.is_empty());
+    assert!(attempt.finalization.is_none());
+    assert_eq!(retry.finalizers.len(), 1);
+    assert_eq!(retry.finalizers[0].id, "cleanup");
+    assert_eq!(retry.finalizers[0].state, AttemptStepStateV1::Pending);
+}
+
+#[test]
 fn owner_loss_after_retry_commit_consumes_the_attempt_number() {
     let fixture = AdmittedFixture::new();
     let run_path = fixture.run_path("retry-crash");
@@ -899,7 +972,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
             "fullyDrained": true
         }
     });
-    let (outcome, steps, primary_failure) = match attempt.state {
+    let (outcome, mut steps, primary_failure) = match attempt.state {
         AttemptStateV1::Succeeded => (
             "succeeded",
             vec![
@@ -949,7 +1022,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                 }),
             ],
             Some(serde_json::json!({
-                "step": "first",
+                "node": { "id": "first", "role": "step" },
                 "phase": "execution",
                 "cause": { "code": "command_exit", "exitCode": 23 }
             })),
@@ -976,6 +1049,9 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
         ),
         state => panic!("unsupported fixture state: {state:?}"),
     };
+    for step in &mut steps {
+        step["role"] = Value::String("step".to_owned());
+    }
     let mut result = serde_json::json!({
         "schemaVersion": 1,
         "attemptNumber": attempt.attempt_number,
@@ -1041,6 +1117,7 @@ fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
     });
     result["steps"][1] = serde_json::json!({
         "id": "second",
+        "role": "step",
         "kind": "cmd",
         "failurePolicy": "advisory",
         "state": "blocked",
@@ -1134,15 +1211,29 @@ fn archived_attempt_loads_failed_current_result_and_raw_stream_prefixes_read_onl
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_workflow_failed(&run);
     let result_directory = publish_result_fixture(&fixture, &run);
+    let expected_result = result_value(&result_directory);
     let before = durable_tree(&run_path);
+    let result_open_count = std::cell::Cell::new(0_u8);
 
-    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+    let archived = load_local_archived_attempt_observed(
+        &run_path,
+        None,
+        |_| {},
+        |_| result_open_count.set(result_open_count.get().saturating_add(1)),
+    )
+    .unwrap();
 
     assert_eq!(archived.current_attempt_number, 1);
     assert_eq!(archived.attempt_number, 1);
     assert_eq!(archived.state, ArchivedAttemptState::WorkflowFailed);
     assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Failed);
     assert_eq!(archived.result_directory, result_directory);
+    assert_eq!(
+        serde_json::to_value(&archived.result).unwrap(),
+        expected_result,
+        "the loader must expose the complete value from its validated immutable read"
+    );
+    assert_eq!(result_open_count.get(), 1);
     assert_eq!(archived.workflow.presentation_order, ["first", "second"]);
     assert_eq!(archived.steps.len(), 2);
     assert!(matches!(
@@ -1392,6 +1483,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
         .map(|step| {
             serde_json::json!({
                 "id": step.id,
+                "role": "step",
                 "kind": "cmd",
                 "failurePolicy": "required",
                 "state": "succeeded",
@@ -1510,6 +1602,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         "outcome": "succeeded",
         "steps": [{
             "id": "produce",
+            "role": "step",
             "kind": "cmd",
             "failurePolicy": "required",
             "state": "succeeded",
@@ -1709,7 +1802,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
         .unwrap()
         .remove("commandOutput");
     invalid_name["primaryFailure"] = serde_json::json!({
-        "step": "first",
+        "node": { "id": "first", "role": "step" },
         "phase": "start",
         "cause": invalid_name_cause
     });
@@ -1731,7 +1824,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
         .unwrap()
         .remove("commandOutput");
     input_failure["primaryFailure"] = serde_json::json!({
-        "step": "first",
+        "node": { "id": "first", "role": "step" },
         "phase": "start",
         "cause": declared_input_cause
     });
@@ -1761,7 +1854,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
         .unwrap()
         .remove("commandOutput");
     indexed_scalar["primaryFailure"] = serde_json::json!({
-        "step": "first",
+        "node": { "id": "first", "role": "step" },
         "phase": "start",
         "cause": indexed_cause
     });
@@ -1781,7 +1874,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
         "cause": declared_output_cause.clone()
     });
     output_failure["primaryFailure"] = serde_json::json!({
-        "step": "first",
+        "node": { "id": "first", "role": "step" },
         "phase": "output_capture",
         "cause": declared_output_cause
     });
@@ -1863,13 +1956,14 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
         },
         "outcome": "failed",
         "primaryFailure": {
-            "step": "first",
+            "node": { "id": "first", "role": "step" },
             "phase": "execution",
             "cause": { "code": "command_exit", "exitCode": 23 }
         },
         "steps": [
             {
                 "id": "first",
+                "role": "step",
                 "kind": "cmd",
                 "failurePolicy": "required",
                 "state": "failed",
@@ -1883,6 +1977,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             },
             {
                 "id": "second",
+                "role": "step",
                 "kind": "cmd",
                 "failurePolicy": "required",
                 "state": "succeeded",
@@ -1892,6 +1987,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             },
             {
                 "id": "third",
+                "role": "step",
                 "kind": "cmd",
                 "failurePolicy": "required",
                 "state": "blocked",
@@ -1912,7 +2008,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
     // that then-terminal prerequisite even if lexicographically lower `first` fails later.
     let mut historical_blocker = valid.clone();
     historical_blocker["primaryFailure"] = serde_json::json!({
-        "step": "second",
+        "node": { "id": "second", "role": "step" },
         "phase": "execution",
         "cause": { "code": "command_exit", "exitCode": 29 }
     });
@@ -1975,6 +2071,7 @@ fn archived_attempt_rejects_not_run_step_with_failed_dependency() {
     let mut result = result_value(&result_directory);
     result["steps"][1] = serde_json::json!({
         "id": "second",
+        "role": "step",
         "kind": "cmd",
         "failurePolicy": "required",
         "state": "not_run",

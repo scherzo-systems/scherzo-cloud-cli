@@ -20,6 +20,7 @@ mod execution;
 mod exit_code;
 mod human_auth;
 mod process;
+mod public_id;
 mod runner;
 mod runner_protocol;
 mod timing;

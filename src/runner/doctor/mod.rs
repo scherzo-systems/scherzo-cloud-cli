@@ -1,4 +1,5 @@
 mod claude_code;
+mod codex;
 mod git;
 mod pi;
 
@@ -6,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use claude_code::ClaudeCodeCheck;
+use codex::CodexCheck;
 use git::GitCheck;
 use pi::PiCheck;
 
@@ -191,6 +193,7 @@ pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
     registry.register(Box::new(GitCheck::system()))?;
     registry.register(Box::new(PiCheck))?;
     registry.register(Box::new(ClaudeCodeCheck))?;
+    registry.register(Box::new(CodexCheck))?;
     Ok(registry)
 }
 
@@ -563,6 +566,11 @@ mod tests {
                 CheckDescriptor {
                     id: "execution.harness.claude-code-stream-json-v1",
                     title: "ClaudeCodeStreamJsonV1 installation",
+                    default: false,
+                },
+                CheckDescriptor {
+                    id: "execution.harness.codex-app-server-v1",
+                    title: "CodexAppServerV1 installation",
                     default: false,
                 },
             ]

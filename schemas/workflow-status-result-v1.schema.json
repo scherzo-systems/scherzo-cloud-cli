@@ -90,7 +90,8 @@
             "user_request",
             "termination_request",
             "caller_output_failure",
-            "runner_shutdown"
+            "runner_shutdown",
+            "execution_lease_expired"
           ]
         },
         "requestedAt": { "$ref": "#/$defs/Timestamp" },
@@ -128,12 +129,16 @@
         "code": { "const": "immutable_specification_unusable" }
       }
     },
+    "NodeRole": {
+      "enum": ["step", "finalizer"]
+    },
     "AttemptStep": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "failurePolicy", "state"],
+      "required": ["id", "role", "failurePolicy", "state"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "role": { "$ref": "#/$defs/NodeRole" },
         "failurePolicy": { "enum": ["required", "advisory"] },
         "state": {
           "enum": [
@@ -151,18 +156,228 @@
         }
       }
     },
+    "Failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "cause"],
+      "properties": {
+        "phase": { "enum": ["start", "execution", "output_capture"] },
+        "cause": { "$ref": "#/$defs/FailureCause" }
+      }
+    },
+    "FailureCause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": {
+          "enum": [
+            "step_unavailable",
+            "preparation_task_unavailable",
+            "inputs_unavailable",
+            "outputs_unsupported",
+            "agent_runtime_unavailable",
+            "agent_step_unavailable",
+            "agent_admission_unavailable",
+            "agent_inputs_unavailable",
+            "agent_input_missing_upstream",
+            "agent_input_type_mismatch",
+            "agent_source_unavailable",
+            "agent_source_text_invalid",
+            "agent_result_schema_unavailable",
+            "agent_value_mode_invalid",
+            "agent_attachment_count_limit",
+            "agent_attachment_bytes_limit",
+            "artifact_staging_mismatch",
+            "agent_staging_mismatch",
+            "agent_input_staging_unavailable",
+            "harness_start_failed",
+            "harness_input_too_large",
+            "harness_failed",
+            "harness_protocol_failed",
+            "missing_response",
+            "missing_result",
+            "result_validation_limit_exceeded",
+            "captured_value_too_large",
+            "result_settlement_failed",
+            "input_invalid_name",
+            "input_value_count_limit",
+            "input_value_size_limit",
+            "input_total_size_limit",
+            "input_collection_ordinal_limit",
+            "input_type_mismatch",
+            "input_source_unavailable",
+            "input_staging_unavailable",
+            "input_live_limit",
+            "execution_root_rebound",
+            "working_directory_unavailable",
+            "working_directory_escape",
+            "working_directory_not_directory",
+            "command_argv_invalid",
+            "command_path_unconfigured",
+            "executable_not_found",
+            "executable_unavailable",
+            "command_launch_not_found",
+            "command_launch_permission_denied",
+            "command_launch_invalid_input",
+            "command_launch_failed",
+            "command_exit",
+            "command_wait_failed",
+            "output_unsupported",
+            "capture_task_unavailable",
+            "output_path_absolute",
+            "output_path_escape",
+            "output_path_empty",
+            "output_missing",
+            "output_symbolic_link",
+            "output_parent_not_directory",
+            "output_not_regular_file",
+            "output_source_unavailable",
+            "captured_file_count_limit",
+            "captured_file_size_limit",
+            "captured_total_size_limit",
+            "captured_git_carrier_count_limit",
+            "captured_git_carrier_size_limit",
+            "captured_total_git_carrier_size_limit",
+            "git_execution_root_rebound",
+            "git_head_unavailable",
+            "git_baseline_not_ancestor",
+            "git_cleanliness_unavailable",
+            "git_workspace_dirty",
+            "git_tree_unavailable",
+            "git_required_objects_unavailable",
+            "git_source_authority_changed",
+            "git_structure_limit_exceeded",
+            "git_command_timed_out",
+            "git_bundle_generation_failed",
+            "git_bundle_profile_invalid",
+            "git_bundle_verification_failed",
+            "git_workspace_changed",
+            "git_temporary_storage_unavailable",
+            "output_staging_unavailable"
+          ]
+        },
+        "input": { "type": "string", "minLength": 1 },
+        "collectionIndex": { "type": "integer", "minimum": 0 },
+        "output": { "type": "string", "minLength": 1 },
+        "exitCode": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 }
+      }
+    },
+    "FinalizationCancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "enum": [
+            "user_request",
+            "termination_request",
+            "caller_output_failure",
+            "runner_shutdown",
+            "execution_lease_expired",
+            "finalization_force_abort"
+          ]
+        },
+        "forceStopDeadline": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DurableFinalizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "failurePolicy", "state"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "role": { "const": "finalizer" },
+        "failurePolicy": { "enum": ["required", "advisory"] },
+        "state": { "enum": ["succeeded", "failed", "blocked", "not_run", "cancelled"] },
+        "failure": { "$ref": "#/$defs/Failure" },
+        "reason": {
+          "enum": [
+            "user_request",
+            "termination_request",
+            "caller_output_failure",
+            "runner_shutdown",
+            "execution_lease_expired",
+            "finalization_force_abort",
+            "input_unavailable",
+            "finalizer_trigger_not_selected"
+          ]
+        },
+        "unavailableReferences": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "FinalizationIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finalizerId", "impact"],
+      "properties": {
+        "finalizerId": { "type": "string", "minLength": 1 },
+        "impact": { "enum": ["required", "advisory"] }
+      }
+    },
+    "AttemptFinalization": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["complete", "trigger", "finalizers", "forceAbort"],
+          "properties": {
+            "complete": { "const": false },
+            "trigger": { "enum": ["succeeded", "failed", "cancelled"] },
+            "finalizers": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "allOf": [
+                  { "$ref": "#/$defs/AttemptStep" },
+                  { "properties": { "role": { "const": "finalizer" } } }
+                ]
+              }
+            },
+            "cancellation": { "$ref": "#/$defs/FinalizationCancellation" },
+            "forceAbort": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["complete", "trigger", "finalizers", "issues", "forceAbort"],
+          "properties": {
+            "complete": { "const": true },
+            "trigger": { "enum": ["succeeded", "failed", "cancelled"] },
+            "finalizers": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/DurableFinalizer" }
+            },
+            "issues": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/FinalizationIssue" }
+            },
+            "cancellation": { "$ref": "#/$defs/FinalizationCancellation" },
+            "forceAbort": { "type": "boolean" }
+          }
+        }
+      ]
+    },
     "OutstandingAction": {
       "oneOf": [
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["actionId", "kind", "stepId"],
+          "required": ["actionId", "kind", "stepId", "nodeRole"],
           "properties": {
             "actionId": { "type": "integer", "minimum": 1 },
             "kind": {
               "enum": ["start_step", "capture_outputs", "cancel_step"]
             },
-            "stepId": { "type": "string", "minLength": 1 }
+            "stepId": { "type": "string", "minLength": 1 },
+            "nodeRole": { "$ref": "#/$defs/NodeRole" }
           }
         },
         {
@@ -191,7 +406,12 @@
         "steps": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/AttemptStep" }
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/AttemptStep" },
+              { "properties": { "role": { "const": "step" } } }
+            ]
+          }
         },
         "outstandingActions": {
           "type": "array",
@@ -206,6 +426,7 @@
         "guardId",
         "actionId",
         "stepId",
+        "nodeRole",
         "state",
         "executionHost",
         "processGroupId",
@@ -215,6 +436,7 @@
         "guardId": { "$ref": "#/$defs/Uuid" },
         "actionId": { "type": "integer", "minimum": 1 },
         "stepId": { "type": "string", "minLength": 1 },
+        "nodeRole": { "$ref": "#/$defs/NodeRole" },
         "state": { "enum": ["prepared", "released", "quiesced"] },
         "executionHost": { "$ref": "#/$defs/ExecutionHost" },
         "processGroupId": {
@@ -329,6 +551,7 @@
         "interruption": { "$ref": "#/$defs/Interruption" },
         "rejection": { "$ref": "#/$defs/Rejection" },
         "progress": { "$ref": "#/$defs/Progress" },
+        "finalization": { "$ref": "#/$defs/AttemptFinalization" },
         "processGuards": {
           "type": "array",
           "items": { "$ref": "#/$defs/ProcessGuard" }
@@ -391,7 +614,17 @@
           "else": { "not": { "required": ["rejection"] } }
         },
         {
-          "if": { "required": ["cancellation"] },
+          "if": {
+            "anyOf": [
+              { "required": ["cancellation"] },
+              {
+                "required": ["finalization"],
+                "properties": {
+                  "finalization": { "required": ["cancellation"] }
+                }
+              }
+            ]
+          },
           "then": {
             "properties": {
               "interruption": {
@@ -409,7 +642,17 @@
         },
         {
           "if": { "properties": { "state": { "enum": ["cancelling", "cancelled"] } } },
-          "then": { "required": ["cancellation"] }
+          "then": {
+            "anyOf": [
+              { "required": ["cancellation"] },
+              {
+                "required": ["finalization"],
+                "properties": {
+                  "finalization": { "required": ["cancellation"] }
+                }
+              }
+            ]
+          }
         },
         {
           "if": { "properties": { "state": { "const": "cancelled" } } },

@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --no-session-persistence Disable sessions\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --json-schema <schema> Schema\n";
+const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --session-id <uuid> Use session\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --json-schema <schema> Schema\n";
 
 struct FakeRunner {
     invocations: Mutex<Vec<Vec<String>>>,
@@ -96,7 +96,7 @@ fn exact_release_and_every_capability_construct_the_pinned_installation() {
     let executable = std::env::current_exe().unwrap();
     let runner = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"2.1.222 (Claude Code)\n"),
+        version: output(b"2.1.234 (Claude Code)\n"),
         capabilities: output(COMPLETE_HELP.as_bytes()),
     };
 
@@ -108,7 +108,7 @@ fn exact_release_and_every_capability_construct_the_pinned_installation() {
         installation.executable(),
         fs::canonicalize(executable).unwrap()
     );
-    assert_eq!(installation.version().as_str(), "2.1.222");
+    assert_eq!(installation.version().as_str(), "2.1.234");
     assert_eq!(
         installation.profile(),
         ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
@@ -128,9 +128,9 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
     let executable = std::env::current_exe().unwrap();
     for malformed in [
         "not-a-version",
-        "2.1.222",
-        "2.1.222-rc.1 (Claude Code)",
-        "02.1.222 (Claude Code)",
+        "2.1.234",
+        "2.1.234-rc.1 (Claude Code)",
+        "02.1.234 (Claude Code)",
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
@@ -149,29 +149,31 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
         );
     }
 
-    let incompatible = FakeRunner {
-        invocations: Mutex::new(Vec::new()),
-        version: output(b"2.1.221 (Claude Code)\n"),
-        capabilities: output(COMPLETE_HELP.as_bytes()),
-    };
-    assert_eq!(
-        validate_claude_code_installation_with(
-            &executable,
-            OsStr::new("/controlled/bin"),
-            &incompatible,
-        ),
-        Err(ClaudeCodeInstallationFailure::Unsupported(
-            ClaudeCodeIncompatibility::Version("2.1.221".to_owned())
-        ))
-    );
-    assert_eq!(
-        *incompatible.invocations.lock().unwrap(),
-        [vec!["--version".to_owned()]]
-    );
+    for version in ["2.1.222", "2.1.233", "2.1.235"] {
+        let incompatible = FakeRunner {
+            invocations: Mutex::new(Vec::new()),
+            version: output(format!("{version} (Claude Code)\n").as_bytes()),
+            capabilities: output(COMPLETE_HELP.as_bytes()),
+        };
+        assert_eq!(
+            validate_claude_code_installation_with(
+                &executable,
+                OsStr::new("/controlled/bin"),
+                &incompatible,
+            ),
+            Err(ClaudeCodeInstallationFailure::Unsupported(
+                ClaudeCodeIncompatibility::Version(version.to_owned())
+            ))
+        );
+        assert_eq!(
+            *incompatible.invocations.lock().unwrap(),
+            [vec!["--version".to_owned()]]
+        );
+    }
 
     let missing_schema = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"2.1.222 (Claude Code)\n"),
+        version: output(b"2.1.234 (Claude Code)\n"),
         capabilities: output(
             COMPLETE_HELP
                 .replace("--json-schema", "--schema")

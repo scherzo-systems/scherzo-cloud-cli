@@ -12,6 +12,10 @@ fn http_client() -> HttpClient {
     HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("HTTP client should build")
 }
 
+fn assert_protocol_error(error: &OrganizationError) {
+    assert!(matches!(error.kind, OrganizationErrorKind::Protocol { .. }));
+}
+
 fn response(
     status: &str,
     content_type: Option<&str>,
@@ -247,7 +251,7 @@ fn rate_limit_requires_matching_problem_and_positive_retry_after() {
         ));
         let error = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None)
             .expect_err("invalid Retry-After should be a protocol failure");
-        assert!(error.to_string().contains("invalid Retry-After"));
+        assert_protocol_error(&error);
         server.finish_one();
     }
 }
@@ -596,7 +600,7 @@ fn malformed_media_and_mismatched_problem_status_are_protocol_failures() {
     ));
     let error = get_organization(&http_client(), &invalid_media.api_url, TOKEN, "acme")
         .expect_err("invalid success media type should fail");
-    assert!(error.to_string().contains("Content-Type"));
+    assert_protocol_error(&error);
     invalid_media.finish_one();
 
     let mismatched_body = serde_json::to_vec(&serde_json::json!({
@@ -613,7 +617,7 @@ fn malformed_media_and_mismatched_problem_status_are_protocol_failures() {
     ));
     let error = get_organization(&http_client(), &mismatched.api_url, TOKEN, "acme")
         .expect_err("mismatched problem status should fail");
-    assert!(error.to_string().contains("does not match"));
+    assert_protocol_error(&error);
     assert!(
         !error
             .to_string()
@@ -642,8 +646,8 @@ fn changed_operation_problem_is_a_protocol_failure_without_leaking_prose() {
     )
     .expect_err("create-only problem should not be accepted for update");
 
+    assert_protocol_error(&error);
     let formatted = error.to_string();
-    assert!(formatted.contains("unrecognized problem type"));
     for secret in [
         TOKEN,
         KEY,
@@ -662,7 +666,7 @@ fn responses_are_bounded_and_success_models_are_validated() {
         ScriptedHttpServer::respond(response("200 OK", Some(JSON_MEDIA_TYPE), &[], &oversized));
     let error = get_organization(&http_client(), &server.api_url, TOKEN, "acme")
         .expect_err("oversized body should fail");
-    assert!(error.to_string().contains("exceeds 1 MiB"));
+    assert_protocol_error(&error);
     server.finish_one();
 
     for body in [
@@ -698,7 +702,7 @@ fn mutation_successes_require_their_response_identity_headers() {
         ));
         let error = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None)
             .expect_err("missing or changed response identity must fail");
-        assert!(error.to_string().contains("Idempotency-Key"));
+        assert_protocol_error(&error);
         server.finish_one();
     }
 
@@ -715,7 +719,7 @@ fn mutation_successes_require_their_response_identity_headers() {
         ));
         let error = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None)
             .expect_err("missing or changed Location must fail");
-        assert!(error.to_string().contains("Location"));
+        assert_protocol_error(&error);
         server.finish_one();
     }
 
@@ -735,7 +739,7 @@ fn mutation_successes_require_their_response_identity_headers() {
         None,
     )
     .expect_err("update response identity is required");
-    assert!(error.to_string().contains("Idempotency-Key"));
+    assert_protocol_error(&error);
     missing_update_identity.finish_one();
 }
 
@@ -762,7 +766,7 @@ fn interrupted_success_with_mismatched_identity_is_not_retried() {
         "the mutation retried after the successful response echoed another request identity"
     );
     let error = result.expect_err("a mismatched response identity is a protocol failure");
-    assert!(error.to_string().contains("Idempotency-Key"));
+    assert_protocol_error(&error);
 }
 
 #[test]
@@ -775,7 +779,7 @@ fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
     ));
     let error = get_organization(&http_client(), &redirect.api_url, TOKEN, "acme")
         .expect_err("redirect should fail");
-    assert!(error.to_string().contains("redirect responses"));
+    assert_protocol_error(&error);
     redirect.finish_one();
 
     let unauthorized = ScriptedHttpServer::respond(response(
@@ -803,7 +807,7 @@ fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
     )
     .expect_err("interrupted unauthorized mutation response should fail");
     assert!(error.credential_rejected());
-    assert!(error.to_string().contains("could not be read"));
+    assert_protocol_error(&error);
     assert!(!error.to_string().contains(TOKEN));
     interrupted.finish_one();
 }

@@ -10,6 +10,8 @@ use crate::execution::workflow::agent::{
 };
 
 const CWD: &str = "/execution/worktree";
+const FIRST_REASONING_SUMMARY: &str = "Inspecting the changed parser state.";
+const SECOND_REASONING_SUMMARY: &str = "Checking the next transition.";
 const RESPONSE_SUCCESS: &[u8] = include_bytes!("fixtures/response-success.jsonl");
 const NATIVE_RECOVERY: &[u8] = include_bytes!("fixtures/native-recovery.jsonl");
 const PARALLEL_WORK_BEFORE_RESULT: &[u8] =
@@ -160,6 +162,82 @@ fn simple_transcript(reason: &str, content: Value) -> Vec<u8> {
     ])
 }
 
+fn multiple_reasoning_summaries_transcript(finalized_thinking: &str) -> Vec<u8> {
+    let usage = json!({
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+    });
+    let message = |thinking: Option<&str>, text: Option<&str>, stop_reason: &str| {
+        let mut content = Vec::new();
+        if let Some(thinking) = thinking {
+            content.push(json!({"type": "thinking", "thinking": thinking}));
+        }
+        if let Some(text) = text {
+            content.push(json!({"type": "text", "text": text}));
+        }
+        json!({
+            "role": "assistant",
+            "content": content,
+            "api": "test-api",
+            "provider": "test-provider",
+            "model": "test-model",
+            "usage": usage,
+            "stopReason": stop_reason,
+            "timestamp": 2
+        })
+    };
+    let empty = message(None, None, "pending");
+    let thinking_started = message(Some(""), None, "pending");
+    let first = message(Some(FIRST_REASONING_SUMMARY), None, "pending");
+    let first_separator = message(
+        Some(&format!("{FIRST_REASONING_SUMMARY}\n\n")),
+        None,
+        "pending",
+    );
+    let both = message(
+        Some(&format!(
+            "{FIRST_REASONING_SUMMARY}\n\n{SECOND_REASONING_SUMMARY}"
+        )),
+        None,
+        "pending",
+    );
+    let streamed = message(
+        Some(&format!(
+            "{FIRST_REASONING_SUMMARY}\n\n{SECOND_REASONING_SUMMARY}\n\n"
+        )),
+        None,
+        "pending",
+    );
+    let finalized = message(Some(finalized_thinking), None, "pending");
+    let text_started = message(Some(finalized_thinking), Some(""), "pending");
+    let text = message(Some(finalized_thinking), Some("complete"), "pending");
+    let completed = message(Some(finalized_thinking), Some("complete"), "stop");
+
+    encoded(&[
+        json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000b", "timestamp": "2026-07-30T12:00:00Z", "cwd": CWD}),
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": empty}),
+        json!({"type": "message_update", "message": thinking_started, "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0, "partial": thinking_started}}),
+        json!({"type": "message_update", "message": first, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": FIRST_REASONING_SUMMARY, "partial": first}}),
+        json!({"type": "message_update", "message": first_separator, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "\n\n", "partial": first_separator}}),
+        json!({"type": "message_update", "message": both, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": SECOND_REASONING_SUMMARY, "partial": both}}),
+        json!({"type": "message_update", "message": streamed, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "\n\n", "partial": streamed}}),
+        json!({"type": "message_update", "message": finalized, "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": finalized_thinking, "partial": finalized}}),
+        json!({"type": "message_update", "message": text_started, "assistantMessageEvent": {"type": "text_start", "contentIndex": 1, "partial": text_started}}),
+        json!({"type": "message_update", "message": text, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": "complete", "partial": text}}),
+        json!({"type": "message_update", "message": text, "assistantMessageEvent": {"type": "text_end", "contentIndex": 1, "content": "complete", "partial": text}}),
+        json!({"type": "message_end", "message": completed}),
+        json!({"type": "turn_end", "message": completed, "toolResults": []}),
+        json!({"type": "agent_end", "messages": [completed], "willRetry": false}),
+        json!({"type": "agent_settled"}),
+    ])
+}
+
 fn terminal(outcome: AgentOutcome) -> RecordedReplay {
     RecordedReplay {
         observations: Vec::new(),
@@ -227,6 +305,110 @@ fn unclosed_streamed_tool_call(reason: &str) -> Vec<u8> {
             "message": updated
         }),
         json!({"type": "message_end", "message": completed}),
+    ])
+}
+
+fn partial_tool_call_native_result_recovery_transcript() -> Vec<u8> {
+    let usage = json!({
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+    });
+    let user = json!({"role": "user", "content": "prompt", "timestamp": 1});
+    let empty = json!({
+        "role": "assistant",
+        "content": [],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": usage,
+        "stopReason": "pending",
+        "timestamp": 2
+    });
+    let mut thinking_started = empty.clone();
+    thinking_started["content"] = json!([{"type": "thinking", "thinking": ""}]);
+    let mut thinking_streamed = thinking_started.clone();
+    thinking_streamed["content"][0]["thinking"] = json!("Preparing a result call.");
+    let mut tool_started = thinking_streamed.clone();
+    tool_started["content"].as_array_mut().unwrap().push(json!({
+        "type": "toolCall",
+        "id": "call-interrupted-result",
+        "name": "scherzo_result_fixed",
+        "arguments": {}
+    }));
+    let mut tool_streamed = tool_started.clone();
+    tool_streamed["content"][1]["arguments"] = json!({"result": {"answer": 0}});
+    let mut interrupted = tool_streamed.clone();
+    interrupted["stopReason"] = json!("error");
+    interrupted["errorMessage"] = json!("WebSocket closed 1006 Connection ended");
+    interrupted["diagnostics"] = json!([{
+        "type": "provider_transport_failure",
+        "timestamp": 2,
+        "error": {
+            "name": "Error",
+            "message": "WebSocket closed 1006 Connection ended"
+        },
+        "details": {
+            "eventsEmitted": true,
+            "phase": "after_message_stream_start"
+        }
+    }]);
+    let recovered = json!({
+        "role": "assistant",
+        "content": [{
+            "type": "toolCall",
+            "id": "call-recovered-result",
+            "name": "scherzo_result_fixed",
+            "arguments": {"result": {"answer": 42}}
+        }],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": usage,
+        "stopReason": "toolUse",
+        "timestamp": 3
+    });
+    let result = json!({
+        "role": "toolResult",
+        "toolCallId": "call-recovered-result",
+        "toolName": "scherzo_result_fixed",
+        "content": [{"type": "text", "text": "accepted"}],
+        "details": {},
+        "isError": false,
+        "timestamp": 4
+    });
+
+    encoded(&[
+        json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000a", "timestamp": "2026-07-30T12:00:00Z", "cwd": CWD}),
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": user}),
+        json!({"type": "message_end", "message": user}),
+        json!({"type": "message_start", "message": empty}),
+        json!({"type": "message_update", "message": thinking_started, "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0, "partial": thinking_started}}),
+        json!({"type": "message_update", "message": thinking_streamed, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "Preparing a result call.", "partial": thinking_streamed}}),
+        json!({"type": "message_update", "message": thinking_streamed, "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": "Preparing a result call.", "partial": thinking_streamed}}),
+        json!({"type": "message_update", "message": tool_started, "assistantMessageEvent": {"type": "toolcall_start", "contentIndex": 1, "partial": tool_started}}),
+        json!({"type": "message_update", "message": tool_streamed, "assistantMessageEvent": {"type": "toolcall_delta", "contentIndex": 1, "delta": "{\"result\":{\"answer\":0}}", "partial": tool_streamed}}),
+        json!({"type": "message_end", "message": interrupted}),
+        json!({"type": "turn_end", "message": interrupted, "toolResults": []}),
+        json!({"type": "agent_end", "messages": [user, interrupted], "willRetry": true}),
+        json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 0, "errorMessage": "WebSocket closed 1006 Connection ended"}),
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": recovered}),
+        json!({"type": "message_end", "message": recovered}),
+        json!({"type": "auto_retry_end", "success": true, "attempt": 1}),
+        json!({"type": "tool_execution_start", "toolCallId": "call-recovered-result", "toolName": "scherzo_result_fixed", "args": {"result": {"answer": 42}}}),
+        json!({"type": "tool_execution_end", "toolCallId": "call-recovered-result", "toolName": "scherzo_result_fixed", "result": {"content": [{"type": "text", "text": "accepted"}], "details": {}, "terminate": true}, "isError": false}),
+        json!({"type": "message_start", "message": result}),
+        json!({"type": "message_end", "message": result}),
+        json!({"type": "turn_end", "message": recovered, "toolResults": [result]}),
+        json!({"type": "agent_end", "messages": [recovered, result], "willRetry": false}),
+        json!({"type": "agent_settled"}),
     ])
 }
 
@@ -423,7 +605,26 @@ fn tool_error_then_success_transcript() -> Vec<u8> {
 }
 
 fn assert_failure(transcript: &RecordedReplay, cause: AgentFailureCause) {
-    assert_eq!(transcript.outcome(), &AgentOutcome::Failed { cause });
+    assert_outcome_failure(transcript.outcome(), cause);
+}
+
+fn assert_outcome_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    assert_eq!(failure.cause(), &cause);
+}
+
+fn protocol_rejection_value(outcome: &AgentOutcome) -> Value {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    serde_json::to_value(
+        failure
+            .protocol_rejection()
+            .expect("parser-owned failure must carry a rejection diagnostic"),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -459,6 +660,340 @@ fn recorded_response_is_ordered_bounded_and_repeatable_across_chunking() {
 }
 
 #[test]
+fn parser_rejections_report_stable_frame_startup_and_reasoning_transition_context() {
+    let mut malformed_frame = parser(AgentValueKind::None);
+    assert_eq!(
+        malformed_frame.push_ignoring(b"not-json\n"),
+        Err(AgentFailureCause::HarnessStartFailed)
+    );
+    let malformed_frame = malformed_frame.finish(PiJsonV1ProcessCompletion::exited(false));
+    assert_eq!(
+        protocol_rejection_value(&malformed_frame),
+        json!({
+            "schemaVersion": 1,
+            "profile": "PiJsonV1",
+            "detail": {
+                "reason": "frame_decode_failed",
+                "stage": "frame_decode",
+                "state": {
+                    "sessionHeaderSeen": false,
+                    "agentStarted": false,
+                    "activeAttempt": false,
+                    "activeTurn": false,
+                    "activeMessage": "none",
+                    "assistantUpdateSeen": false,
+                    "resultAccepted": false,
+                    "settled": false
+                }
+            }
+        })
+    );
+
+    let events = values(RESPONSE_SUCCESS);
+    let rejected_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_update"
+                && event["assistantMessageEvent"]["type"] == "text_delta"
+        })
+        .unwrap();
+    let prefix = encoded(&events[..rejected_index]);
+    let mut original = events[rejected_index].clone();
+    for (field, sentinel) in [
+        ("prompt", "SENTINEL_PROMPT_CONTENT"),
+        ("reasoning", "SENTINEL_REASONING_CONTENT"),
+        ("toolArguments", "SENTINEL_TOOL_ARGUMENTS"),
+        ("signature", "SENTINEL_PROVIDER_SIGNATURE"),
+        ("nativeSessionId", "SENTINEL_NATIVE_SESSION_ID"),
+    ] {
+        original[field] = json!(sentinel);
+    }
+    let cases = [
+        (
+            "assistant_update_invalid",
+            "assistant_update",
+            "text_delta",
+            0,
+            {
+                let mut event = original.clone();
+                event["assistantMessageEvent"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("delta");
+                event
+            },
+        ),
+        (
+            "assistant_update_content_index_mismatch",
+            "assistant_transition",
+            "text_delta",
+            1,
+            {
+                let mut event = original.clone();
+                event["assistantMessageEvent"]["contentIndex"] = json!(1);
+                event
+            },
+        ),
+        (
+            "assistant_update_open_block_mismatch",
+            "assistant_transition",
+            "thinking_delta",
+            0,
+            {
+                let mut event = original;
+                event["assistantMessageEvent"]["type"] = json!("thinking_delta");
+                event
+            },
+        ),
+    ];
+    for (reason, stage, update, content_index, rejected) in cases {
+        let mut parser = parser(AgentValueKind::Response);
+        parser.push_ignoring(&prefix).unwrap();
+        assert_eq!(
+            parser.push_ignoring(&encoded(&[rejected])),
+            Err(AgentFailureCause::HarnessProtocolFailed)
+        );
+        let outcome = parser.finish(PiJsonV1ProcessCompletion::exited(false));
+        let diagnostic = protocol_rejection_value(&outcome);
+        assert_eq!(diagnostic["schemaVersion"], 1);
+        assert_eq!(diagnostic["profile"], "PiJsonV1");
+        assert_eq!(diagnostic["detail"]["reason"], reason);
+        assert_eq!(diagnostic["detail"]["stage"], stage);
+        assert_eq!(diagnostic["detail"]["outerEvent"], "message_update");
+        assert_eq!(diagnostic["detail"]["assistantUpdate"], update);
+        assert_eq!(diagnostic["detail"]["contentIndex"], content_index);
+        assert_eq!(
+            diagnostic["detail"]["state"],
+            json!({
+                "sessionHeaderSeen": true,
+                "agentStarted": true,
+                "activeAttempt": true,
+                "activeTurn": true,
+                "activeMessage": "assistant",
+                "activeAssistantContentBlocks": 1,
+                "assistantUpdateSeen": true,
+                "openBlock": {"kind": "text", "contentIndex": 0},
+                "resultAccepted": false,
+                "settled": false
+            })
+        );
+        let serialized = diagnostic.to_string();
+        for sentinel in [
+            "SENTINEL_PROMPT_CONTENT",
+            "SENTINEL_REASONING_CONTENT",
+            "SENTINEL_TOOL_ARGUMENTS",
+            "SENTINEL_PROVIDER_SIGNATURE",
+            "SENTINEL_NATIVE_SESSION_ID",
+        ] {
+            assert!(!serialized.contains(sentinel));
+        }
+        assert!(serialized.len() < 16 * 1024);
+    }
+
+    let limits = PiJsonV1ProtocolLimits {
+        maximum_frame_bytes: NonZeroU64::new(512).unwrap(),
+    };
+    let mut oversized = PiJsonV1Parser::new(
+        Arc::from(CWD),
+        AgentValueKind::None,
+        NonZeroU64::new(1024).unwrap(),
+        limits,
+        None,
+    );
+    oversized
+        .push_ignoring(&encoded(&[
+            json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000e", "timestamp": "2026-07-30T12:00:00Z", "cwd": CWD}),
+            json!({"type": "agent_start"}),
+        ]))
+        .unwrap();
+    let oversized_frame = encoded(&[json!({
+        "type": "message_update",
+        "reasoning": "SENTINEL_OVERSIZED_FRAME",
+        "padding": "x".repeat(1024)
+    })]);
+    assert_eq!(
+        oversized.push_ignoring(&oversized_frame),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    let diagnostic =
+        protocol_rejection_value(&oversized.finish(PiJsonV1ProcessCompletion::exited(false)));
+    let serialized = diagnostic.to_string();
+    assert_eq!(diagnostic["detail"]["reason"], "frame_too_large");
+    assert!(!serialized.contains("SENTINEL_OVERSIZED_FRAME"));
+    assert!(serialized.len() < 16 * 1024);
+}
+
+#[test]
+fn rejected_turn_end_preserves_pre_transition_state_in_diagnostic() {
+    let events = values(RESPONSE_SUCCESS);
+    let rejected_boundary = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_update"
+                && event["assistantMessageEvent"]["type"] == "text_delta"
+        })
+        .unwrap()
+        + 1;
+    let premature_turn_end = events
+        .iter()
+        .find(|event| event["type"] == "turn_end")
+        .unwrap()
+        .clone();
+    let mut rejected = events[..rejected_boundary].to_vec();
+    rejected.push(premature_turn_end);
+
+    let outcome = replay(&encoded(&rejected), AgentValueKind::Response).outcome;
+    let diagnostic = protocol_rejection_value(&outcome);
+
+    assert_eq!(diagnostic["detail"]["outerEvent"], "turn_end");
+    assert_eq!(diagnostic["detail"]["state"]["activeTurn"], true);
+    assert_eq!(diagnostic["detail"]["state"]["activeMessage"], "assistant");
+    assert_eq!(
+        diagnostic["detail"]["state"]["openBlock"],
+        json!({"kind": "text", "contentIndex": 0})
+    );
+}
+
+#[test]
+fn provider_finalized_thinking_reaches_the_next_action_and_terminal_snapshot() {
+    const FINALIZED_THINKING: &str = "Provider-finalized reasoning snapshot.";
+    let conforming = replay(
+        &multiple_reasoning_summaries_transcript(FINALIZED_THINKING),
+        AgentValueKind::Response,
+    );
+    assert_eq!(
+        conforming.outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Response(
+            BoundedAgentResponse::from_bounded(Arc::from("complete")),
+        ))
+    );
+    let reasoning = conforming
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::Reasoning { text } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasoning,
+        [
+            FIRST_REASONING_SUMMARY,
+            "\n\n",
+            SECOND_REASONING_SUMMARY,
+            "\n\n"
+        ]
+    );
+    assert!(!reasoning.contains(&FINALIZED_THINKING));
+}
+
+#[test]
+fn compact_thinking_end_cannot_erase_event_snapshot_disagreement() {
+    const FINALIZED_THINKING: &str = "Provider-finalized reasoning snapshot.";
+    let mut events = values(&multiple_reasoning_summaries_transcript(FINALIZED_THINKING));
+    let thinking_end = events
+        .iter_mut()
+        .find(|event| {
+            event["type"] == "message_update"
+                && event["assistantMessageEvent"]["type"] == "thinking_end"
+        })
+        .unwrap();
+    thinking_end["assistantMessageEvent"]["content"] =
+        json!("A provider event snapshot that disagrees with its partial.");
+
+    // Reproduce the superseded compaction shape to keep the parser fail closed
+    // if a compact thinking-end frame reaches it from any source.
+    let assistant_event = thinking_end["assistantMessageEvent"]
+        .as_object_mut()
+        .unwrap();
+    assistant_event.insert("scherzoCompact".to_owned(), json!(true));
+    assistant_event.remove("partial");
+    assistant_event.remove("content");
+
+    let rejected = replay(&encoded(&events), AgentValueKind::Response);
+    assert_outcome_failure(&rejected.outcome, AgentFailureCause::HarnessProtocolFailed);
+    let diagnostic = protocol_rejection_value(&rejected.outcome);
+    assert_eq!(diagnostic["detail"]["reason"], "assistant_update_invalid");
+    assert_eq!(diagnostic["detail"]["stage"], "assistant_update");
+    assert_eq!(diagnostic["detail"]["assistantUpdate"], "thinking_end");
+}
+
+#[test]
+fn thinking_end_rejects_structural_and_snapshot_disagreement() {
+    const FINALIZED_THINKING: &str = "Provider-finalized reasoning snapshot.";
+    let baseline = values(&multiple_reasoning_summaries_transcript(FINALIZED_THINKING));
+    let thinking_end_index = baseline
+        .iter()
+        .position(|event| {
+            event["type"] == "message_update"
+                && event["assistantMessageEvent"]["type"] == "thinking_end"
+        })
+        .unwrap();
+    let assert_rejected = |events: Vec<Value>, expected_reason: &str, expected_index: u64| {
+        let rejected = replay(&encoded(&events), AgentValueKind::Response);
+        assert_outcome_failure(&rejected.outcome, AgentFailureCause::HarnessProtocolFailed);
+        let diagnostic = protocol_rejection_value(&rejected.outcome);
+        assert_eq!(diagnostic["detail"]["reason"], expected_reason);
+        assert_eq!(diagnostic["detail"]["stage"], "assistant_transition");
+        assert_eq!(diagnostic["detail"]["outerEvent"], "message_update");
+        assert_eq!(diagnostic["detail"]["assistantUpdate"], "thinking_end");
+        assert_eq!(diagnostic["detail"]["contentIndex"], expected_index);
+        assert_eq!(diagnostic["detail"]["state"]["activeMessage"], "assistant");
+        let serialized = diagnostic.to_string();
+        assert!(!serialized.contains(FIRST_REASONING_SUMMARY));
+        assert!(!serialized.contains(FINALIZED_THINKING));
+        assert!(serialized.len() < 16 * 1024);
+    };
+
+    let mut no_open_block = baseline.clone();
+    no_open_block.retain(|event| {
+        event["type"] != "message_update"
+            || !matches!(
+                event["assistantMessageEvent"]["type"].as_str(),
+                Some("thinking_start" | "thinking_delta")
+            )
+    });
+    assert_rejected(no_open_block, "assistant_update_open_block_mismatch", 0);
+
+    let mut wrong_index = baseline.clone();
+    wrong_index[thinking_end_index]["assistantMessageEvent"]["contentIndex"] = json!(1);
+    assert_rejected(wrong_index, "assistant_update_content_index_mismatch", 1);
+
+    let mut wrong_kind = baseline.clone();
+    let text_block = json!({"type": "text", "text": FINALIZED_THINKING});
+    wrong_kind[thinking_end_index]["message"]["content"][0] = text_block.clone();
+    wrong_kind[thinking_end_index]["assistantMessageEvent"]["partial"]["content"][0] = text_block;
+    assert_rejected(wrong_kind, "thinking_finalization_rewrite", 0);
+
+    let mut event_partial_disagreement = baseline.clone();
+    event_partial_disagreement[thinking_end_index]["assistantMessageEvent"]["content"] =
+        json!("A different event snapshot.");
+    assert_rejected(
+        event_partial_disagreement,
+        "thinking_finalization_rewrite",
+        0,
+    );
+
+    let mut stable_fields_changed = baseline.clone();
+    stable_fields_changed[thinking_end_index]["message"]["model"] = json!("changed-model");
+    stable_fields_changed[thinking_end_index]["assistantMessageEvent"]["partial"]["model"] =
+        json!("changed-model");
+    assert_rejected(stable_fields_changed, "assistant_stable_fields_changed", 0);
+
+    let mut sibling_added = baseline;
+    let sibling = json!({"type": "text", "text": "changed sibling"});
+    sibling_added[thinking_end_index]["message"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(sibling.clone());
+    sibling_added[thinking_end_index]["assistantMessageEvent"]["partial"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(sibling);
+    assert_rejected(sibling_added, "thinking_finalization_rewrite", 0);
+}
+
+#[test]
 fn recorded_native_retry_keeps_intermediate_error_observational() {
     let transcript = replay(NATIVE_RECOVERY, AgentValueKind::Response);
     let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
@@ -486,6 +1021,82 @@ fn recorded_native_retry_keeps_intermediate_error_observational() {
             ))
             .count(),
         1
+    );
+}
+
+#[test]
+fn partial_tool_call_error_recovers_without_execution_or_result_correlation() {
+    let bytes = partial_tool_call_native_result_recovery_transcript();
+    let events = values(&bytes);
+    let first_turn_end = events
+        .iter()
+        .position(|event| event["type"] == "turn_end")
+        .unwrap();
+    let mut interrupted = result_parser();
+    interrupted
+        .push_ignoring(&encoded(&events[..first_turn_end]))
+        .unwrap();
+    assert_eq!(
+        interrupted.try_correlate_result_request(
+            "scherzo_result_fixed",
+            "call-interrupted-result",
+            &json!({"result": {"answer": 0}}),
+        ),
+        Ok(false),
+        "the interrupted result call must not become correlatable"
+    );
+
+    let transcript = replay_accepted_result(&bytes, "call-recovered-result");
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = transcript.outcome()
+    else {
+        panic!("native retry must complete from the recovered result call");
+    };
+    assert_eq!(result.value(), &json!({"answer": 42}));
+    assert!(transcript.observations().iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Error,
+            message,
+        } if message.as_ref() == "WebSocket closed 1006 Connection ended"
+    )));
+    let retry_milestones = transcript
+        .observations()
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::Lifecycle { milestone }
+                if matches!(
+                    milestone,
+                    AgentLifecycleMilestone::RetryStarted | AgentLifecycleMilestone::RetryCompleted
+                ) =>
+            {
+                Some(*milestone)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retry_milestones,
+        [
+            AgentLifecycleMilestone::RetryStarted,
+            AgentLifecycleMilestone::RetryCompleted
+        ]
+    );
+    assert!(
+        !transcript.observations().iter().any(|observation| matches!(
+            observation,
+            AgentObservation::ToolCall {
+                call_id,
+                phase: AgentToolCallPhase::Completed,
+                ..
+            } if call_id.as_ref() == "call-interrupted-result"
+        ))
+    );
+    assert!(
+        !transcript.observations().iter().any(|observation| matches!(
+            observation,
+            AgentObservation::ToolResult { call_id, .. }
+                if call_id.as_ref() == "call-interrupted-result"
+        ))
     );
 }
 
@@ -633,8 +1244,8 @@ fn pending_is_partial_only_and_recorded_streams_reach_terminal_reasons() {
 }
 
 #[test]
-fn non_length_terminal_reasons_cannot_close_a_streamed_tool_call() {
-    for reason in ["stop", "toolUse", "error", "aborted"] {
+fn non_retry_terminal_reasons_cannot_close_a_streamed_tool_call() {
+    for reason in ["stop", "toolUse", "aborted"] {
         let mut parser = parser(AgentValueKind::None);
         assert_eq!(
             parser.push_ignoring(&unclosed_streamed_tool_call(reason)),
@@ -642,6 +1253,72 @@ fn non_length_terminal_reasons_cannot_close_a_streamed_tool_call() {
             "unexpected implicit close for {reason}"
         );
     }
+
+    let bytes = partial_tool_call_native_result_recovery_transcript();
+    let mut events = values(&bytes);
+    let first_agent_end = events
+        .iter()
+        .position(|event| event["type"] == "agent_end")
+        .unwrap();
+    events[first_agent_end]["willRetry"] = json!(false);
+    events.truncate(first_agent_end + 1);
+    let mut parser = result_parser();
+    assert_eq!(
+        parser.push_ignoring(&encoded(&events)),
+        Err(AgentFailureCause::HarnessProtocolFailed),
+        "an interrupted tool call requires Pi's promised native retry"
+    );
+}
+
+#[test]
+fn partial_tool_call_requires_native_retry_start_before_continuation() {
+    let mut events = values(&partial_tool_call_native_result_recovery_transcript());
+    events.retain(|event| {
+        !matches!(
+            event["type"].as_str(),
+            Some("auto_retry_start" | "auto_retry_end")
+        )
+    });
+    let first_agent_end = events
+        .iter()
+        .position(|event| event["type"] == "agent_end")
+        .unwrap();
+    events.splice(
+        first_agent_end + 1..first_agent_end + 1,
+        [
+            json!({"type": "compaction_start", "reason": "overflow"}),
+            json!({"type": "compaction_end", "reason": "overflow", "result": {}, "aborted": false, "willRetry": true}),
+        ],
+    );
+
+    let mut parser = result_parser();
+    assert_eq!(
+        parser.push_ignoring(&encoded(&events)),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+}
+
+#[test]
+fn interrupted_tool_call_cannot_emit_native_execution_events() {
+    let mut events = values(&partial_tool_call_native_result_recovery_transcript());
+    let first_turn_end = events
+        .iter()
+        .position(|event| event["type"] == "turn_end")
+        .unwrap();
+    events.insert(
+        first_turn_end,
+        json!({
+            "type": "tool_execution_start",
+            "toolCallId": "call-interrupted-result",
+            "toolName": "scherzo_result_fixed",
+            "args": {"result": {"answer": 0}}
+        }),
+    );
+    let mut parser = result_parser();
+    assert_eq!(
+        parser.push_ignoring(&encoded(&events)),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
 }
 
 #[test]
@@ -1560,15 +2237,9 @@ fn terminal_validation_requires_settlement_and_closed_retry_state() {
         replay(&encoded(&missing_settled), AgentValueKind::Response).outcome,
         replay(&encoded(&missing_retry_end), AgentValueKind::Response).outcome,
     ];
-    let expected = [
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        },
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        },
-    ];
-    assert_eq!(actual, expected);
+    for outcome in &actual {
+        assert_outcome_failure(outcome, AgentFailureCause::HarnessProtocolFailed);
+    }
 }
 
 #[test]
@@ -1687,10 +2358,8 @@ fn queued_continuation_requires_a_queued_message() {
         json!({"type": "agent_settled"}),
     ]);
 
-    assert_eq!(
-        replay(&encoded(&events), AgentValueKind::Response).outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        }
+    assert_outcome_failure(
+        &replay(&encoded(&events), AgentValueKind::Response).outcome,
+        AgentFailureCause::HarnessProtocolFailed,
     );
 }

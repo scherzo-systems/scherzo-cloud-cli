@@ -60,6 +60,7 @@ fn parser(kind: AgentValueKind, maximum_response_bytes: u64) -> ClaudeCodeStream
     ClaudeCodeStreamJsonV1Parser::profile(
         Arc::from(CWD),
         Arc::from(MODEL),
+        Arc::from(SESSION_ID),
         kind,
         NonZeroU64::new(maximum_response_bytes).unwrap(),
     )
@@ -138,7 +139,22 @@ fn completed_text_transcript(deltas: &[&str], present: bool) -> Vec<u8> {
 }
 
 fn assert_failed(outcome: AgentOutcome, cause: AgentFailureCause) {
-    assert_eq!(outcome, AgentOutcome::Failed { cause });
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure");
+    };
+    assert_eq!(failure.cause(), &cause);
+}
+
+fn protocol_rejection_value(outcome: &AgentOutcome) -> Value {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    serde_json::to_value(
+        failure
+            .protocol_rejection()
+            .expect("parser-owned failure must carry a rejection diagnostic"),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -146,6 +162,7 @@ fn normal_mode_arguments_and_input_frame_are_exact() {
     let arguments = normal_mode_arguments(
         "claude-profile-model",
         "xhigh",
+        SESSION_ID,
         Path::new("/synthetic/private/system-prompt"),
     );
     assert_eq!(
@@ -159,7 +176,8 @@ fn normal_mode_arguments_and_input_frame_are_exact() {
             "--verbose",
             "--include-partial-messages",
             "--forward-subagent-text",
-            "--no-session-persistence",
+            "--session-id",
+            SESSION_ID,
             "--permission-mode",
             "bypassPermissions",
             "--setting-sources",
@@ -330,13 +348,247 @@ fn malformed_and_contradictory_recorded_streams_never_accept_a_response() {
 }
 
 #[test]
+fn parser_rejections_report_stable_profile_owned_structural_context() {
+    let mut malformed = parser(AgentValueKind::None, 1024);
+    assert_eq!(
+        malformed.push_stdout(b"not-json\n", drop),
+        Err(AgentFailureCause::HarnessStartFailed)
+    );
+    let malformed = malformed.finish(false);
+    assert_eq!(
+        protocol_rejection_value(&malformed),
+        json!({
+            "schemaVersion": 1,
+            "profile": "ClaudeCodeStreamJsonV1",
+            "detail": {
+                "reason": "frame_decode_failed",
+                "stage": "frame_decode",
+                "state": {
+                    "initialized": false,
+                    "exchangeInitialized": false,
+                    "exchangeActive": true,
+                    "completedExchanges": 0,
+                    "activeMessage": "none",
+                    "finalMainMessage": false,
+                    "exchangeStructuredOutputCandidates": 0,
+                    "completedResultExchange": "none",
+                    "resultDecisionPending": false,
+                    "resultAccepted": false,
+                    "nativeFailure": false,
+                    "retryActive": false
+                }
+            }
+        })
+    );
+
+    let mut initialization = init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID);
+    initialization["cwd"] = json!("/contradictory");
+    let (_, invalid_initialization) =
+        replay(&framed(&[initialization]), AgentValueKind::None, 1024);
+    let initialization = protocol_rejection_value(&invalid_initialization);
+    assert_eq!(initialization["detail"]["reason"], "initialization_invalid");
+    assert_eq!(initialization["detail"]["stage"], "initialization");
+    assert_eq!(initialization["detail"]["outerEvent"], "system");
+
+    let mut missing_exchange_init = parser(AgentValueKind::None, 1024);
+    missing_exchange_init
+        .push_stdout(
+            &framed(&[
+                init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+                result(SESSION_ID),
+            ]),
+            drop,
+        )
+        .unwrap();
+    missing_exchange_init.begin_exchange().unwrap();
+    assert!(
+        missing_exchange_init
+            .push_stdout(&framed(&[status(SESSION_ID)]), drop)
+            .is_err()
+    );
+    let missing_exchange_init = protocol_rejection_value(&missing_exchange_init.finish(false));
+    assert_eq!(
+        missing_exchange_init["detail"]["reason"],
+        "exchange_initialization_missing"
+    );
+    assert_eq!(
+        missing_exchange_init["detail"]["stage"],
+        "exchange_lifecycle"
+    );
+
+    let wrong_parent = json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "SENTINEL_ASSISTANT_TEXT"},
+        },
+        "session_id": SESSION_ID,
+        "parent_tool_use_id": "SENTINEL_PARENT_TOOL_ID",
+    });
+    let (_, wrong_parent) = replay(
+        &framed(&[
+            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            message_start("msg-main"),
+            wrong_parent,
+        ]),
+        AgentValueKind::Response,
+        1024,
+    );
+    let wrong_parent = protocol_rejection_value(&wrong_parent);
+    assert_eq!(
+        wrong_parent["detail"]["reason"],
+        "active_stream_parent_mismatch"
+    );
+    assert_eq!(wrong_parent["detail"]["outerEvent"], "stream_event");
+    assert_eq!(wrong_parent["detail"]["streamEvent"], "content_block_start");
+    assert_eq!(wrong_parent["detail"]["contentIndex"], 0);
+    assert_eq!(wrong_parent["detail"]["contentBlock"], "text");
+    assert_eq!(wrong_parent["detail"]["state"]["activeMessage"], "main");
+
+    let (_, message_transition) = replay(
+        &framed(&[
+            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            message_start("msg-incomplete"),
+            stream_event(json!({"type": "message_stop"})),
+        ]),
+        AgentValueKind::Response,
+        1024,
+    );
+    let message_transition = protocol_rejection_value(&message_transition);
+    assert_eq!(
+        message_transition["detail"]["reason"],
+        "message_transition_invalid"
+    );
+    assert_eq!(message_transition["detail"]["streamEvent"], "message_stop");
+    assert_eq!(
+        message_transition["detail"]["state"]["activeMessage"],
+        "main"
+    );
+
+    let mut rejected_delta = stream_event(json!({
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {
+            "type": "text_delta",
+            "text": "SENTINEL_ASSISTANT_TEXT",
+            "reasoning": "SENTINEL_REASONING",
+            "tool_input": {"secret": "SENTINEL_TOOL_INPUT"},
+        },
+    }));
+    rejected_delta["prompt"] = json!("SENTINEL_PROMPT");
+    rejected_delta["tool_result"] = json!("SENTINEL_TOOL_RESULT");
+    rejected_delta["structured_output"] = json!({"value": "SENTINEL_STRUCTURED_OUTPUT"});
+    rejected_delta["provider_payload"] = json!("SENTINEL_PROVIDER_PAYLOAD");
+    rejected_delta["request_id"] = json!("SENTINEL_REQUEST_ID");
+    rejected_delta["native_session_id"] = json!("SENTINEL_NATIVE_SESSION_ID");
+    rejected_delta["credential"] = json!("SENTINEL_CREDENTIAL");
+    rejected_delta["oversized"] = json!("x".repeat(100_000));
+    let (_, rejected_delta) = replay(
+        &framed(&[
+            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            message_start("msg-content"),
+            stream_event(json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })),
+            rejected_delta,
+        ]),
+        AgentValueKind::Response,
+        1024,
+    );
+    let rejected_delta = protocol_rejection_value(&rejected_delta);
+    assert_eq!(
+        rejected_delta["detail"]["reason"],
+        "content_block_index_mismatch"
+    );
+    assert_eq!(rejected_delta["detail"]["stage"], "content_block_delta");
+    assert_eq!(rejected_delta["detail"]["outerEvent"], "stream_event");
+    assert_eq!(
+        rejected_delta["detail"]["streamEvent"],
+        "content_block_delta"
+    );
+    assert_eq!(rejected_delta["detail"]["contentIndex"], 1);
+    assert_eq!(rejected_delta["detail"]["contentBlock"], "text");
+    assert_eq!(
+        rejected_delta["detail"]["state"]["openContentBlock"],
+        json!({"kind": "text", "contentIndex": 0})
+    );
+    let serialized = rejected_delta.to_string();
+    for sentinel in [
+        "SENTINEL_ASSISTANT_TEXT",
+        "SENTINEL_REASONING",
+        "SENTINEL_TOOL_INPUT",
+        "SENTINEL_PROMPT",
+        "SENTINEL_TOOL_RESULT",
+        "SENTINEL_STRUCTURED_OUTPUT",
+        "SENTINEL_PROVIDER_PAYLOAD",
+        "SENTINEL_REQUEST_ID",
+        "SENTINEL_NATIVE_SESSION_ID",
+        "SENTINEL_CREDENTIAL",
+        SESSION_ID,
+    ] {
+        assert!(!serialized.contains(sentinel));
+    }
+    assert!(serialized.len() < 16 * 1024);
+
+    let (_, result_correlation) = replay(
+        &framed(&[
+            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            message_start("msg-active"),
+            result(SESSION_ID),
+        ]),
+        AgentValueKind::None,
+        1024,
+    );
+    let result_correlation = protocol_rejection_value(&result_correlation);
+    assert_eq!(
+        result_correlation["detail"]["reason"],
+        "result_correlation_invalid"
+    );
+    assert_eq!(result_correlation["detail"]["outerEvent"], "result");
+    assert_eq!(
+        result_correlation["detail"]["state"]["activeMessage"],
+        "main"
+    );
+
+    let (_, terminal_drain) = replay(
+        &framed(&[
+            init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID),
+            result(SESSION_ID),
+            result(SESSION_ID),
+        ]),
+        AgentValueKind::None,
+        1024,
+    );
+    let terminal_drain = protocol_rejection_value(&terminal_drain);
+    assert_eq!(
+        terminal_drain["detail"]["reason"],
+        "terminal_drain_event_invalid"
+    );
+    assert_eq!(terminal_drain["detail"]["stage"], "terminal_drain");
+    assert_eq!(terminal_drain["detail"]["outerEvent"], "result");
+
+    let (_, eof) = replay(
+        &framed(&[init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID)]),
+        AgentValueKind::None,
+        1024,
+    );
+    let eof = protocol_rejection_value(&eof);
+    assert_eq!(eof["detail"]["reason"], "end_of_stream_invariant_invalid");
+    assert_eq!(eof["detail"]["stage"], "end_of_stream");
+    assert!(eof["detail"].get("outerEvent").is_none());
+}
+
+#[test]
 fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
     let contradictory = [
         ("claude_code_version", json!("2.1.223")),
         ("cwd", json!("/other")),
         ("model", json!("other-model")),
         ("permissionMode", json!("default")),
-        ("session_id", json!("00000000-0000-0000-0000-000000000000")),
+        ("session_id", json!("00000000-0000-4000-8000-000000000002")),
     ];
     for (field, replacement) in contradictory {
         let mut initialization = init(CLAUDE_CODE_STREAM_JSON_V1_VERSION, SESSION_ID);
@@ -404,6 +656,7 @@ fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
     let mut oversized = ClaudeCodeStreamJsonV1Parser::new(
         Arc::from(CWD),
         Arc::from(MODEL),
+        Arc::from(SESSION_ID),
         AgentValueKind::Response,
         NonZeroU64::new(1024).unwrap(),
         limits,
@@ -472,7 +725,7 @@ fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
         stream_event(json!({
             "type": "content_block_start",
             "index": 1,
-            "content_block": {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}},
+            "content_block": {"type": "tool_use", "id": "tool-1", "name": "Agent", "input": {}},
         })),
         stream_event(json!({
             "type": "content_block_delta",
@@ -493,12 +746,16 @@ fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
                 "content": [{
                     "type": "tool_result",
                     "tool_use_id": "tool-1",
-                    "is_error": false,
                     "content": [{"type": "text", "text": "contents"}],
                 }],
             },
             "parent_tool_use_id": null,
             "session_id": SESSION_ID,
+            "tool_use_result": {
+                "status": "completed",
+                "agentId": "agent-fixture",
+                "agentType": "general-purpose",
+            },
         }),
         json!({"type": "future_additive_event", "session_id": SESSION_ID}),
     ]);
@@ -521,7 +778,7 @@ fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
         assert!(observations.iter().any(|observation| matches!(
             observation,
             AgentObservation::ToolCall { call_id, name, phase: observed }
-                if call_id.as_ref() == "tool-1" && name.as_ref() == "Read" && *observed == phase
+                if call_id.as_ref() == "tool-1" && name.as_ref() == "Agent" && *observed == phase
         )));
     }
     assert!(observations.iter().any(|observation| matches!(

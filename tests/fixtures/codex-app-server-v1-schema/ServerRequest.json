@@ -1,0 +1,9 @@
+{
+  "oneOf": [
+    { "properties": { "method": { "const": "item/commandExecution/requestApproval" } } },
+    { "properties": { "method": { "const": "item/fileChange/requestApproval" } } },
+    { "properties": { "method": { "const": "item/permissions/requestApproval" } } },
+    { "properties": { "method": { "const": "item/tool/requestUserInput" } } },
+    { "properties": { "method": { "const": "mcpServer/elicitation/request" } } }
+  ]
+}

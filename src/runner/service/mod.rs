@@ -1,3 +1,4 @@
+mod artifact_delivery;
 mod assignment;
 mod backoff;
 mod config;
@@ -8,6 +9,7 @@ mod conversation;
 #[cfg(test)]
 mod determinism_spike;
 mod execution;
+mod source;
 #[cfg(test)]
 mod test_support;
 
@@ -1182,7 +1184,7 @@ const fn sequence_overflow() -> ConnectionError {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1285,7 +1287,7 @@ mod tests {
             fs::create_dir(&work).unwrap();
             fs::write(
                 source.join("workflow.yaml"),
-                "schemaVersion: 1\nsteps: {}\n",
+                "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
             )
             .unwrap();
             let state_path = state_directory.join("runner.json");
@@ -1322,18 +1324,15 @@ mod tests {
                     "deploymentMode": "development",
                     "runnerStatePath": state_path,
                     "controlSocketPath": runtime.path().join("runner.sock"),
-                    "workRoot": work,
-                    "developmentWorkflow": {
-                        "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
-                        "sourceRoot": source,
-                        "workflowPath": "workflow.yaml"
-                    }
+                    "workRoot": work
                 }))
                 .unwrap(),
             )
             .unwrap();
             crate::runner::enrollment::load_runner_service_configuration(&config_path).unwrap();
-            let config = Config::load(&config_path).unwrap();
+            let config = Config::load(&config_path)
+                .unwrap()
+                .with_materialized_source_fixture(source, PathBuf::from("workflow.yaml"));
             Self {
                 _root: root,
                 _runtime: runtime,
@@ -1353,7 +1352,12 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&fixture.state_path, fs::Permissions::from_mode(0o600)).unwrap();
-            fixture.config = Config::load(&fixture.config_path).unwrap();
+            fixture.config = Config::load(&fixture.config_path)
+                .unwrap()
+                .with_materialized_source_fixture(
+                    fixture._root.path().join("source"),
+                    PathBuf::from("workflow.yaml"),
+                );
             fixture
         }
 
@@ -1556,15 +1560,6 @@ mod tests {
     async fn live_reload_retains_the_boot_and_accepted_assignment_manager() {
         let (listener, endpoint) = fixture_listener().await;
         let fixture = RotationFixture::without_pending(&endpoint);
-        fs::write(
-            fixture
-                .config
-                .assignment()
-                .workflow_source_root()
-                .join("workflow.yaml"),
-            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
-        )
-        .unwrap();
         let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
         let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -1730,7 +1725,11 @@ mod tests {
     #[tokio::test]
     async fn pending_handshake_preserves_contiguous_current_boot_sequences() {
         let (listener, endpoint) = fixture_listener().await;
-        let fixture = RotationFixture::without_pending(&endpoint);
+        let mut fixture = RotationFixture::without_pending(&endpoint);
+        fixture.config = fixture.config.clone().with_materialized_source_fixture(
+            fixture._root.path().join("source"),
+            PathBuf::from("missing-workflow-fixture.yaml"),
+        );
         let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
         let (current_sent, current_received) = tokio::sync::oneshot::channel();
         let (sequences_sent, sequences_received) = tokio::sync::oneshot::channel();
@@ -2072,22 +2071,17 @@ mod tests {
         let temporary = tempfile::tempdir().expect("create service fixture root");
         let source = temporary.path().join("source");
         let work = temporary.path().join("work");
-        fs::create_dir(&source).expect("create workflow source");
+        fs::create_dir(&source).expect("create materialized source fixture");
         fs::create_dir(&work).expect("create runner work root");
         fs::write(
             source.join("workflow.yaml"),
             "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
         )
-        .expect("write workflow fixture");
-        let assignment = AssignmentConfig::new(
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            &source,
-            Path::new("workflow.yaml"),
-            &work,
-        )
-        .expect("configure assignment");
-        let config =
-            Config::new(endpoint, test_credential(), true, assignment).expect("configure gateway");
+        .expect("write materialized workflow fixture");
+        let assignment = AssignmentConfig::new(&work).expect("configure assignment");
+        let config = Config::new(endpoint, test_credential(), true, assignment)
+            .expect("configure gateway")
+            .with_materialized_source_fixture(source, PathBuf::from("workflow.yaml"));
         (temporary, config)
     }
 

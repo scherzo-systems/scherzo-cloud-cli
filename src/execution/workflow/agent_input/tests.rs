@@ -20,6 +20,7 @@ use crate::execution::workflow::agent::{AgentValueKind, NoopAgentObservationSink
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::execution::workflow::input::{InputStaging, InputValue};
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
@@ -214,6 +215,7 @@ impl Fixture {
             &self.diagnostic_sessions,
             identity(),
             &self.upstream,
+            None,
             cancellation,
             crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
             NoopAgentObservationSink,
@@ -647,6 +649,7 @@ fn cancellation_at_the_ready_barrier_removes_partial_staging_without_launch() {
             &diagnostic_sessions,
             identity(),
             &upstream,
+            None,
             cancellation,
             crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
             NoopAgentObservationSink,
@@ -782,6 +785,7 @@ fn execution_root_rebinding_during_materialization_is_rejected_before_launch() {
         &fixture.diagnostic_sessions,
         identity(),
         &fixture.upstream,
+        None,
         CancellationSource::new(),
         crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
         NoopAgentObservationSink,
@@ -837,4 +841,59 @@ fn staging_creation_error(
         Ok(_) => panic!("staging creation unexpectedly succeeded"),
         Err(error) => error,
     }
+}
+#[test]
+fn finalization_context_bytes_are_shared_by_command_and_agent() {
+    let fixture = Fixture::new(ConsumerValueMode::None);
+    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
+    let ValidatedStep::Agent(consumer) = fixture
+        .admitted
+        .workflow()
+        .definition
+        .steps
+        .get("consumer")
+        .unwrap()
+    else {
+        panic!("fixture consumer must be an agent");
+    };
+    let mut consumer = consumer.clone();
+    consumer.agent.message.attachments = vec![ValidatedMessageSource::Reference {
+        source: ResolvedValueSource::FinalizationContext,
+        value_type: WorkflowValueType::Json,
+    }];
+    // Build the plan directly because the retained admitted workflow is immutable by design.
+    let harness = fixture.admitted.agent_step("consumer").unwrap();
+    let plan = build_plan(
+        &fixture.admitted,
+        "consumer",
+        &consumer,
+        &fixture.upstream,
+        Some(exact),
+        harness,
+    )
+    .unwrap();
+
+    assert!(!plan.prompt.message().contains("schemaVersion"));
+    assert_eq!(plan.attachments.len(), 1);
+    let PlannedAttachment::CanonicalJson(bytes) = plan.attachments[0].payload else {
+        panic!("context was not retained as exact canonical bytes");
+    };
+    assert_eq!(bytes, exact);
+    assert_eq!(plan.attachments[0].media_type.as_ref(), "application/json");
+
+    let command_inputs =
+        InputStaging::create(fixture.admitted.execution(), &fixture.staging_parent).unwrap();
+    let command_view = command_inputs
+        .materialize(
+            &BTreeMap::from([(
+                "context".to_owned(),
+                InputValue::CanonicalJson(exact.as_slice()),
+            )]),
+            &fixture.artifacts,
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(command_view.path().join("values/context")).unwrap(),
+        bytes
+    );
 }

@@ -19,6 +19,7 @@ impl Fixture {
             lock_path: sibling_path(&path, path.file_name().unwrap(), ".lock"),
             path,
             lock_timeout: Duration::from_millis(75),
+            refresh_lock_timeout: Duration::from_millis(75),
         };
         Self { directory, store }
     }
@@ -85,10 +86,15 @@ fn normal_home_store_writes_and_reads_private_credentials() {
     let expiration = timestamp("2026-07-22T12:00:00Z");
 
     store
-        .replace(&deployment, "synthetic-access-token", expiration)
+        .replace(
+            &deployment,
+            "synthetic-access-token",
+            expiration,
+            "synthetic-refresh-token",
+        )
         .expect("credential should be stored");
     let selected = store
-        .selected(&deployment, timestamp("2026-07-22T11:00:00Z"))
+        .selected(&deployment)
         .expect("credential should load")
         .expect("credential should match");
 
@@ -136,11 +142,16 @@ fn replacement_writes_schema_one_and_selects_exact_deployment() {
 
     fixture
         .store
-        .replace(&primary, "synthetic-access-token", expiration)
+        .replace(
+            &primary,
+            "synthetic-access-token",
+            expiration,
+            "synthetic-refresh-token",
+        )
         .expect("credential should be stored");
     let selected = fixture
         .store
-        .selected(&primary, timestamp("2026-07-22T11:00:00Z"))
+        .selected(&primary)
         .expect("credential should load")
         .expect("credential should match");
 
@@ -149,7 +160,7 @@ fn replacement_writes_schema_one_and_selects_exact_deployment() {
     assert!(
         fixture
             .store
-            .selected(&other, timestamp("2026-07-22T11:00:00Z"))
+            .selected(&other)
             .expect("other deployment lookup should succeed")
             .is_none()
     );
@@ -161,6 +172,10 @@ fn replacement_writes_schema_one_and_selects_exact_deployment() {
         serde_json::from_slice(&fs::read(&fixture.store.path).unwrap()).unwrap();
     assert_eq!(value["schemaVersion"], 1);
     assert_eq!(value["credentials"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["credentials"][0]["refreshToken"],
+        "synthetic-refresh-token"
+    );
     assert!(
         fs::read_dir(fixture.directory.path())
             .unwrap()
@@ -180,11 +195,11 @@ fn replacing_one_deployment_never_creates_a_duplicate() {
 
     fixture
         .store
-        .replace(&deployment, "first", expiration)
+        .replace(&deployment, "first", expiration, "first-refresh")
         .unwrap();
     fixture
         .store
-        .replace(&deployment, "second", expiration)
+        .replace(&deployment, "second", expiration, "second-refresh")
         .unwrap();
 
     let value: serde_json::Value =
@@ -192,6 +207,7 @@ fn replacing_one_deployment_never_creates_a_duplicate() {
     let credentials = value["credentials"].as_array().unwrap();
     assert_eq!(credentials.len(), 1);
     assert_eq!(credentials[0]["accessToken"], "second");
+    assert_eq!(credentials[0]["refreshToken"], "second-refresh");
 }
 
 #[test]
@@ -201,21 +217,94 @@ fn conditional_removal_does_not_delete_a_concurrently_replaced_token() {
     let expiration = timestamp("2026-07-22T12:00:00Z");
     fixture
         .store
-        .replace(&deployment, "replacement-token", expiration)
+        .replace(
+            &deployment,
+            "replacement-token",
+            expiration,
+            "replacement-refresh-token",
+        )
         .unwrap();
 
     let removed = fixture
         .store
-        .remove_if_access_token_matches(&deployment, "rejected-old-token")
+        .remove_if_access_token_matches_under_authority(&deployment, "rejected-old-token")
         .unwrap();
 
     assert!(!removed);
     let selected = fixture
         .store
-        .selected(&deployment, timestamp("2026-07-22T11:00:00Z"))
+        .selected(&deployment)
         .unwrap()
         .expect("replacement credential should remain");
     assert_eq!(selected.access_token(), "replacement-token");
+}
+
+#[test]
+fn rotated_refresh_replacement_is_atomic_and_rejects_a_stale_overwrite() {
+    let fixture = Fixture::new();
+    let deployment = fingerprint("primary");
+    let expiration = timestamp("2026-07-22T12:00:00Z");
+    fixture
+        .store
+        .replace(&deployment, "first-access", expiration, "first-refresh")
+        .unwrap();
+
+    let rotated = fixture
+        .store
+        .replace_if_refresh_token_matches(
+            &deployment,
+            "first-refresh",
+            "second-access",
+            expiration,
+            "second-refresh",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.access_token(), "second-access");
+    assert_eq!(rotated.refresh_token(), "second-refresh");
+
+    let retained = fixture
+        .store
+        .replace_if_refresh_token_matches(
+            &deployment,
+            "first-refresh",
+            "stale-access",
+            expiration,
+            "stale-refresh",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.access_token(), "second-access");
+    assert_eq!(retained.refresh_token(), "second-refresh");
+    let bytes = fs::read(&fixture.store.path).unwrap();
+    for stale in ["stale-access", "stale-refresh"] {
+        assert!(
+            !bytes
+                .windows(stale.len())
+                .any(|part| part == stale.as_bytes())
+        );
+    }
+}
+
+#[test]
+fn refresh_lock_paths_are_stable_and_fingerprint_scoped() {
+    let fixture = Fixture::new();
+    let primary = fixture
+        .store
+        .refresh_lock_path(&fingerprint("primary"))
+        .unwrap();
+    let same = fixture
+        .store
+        .refresh_lock_path(&fingerprint("primary"))
+        .unwrap();
+    let other = fixture
+        .store
+        .refresh_lock_path(&fingerprint("other"))
+        .unwrap();
+
+    assert_eq!(primary, same);
+    assert_ne!(primary, other);
+    assert_eq!(primary.parent(), Some(fixture.directory.path()));
 }
 
 #[test]
@@ -226,7 +315,7 @@ fn token_size_boundary_is_enforced_without_modifying_existing_bytes() {
     let maximum = "x".repeat(MAX_ACCESS_TOKEN_BYTES);
     fixture
         .store
-        .replace(&deployment, &maximum, expiration)
+        .replace(&deployment, &maximum, expiration, "maximum-refresh")
         .expect("a 64 KiB token should be accepted");
     let original = fs::read(&fixture.store.path).unwrap();
     let oversized = "x".repeat(MAX_ACCESS_TOKEN_BYTES + 1);
@@ -234,14 +323,14 @@ fn token_size_boundary_is_enforced_without_modifying_existing_bytes() {
     assert!(
         fixture
             .store
-            .replace(&deployment, &oversized, expiration)
+            .replace(&deployment, &oversized, expiration, "oversized-refresh")
             .is_err()
     );
     assert_eq!(fs::read(&fixture.store.path).unwrap(), original);
 }
 
 #[test]
-fn safety_margin_removes_only_the_expiring_selected_credential() {
+fn safety_margin_marks_only_the_expiring_selected_credential_for_refresh() {
     let fixture = Fixture::new();
     let expiring = fingerprint("expiring");
     let retained = fingerprint("retained");
@@ -251,6 +340,7 @@ fn safety_margin_removes_only_the_expiring_selected_credential() {
             &expiring,
             "expiring-token",
             timestamp("2026-07-22T11:00:30Z"),
+            "expiring-refresh-token",
         )
         .unwrap();
     fixture
@@ -259,34 +349,35 @@ fn safety_margin_removes_only_the_expiring_selected_credential() {
             &retained,
             "retained-token",
             timestamp("2026-07-22T12:00:00Z"),
+            "retained-refresh-token",
         )
         .unwrap();
 
+    let now = timestamp("2026-07-22T11:00:00Z");
     assert!(
         fixture
             .store
-            .selected(&expiring, timestamp("2026-07-22T11:00:00Z"))
+            .selected(&expiring)
             .unwrap()
-            .is_none()
+            .unwrap()
+            .needs_refresh(now)
     );
     assert!(
-        fixture
+        !fixture
             .store
-            .selected(&retained, timestamp("2026-07-22T11:00:00Z"))
+            .selected(&retained)
             .unwrap()
-            .is_some()
+            .unwrap()
+            .needs_refresh(now)
     );
     let bytes = fs::read(&fixture.store.path).unwrap();
-    assert!(
-        !bytes
-            .windows("expiring-token".len())
-            .any(|part| part == b"expiring-token")
-    );
-    assert!(
-        bytes
-            .windows("retained-token".len())
-            .any(|part| part == b"retained-token")
-    );
+    for token in ["expiring-token", "retained-token"] {
+        assert!(
+            bytes
+                .windows(token.len())
+                .any(|part| part == token.as_bytes())
+        );
+    }
 }
 
 #[test]
@@ -357,13 +448,15 @@ fn busy_lock_respects_the_configured_deadline() {
 }
 
 #[test]
-fn debug_output_never_contains_the_access_token() {
+fn debug_output_never_contains_tokens() {
     let credential = StoredCredential {
-        access_token: "unique-synthetic-secret".to_owned(),
+        access_token: "unique-synthetic-access-secret".to_owned(),
         expires_at: timestamp("2026-07-22T12:00:00Z"),
+        refresh_token: "unique-synthetic-refresh-secret".to_owned(),
     };
     let debug = format!("{credential:?}");
 
-    assert!(!debug.contains("unique-synthetic-secret"));
+    assert!(!debug.contains("unique-synthetic-access-secret"));
+    assert!(!debug.contains("unique-synthetic-refresh-secret"));
     assert!(debug.contains("[REDACTED]"));
 }

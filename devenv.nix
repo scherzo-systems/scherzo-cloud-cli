@@ -26,6 +26,7 @@ in
   packages = [
     pkgs.actionlint
     pkgs.ast-grep
+    pkgs.cargo-nextest
     pkgs.git
     pkgs.jq
     pkgs.nodejs_24
@@ -33,6 +34,6 @@ in
   ];
 
   enterTest = ''
-    ./scripts/check
+    ./scripts/check-suite
   '';
 }

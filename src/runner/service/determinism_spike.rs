@@ -139,7 +139,7 @@ async fn run_assignment_scenario() -> Vec<String> {
         assert_eq!(semantic["sequence"], 3);
         assert_eq!(
             semantic["payload"]["decline"]["reason"],
-            "workflow_mapping_unavailable"
+            "workflow_source_invalid"
         );
         let semantic_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;

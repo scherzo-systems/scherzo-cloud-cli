@@ -1,0 +1,17 @@
+{
+  "properties": {
+    "thread": { "$ref": "#/definitions/Thread" }
+  },
+  "definitions": {
+    "Thread": {
+      "properties": {
+        "cliVersion": { "type": "string" },
+        "ephemeral": { "type": "boolean" },
+        "id": { "type": "string" },
+        "path": { "type": ["string", "null"] },
+        "sessionId": { "type": "string" },
+        "turns": { "type": "array" }
+      }
+    }
+  }
+}

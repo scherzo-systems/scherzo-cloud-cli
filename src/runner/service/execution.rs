@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::Sleeper;
+use super::artifact_delivery::{
+    ArtifactDeliveryBroker, ArtifactDeliveryOutcome, ArtifactDeliverySpec,
+    ClosedArtifactDeliveryFailure,
+};
 use super::assignment::{
     AcceptedAssignment, AssignmentObservation, ExecutionReport, LeaseAuthority, ManagerEvent,
     ObservationOutbox,
@@ -16,7 +20,8 @@ use super::assignment::{
 use crate::execution::workflow::admission::CancellationReason;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
 use crate::execution::workflow::agent::{
-    AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind, WorkflowRunId,
+    AgentFailure, AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind,
+    AgentProtocolRejectionDiagnostic, WorkflowRunId,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStartFailure};
@@ -33,15 +38,21 @@ use crate::execution::workflow::process_group::{
     ProcessIdentityInspector, ProcessIdentityObservation, SystemProcessIdentityInspector,
     terminate_authenticated_process_group,
 };
+use crate::execution::workflow::publication::{
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
+    prepare_cloud_workflow_result, summary_disposition_matches,
+};
 use crate::execution::workflow::runtime::{
-    FailurePhase, NotRunReason, RunOutcome, SchedulingGate, StepFailure, StepStateKind,
-    TransitionEvent, WorkflowState,
+    FailurePhase, FinalizationGate, FinalizationSummary, FinalizerResult, NotRunReason, RunOutcome,
+    SchedulingGate, StepFailure, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
 use crate::execution::workflow::step_runtime::{
     AgentExecution, CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure,
     OutputCaptureFailure, StepExecutionFailure, StepFailureCause, StepStartFailure,
     WorkingDirectoryFailure,
 };
+use crate::execution::workflow::validated::WorkflowNodeRole;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuardLifecycle {
@@ -234,6 +245,7 @@ impl ExecutionCompletion {
 pub(super) struct ExecutionJob {
     accepted: AcceptedAssignment,
     outbox: ObservationOutbox,
+    artifact_delivery: ArtifactDeliveryBroker,
     manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
     sleeper: Arc<dyn Sleeper>,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
@@ -243,6 +255,7 @@ impl ExecutionJob {
     pub(super) fn new(
         accepted: AcceptedAssignment,
         outbox: ObservationOutbox,
+        artifact_delivery: ArtifactDeliveryBroker,
         manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
         sleeper: Arc<dyn Sleeper>,
         authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
@@ -250,6 +263,7 @@ impl ExecutionJob {
         Self {
             accepted,
             outbox,
+            artifact_delivery,
             manager_events,
             sleeper,
             authority_updates,
@@ -270,11 +284,12 @@ impl ExecutionJob {
         if completion.final_observation_id.is_some() {
             completion.final_delivery_deadline = Some(self.terminal_report_deadline());
         }
-        drop(self.accepted);
+        let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
             final_observation_id: completion.final_observation_id,
             final_delivery_deadline: completion.final_delivery_deadline,
+            retained_root: Some(retained_root),
         });
         self.outbox.wake();
     }
@@ -288,6 +303,7 @@ impl ExecutionJob {
         if !self.has_execution_authority() {
             return ExecutionCompletion::without_report();
         }
+        let started_at = RunnerExecutionClock.now();
         if self
             .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
             .is_none()
@@ -382,14 +398,6 @@ impl ExecutionJob {
         }
 
         let post_stop_fence = PostStopFence::new();
-        let observer = RunnerExecutionObserver::new(
-            assignment_id.to_owned(),
-            attempt_id.to_owned(),
-            self.accepted.transition_budget,
-            self.outbox.clone(),
-            post_stop_fence.clone(),
-        );
-        let diagnostics = StepDiagnosticLog::default();
         let cancellation = self
             .accepted
             .admitted
@@ -397,6 +405,15 @@ impl ExecutionJob {
             .cancellation()
             .source()
             .clone();
+        let observer = RunnerExecutionObserver::new(
+            assignment_id.to_owned(),
+            attempt_id.to_owned(),
+            self.accepted.transition_budget,
+            self.outbox.clone(),
+            post_stop_fence.clone(),
+            cancellation.clone(),
+        );
+        let diagnostics = StepDiagnosticLog::default();
         let process_guard_registry = self
             .accepted
             .process_guards
@@ -485,7 +502,7 @@ impl ExecutionJob {
             // jscpd:ignore-end
             result
         };
-        let cleanup_failed = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+        let support_cleanup_failed = release_support_staging(&inputs, agent_staging.as_ref());
 
         let (result, final_delivery_budget) = match execution {
             LeaseExecution::Completed {
@@ -496,6 +513,7 @@ impl ExecutionJob {
                 output: Err(_),
                 final_delivery_budget,
             } => {
+                let _ = artifacts.release();
                 return self.abort_unless_fenced(
                     &post_stop_fence,
                     assignment_id,
@@ -506,10 +524,12 @@ impl ExecutionJob {
                 );
             }
             LeaseExecution::ContainmentDeadline => {
+                let _ = artifacts.release();
                 return ExecutionCompletion::fenced(None, None);
             }
         };
-        if cleanup_failed {
+        if support_cleanup_failed {
+            let _ = artifacts.release();
             return self.abort_unless_fenced(
                 &post_stop_fence,
                 assignment_id,
@@ -520,6 +540,7 @@ impl ExecutionJob {
             );
         }
         if observer.faulted() {
+            let _ = artifacts.release();
             return self.abort_unless_fenced(
                 &post_stop_fence,
                 assignment_id,
@@ -530,11 +551,19 @@ impl ExecutionJob {
             );
         }
         let last_sequence = observer.last_sequence();
+        let has_finalizers = !self
+            .accepted
+            .admitted
+            .workflow()
+            .definition
+            .finalizers
+            .is_empty();
         if last_sequence == 0
             || observer.terminal_sequence() != Some(last_sequence)
             || !terminal_result_agrees(observer.terminal_state().as_ref(), &result.outcome)
-            || !result.exports.is_empty()
+            || has_finalizers != result.finalization_summary.is_some()
         {
+            let _ = artifacts.release();
             return self.abort_unless_fenced(
                 &post_stop_fence,
                 assignment_id,
@@ -545,39 +574,84 @@ impl ExecutionJob {
             );
         }
 
+        let finished_at = RunnerExecutionClock.now();
+        let prepared = self
+            .runner_result(
+                &diagnostics,
+                result.clone(),
+                &observer,
+                started_at,
+                finished_at,
+            )
+            .and_then(|run| {
+                prepare_cloud_workflow_result(
+                    &run,
+                    self.accepted.project_id().to_owned(),
+                    self.accepted.workflow_id().to_owned(),
+                )
+                .ok()
+            });
+        let delivery = match prepared {
+            Some(prepared) => {
+                self.deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
+                    .await
+            }
+            None => internal_delivery_failure("preparation"),
+        };
+        if delivery == ArtifactDeliveryOutcome::AuthorityLost {
+            let _ = artifacts.release();
+            return ExecutionCompletion::without_report();
+        }
+        let _ = artifacts.release();
+        let artifact_delivery = artifact_delivery_result(&delivery);
+
+        let finalization = result
+            .finalization_summary
+            .as_ref()
+            .map(finalization_summary);
         let report = match result.outcome {
             RunOutcome::Succeeded => ExecutionReport::Finished {
                 final_execution_event_sequence: last_sequence,
-                outcome: json!({ "outcome": "succeeded" }),
+                outcome: terminal_outcome("succeeded", None, None, finalization),
+                artifact_delivery,
             },
             RunOutcome::Failed {
                 primary_failure, ..
             } => ExecutionReport::Finished {
                 final_execution_event_sequence: last_sequence,
-                outcome: json!({
-                    "outcome": "failed",
-                    "failure": workflow_failure(&primary_failure),
-                }),
+                outcome: terminal_outcome(
+                    "failed",
+                    Some(workflow_failure(&primary_failure)),
+                    None,
+                    finalization,
+                ),
+                artifact_delivery,
             },
             RunOutcome::Cancelled {
                 reason: CancellationReason::ExecutionLeaseExpired,
             } => ExecutionReport::Interrupted {
                 final_execution_event_sequence: last_sequence,
                 reason: "execution_lease_expired".to_owned(),
-                terminal_outcome: json!({
-                    "outcome": "cancelled",
-                    "reason": "execution_lease_expired",
-                }),
+                terminal_outcome: terminal_outcome(
+                    "cancelled",
+                    None,
+                    Some("execution_lease_expired"),
+                    finalization,
+                ),
+                artifact_delivery,
             },
             RunOutcome::Cancelled {
                 reason: CancellationReason::RunnerShutdown,
             } => ExecutionReport::Interrupted {
                 final_execution_event_sequence: last_sequence,
                 reason: "graceful_shutdown".to_owned(),
-                terminal_outcome: json!({
-                    "outcome": "cancelled",
-                    "reason": "runner_shutdown",
-                }),
+                terminal_outcome: terminal_outcome(
+                    "cancelled",
+                    None,
+                    Some("runner_shutdown"),
+                    finalization,
+                ),
+                artifact_delivery,
             },
             RunOutcome::Cancelled { .. } => {
                 return self.abort_unless_fenced(
@@ -594,6 +668,213 @@ impl ExecutionJob {
             self.enqueue(assignment_id, attempt_id, report),
             final_delivery_budget,
         )
+    }
+
+    fn runner_result(
+        &self,
+        diagnostics: &StepDiagnosticLog,
+        execution: crate::execution::workflow::execution::WorkflowExecutionResult<
+            RunnerExecutionInstant,
+        >,
+        observer: &RunnerExecutionObserver,
+        started_at: RunnerExecutionInstant,
+        finished_at: RunnerExecutionInstant,
+    ) -> Option<WorkflowRunResult> {
+        let workflow = self.accepted.admitted.workflow();
+        let cancellation =
+            observed_workflow_cancellation(&execution.outcome, observer.cancellation())?;
+        let mut states = execution.steps;
+        let mut steps = Vec::with_capacity(states.len());
+        for id in &workflow.definition.presentation_order {
+            let state = states.remove(id)?;
+            let (kind, failure_policy) =
+                workflow_step_kind_policy(workflow.definition.steps.get(id)?);
+            steps.push(WorkflowRunStep {
+                id: id.clone(),
+                role: WorkflowNodeRole::Step,
+                kind,
+                failure_policy,
+                state,
+                timing: observer.step_timing(id),
+                command_output: (kind == WorkflowRunStepKind::Command)
+                    .then(|| diagnostics.get(id))
+                    .flatten(),
+            });
+        }
+        let finalization = match (
+            workflow.definition.finalizers.is_empty(),
+            execution.finalization_summary,
+        ) {
+            (true, None) => None,
+            (false, Some(summary)) => {
+                let mut summarized = summary
+                    .finalizers
+                    .into_iter()
+                    .map(|result| (result.finalizer.clone(), result))
+                    .collect::<BTreeMap<_, _>>();
+                let mut finalizers = Vec::with_capacity(summarized.len());
+                for id in &workflow.definition.finalizer_presentation_order {
+                    let state = states.remove(id)?;
+                    let summary = summarized.remove(id)?;
+                    let finalizer = workflow.definition.finalizers.get(id)?;
+                    let (kind, failure_policy) = workflow_step_kind_policy(&finalizer.body);
+                    if summary.failure_policy != failure_policy
+                        || !summary_disposition_matches(&summary.disposition, &state)
+                    {
+                        return None;
+                    }
+                    finalizers.push(WorkflowRunStep {
+                        id: id.clone(),
+                        role: WorkflowNodeRole::Finalizer,
+                        kind,
+                        failure_policy,
+                        state,
+                        timing: observer.step_timing(id),
+                        command_output: (kind == WorkflowRunStepKind::Command)
+                            .then(|| diagnostics.get(id))
+                            .flatten(),
+                    });
+                }
+                if !summarized.is_empty() {
+                    return None;
+                }
+                Some(WorkflowRunFinalization {
+                    trigger: summary.trigger,
+                    finalizers,
+                    cancellation: summary.cancellation.map(|cancellation| {
+                        WorkflowRunFinalizationCancellation {
+                            reason: cancellation.reason,
+                            force_stop_deadline: cancellation.deadline.map(|deadline| deadline.utc),
+                        }
+                    }),
+                    force_abort: summary.force_abort,
+                })
+            }
+            (true, Some(_)) | (false, None) => return None,
+        };
+        if !states.is_empty() {
+            return None;
+        }
+        Some(WorkflowRunResult {
+            run_directory: self.accepted.root.private.clone(),
+            attempt_number: 1,
+            workflow_path: execution.provenance.workflow_path,
+            source_root: execution.provenance.source_root,
+            content_digest: execution.content_digest,
+            execution_root: self.accepted.admitted.execution().root().to_owned(),
+            maximum_parallel_steps: self
+                .accepted
+                .admitted
+                .execution()
+                .limits()
+                .maximum_parallel_steps(),
+            timing: WorkflowRunTiming {
+                started_at: started_at.utc,
+                finished_at: finished_at.utc,
+                duration: finished_at
+                    .monotonic
+                    .saturating_duration_since(started_at.monotonic),
+            },
+            outcome: execution.outcome,
+            cancellation,
+            steps,
+            finalization,
+            exports: execution.exports,
+            export_sources: workflow.definition.exports.clone(),
+        })
+    }
+
+    async fn deliver_artifacts(
+        &self,
+        assignment_id: &str,
+        attempt_id: &str,
+        artifacts: &ArtifactStaging,
+        prepared: crate::execution::workflow::publication::PreparedCloudWorkflowResult,
+    ) -> ArtifactDeliveryOutcome {
+        for carrier in prepared.carriers {
+            let delivery = ArtifactDeliverySpec::cloud_carrier(
+                assignment_id.to_owned(),
+                attempt_id.to_owned(),
+                artifacts,
+                carrier,
+            );
+            let outcome = self.await_delivery(assignment_id, delivery).await;
+            if !matches!(outcome, ArtifactDeliveryOutcome::Delivered { .. }) {
+                return outcome;
+            }
+        }
+        self.await_delivery(
+            assignment_id,
+            ArtifactDeliverySpec::result(
+                assignment_id.to_owned(),
+                attempt_id.to_owned(),
+                prepared.result_json,
+            ),
+        )
+        .await
+    }
+
+    async fn await_delivery(
+        &self,
+        assignment_id: &str,
+        delivery: ArtifactDeliverySpec,
+    ) -> ArtifactDeliveryOutcome {
+        let Ok(mut completion) = self.artifact_delivery.start(delivery) else {
+            return internal_delivery_failure("registration");
+        };
+        let mut authority_updates = self.authority_updates.clone();
+        loop {
+            let authority = authority_updates.borrow_and_update().clone();
+            if authority.revoked || self.sleeper.now() >= authority.expires_deadline {
+                self.artifact_delivery.cancel_assignment(assignment_id);
+                return ArtifactDeliveryOutcome::AuthorityLost;
+            }
+            if self.sleeper.now() >= authority.renewal_deadline {
+                if self
+                    .outbox
+                    .enqueue(AssignmentObservation::LeaseRenewalRequested {
+                        assignment_id: assignment_id.to_owned(),
+                        attempt_id: self.accepted.attempt_id().to_owned(),
+                        current_lease_sequence: authority.sequence,
+                    })
+                    .is_err()
+                {
+                    return internal_delivery_failure("preparation");
+                }
+                tokio::select! {
+                    result = &mut completion => return result
+                        .unwrap_or_else(|_| internal_delivery_failure("preparation")),
+                    changed = authority_updates.changed() => {
+                        if changed.is_err() {
+                            self.artifact_delivery.cancel_assignment(assignment_id);
+                            return ArtifactDeliveryOutcome::AuthorityLost;
+                        }
+                    }
+                    () = self.sleeper.sleep(duration_until(
+                        self.sleeper.as_ref(),
+                        authority.expires_deadline,
+                    )) => {
+                        self.artifact_delivery.cancel_assignment(assignment_id);
+                        return ArtifactDeliveryOutcome::AuthorityLost;
+                    }
+                }
+                continue;
+            }
+            tokio::select! {
+                result = &mut completion => return result
+                    .unwrap_or_else(|_| internal_delivery_failure("preparation")),
+                changed = authority_updates.changed() => {
+                    if changed.is_err() {
+                        self.artifact_delivery.cancel_assignment(assignment_id);
+                        return ArtifactDeliveryOutcome::AuthorityLost;
+                    }
+                }
+                () = self.sleeper.sleep(duration_until(
+                    self.sleeper.as_ref(),
+                    authority.renewal_deadline,
+                )) => {}
+            }
+        }
     }
 
     fn has_execution_authority(&self) -> bool {
@@ -664,6 +945,82 @@ impl ExecutionJob {
                 reason: reason.to_owned(),
             },
         )
+    }
+}
+
+fn observed_workflow_cancellation(
+    outcome: &RunOutcome<StepFailureCause>,
+    cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
+) -> Option<Option<WorkflowRunCancellation>> {
+    match (cancellation, outcome) {
+        (
+            None,
+            RunOutcome::Succeeded
+            | RunOutcome::Failed {
+                later_cancellation: None,
+                ..
+            },
+        ) => Some(None),
+        (
+            Some((reason, deadline)),
+            RunOutcome::Failed {
+                later_cancellation: Some(later),
+                ..
+            },
+        ) if reason == *later => Some(Some(WorkflowRunCancellation {
+            reason,
+            force_stop_deadline: deadline.utc,
+        })),
+        (
+            Some((reason, deadline)),
+            RunOutcome::Cancelled {
+                reason: outcome_reason,
+            },
+        ) if reason == *outcome_reason => Some(Some(WorkflowRunCancellation {
+            reason,
+            force_stop_deadline: deadline.utc,
+        })),
+        _ => None,
+    }
+}
+
+fn internal_delivery_failure(phase: &str) -> ArtifactDeliveryOutcome {
+    ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
+        phase: phase.to_owned(),
+        code: "delivery_internal_failure".to_owned(),
+    })
+}
+
+fn workflow_step_kind_policy(
+    step: &crate::execution::workflow::validated::ValidatedStep,
+) -> (
+    WorkflowRunStepKind,
+    crate::execution::workflow::document::FailurePolicy,
+) {
+    match step {
+        crate::execution::workflow::validated::ValidatedStep::Command(command) => {
+            (WorkflowRunStepKind::Command, command.common.failure_policy)
+        }
+        crate::execution::workflow::validated::ValidatedStep::Agent(agent) => {
+            (WorkflowRunStepKind::Agent, agent.common.failure_policy)
+        }
+    }
+}
+
+fn artifact_delivery_result(delivery: &ArtifactDeliveryOutcome) -> Value {
+    match delivery {
+        ArtifactDeliveryOutcome::Prepared { artifact_set_id } => json!({
+            "outcome": "prepared",
+            "artifactSetId": artifact_set_id,
+        }),
+        ArtifactDeliveryOutcome::Failed(failure) => json!({
+            "outcome": "failed",
+            "phase": failure.phase,
+            "code": failure.code,
+        }),
+        ArtifactDeliveryOutcome::Delivered { .. } | ArtifactDeliveryOutcome::AuthorityLost => {
+            unreachable!("only a closed whole-set delivery can be terminal")
+        }
     }
 }
 
@@ -835,9 +1192,11 @@ fn release_staging(
     agent: Option<&AgentInputStaging>,
     artifacts: &ArtifactStaging,
 ) -> bool {
-    agent.is_some_and(|staging| staging.release().is_err())
-        | inputs.release().is_err()
-        | artifacts.release().is_err()
+    release_support_staging(inputs, agent) | artifacts.release().is_err()
+}
+
+fn release_support_staging(inputs: &InputStaging, agent: Option<&AgentInputStaging>) -> bool {
+    agent.is_some_and(|staging| staging.release().is_err()) | inputs.release().is_err()
 }
 
 #[derive(Clone)]
@@ -847,6 +1206,7 @@ struct RunnerExecutionObserver {
     transition_budget: usize,
     outbox: ObservationOutbox,
     post_stop_fence: PostStopFence,
+    cancellation: crate::execution::workflow::admission::CancellationSource,
     state: Arc<Mutex<ObserverState>>,
 }
 
@@ -855,7 +1215,15 @@ struct ObserverState {
     last_sequence: u64,
     terminal_sequence: Option<u64>,
     terminal_state: Option<WorkflowState<StepFailureCause>>,
+    cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
+    step_timings: BTreeMap<String, RunnerStepTiming>,
     faulted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RunnerStepTiming {
+    started_at: RunnerExecutionInstant,
+    finished_at: Option<RunnerExecutionInstant>,
 }
 
 impl RunnerExecutionObserver {
@@ -865,6 +1233,7 @@ impl RunnerExecutionObserver {
         transition_budget: usize,
         outbox: ObservationOutbox,
         post_stop_fence: PostStopFence,
+        cancellation: crate::execution::workflow::admission::CancellationSource,
     ) -> Self {
         Self {
             assignment_id,
@@ -872,11 +1241,14 @@ impl RunnerExecutionObserver {
             transition_budget,
             outbox,
             post_stop_fence,
+            cancellation,
             state: Arc::new(Mutex::new(ObserverState {
                 transition_count: 0,
                 last_sequence: 0,
                 terminal_sequence: None,
                 terminal_state: None,
+                cancellation: None,
+                step_timings: BTreeMap::new(),
                 faulted: false,
             })),
         }
@@ -898,6 +1270,21 @@ impl RunnerExecutionObserver {
         self.lock().faulted
     }
 
+    fn cancellation(&self) -> Option<(CancellationReason, RunnerExecutionInstant)> {
+        self.lock().cancellation
+    }
+
+    fn step_timing(&self, step: &str) -> Option<WorkflowStepTiming> {
+        let timing = *self.lock().step_timings.get(step)?;
+        let finished_at = timing.finished_at?;
+        Some(WorkflowStepTiming {
+            started_at: timing.started_at.utc,
+            duration: finished_at
+                .monotonic
+                .saturating_duration_since(timing.started_at.monotonic),
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ObserverState> {
         self.state
             .lock()
@@ -916,8 +1303,29 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 // Invocation-level command streams and agent transcript activity remain local.
                 return;
             };
+            let observed_at = RunnerExecutionClock.now();
+            let phase_cancellation = match &transition.event {
+                TransitionEvent::Workflow {
+                    to: WorkflowState::Finalizing { .. },
+                    ..
+                } => observer
+                    .cancellation
+                    .cancellation_reason()
+                    .filter(|reason| {
+                        matches!(
+                            reason,
+                            CancellationReason::RunnerShutdown
+                                | CancellationReason::ExecutionLeaseExpired
+                        )
+                    }),
+                _ => None,
+            };
             let fence = observer.post_stop_fence.lock();
             if *fence && !is_lease_loss_terminal_transition(&transition) {
+                drop(fence);
+                if let Some(reason) = phase_cancellation {
+                    observer.cancellation.request_cancellation(reason);
+                }
                 return;
             }
             let mut state = observer.lock();
@@ -929,9 +1337,20 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 state.faulted = true;
                 return;
             };
+            let cancellation = match &transition.event {
+                TransitionEvent::CancellationAccepted {
+                    reason, deadline, ..
+                } => Some((*reason, *deadline)),
+                _ => None,
+            };
             let terminal = match &transition.event {
                 TransitionEvent::Workflow { to, .. }
-                    if !matches!(to, WorkflowState::Executing { .. }) =>
+                    if matches!(
+                        to,
+                        WorkflowState::Succeeded
+                            | WorkflowState::Failed { .. }
+                            | WorkflowState::Cancelled { .. }
+                    ) =>
                 {
                     Some(to.clone())
                 }
@@ -954,11 +1373,54 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 state.faulted = true;
                 return;
             }
+            match &transition.event {
+                TransitionEvent::Step {
+                    step,
+                    to: StepStateKind::Starting,
+                    ..
+                } => {
+                    state
+                        .step_timings
+                        .entry(step.clone())
+                        .or_insert(RunnerStepTiming {
+                            started_at: observed_at,
+                            finished_at: None,
+                        });
+                }
+                TransitionEvent::Step {
+                    step,
+                    to:
+                        StepStateKind::Succeeded
+                        | StepStateKind::Failed
+                        | StepStateKind::Blocked
+                        | StepStateKind::NotRun
+                        | StepStateKind::Cancelled,
+                    ..
+                } => {
+                    if let Some(timing) = state.step_timings.get_mut(step) {
+                        timing.finished_at.get_or_insert(observed_at);
+                    }
+                }
+                TransitionEvent::Step { .. }
+                | TransitionEvent::Workflow { .. }
+                | TransitionEvent::CancellationAccepted { .. }
+                | TransitionEvent::FinalizationCancellationAccepted { .. }
+                | TransitionEvent::ForceAbortAccepted { .. } => {}
+            }
             state.transition_count += 1;
             state.last_sequence = sequence;
             if let Some(terminal) = terminal {
                 state.terminal_sequence = Some(sequence);
-                state.terminal_state = Some(terminal);
+                state.terminal_state = Some(terminal.map_deadline(|_| ()));
+            }
+            if let Some(cancellation) = cancellation
+                && state.cancellation.replace(cancellation).is_some()
+            {
+                state.faulted = true;
+            }
+            drop(state);
+            if let Some(reason) = phase_cancellation {
+                observer.cancellation.request_cancellation(reason);
             }
         }
     }
@@ -978,11 +1440,119 @@ fn is_lease_loss_terminal_transition(
     )
 }
 
+fn terminal_outcome(
+    outcome: &str,
+    failure: Option<Value>,
+    reason: Option<&str>,
+    finalization: Option<Value>,
+) -> Value {
+    let mut object = serde_json::Map::from_iter([("outcome".to_owned(), json!(outcome))]);
+    if let Some(failure) = failure {
+        object.insert("failure".to_owned(), failure);
+    }
+    if let Some(reason) = reason {
+        object.insert("reason".to_owned(), json!(reason));
+    }
+    if let Some(finalization) = finalization {
+        object.insert("finalization".to_owned(), finalization);
+    }
+    Value::Object(object)
+}
+
+fn finalization_summary(
+    summary: &FinalizationSummary<StepFailureCause, RunnerExecutionInstant>,
+) -> Value {
+    let finalizers = summary
+        .finalizers
+        .iter()
+        .map(finalizer_result)
+        .collect::<Vec<_>>();
+    let issues = summary
+        .finalizers
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.disposition,
+                StepState::Failed { .. } | StepState::InputUnavailable { .. }
+            )
+        })
+        .map(|result| {
+            json!({
+                "node": { "id": result.finalizer, "role": "finalizer" },
+                "impact": result.failure_policy,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut object = serde_json::Map::from_iter([
+        ("trigger".to_owned(), json!(summary.trigger.as_str())),
+        ("finalizers".to_owned(), Value::Array(finalizers)),
+        ("issues".to_owned(), Value::Array(issues)),
+        ("forceAbort".to_owned(), json!(summary.force_abort)),
+    ]);
+    if let Some(cancellation) = &summary.cancellation {
+        let mut value = serde_json::Map::from_iter([(
+            "reason".to_owned(),
+            json!(cancellation_reason(cancellation.reason)),
+        )]);
+        if let Some(deadline) = cancellation.deadline {
+            value.insert(
+                "forceStopDeadline".to_owned(),
+                json!(format_utc(deadline.utc)),
+            );
+        }
+        object.insert("cancellation".to_owned(), Value::Object(value));
+    }
+    Value::Object(object)
+}
+
+fn finalizer_result(result: &FinalizerResult<StepFailureCause>) -> Value {
+    let mut object = serde_json::Map::from_iter([
+        ("id".to_owned(), json!(result.finalizer)),
+        ("role".to_owned(), json!("finalizer")),
+        ("failurePolicy".to_owned(), json!(result.failure_policy)),
+    ]);
+    match &result.disposition {
+        StepState::Succeeded { .. } => {
+            object.insert("state".to_owned(), json!("succeeded"));
+        }
+        StepState::Failed { phase, cause } => {
+            object.insert("state".to_owned(), json!("failed"));
+            object.insert("failure".to_owned(), failure_evidence(*phase, cause));
+        }
+        StepState::Blocked { dependency } => {
+            object.insert("state".to_owned(), json!("blocked"));
+            object.insert("dependency".to_owned(), json!(dependency));
+        }
+        StepState::InputUnavailable { references } => {
+            object.insert("state".to_owned(), json!("blocked"));
+            object.insert("reason".to_owned(), json!("input_unavailable"));
+            object.insert("unavailableReferences".to_owned(), json!(references));
+        }
+        StepState::NotRun { reason } => {
+            object.insert("state".to_owned(), json!("not_run"));
+            object.insert("reason".to_owned(), json!(not_run_reason(*reason)));
+        }
+        StepState::Cancelled { reason } => {
+            object.insert("state".to_owned(), json!("cancelled"));
+            object.insert("reason".to_owned(), json!(cancellation_reason(*reason)));
+        }
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Cancelling { .. } => {
+            object.insert("state".to_owned(), json!("incomplete"));
+        }
+    }
+    Value::Object(object)
+}
+
 fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) -> Value {
     match &transition.event {
         TransitionEvent::Step {
             sequence,
             step,
+            role,
             failure_policy,
             from,
             to,
@@ -992,6 +1562,7 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
                 ("eventType".to_owned(), json!("step_state_changed")),
                 ("transitionSequence".to_owned(), json!(sequence.get())),
                 ("stepId".to_owned(), json!(step)),
+                ("role".to_owned(), json!(node_role(*role))),
                 ("failurePolicy".to_owned(), json!(failure_policy)),
                 ("from".to_owned(), json!(step_state_name(*from))),
                 ("to".to_owned(), json!(step_state_name(*to))),
@@ -1004,6 +1575,10 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
                     }
                     ObservedStepTransition::Blocked { dependency } => {
                         event.insert("dependency".to_owned(), json!(dependency));
+                    }
+                    ObservedStepTransition::InputUnavailable { references } => {
+                        event.insert("reason".to_owned(), json!("input_unavailable"));
+                        event.insert("unavailableReferences".to_owned(), json!(references));
                     }
                     ObservedStepTransition::NotRun { reason } => {
                         event.insert("reason".to_owned(), json!(not_run_reason(*reason)));
@@ -1034,10 +1609,27 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
             "reason": cancellation_reason(*reason),
             "deadline": format_utc(deadline.utc),
         }),
+        TransitionEvent::FinalizationCancellationAccepted {
+            sequence,
+            reason,
+            deadline,
+        } => json!({
+            "eventVersion": 1,
+            "eventType": "finalization_cancellation_accepted",
+            "transitionSequence": sequence.get(),
+            "reason": cancellation_reason(*reason),
+            "deadline": format_utc(deadline.utc),
+        }),
+        TransitionEvent::ForceAbortAccepted { sequence, reason } => json!({
+            "eventVersion": 1,
+            "eventType": "force_abort_accepted",
+            "transitionSequence": sequence.get(),
+            "reason": cancellation_reason(*reason),
+        }),
     }
 }
 
-fn workflow_state(state: &WorkflowState<StepFailureCause>) -> Value {
+fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant>) -> Value {
     match state {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
@@ -1072,6 +1664,43 @@ fn workflow_state(state: &WorkflowState<StepFailureCause>) -> Value {
             "reason": cancellation_reason(*reason),
             "priorFailure": workflow_failure(prior_failure),
         }),
+        WorkflowState::Finalizing {
+            trigger,
+            gate,
+            primary_failure,
+        } => {
+            let mut object = serde_json::Map::from_iter([
+                ("state".to_owned(), json!("finalizing")),
+                ("trigger".to_owned(), json!(trigger.as_str())),
+            ]);
+            match gate {
+                FinalizationGate::Open => {
+                    object.insert("gate".to_owned(), json!("open"));
+                }
+                FinalizationGate::Cancelling {
+                    reason,
+                    deadline,
+                    force_abort,
+                } => {
+                    object.insert("gate".to_owned(), json!("cancelling"));
+                    object.insert("reason".to_owned(), json!(cancellation_reason(*reason)));
+                    object.insert("forceAbort".to_owned(), json!(force_abort));
+                    if let Some(deadline) = deadline {
+                        object.insert(
+                            "forceStopDeadline".to_owned(),
+                            json!(format_utc(deadline.utc)),
+                        );
+                    }
+                }
+            }
+            if let Some(primary_failure) = primary_failure {
+                object.insert(
+                    "primaryFailure".to_owned(),
+                    workflow_failure(primary_failure),
+                );
+            }
+            Value::Object(object)
+        }
         WorkflowState::Succeeded => json!({ "state": "succeeded" }),
         WorkflowState::Failed {
             primary_failure,
@@ -1097,32 +1726,60 @@ fn workflow_state(state: &WorkflowState<StepFailureCause>) -> Value {
 
 fn workflow_failure(failure: &StepFailure<StepFailureCause>) -> Value {
     json!({
-        "stepId": failure.step,
+        "node": { "id": failure.step, "role": node_role(failure.role) },
         "failure": failure_evidence(failure.phase, &failure.cause),
     })
+}
+
+fn node_role(role: WorkflowNodeRole) -> &'static str {
+    match role {
+        WorkflowNodeRole::Step => "step",
+        WorkflowNodeRole::Finalizer => "finalizer",
+    }
 }
 
 fn failure_evidence(phase: FailurePhase, cause: &StepFailureCause) -> Value {
     match (phase, cause) {
         (FailurePhase::Start, StepFailureCause::Start(cause)) => {
-            let (cause, exit_code) = start_failure(cause);
-            failure_value("start", cause, exit_code)
+            let protocol_rejection = match cause {
+                StepStartFailure::Agent(failure) => failure.protocol_rejection(),
+                _ => None,
+            };
+            let (code, exit_code) = start_failure(cause);
+            failure_value("start", code, exit_code, protocol_rejection)
         }
         (FailurePhase::Execution, StepFailureCause::Execution(cause)) => {
-            let (cause, exit_code) = execution_failure(cause);
-            failure_value("execution", cause, exit_code)
+            let (code, exit_code) = execution_failure(cause);
+            let protocol_rejection = match cause {
+                StepExecutionFailure::Agent(failure) => failure.protocol_rejection(),
+                StepExecutionFailure::Command(_) => None,
+            };
+            failure_value("execution", code, exit_code, protocol_rejection)
         }
         (FailurePhase::OutputCapture, StepFailureCause::OutputCapture(cause)) => {
-            failure_value("output_capture", output_capture_failure(cause), None)
+            failure_value("output_capture", output_capture_failure(cause), None, None)
         }
-        _ => failure_value("start", "step_unavailable", None),
+        _ => failure_value("start", "step_unavailable", None, None),
     }
 }
 
-fn failure_value(phase: &str, cause: &str, exit_code: Option<i32>) -> Value {
-    match exit_code {
-        Some(exit_code) => json!({ "phase": phase, "cause": cause, "exitCode": exit_code }),
-        None => json!({ "phase": phase, "cause": cause }),
+fn failure_value(
+    phase: &str,
+    cause: &str,
+    exit_code: Option<i32>,
+    protocol_rejection: Option<&AgentProtocolRejectionDiagnostic>,
+) -> Value {
+    match (exit_code, protocol_rejection) {
+        (Some(exit_code), None) => {
+            json!({ "phase": phase, "cause": cause, "exitCode": exit_code })
+        }
+        (None, Some(protocol_rejection)) => json!({
+            "phase": phase,
+            "cause": cause,
+            "protocolRejection": protocol_rejection,
+        }),
+        (None, None) => json!({ "phase": phase, "cause": cause }),
+        (Some(_), Some(_)) => unreachable!("agent protocol rejections have no command exit code"),
     }
 }
 
@@ -1219,9 +1876,11 @@ fn execution_failure(failure: &StepExecutionFailure) -> (&'static str, Option<i3
     }
 }
 
-fn agent_failure(failure: &AgentFailureCause) -> &'static str {
-    match failure {
-        AgentFailureCause::HarnessStartFailed => "agent_harness_start_failed",
+fn agent_failure(failure: &AgentFailure) -> &'static str {
+    match failure.cause() {
+        AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessSetupFailed { .. } => {
+            "agent_harness_start_failed"
+        }
         AgentFailureCause::HarnessInputTooLarge {
             input: AgentInputKind::SystemPrompt,
             ..
@@ -1261,8 +1920,37 @@ fn output_capture_failure(failure: &OutputCaptureFailure) -> &'static str {
         OutputCaptureFailure::StepUnavailable => "output_step_unavailable",
         OutputCaptureFailure::UnsupportedOutput => "output_unsupported",
         OutputCaptureFailure::Capture(failure) => capture_failure(failure.kind()),
-        OutputCaptureFailure::Git { .. } => "output_git_capture_failed",
+        OutputCaptureFailure::Git { failure, .. } => git_capture_failure(failure),
         OutputCaptureFailure::TaskUnavailable => "output_task_unavailable",
+    }
+}
+
+fn git_capture_failure(
+    failure: &crate::execution::workflow::git_capture::GitCaptureFailure,
+) -> &'static str {
+    use crate::execution::workflow::git_capture::GitCaptureFailure;
+
+    match failure {
+        GitCaptureFailure::Cancelled
+        | GitCaptureFailure::StagingMismatch
+        | GitCaptureFailure::Artifact(_) => "output_staging_unavailable",
+        GitCaptureFailure::ExecutionRootRebound => "output_git_execution_root_rebound",
+        GitCaptureFailure::HeadUnavailable => "output_git_head_unavailable",
+        GitCaptureFailure::BaselineNotAncestor => "output_git_baseline_not_ancestor",
+        GitCaptureFailure::CleanlinessUnavailable => "output_git_cleanliness_unavailable",
+        GitCaptureFailure::WorkspaceDirty => "output_git_workspace_dirty",
+        GitCaptureFailure::TreeUnavailable => "output_git_tree_unavailable",
+        GitCaptureFailure::RequiredObjectsUnavailable => "output_git_required_objects_unavailable",
+        GitCaptureFailure::SourceAuthorityChanged => "output_git_source_authority_changed",
+        GitCaptureFailure::GitStructureLimitExceeded => "output_git_structure_limit_exceeded",
+        GitCaptureFailure::CommandTimedOut(_) => "output_git_command_timed_out",
+        GitCaptureFailure::BundleGenerationFailed => "output_git_bundle_generation_failed",
+        GitCaptureFailure::BundleProfileInvalid => "output_git_bundle_profile_invalid",
+        GitCaptureFailure::BundleVerificationFailed => "output_git_bundle_verification_failed",
+        GitCaptureFailure::WorkspaceChanged => "output_git_workspace_changed",
+        GitCaptureFailure::TemporaryStorageUnavailable => {
+            "output_git_temporary_storage_unavailable"
+        }
     }
 }
 
@@ -1333,6 +2021,7 @@ fn step_state_name(state: StepStateKind) -> &'static str {
 fn not_run_reason(reason: NotRunReason) -> &'static str {
     match reason {
         NotRunReason::FailureStop => "failure_stop",
+        NotRunReason::FinalizerTriggerNotSelected => "finalizer_trigger_not_selected",
     }
 }
 
@@ -1397,9 +2086,14 @@ impl CoordinatorClock for RunnerExecutionClock {
 mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
+    use std::sync::Arc;
 
     use super::*;
-    use crate::execution::workflow::agent::PositiveDuration;
+    use crate::execution::workflow::agent::{
+        AgentFailure, AgentOutcome, AgentValueKind, PositiveDuration,
+    };
+    use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1Parser;
+    use crate::execution::workflow::pi_json_v1::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
     use crate::execution::workflow::validated::{
         ResolvedOutputSource, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
     };
@@ -1633,6 +2327,7 @@ mod tests {
             2,
             outbox.clone(),
             fence.clone(),
+            crate::execution::workflow::admission::CancellationSource::new(),
         );
         fence.fence();
         observer
@@ -1668,6 +2363,51 @@ mod tests {
         assert!(is_lease_loss_terminal_transition(&lease_terminal));
     }
 
+    #[tokio::test]
+    async fn post_stop_fence_rearms_lease_loss_at_finalization_boundary() {
+        let cancellation = crate::execution::workflow::admission::CancellationSource::new();
+        assert!(cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired));
+        assert!(cancellation.fixture_begin_finalization_arm());
+
+        let fence = PostStopFence::new();
+        fence.fence();
+        let observer = RunnerExecutionObserver::new(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            1,
+            ObservationOutbox::new(),
+            fence,
+            cancellation.clone(),
+        );
+        observer
+            .observe(ExecutionObservation::Transition(TransitionObservation {
+                event: TransitionEvent::Workflow {
+                    sequence: Default::default(),
+                    from: WorkflowState::Executing {
+                        gate: SchedulingGate::Cancelling {
+                            reason: CancellationReason::ExecutionLeaseExpired,
+                            prior_failure: None,
+                        },
+                    },
+                    to: WorkflowState::Finalizing {
+                        trigger:
+                            crate::execution::workflow::document::FinalizationTrigger::Cancelled,
+                        gate: FinalizationGate::Open,
+                        primary_failure: None,
+                    },
+                },
+                step: None,
+            }))
+            .await;
+        assert!(cancellation.fixture_complete_finalization_arm());
+
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::ExecutionLeaseExpired),
+            "lease loss must close the newly committed finalization gate even after the post-stop observation fence",
+        );
+    }
+
     #[test]
     fn assignment_supervisor_registers_before_release_and_closes_on_containment() {
         let guards = AssignmentProcessGuards::new();
@@ -1693,6 +2433,7 @@ mod tests {
             event: TransitionEvent::Step {
                 sequence: crate::execution::workflow::runtime::TransitionSequence::default(),
                 step: "lint".to_owned(),
+                role: WorkflowNodeRole::Step,
                 failure_policy: crate::execution::workflow::document::FailurePolicy::Advisory,
                 from: StepStateKind::Pending,
                 to: StepStateKind::Blocked,
@@ -1709,6 +2450,7 @@ mod tests {
                 "eventType": "step_state_changed",
                 "transitionSequence": 0,
                 "stepId": "lint",
+                "role": "step",
                 "failurePolicy": "advisory",
                 "from": "pending",
                 "to": "blocked",
@@ -1885,14 +2627,14 @@ mod tests {
         for (failure, expected) in agent_failures() {
             assert_projection(
                 FailurePhase::Start,
-                StepFailureCause::Start(StepStartFailure::Agent(failure.clone())),
+                StepFailureCause::Start(StepStartFailure::Agent(failure.clone().into())),
                 "start",
                 expected,
                 None,
             );
             assert_projection(
                 FailurePhase::Execution,
-                StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
+                StepFailureCause::Execution(StepExecutionFailure::Agent(failure.into())),
                 "execution",
                 expected,
                 None,
@@ -2011,6 +2753,22 @@ mod tests {
                 "output_total_size_limit_exceeded",
             ),
             (
+                CaptureFailureKind::GitCarrierCountLimitExceeded,
+                "output_git_carrier_count_limit_exceeded",
+            ),
+            (
+                CaptureFailureKind::GitCarrierSizeLimitExceeded,
+                "output_git_carrier_size_limit_exceeded",
+            ),
+            (
+                CaptureFailureKind::TotalGitCarrierSizeLimitExceeded,
+                "output_total_git_carrier_size_limit_exceeded",
+            ),
+            (
+                CaptureFailureKind::CarrierProducerUnavailable,
+                "output_carrier_producer_unavailable",
+            ),
+            (
                 CaptureFailureKind::StagingUnavailable,
                 "output_staging_unavailable",
             ),
@@ -2018,6 +2776,225 @@ mod tests {
             assert_eq!(capture_failure(kind), expected);
             assert_encoded_evidence("output_capture", expected, None);
         }
+        for (failure, expected) in [
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::ExecutionRootRebound,
+                "output_git_execution_root_rebound",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::HeadUnavailable,
+                "output_git_head_unavailable",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::BaselineNotAncestor,
+                "output_git_baseline_not_ancestor",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::CleanlinessUnavailable,
+                "output_git_cleanliness_unavailable",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::WorkspaceDirty,
+                "output_git_workspace_dirty",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::TreeUnavailable,
+                "output_git_tree_unavailable",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::RequiredObjectsUnavailable,
+                "output_git_required_objects_unavailable",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::SourceAuthorityChanged,
+                "output_git_source_authority_changed",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::GitStructureLimitExceeded,
+                "output_git_structure_limit_exceeded",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::BundleGenerationFailed,
+                "output_git_bundle_generation_failed",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::BundleProfileInvalid,
+                "output_git_bundle_profile_invalid",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::BundleVerificationFailed,
+                "output_git_bundle_verification_failed",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::WorkspaceChanged,
+                "output_git_workspace_changed",
+            ),
+            (
+                crate::execution::workflow::git_capture::GitCaptureFailure::TemporaryStorageUnavailable,
+                "output_git_temporary_storage_unavailable",
+            ),
+        ] {
+            let failure = OutputCaptureFailure::Git {
+                output: "branch".to_owned(),
+                failure,
+            };
+            assert_projection(
+                FailurePhase::OutputCapture,
+                StepFailureCause::OutputCapture(failure),
+                "output_capture",
+                expected,
+                None,
+            );
+        }
+        assert_encoded_evidence("output_capture", "output_git_command_timed_out", None);
+    }
+
+    fn assert_agent_protocol_rejection_evidence(failure: AgentFailure) -> Value {
+        let expected = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        let evidence = failure_evidence(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
+        );
+        assert_eq!(evidence["cause"], "agent_harness_protocol_failed");
+        assert_eq!(evidence["protocolRejection"], expected);
+        expected
+    }
+
+    #[test]
+    fn runner_failure_evidence_carries_the_agent_protocol_rejection() {
+        let mut parser =
+            PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
+        let frames = concat!(
+            "{\"type\":\"session\",\"version\":3,",
+            "\"id\":\"00000000-0000-4000-8000-00000000000d\",",
+            "\"timestamp\":\"2026-07-30T12:00:00Z\",",
+            "\"cwd\":\"/execution/worktree\"}\n",
+            "{\"type\":\"agent_start\"}\n",
+            "{\"type\":\"turn_end\"}\n",
+        );
+        assert!(parser.push_stdout(frames.as_bytes(), drop).is_err());
+        let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
+        else {
+            panic!("invalid turn transition must fail");
+        };
+        assert_agent_protocol_rejection_evidence(failure);
+    }
+
+    #[test]
+    fn runner_failure_evidence_carries_the_claude_protocol_rejection() {
+        let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
+            Arc::from("/execution/worktree"),
+            Arc::from("scherzo-loopback"),
+            Arc::from("00000000-0000-4000-8000-000000000001"),
+            AgentValueKind::None,
+            NonZeroU64::new(1024).unwrap(),
+        );
+        let initialization = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",",
+            "\"cwd\":\"/execution/worktree\",",
+            "\"session_id\":\"00000000-0000-4000-8000-000000000001\",",
+            "\"model\":\"scherzo-loopback\",",
+            "\"permissionMode\":\"bypassPermissions\",",
+            "\"claude_code_version\":\"2.1.234\"}\n",
+        );
+        parser.push_stdout(initialization.as_bytes(), drop).unwrap();
+        let AgentOutcome::Failed(failure) = parser.finish(true) else {
+            panic!("incomplete Claude exchange must fail");
+        };
+        let expected = assert_agent_protocol_rejection_evidence(failure);
+        serde_json::from_value::<
+            crate::runner_protocol::generated::AgentProtocolRejectionDiagnostic,
+        >(expected.clone())
+        .unwrap();
+        assert_eq!(
+            expected["detail"]["reason"],
+            "end_of_stream_invariant_invalid"
+        );
+    }
+
+    #[test]
+    fn runner_failure_evidence_accepts_large_native_content_index() {
+        let usage = json!({
+            "input": 1,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 2,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+            }
+        });
+        let empty = json!({
+            "role": "assistant",
+            "content": [],
+            "api": "test-api",
+            "provider": "test-provider",
+            "model": "test-model",
+            "usage": usage,
+            "stopReason": "pending",
+            "timestamp": 2
+        });
+        let started = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "api": "test-api",
+            "provider": "test-provider",
+            "model": "test-model",
+            "usage": usage,
+            "stopReason": "pending",
+            "timestamp": 2
+        });
+        let events = [
+            json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000d", "timestamp": "2026-07-30T12:00:00Z", "cwd": "/execution/worktree"}),
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "message_start", "message": empty}),
+            json!({
+                "type": "message_update",
+                "message": started,
+                "assistantMessageEvent": {
+                    "type": "text_start",
+                    "contentIndex": 9_223_372_036_854_775_808_u64,
+                    "partial": started
+                }
+            }),
+        ];
+        let mut parser =
+            PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
+        for event in events {
+            let mut frame = serde_json::to_vec(&event).unwrap();
+            frame.push(b'\n');
+            if parser.push_stdout(&frame, drop).is_err() {
+                break;
+            }
+        }
+        let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
+        else {
+            panic!("invalid content index must fail");
+        };
+        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(
+            rejection["detail"]["reason"],
+            "assistant_update_content_index_invalid"
+        );
+        assert!(rejection["detail"].get("contentIndex").is_none());
+
+        let evidence = failure_evidence(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure.clone())),
+        );
+        let terminal = workflow_failure(&StepFailure {
+            role: WorkflowNodeRole::Step,
+            step: "step".to_owned(),
+            phase: FailurePhase::Execution,
+            cause: StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
+        });
+
+        assert_encoded_evidence_value("execution", evidence, terminal);
     }
 
     fn agent_failures() -> Vec<(AgentFailureCause, &'static str)> {
@@ -2105,9 +3082,10 @@ mod tests {
         let evidence = failure_evidence(phase, &cause);
         assert_eq!(
             evidence,
-            failure_value(expected_phase, expected_cause, exit_code)
+            failure_value(expected_phase, expected_cause, exit_code, None)
         );
         let failure = StepFailure {
+            role: WorkflowNodeRole::Step,
             step: "step".to_owned(),
             phase,
             cause,
@@ -2116,9 +3094,9 @@ mod tests {
     }
 
     fn assert_encoded_evidence(phase: &str, cause: &str, exit_code: Option<i32>) {
-        let evidence = failure_value(phase, cause, exit_code);
+        let evidence = failure_value(phase, cause, exit_code, None);
         let terminal = json!({
-            "stepId": "step",
+            "node": { "id": "step", "role": "step" },
             "failure": evidence.clone(),
         });
         assert_encoded_evidence_value(phase, evidence, terminal);
@@ -2142,6 +3120,7 @@ mod tests {
                         "eventType": "step_state_changed",
                         "transitionSequence": 1,
                         "stepId": "step",
+                        "role": "step",
                         "failurePolicy": "required",
                         "from": from,
                         "to": "failed",
@@ -2157,6 +3136,10 @@ mod tests {
                     outcome: json!({
                         "outcome": "failed",
                         "failure": terminal,
+                    }),
+                    artifact_delivery: json!({
+                        "outcome": "prepared",
+                        "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
                     }),
                 },
             },

@@ -42,6 +42,7 @@ fn result_fixture() -> Value {
         "outcome": "succeeded",
         "steps": [{
             "id": "produce",
+            "role": "step",
             "kind": "agent",
             "failurePolicy": "required",
             "state": "succeeded",
@@ -55,6 +56,46 @@ fn result_fixture() -> Value {
     })
 }
 
+fn finalized_result_fixture() -> Value {
+    let mut result = result_fixture();
+    result["exports"] = json!({});
+    result["finalization"] = json!({
+        "trigger": "succeeded",
+        "finalizers": [{
+            "id": "cleanup",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "succeeded",
+            "startedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 100
+        }],
+        "issues": [],
+        "forceAbort": false
+    });
+    result
+}
+
+fn cloud_result_fixture() -> Value {
+    let mut result = result_fixture();
+    result["workflow"]["provenance"] = json!({
+        "kind": "cloud",
+        "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc"
+    });
+    result["execution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("executionRoot");
+    result
+}
+
+fn cloud_metadata_only_result_fixture() -> Value {
+    let mut result = cloud_result_fixture();
+    result["exports"] = json!({});
+    result
+}
+
 fn failed_result_fixture(phase: &str, cause: Value) -> Value {
     let mut result = result_fixture();
     let failure = json!({
@@ -63,7 +104,7 @@ fn failed_result_fixture(phase: &str, cause: Value) -> Value {
     });
     result["outcome"] = Value::String("failed".to_owned());
     result["primaryFailure"] = json!({
-        "step": "produce",
+        "node": { "id": "produce", "role": "step" },
         "phase": phase,
         "cause": failure["cause"].clone()
     });
@@ -76,6 +117,100 @@ fn encode(value: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+#[test]
+fn finalization_metadata_rejects_role_issue_and_force_mismatches() {
+    let valid = finalized_result_fixture();
+    assert!(decode(&encode(&valid)).is_ok());
+
+    let mut wrong_role = valid.clone();
+    wrong_role["finalization"]["finalizers"][0]["role"] = Value::String("step".to_owned());
+    assert_eq!(decode(&encode(&wrong_role)), Err(ResultMetadataError));
+
+    let mut false_issue = valid.clone();
+    false_issue["finalization"]["issues"] = json!([{
+        "node": { "id": "cleanup", "role": "finalizer" },
+        "impact": "required"
+    }]);
+    assert_eq!(decode(&encode(&false_issue)), Err(ResultMetadataError));
+
+    let mut impossible_force_abort = valid;
+    impossible_force_abort["finalization"]["forceAbort"] = Value::Bool(true);
+    assert_eq!(
+        decode(&encode(&impossible_force_abort)),
+        Err(ResultMetadataError)
+    );
+}
+
+#[test]
+fn admits_exact_local_and_cloud_origin_profiles() {
+    assert!(decode(&encode(&result_fixture())).is_ok());
+    assert!(decode(&encode(&cloud_result_fixture())).is_ok());
+}
+
+#[test]
+fn rejects_unknown_mixed_or_malformed_cloud_origin_profiles() {
+    let mut invalid_results = Vec::new();
+
+    let mut unknown_kind = cloud_metadata_only_result_fixture();
+    unknown_kind["workflow"]["provenance"]["kind"] = Value::String("remote".to_owned());
+    invalid_results.push(unknown_kind);
+
+    let mut mixed_cloud = cloud_metadata_only_result_fixture();
+    mixed_cloud["workflow"]["provenance"]["sourceRoot"] = Value::String("/runner".to_owned());
+    invalid_results.push(mixed_cloud);
+
+    let mut mixed_local = result_fixture();
+    mixed_local["workflow"]["provenance"]["projectId"] =
+        Value::String("prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned());
+    invalid_results.push(mixed_local);
+
+    let mut malformed_project = cloud_metadata_only_result_fixture();
+    malformed_project["workflow"]["provenance"]["projectId"] =
+        Value::String("prj_81k0z6r1w8f4jy2m7q9v3x5abc".to_owned());
+    invalid_results.push(malformed_project);
+
+    let mut malformed_workflow = cloud_metadata_only_result_fixture();
+    malformed_workflow["workflow"]["provenance"]["workflowId"] =
+        Value::String("wfl_01K0z6r1w8f4jy2m7q9v3x5abc".to_owned());
+    invalid_results.push(malformed_workflow);
+
+    let mut runner_execution_root = cloud_metadata_only_result_fixture();
+    runner_execution_root["execution"]["executionRoot"] = Value::String("/runner/work".to_owned());
+    invalid_results.push(runner_execution_root);
+
+    for field in [
+        "runnerPath",
+        "runnerId",
+        "organizationName",
+        "repositoryUrl",
+        "bucket",
+        "objectKey",
+        "credential",
+        "destinationPublicationState",
+    ] {
+        let mut extra_origin = cloud_metadata_only_result_fixture();
+        extra_origin["workflow"]["provenance"][field] = Value::String("forbidden".to_owned());
+        invalid_results.push(extra_origin);
+    }
+
+    for result in invalid_results {
+        assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+    }
+}
+
+#[test]
+fn local_and_cloud_profiles_share_result_invariants() {
+    for mut result in [result_fixture(), cloud_result_fixture()] {
+        result["exports"]["second"]["digest"]["value"] = Value::String("2".repeat(64));
+        assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+    }
+
+    for mut result in [result_fixture(), cloud_metadata_only_result_fixture()] {
+        result["steps"][0]["state"] = Value::String("failed".to_owned());
+        assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+    }
 }
 
 #[test]
@@ -129,6 +264,7 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
     let mut result = result_fixture();
     let command = json!({
         "id": "step0",
+        "role": "step",
         "kind": "cmd",
         "failurePolicy": "required",
         "state": "succeeded",
@@ -149,6 +285,7 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
     let agents = (1..step_count).map(|index| {
         json!({
             "id": format!("step{index}"),
+            "role": "step",
             "kind": "agent",
             "failurePolicy": "required",
             "state": "succeeded",
@@ -243,7 +380,7 @@ fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
 
     advisory["outcome"] = Value::String("failed".to_owned());
     advisory["primaryFailure"] = json!({
-        "step": "produce",
+        "node": { "id": "produce", "role": "step" },
         "phase": "execution",
         "cause": { "code": "harness_failed" }
     });

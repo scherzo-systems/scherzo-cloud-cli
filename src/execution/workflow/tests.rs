@@ -198,6 +198,25 @@ fn workflow_v1_decodes_the_closed_claude_code_profile() {
 }
 
 #[test]
+fn workflow_v1_remains_closed_to_every_future_codex_configuration_shape() {
+    for config in [
+        "model: gpt-5\n        effort: high",
+        "model: gpt-5\n        effort: future-native-effort",
+        "model: gpt-5\n        effort: high\n        modelProvider: openai",
+        "model: gpt-5\n        effort: high\n        apiKey: forbidden",
+    ] {
+        let source = format!(
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: codex\n      config:\n        {config}\nsteps:\n  command:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+        );
+
+        assert_eq!(
+            decode(source.as_bytes()).unwrap_err().kind(),
+            DecodeFailureKind::StructuralContract
+        );
+    }
+}
+
+#[test]
 fn finalizers_decode_with_independent_order_defaults_and_engine_context() {
     let source = br#"schemaVersion: 1
 agentProfiles:

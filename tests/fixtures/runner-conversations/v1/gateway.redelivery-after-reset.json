@@ -12,7 +12,6 @@
         "direction": "runner_to_cloud",
         "messageId": "«mid-1»",
         "payload": {
-          "maxConcurrentRuns": 1,
           "runnerVersion": "«ver»"
         },
         "payloadVersion": 1,
@@ -86,9 +85,21 @@
             },
             "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
             "registeredWorkflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "schemaVersion": 1
+            "schemaVersion": 1,
+            "source": {
+              "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+              "commitOid": "0123456789abcdef0123456789abcdef01234567",
+              "objectFormat": "sha1",
+              "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+              "workflowPath": "workflow.yaml",
+              "workflowSourceClosureDigest": {
+                "algorithm": "sha256",
+                "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              }
+            }
           },
           "offerExpiresAt": "2026-07-23T13:00:00Z",
+          "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
           "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj"
         },
         "payloadVersion": 1,
@@ -144,7 +155,7 @@
         "payload": {
           "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
           "decline": {
-            "reason": "workflow_mapping_unavailable",
+            "reason": "source_service_unavailable",
             "type": "runner_unable"
           },
           "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg"

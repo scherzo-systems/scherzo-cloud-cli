@@ -39,7 +39,8 @@ use crate::execution::workflow::execution_root::ExecutionRootPrelaunchBoundary;
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
-    self, Action, ExportValue, Occurrence, RequestedAction, StepState, WorkflowState,
+    self, Action, ExportValue, Occurrence, RequestedAction, StepState, TransitionSequence,
+    WorkflowState,
 };
 use crate::execution::workflow::value::CapturedValue;
 
@@ -57,11 +58,12 @@ const FIXTURE_DESCENDANT: &str = "descendant";
 const LITERAL_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 
-type TestOccurrence = Occurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue, ()>;
+type TestOccurrence =
+    Occurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>;
 type TestReceiver = OccurrenceReceiver<ProvisionalStepOutputs, StepFailureCause, CapturedValue>;
 type TestRequestedAction =
     RequestedAction<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>;
-type TestRuntimeState = runtime::RuntimeState<StepFailureCause, CapturedValue>;
+type TestRuntimeState = runtime::RuntimeState<StepFailureCause, CapturedValue, TestInstant>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FixtureReport {
@@ -646,14 +648,11 @@ async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() 
         let argv = std::iter::once(executable.to_str().unwrap())
             .chain(arguments.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        let producer_argv = [
-            executable.to_str().unwrap(),
-            "--exact",
-            "__workflow_producer_noop__",
-        ];
+        // Hold the producer at the fixture boundary so it cannot exit before
+        // the direct test runtime authenticates its process-group identity.
         let mut source = format!(
             "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      report:\n        kind: file\n        path: report.bin\n        mediaType: application/fixture\n",
-            serde_json::to_string(&producer_argv).unwrap()
+            serde_json::to_string(&argv).unwrap()
         );
         for step in ["alpha", "beta"] {
             source.push_str(&format!(
@@ -682,6 +681,8 @@ async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() 
             },
         );
         let commands = async {
+            let (producer_control, _) = accept_report(&listener).await;
+            release(producer_control).await;
             let (first_control, first_report) = accept_report(&listener).await;
             let (second_control, second_report) = accept_report(&listener).await;
             let first_path = PathBuf::from(&first_report.environment["SCHERZO_STEP_INPUTS"]);
@@ -969,7 +970,7 @@ steps:
 }
 
 #[tokio::test]
-async fn active_capture_cancellation_stops_at_a_chunk_boundary_before_quiescence() {
+async fn active_capture_force_abort_replaces_graceful_action_before_quiescence() {
     with_watchdog(async {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -1037,6 +1038,18 @@ steps:
 
         driver.release(cancellation.clone()).await;
         driver.release(cancellation.clone()).await;
+        let force_abort = RequestedAction {
+            id: ActionId {
+                transition_sequence: TransitionSequence(1_u64 << 63),
+            },
+            action: Action::ForceAbortStep {
+                step: "task".to_owned(),
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::ZERO),
+            },
+        };
+        driver.release(force_abort.clone()).await;
+        driver.release(force_abort.clone()).await;
         assert!(receiver.try_recv().is_none());
         boundaries.release();
 
@@ -1044,7 +1057,7 @@ steps:
             next_occurrence(&mut receiver).await,
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
-                action: cancellation.id,
+                action: force_abort.id,
             }
         );
         assert!(boundaries.reached.try_recv().is_err());
@@ -3179,6 +3192,70 @@ async fn admitted_deadline_forces_the_stubborn_process_group_without_wall_clock_
 }
 
 #[tokio::test]
+async fn force_abort_of_gracefully_cancelling_command_reports_the_force_action() {
+    with_watchdog(async {
+        let PreparedGroupCommand {
+            _temporary,
+            listener,
+            admitted,
+        } = prepare_group_command(FIXTURE_MODE_STUBBORN).await;
+        let graceful_deadline = TestInstant(Duration::from_secs(29));
+        let (start, cancel) = running_cancellation_actions(&admitted, graceful_deadline);
+        let start_action = start.id;
+        let force_abort = RequestedAction {
+            id: ActionId {
+                transition_sequence: TransitionSequence((1_u64 << 63) | 1),
+            },
+            action: Action::ForceAbortStep {
+                step: "task".to_owned(),
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::ZERO),
+            },
+        };
+        let force_action = force_abort.id;
+        let (clock, mut control) = ControlledClock::new(TestInstant(Duration::ZERO));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
+
+        runtime.release(start).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start_action,
+            }
+        );
+        let mut processes = accept_group(&listener).await;
+
+        runtime.release(cancel).await;
+        assert_group_interrupted(&processes).await;
+        assert_eq!(control.next_deadline().await, graceful_deadline);
+        runtime.release(force_abort.clone()).await;
+        runtime.release(force_abort).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: force_action,
+            }
+        );
+
+        assert_group_closed(&mut processes).await;
+        assert_eq!(runtime.active_work_count(), 0);
+        assert_eq!(control.active_waiters(), 0);
+        assert!(receiver.try_recv().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn natural_exit_before_cancel_delivery_has_no_late_lifecycle_or_cleanup_work() {
     with_watchdog(async {
         let PreparedGroupCommand {
@@ -3829,6 +3906,131 @@ fn admit_fixture_with_inputs(
     .unwrap()
 }
 
+#[test]
+fn absent_agent_response_remains_a_successful_empty_capture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    let source_root = temporary.path().join("source");
+    fs::create_dir(&source_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  respond:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: workflow.yaml
+      message:
+        text:
+          - file: workflow.yaml
+    outputs:
+      response:
+        kind: agent_response
+"#,
+    )
+    .unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedImports::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        )
+        .with_pi_installation(crate::execution::pi::ValidatedPiInstallation::fixture(
+            PathBuf::from("/validated/pi"),
+        )),
+    )
+    .unwrap();
+    let artifacts = test_artifacts(&admitted);
+    let (occurrences, _receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    let worker = CaptureWorker {
+        admitted,
+        artifacts: artifacts.staging.clone(),
+        occurrences,
+        work: Arc::new(Mutex::new(CaptureWorkRegistry::new())),
+    };
+    let values = completed_agent_outputs(
+        Some("response".to_owned()),
+        CompletedAgentInvocation::NoResponse,
+    )
+    .unwrap();
+    let value_names = values.keys().cloned().collect();
+    let Ok(candidates) =
+        worker.capture_outputs_blocking("respond", &value_names, &CaptureCancellation::default())
+    else {
+        panic!("an absent optional response must remain a successful empty capture");
+    };
+
+    assert!(candidates.outputs().is_empty());
+}
+
+#[test]
+fn agent_finalization_context_is_an_engine_input_not_an_upstream_output() {
+    let temporary = tempfile::tempdir().unwrap();
+    fs::write(temporary.path().join("system.md"), "System.\n").unwrap();
+    fs::write(temporary.path().join("message.md"), "Message.\n").unwrap();
+    fs::write(
+        temporary.path().join("workflow.yaml"),
+        r#"schemaVersion: 1
+agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  work:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  notify:
+    kind: agent
+    agent:
+      profile: reporting
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+        attachments:
+          - ref: finalization.context
+"#,
+    )
+    .unwrap();
+    let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
+    let ValidatedStep::Agent(agent) = &workflow.definition.finalizers["notify"].body else {
+        panic!("notify must resolve as an agent finalizer");
+    };
+    let context: Arc<[u8]> = Arc::from(br#"{"schemaVersion":1}"#.as_slice());
+    let inputs = BTreeMap::from([(
+        "finalization.context".to_owned(),
+        ActionInput::FinalizationContext(context),
+    )]);
+
+    assert_eq!(
+        resolve_agent_upstream_outputs(agent, &inputs),
+        Ok(BTreeMap::new())
+    );
+}
+
 fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
     runtime::initialize::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, ()>(
         admitted, None,
@@ -3837,9 +4039,10 @@ fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
     .into_iter()
     .filter_map(|requested| match requested.action {
         Action::StartStep { step, .. } => Some((step, requested.id)),
-        Action::CaptureOutputs { .. } | Action::CancelStep { .. } | Action::FinishRun { .. } => {
-            None
-        }
+        Action::CaptureOutputs { .. }
+        | Action::CancelStep { .. }
+        | Action::ForceAbortStep { .. }
+        | Action::FinishRun { .. } => None,
     })
     .collect()
 }
@@ -3948,6 +4151,16 @@ async fn await_fixture_eof(stream: &TcpStream) {
             Ok(0) => return,
             Ok(_) => panic!("fixture sent an unexpected late control message"),
             Err(failure) if failure.kind() == io::ErrorKind::WouldBlock => {}
+            Err(failure)
+                if matches!(
+                    failure.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return;
+            }
             Err(failure) => panic!("fixture closure read failed: {failure:?}"),
         }
     }

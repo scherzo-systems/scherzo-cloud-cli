@@ -17,8 +17,8 @@ use super::presentation_feed::{
     WorkflowPresentationStep,
 };
 use super::publication::{
-    LocalPublicationError, LocalPublicationFailureKind, LocalPublicationPhase, WorkflowRunResult,
-    WorkflowRunTiming, WorkflowStepTiming,
+    LocalPublicationError, LocalPublicationFailureKind, LocalPublicationPhase,
+    WorkflowRunFinalization, WorkflowRunResult, WorkflowRunTiming, WorkflowStepTiming,
 };
 use super::resolution::ResolvedWorkflow;
 use super::run_timing::{
@@ -28,6 +28,7 @@ use super::runtime::{
     RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
 use super::step_runtime::StepFailureCause;
+use super::validated::WorkflowNodeRole;
 
 const MAXIMUM_LOG_RECORDS_PER_STEP: usize = 4_096;
 const RUN_LOG_RECORD_BUDGET: usize = 262_144;
@@ -120,6 +121,7 @@ pub(crate) struct WorkflowRunElapsed {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowRunStepView {
     pub(crate) id: String,
+    pub(crate) role: WorkflowNodeRole,
     pub(crate) definition: WorkflowPresentationStep,
     pub(crate) state: StepStateKind,
     pub(crate) fact: Option<ObservedStepTransition>,
@@ -182,10 +184,12 @@ pub(crate) struct WorkflowRunViewSnapshot {
     pub(crate) generation: u64,
     pub(crate) workflow_path: String,
     pub(crate) maximum_parallel_steps: usize,
-    pub(crate) workflow: WorkflowState<StepFailureCause>,
+    pub(crate) workflow: WorkflowState<StepFailureCause, OffsetDateTime>,
     pub(crate) timing: WorkflowRunElapsed,
     pub(crate) steps: Vec<WorkflowRunStepView>,
+    pub(crate) finalization_start: Option<usize>,
     pub(crate) cancellation: Option<WorkflowRunCancellationView>,
+    pub(crate) finalization: Option<WorkflowRunFinalization>,
     pub(crate) authoritative_result: bool,
     pub(crate) quiescent: bool,
     pub(crate) publication: WorkflowRunPublicationState,
@@ -227,8 +231,10 @@ where
         timing: RunTimingObservation,
         clock: Clock,
     ) -> Self {
-        let log_capacity =
-            StepLogCapacity::for_step_count(workflow.definition.presentation_order.len());
+        let log_capacity = StepLogCapacity::for_step_count(
+            workflow.definition.presentation_order.len()
+                + workflow.definition.finalizer_presentation_order.len(),
+        );
         Self::with_log_capacity(
             workflow,
             maximum_parallel_steps,
@@ -255,7 +261,10 @@ where
                     .steps
                     .get(id)
                     .cloned()
-                    .map(|definition| WorkflowRunStepViewState::new(id.clone(), definition))
+                    .zip(feed.definition().node_roles.get(id).copied())
+                    .map(|(definition, role)| {
+                        WorkflowRunStepViewState::new(id.clone(), role, definition)
+                    })
             })
             .collect::<Vec<_>>();
         let step_indexes = steps
@@ -263,6 +272,7 @@ where
             .enumerate()
             .map(|(index, step)| (step.id.clone(), index))
             .collect();
+        let finalization_start = feed.definition().finalization_start;
         let (changes, _) = watch::channel(0);
         Self {
             inner: Arc::new(Mutex::new(WorkflowRunViewState {
@@ -271,10 +281,12 @@ where
                 feed,
                 step_indexes,
                 steps,
+                finalization_start,
                 workflow: WorkflowState::Executing {
                     gate: SchedulingGate::Open,
                 },
                 cancellation: None,
+                finalization: None,
                 authoritative_result: false,
                 terminal_timing: None,
                 quiescent: false,
@@ -339,7 +351,9 @@ where
             workflow: state.workflow.clone(),
             timing: workflow_timing,
             steps,
+            finalization_start: state.finalization_start,
             cancellation: state.cancellation.clone(),
+            finalization: state.finalization.clone(),
             authoritative_result: state.authoritative_result,
             quiescent: state.quiescent,
             publication: state.publication.clone(),
@@ -371,9 +385,10 @@ where
                         reason: cancellation.reason,
                         force_stop_deadline: cancellation.force_stop_deadline,
                     });
-            for (view, terminal) in state.steps.iter_mut().zip(&run.steps) {
+            for (view, terminal) in state.steps.iter_mut().zip(run_nodes(run)) {
                 view.reconcile(terminal);
             }
+            state.finalization = run.finalization.clone();
             state.terminal_timing = Some(run.timing.clone());
             state.authoritative_result = true;
             state.advance_generation()
@@ -493,8 +508,10 @@ struct WorkflowRunViewState {
     feed: WorkflowPresentationFeed,
     step_indexes: BTreeMap<String, usize>,
     steps: Vec<WorkflowRunStepViewState>,
-    workflow: WorkflowState<StepFailureCause>,
+    finalization_start: Option<usize>,
+    workflow: WorkflowState<StepFailureCause, OffsetDateTime>,
     cancellation: Option<WorkflowRunCancellationView>,
+    finalization: Option<WorkflowRunFinalization>,
     authoritative_result: bool,
     terminal_timing: Option<WorkflowRunTiming>,
     quiescent: bool,
@@ -549,7 +566,9 @@ impl WorkflowRunViewState {
                 };
                 self.steps[index].apply_transition(to, transition.step);
             }
-            TransitionEvent::Workflow { to, .. } => self.workflow = to,
+            TransitionEvent::Workflow { to, .. } => {
+                self.workflow = to;
+            }
             TransitionEvent::CancellationAccepted {
                 reason, deadline, ..
             } => {
@@ -565,6 +584,7 @@ impl WorkflowRunViewState {
                             },
                     } => Some(primary_failure.clone()),
                     WorkflowState::Executing { .. }
+                    | WorkflowState::Finalizing { .. }
                     | WorkflowState::Succeeded
                     | WorkflowState::Failed { .. }
                     | WorkflowState::Cancelled { .. } => None,
@@ -580,6 +600,50 @@ impl WorkflowRunViewState {
                     force_stop_deadline: deadline,
                 });
             }
+            TransitionEvent::FinalizationCancellationAccepted {
+                reason, deadline, ..
+            } => {
+                let WorkflowState::Finalizing {
+                    trigger,
+                    primary_failure,
+                    ..
+                } = &self.workflow
+                else {
+                    return;
+                };
+                self.workflow = WorkflowState::Finalizing {
+                    trigger: *trigger,
+                    gate: super::runtime::FinalizationGate::Cancelling {
+                        reason,
+                        deadline: Some(deadline),
+                        force_abort: false,
+                    },
+                    primary_failure: primary_failure.clone(),
+                };
+            }
+            TransitionEvent::ForceAbortAccepted { reason, .. } => {
+                let WorkflowState::Finalizing {
+                    trigger,
+                    gate,
+                    primary_failure,
+                } = &self.workflow
+                else {
+                    return;
+                };
+                let deadline = match gate {
+                    super::runtime::FinalizationGate::Open => None,
+                    super::runtime::FinalizationGate::Cancelling { deadline, .. } => *deadline,
+                };
+                self.workflow = WorkflowState::Finalizing {
+                    trigger: *trigger,
+                    gate: super::runtime::FinalizationGate::Cancelling {
+                        reason,
+                        deadline,
+                        force_abort: true,
+                    },
+                    primary_failure: primary_failure.clone(),
+                };
+            }
         }
     }
 
@@ -591,6 +655,7 @@ impl WorkflowRunViewState {
 
 struct WorkflowRunStepViewState {
     id: String,
+    role: WorkflowNodeRole,
     definition: WorkflowPresentationStep,
     state: StepStateKind,
     fact: Option<ObservedStepTransition>,
@@ -600,7 +665,7 @@ struct WorkflowRunStepViewState {
 }
 
 impl WorkflowRunStepViewState {
-    fn new(id: String, definition: WorkflowPresentationStep) -> Self {
+    fn new(id: String, role: WorkflowNodeRole, definition: WorkflowPresentationStep) -> Self {
         let outputs = definition
             .outputs()
             .keys()
@@ -608,6 +673,7 @@ impl WorkflowRunStepViewState {
             .collect();
         Self {
             id,
+            role,
             definition,
             state: StepStateKind::Pending,
             fact: None,
@@ -669,7 +735,7 @@ impl WorkflowRunStepViewState {
             StepState::Failed { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
             }
-            StepState::Blocked { .. } => {
+            StepState::Blocked { .. } | StepState::InputUnavailable { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
             }
             StepState::NotRun { .. } => {
@@ -713,6 +779,7 @@ impl WorkflowRunStepViewState {
         };
         WorkflowRunStepView {
             id: self.id.clone(),
+            role: self.role,
             definition: self.definition.clone(),
             state: self.state,
             fact: self.fact.clone(),
@@ -839,11 +906,16 @@ fn validate_terminal_result(
     state: &WorkflowRunViewState,
     run: &WorkflowRunResult,
 ) -> Result<(), WorkflowRunViewModelError> {
-    if run.workflow_path != state.workflow_path || run.steps.len() != state.steps.len() {
+    let nodes = run_nodes(run).collect::<Vec<_>>();
+    if run.workflow_path != state.workflow_path
+        || nodes.len() != state.steps.len()
+        || run.finalization.is_some() != state.finalization_start.is_some()
+    {
         return Err(WorkflowRunViewModelError::InvalidTerminalResult);
     }
-    for (view, terminal) in state.steps.iter().zip(&run.steps) {
+    for (view, terminal) in state.steps.iter().zip(nodes) {
         if view.id != terminal.id
+            || view.role != terminal.role
             || terminal.failure_policy != view.definition.failure_policy()
             || !terminal_step_is_valid(view, terminal)
         {
@@ -851,6 +923,16 @@ fn validate_terminal_result(
         }
     }
     Ok(())
+}
+
+fn run_nodes(
+    run: &WorkflowRunResult,
+) -> impl Iterator<Item = &super::publication::WorkflowRunStep> {
+    run.steps.iter().chain(
+        run.finalization
+            .iter()
+            .flat_map(|finalization| &finalization.finalizers),
+    )
 }
 
 fn terminal_step_is_valid(
@@ -861,6 +943,7 @@ fn terminal_step_is_valid(
         StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
         StepState::Failed { .. }
         | StepState::Blocked { .. }
+        | StepState::InputUnavailable { .. }
         | StepState::NotRun { .. }
         | StepState::Cancelled { .. } => true,
         StepState::Pending
@@ -882,7 +965,7 @@ fn terminal_state_kind(
         StepState::Cancelling { .. } => StepStateKind::Cancelling,
         StepState::Succeeded { .. } => StepStateKind::Succeeded,
         StepState::Failed { .. } => StepStateKind::Failed,
-        StepState::Blocked { .. } => StepStateKind::Blocked,
+        StepState::Blocked { .. } | StepState::InputUnavailable { .. } => StepStateKind::Blocked,
         StepState::NotRun { .. } => StepStateKind::NotRun,
         StepState::Cancelled { .. } => StepStateKind::Cancelled,
     }
@@ -899,6 +982,11 @@ fn terminal_step_fact(
         StepState::Blocked { dependency } => Some(ObservedStepTransition::Blocked {
             dependency: dependency.clone(),
         }),
+        StepState::InputUnavailable { references } => {
+            Some(ObservedStepTransition::InputUnavailable {
+                references: references.clone(),
+            })
+        }
         StepState::NotRun { reason } => Some(ObservedStepTransition::NotRun { reason: *reason }),
         StepState::Cancelling { reason } => {
             Some(ObservedStepTransition::Cancelling { reason: *reason })
@@ -916,7 +1004,7 @@ fn terminal_step_fact(
 
 fn workflow_state_from_outcome(
     outcome: &RunOutcome<StepFailureCause>,
-) -> WorkflowState<StepFailureCause> {
+) -> WorkflowState<StepFailureCause, OffsetDateTime> {
     match outcome {
         RunOutcome::Succeeded => WorkflowState::Succeeded,
         RunOutcome::Failed {

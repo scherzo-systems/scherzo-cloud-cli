@@ -185,7 +185,7 @@ impl ResolvedWorkflow {
     }
 }
 
-// Runner configuration keeps its source-root-relative workflow mapping.
+// Adapters provide an explicit source root and source-root-relative workflow path.
 pub(crate) fn resolve(
     source_root: &Path,
     selected_workflow: &Path,

@@ -13,8 +13,8 @@ use crate::api::{
     UpdateOrganizationOutcome,
 };
 use crate::exit_code::ExitCode;
-use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
+use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
 const NAME: &str = "organization";
@@ -50,7 +50,7 @@ impl LeafOptions {
     fn execute<O>(
         self,
         deployment: &Deployment,
-        operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
+        operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
         write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
@@ -64,7 +64,7 @@ impl LeafOptions {
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
-        operation: impl FnOnce(&HttpClient, &str, &str, &str) -> Result<O, OrganizationError>,
+        mut operation: impl FnMut(&HttpClient, &str, &str, &str) -> Result<O, OrganizationError>,
         write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
@@ -114,6 +114,7 @@ fn execute_leaf<T>(
 
 trait HumanCredentialOutcome: Sized {
     fn unauthenticated() -> Self;
+    fn unreachable(category: crate::api::UnreachableCategory) -> Self;
     fn is_unauthenticated(&self) -> bool;
 }
 
@@ -123,6 +124,10 @@ macro_rules! impl_human_credential_outcome {
             impl HumanCredentialOutcome for $outcome {
                 fn unauthenticated() -> Self {
                     Self::Common(CommonOrganizationFailure::Unauthenticated)
+                }
+
+                fn unreachable(category: crate::api::UnreachableCategory) -> Self {
+                    Self::Common(CommonOrganizationFailure::Unreachable(category))
                 }
 
                 fn is_unauthenticated(&self) -> bool {
@@ -146,43 +151,37 @@ impl_human_credential_outcome!(
 fn with_human_credential<O>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
-    operation: impl FnOnce(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
+    mut operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
 ) -> anyhow::Result<O>
 where
     O: HumanCredentialOutcome,
 {
-    let store = CredentialStore::from_environment()
-        .map_err(|error| anyhow!(error))
-        .context("access credential store")?;
-    let Some(credential) = store
-        .selected(deployment.fingerprint(), crate::timing::utc_now())
-        .map_err(|error| anyhow!(error))
-        .context("access credential store")?
-    else {
-        return Ok(O::unauthenticated());
-    };
     let client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare organization networking")?;
-    let result = operation(
+    match session::execute_required(
         &client,
-        deployment.fingerprint().api_url(),
-        credential.access_token(),
-    );
-    let credential_rejected = result.as_ref().is_ok_and(O::is_unauthenticated)
-        || result
-            .as_ref()
-            .is_err_and(OrganizationError::credential_rejected);
-    if credential_rejected {
-        store
-            .remove_if_access_token_matches(deployment.fingerprint(), credential.access_token())
-            .map_err(|error| anyhow!(error))
-            .context("access credential store")?;
+        deployment,
+        |access_token| operation(&client, deployment.fingerprint().api_url(), access_token),
+        |result| {
+            result.as_ref().is_ok_and(O::is_unauthenticated)
+                || result
+                    .as_ref()
+                    .is_err_and(OrganizationError::credential_rejected)
+        },
+    ) {
+        Ok(RequiredOperation::Unauthenticated) => Ok(O::unauthenticated()),
+        Ok(RequiredOperation::Completed(result)) => {
+            result.map_err(|error| anyhow!(error)).with_context(|| {
+                format!(
+                    "contact organization API at {}",
+                    deployment.fingerprint().api_url()
+                )
+            })
+        }
+        Err(error) => match error.unreachable_category() {
+            Some(category) => Ok(O::unreachable(category)),
+            None => Err(anyhow!(error).context("acquire human session")),
+        },
     }
-    result.map_err(|error| anyhow!(error)).with_context(|| {
-        format!(
-            "contact organization API at {}",
-            deployment.fingerprint().api_url()
-        )
-    })
 }

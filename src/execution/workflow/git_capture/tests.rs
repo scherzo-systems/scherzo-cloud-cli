@@ -3,8 +3,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use rustix::process::Pid;
 
 use super::*;
 use crate::execution::workflow::admission::{
@@ -106,6 +108,21 @@ fn admitted_capture<const N: usize>(
     (admitted, artifacts)
 }
 
+fn git_executable() -> &'static Path {
+    static GIT_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    GIT_EXECUTABLE.get_or_init(|| {
+        let path = std::env::var_os("PATH").expect("test PATH must contain Git");
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("git"))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+            .expect("Git must be available to Git capture tests")
+    })
+}
+
 fn init_repository(path: &Path) {
     git_parent(&["init", "--quiet", path.to_str().unwrap()]);
     git(path, &["config", "user.name", "Scherzo Test"]);
@@ -113,7 +130,7 @@ fn init_repository(path: &Path) {
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = Command::new(git_executable())
         .arg("-C")
         .arg(repository)
         .args(arguments)
@@ -129,7 +146,10 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
 }
 
 fn git_parent(arguments: &[&str]) -> String {
-    let output = Command::new("git").args(arguments).output().unwrap();
+    let output = Command::new(git_executable())
+        .args(arguments)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {arguments:?} failed: {}",
@@ -840,7 +860,7 @@ fn post_staging_recheck_rejects_head_changed_after_tree_observation() {
         temporary.path(),
         &repository,
         [
-            ("REAL_GIT", OsStr::new("git")),
+            ("REAL_GIT", git_executable().as_os_str()),
             ("ARMED", armed.as_os_str()),
             ("MUTATED", mutated.as_os_str()),
         ],
@@ -879,23 +899,23 @@ fn process_timeout_terminates_and_reaps_a_running_child() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    let mut child = ManagedChild::spawn(&mut command).unwrap();
-    let pid = i32::try_from(child.child.id())
+    let mut child = ManagedProcessGroup::spawn(&mut command).unwrap();
+    let pid = i32::try_from(child.child_mut().id())
         .ok()
         .and_then(Pid::from_raw)
         .unwrap();
     assert!(rustix::process::test_kill_process(pid).is_ok());
 
     let command_description = Arc::<str>::from("cat blocker");
-    let failure = child
-        .wait(
-            &CaptureCancellation::default(),
-            Duration::ZERO,
-            Arc::clone(&command_description),
-            || false,
-            || false,
-        )
-        .unwrap_err();
+    let failure = wait_managed_child(
+        &mut child,
+        &CaptureCancellation::default(),
+        Duration::ZERO,
+        Arc::clone(&command_description),
+        || false,
+        || false,
+    )
+    .unwrap_err();
 
     assert_eq!(
         failure,
@@ -908,7 +928,7 @@ fn process_timeout_terminates_and_reaps_a_running_child() {
         admission_process_failure(failure),
         GitWorkspaceAdmissionFailure::GitTimedOut
     );
-    assert!(child.reaped);
+    assert!(child.try_wait().unwrap().is_some());
     assert!(rustix::process::test_kill_process(pid).is_err());
 }
 
@@ -935,9 +955,8 @@ fn process_timeout_covers_blocked_output_workers_after_the_leader_exits() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    let mut child = ManagedChild::spawn(&mut command).unwrap();
-    let leader_status = child.child.wait().unwrap();
-    child.reaped = true;
+    let mut child = ManagedProcessGroup::spawn(&mut command).unwrap();
+    let leader_status = child.wait().unwrap();
     assert!(leader_status.success());
     let helper_pid = fs::read_to_string(marker)
         .unwrap()
@@ -949,15 +968,15 @@ fn process_timeout_covers_blocked_output_workers_after_the_leader_exits() {
     assert!(rustix::process::test_kill_process(helper_pid).is_ok());
 
     let command_description = Arc::<str>::from("leader with lingering helper");
-    let failure = child
-        .wait(
-            &CaptureCancellation::default(),
-            Duration::ZERO,
-            Arc::clone(&command_description),
-            || false,
-            || false,
-        )
-        .unwrap_err();
+    let failure = wait_managed_child(
+        &mut child,
+        &CaptureCancellation::default(),
+        Duration::ZERO,
+        Arc::clone(&command_description),
+        || false,
+        || false,
+    )
+    .unwrap_err();
 
     assert_eq!(
         failure,
@@ -976,10 +995,12 @@ fn capture_timeout_names_git_command_and_limit() {
     fs::write(repository.join("base.txt"), b"base\n").unwrap();
     git(&repository, &["add", "base.txt"]);
     git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let blocker = temporary.path().join("pack-blocker");
+    create_fifo(&blocker);
     let wrapper = temporary.path().join("git-with-timeout");
     fs::write(
         &wrapper,
-        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --window=0 --depth=0 \"*) exec sleep 300 ;;
+        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --window=0 --depth=0 \"*) IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;
 esac\nexec \"$REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
@@ -987,7 +1008,10 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     let (admitted, artifacts) = admitted_capture(
         temporary.path(),
         &repository,
-        [("REAL_GIT", OsStr::new("git"))],
+        [
+            ("REAL_GIT", git_executable().as_os_str()),
+            ("BLOCKER", blocker.as_os_str()),
+        ],
     );
     let capture = GitCaptureContext::admit_with_program(
         admitted.execution(),
@@ -1019,11 +1043,14 @@ fn capture_cancellation_terminates_and_reaps_bundle_process_and_rolls_back() {
     git(&repository, &["add", "base.txt"]);
     git(&repository, &["commit", "--quiet", "-m", "baseline"]);
     let marker = temporary.path().join("pack.pid");
+    create_fifo(&marker);
+    let blocker = temporary.path().join("pack-blocker");
+    create_fifo(&blocker);
     let wrapper = temporary.path().join("git-wrapper");
     fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects \"*) printf '%s\\n' \"$$\" > '{}'; exec sleep 300 ;;\nesac\nexec \"$REAL_GIT\" \"$@\"\n",
+            "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects \"*) printf '%s\\n' \"$$\" > '{}'; IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;\nesac\nexec \"$REAL_GIT\" \"$@\"\n",
             marker.display()
         ),
     )
@@ -1032,7 +1059,10 @@ fn capture_cancellation_terminates_and_reaps_bundle_process_and_rolls_back() {
     let (admitted, artifacts) = admitted_capture(
         temporary.path(),
         &repository,
-        [("REAL_GIT", OsStr::new("git"))],
+        [
+            ("REAL_GIT", git_executable().as_os_str()),
+            ("BLOCKER", blocker.as_os_str()),
+        ],
     );
     let capture = GitCaptureContext::admit_with_program(
         admitted.execution(),
@@ -1048,12 +1078,6 @@ fn capture_cancellation_terminates_and_reaps_bundle_process_and_rolls_back() {
     let worker_cancellation = cancellation.clone();
     let capture =
         std::thread::spawn(move || capture.capture("changes", &artifacts, &worker_cancellation));
-    for _ in 0..500 {
-        if marker.is_file() {
-            break;
-        }
-        crate::timing::sleep(Duration::from_millis(10));
-    }
     let pid = fs::read_to_string(&marker).unwrap().trim().to_owned();
     assert!(!pid.is_empty());
 

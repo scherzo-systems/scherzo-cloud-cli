@@ -27,13 +27,15 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use self::dag_layout::DagLayout;
+#[cfg(test)]
+use super::admission::CancellationOperation;
 use super::admission::{CancellationReason, CancellationSource};
 use super::document::{FailurePolicy, Output as WorkflowOutput};
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
-    header_timestamp, human_duration, shell_quote, shell_quote_visible_argument, step_kind,
-    visible_text,
+    finalization_trigger, header_timestamp, human_duration, shell_quote,
+    shell_quote_visible_argument, step_kind, visible_text,
 };
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, AgentPresentationObservationKind,
@@ -1220,8 +1222,14 @@ impl HostInteraction {
         clamp_step_selection(&mut self.selected, snapshot.steps.len());
 
         if event == TerminalInputEvent::Cancel {
-            if cancellation_available(snapshot) {
-                cancellation.request_cancellation(CancellationReason::UserRequest);
+            match finalization_signal_action(snapshot) {
+                FinalizationSignalAction::Graceful => {
+                    cancellation.request_cancellation(CancellationReason::UserRequest);
+                }
+                FinalizationSignalAction::ForceAbort => {
+                    cancellation.request_force_abort();
+                }
+                FinalizationSignalAction::Inert => {}
             }
             return HostControl::Continue;
         }
@@ -1543,6 +1551,7 @@ fn render_split_body(
         layout,
         &snapshot.steps,
         graph,
+        live_step_phase_boundary(snapshot),
         interaction.selected,
         color,
     );
@@ -1788,6 +1797,33 @@ pub(super) trait StepProjection {
 pub(super) struct StepPanel {
     pub(super) borders: Borders,
     pub(super) show_title: bool,
+    phase_boundary: Option<StepPhaseBoundary>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StepPhaseBoundary {
+    pub(super) finalization_start: usize,
+    pub(super) trigger: Option<&'static str>,
+}
+
+fn live_step_phase_boundary(snapshot: &WorkflowRunViewSnapshot) -> Option<StepPhaseBoundary> {
+    let finalization_start = snapshot.finalization_start?;
+    let trigger = snapshot
+        .finalization
+        .as_ref()
+        .map(|finalization| finalization.trigger)
+        .or(match &snapshot.workflow {
+            WorkflowState::Finalizing { trigger, .. } => Some(*trigger),
+            WorkflowState::Executing { .. }
+            | WorkflowState::Succeeded
+            | WorkflowState::Failed { .. }
+            | WorkflowState::Cancelled { .. } => None,
+        })
+        .map(finalization_trigger);
+    Some(StepPhaseBoundary {
+        finalization_start,
+        trigger,
+    })
 }
 
 fn render_split_steps<Step: StepProjection>(
@@ -1795,6 +1831,7 @@ fn render_split_steps<Step: StepProjection>(
     layout: SplitBodyLayout,
     steps: &[Step],
     graph: &DagLayout,
+    phase_boundary: Option<StepPhaseBoundary>,
     selected: usize,
     color: bool,
 ) {
@@ -1808,6 +1845,7 @@ fn render_split_steps<Step: StepProjection>(
         StepPanel {
             borders: layout.dag_borders(),
             show_title: false,
+            phase_boundary,
         },
     );
 }
@@ -1828,7 +1866,10 @@ fn render_steps(
         graph,
         interaction.selected,
         color,
-        panel,
+        StepPanel {
+            phase_boundary: live_step_phase_boundary(snapshot),
+            ..panel
+        },
     );
 }
 
@@ -1850,64 +1891,82 @@ fn render_projected_steps<Step: StepProjection>(
     let available_width = usize::from(block.inner(area).width);
     let columns = StepColumns::for_steps(available_width, graph.gutter_width(), steps);
     let connector_style = graph_connector_style(color);
-    let items = steps
-        .iter()
-        .zip(graph.rows())
-        .enumerate()
-        .map(|(index, (step, graph_row))| {
-            let selected = index == selected_step;
-            let marker = if selected { "▏ " } else { "  " };
-            let id = padded_text(&visible_text(step.id()), columns.id_width);
-            let duration = step
-                .timing()
-                .map(|timing| human_duration(timing.duration))
-                .unwrap_or_else(|| "-".to_owned());
-            let mut spans = vec![
-                Span::styled(marker, selection_marker_style(color)),
-                Span::styled(graph_row.before_node.clone(), connector_style),
-                Span::styled(
-                    step_state_glyph(step),
-                    step_state_style(step.state(), color),
-                ),
-                Span::styled(graph_row.after_node.clone(), connector_style),
-                Span::raw(" "),
-                Span::styled(id, step_identity_style(step.state(), color)),
-            ];
-            if columns.kind {
-                spans.push(Span::raw("  "));
+    let phase_boundary = panel
+        .phase_boundary
+        .filter(|boundary| boundary.finalization_start < steps.len());
+    let mut items = Vec::with_capacity(steps.len() + usize::from(phase_boundary.is_some()) * 2);
+    if phase_boundary.is_some() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  ordinary phase",
+            tone_style(color, Tone::Muted).add_modifier(Modifier::BOLD),
+        ))));
+    }
+    for (index, (step, graph_row)) in steps.iter().zip(graph.rows()).enumerate() {
+        if phase_boundary.is_some_and(|boundary| boundary.finalization_start == index) {
+            let trigger = phase_boundary
+                .and_then(|boundary| boundary.trigger)
+                .map_or_else(String::new, |trigger| format!(" · trigger {trigger}"));
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  finalization phase{trigger}"),
+                tone_style(color, Tone::Muted).add_modifier(Modifier::BOLD),
+            ))));
+        }
+        let selected = index == selected_step;
+        let marker = if selected { "▏ " } else { "  " };
+        let id = padded_text(&visible_text(step.id()), columns.id_width);
+        let duration = step
+            .timing()
+            .map(|timing| human_duration(timing.duration))
+            .unwrap_or_else(|| "-".to_owned());
+        let mut spans = vec![
+            Span::styled(marker, selection_marker_style(color)),
+            Span::styled(graph_row.before_node.clone(), connector_style),
+            Span::styled(
+                step_state_glyph(step),
+                step_state_style(step.state(), color),
+            ),
+            Span::styled(graph_row.after_node.clone(), connector_style),
+            Span::raw(" "),
+            Span::styled(id, step_identity_style(step.state(), color)),
+        ];
+        if columns.kind {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{:<KIND_COLUMN_WIDTH$}", step_kind(step.definition())),
+                tone_style(color, Tone::Muted),
+            ));
+        }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            padded_text(&duration, columns.duration_width),
+            step_duration_style(step.state(), color),
+        ));
+        if columns.detail {
+            spans.push(Span::raw("  "));
+            if let Some(detail) = step.dag_detail() {
                 spans.push(Span::styled(
-                    format!("{:<KIND_COLUMN_WIDTH$}", step_kind(step.definition())),
+                    fit_text(&visible_text(&detail), columns.detail_width),
                     tone_style(color, Tone::Muted),
                 ));
             }
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                padded_text(&duration, columns.duration_width),
-                step_duration_style(step.state(), color),
-            ));
-            if columns.detail {
-                spans.push(Span::raw("  "));
-                if let Some(detail) = step.dag_detail() {
-                    spans.push(Span::styled(
-                        fit_text(&visible_text(&detail), columns.detail_width),
-                        tone_style(color, Tone::Muted),
-                    ));
-                }
-            }
-            let mut node_line = Line::from(spans);
-            if selected {
-                node_line = node_line.style(step_selection_style(color));
-            }
-            let connector_line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(graph_row.below_node.clone(), connector_style),
-            ]);
-            ListItem::new(vec![node_line, connector_line])
-        });
+        }
+        let mut node_line = Line::from(spans);
+        if selected {
+            node_line = node_line.style(step_selection_style(color));
+        }
+        let connector_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(graph_row.below_node.clone(), connector_style),
+        ]);
+        items.push(ListItem::new(vec![node_line, connector_line]));
+    }
     let list = List::new(items).block(block);
     let mut state = ListState::default();
     if !steps.is_empty() {
-        state.select(Some(selected_step));
+        let phase_rows_before_selection = phase_boundary.map_or(0, |boundary| {
+            1 + usize::from(selected_step >= boundary.finalization_start)
+        });
+        state.select(Some(selected_step + phase_rows_before_selection));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -1978,11 +2037,17 @@ impl StepProjection for WorkflowRunStepView {
         let WorkflowPresentationStep::Command { argv, .. } = &self.definition else {
             return None;
         };
+        let command = argv
+            .iter()
+            .map(|argument| shell_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
         Some(
-            argv.iter()
-                .map(|argument| shell_quote(argument))
-                .collect::<Vec<_>>()
-                .join(" "),
+            if self.role == crate::execution::workflow::validated::WorkflowNodeRole::Finalizer {
+                format!("finalizer · {command}")
+            } else {
+                command
+            },
         )
     }
 
@@ -2394,6 +2459,11 @@ fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<Inspecto
         ObservedStepTransition::Blocked { dependency } => {
             Some(InspectorField::new("blocked by", dependency, Tone::Blocked))
         }
+        ObservedStepTransition::InputUnavailable { references } => Some(InspectorField::new(
+            "inputs unavailable",
+            references.join(", "),
+            Tone::Blocked,
+        )),
         ObservedStepTransition::NotRun { .. } => {
             Some(InspectorField::new("not run", "failure_stop", Tone::Muted))
         }
@@ -2791,9 +2861,19 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
             &step.definition,
             step.state,
         )),
+        Some(ObservedStepTransition::InputUnavailable { references }) => {
+            Some(issue_detail_for_step(
+                format!("inputs unavailable: {}", references.join(", ")),
+                &step.definition,
+                step.state,
+            ))
+        }
         Some(ObservedStepTransition::NotRun {
             reason: NotRunReason::FailureStop,
         }) => Some("failure_stop".to_owned()),
+        Some(ObservedStepTransition::NotRun {
+            reason: NotRunReason::FinalizerTriggerNotSelected,
+        }) => Some("finalizer_trigger_not_selected".to_owned()),
         Some(ObservedStepTransition::Cancelling { reason })
         | Some(ObservedStepTransition::Cancelled { reason }) => {
             Some(cancellation_reason(*reason).to_owned())
@@ -3618,13 +3698,47 @@ enum LifecycleControl {
     None,
 }
 
-fn cancellation_available(snapshot: &WorkflowRunViewSnapshot) -> bool {
-    matches!(
-        &snapshot.workflow,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalizationSignalAction {
+    Graceful,
+    ForceAbort,
+    Inert,
+}
+
+fn finalization_signal_action(snapshot: &WorkflowRunViewSnapshot) -> FinalizationSignalAction {
+    match &snapshot.workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open | SchedulingGate::FailureStopped { .. },
         }
-    )
+        | WorkflowState::Finalizing {
+            gate: super::runtime::FinalizationGate::Open,
+            ..
+        } => FinalizationSignalAction::Graceful,
+        WorkflowState::Finalizing {
+            gate:
+                super::runtime::FinalizationGate::Cancelling {
+                    force_abort: false, ..
+                },
+            ..
+        } => FinalizationSignalAction::ForceAbort,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Cancelling { .. },
+        }
+        | WorkflowState::Finalizing {
+            gate:
+                super::runtime::FinalizationGate::Cancelling {
+                    force_abort: true, ..
+                },
+            ..
+        }
+        | WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => FinalizationSignalAction::Inert,
+    }
+}
+
+fn cancellation_available(snapshot: &WorkflowRunViewSnapshot) -> bool {
+    finalization_signal_action(snapshot) != FinalizationSignalAction::Inert
 }
 
 fn lifecycle_control(snapshot: &WorkflowRunViewSnapshot) -> LifecycleControl {
@@ -4185,7 +4299,7 @@ fn workflow_header_status(snapshot: &WorkflowRunViewSnapshot) -> (&'static str, 
     }
 }
 
-fn workflow_status(workflow: &WorkflowState<StepFailureCause>) -> &'static str {
+fn workflow_status<Deadline>(workflow: &WorkflowState<StepFailureCause, Deadline>) -> &'static str {
     match workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
@@ -4196,13 +4310,14 @@ fn workflow_status(workflow: &WorkflowState<StepFailureCause>) -> &'static str {
         WorkflowState::Executing {
             gate: SchedulingGate::Cancelling { .. },
         } => "cancelling",
+        WorkflowState::Finalizing { .. } => "finalizing",
         WorkflowState::Succeeded => "succeeded",
         WorkflowState::Failed { .. } => "failed",
         WorkflowState::Cancelled { .. } => "cancelled",
     }
 }
 
-fn workflow_tone(workflow: &WorkflowState<StepFailureCause>) -> Tone {
+fn workflow_tone<Deadline>(workflow: &WorkflowState<StepFailureCause, Deadline>) -> Tone {
     match workflow {
         WorkflowState::Succeeded => Tone::Success,
         WorkflowState::Failed { .. }
@@ -4215,7 +4330,8 @@ fn workflow_tone(workflow: &WorkflowState<StepFailureCause>) -> Tone {
         } => Tone::Blocked,
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
-        } => Tone::Active,
+        }
+        | WorkflowState::Finalizing { .. } => Tone::Active,
     }
 }
 
@@ -5432,6 +5548,46 @@ mod tests {
     }
 
     #[test]
+    fn finalization_ctrl_c_escalates_from_graceful_to_force_abort() {
+        let cancellation = CancellationSource::new();
+        assert!(cancellation.begin_finalization_arm());
+        assert!(cancellation.complete_finalization_arm());
+        let mut operations = cancellation.subscribe_operations();
+        let mut snapshot = direct_snapshot(long_log_step());
+        let trigger = crate::execution::workflow::document::FinalizationTrigger::Succeeded;
+        snapshot.workflow = WorkflowState::Finalizing {
+            trigger,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Open,
+            primary_failure: None,
+        };
+        let mut interaction = HostInteraction::default();
+
+        interaction.handle_key(TerminalInputEvent::Cancel, &snapshot, &cancellation);
+        assert!(matches!(
+            operations.next_operation(),
+            Some(CancellationOperation::Graceful {
+                reason: CancellationReason::UserRequest,
+                ..
+            })
+        ));
+
+        snapshot.workflow = WorkflowState::Finalizing {
+            trigger,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Cancelling {
+                reason: CancellationReason::UserRequest,
+                deadline: Some(time::OffsetDateTime::UNIX_EPOCH),
+                force_abort: false,
+            },
+            primary_failure: None,
+        };
+        interaction.handle_key(TerminalInputEvent::Cancel, &snapshot, &cancellation);
+        assert!(matches!(
+            operations.next_operation(),
+            Some(CancellationOperation::ForceAbort { .. })
+        ));
+    }
+
+    #[test]
     fn quit_requires_adapter_completion_on_every_surface() {
         let cancellation = CancellationSource::new();
         let mut snapshot = direct_snapshot(long_log_step());
@@ -6195,6 +6351,7 @@ mod tests {
         snapshot.workflow = WorkflowState::Executing {
             gate: SchedulingGate::FailureStopped {
                 primary_failure: StepFailure {
+                    role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                     step: "selected-command".to_owned(),
                     phase: FailurePhase::Execution,
                     cause: StepFailureCause::Execution(StepExecutionFailure::Command(
@@ -6819,6 +6976,47 @@ mod tests {
     }
 
     #[test]
+    fn live_dag_separates_ordinary_and_finalization_phases_after_trigger_commit() {
+        let mut snapshot = snapshot_from_yaml(
+            "schemaVersion: 1
+steps:
+  complete:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+",
+        );
+
+        let before_trigger =
+            render_steps_lines(&snapshot, &HostInteraction::default(), 80, 10).join("\n");
+        assert!(before_trigger.contains("ordinary phase"));
+        assert!(before_trigger.contains("finalization phase"));
+        assert!(!before_trigger.contains("finalization phase · trigger"));
+
+        snapshot.workflow = WorkflowState::Finalizing {
+            trigger: crate::execution::workflow::document::FinalizationTrigger::Succeeded,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Open,
+            primary_failure: None,
+        };
+        let after_trigger =
+            render_steps_lines(&snapshot, &HostInteraction::default(), 80, 10).join("\n");
+        let ordinary = after_trigger.find("ordinary phase").unwrap();
+        let ordinary_step = after_trigger.find("complete").unwrap();
+        let finalization = after_trigger
+            .find("finalization phase · trigger succeeded")
+            .unwrap();
+        let finalizer = after_trigger.find("cleanup").unwrap();
+        assert!(ordinary < ordinary_step);
+        assert!(ordinary_step < finalization);
+        assert!(finalization < finalizer);
+    }
+
+    #[test]
     fn graph_layout_is_stable_when_step_state_and_timing_change() {
         let mut snapshot = snapshot_from_yaml(
             "schemaVersion: 1\nsteps:\n  root:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  left:\n    kind: cmd\n    dependsOn: [root]\n    command:\n      argv: [\"true\"]\n  right:\n    kind: cmd\n    dependsOn: [root]\n    command:\n      argv: [\"true\"]\n  join:\n    kind: cmd\n    dependsOn: [left, right]\n    command:\n      argv: [\"true\"]\n",
@@ -7050,12 +7248,14 @@ mod tests {
             cancellation: cancellation_fact,
             steps: vec![WorkflowRunStep {
                 id: "complete".to_owned(),
+                role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                 kind: WorkflowRunStepKind::Command,
                 failure_policy: FailurePolicy::Required,
                 state: step_state,
                 timing: step_timing,
                 command_output: None,
             }],
+            finalization: None,
             exports: BTreeMap::new(),
             export_sources: BTreeMap::new(),
         };
@@ -7443,6 +7643,7 @@ mod tests {
         };
         WorkflowRunStepView {
             id: "selected-command".to_owned(),
+            role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
             definition: WorkflowPresentationStep::Command {
                 argv: vec!["build".to_owned(), "héllo world".to_owned()],
                 cwd: Some("work".to_owned()),
@@ -7479,7 +7680,9 @@ mod tests {
                 frozen: false,
             },
             steps: vec![step],
+            finalization_start: None,
             cancellation: None,
+            finalization: None,
             authoritative_result: false,
             quiescent: false,
             publication: WorkflowRunPublicationState::NotStarted,
@@ -7601,6 +7804,7 @@ mod tests {
                     StepPanel {
                         borders: Borders::ALL,
                         show_title: true,
+                        phase_boundary: None,
                     },
                 );
             })

@@ -1,17 +1,14 @@
 {
   buildIdentity ? "unknown",
   cacert,
+  craneLib,
   git,
   jq,
   lib,
-  rustPlatform,
   version,
 }:
 
-rustPlatform.buildRustPackage {
-  pname = "scherzo-cloud";
-  inherit version;
-
+let
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -23,7 +20,21 @@ rustPlatform.buildRustPackage {
     ];
   };
 
-  cargoLock.lockFile = ../Cargo.lock;
+  # The dependency-only build is keyed on the crate manifests alone. The
+  # rolling version and build identity change on every commit and must not
+  # reach this derivation, or the cached dependency artifacts would be
+  # invalidated by every source change.
+  cargoArtifacts = craneLib.buildDepsOnly {
+    pname = "scherzo-cloud";
+    version = "0.0.0-deps";
+    inherit src;
+    strictDeps = true;
+  };
+in
+craneLib.buildPackage {
+  pname = "scherzo-cloud";
+  inherit cargoArtifacts src version;
+  strictDeps = true;
 
   nativeBuildInputs = [ jq ];
   nativeCheckInputs = [ git ];
@@ -32,6 +43,10 @@ rustPlatform.buildRustPackage {
     SCHERZO_CLOUD_BUILD_IDENTITY = buildIdentity;
     SCHERZO_CLOUD_VERSION = version;
     SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
+  };
+
+  passthru = {
+    inherit cargoArtifacts;
   };
 
   postInstall = ''

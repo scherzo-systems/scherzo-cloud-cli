@@ -6,11 +6,14 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
+use crate::public_id::valid_typed_id;
+
 use super::MAXIMUM_PARALLEL_STEPS;
 use super::document::FailurePolicy;
 use super::publication::{
-    DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1, StepReasonV1,
-    WorkflowOutcomeV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    CancellationReasonV1, DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
+    FinalizationTriggerV1, StepReasonV1, WorkflowNodeRoleV1, WorkflowOutcomeV1,
+    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -19,7 +22,7 @@ use super::schema_common::{
 
 const MAXIMUM_STEPS: usize = 256;
 const MAXIMUM_EXPORTS: usize = 4_096;
-const MAXIMUM_CARRIERS: usize = 2_048;
+const MAXIMUM_CARRIERS: usize = 4_096;
 const MAXIMUM_RESULT_STRUCTURE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES: u64 = MAXIMUM_EXPORTS as u64 * 128 * 12;
 pub(super) const MAXIMUM_RESULT_NON_STREAM_JSON_BYTES: u64 =
@@ -82,14 +85,30 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataErr
 }
 
 pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
+    let origin_profile_valid = match &result.workflow.provenance {
+        WorkflowProvenanceV1::Local { source_root } => {
+            is_canonical_absolute_path(source_root)
+                && result
+                    .execution
+                    .execution_root
+                    .as_deref()
+                    .is_some_and(is_canonical_absolute_path)
+        }
+        WorkflowProvenanceV1::Cloud {
+            project_id,
+            workflow_id,
+        } => {
+            valid_typed_id(project_id, "prj_")
+                && valid_typed_id(workflow_id, "wfl_")
+                && result.execution.execution_root.is_none()
+        }
+    };
     if result.schema_version != 1
         || result.attempt_number == 0
-        || result.workflow.provenance.kind != "local"
+        || !origin_profile_valid
         || !is_canonical_relative_path(&result.workflow.path)
-        || !is_canonical_absolute_path(&result.workflow.provenance.source_root)
         || result.workflow.digest.algorithm != SHA256_ALGORITHM
         || !is_lowercase_hex(&result.workflow.digest.value, 64)
-        || !is_canonical_absolute_path(&result.execution.execution_root)
         || !(1..=MAXIMUM_PARALLEL_STEPS).contains(&result.execution.maximum_parallel_steps)
         || parse_canonical_utc_timestamp(&result.execution.started_at).is_none()
         || parse_canonical_utc_timestamp(&result.execution.finished_at).is_none()
@@ -99,35 +118,77 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
             .maximum_retained_bytes_per_stream
             != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         || result.steps.is_empty()
-        || result.steps.len() > MAXIMUM_STEPS
+        || result
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| finalization.finalizers.is_empty())
+        || result.steps.len()
+            + result
+                .finalization
+                .as_ref()
+                .map_or(0, |finalization| finalization.finalizers.len())
+            > MAXIMUM_STEPS
         || result.exports.len() > MAXIMUM_EXPORTS
     {
         return Err(ResultMetadataError);
     }
 
+    let total_nodes = result.steps.len()
+        + result
+            .finalization
+            .as_ref()
+            .map_or(0, |finalization| finalization.finalizers.len());
+    let mut ids = BTreeSet::new();
+    validate_steps(
+        &result.steps,
+        WorkflowNodeRoleV1::Step,
+        total_nodes,
+        &mut ids,
+    )?;
+    if let Some(finalization) = &result.finalization {
+        validate_steps(
+            &finalization.finalizers,
+            WorkflowNodeRoleV1::Finalizer,
+            total_nodes,
+            &mut ids,
+        )?;
+        validate_finalization(finalization)?;
+    }
     validate_outcome(result)?;
-    validate_steps(&result.steps)?;
     validate_exports(&result.exports)
 }
 
 fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
-    let valid = match result.outcome {
-        WorkflowOutcomeV1::Succeeded => {
-            result.primary_failure.is_none()
-                && result.cancellation.is_none()
-                && result.steps.iter().all(step_succeeds_workflow)
+    if let Some(cancellation) = &result.cancellation
+        && (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+            || parse_canonical_utc_timestamp(&cancellation.force_stop_deadline).is_none())
+    {
+        return Err(ResultMetadataError);
+    }
+
+    let ordinary_trigger = if let Some(finalization) = &result.finalization {
+        finalization.trigger
+    } else if result
+        .primary_failure
+        .as_ref()
+        .is_some_and(|primary| primary.node.role == WorkflowNodeRoleV1::Step)
+    {
+        FinalizationTriggerV1::Failed
+    } else if result.cancellation.is_some() {
+        FinalizationTriggerV1::Cancelled
+    } else {
+        FinalizationTriggerV1::Succeeded
+    };
+    let ordinary_valid = match ordinary_trigger {
+        FinalizationTriggerV1::Succeeded => {
+            result.cancellation.is_none() && result.steps.iter().all(step_succeeds_workflow)
         }
-        WorkflowOutcomeV1::Failed => {
-            result.primary_failure.is_some()
-                && (result.cancellation.is_some()
-                    || result
-                        .steps
-                        .iter()
-                        .all(|step| step.state != WorkflowStepStateV1::Cancelled))
-        }
-        WorkflowOutcomeV1::Cancelled => {
-            result.primary_failure.is_none()
-                && result.cancellation.is_some()
+        FinalizationTriggerV1::Failed => result
+            .primary_failure
+            .as_ref()
+            .is_some_and(|primary| primary.node.role == WorkflowNodeRoleV1::Step),
+        FinalizationTriggerV1::Cancelled => {
+            result.cancellation.is_some()
                 && result.steps.iter().all(|step| {
                     step_succeeds_workflow(step) || step.state == WorkflowStepStateV1::Cancelled
                 })
@@ -137,13 +198,45 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
                     .any(|step| step.state == WorkflowStepStateV1::Cancelled)
         }
     };
-    if !valid {
+    if !ordinary_valid {
         return Err(ResultMetadataError);
     }
 
-    if let Some(cancellation) = &result.cancellation
-        && parse_canonical_utc_timestamp(&cancellation.force_stop_deadline).is_none()
-    {
+    let required_finalization_issue = result.finalization.as_ref().is_some_and(|finalization| {
+        finalization
+            .issues
+            .iter()
+            .any(|issue| issue.impact == FailurePolicy::Required)
+    });
+    let finalization_cancelled = result
+        .finalization
+        .as_ref()
+        .and_then(|finalization| finalization.cancellation.as_ref());
+    let outcome_valid = match (ordinary_trigger, result.outcome) {
+        (FinalizationTriggerV1::Succeeded, WorkflowOutcomeV1::Succeeded) => {
+            result.primary_failure.is_none()
+                && !required_finalization_issue
+                && finalization_cancelled.is_none()
+        }
+        (FinalizationTriggerV1::Succeeded, WorkflowOutcomeV1::Failed) => {
+            required_finalization_issue
+                && result
+                    .primary_failure
+                    .as_ref()
+                    .is_some_and(|primary| primary.node.role == WorkflowNodeRoleV1::Finalizer)
+        }
+        (FinalizationTriggerV1::Succeeded, WorkflowOutcomeV1::Cancelled) => {
+            result.primary_failure.is_none()
+                && !required_finalization_issue
+                && finalization_cancelled.is_some()
+        }
+        (FinalizationTriggerV1::Failed, WorkflowOutcomeV1::Failed) => true,
+        (FinalizationTriggerV1::Cancelled, WorkflowOutcomeV1::Cancelled) => {
+            result.primary_failure.is_none()
+        }
+        _ => false,
+    };
+    if !outcome_valid {
         return Err(ResultMetadataError);
     }
 
@@ -155,11 +248,19 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         cause: primary.cause.clone(),
     };
     validate_failure(&failure)?;
-    result
-        .steps
+    let candidates = match primary.node.role {
+        WorkflowNodeRoleV1::Step => &result.steps,
+        WorkflowNodeRoleV1::Finalizer => result
+            .finalization
+            .as_ref()
+            .map(|finalization| &finalization.finalizers)
+            .ok_or(ResultMetadataError)?,
+    };
+    candidates
         .iter()
         .any(|step| {
-            step.id == primary.step
+            step.id == primary.node.id
+                && step.role == primary.node.role
                 && step.failure_policy == FailurePolicy::Required
                 && step.state == WorkflowStepStateV1::Failed
                 && step.failure.as_ref() == Some(&failure)
@@ -177,12 +278,96 @@ fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
             ))
 }
 
-fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
-    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(steps.len());
-    let mut ids = BTreeSet::new();
+fn validate_finalization(
+    finalization: &super::publication::FinalizationV1,
+) -> Result<(), ResultMetadataError> {
+    let expected_issues = finalization
+        .finalizers
+        .iter()
+        .filter(|finalizer| {
+            finalizer.state == WorkflowStepStateV1::Failed
+                || (finalizer.state == WorkflowStepStateV1::Blocked
+                    && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+        })
+        .map(|finalizer| (&finalizer.id, finalizer.failure_policy))
+        .collect::<Vec<_>>();
+    if finalization.issues.len() != expected_issues.len()
+        || finalization
+            .issues
+            .iter()
+            .zip(expected_issues)
+            .any(|(issue, (id, impact))| {
+                issue.node.id != *id
+                    || issue.node.role != WorkflowNodeRoleV1::Finalizer
+                    || issue.impact != impact
+            })
+    {
+        return Err(ResultMetadataError);
+    }
+
+    match (&finalization.cancellation, finalization.force_abort) {
+        (None, false) => {}
+        (Some(cancellation), false)
+            if cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                && cancellation
+                    .force_stop_deadline
+                    .as_deref()
+                    .and_then(parse_canonical_utc_timestamp)
+                    .is_some() => {}
+        (Some(cancellation), true)
+            if (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+                && cancellation.force_stop_deadline.is_none())
+                || (cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                    && cancellation
+                        .force_stop_deadline
+                        .as_deref()
+                        .and_then(parse_canonical_utc_timestamp)
+                        .is_some()) => {}
+        (None, true) | (Some(_), false | true) => return Err(ResultMetadataError),
+    }
+
+    let cancelled_finalizers = finalization
+        .finalizers
+        .iter()
+        .filter(|finalizer| finalizer.state == WorkflowStepStateV1::Cancelled)
+        .collect::<Vec<_>>();
+    let cancellation_dispositions_valid = match &finalization.cancellation {
+        None => cancelled_finalizers.is_empty(),
+        Some(cancellation) => {
+            let expected_reason = cancellation_step_reason(cancellation.reason);
+            !cancelled_finalizers.is_empty()
+                && cancelled_finalizers
+                    .iter()
+                    .all(|finalizer| finalizer.reason == Some(expected_reason))
+        }
+    };
+    cancellation_dispositions_valid
+        .then_some(())
+        .ok_or(ResultMetadataError)
+}
+
+fn cancellation_step_reason(reason: CancellationReasonV1) -> StepReasonV1 {
+    match reason {
+        CancellationReasonV1::UserRequest => StepReasonV1::UserRequest,
+        CancellationReasonV1::TerminationRequest => StepReasonV1::TerminationRequest,
+        CancellationReasonV1::CallerOutputFailure => StepReasonV1::CallerOutputFailure,
+        CancellationReasonV1::RunnerShutdown => StepReasonV1::RunnerShutdown,
+        CancellationReasonV1::ExecutionLeaseExpired => StepReasonV1::ExecutionLeaseExpired,
+        CancellationReasonV1::FinalizationForceAbort => StepReasonV1::FinalizationForceAbort,
+    }
+}
+
+fn validate_steps(
+    steps: &[WorkflowStepV1],
+    expected_role: WorkflowNodeRoleV1,
+    total_nodes: usize,
+    ids: &mut BTreeSet<String>,
+) -> Result<(), ResultMetadataError> {
+    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(total_nodes);
     for step in steps {
         if !is_identifier(&step.id)
-            || !ids.insert(&step.id)
+            || !ids.insert(step.id.clone())
+            || step.role != expected_role
             || !matches!(step.kind.as_str(), "cmd" | "agent")
         {
             return Err(ResultMetadataError);
@@ -195,26 +380,57 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
             (None, None) => {}
             _ => return Err(ResultMetadataError),
         }
-        let exact_fields = match step.state {
-            WorkflowStepStateV1::Succeeded => {
-                step.failure.is_none() && step.dependency.is_none() && step.reason.is_none()
+        let exact_fields = match (expected_role, step.state) {
+            (_, WorkflowStepStateV1::Succeeded) => {
+                step.failure.is_none()
+                    && step.dependency.is_none()
+                    && step.reason.is_none()
+                    && step.unavailable_references.is_none()
             }
-            WorkflowStepStateV1::Failed => {
-                step.failure.is_some() && step.dependency.is_none() && step.reason.is_none()
+            (_, WorkflowStepStateV1::Failed) => {
+                step.failure.is_some()
+                    && step.dependency.is_none()
+                    && step.reason.is_none()
+                    && step.unavailable_references.is_none()
             }
-            WorkflowStepStateV1::Blocked => {
+            (WorkflowNodeRoleV1::Step, WorkflowStepStateV1::Blocked) => {
                 step.failure.is_none()
                     && step.dependency.as_deref().is_some_and(is_identifier)
                     && step.reason.is_none()
+                    && step.unavailable_references.is_none()
             }
-            WorkflowStepStateV1::NotRun => {
+            (WorkflowNodeRoleV1::Finalizer, WorkflowStepStateV1::Blocked) => {
+                step.failure.is_none()
+                    && step.dependency.is_none()
+                    && step.reason == Some(StepReasonV1::InputUnavailable)
+                    && step
+                        .unavailable_references
+                        .as_ref()
+                        .is_some_and(|references| {
+                            !references.is_empty()
+                                && references.windows(2).all(|pair| pair[0] < pair[1])
+                                && references.iter().all(|reference| {
+                                    reference.starts_with("outputs.")
+                                        && reference.split('.').count() == 3
+                                })
+                        })
+            }
+            (WorkflowNodeRoleV1::Step, WorkflowStepStateV1::NotRun) => {
                 step.failure.is_none()
                     && step.dependency.is_none()
                     && step.reason == Some(StepReasonV1::FailureStop)
+                    && step.unavailable_references.is_none()
             }
-            WorkflowStepStateV1::Cancelled => {
+            (WorkflowNodeRoleV1::Finalizer, WorkflowStepStateV1::NotRun) => {
                 step.failure.is_none()
                     && step.dependency.is_none()
+                    && step.reason == Some(StepReasonV1::FinalizerTriggerNotSelected)
+                    && step.unavailable_references.is_none()
+            }
+            (role, WorkflowStepStateV1::Cancelled) => {
+                step.failure.is_none()
+                    && step.dependency.is_none()
+                    && step.unavailable_references.is_none()
                     && matches!(
                         step.reason,
                         Some(
@@ -225,6 +441,11 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
                                 | StepReasonV1::ExecutionLeaseExpired
                         )
                     )
+                    || (role == WorkflowNodeRoleV1::Finalizer
+                        && step.reason == Some(StepReasonV1::FinalizationForceAbort)
+                        && step.failure.is_none()
+                        && step.dependency.is_none()
+                        && step.unavailable_references.is_none())
             }
         };
         let timing_present = step.started_at.is_some();
@@ -262,7 +483,7 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
     Ok(())
 }
 
-fn validate_failure(failure: &FailureV1) -> Result<(), ResultMetadataError> {
+pub(super) fn validate_failure(failure: &FailureV1) -> Result<(), ResultMetadataError> {
     let cause = &failure.cause;
     let valid = if is_input_failure_code(cause.code) {
         let valid_input = if cause.code == FailureCodeV1::InputInvalidName {
@@ -297,7 +518,17 @@ fn validate_failure(failure: &FailureV1) -> Result<(), ResultMetadataError> {
             && cause.exit_code.is_none()
             && simple_failure_phase(cause.code, failure.phase)
     };
-    valid.then_some(()).ok_or(ResultMetadataError)
+    let protocol_rejection_valid = cause.protocol_rejection.is_none()
+        || matches!(
+            cause.code,
+            FailureCodeV1::HarnessStartFailed | FailureCodeV1::HarnessProtocolFailed
+        ) && matches!(
+            failure.phase,
+            FailurePhaseV1::Start | FailurePhaseV1::Execution
+        );
+    (valid && protocol_rejection_valid)
+        .then_some(())
+        .ok_or(ResultMetadataError)
 }
 
 pub(crate) fn is_input_failure_code(code: FailureCodeV1) -> bool {

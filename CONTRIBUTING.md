@@ -22,9 +22,9 @@ If you inspect or modify a local copy, run the canonical check from the reposito
 
 The project uses its standalone devenv environment to provide the minimum Rust toolchain
 declared in `Cargo.toml` and the pinned Node 24 line used by the private PiJsonV1
-extension project. Run `./scripts/strict-devenv test` for the same lock-strict
-formatting, linting, testing, source-boundary, and release build checks used by CI. The
-canonical check performs a
+extension project. `./scripts/check` enters that environment through the clean boundary
+and runs the same formatting, linting, testing, source-boundary, and release build checks
+used by CI. The canonical check performs a
 locked npm install before checking the extension; run
 `./scripts/check-pi-json-v1-extension` for that focused path.
 
@@ -69,7 +69,7 @@ Managed Buildkite allocates one exact version and publishes an allocation record
 mirror. Public Actions ignores allocation- and recovery-metadata branch creation and never
 plans a version: `scripts/verify-release-allocation` checks the exact allocation,
 stable-state snapshot, release body, and any current recovery chain after the accompanying
-`main` push, then the four native builds check out the original allocated commit. The write-scoped
+`main` push, then the three native builds check out the original allocated commit. The write-scoped
 `scripts/reconcile-release` accepts only matching absent, partial-tag, or draft state and
 leaves an exact published release unchanged. Run
 `python3 scripts/test-release-allocation` for the local Git and mocked GitHub fixture. Do

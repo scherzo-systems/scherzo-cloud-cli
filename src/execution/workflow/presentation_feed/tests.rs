@@ -44,6 +44,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: "a".to_owned(),
+            role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
             failure_policy: FailurePolicy::Required,
             from,
             to,

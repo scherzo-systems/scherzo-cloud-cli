@@ -6,7 +6,7 @@ use super::*;
 use crate::execution::workflow::admission::{CancellationSource, EnvironmentSnapshot};
 use crate::execution::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
+    AgentInvocationLimits, AgentInvocationStaging, AgentOutcome, AgentProcessContext, AgentPrompt,
     AgentValueMode, CompletedAgentInvocation, NoopAgentObservationSink, PositiveDuration,
     WorkflowRunId, agent_start_channel, agent_terminal_channel,
 };
@@ -102,6 +102,18 @@ fn invocation<Configuration, ProtocolLimits>(
         PositiveDuration::new(Duration::from_secs(1)).unwrap(),
         protocol_limits,
     );
+    let diagnostic_session_path = temporary.path().join(format!("diagnostics-{profile:?}"));
+    let diagnostic_session = match profile {
+        AgentCompatibilityProfile::PiJsonV1 => {
+            AgentDiagnosticSession::fixture(diagnostic_session_path)
+        }
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
+            AgentDiagnosticSession::claude_code_fixture(diagnostic_session_path)
+        }
+        AgentCompatibilityProfile::CodexAppServerV1 => {
+            AgentDiagnosticSession::codex_fixture(diagnostic_session_path)
+        }
+    };
     AgentInvocation::new(
         AgentInvocationIdentity::new(
             WorkflowRunId::from(Arc::from("run")),
@@ -118,7 +130,7 @@ fn invocation<Configuration, ProtocolLimits>(
         ),
         AgentProcessContext::new(cwd, EnvironmentSnapshot::default()),
         AgentInvocationStaging::new(temporary.path().join("result-endpoint")),
-        AgentDiagnosticSession::fixture(temporary.path().join(format!("diagnostics-{profile:?}"))),
+        diagnostic_session,
         AgentPrompt::new(Arc::from("system"), Arc::from("message")),
         Arc::from([]),
         AgentValueMode::None,
@@ -180,7 +192,7 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
             &temporary,
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
             "/validated/claude",
-            "2.1.222",
+            "2.1.234",
             claude_code_config.clone(),
             ClaudeCodeStreamJsonV1ProtocolLimits::profile(),
         )),

@@ -1,0 +1,17 @@
+{
+  "properties": {
+    "approvalPolicy": {},
+    "config": {},
+    "cwd": {},
+    "developerInstructions": {},
+    "ephemeral": {},
+    "model": {},
+    "modelProvider": {},
+    "sandbox": {}
+  },
+  "definitions": {
+    "SandboxMode": {
+      "enum": ["read-only", "danger-full-access"]
+    }
+  }
+}

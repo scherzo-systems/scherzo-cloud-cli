@@ -13,7 +13,7 @@
     "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
     "decline": {
       "type": "runner_unable",
-      "reason": "workflow_mapping_unavailable"
+      "reason": "source_service_unavailable"
     }
   }
 }

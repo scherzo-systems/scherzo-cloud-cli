@@ -30,6 +30,12 @@ function compactMessageUpdate(event: { assistantMessageEvent: unknown }): void {
   }
 
   const assistantEvent = event.assistantMessageEvent as Record<string, unknown>;
+  // Preserve the provider-finalized content and Pi partial snapshot so the
+  // parser can enforce their agreement.
+  if (assistantEvent.type === "thinking_end") {
+    return;
+  }
+
   assistantEvent.scherzoCompact = true;
   delete assistantEvent.partial;
   delete assistantEvent.message;
@@ -38,10 +44,7 @@ function compactMessageUpdate(event: { assistantMessageEvent: unknown }): void {
     assistantEvent.type === "thinking_delta"
   ) {
     delete assistantEvent.delta;
-  } else if (
-    assistantEvent.type === "text_end" ||
-    assistantEvent.type === "thinking_end"
-  ) {
+  } else if (assistantEvent.type === "text_end") {
     delete assistantEvent.content;
   }
 }

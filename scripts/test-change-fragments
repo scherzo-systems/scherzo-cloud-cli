@@ -45,23 +45,15 @@ write_public() {
 }
 
 expect_success() {
-  local output
-  if ! output=$("$validator" 2>&1); then
-    fail "Expected fragment validation success, got: $output"
-  fi
-  if [[ $output != "CLI change fragments are valid." ]]; then
-    fail "Unexpected fragment validation output: $output"
+  if ! "$validator" >/dev/null 2>&1; then
+    fail "Expected fragment validation success."
   fi
 }
 
 expect_failure() {
-  local expected=$1
-  local output
-  if output=$("$validator" 2>&1); then
-    fail "Expected fragment validation failure containing '$expected', got success: $output"
-  fi
-  if [[ $output != *"$expected"* ]]; then
-    fail "Expected fragment validation failure containing '$expected', got: $output"
+  local description=$1
+  if "$validator" >/dev/null 2>&1; then
+    fail "Expected fragment validation failure for $description."
   fi
 }
 

@@ -13,6 +13,7 @@ use crate::execution::workflow::observation::{
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{ActionId, FailurePhase, TransitionSequence};
 use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
+use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::execution::workflow::value::CapturedValue;
 
 #[derive(Clone)]
@@ -50,9 +51,7 @@ fn point(base: Instant, milliseconds: u64) -> ObservationTime {
 }
 
 fn resolved_workflow() -> (tempfile::TempDir, ResolvedWorkflow) {
-    let temporary = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temporary.path().join("workflow.yaml"),
+    resolve_workflow(
         "schemaVersion: 1
 steps:
   prepare:
@@ -76,7 +75,11 @@ steps:
         mediaType: text/plain
 ",
     )
-    .unwrap();
+}
+
+fn resolve_workflow(source: &str) -> (tempfile::TempDir, ResolvedWorkflow) {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(temporary.path().join("workflow.yaml"), source).unwrap();
     let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
     (temporary, workflow)
 }
@@ -112,6 +115,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
+            role: WorkflowNodeRole::Step,
             failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
             from,
             to,
@@ -121,8 +125,8 @@ fn step_transition(
 }
 
 fn workflow_transition(
-    from: WorkflowState<StepFailureCause>,
-    to: WorkflowState<StepFailureCause>,
+    from: WorkflowState<StepFailureCause, OffsetDateTime>,
+    to: WorkflowState<StepFailureCause, OffsetDateTime>,
 ) -> ExecutionObservation<OffsetDateTime> {
     ExecutionObservation::Transition(TransitionObservation {
         event: TransitionEvent::Workflow {
@@ -345,6 +349,88 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
     assert_eq!(terminal.timing.duration, Duration::from_millis(71));
     assert!(terminal.timing.frozen);
     assert_eq!(*changes.borrow(), terminal.generation);
+}
+
+#[tokio::test]
+async fn finalization_cancellation_events_update_live_gate_for_tui_escalation() {
+    let (_temporary, workflow) = resolve_workflow(
+        "schemaVersion: 1
+steps:
+  complete:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+",
+    );
+    let base = crate::timing::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock);
+    let trigger = crate::execution::workflow::document::FinalizationTrigger::Succeeded;
+    view.observe(workflow_transition(
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        },
+        WorkflowState::Finalizing {
+            trigger,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Open,
+            primary_failure: None,
+        },
+    ))
+    .await;
+
+    let deadline = point(base, 50).utc;
+    view.observe(ExecutionObservation::Transition(TransitionObservation {
+        event: TransitionEvent::FinalizationCancellationAccepted {
+            sequence: TransitionSequence::default(),
+            reason: CancellationReason::UserRequest,
+            deadline,
+        },
+        step: None,
+    }))
+    .await;
+
+    assert_eq!(
+        view.snapshot().workflow,
+        WorkflowState::Finalizing {
+            trigger,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Cancelling {
+                reason: CancellationReason::UserRequest,
+                deadline: Some(deadline),
+                force_abort: false,
+            },
+            primary_failure: None,
+        }
+    );
+    assert!(view.snapshot().finalization.is_none());
+
+    view.observe(ExecutionObservation::Transition(TransitionObservation::<
+        OffsetDateTime,
+    > {
+        event: TransitionEvent::ForceAbortAccepted {
+            sequence: TransitionSequence::default(),
+            reason: CancellationReason::UserRequest,
+        },
+        step: None,
+    }))
+    .await;
+
+    assert_eq!(
+        view.snapshot().workflow,
+        WorkflowState::Finalizing {
+            trigger,
+            gate: crate::execution::workflow::runtime::FinalizationGate::Cancelling {
+                reason: CancellationReason::UserRequest,
+                deadline: Some(deadline),
+                force_abort: true,
+            },
+            primary_failure: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -654,6 +740,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         steps: vec![
             super::super::publication::WorkflowRunStep {
                 id: "prepare".to_owned(),
+                role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                 kind: super::super::publication::WorkflowRunStepKind::Command,
                 failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 state: StepState::Succeeded {
@@ -670,6 +757,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
             },
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
+                role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                 kind: super::super::publication::WorkflowRunStepKind::Command,
                 failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 state: StepState::Succeeded {
@@ -685,6 +773,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 command_output: None,
             },
         ],
+        finalization: None,
         exports: BTreeMap::new(),
         export_sources: BTreeMap::new(),
     }

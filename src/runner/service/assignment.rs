@@ -10,21 +10,26 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tokio::sync::{Notify, mpsc};
 
 use super::Sleeper;
+use super::artifact_delivery::{
+    ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
+};
 use super::config::{AssignmentConfig, Config};
 use super::execution::{AssignmentProcessGuards, ExecutionJob};
+use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
-    AdmissionFailure, AdmittedWorkflow, CancellationPolicy, CancellationSource,
-    EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
-    default_execution_policy_limits,
+    AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
+    CancellationSource, EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle,
+    ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
+use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
     MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
 };
 use crate::execution::workflow::command_contract::{
-    ServeWorkflowContractFailure, ServeWorkflowContractFailureKind,
-    require_inputless_workflow_no_outputs,
+    ServeWorkflowContractFailure, require_serve_workflow,
 };
+#[cfg(test)]
 use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner_protocol::{
@@ -36,7 +41,7 @@ use crate::runner_protocol::{
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
-pub(super) const MAXIMUM_TRANSITIONS_PER_STEP: usize = 5;
+pub(super) const MAXIMUM_TRANSITIONS_PER_NODE: usize = 4;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
 
 pub(super) trait WallClockHealth: Send + Sync {
@@ -95,6 +100,7 @@ pub(super) struct AssignmentOffer {
     pub(super) effect_id: String,
     pub(super) assignment_id: String,
     pub(super) run_id: String,
+    pub(super) project_id: String,
     pub(super) attempt_id: String,
     pub(super) execution_spec: ExecutionSpecV1RunnerProjection,
 }
@@ -180,11 +186,13 @@ pub(super) enum ExecutionReport {
     Finished {
         final_execution_event_sequence: u64,
         outcome: Value,
+        artifact_delivery: Value,
     },
     Interrupted {
         final_execution_event_sequence: u64,
         reason: String,
         terminal_outcome: Value,
+        artifact_delivery: Value,
     },
     Aborted {
         last_execution_event_sequence: u64,
@@ -234,17 +242,20 @@ impl ExecutionReport {
             Self::Finished {
                 final_execution_event_sequence,
                 outcome,
+                artifact_delivery,
             } => RunnerFrame::ExecutionFinished {
                 envelope,
                 assignment_id,
                 attempt_id,
                 final_execution_event_sequence: *final_execution_event_sequence,
                 outcome: outcome.clone(),
+                artifact_delivery: artifact_delivery.clone(),
             },
             Self::Interrupted {
                 final_execution_event_sequence,
                 reason,
                 terminal_outcome,
+                artifact_delivery,
             } => RunnerFrame::ExecutionInterrupted {
                 envelope,
                 assignment_id,
@@ -252,6 +263,7 @@ impl ExecutionReport {
                 final_execution_event_sequence: *final_execution_event_sequence,
                 reason: reason.clone(),
                 terminal_outcome: terminal_outcome.clone(),
+                artifact_delivery: artifact_delivery.clone(),
             },
             Self::Aborted {
                 last_execution_event_sequence,
@@ -262,6 +274,104 @@ impl ExecutionReport {
                 attempt_id,
                 last_execution_event_sequence: *last_execution_event_sequence,
                 reason: reason.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ArtifactRequest {
+    RegisterCarrier {
+        assignment_id: String,
+        attempt_id: String,
+        portable_owner_path: String,
+        media_type: String,
+        size_bytes: u64,
+        sha256: String,
+        idempotency_key: String,
+    },
+    ConfirmCarrier {
+        assignment_id: String,
+        attempt_id: String,
+        artifact_set_id: String,
+        carrier_id: String,
+    },
+    RegisterResult {
+        assignment_id: String,
+        attempt_id: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    ConfirmResult {
+        assignment_id: String,
+        attempt_id: String,
+        artifact_set_id: String,
+    },
+}
+
+impl ArtifactRequest {
+    fn assignment_id(&self) -> &str {
+        match self {
+            Self::RegisterCarrier { assignment_id, .. }
+            | Self::ConfirmCarrier { assignment_id, .. }
+            | Self::RegisterResult { assignment_id, .. }
+            | Self::ConfirmResult { assignment_id, .. } => assignment_id,
+        }
+    }
+
+    fn runner_frame(&self, envelope: RunnerEnvelope) -> RunnerFrame {
+        match self {
+            Self::RegisterCarrier {
+                assignment_id,
+                attempt_id,
+                portable_owner_path,
+                media_type,
+                size_bytes,
+                sha256,
+                idempotency_key,
+            } => RunnerFrame::ArtifactCarrierRegister {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                portable_owner_path: portable_owner_path.clone(),
+                media_type: media_type.clone(),
+                size_bytes: *size_bytes,
+                sha256: sha256.clone(),
+                idempotency_key: idempotency_key.clone(),
+            },
+            Self::ConfirmCarrier {
+                assignment_id,
+                attempt_id,
+                artifact_set_id,
+                carrier_id,
+            } => RunnerFrame::ArtifactCarrierConfirm {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                artifact_set_id: artifact_set_id.clone(),
+                carrier_id: carrier_id.clone(),
+            },
+            Self::RegisterResult {
+                assignment_id,
+                attempt_id,
+                size_bytes,
+                sha256,
+            } => RunnerFrame::ArtifactResultRegister {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                size_bytes: *size_bytes,
+                sha256: sha256.clone(),
+            },
+            Self::ConfirmResult {
+                assignment_id,
+                attempt_id,
+                artifact_set_id,
+            } => RunnerFrame::ArtifactResultConfirm {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                artifact_set_id: artifact_set_id.clone(),
             },
         }
     }
@@ -280,6 +390,10 @@ pub(super) enum AssignmentObservation {
         attempt_id: String,
         report: ExecutionReport,
     },
+    Artifact {
+        delivery_id: u64,
+        request: ArtifactRequest,
+    },
 }
 
 impl AssignmentObservation {
@@ -288,6 +402,7 @@ impl AssignmentObservation {
             Self::Decision(decision) => decision.assignment_id(),
             Self::LeaseRenewalRequested { assignment_id, .. }
             | Self::Execution { assignment_id, .. } => assignment_id,
+            Self::Artifact { request, .. } => request.assignment_id(),
         }
     }
 
@@ -313,6 +428,7 @@ impl AssignmentObservation {
                 attempt_id,
                 report,
             } => report.runner_frame(envelope, assignment_id.clone(), attempt_id.clone()),
+            Self::Artifact { request, .. } => request.runner_frame(envelope),
         }
     }
 }
@@ -321,6 +437,15 @@ impl AssignmentObservation {
 pub(super) struct PendingAssignmentObservation {
     pub(super) id: u64,
     pub(super) observation: AssignmentObservation,
+}
+
+impl PendingAssignmentObservation {
+    pub(super) fn artifact_delivery_id(&self) -> Option<u64> {
+        match &self.observation {
+            AssignmentObservation::Artifact { delivery_id, .. } => Some(*delivery_id),
+            _ => None,
+        }
+    }
 }
 
 struct ObservationEntry {
@@ -352,9 +477,22 @@ impl ObservationOutbox {
         }
     }
 
-    fn reserve(&self, step_count: usize) -> Result<usize, AssignmentDecline> {
-        let transition_entries = MAXIMUM_TRANSITIONS_PER_STEP
-            .checked_mul(step_count)
+    fn reserve(
+        &self,
+        step_count: usize,
+        finalizer_count: usize,
+    ) -> Result<usize, AssignmentDecline> {
+        let node_count = step_count
+            .checked_add(finalizer_count)
+            .ok_or_else(environment_unavailable)?;
+        if node_count > MAXIMUM_PARALLEL_STEPS {
+            return Err(environment_unavailable());
+        }
+        let transition_entries = MAXIMUM_TRANSITIONS_PER_NODE
+            .checked_mul(node_count)
+            .and_then(|node_transitions| {
+                node_transitions.checked_add(if finalizer_count == 0 { 3 } else { 6 })
+            })
             .ok_or_else(environment_unavailable)?;
         let reservation = transition_entries
             .checked_add(OBSERVATION_RESERVE_BASE)
@@ -370,7 +508,7 @@ impl ObservationOutbox {
                 .try_reserve_exact(additional)
                 .map_err(|_| environment_unavailable())?;
         }
-        Ok(transition_entries.saturating_add(3))
+        Ok(transition_entries)
     }
 
     pub(super) fn enqueue(&self, observation: AssignmentObservation) -> Result<u64, OutboxFailure> {
@@ -519,7 +657,9 @@ struct RetainedDecision {
 struct AssignmentIdentity {
     assignment_id: String,
     run_id: String,
+    project_id: String,
     attempt_id: String,
+    workflow_id: String,
     execution_spec_id: String,
 }
 
@@ -527,6 +667,7 @@ pub(super) struct AssignmentRoot {
     pub(super) _temporary: TempDir,
     pub(super) execution: PathBuf,
     pub(super) private: PathBuf,
+    pub(super) source: PathBuf,
 }
 
 pub(super) struct AcceptedAssignment {
@@ -550,6 +691,14 @@ impl AcceptedAssignment {
     pub(super) fn run_id(&self) -> &str {
         &self.identity.run_id
     }
+
+    pub(super) fn project_id(&self) -> &str {
+        &self.identity.project_id
+    }
+
+    pub(super) fn workflow_id(&self) -> &str {
+        &self.identity.workflow_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -572,29 +721,92 @@ struct RunningAssignment {
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
 }
 
+struct PreparingAssignment {
+    offer: AssignmentOffer,
+    cancellation: CaptureCancellation,
+}
+
 struct FinishingAssignment {
     identity: AssignmentIdentity,
     final_observation_id: u64,
+    _retained_root: Option<AssignmentRoot>,
 }
 
 enum LocalSlot {
-    Preparing,
+    Preparing(PreparingAssignment),
     Accepted(Box<AcceptedAssignment>),
     Running(Box<RunningAssignment>),
     Finishing(FinishingAssignment),
 }
 
 pub(super) enum ManagerEvent {
+    Prepared {
+        offer: Box<AssignmentOffer>,
+        admission: Box<Result<AcceptedAssignment, AssignmentDecline>>,
+    },
     Finished {
         assignment_id: String,
         final_observation_id: Option<u64>,
         final_delivery_deadline: Option<Instant>,
+        retained_root: Option<AssignmentRoot>,
     },
     FinalGraceElapsed {
         assignment_id: String,
         final_observation_id: u64,
         continue_reporting: bool,
     },
+}
+
+#[derive(Clone)]
+struct AdmissionRuntime {
+    pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
+    claude_code_installation:
+        Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
+    environment: EnvironmentSnapshot,
+    outbox: ObservationOutbox,
+    guard_processes: bool,
+}
+
+impl AdmissionRuntime {
+    fn finish(
+        &self,
+        offer: &AssignmentOffer,
+        root: AssignmentRoot,
+        workflow: crate::execution::workflow::resolution::ResolvedWorkflow,
+        git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
+    ) -> Result<AcceptedAssignment, AssignmentDecline> {
+        let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
+        let transition_budget = self.outbox.reserve(
+            workflow.definition.steps.len(),
+            workflow.definition.finalizers.len(),
+        )?;
+        let cloud_git_capture = git_capture.is_some();
+        let context = build_execution_context(
+            &offer.execution_spec,
+            &root.execution,
+            git_capture,
+            &self.environment,
+            self.pi_installation.as_ref(),
+            self.claude_code_installation.as_ref(),
+        )?;
+        let admitted = admit_workflow(workflow, ResolvedImports::default(), context)
+            .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
+        Ok(AcceptedAssignment {
+            identity: AssignmentIdentity {
+                assignment_id: offer.assignment_id.clone(),
+                run_id: offer.run_id.clone(),
+                project_id: offer.project_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+                workflow_id: offer.execution_spec.registered_workflow_id.clone(),
+                execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+            },
+            root,
+            admitted,
+            transition_budget,
+            process_guards: AssignmentProcessGuards::new(),
+            guard_processes: self.guard_processes,
+        })
+    }
 }
 
 pub(super) struct AssignmentManager {
@@ -606,11 +818,15 @@ pub(super) struct AssignmentManager {
     environment: EnvironmentSnapshot,
     wall_clock: Arc<dyn WallClockHealth>,
     sleeper: Arc<dyn Sleeper>,
+    source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+    #[cfg(test)]
+    fixture_materialized_source: Option<(PathBuf, PathBuf)>,
     lease_policy: Option<ExecutionLeasePolicy>,
     slot: Option<LocalSlot>,
     reporting: Option<AssignmentIdentity>,
     decisions: VecDeque<RetainedDecision>,
     outbox: ObservationOutbox,
+    artifact_delivery: ArtifactDeliveryBroker,
     events: mpsc::UnboundedReceiver<ManagerEvent>,
     event_sender: mpsc::UnboundedSender<ManagerEvent>,
     shutting_down: bool,
@@ -660,24 +876,42 @@ impl AssignmentManager {
         guard_processes: bool,
     ) -> Self {
         let (event_sender, events) = mpsc::unbounded_channel();
+        let outbox = ObservationOutbox::new();
+        let artifact_delivery = ArtifactDeliveryBroker::new(outbox.clone(), Arc::clone(&sleeper));
         Self {
             config: config.assignment().clone(),
             pi_installation: config.pi_installation().cloned(),
             claude_code_installation: config.claude_code_installation().cloned(),
-            boot_id,
+            boot_id: boot_id.clone(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
             wall_clock,
             sleeper,
+            source_broker: HttpSourceCredentialBroker::new(
+                config.endpoint(),
+                config.credential(),
+                &boot_id,
+            )
+            .ok()
+            .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>),
+            #[cfg(test)]
+            fixture_materialized_source: config.fixture_materialized_source().cloned(),
             lease_policy: None,
             slot: None,
             reporting: None,
             decisions: VecDeque::new(),
-            outbox: ObservationOutbox::new(),
+            outbox,
+            artifact_delivery,
             events,
             event_sender,
             shutting_down: false,
             guard_processes,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_source_broker_fixture(&mut self, broker: Arc<dyn SourceCredentialBroker>) {
+        self.fixture_materialized_source = None;
+        self.source_broker = Some(broker);
     }
 
     pub(super) fn retain_lease_policy(
@@ -700,6 +934,18 @@ impl AssignmentManager {
         offer: AssignmentOffer,
     ) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        if let Some(LocalSlot::Preparing(preparing)) = &self.slot {
+            if preparing.offer.assignment_id == offer.assignment_id {
+                return if same_assignment(&preparing.offer, &offer) {
+                    Ok(())
+                } else {
+                    Err(AssignmentManagerFailure::ConflictingOffer)
+                };
+            }
+            if preparing.offer.effect_id == offer.effect_id {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+        }
         if let Some(index) = self
             .decisions
             .iter()
@@ -729,8 +975,107 @@ impl AssignmentManager {
             return self.retain_decision(offer, response);
         }
 
-        self.slot = Some(LocalSlot::Preparing);
-        let admission = self.admit(&offer);
+        self.begin_source_admission(offer)
+    }
+
+    fn begin_source_admission(
+        &mut self,
+        offer: AssignmentOffer,
+    ) -> Result<(), AssignmentManagerFailure> {
+        #[cfg(test)]
+        if self.fixture_materialized_source.is_some() {
+            return self.admit_materialized_source_fixture(offer);
+        }
+        if let Err(decline) = self.validate_admission_prerequisites(&offer) {
+            return self.retain_decision(offer.clone(), rejected(&offer, decline));
+        }
+        let root = match self.prepare_execution_root(&offer.assignment_id) {
+            Ok(root) => root,
+            Err(decline) => {
+                return self.retain_decision(offer.clone(), rejected(&offer, decline));
+            }
+        };
+        let source = offer.execution_spec.source.clone();
+        let Some(broker) = self.source_broker.clone() else {
+            return self.retain_decision(
+                offer.clone(),
+                rejected(
+                    &offer,
+                    AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+                ),
+            );
+        };
+
+        let cancellation = CaptureCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker_offer = offer.clone();
+        let environment = self.environment.clone();
+        let runtime = self.admission_runtime();
+        let sender = self.event_sender.clone();
+        let wake = self.outbox.clone();
+        let worker = std::thread::Builder::new()
+            .name("runner-source-preparation".to_owned())
+            .spawn(move || {
+                let admission = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let materialized = super::source::materialize(
+                        broker,
+                        &environment,
+                        &worker_offer.assignment_id,
+                        &source,
+                        &worker_cancellation,
+                        &root.source,
+                        &root.execution,
+                        &root.private,
+                    )
+                    .map_err(materialization_decline)?;
+                    let mut root = root;
+                    root.execution = materialized.execution_root;
+                    runtime.finish(
+                        &worker_offer,
+                        root,
+                        materialized.workflow,
+                        materialized.git_capture,
+                    )
+                }))
+                .unwrap_or_else(|_| Err(environment_unavailable()));
+                let _ = sender.send(ManagerEvent::Prepared {
+                    offer: Box::new(worker_offer),
+                    admission: Box::new(admission),
+                });
+                wake.wake();
+            });
+        if worker.is_err() {
+            return self
+                .retain_decision(offer.clone(), rejected(&offer, environment_unavailable()));
+        }
+        self.slot = Some(LocalSlot::Preparing(PreparingAssignment {
+            offer,
+            cancellation,
+        }));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn admit_materialized_source_fixture(
+        &mut self,
+        offer: AssignmentOffer,
+    ) -> Result<(), AssignmentManagerFailure> {
+        let admission = self
+            .validate_admission_prerequisites(&offer)
+            .and_then(|()| {
+                let root = self.prepare_execution_root(&offer.assignment_id)?;
+                let (source_root, workflow_path) = self
+                    .fixture_materialized_source
+                    .as_ref()
+                    .expect("fixture source is present");
+                let workflow = resolution::resolve(source_root, workflow_path).map_err(|_| {
+                    AssignmentDecline::ExecutionSpecInvalid(
+                        ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+                    )
+                })?;
+                self.admission_runtime()
+                    .finish(&offer, root, workflow, None)
+            });
         let response = match admission {
             Ok(accepted) => {
                 self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
@@ -823,6 +1168,7 @@ impl AssignmentManager {
         Ok(Some(ExecutionJob::new(
             *accepted,
             self.outbox.clone(),
+            self.artifact_delivery.clone(),
             self.event_sender.clone(),
             Arc::clone(&self.sleeper),
             authority_receiver,
@@ -958,6 +1304,25 @@ impl AssignmentManager {
         if retained_conflict {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
+        if let Some(LocalSlot::Preparing(preparing)) = &self.slot
+            && preparing.offer.assignment_id == assignment_id
+        {
+            if preparing.offer.run_id != run_id || preparing.offer.attempt_id != attempt_id {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+            let Some(LocalSlot::Preparing(preparing)) = self.slot.take() else {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            };
+            preparing.cancellation.cancel();
+            let offer = preparing.offer;
+            let response = rejected(
+                &offer,
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+            );
+            self.retain_decision(offer, response)?;
+            self.retire_assignment_observations(assignment_id);
+            return Ok(());
+        }
         let now = self.sleeper.now();
         match &mut self.slot {
             Some(LocalSlot::Accepted(accepted))
@@ -1022,6 +1387,22 @@ impl AssignmentManager {
         self.outbox.mark_encoded(id);
     }
 
+    pub(super) fn handle_artifact_response(
+        &mut self,
+        observation_id: u64,
+        delivery_id: u64,
+        response: ArtifactCloudResponse,
+    ) -> Result<(), ArtifactDeliveryProtocolFailure> {
+        self.outbox.acknowledge(observation_id);
+        self.artifact_delivery
+            .handle_response(delivery_id, response)
+    }
+
+    #[cfg(test)]
+    pub(super) fn artifact_delivery(&self) -> ArtifactDeliveryBroker {
+        self.artifact_delivery.clone()
+    }
+
     pub(super) fn finish_transport(&mut self) {
         let removed = self.outbox.finish_transport();
         for decision in &mut self.decisions {
@@ -1042,7 +1423,10 @@ impl AssignmentManager {
             return Ok(());
         };
         match slot {
-            LocalSlot::Preparing => {}
+            LocalSlot::Preparing(preparing) => {
+                preparing.cancellation.cancel();
+                self.slot = Some(LocalSlot::Preparing(preparing));
+            }
             LocalSlot::Accepted(accepted) => {
                 let identity = accepted.identity.clone();
                 drop(accepted);
@@ -1080,6 +1464,7 @@ impl AssignmentManager {
         self.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity: identity.clone(),
             final_observation_id,
+            _retained_root: None,
         }));
         self.start_final_grace(
             identity.assignment_id,
@@ -1099,7 +1484,7 @@ impl AssignmentManager {
         self.drain_events();
         let mut counts = AssignmentCounts::default();
         match &self.slot {
-            Some(LocalSlot::Preparing) => counts.preparing = 1,
+            Some(LocalSlot::Preparing(_)) => counts.preparing = 1,
             Some(LocalSlot::Accepted(_)) => counts.accepted = 1,
             Some(LocalSlot::Running(_)) => counts.running = 1,
             Some(LocalSlot::Finishing(_)) => counts.finishing = 1,
@@ -1114,12 +1499,44 @@ impl AssignmentManager {
     }
 
     fn drain_events(&mut self) {
+        self.artifact_delivery.drain_uploads();
         while let Ok(event) = self.events.try_recv() {
             match event {
+                ManagerEvent::Prepared { offer, admission } => {
+                    let Some(LocalSlot::Preparing(preparing)) = self.slot.take() else {
+                        continue;
+                    };
+                    if !same_assignment(&preparing.offer, &offer) {
+                        self.slot = Some(LocalSlot::Preparing(preparing));
+                        continue;
+                    }
+                    if preparing.cancellation.is_cancelled() {
+                        continue;
+                    }
+                    let response = match *admission {
+                        Ok(accepted) => {
+                            self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
+                            AssignmentDecision::Accepted {
+                                effect_id: offer.effect_id.clone(),
+                                assignment_id: offer.assignment_id.clone(),
+                                offered_execution_spec_id: offer
+                                    .execution_spec
+                                    .execution_spec_id
+                                    .clone(),
+                            }
+                        }
+                        Err(decline) => rejected(&offer, decline),
+                    };
+                    let accepted = matches!(response, AssignmentDecision::Accepted { .. });
+                    if self.retain_decision(*offer, response).is_err() || !accepted {
+                        self.slot = None;
+                    }
+                }
                 ManagerEvent::Finished {
                     assignment_id,
                     final_observation_id,
                     final_delivery_deadline,
+                    retained_root,
                 } => {
                     let Some(LocalSlot::Running(running)) = self.slot.take() else {
                         continue;
@@ -1149,6 +1566,7 @@ impl AssignmentManager {
                     self.slot = Some(LocalSlot::Finishing(FinishingAssignment {
                         identity: identity.clone(),
                         final_observation_id,
+                        _retained_root: retained_root,
                     }));
                     self.start_final_grace(
                         identity.assignment_id,
@@ -1236,6 +1654,7 @@ impl AssignmentManager {
 
     fn retire_assignment_observations(&mut self, assignment_id: &str) {
         self.outbox.fence_assignment(assignment_id);
+        self.artifact_delivery.cancel_assignment(assignment_id);
         for decision in &mut self.decisions {
             if decision.offer.assignment_id == assignment_id
                 && decision
@@ -1257,7 +1676,7 @@ impl AssignmentManager {
             Some(LocalSlot::Finishing(finishing)) => {
                 Some(finishing.identity.assignment_id.as_str())
             }
-            Some(LocalSlot::Preparing) | None => None,
+            Some(LocalSlot::Preparing(_)) | None => None,
         };
         let Some(index) = self.decisions.iter().position(|decision| {
             decision.response_observation_id.is_none()
@@ -1288,49 +1707,22 @@ impl AssignmentManager {
         Ok(())
     }
 
-    fn admit(&self, offer: &AssignmentOffer) -> Result<AcceptedAssignment, AssignmentDecline> {
+    fn validate_admission_prerequisites(
+        &self,
+        offer: &AssignmentOffer,
+    ) -> Result<(), AssignmentDecline> {
         validate_execution_spec(&offer.execution_spec)?;
-        // Production Git materialization is a later slice. Never substitute the
-        // development-configured local workflow for an immutable Cloud source.
-        if offer.execution_spec.source.is_some() {
-            return Err(AssignmentDecline::RunnerUnable(
-                RunnerUnableReason::WorkflowSourceUnavailable,
-            ));
-        }
-        // An immutable workflow mismatch does not depend on mutable host health.
-        if offer.execution_spec.registered_workflow_id != self.config.workflow_id() {
-            return Err(AssignmentDecline::RunnerUnable(
-                RunnerUnableReason::WorkflowMappingUnavailable,
-            ));
-        }
-        self.validate_wall_clock()?;
-        let root = self.prepare_execution_root(&offer.assignment_id)?;
-        let workflow = resolution::resolve(
-            self.config.workflow_source_root(),
-            self.config.workflow_path(),
-        )
-        .map_err(|_| {
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable)
-        })?;
-        let workflow =
-            require_inputless_workflow_no_outputs(workflow).map_err(serve_contract_decline)?;
-        let transition_budget = self.outbox.reserve(workflow.definition.steps.len())?;
-        let context = self.execution_context(&offer.execution_spec, &root.execution)?;
-        let admitted = admit_workflow(workflow, ResolvedImports::default(), context)
-            .map_err(admission_decline)?;
-        Ok(AcceptedAssignment {
-            identity: AssignmentIdentity {
-                assignment_id: offer.assignment_id.clone(),
-                run_id: offer.run_id.clone(),
-                attempt_id: offer.attempt_id.clone(),
-                execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
-            },
-            root,
-            admitted,
-            transition_budget,
-            process_guards: AssignmentProcessGuards::new(),
+        self.validate_wall_clock()
+    }
+
+    fn admission_runtime(&self) -> AdmissionRuntime {
+        AdmissionRuntime {
+            pi_installation: self.pi_installation.clone(),
+            claude_code_installation: self.claude_code_installation.clone(),
+            environment: self.environment.clone(),
+            outbox: self.outbox.clone(),
             guard_processes: self.guard_processes,
-        })
+        }
     }
 
     fn validate_wall_clock(&self) -> Result<(), AssignmentDecline> {
@@ -1416,39 +1808,14 @@ impl AssignmentManager {
             .map_err(|_| environment_unavailable())?;
         let execution = temporary.path().join("execution");
         let private = temporary.path().join("private");
+        let source = temporary.path().join("source");
         fs::create_dir(&execution).map_err(|_| environment_unavailable())?;
         fs::create_dir(&private).map_err(|_| environment_unavailable())?;
         Ok(AssignmentRoot {
             _temporary: temporary,
             execution,
             private,
-        })
-    }
-
-    fn execution_context(
-        &self,
-        execution_spec: &ExecutionSpecV1RunnerProjection,
-        root: &Path,
-    ) -> Result<ExecutionContext, AssignmentDecline> {
-        let maximum_parallel_steps =
-            usize::try_from(execution_spec.execution_limits.maximum_parallel_steps)
-                .map_err(|_| invalid_execution_limits())?;
-        let cancellation_grace =
-            Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
-        let context = ExecutionContext::new(
-            root.to_owned(),
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
-            default_execution_policy_limits(maximum_parallel_steps),
-            self.environment.clone(),
-            CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
-        );
-        let context = match &self.pi_installation {
-            Some(installation) => context.with_pi_installation(installation.clone()),
-            None => context,
-        };
-        Ok(match &self.claude_code_installation {
-            Some(installation) => context.with_claude_code_installation(installation.clone()),
-            None => context,
+            source,
         })
     }
 
@@ -1466,6 +1833,7 @@ impl AssignmentManager {
                             "eventType": "step_state_changed",
                             "transitionSequence": sequence,
                             "stepId": "fixture",
+                            "role": "step",
                             "failurePolicy": "required",
                             "from": "pending",
                             "to": "starting",
@@ -1477,6 +1845,37 @@ impl AssignmentManager {
     }
 
     #[cfg(test)]
+    pub(super) fn enqueue_fixture_finalization_terminal(&self) {
+        self.outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                report: ExecutionReport::Finished {
+                    final_execution_event_sequence: 1,
+                    outcome: serde_json::json!({
+                        "outcome": "succeeded",
+                        "finalization": {
+                            "trigger": "succeeded",
+                            "finalizers": [{
+                                "id": "cleanup",
+                                "role": "finalizer",
+                                "failurePolicy": "required",
+                                "state": "succeeded",
+                            }],
+                            "issues": [],
+                            "forceAbort": false,
+                        },
+                    }),
+                    artifact_delivery: serde_json::json!({
+                        "outcome": "prepared",
+                        "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    }),
+                },
+            })
+            .unwrap();
+    }
+
+    #[cfg(test)]
     fn active_step_count(&self) -> Option<usize> {
         match &self.slot {
             Some(LocalSlot::Accepted(accepted)) => {
@@ -1485,6 +1884,47 @@ impl AssignmentManager {
             _ => None,
         }
     }
+}
+
+fn build_execution_context(
+    execution_spec: &ExecutionSpecV1RunnerProjection,
+    root: &Path,
+    git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
+    environment: &EnvironmentSnapshot,
+    pi_installation: Option<&crate::execution::pi::ValidatedPiInstallation>,
+    claude_code_installation: Option<
+        &crate::execution::claude_code::ValidatedClaudeCodeInstallation,
+    >,
+) -> Result<ExecutionContext, AssignmentDecline> {
+    let maximum_parallel_steps =
+        usize::try_from(execution_spec.execution_limits.maximum_parallel_steps)
+            .map_err(|_| invalid_execution_limits())?;
+    let cancellation_grace =
+        Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
+    let lifecycle = if git_capture.is_some() {
+        ExecutionRootLifecycle::CallerOwnedRetained
+    } else {
+        ExecutionRootLifecycle::EngineOwnedEphemeral
+    };
+    let context = ExecutionContext::new(
+        root.to_owned(),
+        lifecycle,
+        default_execution_policy_limits(maximum_parallel_steps),
+        environment.without_managed_runner_credentials_and_helpers(),
+        CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
+    );
+    let context = match git_capture {
+        Some(projection) => context.with_cloud_git_capture(projection),
+        None => context,
+    };
+    let context = match pi_installation {
+        Some(installation) => context.with_pi_installation(installation.clone()),
+        None => context,
+    };
+    Ok(match claude_code_installation {
+        Some(installation) => context.with_claude_code_installation(installation.clone()),
+        None => context,
+    })
 }
 
 fn revoke_authority(running: &mut RunningAssignment, now: Instant) {
@@ -1569,15 +2009,8 @@ fn policy_duration(value: i64) -> Result<Duration, ()> {
         .map_err(|_| ())
 }
 
-fn serve_contract_decline(failure: ServeWorkflowContractFailure) -> AssignmentDecline {
-    match failure.kind() {
-        ServeWorkflowContractFailureKind::InvalidStepCount => {
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable)
-        }
-        ServeWorkflowContractFailureKind::DeclaredOutput => {
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowContractInvalid)
-        }
-    }
+fn serve_contract_decline(_failure: ServeWorkflowContractFailure) -> AssignmentDecline {
+    AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowContractInvalid)
 }
 
 fn validate_execution_spec(
@@ -1598,21 +2031,117 @@ fn validate_execution_spec(
     {
         return Err(invalid_execution_limits());
     }
+    let source = &execution_spec.source;
+    if source.object_format != "sha1" {
+        return Err(AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
+        ));
+    }
+    let valid_connection = source
+        .repository_connection_id
+        .parse::<crate::runner_protocol::generated::RepositoryConnectionId>()
+        .is_ok();
+    let valid_path = !source.workflow_path.is_empty()
+        && source.workflow_path.chars().count() <= 4096
+        && !source.workflow_path.starts_with('/')
+        && !source.workflow_path.contains('\0')
+        && source
+            .workflow_path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."));
+    if !valid_connection
+        || source.checkout_credential_reference != source.repository_connection_id
+        || !lowercase_hex(&source.commit_oid, 40)
+        || !valid_path
+        || source.workflow_source_closure_digest.algorithm != "sha256"
+        || !lowercase_hex(&source.workflow_source_closure_digest.value, 64)
+    {
+        return Err(AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::InvalidSourceProjection,
+        ));
+    }
     Ok(())
+}
+
+fn lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn materialization_decline(failure: MaterializationFailure) -> AssignmentDecline {
+    let reason = match failure {
+        MaterializationFailure::UnsupportedObjectFormat => {
+            return AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
+            );
+        }
+        MaterializationFailure::CommitUnavailable | MaterializationFailure::CommitMismatch => {
+            ExecutionSpecInvalidReason::SourceCommitMismatch
+        }
+        MaterializationFailure::DirtyCheckout => ExecutionSpecInvalidReason::SourceCheckoutDirty,
+        MaterializationFailure::WorkflowUnavailable => {
+            ExecutionSpecInvalidReason::WorkflowSourceInvalid
+        }
+        MaterializationFailure::WorkflowDigestMismatch => {
+            ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch
+        }
+        MaterializationFailure::ProviderUnavailable | MaterializationFailure::AssignmentFenced => {
+            return AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable);
+        }
+        MaterializationFailure::EnvironmentUnavailable => return environment_unavailable(),
+    };
+    AssignmentDecline::ExecutionSpecInvalid(reason)
 }
 
 fn invalid_execution_limits() -> AssignmentDecline {
     AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::InvalidExecutionLimits)
 }
 
-fn admission_decline(failure: AdmissionFailure) -> AssignmentDecline {
+fn admission_decline(failure: AdmissionFailure, cloud_git_capture: bool) -> AssignmentDecline {
     let kind = failure.kind();
+    if cloud_git_capture {
+        match kind {
+            AdmissionFailureKind::GitObjectFormatUnsupported => {
+                return AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
+                );
+            }
+            AdmissionFailureKind::GitBaselineUnavailable => {
+                return AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCommitMismatch,
+                );
+            }
+            AdmissionFailureKind::GitInitialWorkspaceDirty => {
+                return AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCheckoutDirty,
+                );
+            }
+            AdmissionFailureKind::GitWorkflowDigestMismatch => {
+                return AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch,
+                );
+            }
+            AdmissionFailureKind::GitContextUnavailable
+            | AdmissionFailureKind::GitContextNotRepository
+            | AdmissionFailureKind::GitContextExecutionRootMismatch => {
+                return environment_unavailable();
+            }
+            _ => {}
+        }
+    }
     if kind.is_execution_root_failure() {
         environment_unavailable()
     } else if kind.is_projected_execution_limit_failure() {
         invalid_execution_limits()
+    } else if kind == AdmissionFailureKind::AgentStepRuntimeUnsupported {
+        AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowEnvironmentUnsupported)
     } else {
-        AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowAdmissionRejected)
+        AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::WorkflowAdmissionInvalid,
+        )
     }
 }
 
@@ -1644,11 +2173,12 @@ fn start_matches_offer(start: &AssignmentStart, offer: &AssignmentOffer) -> bool
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream as StandardTcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1659,10 +2189,15 @@ mod tests {
     use crate::execution::pi::ValidatedPiInstallation;
     use crate::runner::credential::test_credential;
     use crate::runner::service::config::Config;
+    use crate::runner::service::source::{
+        CredentialBrokerFailure, CredentialOperation, ProviderCredential,
+    };
     use crate::runner::service::test_support::{
         SleepRelease, controlled_sleeper, sleep_request, with_watchdog,
     };
     use crate::runner_protocol::{
+        ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
+        ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse,
         ExecutionLimitsV1RunnerProjection, ExecutionSourceV1RunnerProjection,
         WorkflowSourceClosureDigestV1RunnerProjection,
     };
@@ -1671,6 +2206,8 @@ mod tests {
     const NOW: &str = "2026-07-23T00:00:00Z";
     const COMMAND_FIXTURE_TEST_NAME: &str =
         "runner::service::assignment::tests::command_fixture_process";
+    const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
+        "runner::service::assignment::tests::failing_command_fixture_process";
     // SCHERZO_* variables are intentionally removed from admitted command environments.
     const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
     const SUCCESSFUL_PI: &str = r#"#!/bin/sh
@@ -1701,13 +2238,6 @@ steps:
       systemPrompt: system.md
       message:
         text: [{ file: system.md }]
-"#;
-    const COMMAND_ONLY_WORKFLOW: &str = r#"schemaVersion: 1
-steps:
-  command:
-    kind: cmd
-    command:
-      argv: ["true"]
 "#;
     const CLAUDE_CODE_ONLY_WORKFLOW: &str = r#"schemaVersion: 1
 agentProfiles:
@@ -1761,14 +2291,15 @@ steps:
 set -eu
 printf '%s\0' "$*" >> "${0%/*}/claude.calls"
 model=
+session=
 previous=
 for argument in "$@"; do
   if [ "$previous" = --model ]; then model=$argument; fi
+  if [ "$previous" = --session-id ]; then session=$argument; fi
   previous=$argument
 done
 while IFS= read -r _; do :; done
-session=00000000-0000-4000-8000-000000000098
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -1780,11 +2311,49 @@ printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s"
 printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"value","session_id":"%s"}\n' "$session"
 "#;
 
-    // Keep successful commands alive until the test observes them. A bare `true`
-    // can exit before the direct-child test path captures its process identity.
-    #[test]
-    #[ignore = "launched only as the assignment workflow command fixture"]
-    fn command_fixture_process() {
+    struct BlockingSourceBroker {
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        stopped: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        calls: AtomicUsize,
+    }
+
+    impl SourceCredentialBroker for BlockingSourceBroker {
+        fn issue(
+            &self,
+            _assignment_id: &str,
+            _repository_connection_id: &str,
+            _operation: CredentialOperation,
+            cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            while !cancellation.is_cancelled() {
+                crate::timing::sleep(Duration::from_millis(5));
+            }
+            if let Some(stopped) = self.stopped.lock().unwrap().take() {
+                let _ = stopped.send(());
+            }
+            Err(CredentialBrokerFailure::Fenced)
+        }
+    }
+
+    struct UnavailableSourceBroker;
+
+    impl SourceCredentialBroker for UnavailableSourceBroker {
+        fn issue(
+            &self,
+            _assignment_id: &str,
+            _repository_connection_id: &str,
+            _operation: CredentialOperation,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+    }
+
+    fn run_command_fixture() {
         let socket = std::env::var(COMMAND_FIXTURE_SOCKET).unwrap();
         let mut control = StandardTcpStream::connect(socket).unwrap();
         control.write_all(&[1]).unwrap();
@@ -1792,6 +2361,21 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let mut release = [0_u8; 1];
         control.read_exact(&mut release).unwrap();
         assert_eq!(release, [1]);
+    }
+
+    // Keep commands alive until the test observes them. Bare `true` and `false`
+    // commands can exit before the direct-child test path captures their process identity.
+    #[test]
+    #[ignore = "launched only as the assignment workflow command fixture"]
+    fn command_fixture_process() {
+        run_command_fixture();
+    }
+
+    #[test]
+    #[ignore = "launched only as the failing assignment workflow command fixture"]
+    fn failing_command_fixture_process() {
+        run_command_fixture();
+        panic!("intentional assignment command fixture failure");
     }
 
     struct FixedWallClockHealth {
@@ -1838,6 +2422,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
             assignment_id: format!("asn_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
             run_id: format!("run_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             attempt_id: format!("atm_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
             execution_spec: ExecutionSpecV1RunnerProjection {
                 execution_spec_id: format!("xsp_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
@@ -1847,7 +2432,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     maximum_parallel_steps: 1,
                     cancellation_grace_seconds: 1,
                 },
-                source: None,
+                source: production_source(),
             },
         }
     }
@@ -1874,7 +2459,18 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         expected: AssignmentDecline,
     ) {
         manager.handle_offer(offered).unwrap();
-        let pending = manager.pending_observations(&BTreeSet::new(), 1);
+        let mut pending = Vec::new();
+        for _ in 0..100 {
+            pending = manager.pending_observations(&BTreeSet::new(), 1);
+            if !pending.is_empty() {
+                break;
+            }
+            crate::timing::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !pending.is_empty(),
+            "assignment decline should become observable"
+        );
         assert!(matches!(
             &pending[0].observation,
             AssignmentObservation::Decision(AssignmentDecision::Rejected { decline, .. })
@@ -1906,13 +2502,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fs::create_dir(&work).unwrap();
         fs::write(source.join("workflow.yaml"), workflow).unwrap();
         fs::write(source.join("system.md"), "System.\n").unwrap();
-        let assignment = AssignmentConfig::new(
-            WORKFLOW_ID.to_owned(),
-            &source,
-            Path::new("workflow.yaml"),
-            &work,
-        )
-        .unwrap();
+        let assignment = AssignmentConfig::new(&work).unwrap();
         let mut config = Config::new(
             "wss://gateway.example.test/v1/runner/connect",
             test_credential(),
@@ -1938,7 +2528,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             wall_clock(Duration::ZERO),
             sleeper,
         );
+        manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
         manager.retain_lease_policy(&policy()).unwrap();
+        let mut environment = manager.environment.variables().clone();
+        environment.insert(
+            OsString::from("CLAUDE_CONFIG_DIR"),
+            temporary.path().join("claude-config").into_os_string(),
+        );
+        manager.environment = EnvironmentSnapshot::new(environment);
         (temporary, manager)
     }
 
@@ -1998,6 +2595,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 report: ExecutionReport::Finished {
                     final_execution_event_sequence: 1,
                     outcome: json!({ "outcome": "succeeded" }),
+                    artifact_delivery: json!({
+                        "outcome": "prepared",
+                        "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    }),
                 },
             })
             .unwrap()
@@ -2015,6 +2616,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 assignment_id: identity.assignment_id,
                 final_observation_id: Some(final_observation_id),
                 final_delivery_deadline: Some(final_delivery_deadline),
+                retained_root: None,
             })
             .unwrap();
         final_observation_id
@@ -2047,13 +2649,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         (temporary, manager, sleep_requests, offered)
     }
 
-    fn assert_workflow_admission_rejected(manager: &mut AssignmentManager) {
+    fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager) {
         let pending = manager.pending_observations(&BTreeSet::new(), 1);
         assert!(matches!(
             &pending[0].observation,
             AssignmentObservation::Decision(AssignmentDecision::Rejected {
                 decline: AssignmentDecline::RunnerUnable(
-                    RunnerUnableReason::WorkflowAdmissionRejected
+                    RunnerUnableReason::WorkflowEnvironmentUnsupported
                 ),
                 ..
             })
@@ -2071,12 +2673,56 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .expect("workflow did not finish")
     }
 
+    fn fail_pending_artifact_registrations(
+        manager: &mut AssignmentManager,
+        pending: &[PendingAssignmentObservation],
+    ) -> bool {
+        let registrations = pending
+            .iter()
+            .filter_map(|entry| match &entry.observation {
+                AssignmentObservation::Artifact {
+                    delivery_id,
+                    request: ArtifactRequest::RegisterCarrier { .. },
+                } => Some((entry.id, *delivery_id, false)),
+                AssignmentObservation::Artifact {
+                    delivery_id,
+                    request: ArtifactRequest::RegisterResult { .. },
+                } => Some((entry.id, *delivery_id, true)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (observation_id, delivery_id, is_result) in &registrations {
+            let response = if *is_result {
+                ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    outcome: ArtifactResultRegistrationOutcome::Failed {
+                        code: "storage_quota_exceeded".to_owned(),
+                    },
+                })
+            } else {
+                ArtifactCloudResponse::CarrierRegistration(ArtifactRegistrationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    outcome: ArtifactRegistrationOutcome::Failed {
+                        code: "storage_quota_exceeded".to_owned(),
+                    },
+                })
+            };
+            manager
+                .handle_artifact_response(*observation_id, *delivery_id, response)
+                .expect("test Cloud must close artifact registration");
+        }
+        !registrations.is_empty()
+    }
+
     async fn wait_for_terminal(manager: &mut AssignmentManager) -> Vec<ExecutionReport> {
         let notification = manager.notification();
         loop {
             let notified = notification.notified();
             tokio::pin!(notified);
             let pending = manager.pending_observations(&BTreeSet::new(), 100);
+            if fail_pending_artifact_registrations(manager, &pending) {
+                continue;
+            }
             if pending
                 .iter()
                 .any(|pending| pending.observation.is_terminal())
@@ -2086,7 +2732,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     .filter_map(|pending| match pending.observation {
                         AssignmentObservation::Execution { report, .. } => Some(report),
                         AssignmentObservation::Decision(_)
-                        | AssignmentObservation::LeaseRenewalRequested { .. } => None,
+                        | AssignmentObservation::LeaseRenewalRequested { .. }
+                        | AssignmentObservation::Artifact { .. } => None,
                     })
                     .collect();
             }
@@ -2095,6 +2742,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn command_fixture_arguments() -> Vec<String> {
+        command_fixture_arguments_for(COMMAND_FIXTURE_TEST_NAME)
+    }
+
+    fn failing_command_fixture_arguments() -> Vec<String> {
+        command_fixture_arguments_for(FAILING_COMMAND_FIXTURE_TEST_NAME)
+    }
+
+    fn command_fixture_arguments_for(test_name: &str) -> Vec<String> {
         std::iter::once(
             std::env::current_exe()
                 .unwrap()
@@ -2103,14 +2758,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 .to_owned(),
         )
         .chain(
-            [
-                "--ignored",
-                "--exact",
-                COMMAND_FIXTURE_TEST_NAME,
-                "--nocapture",
-            ]
-            .into_iter()
-            .map(str::to_owned),
+            ["--ignored", "--exact", test_name, "--nocapture"]
+                .into_iter()
+                .map(str::to_owned),
         )
         .collect()
     }
@@ -2160,15 +2810,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         pi_source: Option<&str>,
         command_count: usize,
     ) -> Vec<ExecutionReport> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let (_temporary, mut manager) = manager_fixture_with_pi(workflow, pi_source);
-        install_command_fixture_environment(
-            &mut manager,
-            listener.local_addr().unwrap().to_string(),
-        );
-        let offered = offer("bg");
-        manager.handle_offer(offered.clone()).unwrap();
-        execute_fixture_to_terminal(&mut manager, &offered, &listener, command_count).await
+        offer_and_execute_with_command_fixtures(&mut manager, command_count).await
     }
 
     fn assert_succeeded(reports: &[ExecutionReport]) {
@@ -2186,6 +2829,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         execute_to_terminal(manager, &offered).await
+    }
+
+    async fn offer_and_execute_with_command_fixtures(
+        manager: &mut AssignmentManager,
+        command_count: usize,
+    ) -> Vec<ExecutionReport> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        install_command_fixture_environment(manager, listener.local_addr().unwrap().to_string());
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        execute_fixture_to_terminal(manager, &offered, &listener, command_count).await
     }
 
     fn assert_workflow_succeeded(reports: &[ExecutionReport]) {
@@ -2213,49 +2867,119 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[test]
-    fn rejects_file_and_git_branch_outputs_before_acceptance() {
-        for output in [
-            "        kind: file\n        path: value.txt\n        mediaType: text/plain\n",
-            "        kind: git_branch\n",
-        ] {
-            let workflow = format!(
-                "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n{output}"
-            );
-            let (_temporary, mut manager) = manager_fixture(&workflow);
-            assert_offer_declined(
-                &mut manager,
-                offer("bg"),
-                AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowContractInvalid),
-            );
-        }
+    fn admits_file_exports_for_cloud_delivery() {
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n        kind: file\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        manager.handle_offer(offer("bg")).unwrap();
+        let pending = manager.pending_observations(&BTreeSet::new(), 1);
+        assert!(matches!(
+            pending[0].observation,
+            AssignmentObservation::Decision(AssignmentDecision::Accepted { .. })
+        ));
     }
 
     #[test]
-    fn cloud_source_is_not_replaced_by_the_development_workflow_mapping() {
+    fn malformed_and_unsupported_source_projections_have_closed_declines() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        let mut offered = offer("bg");
-        offered.execution_spec.source = Some(production_source());
-
+        let mut unsupported = offer("bg");
+        unsupported.execution_spec.source.object_format = "sha256".to_owned();
         assert_offer_declined(
             &mut manager,
-            offered,
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable),
+            unsupported,
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
+            ),
+        );
+
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let mut malformed = offer("bh");
+        malformed.execution_spec.source.commit_oid = "not-an-oid".to_owned();
+        assert_offer_declined(
+            &mut manager,
+            malformed,
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::InvalidSourceProjection,
+            ),
         );
     }
 
     #[test]
-    fn workflow_mapping_rejection_precedes_unhealthy_wall_clock() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds the blocking source fixture's readiness messages"
+    )]
+    fn release_fences_source_preparation_and_exact_replay_cannot_reissue() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        manager.wall_clock = wall_clock(Duration::from_millis(1001));
-        let mut offered = offer("bg");
-        offered.execution_spec.registered_workflow_id = "wfl_01k0z6r1w8f4jy2m7q9v3x5abs".to_owned();
+        let offered = offer("bg");
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (stopped_sender, stopped_receiver) = std::sync::mpsc::sync_channel(1);
+        let broker = Arc::new(BlockingSourceBroker {
+            started: Mutex::new(Some(started_sender)),
+            stopped: Mutex::new(Some(stopped_sender)),
+            calls: AtomicUsize::new(0),
+        });
+        manager.fixture_materialized_source = None;
+        manager.source_broker = Some(broker.clone());
+
+        manager.handle_offer(offered.clone()).unwrap();
+        assert!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
+        manager
+            .handle_release(
+                &offered.assignment_id,
+                &offered.run_id,
+                &offered.attempt_id,
+                "offer_expired",
+            )
+            .unwrap();
+        assert!(manager.slot.is_none());
+        assert!(
+            stopped_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+
+        manager.handle_offer(offered).unwrap();
+        assert_eq!(broker.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            manager
+                .pending_observations(&BTreeSet::new(), 10)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_materialization_declines_preserve_failure_provenance() {
+        assert_eq!(
+            materialization_decline(MaterializationFailure::CommitUnavailable),
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::SourceCommitMismatch,
+            )
+        );
+        assert_eq!(
+            materialization_decline(MaterializationFailure::EnvironmentUnavailable),
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
+        );
+    }
+
+    #[test]
+    fn source_credential_failure_declines_the_assignment() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        manager.fixture_materialized_source = None;
+        manager.source_broker = Some(Arc::new(UnavailableSourceBroker));
 
         assert_offer_declined(
             &mut manager,
             offered,
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowMappingUnavailable),
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
         );
     }
 
@@ -2281,18 +3005,98 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_eq!(manager.active_step_count(), Some(1));
     }
 
+    #[tokio::test]
+    async fn managed_workflow_environment_excludes_runner_credentials_and_helpers() {
+        let workflow = r#"schemaVersion: 1
+steps:
+  check:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - 'test "$RUNNER_VISIBLE" = retained && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${SCHERZO_SOURCE_TOKEN_FD+x}"'
+"#;
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let mut variables = manager.environment.variables().clone();
+        for (name, value) in [
+            ("RUNNER_VISIBLE", "retained"),
+            ("GIT_ASKPASS", "/runner/private/askpass"),
+            ("GIT_ASKPASS_REQUIRE", "force"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_CONFIG", "runner-private"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_PARAMETERS", "runner-private"),
+            ("GIT_CONFIG_GLOBAL", "/runner/private/gitconfig"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_SYSTEM", "/runner/private/system-gitconfig"),
+            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+            ("GIT_CONFIG_VALUE_0", "authorization: runner-private"),
+            ("GIT_SSH", "/runner/private/ssh"),
+            ("GIT_SSH_COMMAND", "/runner/private/ssh --private"),
+            ("SSH_ASKPASS", "/runner/private/ssh-askpass"),
+            ("SSH_ASKPASS_REQUIRE", "force"),
+            ("SSH_AUTH_SOCK", "/runner/private/agent.sock"),
+            ("SSH_AGENT_PID", "4242"),
+            ("GH_TOKEN", "runner-private"),
+            ("GITHUB_TOKEN", "runner-private"),
+            ("SCHERZO_SOURCE_TOKEN_FD", "9"),
+        ] {
+            variables.insert(OsString::from(name), OsString::from(value));
+        }
+        manager.environment = EnvironmentSnapshot::new(variables);
+        let offered = offer("bg");
+
+        manager.handle_offer(offered.clone()).unwrap();
+
+        let environment = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => accepted.admitted.execution().environment(),
+            _ => panic!("assignment should be accepted"),
+        };
+        assert_eq!(
+            environment.variable(OsStr::new("RUNNER_VISIBLE")),
+            Some(OsStr::new("retained"))
+        );
+        for name in [
+            "GIT_ASKPASS",
+            "GIT_ASKPASS_REQUIRE",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SCHERZO_SOURCE_TOKEN_FD",
+        ] {
+            assert!(environment.variable(OsStr::new(name)).is_none(), "{name}");
+        }
+
+        assert_workflow_succeeded(&execute_to_terminal(&mut manager, &offered).await);
+    }
+
     #[test]
     fn admission_requires_only_the_harness_selected_by_the_assignment() {
         let (pi_temporary, mut pi_manager) =
             manager_fixture_with_harnesses(PI_ONLY_WORKFLOW, None, Some(SUCCESSFUL_CLAUDE_CODE));
         pi_manager.handle_offer(offer("bg")).unwrap();
-        assert_workflow_admission_rejected(&mut pi_manager);
+        assert_workflow_environment_unsupported(&mut pi_manager);
         assert!(!pi_temporary.path().join("claude.calls").exists());
 
         let (claude_temporary, mut claude_manager) =
             manager_fixture_with_harnesses(CLAUDE_CODE_ONLY_WORKFLOW, Some(SUCCESSFUL_PI), None);
         claude_manager.handle_offer(offer("bg")).unwrap();
-        assert_workflow_admission_rejected(&mut claude_manager);
+        assert_workflow_environment_unsupported(&mut claude_manager);
         assert!(!claude_temporary.path().join("pi.calls").exists());
     }
 
@@ -2318,8 +3122,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn shutdown_preserves_unsent_acceptance_before_interruption() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    async fn accepted_phase_shutdown_omits_non_authoritative_finalization() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         manager.handle_offer(offer("bg")).unwrap();
 
@@ -2364,36 +3168,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn shutdown_quiesces_running_work_and_reports_interruption() {
-        let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
+    async fn shutdown_rearms_after_the_finalization_boundary_and_reports_summary() {
+        let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         spawn_execution(&mut manager, &offered);
         manager.begin_shutdown().unwrap();
 
-        let notification = manager.notification();
-        let reports = with_watchdog(async {
-            loop {
-                let notified = notification.notified();
-                tokio::pin!(notified);
-                let reports: Vec<_> = manager
-                    .pending_observations(&BTreeSet::new(), 100)
-                    .into_iter()
-                    .filter_map(|pending| match pending.observation {
-                        AssignmentObservation::Execution { report, .. } => Some(report),
-                        AssignmentObservation::Decision(_)
-                        | AssignmentObservation::LeaseRenewalRequested { .. } => None,
-                    })
-                    .collect();
-                if reports.iter().any(ExecutionReport::is_terminal) {
-                    break reports;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("shutdown did not quiesce execution");
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("shutdown did not quiesce execution");
 
         assert!(matches!(
             reports.last(),
@@ -2403,6 +3188,11 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 ..
             }) if reason == "graceful_shutdown"
                 && terminal_outcome["reason"] == "runner_shutdown"
+                && terminal_outcome["finalization"]["trigger"] == "cancelled"
+                && terminal_outcome["finalization"]["cancellation"]["reason"]
+                    == "runner_shutdown"
+                && terminal_outcome["finalization"]["finalizers"][0]["id"] == "cleanup"
+                && terminal_outcome["finalization"]["finalizers"][0]["state"] == "cancelled"
         ));
     }
 
@@ -2576,6 +3366,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 let notified = notification.notified();
                 tokio::pin!(notified);
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
+                if fail_pending_artifact_registrations(&mut manager, &pending) {
+                    continue;
+                }
                 if pending.iter().any(|entry| entry.observation.is_terminal()) {
                     manager.pending_observations(&BTreeSet::new(), 100);
                     break;
@@ -2585,6 +3378,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         })
         .await
         .expect("workflow did not select a terminal report");
+
+        let (artifact_duration, _artifact_release) =
+            with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
+        assert_eq!(artifact_duration, Duration::from_secs(13));
 
         let (delivery_duration, _delivery_release) =
             with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
@@ -2613,6 +3410,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 assignment_id: offered.assignment_id,
                 final_observation_id: None,
                 final_delivery_deadline: None,
+                retained_root: None,
             })
             .unwrap();
 
@@ -2718,6 +3516,85 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert!(
             duration <= Duration::from_secs(13),
             "first lease timer was scheduled at {duration:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report() {
+        let (_temporary, mut manager, mut sleep_requests, _offered) = controlled_running_fixture();
+
+        sleep_request(&mut sleep_requests, Duration::from_secs(13))
+            .await
+            .release();
+        sleep_request(&mut sleep_requests, Duration::from_secs(5))
+            .await
+            .release();
+
+        let notification = manager.notification();
+        let report = with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                let pending = manager.pending_observations(&BTreeSet::new(), 100);
+                if let Some(artifact) = pending
+                    .iter()
+                    .find(|entry| entry.artifact_delivery_id().is_some())
+                {
+                    manager
+                        .handle_artifact_response(
+                            artifact.id,
+                            artifact.artifact_delivery_id().unwrap(),
+                            ArtifactCloudResponse::ResultRegistration(
+                                ArtifactResultRegistrationResponse {
+                                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc"
+                                        .to_owned(),
+                                    outcome: ArtifactResultRegistrationOutcome::Failed {
+                                        code: "storage_quota_exceeded".to_owned(),
+                                    },
+                                },
+                            ),
+                        )
+                        .expect("lease-loss delivery registration must remain authoritative");
+                }
+                if let Some(report) =
+                    pending
+                        .into_iter()
+                        .find_map(|entry| match entry.observation {
+                            AssignmentObservation::Execution { report, .. }
+                                if report.is_terminal() =>
+                            {
+                                Some(report)
+                            }
+                            _ => None,
+                        })
+                {
+                    break report;
+                }
+                assert!(
+                    manager.slot.is_some(),
+                    "orderly lease-loss quiescence dropped the terminal artifact delivery"
+                );
+                notified.await;
+            }
+        })
+        .await
+        .expect("lease-loss delivery did not close");
+
+        assert!(
+            matches!(
+                &report,
+                ExecutionReport::Interrupted {
+                    reason,
+                    artifact_delivery,
+                    ..
+                } if reason == "execution_lease_expired"
+                    && artifact_delivery == &json!({
+                        "outcome": "failed",
+                        "phase": "registration",
+                        "code": "storage_quota_exceeded",
+                    })
+            ),
+            "unexpected lease-loss report: {report:?}"
         );
     }
 
@@ -2871,11 +3748,23 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     #[tokio::test]
     async fn command_pi_claude_and_mixed_assignment_matrix_invokes_only_declared_harnesses() {
-        for (workflow, pi_source, claude_code_source, expected_pi, expected_claude) in [
+        let fixture_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
+        let command_only_workflow = format!(
+            "schemaVersion: 1\nsteps:\n  command:\n    kind: cmd\n    command:\n      argv: {fixture_argv}\n"
+        );
+        for (
+            workflow,
+            pi_source,
+            claude_code_source,
+            command_count,
+            expected_pi,
+            expected_claude,
+        ) in [
             (
-                COMMAND_ONLY_WORKFLOW,
+                command_only_workflow.as_str(),
                 Some(SUCCESSFUL_PI),
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                1,
                 false,
                 false,
             ),
@@ -2883,6 +3772,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 PI_ONLY_WORKFLOW,
                 Some(SUCCESSFUL_PI),
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                0,
                 true,
                 false,
             ),
@@ -2890,6 +3780,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 CLAUDE_CODE_ONLY_WORKFLOW,
                 Some(SUCCESSFUL_PI),
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                0,
                 false,
                 true,
             ),
@@ -2897,13 +3788,18 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 MIXED_HARNESS_WORKFLOW,
                 Some(SUCCESSFUL_PI),
                 Some(SUCCESSFUL_CLAUDE_CODE),
+                0,
                 true,
                 true,
             ),
         ] {
             let (temporary, mut manager) =
                 manager_fixture_with_harnesses(workflow, pi_source, claude_code_source);
-            let reports = offer_and_execute(&mut manager).await;
+            let reports = if command_count == 0 {
+                offer_and_execute(&mut manager).await
+            } else {
+                offer_and_execute_with_command_fixtures(&mut manager, command_count).await
+            };
 
             assert_workflow_succeeded(&reports);
             assert_eq!(
@@ -3051,6 +3947,40 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         ));
     }
 
+    #[tokio::test]
+    async fn outputless_finalizers_emit_roles_phase_and_authoritative_summary() {
+        let successful_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
+        let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();
+        let workflow = format!(
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: {successful_argv}\nfinalizers:\n  cleanup:\n    kind: cmd\n    inputs:\n      context:\n        ref: finalization.context\n    command:\n      argv: {successful_argv}\n  report:\n    kind: cmd\n    failurePolicy: advisory\n    command:\n      argv: {failing_argv}\n"
+        );
+        let reports = execute_fixture_workflow(&workflow, None, 3).await;
+
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["eventType"] == "workflow_state_changed"
+                    && workflow_event["to"]["state"] == "finalizing"
+                    && workflow_event["to"]["gate"] == "open"
+        )));
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["eventType"] == "step_state_changed"
+                    && workflow_event["stepId"] == "cleanup"
+                    && workflow_event["role"] == "finalizer"
+        )));
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "succeeded"
+                    && outcome["finalization"]["trigger"] == "succeeded"
+                    && outcome["finalization"]["finalizers"].as_array().map(Vec::len) == Some(2)
+                    && outcome["finalization"]["issues"][0]["node"]["id"] == "report"
+                    && outcome["finalization"]["issues"][0]["impact"] == "advisory"
+        ));
+    }
+
     #[test]
     fn oversized_workflow_is_rejected_before_semantic_acceptance() {
         let mut workflow = String::from("schemaVersion: 1\nsteps:\n");
@@ -3063,12 +3993,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_offer_declined(
             &mut manager,
             offer("bg"),
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable),
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+            ),
         );
     }
 
     #[test]
-    fn general_transition_reservation_reaches_the_service_limit() {
+    fn narrow_transition_reservation_uses_the_piecewise_node_bound() {
         let outbox = ObservationOutbox::new();
         for _ in 0..32 {
             outbox
@@ -3079,18 +4011,21 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 })
                 .unwrap();
         }
-        let transition_entries = MAXIMUM_TRANSITIONS_PER_STEP * MAXIMUM_PARALLEL_STEPS;
+        let ordinary_maximum = MAXIMUM_TRANSITIONS_PER_NODE * MAXIMUM_PARALLEL_STEPS + 3;
+        let finalizer_maximum = MAXIMUM_TRANSITIONS_PER_NODE * MAXIMUM_PARALLEL_STEPS + 6;
+        assert_eq!(ordinary_maximum, 1_027);
+        assert_eq!(finalizer_maximum, 1_030);
         assert_eq!(
-            transition_entries + OBSERVATION_RESERVE_BASE,
-            MAXIMUM_SERVICE_OBSERVATIONS
+            outbox.reserve(MAXIMUM_PARALLEL_STEPS, 0),
+            Ok(ordinary_maximum)
         );
         assert_eq!(
-            outbox.reserve(MAXIMUM_PARALLEL_STEPS),
-            Ok(transition_entries + 3)
+            outbox.reserve(MAXIMUM_PARALLEL_STEPS - 1, 1),
+            Ok(finalizer_maximum)
         );
-        assert!(outbox.lock().entries.capacity() >= MAXIMUM_SERVICE_OBSERVATIONS);
+        assert!(outbox.lock().entries.capacity() >= finalizer_maximum + OBSERVATION_RESERVE_BASE);
         assert_eq!(
-            outbox.reserve(MAXIMUM_PARALLEL_STEPS + 1),
+            outbox.reserve(MAXIMUM_PARALLEL_STEPS, 1),
             Err(environment_unavailable())
         );
         assert_eq!(outbox.len(), 32);
@@ -3151,6 +4086,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
                 identity,
                 final_observation_id,
+                _retained_root: None,
             }));
         }
 
@@ -3171,6 +4107,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity: identity.clone(),
             final_observation_id,
+            _retained_root: None,
         }));
         manager
             .event_sender
@@ -3191,6 +4128,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity,
             final_observation_id,
+            _retained_root: None,
         }));
         manager.handle_offer(offer("bh")).unwrap();
         assert_eq!(manager.outbox.len(), 2);

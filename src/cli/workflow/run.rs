@@ -20,10 +20,12 @@ use crate::execution::AgentHarnessInstallationFailure;
 use crate::execution::claude_code::discover_and_validate_claude_code_installation;
 use crate::execution::pi::discover_and_validate_pi_installation;
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
+#[cfg(test)]
+use crate::execution::workflow::admission::admit_workflow;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
     EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, MAXIMUM_AGENT_PROMPT_BYTES,
-    ResolvedAttachment, ResolvedImports, admit_workflow, default_execution_policy_limits,
+    ResolvedAttachment, ResolvedImports, admit_local_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -47,9 +49,11 @@ use crate::execution::workflow::presentation::{
 };
 use crate::execution::workflow::presentation_feed::DisplayDeadline;
 use crate::execution::workflow::publication::{
-    LocalPublicationError, LocalPublicationPhase, WorkflowRunCancellation, WorkflowRunResult,
-    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
-    WorkflowStepTiming, prepare_attempt_result_destination, publish_prepared_workflow_result,
+    LocalPublicationError, LocalPublicationPhase, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
+    WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowStepTiming,
+    prepare_attempt_result_destination, publish_prepared_workflow_result,
+    summary_disposition_matches,
 };
 use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve_workflow_file};
 use crate::execution::workflow::run_timing::{
@@ -61,6 +65,7 @@ use crate::execution::workflow::run_view_model::{
 use crate::execution::workflow::runtime::RunOutcome;
 use crate::execution::workflow::step_runtime::AgentExecution;
 use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
+use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
@@ -174,7 +179,7 @@ impl Command {
                 });
             }
         };
-        let admitted = match admit_workflow(workflow.clone(), imports, context) {
+        let admitted = match admit_local_workflow(workflow.clone(), imports, context) {
             Ok(admitted) => admitted,
             Err(failure) => {
                 signal_task.abort();
@@ -243,7 +248,7 @@ pub(super) fn presentation_config(presentation: &super::PresentationOptions) -> 
     presentation_config_with(presentation, false, TerminalCapabilities::detect())
 }
 
-fn presentation_config_with(
+pub(super) fn presentation_config_with(
     presentation: &super::PresentationOptions,
     standard_input_reserved: bool,
     capabilities: TerminalCapabilities,
@@ -692,9 +697,20 @@ pub(super) fn execution_context_for_workflow(
 
     let mut pi_validated = false;
     let mut claude_code_validated = false;
-    for step_name in &workflow.definition.source_order {
+    for step_name in workflow
+        .definition
+        .source_order
+        .iter()
+        .chain(&workflow.definition.finalizer_source_order)
+    {
         let Some(crate::execution::workflow::validated::ValidatedStep::Agent(step)) =
-            workflow.definition.steps.get(step_name)
+            workflow.definition.steps.get(step_name).or_else(|| {
+                workflow
+                    .definition
+                    .finalizers
+                    .get(step_name)
+                    .map(|finalizer| &finalizer.body)
+            })
         else {
             continue;
         };
@@ -912,17 +928,29 @@ pub(super) fn start_signal_observation(
         .context("install local workflow interrupt observation")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install local workflow termination observation")?;
-    Ok(tokio::spawn(observe_first_signal(
-        async move {
-            let _ = interrupt.recv().await;
-        },
-        async move {
-            let _ = terminate.recv().await;
-        },
-        cancellation,
-    )))
+    Ok(tokio::spawn(async move {
+        loop {
+            let reason = tokio::select! {
+                biased;
+                signal = interrupt.recv() => signal.map(|()| CancellationReason::UserRequest),
+                signal = terminate.recv() => {
+                    signal.map(|()| CancellationReason::TerminationRequest)
+                }
+            };
+            let Some(reason) = reason else {
+                return;
+            };
+            if cancellation.request_cancellation(reason) {
+                continue;
+            }
+            if cancellation.request_force_abort() {
+                return;
+            }
+        }
+    }))
 }
 
+#[cfg(test)]
 async fn observe_first_signal(
     interrupt: impl Future<Output = ()> + Send,
     terminate: impl Future<Output = ()> + Send,
@@ -1356,27 +1384,31 @@ fn build_run_result(
     workflow: &ResolvedWorkflow,
     admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
     diagnostics: &StepDiagnosticLog,
-    execution: WorkflowExecutionResult,
+    execution: WorkflowExecutionResult<ExecutionInstant>,
     timing: RunTimingSnapshot,
     run_timing: WorkflowRunTiming,
     local_run: &InitialLocalRun,
 ) -> anyhow::Result<WorkflowRunResult> {
-    let expected_cancellation = match &execution.outcome {
-        RunOutcome::Succeeded => None,
-        RunOutcome::Failed {
-            later_cancellation, ..
-        } => *later_cancellation,
-        RunOutcome::Cancelled { reason } => Some(*reason),
-    };
-    let cancellation = match (expected_cancellation, timing.cancellation) {
-        (None, None) => None,
-        (Some(reason), Some((observed, deadline))) if reason == observed => {
+    let cancellation = match timing.cancellation {
+        None => None,
+        Some((reason, deadline)) => {
+            let retained_by_outcome = match &execution.outcome {
+                RunOutcome::Succeeded => false,
+                RunOutcome::Failed {
+                    later_cancellation, ..
+                } => *later_cancellation == Some(reason),
+                RunOutcome::Cancelled {
+                    reason: outcome_reason,
+                } => *outcome_reason == reason,
+            };
+            if !retained_by_outcome {
+                return Err(invalid_terminal_result_error());
+            }
             Some(WorkflowRunCancellation {
                 reason,
                 force_stop_deadline: deadline,
             })
         }
-        _ => return Err(invalid_terminal_result_error()),
     };
     let mut states = execution.steps;
     let mut steps = Vec::with_capacity(states.len());
@@ -1405,6 +1437,7 @@ fn build_run_result(
         };
         steps.push(WorkflowRunStep {
             id: id.clone(),
+            role: WorkflowNodeRole::Step,
             kind,
             failure_policy,
             state,
@@ -1414,6 +1447,73 @@ fn build_run_result(
                 .flatten(),
         });
     }
+    let finalization = match (
+        workflow.definition.finalizers.is_empty(),
+        execution.finalization_summary,
+    ) {
+        (true, None) => None,
+        (false, Some(summary)) => {
+            let mut retained = summary
+                .finalizers
+                .into_iter()
+                .map(|finalizer| (finalizer.finalizer.clone(), finalizer))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut finalizers = Vec::with_capacity(retained.len());
+            for id in &workflow.definition.finalizer_presentation_order {
+                let state = states
+                    .remove(id)
+                    .ok_or_else(invalid_terminal_result_error)?;
+                let summarized = retained
+                    .remove(id)
+                    .ok_or_else(invalid_terminal_result_error)?;
+                if summarized.failure_policy
+                    != finalizer_failure_policy(workflow, id)
+                        .ok_or_else(invalid_terminal_result_error)?
+                    || !summary_disposition_matches(&summarized.disposition, &state)
+                {
+                    return Err(invalid_terminal_result_error());
+                }
+                let timing = match timing.steps.get(id) {
+                    None => None,
+                    Some(timing) => {
+                        let finished = timing.finished.ok_or_else(invalid_terminal_result_error)?;
+                        Some(WorkflowStepTiming {
+                            started_at: timing.started.utc,
+                            duration: finished.saturating_duration_since(timing.started.monotonic),
+                        })
+                    }
+                };
+                let (kind, failure_policy) = finalizer_kind_and_policy(workflow, id)
+                    .ok_or_else(invalid_terminal_result_error)?;
+                finalizers.push(WorkflowRunStep {
+                    id: id.clone(),
+                    role: WorkflowNodeRole::Finalizer,
+                    kind,
+                    failure_policy,
+                    state,
+                    timing,
+                    command_output: (kind == WorkflowRunStepKind::Command)
+                        .then(|| diagnostics.get(id))
+                        .flatten(),
+                });
+            }
+            if !retained.is_empty() {
+                return Err(invalid_terminal_result_error());
+            }
+            Some(WorkflowRunFinalization {
+                trigger: summary.trigger,
+                finalizers,
+                cancellation: summary.cancellation.map(|cancellation| {
+                    WorkflowRunFinalizationCancellation {
+                        reason: cancellation.reason,
+                        force_stop_deadline: cancellation.deadline.map(|deadline| deadline.utc),
+                    }
+                }),
+                force_abort: summary.force_abort,
+            })
+        }
+        (true, Some(_)) | (false, None) => return Err(invalid_terminal_result_error()),
+    };
     if !states.is_empty() {
         return Err(invalid_terminal_result_error());
     }
@@ -1429,9 +1529,36 @@ fn build_run_result(
         outcome: execution.outcome,
         cancellation,
         steps,
+        finalization,
         exports: execution.exports,
         export_sources: workflow.definition.exports.clone(),
     })
+}
+
+fn finalizer_kind_and_policy(
+    workflow: &ResolvedWorkflow,
+    id: &str,
+) -> Option<(
+    WorkflowRunStepKind,
+    crate::execution::workflow::document::FailurePolicy,
+)> {
+    let finalizer = workflow.definition.finalizers.get(id)?;
+    let (kind, policy) = match &finalizer.body {
+        crate::execution::workflow::validated::ValidatedStep::Command(command) => {
+            (WorkflowRunStepKind::Command, command.common.failure_policy)
+        }
+        crate::execution::workflow::validated::ValidatedStep::Agent(agent) => {
+            (WorkflowRunStepKind::Agent, agent.common.failure_policy)
+        }
+    };
+    Some((kind, policy))
+}
+
+fn finalizer_failure_policy(
+    workflow: &ResolvedWorkflow,
+    id: &str,
+) -> Option<crate::execution::workflow::document::FailurePolicy> {
+    finalizer_kind_and_policy(workflow, id).map(|(_, policy)| policy)
 }
 
 fn invalid_terminal_result_error() -> anyhow::Error {
@@ -1874,6 +2001,7 @@ mod tests {
             event: TransitionEvent::Step {
                 sequence: TransitionSequence::default(),
                 step: "step".to_owned(),
+                role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                 failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
                 from,
                 to,

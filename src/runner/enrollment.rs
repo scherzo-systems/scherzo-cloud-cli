@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -109,15 +109,6 @@ struct OperatorConfig {
     runner_state_path: PathBuf,
     control_socket_path: PathBuf,
     work_root: PathBuf,
-    development_workflow: DevelopmentWorkflow,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct DevelopmentWorkflow {
-    workflow_id: String,
-    source_root: PathBuf,
-    workflow_path: PathBuf,
 }
 
 // RunnerServiceConfiguration is the validated startup projection shared by
@@ -131,9 +122,6 @@ pub(crate) struct RunnerServiceConfiguration {
     pub(super) pending_credential: Option<PendingCredential>,
     pub(super) state_access: RunnerStateAccess,
     pub(super) control_socket_path: PathBuf,
-    pub(super) workflow_id: String,
-    pub(super) workflow_source_root: PathBuf,
-    pub(super) workflow_path: PathBuf,
     pub(super) work_root: PathBuf,
 }
 
@@ -586,9 +574,6 @@ pub(crate) fn load_runner_service_configuration(
             deployment_mode: config.deployment_mode,
         },
         control_socket_path: config.control_socket_path,
-        workflow_id: config.development_workflow.workflow_id,
-        workflow_source_root: config.development_workflow.source_root,
-        workflow_path: config.development_workflow.workflow_path,
         work_root: config.work_root,
     })
 }
@@ -711,24 +696,6 @@ fn load_operator_config(path: &Path) -> Result<OperatorConfig, EnrollmentError> 
         || !config.runner_state_path.is_absolute()
         || !config.control_socket_path.is_absolute()
         || !config.work_root.is_absolute()
-        || !config.development_workflow.source_root.is_absolute()
-        || !valid_typed_id(&config.development_workflow.workflow_id, "wfl_")
-        || config
-            .development_workflow
-            .workflow_path
-            .as_os_str()
-            .is_empty()
-        || config.development_workflow.workflow_path.is_absolute()
-        || config
-            .development_workflow
-            .workflow_path
-            .components()
-            .any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
     {
         return Err(EnrollmentError::InvalidConfig);
     }

@@ -285,6 +285,9 @@ impl Drop for SocketGuard {
         }) {
             let _ = fs::remove_file(&self.path);
         }
+        // A concurrent fork can briefly retain this close-on-exec descriptor.
+        // Unlock explicitly so that child cannot delay the next bind until exec.
+        let _ = FileExt::unlock(&self._lock);
     }
 }
 

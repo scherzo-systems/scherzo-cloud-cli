@@ -43,6 +43,8 @@ pub(crate) mod attribute {
         "scherzo.protocol.acknowledged_sequence";
     pub(crate) const PROTOCOL_CLOSE_CODE: &str = "scherzo.protocol.close_code";
     pub(crate) const PROTOCOL_CLOSE_INITIATOR: &str = "scherzo.protocol.close_initiator";
+    pub(crate) const PROTOCOL_DECLINE_REASON: &str = "scherzo.protocol.decline_reason";
+    pub(crate) const PROTOCOL_DECLINE_TYPE: &str = "scherzo.protocol.decline_type";
     pub(crate) const PROTOCOL_DIRECTION: &str = "scherzo.protocol.direction";
     pub(crate) const PROTOCOL_EVENT: &str = "scherzo.protocol.event";
     pub(crate) const PROTOCOL_FRAME_KIND: &str = "scherzo.protocol.frame_kind";
@@ -57,7 +59,6 @@ pub(crate) mod attribute {
     pub(crate) const PROTOCOL_SENT_AT: &str = "scherzo.protocol.sent_at";
     pub(crate) const PROTOCOL_TIMER: &str = "scherzo.protocol.timer";
     pub(crate) const PROTOCOL_VERSION: &str = "scherzo.protocol.version";
-    pub(crate) const RUNNER_MAX_CONCURRENT_RUNS: &str = "scherzo.runner.max_concurrent_runs";
     pub(crate) const RUNNER_SESSION_ID: &str = "scherzo.runner.session_id";
 }
 

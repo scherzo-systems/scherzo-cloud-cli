@@ -22,9 +22,9 @@ Keep this command aligned with public CI. Do not place substantive test logic on
 publication workflow or mirror script.
 
 The implementation language is Rust. Keep `scripts/check` as the complete isolated
-validation entrypoint. It must continue to run deterministic formatting checks, Clippy,
-unit and integration tests, dependency and import boundary validation, and a complete
-release build.
+validation entrypoint and enter `scripts/strict-devenv` before its test logic runs. It
+must continue to run deterministic formatting checks, Clippy, unit and integration tests,
+dependency and import boundary validation, and a complete release build.
 
 ## Release policy
 

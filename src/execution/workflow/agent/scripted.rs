@@ -10,7 +10,7 @@ use super::{
     AgentInvocationIdentity, AgentObservation, AgentObservationEmissionError, AgentObservationSink,
     AgentOutcome, AgentStartCallback, AgentStartReportError, AgentTerminalCallback,
     AgentTerminalReportError, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
-    CompletedAgentInvocation,
+    CompletedAgentInvocation, failed_agent_outcome,
 };
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
@@ -347,9 +347,9 @@ where
             })
             .is_err()
         {
-            let _ = terminal.report(AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            });
+            let _ = terminal.report(failed_agent_outcome(
+                AgentFailureCause::HarnessProtocolFailed,
+            ));
             return;
         }
 
@@ -366,9 +366,9 @@ where
                 biased;
                 changed = cancellation.changed() => {
                     if changed.is_err() {
-                        let _ = terminal.report(AgentOutcome::Failed {
-                            cause: AgentFailureCause::HarnessProtocolFailed,
-                        });
+                        let _ = terminal.report(failed_agent_outcome(
+                            AgentFailureCause::HarnessProtocolFailed,
+                        ));
                         return;
                     }
                     if let Some(reason) = *cancellation.borrow_and_update() {
@@ -442,7 +442,7 @@ where
                             acknowledged,
                         } => {
                             let outcome = cancellation_outcome(&invocation)
-                                .unwrap_or(AgentOutcome::Failed { cause });
+                                .unwrap_or_else(|| failed_agent_outcome(cause));
                             let result = terminal.report(outcome).map_err(ScriptedAgentError::from);
                             let _ = acknowledged.send(result);
                             return;
@@ -452,9 +452,8 @@ where
             }
         }
 
-        let outcome = cancellation_outcome(&invocation).unwrap_or(AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        });
+        let outcome = cancellation_outcome(&invocation)
+            .unwrap_or_else(|| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
         let _ = terminal.report(outcome);
     }
 }
@@ -517,17 +516,15 @@ where
         | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::Result(_))) => {
             AgentOutcome::Completed(completed)
         }
-        (AgentValueKind::Response, None) => AgentOutcome::Failed {
-            cause: AgentFailureCause::MissingResponse,
-        },
-        (AgentValueKind::Result, None) => AgentOutcome::Failed {
-            cause: AgentFailureCause::MissingResult,
-        },
+        (AgentValueKind::Response, None) => {
+            failed_agent_outcome(AgentFailureCause::MissingResponse)
+        }
+        (AgentValueKind::Result, None) => failed_agent_outcome(AgentFailureCause::MissingResult),
         (AgentValueKind::None, Some(_))
         | (AgentValueKind::Response, Some(_))
-        | (AgentValueKind::Result, Some(_)) => AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        },
+        | (AgentValueKind::Result, Some(_)) => {
+            failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
+        }
     }
 }
 

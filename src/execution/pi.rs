@@ -1,7 +1,7 @@
 use super::harness_installation::{
-    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation,
-    ValidatedInstallationParts, discover_and_validate_installation, parse_numeric_component,
-    parse_probe_line, parse_probe_text, validate_installation_with as validate_shared_installation,
+    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
+    ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
+    parse_probe_text, validate_installation_with as validate_shared_installation,
     validate_selected_installation,
 };
 use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
@@ -44,39 +44,7 @@ impl PiCompatibilityProfile {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct PiVersion {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    observed: Box<str>,
-}
-
-impl PiVersion {
-    fn parse(observed: String) -> Option<Self> {
-        let mut components = observed.split('.');
-        let major = parse_numeric_component(components.next()?)?;
-        let minor = parse_numeric_component(components.next()?)?;
-        let patch = parse_numeric_component(components.next()?)?;
-        if components.next().is_some() {
-            return None;
-        }
-        Some(Self {
-            major,
-            minor,
-            patch,
-            observed: observed.into_boxed_str(),
-        })
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.observed
-    }
-
-    const fn numeric(&self) -> (u64, u64, u64) {
-        (self.major, self.minor, self.patch)
-    }
-}
+pub(crate) type PiVersion = StableVersion;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiCapability {
@@ -133,7 +101,7 @@ impl ValidatedPiInstallation {
     pub(crate) fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: PiVersion::parse(PI_JSON_V1_QUALIFICATION_VERSION.to_owned()).unwrap(),
+            version: PiVersion::parse(PI_JSON_V1_QUALIFICATION_VERSION).unwrap(),
             profile: PiCompatibilityProfile::PiJsonV1,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
@@ -254,6 +222,10 @@ impl HarnessInstallationProfile for PiInstallationProfile {
 
     fn validate_capability_output(
         output: &CommandOutput,
+        _isolation: &ProbeIsolation,
+        _executable: &Path,
+        _version: &Self::Version,
+        _profile: &Self::CompatibilityProfile,
     ) -> Result<Self::Capabilities, Self::Failure> {
         validate_capability_output(output)?;
         Ok(PiJsonV1Capabilities {
@@ -314,7 +286,7 @@ fn validate_pi_installation_with(
 fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallationFailure> {
     let version =
         parse_probe_line(output).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))?;
-    PiVersion::parse(version.to_owned()).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))
+    PiVersion::parse(version).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))
 }
 
 fn compatibility_profile(version: &PiVersion) -> Option<PiCompatibilityProfile> {
@@ -324,7 +296,7 @@ fn compatibility_profile(version: &PiVersion) -> Option<PiCompatibilityProfile> 
 }
 
 pub(crate) fn compatibility_profile_for_version(observed: &str) -> Option<PiCompatibilityProfile> {
-    compatibility_profile(&PiVersion::parse(observed.to_owned())?)
+    compatibility_profile(&PiVersion::parse(observed)?)
 }
 
 fn validate_capability_output(output: &CommandOutput) -> Result<(), PiInstallationFailure> {

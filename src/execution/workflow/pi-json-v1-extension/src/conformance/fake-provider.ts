@@ -22,6 +22,8 @@ if (configuredSocketPath === undefined) {
   throw new Error("A fake-provider control socket is required");
 }
 const socketPath: string = configuredSocketPath;
+const stubbornFixtureExecutable =
+  process.env.SCHERZO_PI_STUBBORN_FIXTURE_EXECUTABLE;
 
 interface ResponseUsage {
   inputTokens: number | undefined;
@@ -47,7 +49,16 @@ interface ToolCallsResponse extends ResponseUsage {
 interface StreamedToolCallResponse extends ResponseUsage {
   kind: "streamedToolCall";
   thinking: string[];
+  finalizedThinking: string;
+  thinkingEndContent: string | undefined;
   call: ToolCallResponse;
+}
+
+interface PartialToolCallFailureResponse extends ResponseUsage {
+  kind: "partialToolCallFailure";
+  thinking: string[];
+  call: ToolCallResponse;
+  message: string;
 }
 
 interface TruncatedToolCallResponse extends ResponseUsage {
@@ -65,6 +76,7 @@ type ProviderResponse =
   | TextResponse
   | ToolCallsResponse
   | StreamedToolCallResponse
+  | PartialToolCallFailureResponse
   | TruncatedToolCallResponse
   | FailureResponse;
 
@@ -121,6 +133,9 @@ function decodeResponse(value: unknown): ProviderResponse {
     value.kind === "streamedToolCall" &&
     Array.isArray(value.thinking) &&
     value.thinking.every((chunk) => typeof chunk === "string") &&
+    typeof value.finalizedThinking === "string" &&
+    (value.thinkingEndContent === undefined ||
+      typeof value.thinkingEndContent === "string") &&
     isRecord(value.call) &&
     typeof value.call.id === "string" &&
     typeof value.call.name === "string" &&
@@ -130,12 +145,37 @@ function decodeResponse(value: unknown): ProviderResponse {
     return {
       kind: "streamedToolCall",
       thinking: value.thinking,
+      finalizedThinking: value.finalizedThinking,
+      thinkingEndContent: value.thinkingEndContent as string | undefined,
       inputTokens: value.inputTokens as number | undefined,
       call: {
         id: value.call.id,
         name: value.call.name,
         arguments: value.call.arguments,
       },
+    };
+  }
+  if (
+    value.kind === "partialToolCallFailure" &&
+    Array.isArray(value.thinking) &&
+    value.thinking.every((chunk) => typeof chunk === "string") &&
+    isRecord(value.call) &&
+    typeof value.call.id === "string" &&
+    typeof value.call.name === "string" &&
+    isRecord(value.call.arguments) &&
+    typeof value.message === "string" &&
+    validInputTokens(value.inputTokens)
+  ) {
+    return {
+      kind: "partialToolCallFailure",
+      thinking: value.thinking,
+      inputTokens: value.inputTokens as number | undefined,
+      call: {
+        id: value.call.id,
+        name: value.call.name,
+        arguments: value.call.arguments,
+      },
+      message: value.message,
     };
   }
   if (
@@ -357,43 +397,54 @@ function emitToolCalls(
   });
 }
 
-async function emitStreamedToolCall(
+async function emitThinking(
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
-  response: StreamedToolCallResponse,
+  chunks: string[],
+  finalizedThinking?: string,
+  thinkingEndContent?: string,
 ): Promise<void> {
-  const thinkingIndex = output.content.length;
+  const contentIndex = output.content.length;
   const thinking = { type: "thinking" as const, thinking: "" };
   output.content.push(thinking);
   stream.push({
     type: "thinking_start",
-    contentIndex: thinkingIndex,
+    contentIndex,
     partial: snapshot(output),
   });
   await Promise.resolve();
-  for (const delta of response.thinking) {
+  for (const delta of chunks) {
     thinking.thinking += delta;
     stream.push({
       type: "thinking_delta",
-      contentIndex: thinkingIndex,
+      contentIndex,
       delta,
       partial: snapshot(output),
     });
     await Promise.resolve();
   }
+  if (finalizedThinking !== undefined) {
+    thinking.thinking = finalizedThinking;
+  }
   stream.push({
     type: "thinking_end",
-    contentIndex: thinkingIndex,
-    content: thinking.thinking,
+    contentIndex,
+    content: thinkingEndContent ?? thinking.thinking,
     partial: snapshot(output),
   });
   await Promise.resolve();
+}
 
+async function emitOpenToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  call: ToolCallResponse,
+): Promise<{ contentIndex: number; toolCall: ToolCall }> {
   const contentIndex = output.content.length;
   const toolCall: ToolCall = {
     type: "toolCall",
-    id: response.call.id,
-    name: response.call.name,
+    id: call.id,
+    name: call.name,
     arguments: {},
   };
   output.content.push(toolCall);
@@ -403,7 +454,7 @@ async function emitStreamedToolCall(
     partial: snapshot(output),
   });
   await Promise.resolve();
-  const encodedArguments = JSON.stringify(response.call.arguments);
+  const encodedArguments = JSON.stringify(call.arguments);
   let partialJson = "";
   for (let offset = 0; offset < encodedArguments.length; offset += 1024) {
     const delta = encodedArguments.slice(offset, offset + 1024);
@@ -421,7 +472,27 @@ async function emitStreamedToolCall(
     });
     await Promise.resolve();
   }
-  toolCall.arguments = response.call.arguments;
+  toolCall.arguments = call.arguments;
+  return { contentIndex, toolCall };
+}
+
+async function emitStreamedToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  response: StreamedToolCallResponse,
+): Promise<void> {
+  await emitThinking(
+    stream,
+    output,
+    response.thinking,
+    response.finalizedThinking,
+    response.thinkingEndContent,
+  );
+  const { contentIndex, toolCall } = await emitOpenToolCall(
+    stream,
+    output,
+    response.call,
+  );
   stream.push({
     type: "toolcall_end",
     contentIndex,
@@ -434,6 +505,33 @@ async function emitStreamedToolCall(
     type: "done",
     reason: "toolUse",
     message: snapshot(output),
+  });
+}
+
+async function emitPartialToolCallFailure(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  response: PartialToolCallFailureResponse,
+): Promise<void> {
+  await emitThinking(stream, output, response.thinking);
+  await emitOpenToolCall(stream, output, response.call);
+  output.stopReason = "error";
+  output.errorMessage = response.message;
+  output.diagnostics = [
+    {
+      type: "provider_transport_failure",
+      timestamp: Date.now(),
+      error: { name: "Error", message: response.message },
+      details: {
+        eventsEmitted: true,
+        phase: "after_message_stream_start",
+      },
+    },
+  ];
+  stream.push({
+    type: "error",
+    reason: "error",
+    error: snapshot(output),
   });
 }
 
@@ -508,6 +606,8 @@ function streamFakeProvider(
         emitToolCalls(stream, output, response.calls);
       } else if (response.kind === "streamedToolCall") {
         await emitStreamedToolCall(stream, output, response);
+      } else if (response.kind === "partialToolCallFailure") {
+        await emitPartialToolCallFailure(stream, output, response);
       } else if (response.kind === "truncatedToolCall") {
         emitTruncatedToolCall(stream, output, response.call);
       } else {
@@ -600,14 +700,74 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
       "Starts an interrupt-resistant descendant used only by PiJsonV1 conformance",
     parameters: Type.Object({}),
     async execute(toolCallId, _parameters, signal) {
+      if (stubbornFixtureExecutable === undefined) {
+        throw new Error("A stubborn-process fixture executable is required");
+      }
       const descendant = spawn(
-        "/bin/sh",
-        ["-c", "trap '' INT TERM; while :; do :; done"],
-        { stdio: "ignore" },
+        stubbornFixtureExecutable,
+        [
+          "--exact",
+          "execution::workflow::pi_json_v1::conformance_tests::stubborn_descendant_process_fixture",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
       );
-      if (descendant.pid === undefined) {
+      const readiness = descendant.stdout;
+      const diagnostic = descendant.stderr;
+      if (
+        descendant.pid === undefined ||
+        readiness === null ||
+        diagnostic === null
+      ) {
         throw new Error("The stubborn conformance descendant did not start");
       }
+      await new Promise<void>((resolve, reject) => {
+        let startupOutput = "";
+        let diagnosticText = "";
+        diagnostic.on("data", (data: Buffer) => {
+          diagnosticText = (diagnosticText + data.toString("utf8")).slice(
+            -1024,
+          );
+        });
+        const cleanup = (): void => {
+          descendant.off("error", failed);
+          descendant.off("exit", exited);
+          readiness.off("data", ready);
+        };
+        const failed = (error: Error): void => {
+          cleanup();
+          reject(error);
+        };
+        const exited = (): void => {
+          cleanup();
+          reject(
+            new Error(
+              `The stubborn conformance descendant exited before readiness: ${startupOutput}${diagnosticText}`,
+            ),
+          );
+        };
+        const ready = (data: Buffer): void => {
+          startupOutput += data.toString("utf8");
+          if (startupOutput.includes("SCHERZO_STUBBORN_READY")) {
+            cleanup();
+            resolve();
+            return;
+          }
+          if (startupOutput.length > 4096) {
+            cleanup();
+            reject(
+              new Error(
+                "The stubborn conformance descendant sent invalid readiness",
+              ),
+            );
+          }
+        };
+        descendant.once("error", failed);
+        descendant.once("exit", exited);
+        readiness.on("data", ready);
+      });
       await exchange(
         {
           kind: "stubborn",

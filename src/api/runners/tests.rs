@@ -49,8 +49,7 @@ fn registration_body() -> Vec<u8> {
         "activity": {"state": "assigned", "currentAssignmentCount": 1},
         "advertisedMetadata": {
             "runnerVersion": "1.2.3",
-            "protocolVersion": 1,
-            "advertisedCapacity": 7
+            "protocolVersion": 1
         }
     }))
     .unwrap()

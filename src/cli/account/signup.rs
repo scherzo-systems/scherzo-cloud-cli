@@ -12,15 +12,15 @@ use crate::api::{
     HttpClient, HumanPrincipal, SignupError, SignupOutcome, generate_idempotency_key, signup_human,
 };
 use crate::exit_code::ExitCode;
-use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
+use crate::human_auth::session::{self, RequiredOperation};
 
 use super::super::principal::PrincipalResult;
 
 pub(super) const ABOUT: &str = "Create your Scherzo Cloud account";
 
-// Signup owns credential mutation while status is read-only; keeping these
-// command adapters local makes their different cleanup and output paths explicit.
+// Signup keeps its idempotency and output contracts local while shared session
+// acquisition owns refresh, bounded authentication retry, and rejection cleanup.
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -37,46 +37,44 @@ impl Command {
     }
 
     fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let store = CredentialStore::from_environment()
-            .map_err(|error| anyhow!(error))
-            .context("access credential store")?;
-        // jscpd:ignore-end
-        let Some(credential) = store
-            .selected(deployment.fingerprint(), crate::timing::utc_now())
-            .map_err(|error| anyhow!(error))
-            .context("access credential store")?
-        else {
-            return self.write_outcome(deployment, &SignupOutcome::Unauthenticated);
-        };
         let idempotency_key =
             generate_idempotency_key().context("create signup request identity")?;
+        // jscpd:ignore-end
         let client = HttpClient::new(self.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare signup networking")?;
-        let outcome = signup_human(
+        let outcome = match session::execute_required(
             &client,
-            deployment.fingerprint().api_url(),
-            credential.access_token(),
-            &idempotency_key,
-        );
-
-        let credential_rejected = matches!(&outcome, Ok(SignupOutcome::Unauthenticated))
-            || outcome
-                .as_ref()
-                .is_err_and(SignupError::credential_rejected);
-        if credential_rejected {
-            store
-                .remove_if_access_token_matches(deployment.fingerprint(), credential.access_token())
-                .map_err(|error| anyhow!(error))
-                .context("access credential store")?;
-        }
-
-        let outcome = outcome.map_err(|error| anyhow!(error)).with_context(|| {
-            format!(
-                "create Scherzo Cloud account through {}",
-                deployment.fingerprint().api_url()
-            )
-        })?;
+            deployment,
+            |access_token| {
+                signup_human(
+                    &client,
+                    deployment.fingerprint().api_url(),
+                    access_token,
+                    &idempotency_key,
+                )
+            },
+            |outcome| {
+                matches!(outcome, Ok(SignupOutcome::Unauthenticated))
+                    || outcome
+                        .as_ref()
+                        .is_err_and(SignupError::credential_rejected)
+            },
+        ) {
+            Ok(RequiredOperation::Unauthenticated) => SignupOutcome::Unauthenticated,
+            Ok(RequiredOperation::Completed(outcome)) => {
+                outcome.map_err(|error| anyhow!(error)).with_context(|| {
+                    format!(
+                        "create Scherzo Cloud account through {}",
+                        deployment.fingerprint().api_url()
+                    )
+                })?
+            }
+            Err(error) => match error.unreachable_category() {
+                Some(category) => SignupOutcome::Unreachable(category),
+                None => return Err(anyhow!(error).context("acquire human session")),
+            },
+        };
         self.write_outcome(deployment, &outcome)
     }
 

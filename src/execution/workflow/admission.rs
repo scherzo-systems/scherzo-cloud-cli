@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::{Future as _, poll_fn};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -16,7 +16,9 @@ use super::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
-use super::git_capture::{GitCaptureContext, GitWorkspaceAdmissionFailure};
+use super::git_capture::{
+    CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure,
+};
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
@@ -54,6 +56,7 @@ pub(crate) enum CancellationReason {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
+    FinalizationForceAbort,
 }
 
 impl CancellationReason {
@@ -64,6 +67,67 @@ impl CancellationReason {
             Self::CallerOutputFailure => "caller_output_failure",
             Self::RunnerShutdown => "runner_shutdown",
             Self::ExecutionLeaseExpired => "execution_lease_expired",
+            Self::FinalizationForceAbort => "finalization_force_abort",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CancellationOperationId(u64);
+
+impl CancellationOperationId {
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fixture(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CancellationOperation {
+    Graceful {
+        id: CancellationOperationId,
+        reason: CancellationReason,
+    },
+    ForceAbort {
+        id: CancellationOperationId,
+    },
+}
+
+impl CancellationOperation {
+    pub(crate) const fn id(self) -> CancellationOperationId {
+        match self {
+            Self::Graceful { id, .. } | Self::ForceAbort { id } => id,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CancellationOperationState {
+    operations: Vec<CancellationOperation>,
+    next_id: u64,
+    finalization_arming: bool,
+    finalization_armed: bool,
+    pending_finalization_reason: Option<CancellationReason>,
+    pending_finalization_force_abort: bool,
+    phase_reason: Option<CancellationReason>,
+    force_abort_requested: bool,
+}
+
+impl Default for CancellationOperationState {
+    fn default() -> Self {
+        Self {
+            operations: Vec::with_capacity(3),
+            next_id: 1,
+            finalization_arming: false,
+            finalization_armed: false,
+            pending_finalization_reason: None,
+            pending_finalization_force_abort: false,
+            phase_reason: None,
+            force_abort_requested: false,
         }
     }
 }
@@ -74,6 +138,8 @@ pub(super) type CancellationPendingPollBarrier = SynchronousGate;
 #[derive(Clone, Debug)]
 pub(crate) struct CancellationSource {
     reason: watch::Sender<Option<CancellationReason>>,
+    operation_version: watch::Sender<u64>,
+    operations: Arc<Mutex<CancellationOperationState>>,
     #[cfg(test)]
     pending_poll_barrier: Option<CancellationPendingPollBarrier>,
 }
@@ -81,8 +147,11 @@ pub(crate) struct CancellationSource {
 impl CancellationSource {
     pub(crate) fn new() -> Self {
         let (reason, _) = watch::channel(None);
+        let (operation_version, _) = watch::channel(0);
         Self {
             reason,
+            operation_version,
+            operations: Arc::new(Mutex::new(CancellationOperationState::default())),
             #[cfg(test)]
             pending_poll_barrier: None,
         }
@@ -98,13 +167,78 @@ impl CancellationSource {
     }
 
     pub(crate) fn request_cancellation(&self, reason: CancellationReason) -> bool {
-        self.reason.send_if_modified(|current| {
-            if current.is_some() {
-                return false;
+        if reason == CancellationReason::FinalizationForceAbort {
+            return false;
+        }
+        let version = {
+            let mut state = lock_cancellation_operations(&self.operations);
+            if state.finalization_arming {
+                if state.pending_finalization_reason.is_some()
+                    || state.pending_finalization_force_abort
+                {
+                    return false;
+                }
+                state.pending_finalization_reason = Some(reason);
+                None
+            } else {
+                if state.phase_reason.is_some() || state.force_abort_requested {
+                    return false;
+                }
+                let id = CancellationOperationId(state.next_id);
+                state.next_id = state.next_id.saturating_add(1);
+                state.phase_reason = Some(reason);
+                state
+                    .operations
+                    .push(CancellationOperation::Graceful { id, reason });
+                Some(u64::try_from(state.operations.len()).unwrap_or(u64::MAX))
             }
-            *current = Some(reason);
-            true
-        })
+        };
+        if let Some(version) = version {
+            self.reason.send_replace(Some(reason));
+            self.operation_version.send_replace(version);
+        }
+        true
+    }
+
+    pub(crate) fn request_force_abort(&self) -> bool {
+        let admission = {
+            let mut state = lock_cancellation_operations(&self.operations);
+            if state.finalization_arming {
+                if state.pending_finalization_reason.is_none()
+                    || state.pending_finalization_force_abort
+                {
+                    return false;
+                }
+                state.pending_finalization_force_abort = true;
+                None
+            } else {
+                if !state.finalization_armed || state.force_abort_requested {
+                    return false;
+                }
+                let id = CancellationOperationId(state.next_id);
+                state.next_id = state.next_id.saturating_add(1);
+                state.force_abort_requested = true;
+                let closed_open_gate = state.phase_reason.is_none();
+                if closed_open_gate {
+                    state.phase_reason = Some(CancellationReason::FinalizationForceAbort);
+                }
+                state
+                    .operations
+                    .push(CancellationOperation::ForceAbort { id });
+                Some((
+                    u64::try_from(state.operations.len()).unwrap_or(u64::MAX),
+                    closed_open_gate,
+                ))
+            }
+        };
+        if let Some((version, closed_open_gate)) = admission {
+            if closed_open_gate {
+                self.reason
+                    .send_replace(Some(CancellationReason::FinalizationForceAbort));
+            }
+            self.operation_version.send_replace(version);
+        }
+        true
     }
 
     pub(crate) fn cancellation_reason(&self) -> Option<CancellationReason> {
@@ -132,6 +266,97 @@ impl CancellationSource {
             pending_poll_barrier: self.pending_poll_barrier.clone(),
         }
     }
+
+    pub(super) fn subscribe_operations(&self) -> CancellationOperationSubscription {
+        CancellationOperationSubscription {
+            source: self.clone(),
+            receiver: self.operation_version.subscribe(),
+            next_index: 0,
+            #[cfg(test)]
+            pending_poll_barrier: self.pending_poll_barrier.clone(),
+        }
+    }
+
+    pub(super) fn begin_finalization_arm(&self) -> bool {
+        let mut state = lock_cancellation_operations(&self.operations);
+        if state.finalization_arming || state.finalization_armed {
+            return false;
+        }
+        state.finalization_arming = true;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_begin_finalization_arm(&self) -> bool {
+        self.begin_finalization_arm()
+    }
+
+    pub(super) fn complete_finalization_arm(&self) -> bool {
+        let (reason, version) = {
+            let mut state = lock_cancellation_operations(&self.operations);
+            if !state.finalization_arming || state.finalization_armed {
+                return false;
+            }
+            state.finalization_arming = false;
+            state.finalization_armed = true;
+            state.phase_reason = None;
+            state.force_abort_requested = false;
+            let previous_operations = state.operations.len();
+            let reason = state.pending_finalization_reason.take();
+            if let Some(reason) = reason {
+                let id = CancellationOperationId(state.next_id);
+                state.next_id = state.next_id.saturating_add(1);
+                state.phase_reason = Some(reason);
+                state
+                    .operations
+                    .push(CancellationOperation::Graceful { id, reason });
+            }
+            if state.pending_finalization_force_abort {
+                state.pending_finalization_force_abort = false;
+                let id = CancellationOperationId(state.next_id);
+                state.next_id = state.next_id.saturating_add(1);
+                state.force_abort_requested = true;
+                if state.phase_reason.is_none() {
+                    state.phase_reason = Some(CancellationReason::FinalizationForceAbort);
+                }
+                state
+                    .operations
+                    .push(CancellationOperation::ForceAbort { id });
+            }
+            let version = (state.operations.len() > previous_operations)
+                .then(|| u64::try_from(state.operations.len()).unwrap_or(u64::MAX));
+            (state.phase_reason, version)
+        };
+        self.reason.send_replace(reason);
+        if let Some(version) = version {
+            self.operation_version.send_replace(version);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_complete_finalization_arm(&self) -> bool {
+        self.complete_finalization_arm()
+    }
+
+    pub(super) fn abort_finalization_arm(&self) -> bool {
+        let mut state = lock_cancellation_operations(&self.operations);
+        if !state.finalization_arming || state.finalization_armed {
+            return false;
+        }
+        state.finalization_arming = false;
+        state.pending_finalization_reason = None;
+        state.pending_finalization_force_abort = false;
+        true
+    }
+}
+
+fn lock_cancellation_operations(
+    operations: &Mutex<CancellationOperationState>,
+) -> MutexGuard<'_, CancellationOperationState> {
+    operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(super) struct CancellationSubscription {
@@ -142,26 +367,12 @@ pub(super) struct CancellationSubscription {
 
 impl CancellationSubscription {
     pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
-        #[cfg(not(test))]
-        {
-            self.receiver.changed().await
-        }
-        #[cfg(test)]
-        {
-            let mut pending_poll_barrier = self.pending_poll_barrier.take();
-            let changed = self.receiver.changed();
-            tokio::pin!(changed);
-            poll_fn(|context| {
-                let result = changed.as_mut().poll(context);
-                if result.is_pending()
-                    && let Some(barrier) = pending_poll_barrier.take()
-                {
-                    barrier.block_until_resumed();
-                }
-                result
-            })
-            .await
-        }
+        wait_for_watch_change(
+            &mut self.receiver,
+            #[cfg(test)]
+            &mut self.pending_poll_barrier,
+        )
+        .await
     }
 
     pub(super) fn borrow_and_update(&mut self) -> watch::Ref<'_, Option<CancellationReason>> {
@@ -172,6 +383,81 @@ impl CancellationSubscription {
     pub(super) fn has_changed(&self) -> Result<bool, watch::error::RecvError> {
         self.receiver.has_changed()
     }
+}
+
+pub(super) struct CancellationOperationSubscription {
+    source: CancellationSource,
+    receiver: watch::Receiver<u64>,
+    next_index: usize,
+    #[cfg(test)]
+    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
+}
+
+impl CancellationOperationSubscription {
+    pub(super) fn next_operation(&mut self) -> Option<CancellationOperation> {
+        let operation = lock_cancellation_operations(&self.source.operations)
+            .operations
+            .get(self.next_index)
+            .copied();
+        if operation.is_some() {
+            self.next_index = self.next_index.saturating_add(1);
+            self.receiver.borrow_and_update();
+        }
+        operation
+    }
+
+    pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        if self.next_operation_available() {
+            return Ok(());
+        }
+        wait_for_watch_change(
+            &mut self.receiver,
+            #[cfg(test)]
+            &mut self.pending_poll_barrier,
+        )
+        .await
+    }
+
+    fn next_operation_available(&self) -> bool {
+        lock_cancellation_operations(&self.source.operations)
+            .operations
+            .len()
+            > self.next_index
+    }
+}
+
+async fn wait_for_watch_change<T: Clone>(
+    receiver: &mut watch::Receiver<T>,
+    #[cfg(test)] pending_poll_barrier: &mut Option<CancellationPendingPollBarrier>,
+) -> Result<(), watch::error::RecvError> {
+    #[cfg(not(test))]
+    {
+        receiver.changed().await
+    }
+    #[cfg(test)]
+    {
+        poll_watch_change(receiver, pending_poll_barrier).await
+    }
+}
+
+#[cfg(test)]
+async fn poll_watch_change<T: Clone>(
+    receiver: &mut watch::Receiver<T>,
+    pending_poll_barrier: &mut Option<CancellationPendingPollBarrier>,
+) -> Result<(), watch::error::RecvError> {
+    let mut barrier = pending_poll_barrier.take();
+    let changed = receiver.changed();
+    tokio::pin!(changed);
+    poll_fn(|context| {
+        let result = changed.as_mut().poll(context);
+        if result.is_pending()
+            && let Some(barrier) = barrier.take()
+        {
+            barrier.block_until_resumed();
+        }
+        result
+    })
+    .await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,12 +582,20 @@ impl EnvironmentSnapshot {
         }
     }
 
-    fn without_reserved_variables(self) -> Self {
+    fn without_engine_reserved_variables(&self) -> Self {
+        self.without_variables_matching(is_engine_reserved_environment_name)
+    }
+
+    pub(crate) fn without_managed_runner_credentials_and_helpers(&self) -> Self {
+        self.without_variables_matching(is_managed_runner_private_environment_name)
+    }
+
+    fn without_variables_matching(&self, excluded: impl Fn(&OsStr) -> bool) -> Self {
         Self {
             variables: Arc::new(
                 self.variables
                     .iter()
-                    .filter(|(name, _)| !is_reserved_environment_name(name))
+                    .filter(|(name, _)| !excluded(name))
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
             ),
@@ -309,8 +603,36 @@ impl EnvironmentSnapshot {
     }
 }
 
-fn is_reserved_environment_name(name: &OsStr) -> bool {
+fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"SCHERZO_")
+}
+
+fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
+    if is_engine_reserved_environment_name(name) {
+        return true;
+    }
+    let name = name.as_encoded_bytes();
+    matches!(
+        name,
+        b"GIT_ASKPASS"
+            | b"GIT_ASKPASS_REQUIRE"
+            | b"GIT_TERMINAL_PROMPT"
+            | b"GIT_CONFIG"
+            | b"GIT_CONFIG_COUNT"
+            | b"GIT_CONFIG_PARAMETERS"
+            | b"GIT_CONFIG_GLOBAL"
+            | b"GIT_CONFIG_NOSYSTEM"
+            | b"GIT_CONFIG_SYSTEM"
+            | b"GIT_SSH"
+            | b"GIT_SSH_COMMAND"
+            | b"SSH_ASKPASS"
+            | b"SSH_ASKPASS_REQUIRE"
+            | b"SSH_AUTH_SOCK"
+            | b"SSH_AGENT_PID"
+            | b"GH_TOKEN"
+            | b"GITHUB_TOKEN"
+    ) || name.starts_with(b"GIT_CONFIG_KEY_")
+        || name.starts_with(b"GIT_CONFIG_VALUE_")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,6 +743,13 @@ pub(crate) fn default_execution_policy_limits(
 }
 
 #[derive(Clone, Debug)]
+enum GitCaptureAdmission {
+    None,
+    Local,
+    Cloud(CloudGitCaptureProjection),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
     root_lifecycle: ExecutionRootLifecycle,
@@ -429,7 +758,7 @@ pub(crate) struct ExecutionContext {
     cancellation: CancellationPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
-    local_git_capture: bool,
+    git_capture: GitCaptureAdmission,
 }
 
 impl ExecutionContext {
@@ -448,12 +777,17 @@ impl ExecutionContext {
             cancellation,
             pi_installation: None,
             claude_code_installation: None,
-            local_git_capture: false,
+            git_capture: GitCaptureAdmission::None,
         }
     }
 
     pub(crate) fn with_local_git_capture(mut self) -> Self {
-        self.local_git_capture = true;
+        self.git_capture = GitCaptureAdmission::Local;
+        self
+    }
+
+    pub(crate) fn with_cloud_git_capture(mut self, projection: CloudGitCaptureProjection) -> Self {
+        self.git_capture = GitCaptureAdmission::Cloud(projection);
         self
     }
 
@@ -690,7 +1024,6 @@ impl AdmittedWorkflow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionFailureKind {
-    WorkflowFinalizersUnsupported,
     MissingRequiredPrompt,
     InvalidAttachmentMediaType,
     AgentStepRuntimeUnsupported,
@@ -702,6 +1035,8 @@ pub(crate) enum AdmissionFailureKind {
     GitContextExecutionRootMismatch,
     GitObjectFormatUnsupported,
     GitBaselineUnavailable,
+    GitInitialWorkspaceDirty,
+    GitWorkflowDigestMismatch,
     NonPositiveParallelism,
     NonPositiveCapturedFiles,
     NonPositiveCapturedFileBytes,
@@ -791,18 +1126,19 @@ impl fmt::Display for AdmissionFailure {
 
 impl std::error::Error for AdmissionFailure {}
 
+pub(crate) fn admit_local_workflow(
+    workflow: ResolvedWorkflow,
+    imports: ResolvedImports,
+    context: ExecutionContext,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    admit_workflow(workflow, imports, context)
+}
+
 pub(crate) fn admit_workflow(
     workflow: ResolvedWorkflow,
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    if !workflow.definition.finalizers.is_empty() {
-        return Err(AdmissionFailure::new(
-            AdmissionFailureKind::WorkflowFinalizersUnsupported,
-            AdmissionLocation::Workflow,
-        ));
-    }
-
     if workflow.required_imports().prompt && imports.prompt().is_none() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::MissingRequiredPrompt,
@@ -914,9 +1250,17 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumStepLogBytes,
             )
         })?;
-    let maximum_step_log_bytes = NonZeroU64::new(configured_maximum_step_log_bytes.get().min(
-        super::maximum_retained_bytes_per_stream(workflow.definition.presentation_order.len()),
-    ))
+    let maximum_step_log_bytes = NonZeroU64::new(
+        configured_maximum_step_log_bytes
+            .get()
+            .min(super::maximum_retained_bytes_per_stream(
+                workflow
+                    .definition
+                    .presentation_order
+                    .len()
+                    .saturating_add(workflow.definition.finalizer_presentation_order.len()),
+            )),
+    )
     .ok_or_else(|| {
         AdmissionFailure::new(
             AdmissionFailureKind::NonPositiveStepLogBytes,
@@ -954,20 +1298,34 @@ pub(crate) fn admit_workflow(
             maximum_live_input_bytes,
             maximum_step_log_bytes,
         },
-        environment: context.environment.without_reserved_variables(),
+        environment: context.environment.without_engine_reserved_variables(),
         cancellation: context.cancellation,
     };
     let git_capture = if workflow.requires_git_capture() {
-        if !context.local_git_capture {
+        if let GitCaptureAdmission::Cloud(projection) = &context.git_capture
+            && projection.workflow_digest() != workflow.content_digest.value
+        {
             return Err(AdmissionFailure::new(
-                AdmissionFailureKind::GitContextRequired,
+                AdmissionFailureKind::GitWorkflowDigestMismatch,
                 AdmissionLocation::GitContext,
             ));
         }
-        Some(Arc::new(
-            GitCaptureContext::admit(&execution, &CaptureCancellation::default())
-                .map_err(git_admission_failure)?,
-        ))
+        let capture = match &context.git_capture {
+            GitCaptureAdmission::None => {
+                return Err(AdmissionFailure::new(
+                    AdmissionFailureKind::GitContextRequired,
+                    AdmissionLocation::GitContext,
+                ));
+            }
+            GitCaptureAdmission::Local => {
+                GitCaptureContext::admit_local(&execution, &CaptureCancellation::default())
+            }
+            GitCaptureAdmission::Cloud(projection) => {
+                GitCaptureContext::admit_cloud(&execution, projection)
+            }
+        }
+        .map_err(git_admission_failure)?;
+        Some(Arc::new(capture))
     } else {
         None
     };
@@ -998,6 +1356,9 @@ fn git_admission_failure(failure: GitWorkspaceAdmissionFailure) -> AdmissionFail
         }
         GitWorkspaceAdmissionFailure::BaselineUnavailable => {
             AdmissionFailureKind::GitBaselineUnavailable
+        }
+        GitWorkspaceAdmissionFailure::InitialWorkspaceDirty => {
+            AdmissionFailureKind::GitInitialWorkspaceDirty
         }
     };
     AdmissionFailure::new(kind, AdmissionLocation::GitContext)

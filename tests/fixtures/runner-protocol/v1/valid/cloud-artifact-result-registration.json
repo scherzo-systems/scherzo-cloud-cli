@@ -1,0 +1,24 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5ac2",
+  "sentAt": "2026-07-23T00:00:14Z",
+  "type": "artifact_result_registration",
+  "payloadVersion": 1,
+  "payload": {
+    "requestMessageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5ac2",
+    "outcome": "succeeded",
+    "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5ac0",
+    "finalizationDeadline": "2026-07-23T00:15:14Z",
+    "uploadCapability": {
+      "url": "https://example.test/exact-object?X-Amz-Signature=redacted",
+      "headers": {
+        "Content-Length": "2",
+        "Content-Type": "application/json",
+        "If-None-Match": "*",
+        "X-Amz-Checksum-Sha256": "RBNvo1WzZ4oRRq0W9+hknpT7T8If536DEMBg9hyq/4o="
+      },
+      "expiresAt": "2026-07-23T00:05:14Z"
+    }
+  }
+}

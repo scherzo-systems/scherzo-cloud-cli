@@ -1,3 +1,6 @@
+mod artifacts;
+#[cfg(test)]
+mod artifacts_tests;
 mod current_principal;
 mod http_client;
 pub(crate) mod http_util;
@@ -11,6 +14,12 @@ mod signup;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) use artifacts::{
+    ArtifactApi, ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
+    ArtifactSource,
+};
+#[cfg(test)]
+pub(crate) use artifacts::{ArtifactCapabilities, DownloadedMember};
 pub(crate) use current_principal::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
     classify_reqwest_error, get_current_principal,

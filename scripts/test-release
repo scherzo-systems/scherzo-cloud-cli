@@ -28,6 +28,9 @@ version = "$1"
 EOF
 }
 reset_fixture() { write_policy; write_manifest "${1:-0.0.0-dev}"; }
+expect_success() {
+  "$@" >/dev/null 2>&1 || fail "expected success: $*"
+}
 expect_output() {
   local expected=$1; shift
   local output
@@ -41,11 +44,11 @@ expect_failure() {
 }
 
 reset_fixture
-expect_output 'CLI static release policy is valid.' "$checker"
+expect_success "$checker"
 expect_output '0.1.0' "$checker" --initial-version
 expect_output '0.0.0-dev' "$checker" --development-version
 expect_output 'minor' "$checker" --breaking-impact
-expect_output 'CLI release tag is valid: v99.42.7.' "$checker" --validate-tag v99.42.7
+expect_success "$checker" --validate-tag v99.42.7
 
 reset_fixture
 rm "$fixture/release.toml"

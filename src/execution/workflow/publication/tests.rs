@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -14,10 +15,14 @@ use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
+use crate::execution::workflow::agent::{AgentOutcome, AgentValueKind};
 use crate::execution::workflow::artifact::{
     ArtifactReadFailure, CaptureDeclaration, CapturedArtifact,
 };
 use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
+use crate::execution::workflow::pi_json_v1::{
+    PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
+};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::OutputSet;
 use crate::execution::workflow::validated::{WorkflowNode, WorkflowNodeRole};
@@ -132,6 +137,7 @@ fn export_source(step: &str, output: &str, value_type: WorkflowValueType) -> Res
 fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunStep {
     WorkflowRunStep {
         id: id.to_owned(),
+        role: WorkflowNodeRole::Step,
         kind: WorkflowRunStepKind::Command,
         failure_policy: FailurePolicy::Required,
         state: StepState::Succeeded { outputs },
@@ -185,6 +191,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
             succeeded_step("produce", outputs),
             succeeded_step("terminal", BTreeMap::new()),
         ],
+        finalization: None,
         exports: BTreeMap::from([
             (
                 "reportA".to_owned(),
@@ -222,6 +229,7 @@ fn make_failed(run: &mut WorkflowRunResult) {
     };
     run.outcome = RunOutcome::Failed {
         primary_failure: StepFailure {
+            role: WorkflowNodeRole::Step,
             step: "terminal".to_owned(),
             phase: FailurePhase::Execution,
             cause,
@@ -289,6 +297,55 @@ fn staging_paths(parent: &Path) -> Vec<PathBuf> {
                 .is_some_and(|name| name.starts_with(".result-"))
         })
         .collect()
+}
+
+#[test]
+fn prepares_metadata_only_and_carrier_cloud_results() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    run.exports.insert(
+        "agentResponse".to_owned(),
+        ExportValue::Available {
+            output: CapturedValue::Text(Arc::from("response")),
+        },
+    );
+    run.export_sources.insert(
+        "agentResponse".to_owned(),
+        export_source("produce", "response", WorkflowValueType::Text),
+    );
+    run.exports.insert(
+        "agentResult".to_owned(),
+        ExportValue::Available {
+            output: CapturedValue::Json(Arc::new(serde_json::json!({ "ok": true }))),
+        },
+    );
+    run.export_sources.insert(
+        "agentResult".to_owned(),
+        export_source("produce", "result", WorkflowValueType::Json),
+    );
+    let captured = prepare_cloud_workflow_result(
+        &run,
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+    )
+    .unwrap();
+    assert_eq!(captured.carriers.len(), 4);
+    let document: serde_json::Value = serde_json::from_slice(&captured.result_json).unwrap();
+    assert_eq!(document["workflow"]["provenance"]["kind"], "cloud");
+    assert!(document["execution"].get("executionRoot").is_none());
+
+    let mut metadata_only = run;
+    metadata_only.exports.clear();
+    metadata_only.export_sources.clear();
+    let prepared = prepare_cloud_workflow_result(
+        &metadata_only,
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+    )
+    .unwrap();
+    assert!(prepared.carriers.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&prepared.result_json).unwrap();
+    assert_eq!(document["exports"], serde_json::json!({}));
 }
 
 #[test]
@@ -980,24 +1037,52 @@ fn replaced_staged_exports_directory_is_rejected() {
 }
 
 #[test]
-fn existing_and_racing_destinations_are_never_replaced_or_merged() {
+fn identical_result_republication_is_inert() {
     let fixture = PublicationFixture::new();
     let run = run_fixture(&fixture);
-    let existing = fixture.destination("existing");
-    fs::create_dir(&existing).unwrap();
-    fs::write(existing.join("owned.txt"), b"preexisting").unwrap();
+    let destination = fixture.destination("identical-republication");
 
-    let failure = publish_workflow_result(&existing, &fixture.artifacts, &run).unwrap_err();
-    assert_eq!(failure.phase(), LocalPublicationPhase::TargetValidation);
+    let first = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let first_result = fs::read(destination.join("result.json")).unwrap();
+    let first_export = fs::read(destination.join("exports/0001")).unwrap();
+    let first_entries = fs::read_dir(&destination).unwrap().count();
+
+    let replay = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+
+    assert_eq!(replay, first);
     assert_eq!(
-        failure.kind(),
-        LocalPublicationFailureKind::DestinationExists
+        fs::read(destination.join("result.json")).unwrap(),
+        first_result
     );
     assert_eq!(
-        fs::read(existing.join("owned.txt")).unwrap(),
-        b"preexisting"
+        fs::read(destination.join("exports/0001")).unwrap(),
+        first_export
     );
-    assert_eq!(fs::read_dir(&existing).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), first_entries);
+    assert!(staging_paths(&fixture.results_parent).is_empty());
+}
+
+#[test]
+fn conflicting_result_republication_fails_closed() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let destination = fixture.destination("conflicting-republication");
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let first_result = fs::read(destination.join("result.json")).unwrap();
+    let first_export = fs::read(destination.join("exports/0001")).unwrap();
+
+    run.attempt_number += 1;
+    let failure = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap_err();
+    assert_eq!(failure.phase(), LocalPublicationPhase::Commit);
+    assert_eq!(failure.kind(), LocalPublicationFailureKind::ResultConflict);
+    assert_eq!(
+        fs::read(destination.join("result.json")).unwrap(),
+        first_result
+    );
+    assert_eq!(
+        fs::read(destination.join("exports/0001")).unwrap(),
+        first_export
+    );
 
     let racing = fixture.destination("racing");
     let mut observer = DestinationRaceObserver {
@@ -1006,10 +1091,7 @@ fn existing_and_racing_destinations_are_never_replaced_or_merged() {
     let failure =
         publish_with_observer(&racing, &fixture.artifacts, &run, &mut observer).unwrap_err();
     assert_eq!(failure.phase(), LocalPublicationPhase::Commit);
-    assert_eq!(
-        failure.kind(),
-        LocalPublicationFailureKind::DestinationExists
-    );
+    assert_eq!(failure.kind(), LocalPublicationFailureKind::ResultConflict);
     assert_eq!(fs::read(racing.join("owned.txt")).unwrap(), b"preexisting");
     assert_eq!(fs::read_dir(&racing).unwrap().count(), 1);
     assert!(staging_paths(&fixture.results_parent).is_empty());
@@ -1047,6 +1129,116 @@ fn publication_links_carriers_until_successful_private_cleanup() {
         fixture.artifacts.copy_to(&handle, &mut Vec::new()),
         Err(ArtifactReadFailure::Unavailable | ArtifactReadFailure::UnknownHandle)
     ));
+}
+
+#[test]
+fn parser_response_limit_failure_remains_valid_result_metadata() {
+    let mut parser = PiJsonV1Parser::new(
+        Arc::from("/execution/worktree"),
+        AgentValueKind::Response,
+        NonZeroU64::new(1).unwrap(),
+        PiJsonV1ProtocolLimits::profile(),
+        None,
+    );
+    let assistant = json!({
+        "role": "assistant",
+        "content": [{"type": "text", "text": "xx"}],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+            }
+        },
+        "stopReason": "pending",
+        "timestamp": 2
+    });
+    for event in [
+        json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000d", "timestamp": "2026-07-30T12:00:00Z", "cwd": "/execution/worktree"}),
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": assistant}),
+    ] {
+        let mut frame = serde_json::to_vec(&event).unwrap();
+        frame.push(b'\n');
+        if parser.push_stdout(&frame, drop).is_err() {
+            break;
+        }
+    }
+    let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
+    else {
+        panic!("an oversized response must fail");
+    };
+    assert_eq!(failure.cause(), &AgentFailureCause::CapturedValueTooLarge);
+    assert!(failure.protocol_rejection().is_none());
+
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let cause = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
+    run.steps[1].kind = WorkflowRunStepKind::Agent;
+    run.steps[1].state = StepState::Failed {
+        phase: FailurePhase::Execution,
+        cause: cause.clone(),
+    };
+    run.steps[1].command_output = None;
+    run.outcome = RunOutcome::Failed {
+        primary_failure: StepFailure {
+            role: WorkflowNodeRole::Step,
+            step: "terminal".to_owned(),
+            phase: FailurePhase::Execution,
+            cause,
+        },
+        later_cancellation: None,
+    };
+
+    let destination = fixture.destination("captured-value-too-large");
+    publish_workflow_result(&destination, &fixture.artifacts, &run)
+        .expect("a response-limit failure must remain publishable");
+    let (_, published) = read_result(&destination);
+    let cause = published["steps"][1]["failure"]["cause"]
+        .as_object()
+        .unwrap();
+    assert_eq!(cause["code"], "captured_value_too_large");
+    assert!(!cause.contains_key("protocolRejection"));
+}
+
+#[test]
+fn structured_agent_failure_projects_the_protocol_rejection_without_content() {
+    let mut parser =
+        PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
+    let frames = concat!(
+        "{\"type\":\"session\",\"version\":3,",
+        "\"id\":\"00000000-0000-4000-8000-00000000000c\",",
+        "\"timestamp\":\"2026-07-30T12:00:00Z\",",
+        "\"cwd\":\"/execution/worktree\"}\n",
+        "{\"type\":\"agent_start\"}\n",
+        "{\"type\":\"turn_end\",\"content\":\"sensitive sentinel\"}\n",
+    );
+    assert!(parser.push_stdout(frames.as_bytes(), drop).is_err());
+    let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
+    else {
+        panic!("invalid turn transition must fail");
+    };
+
+    let projected = execution_failure_cause(&StepExecutionFailure::Agent(failure));
+    let projected = serde_json::to_value(projected).unwrap();
+    assert_eq!(projected["code"], "harness_protocol_failed");
+    assert_eq!(projected["protocolRejection"]["profile"], "PiJsonV1");
+    assert_eq!(
+        projected["protocolRejection"]["detail"]["outerEvent"],
+        "turn_end"
+    );
+    assert!(!projected.to_string().contains("sensitive sentinel"));
 }
 
 #[test]

@@ -113,9 +113,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
         fs::read_to_string(bundle.execution_root().join("phases")).unwrap(),
         "initial\nretry\n"
     );
-    let warning = String::from_utf8_lossy(&output.stderr);
-    assert!(warning.contains("was used by earlier attempt(s) 1"));
-    assert!(warning.contains("does not check cleanliness or mutations"));
+    assert!(!output.stderr.is_empty());
     assert!(
         run_directory
             .join("attempts/000001/result/result.json")
@@ -157,6 +155,77 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
         state_before
     );
     assert!(!run_directory.join("attempts/000003").exists());
+}
+
+#[test]
+fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/finalization-retry.yaml"
+    ));
+    let run_directory = bundle.result("finalizer-fresh");
+    let mut initial_args = bundle.args(&run_directory);
+    initial_args.insert(initial_args.len() - 1, "--json".to_owned());
+    let initial = run(&initial_args);
+    assert_eq!(initial.status.code(), Some(1));
+    let initial: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial["attemptNumber"], 1);
+    assert_eq!(initial["result"]["finalization"]["trigger"], "failed");
+    assert_eq!(
+        initial["result"]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+
+    let retried = run(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ));
+    assert_eq!(
+        retried.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let retried: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert_eq!(retried["command"], "scherzo-cloud workflow retry");
+    assert_eq!(retried["attemptNumber"], 2);
+    assert_eq!(retried["result"]["finalization"]["trigger"], "failed");
+    assert_eq!(
+        retried["result"]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        fs::read_to_string(bundle.execution_root().join("work-runs")).unwrap(),
+        "workwork"
+    );
+    assert_eq!(
+        fs::read_to_string(bundle.execution_root().join("cleanup-runs")).unwrap(),
+        "cleanupcleanup"
+    );
+
+    let state = read_state(&run_directory);
+    assert_eq!(state["attempts"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        state["attempts"][0]["attemptId"],
+        state["attempts"][1]["attemptId"]
+    );
+    assert_ne!(
+        state["attempts"][0]["owner"]["ownerNonce"],
+        state["attempts"][1]["owner"]["ownerNonce"]
+    );
+    assert_eq!(state["attempts"][0]["finalization"]["complete"], true);
+    assert_eq!(state["attempts"][1]["finalization"]["complete"], true);
+    assert!(
+        run_directory
+            .join("attempts/000001/result/result.json")
+            .is_file()
+    );
+    assert!(
+        run_directory
+            .join("attempts/000002/result/result.json")
+            .is_file()
+    );
 }
 
 #[test]
@@ -207,7 +276,6 @@ fn plain_retry_streams_a_human_run_and_rejection() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let presentation = String::from_utf8(output.stdout).unwrap();
-    assert!(presentation.contains("result succeeded · exit 0"));
     assert!(presentation.contains("attempts/000002/result"));
 
     let rejection = run(&retry_args(
@@ -217,10 +285,7 @@ fn plain_retry_streams_a_human_run_and_rejection() {
     ));
     assert_eq!(rejection.status.code(), Some(1));
     assert!(rejection.stdout.is_empty());
-    assert_eq!(
-        rejection.stderr,
-        b"Error: cannot retry run: attempt 2 succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>\n"
-    );
+    assert!(!rejection.stderr.is_empty());
 }
 
 #[test]

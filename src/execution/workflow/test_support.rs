@@ -1,5 +1,45 @@
 use std::fmt;
+use std::fs;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
+
+pub(super) fn write_process_fixture_signal(variable: &str, value: &[u8]) {
+    fs::write(std::env::var_os(variable).unwrap(), value).unwrap();
+}
+
+pub(super) fn write_process_fixture_id(variable: &str) {
+    let process = format!("{}\n", std::process::id());
+    write_process_fixture_signal(variable, process.as_bytes());
+}
+
+pub(super) fn process_fixture_interrupt_receiver() -> std::sync::mpsc::Receiver<()> {
+    let (interrupt, interrupted) = std::sync::mpsc::sync_channel(1);
+    ctrlc::set_handler(move || {
+        let _ = interrupt.try_send(());
+    })
+    .unwrap();
+    interrupted
+}
+
+pub(super) fn process_fixture_output(descriptor: u8) -> fs::File {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/dev/fd/{descriptor}"))
+        .unwrap()
+}
+
+pub(super) fn spawn_process_fixture(test: &str) -> std::thread::JoinHandle<()> {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--ignored", "--test-threads=1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    })
+}
 
 #[derive(Clone)]
 pub(super) struct SynchronousGate {

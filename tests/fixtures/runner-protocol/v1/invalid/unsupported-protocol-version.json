@@ -9,7 +9,6 @@
   "type": "hello",
   "payloadVersion": 1,
   "payload": {
-    "runnerVersion": "0.2.0",
-    "maxConcurrentRuns": 1
+    "runnerVersion": "0.2.0"
   }
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroU64;
@@ -14,17 +14,19 @@ use rustix::io::dup;
 use time::OffsetDateTime;
 
 use super::artifact_set;
-use super::document::{FailurePolicy, Output};
+use super::document::{FailurePolicy, FinalizationTrigger, Output};
 use super::local_run::{
-    AttemptResultV1, AttemptStateV1, AttemptStepStateV1, AttemptTriggerV1, LocalAttemptV1,
-    LocalStatusError, LocalStatusErrorCode, RetainedReadBudget, StableLocalRunSnapshot,
-    load_retained_execution_with_budget, open_directory_at, read_stable_local_run_snapshot,
+    AttemptFinalizationV1, AttemptNodeRoleV1, AttemptResultV1, AttemptStateV1, AttemptStepStateV1,
+    AttemptTriggerV1, LocalAttemptV1, LocalStatusError, LocalStatusErrorCode, RetainedReadBudget,
+    StableLocalRunSnapshot, load_retained_execution_with_budget, open_directory_at,
+    read_stable_local_run_snapshot,
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
     CancellationReasonV1, CommandOutputV1, DiagnosticStreamV1, ExportUnavailableReasonV1, ExportV1,
-    FailureCauseV1, FailureCodeV1, FailurePhaseV1, FailureV1, PrimaryFailureV1, StepReasonV1,
-    WorkflowOutcomeV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    FailureCauseV1, FailureCodeV1, FailurePhaseV1, FailureV1, FinalizationTriggerV1,
+    PrimaryFailureV1, StepReasonV1, WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1,
+    WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
@@ -32,12 +34,14 @@ use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex,
     parse_canonical_utc_timestamp,
 };
-use super::validated::{ResolvedDirectPrerequisite, ValidatedStep, WorkflowValueType};
+use super::validated::{
+    ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedMessageSource, ValidatedStep,
+    WorkflowNodeRole, WorkflowValueType,
+};
 
 const RESULT_FILE: &str = "result.json";
 const SHA256_ALGORITHM: &str = "sha256";
 const BASE64_ENCODING: &str = "base64";
-const LOCAL_PROVENANCE: &str = "local";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedAttemptOperationalErrorCode {
@@ -121,6 +125,8 @@ pub(crate) enum ArchivedCancellationReason {
     TerminationRequest,
     CallerOutputFailure,
     RunnerShutdown,
+    ExecutionLeaseExpired,
+    FinalizationForceAbort,
 }
 
 pub(crate) type ArchivedFailureCode = FailureCodeV1;
@@ -143,6 +149,7 @@ pub(crate) struct ArchivedFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedPrimaryFailure {
     pub(crate) step: String,
+    pub(crate) role: WorkflowNodeRole,
     pub(crate) failure: ArchivedFailure,
 }
 
@@ -186,19 +193,50 @@ pub(crate) enum ArchivedStepDetail {
     Succeeded,
     Failed(ArchivedFailure),
     Blocked { dependency: String },
+    InputUnavailable { references: Vec<String> },
     NotRun,
+    TriggerNotSelected,
     Cancelled { reason: ArchivedCancellationReason },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedStep {
     pub(crate) id: String,
+    pub(crate) role: WorkflowNodeRole,
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: ArchivedStepState,
     pub(crate) started_at: Option<OffsetDateTime>,
     pub(crate) duration: Option<Duration>,
     pub(crate) detail: ArchivedStepDetail,
     pub(crate) command_output: Option<ArchivedCommandOutput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchivedFinalizationCancellation {
+    pub(crate) reason: ArchivedCancellationReason,
+    pub(crate) force_stop_deadline: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchivedFinalization {
+    pub(crate) trigger: FinalizationTriggerV1,
+    pub(crate) issues: Vec<(String, FailurePolicy)>,
+    pub(crate) cancellation: Option<ArchivedFinalizationCancellation>,
+    pub(crate) force_abort: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoadedLocalArchivedAttempt {
+    pub(crate) projection: LocalArchivedAttempt,
+    pub(crate) result: WorkflowResultV1,
+}
+
+impl std::ops::Deref for LoadedLocalArchivedAttempt {
+    type Target = LocalArchivedAttempt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,13 +259,14 @@ pub(crate) struct LocalArchivedAttempt {
     pub(crate) outcome: ArchivedWorkflowOutcome,
     pub(crate) primary_failure: Option<ArchivedPrimaryFailure>,
     pub(crate) cancellation: Option<ArchivedCancellation>,
+    pub(crate) finalization: Option<ArchivedFinalization>,
     pub(crate) steps: Vec<ArchivedStep>,
 }
 
 pub(crate) fn load_local_archived_attempt(
     requested: &Path,
     requested_attempt: Option<NonZeroU64>,
-) -> Result<LocalArchivedAttempt, ArchivedAttemptLoadError> {
+) -> Result<LoadedLocalArchivedAttempt, ArchivedAttemptLoadError> {
     load_local_archived_attempt_with(requested, requested_attempt, &mut NoopArchiveReadObserver)
 }
 
@@ -247,7 +286,7 @@ pub(crate) fn load_local_archived_attempt_observed<Snapshot, ResultFile>(
     requested_attempt: Option<NonZeroU64>,
     snapshot_acquired: Snapshot,
     result_file_opened: ResultFile,
-) -> Result<LocalArchivedAttempt, ArchivedAttemptLoadError>
+) -> Result<LoadedLocalArchivedAttempt, ArchivedAttemptLoadError>
 where
     Snapshot: FnMut(&Path),
     ResultFile: FnMut(&Path),
@@ -287,7 +326,7 @@ fn load_local_archived_attempt_with(
     requested: &Path,
     requested_attempt: Option<NonZeroU64>,
     observer: &mut impl ArchiveReadObserver,
-) -> Result<LocalArchivedAttempt, ArchivedAttemptLoadError> {
+) -> Result<LoadedLocalArchivedAttempt, ArchivedAttemptLoadError> {
     let snapshot = read_stable_local_run_snapshot(requested).map_err(map_status_error)?;
     observer.stable_snapshot_acquired(&snapshot.run_directory);
     let selected_number =
@@ -338,7 +377,7 @@ fn load_local_archived_attempt_with(
     )
     .map_err(|()| result_invalid(&snapshot.run_directory))?;
 
-    Ok(LocalArchivedAttempt {
+    let projection = LocalArchivedAttempt {
         run_directory: snapshot.run_directory.clone(),
         current_attempt_number: snapshot.state.current_attempt_number,
         attempt_number: attempt.attempt_number,
@@ -371,8 +410,10 @@ fn load_local_archived_attempt_with(
         outcome: validated.outcome,
         primary_failure: validated.primary_failure,
         cancellation: validated.cancellation,
+        finalization: validated.finalization,
         steps: validated.steps,
-    })
+    };
+    Ok(LoadedLocalArchivedAttempt { projection, result })
 }
 
 fn select_published_attempt(
@@ -519,6 +560,7 @@ struct ProjectedResult {
     outcome: ArchivedWorkflowOutcome,
     primary_failure: Option<ArchivedPrimaryFailure>,
     cancellation: Option<ArchivedCancellation>,
+    finalization: Option<ArchivedFinalization>,
     steps: Vec<ArchivedStep>,
 }
 
@@ -529,15 +571,20 @@ fn validate_and_project_result(
     workflow: &super::resolution::ResolvedWorkflow,
     maximum_parallel_steps: usize,
 ) -> Result<ProjectedResult, ()> {
+    let WorkflowProvenanceV1::Local { source_root } = &result.workflow.provenance else {
+        return Err(());
+    };
+    let Some(execution_root) = result.execution.execution_root.as_deref() else {
+        return Err(());
+    };
     if result.attempt_number != attempt.attempt_number
         || result.workflow.path != workflow.source.workflow_path
-        || result.workflow.provenance.kind != LOCAL_PROVENANCE
-        || Path::new(&result.workflow.provenance.source_root) != workflow.source.source_root
+        || Path::new(source_root) != workflow.source.source_root
         || result.workflow.digest.algorithm != SHA256_ALGORITHM
         || result.workflow.digest.value != workflow.content_digest.value
         || result.workflow.digest.algorithm != snapshot.run.workflow_digest.algorithm
         || result.workflow.digest.value != snapshot.run.workflow_digest.value
-        || result.execution.execution_root != attempt.execution_root
+        || execution_root != attempt.execution_root
         || result.execution.maximum_parallel_steps != maximum_parallel_steps
         || result.command_output_policy.encoding != BASE64_ENCODING
         || result
@@ -545,8 +592,8 @@ fn validate_and_project_result(
             .maximum_retained_bytes_per_stream
             != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         || !is_canonical_relative_path(&result.workflow.path)
-        || !is_canonical_absolute_path(&result.workflow.provenance.source_root)
-        || !is_canonical_absolute_path(&result.execution.execution_root)
+        || !is_canonical_absolute_path(source_root)
+        || !is_canonical_absolute_path(execution_root)
         || !valid_digest(
             &result.workflow.digest.algorithm,
             &result.workflow.digest.value,
@@ -573,21 +620,39 @@ fn validate_and_project_result(
         WorkflowOutcomeV1::Cancelled => ArchivedWorkflowOutcome::Cancelled,
     };
     let execution = ArchivedExecution {
-        execution_root: PathBuf::from(&result.execution.execution_root),
+        execution_root: PathBuf::from(execution_root),
         maximum_parallel_steps,
         started_at: parse_canonical_utc_timestamp(&result.execution.started_at).ok_or(())?,
         finished_at: parse_canonical_utc_timestamp(&result.execution.finished_at).ok_or(())?,
         duration: Duration::from_millis(result.execution.duration_milliseconds),
     };
-    let steps = project_steps(attempt, result, workflow)?;
+    let ordinary_trigger = result
+        .finalization
+        .as_ref()
+        .map(|finalization| finalization.trigger)
+        .unwrap_or(match result.outcome {
+            WorkflowOutcomeV1::Succeeded => FinalizationTriggerV1::Succeeded,
+            WorkflowOutcomeV1::Failed => FinalizationTriggerV1::Failed,
+            WorkflowOutcomeV1::Cancelled => FinalizationTriggerV1::Cancelled,
+        });
+    let ordinary_steps = project_steps(attempt, result, workflow)?;
+    validate_terminal_step_facts(ordinary_trigger, &ordinary_steps, workflow)?;
+    let (finalization, finalizers) = project_finalization(attempt, result, workflow)?;
+    let mut steps = ordinary_steps;
+    steps.extend(finalizers);
     let primary_failure = project_primary_failure(result, &steps)?;
-    validate_terminal_step_facts(result.outcome, &steps, workflow)?;
     let cancellation = project_cancellation(attempt, result)?;
     if steps.iter().any(|step| {
+        let expected = match step.role {
+            WorkflowNodeRole::Step => cancellation.as_ref().map(|value| value.reason),
+            WorkflowNodeRole::Finalizer => finalization
+                .as_ref()
+                .and_then(|value| value.cancellation.as_ref())
+                .map(|value| value.reason),
+        };
         matches!(
             &step.detail,
-            ArchivedStepDetail::Cancelled { reason }
-                if cancellation.as_ref().map(|value| value.reason) != Some(*reason)
+            ArchivedStepDetail::Cancelled { reason } if expected != Some(*reason)
         )
     }) {
         return Err(());
@@ -600,6 +665,7 @@ fn validate_and_project_result(
         outcome,
         primary_failure,
         cancellation,
+        finalization,
         steps,
     })
 }
@@ -623,7 +689,9 @@ fn project_steps(
         .map(|((step, durable), expected_id)| {
             let definition = workflow.definition.steps.get(expected_id).ok_or(())?;
             if step.id != *expected_id
+                || step.role != WorkflowNodeRoleV1::Step
                 || durable.id != *expected_id
+                || durable.role != AttemptNodeRoleV1::Step
                 || step.failure_policy != step_failure_policy(definition)
                 || durable.failure_policy != step_failure_policy(definition)
                 || !step_kind_matches(&step.kind, definition)
@@ -631,13 +699,213 @@ fn project_steps(
             {
                 return Err(());
             }
-            project_step(step, definition, maximum_stream_bytes)
+            project_step(
+                step,
+                definition,
+                WorkflowNodeRole::Step,
+                maximum_stream_bytes,
+            )
         })
         .collect()
 }
 
+fn project_finalization(
+    attempt: &LocalAttemptV1,
+    result: &WorkflowResultV1,
+    workflow: &super::resolution::ResolvedWorkflow,
+) -> Result<(Option<ArchivedFinalization>, Vec<ArchivedStep>), ()> {
+    let (wire, durable) = match (&result.finalization, &attempt.finalization) {
+        (None, None) if workflow.definition.finalizers.is_empty() => return Ok((None, Vec::new())),
+        (Some(wire), Some(AttemptFinalizationV1::Complete(durable)))
+            if !workflow.definition.finalizers.is_empty() =>
+        {
+            (wire, durable)
+        }
+        _ => return Err(()),
+    };
+    if !durable.complete
+        || wire.trigger != durable.trigger
+        || wire.force_abort != durable.force_abort
+        || wire.finalizers.len() != workflow.definition.finalizer_presentation_order.len()
+        || durable.finalizers.len() != wire.finalizers.len()
+        || wire.issues.len() != durable.issues.len()
+    {
+        return Err(());
+    }
+    for (wire_issue, durable_issue) in wire.issues.iter().zip(&durable.issues) {
+        if wire_issue.node.id != durable_issue.finalizer_id
+            || wire_issue.node.role != WorkflowNodeRoleV1::Finalizer
+            || wire_issue.impact != durable_issue.impact
+        {
+            return Err(());
+        }
+    }
+    let cancellation = match (&wire.cancellation, &durable.cancellation) {
+        (None, None) => None,
+        (Some(wire), Some(durable)) if wire.reason == durable.reason => {
+            let wire_deadline = parse_optional_timestamp(wire.force_stop_deadline.as_deref())?;
+            let durable_deadline =
+                parse_optional_timestamp(durable.force_stop_deadline.as_deref())?;
+            if wire_deadline != durable_deadline {
+                return Err(());
+            }
+            Some(ArchivedFinalizationCancellation {
+                reason: cancellation_reason(wire.reason)?,
+                force_stop_deadline: wire_deadline,
+            })
+        }
+        _ => return Err(()),
+    };
+    let maximum_stream_bytes =
+        super::maximum_retained_bytes_per_stream(result.steps.len() + wire.finalizers.len());
+    let finalizers = wire
+        .finalizers
+        .iter()
+        .zip(&durable.finalizers)
+        .zip(&workflow.definition.finalizer_presentation_order)
+        .map(|((finalizer, durable), expected_id)| {
+            let declared = workflow.definition.finalizers.get(expected_id).ok_or(())?;
+            let definition = &declared.body;
+            if finalizer.id != *expected_id
+                || finalizer.role != WorkflowNodeRoleV1::Finalizer
+                || durable.id != *expected_id
+                || durable.role != AttemptNodeRoleV1::Finalizer
+                || finalizer.failure_policy != step_failure_policy(definition)
+                || durable.failure_policy != step_failure_policy(definition)
+                || !step_state_matches(finalizer.state, durable.state)
+                || !durable_finalizer_matches_wire(durable, finalizer)
+                || !step_kind_matches(&finalizer.kind, definition)
+                || !finalizer_disposition_matches_definition(declared, finalizer, result)
+            {
+                return Err(());
+            }
+            project_step(
+                finalizer,
+                definition,
+                WorkflowNodeRole::Finalizer,
+                maximum_stream_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    Ok((
+        Some(ArchivedFinalization {
+            trigger: wire.trigger,
+            issues: wire
+                .issues
+                .iter()
+                .map(|issue| (issue.node.id.clone(), issue.impact))
+                .collect(),
+            cancellation,
+            force_abort: wire.force_abort,
+        }),
+        finalizers,
+    ))
+}
+
+fn finalizer_disposition_matches_definition(
+    declared: &super::validated::ValidatedFinalizer,
+    finalizer: &WorkflowStepV1,
+    result: &WorkflowResultV1,
+) -> bool {
+    let trigger = match result.finalization.as_ref().map(|summary| summary.trigger) {
+        Some(FinalizationTriggerV1::Succeeded) => FinalizationTrigger::Succeeded,
+        Some(FinalizationTriggerV1::Failed) => FinalizationTrigger::Failed,
+        Some(FinalizationTriggerV1::Cancelled) => FinalizationTrigger::Cancelled,
+        None => return false,
+    };
+    let selected = declared.when.contains(&trigger);
+    if !selected {
+        return finalizer.state == WorkflowStepStateV1::NotRun
+            && finalizer.reason == Some(StepReasonV1::FinalizerTriggerNotSelected);
+    }
+    if finalizer.state == WorkflowStepStateV1::NotRun {
+        return false;
+    }
+
+    let unavailable = consumed_output_sources(&declared.body)
+        .into_iter()
+        .filter(|source| !result_node_succeeded(result, &source.node.id))
+        .map(super::validated::ResolvedOutputSource::reference)
+        .collect::<BTreeSet<_>>();
+    match finalizer.state {
+        WorkflowStepStateV1::Blocked => {
+            finalizer.reason == Some(StepReasonV1::InputUnavailable)
+                && finalizer
+                    .unavailable_references
+                    .as_ref()
+                    .is_some_and(|references| references.iter().eq(&unavailable))
+                && !unavailable.is_empty()
+        }
+        WorkflowStepStateV1::Succeeded
+        | WorkflowStepStateV1::Failed
+        | WorkflowStepStateV1::Cancelled => unavailable.is_empty(),
+        WorkflowStepStateV1::NotRun => false,
+    }
+}
+
+fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::ResolvedOutputSource> {
+    match step {
+        ValidatedStep::Command(command) => command
+            .inputs
+            .values()
+            .filter_map(|reference| match &reference.source {
+                ResolvedValueSource::Output(source) => Some(source),
+                ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext => None,
+            })
+            .collect(),
+        ValidatedStep::Agent(agent) => agent
+            .agent
+            .message
+            .text
+            .iter()
+            .chain(&agent.agent.message.attachments)
+            .filter_map(|source| match source {
+                ValidatedMessageSource::Reference {
+                    source: ResolvedValueSource::Output(source),
+                    ..
+                } => Some(source),
+                ValidatedMessageSource::Reference {
+                    source:
+                        ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext,
+                    ..
+                }
+                | ValidatedMessageSource::File { .. } => None,
+            })
+            .collect(),
+    }
+}
+
+fn result_node_succeeded(result: &WorkflowResultV1, id: &str) -> bool {
+    result
+        .steps
+        .iter()
+        .chain(
+            result
+                .finalization
+                .iter()
+                .flat_map(|summary| &summary.finalizers),
+        )
+        .find(|node| node.id == id)
+        .is_some_and(|node| node.state == WorkflowStepStateV1::Succeeded)
+}
+
+fn parse_optional_timestamp(value: Option<&str>) -> Result<Option<OffsetDateTime>, ()> {
+    value
+        .map(|value| parse_canonical_utc_timestamp(value).ok_or(()))
+        .transpose()
+}
+
+fn durable_finalizer_matches_wire(
+    durable: &super::local_run::DurableFinalizerV1,
+    wire: &WorkflowStepV1,
+) -> bool {
+    durable.failure == wire.failure
+        && durable.reason == wire.reason
+        && durable.unavailable_references == wire.unavailable_references
+}
+
 fn validate_terminal_step_facts(
-    outcome: WorkflowOutcomeV1,
+    trigger: FinalizationTriggerV1,
     steps: &[ArchivedStep],
     workflow: &super::resolution::ResolvedWorkflow,
 ) -> Result<(), ()> {
@@ -664,14 +932,16 @@ fn validate_terminal_step_facts(
             }
             ArchivedStepDetail::Succeeded
             | ArchivedStepDetail::Failed(_)
+            | ArchivedStepDetail::InputUnavailable { .. }
+            | ArchivedStepDetail::TriggerNotSelected
             | ArchivedStepDetail::Cancelled { .. } => {}
         }
     }
 
-    let valid_outcome = match outcome {
-        WorkflowOutcomeV1::Succeeded => steps.iter().all(step_succeeds_workflow),
-        WorkflowOutcomeV1::Failed => true,
-        WorkflowOutcomeV1::Cancelled => {
+    let valid_outcome = match trigger {
+        FinalizationTriggerV1::Succeeded => steps.iter().all(step_succeeds_workflow),
+        FinalizationTriggerV1::Failed => true,
+        FinalizationTriggerV1::Cancelled => {
             steps.iter().all(|step| {
                 step_succeeds_workflow(step) || step.state == ArchivedStepState::Cancelled
             }) && steps
@@ -685,6 +955,7 @@ fn validate_terminal_step_facts(
 fn project_step(
     step: &WorkflowStepV1,
     definition: &ValidatedStep,
+    role: WorkflowNodeRole,
     maximum_stream_bytes: u64,
 ) -> Result<ArchivedStep, ()> {
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
@@ -697,11 +968,11 @@ fn project_step(
     };
     let (state, detail) = match step.state {
         WorkflowStepStateV1::Succeeded => {
-            exact_step_fields(step, false, false, false)?;
+            exact_step_fields(step, false, false, false, false)?;
             (ArchivedStepState::Succeeded, ArchivedStepDetail::Succeeded)
         }
         WorkflowStepStateV1::Failed => {
-            exact_step_fields(step, true, false, false)?;
+            exact_step_fields(step, true, false, false, false)?;
             let failure = project_failure(step.failure.as_ref().ok_or(())?)?;
             validate_failure_binding(&failure.cause, definition)?;
             (
@@ -709,8 +980,8 @@ fn project_step(
                 ArchivedStepDetail::Failed(failure),
             )
         }
-        WorkflowStepStateV1::Blocked => {
-            exact_step_fields(step, false, true, false)?;
+        WorkflowStepStateV1::Blocked if role == WorkflowNodeRole::Step => {
+            exact_step_fields(step, false, true, false, false)?;
             let dependency = step.dependency.clone().ok_or(())?;
             if !direct_prerequisites(definition)
                 .iter()
@@ -723,15 +994,37 @@ fn project_step(
                 ArchivedStepDetail::Blocked { dependency },
             )
         }
-        WorkflowStepStateV1::NotRun => {
-            exact_step_fields(step, false, false, true)?;
+        WorkflowStepStateV1::Blocked => {
+            exact_step_fields(step, false, false, true, true)?;
+            if step.reason != Some(StepReasonV1::InputUnavailable) {
+                return Err(());
+            }
+            (
+                ArchivedStepState::Blocked,
+                ArchivedStepDetail::InputUnavailable {
+                    references: step.unavailable_references.clone().ok_or(())?,
+                },
+            )
+        }
+        WorkflowStepStateV1::NotRun if role == WorkflowNodeRole::Step => {
+            exact_step_fields(step, false, false, true, false)?;
             if step.reason != Some(StepReasonV1::FailureStop) {
                 return Err(());
             }
             (ArchivedStepState::NotRun, ArchivedStepDetail::NotRun)
         }
+        WorkflowStepStateV1::NotRun => {
+            exact_step_fields(step, false, false, true, false)?;
+            if step.reason != Some(StepReasonV1::FinalizerTriggerNotSelected) {
+                return Err(());
+            }
+            (
+                ArchivedStepState::NotRun,
+                ArchivedStepDetail::TriggerNotSelected,
+            )
+        }
         WorkflowStepStateV1::Cancelled => {
-            exact_step_fields(step, false, false, true)?;
+            exact_step_fields(step, false, false, true, false)?;
             let reason = cancellation_step_reason(step.reason.ok_or(())?)?;
             (
                 ArchivedStepState::Cancelled,
@@ -761,7 +1054,10 @@ fn project_step(
         }
         (
             ValidatedStep::Command(_),
-            ArchivedStepDetail::Blocked { .. } | ArchivedStepDetail::NotRun,
+            ArchivedStepDetail::Blocked { .. }
+            | ArchivedStepDetail::InputUnavailable { .. }
+            | ArchivedStepDetail::NotRun
+            | ArchivedStepDetail::TriggerNotSelected,
         ) => !output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Cancelled { .. }) => true,
     };
@@ -770,6 +1066,7 @@ fn project_step(
     }
     Ok(ArchivedStep {
         id: step.id.clone(),
+        role,
         failure_policy: step.failure_policy,
         state,
         started_at,
@@ -784,10 +1081,12 @@ fn exact_step_fields(
     failure: bool,
     dependency: bool,
     reason: bool,
+    unavailable_references: bool,
 ) -> Result<(), ()> {
     if step.failure.is_some() != failure
         || step.dependency.is_some() != dependency
         || step.reason.is_some() != reason
+        || step.unavailable_references.is_some() != unavailable_references
     {
         return Err(());
     }
@@ -843,9 +1142,10 @@ fn project_primary_failure(
         WorkflowOutcomeV1::Failed => {
             let primary = result.primary_failure.as_ref().ok_or(())?;
             let projected = project_primary(primary)?;
+            let expected_role = workflow_node_role(primary.node.role);
             let step = steps
                 .iter()
-                .find(|step| step.id == primary.step)
+                .find(|step| step.id == primary.node.id && step.role == expected_role)
                 .ok_or(())?;
             if step.failure_policy != FailurePolicy::Required
                 || !matches!(&step.detail, ArchivedStepDetail::Failed(failure) if *failure == projected.failure)
@@ -860,12 +1160,20 @@ fn project_primary_failure(
 
 fn project_primary(primary: &PrimaryFailureV1) -> Result<ArchivedPrimaryFailure, ()> {
     Ok(ArchivedPrimaryFailure {
-        step: primary.step.clone(),
+        step: primary.node.id.clone(),
+        role: workflow_node_role(primary.node.role),
         failure: project_failure(&FailureV1 {
             phase: primary.phase,
             cause: primary.cause.clone(),
         })?,
     })
+}
+
+fn workflow_node_role(role: WorkflowNodeRoleV1) -> WorkflowNodeRole {
+    match role {
+        WorkflowNodeRoleV1::Step => WorkflowNodeRole::Step,
+        WorkflowNodeRoleV1::Finalizer => WorkflowNodeRole::Finalizer,
+    }
 }
 
 fn project_failure(failure: &FailureV1) -> Result<ArchivedFailure, ()> {
@@ -927,12 +1235,7 @@ fn project_cancellation(
     attempt: &LocalAttemptV1,
     result: &WorkflowResultV1,
 ) -> Result<Option<ArchivedCancellation>, ()> {
-    let required = match result.outcome {
-        WorkflowOutcomeV1::Succeeded => false,
-        WorkflowOutcomeV1::Failed => attempt.cancellation.is_some(),
-        WorkflowOutcomeV1::Cancelled => true,
-    };
-    if result.cancellation.is_some() != required || attempt.cancellation.is_some() != required {
+    if result.cancellation.is_some() != attempt.cancellation.is_some() {
         return Err(());
     }
     let Some(result_cancellation) = &result.cancellation else {
@@ -965,7 +1268,12 @@ fn cancellation_reason(reason: CancellationReasonV1) -> Result<ArchivedCancellat
             Ok(ArchivedCancellationReason::CallerOutputFailure)
         }
         CancellationReasonV1::RunnerShutdown => Ok(ArchivedCancellationReason::RunnerShutdown),
-        CancellationReasonV1::ExecutionLeaseExpired => Err(()),
+        CancellationReasonV1::ExecutionLeaseExpired => {
+            Ok(ArchivedCancellationReason::ExecutionLeaseExpired)
+        }
+        CancellationReasonV1::FinalizationForceAbort => {
+            Ok(ArchivedCancellationReason::FinalizationForceAbort)
+        }
     }
 }
 
@@ -975,7 +1283,15 @@ fn cancellation_step_reason(reason: StepReasonV1) -> Result<ArchivedCancellation
         StepReasonV1::TerminationRequest => Ok(ArchivedCancellationReason::TerminationRequest),
         StepReasonV1::CallerOutputFailure => Ok(ArchivedCancellationReason::CallerOutputFailure),
         StepReasonV1::RunnerShutdown => Ok(ArchivedCancellationReason::RunnerShutdown),
-        StepReasonV1::FailureStop | StepReasonV1::ExecutionLeaseExpired => Err(()),
+        StepReasonV1::ExecutionLeaseExpired => {
+            Ok(ArchivedCancellationReason::ExecutionLeaseExpired)
+        }
+        StepReasonV1::FinalizationForceAbort => {
+            Ok(ArchivedCancellationReason::FinalizationForceAbort)
+        }
+        StepReasonV1::FailureStop
+        | StepReasonV1::InputUnavailable
+        | StepReasonV1::FinalizerTriggerNotSelected => Err(()),
     }
 }
 
@@ -1060,12 +1376,25 @@ fn validate_exports(
                 }
             }
             ExportV1::Unavailable { reason } => {
-                let expected = match source_step.state {
-                    ArchivedStepState::Failed => ExportUnavailableReasonV1::Failed,
-                    ArchivedStepState::Blocked => ExportUnavailableReasonV1::Blocked,
-                    ArchivedStepState::NotRun => ExportUnavailableReasonV1::NotRun,
-                    ArchivedStepState::Cancelled => ExportUnavailableReasonV1::Cancelled,
-                    ArchivedStepState::Succeeded => return Err(()),
+                let expected = match (&source_step.detail, source_step.role) {
+                    (ArchivedStepDetail::Failed(_), _) => ExportUnavailableReasonV1::Failed,
+                    (ArchivedStepDetail::Blocked { .. }, WorkflowNodeRole::Step) => {
+                        ExportUnavailableReasonV1::Blocked
+                    }
+                    (ArchivedStepDetail::InputUnavailable { .. }, WorkflowNodeRole::Finalizer) => {
+                        ExportUnavailableReasonV1::InputUnavailable
+                    }
+                    (ArchivedStepDetail::NotRun, WorkflowNodeRole::Step) => {
+                        ExportUnavailableReasonV1::NotRun
+                    }
+                    (ArchivedStepDetail::TriggerNotSelected, WorkflowNodeRole::Finalizer) => {
+                        ExportUnavailableReasonV1::TriggerNotSelected
+                    }
+                    (ArchivedStepDetail::Cancelled { .. }, _) => {
+                        ExportUnavailableReasonV1::Cancelled
+                    }
+                    (ArchivedStepDetail::Succeeded, _) => return Err(()),
+                    _ => return Err(()),
                 };
                 if *reason != expected {
                     return Err(());
@@ -1090,7 +1419,18 @@ fn export_media_type<'a>(
     workflow: &'a super::resolution::ResolvedWorkflow,
     source: &super::validated::ResolvedOutputSource,
 ) -> Result<&'a str, ()> {
-    let step = workflow.definition.steps.get(&source.node.id).ok_or(())?;
+    let step = workflow
+        .definition
+        .steps
+        .get(&source.node.id)
+        .or_else(|| {
+            workflow
+                .definition
+                .finalizers
+                .get(&source.node.id)
+                .map(|finalizer| &finalizer.body)
+        })
+        .ok_or(())?;
     let output = match step {
         ValidatedStep::Command(command) => command.common.outputs.get(&source.output),
         ValidatedStep::Agent(agent) => agent.common.outputs.get(&source.output),

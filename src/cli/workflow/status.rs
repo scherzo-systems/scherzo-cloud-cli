@@ -12,6 +12,7 @@ use crate::execution::workflow::local_run::{
 };
 use crate::execution::workflow::presentation::{
     ColorChoice, PresentationConfig, RequestedPresentationMode, TerminalCapabilities,
+    styled_terminal_text as styled,
 };
 use crate::exit_code::ExitCode;
 
@@ -319,13 +320,5 @@ const fn retry_reason_style(reason: RetryIneligibilityReason) -> &'static str {
         RetryIneligibilityReason::LatestAttemptSucceeded => STYLE_SUCCESS,
         RetryIneligibilityReason::LatestAttemptRejected
         | RetryIneligibilityReason::OwnershipUnproven => STYLE_FAILURE,
-    }
-}
-
-fn styled(value: &str, style: &str, color: bool) -> String {
-    if color {
-        format!("\u{1b}[{style}m{value}\u{1b}[0m")
-    } else {
-        value.to_owned()
     }
 }

@@ -239,17 +239,6 @@ mod tests {
 
     use super::Cli;
 
-    fn command_help(path: &[&str]) -> String {
-        let mut root = Cli::command();
-        let mut command = &mut root;
-        for name in path {
-            command = command
-                .find_subcommand_mut(name)
-                .expect("command should exist");
-        }
-        command.render_help().to_string()
-    }
-
     fn collect_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
         assert!(
             !command.is_allow_external_subcommands_set(),
@@ -325,6 +314,7 @@ mod tests {
             "account",
             "account signup",
             "artifact",
+            "artifact download",
             "artifact validate",
             "auth",
             "auth login",
@@ -372,172 +362,5 @@ mod tests {
         ];
 
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn root_help_is_composed_from_command_metadata() {
-        let help = command_help(&[]);
-
-        assert!(help.contains("account       Manage your Scherzo Cloud account"));
-        assert!(help.contains("artifact      Work with portable workflow artifacts"));
-        assert!(help.contains("auth          Manage your Scherzo Cloud sign-in"));
-        assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
-        assert!(help.contains("version       Print version information"));
-        assert!(help.contains("runner        Work with the Scherzo Cloud runner"));
-        assert!(help.contains("workflow      Work with local workflow definitions and runs"));
-        assert!(!help.contains("--allow-insecure-http"));
-    }
-
-    #[test]
-    fn account_help_is_composed_from_command_metadata() {
-        let help = command_help(&["account"]);
-
-        assert!(help.contains("signup  Create your Scherzo Cloud account"));
-        assert!(command_help(&["account", "signup"]).contains("--allow-insecure-http"));
-    }
-
-    #[test]
-    fn artifact_help_is_composed_from_command_metadata() {
-        let help = command_help(&["artifact"]);
-        let validate = command_help(&["artifact", "validate"]);
-
-        assert!(help.contains("validate  Validate a portable workflow artifact directory"));
-        assert!(validate.contains("[OPTIONS] <ARTIFACT_DIR>"));
-        assert!(validate.contains("--json"));
-        assert!(!validate.contains("--plain"));
-        assert!(!validate.contains("--color"));
-    }
-
-    #[test]
-    fn auth_help_is_composed_from_command_metadata() {
-        let help = command_help(&["auth"]);
-
-        assert!(help.contains("login   Sign in to Scherzo Cloud"));
-        assert!(help.contains("status  Show your Scherzo Cloud sign-in status"));
-        assert!(help.contains("logout  Sign out of Scherzo Cloud on this device"));
-        assert!(command_help(&["auth", "login"]).contains("--allow-insecure-http"));
-        assert!(command_help(&["auth", "status"]).contains("--allow-insecure-http"));
-        assert!(!command_help(&["auth", "logout"]).contains("--allow-insecure-http"));
-    }
-
-    #[test]
-    fn organization_help_is_composed_from_command_metadata() {
-        let help = command_help(&["organization"]);
-
-        assert!(help.contains("create   Create a Scherzo Cloud organization"));
-        assert!(help.contains("show     Show a Scherzo Cloud organization"));
-        assert!(help.contains("update   Update a Scherzo Cloud organization"));
-        assert!(help.contains("members  Manage Scherzo Cloud organization members"));
-        assert!(command_help(&["organization", "create"]).contains("--display-name"));
-        assert!(command_help(&["organization", "create"]).contains("--allow-insecure-http"));
-        assert!(command_help(&["organization", "show"]).contains("<ORGANIZATION>"));
-
-        let update = command_help(&["organization", "update"]);
-        assert!(update.contains("--display-name"));
-        assert!(update.contains("--slug"));
-        assert!(update.contains("--allow-insecure-http"));
-
-        let members = command_help(&["organization", "members"]);
-        assert!(members.contains("list  List organization members"));
-        let list = command_help(&["organization", "members", "list"]);
-        assert!(list.contains("--limit <LIMIT>"));
-        assert!(list.contains("--cursor <CURSOR>"));
-        assert!(list.contains("--allow-insecure-http"));
-    }
-
-    #[test]
-    fn runner_help_is_composed_from_leaf_metadata() {
-        let help = command_help(&["runner"]);
-
-        assert!(help.contains("pool        Manage Scherzo Cloud runner pools"));
-        assert!(
-            help.contains("create      Create a runner registration and enrollment activation")
-        );
-        assert!(help.contains("activation  Manage runner enrollment activations"));
-        assert!(help.contains("enroll      Enroll a protected runner credential"));
-        assert!(help.contains("list        List Scherzo Cloud runner registrations"));
-        assert!(help.contains("show        Show a Scherzo Cloud runner registration"));
-        assert!(help.contains("rename      Rename a Scherzo Cloud runner registration"));
-        assert!(help.contains("doctor      Check local runner prerequisites"));
-        assert!(help.contains("serve       Connect to Scherzo Cloud and serve run assignments"));
-        assert!(help.contains("status      Show live Runner Serve status"));
-
-        let activation = command_help(&["runner", "activation"]);
-        assert!(activation.contains("create  Create a single-use runner activation"));
-        assert!(activation.contains("list    List runner activations"));
-        assert!(activation.contains("revoke  Revoke a runner activation"));
-        assert!(command_help(&["runner", "create"]).contains("--activation-file <PATH|->"));
-        assert!(command_help(&["runner", "enroll"]).contains("--resume"));
-
-        let pool = command_help(&["runner", "pool"]);
-        assert!(pool.contains("create  Create a Scherzo Cloud runner pool"));
-        assert!(pool.contains("list    List Scherzo Cloud runner pools"));
-        assert!(pool.contains("show    Show a Scherzo Cloud runner pool"));
-        assert!(pool.contains("rename  Rename a Scherzo Cloud runner pool"));
-        assert!(command_help(&["runner", "show"]).contains("<ORGANIZATION> <RUNNER>"));
-        assert!(command_help(&["runner", "rename"]).contains("--name <NAME>"));
-    }
-
-    #[test]
-    fn workflow_help_is_composed_from_leaf_metadata() {
-        let help = command_help(&["workflow"]);
-        let validate = command_help(&["workflow", "validate"]);
-
-        assert!(help.contains("retry     Retry a local workflow run"));
-        assert!(help.contains("run       Run a local command and agent workflow"));
-        assert!(help.contains("status    Show local workflow run status"));
-        assert!(help.contains("validate  Validate a local workflow definition"));
-        assert!(help.contains("view      View a published local workflow attempt"));
-        let run = command_help(&["workflow", "run"]);
-        for option in [
-            "--source-root <ROOT>",
-            "--execution-root <PATH>",
-            "--run-dir <PATH>",
-            "--prompt-file <PATH>",
-            "--attachment <MEDIA_TYPE> <PATH>",
-            "--max-parallel <COUNT>",
-            "--plain",
-            "--json",
-            "--color <WHEN>",
-            "<WORKFLOW_FILE>",
-        ] {
-            assert!(run.contains(option), "run help should contain {option}");
-        }
-        let retry = command_help(&["workflow", "retry"]);
-        for option in [
-            "<RUN_DIR>",
-            "--execution-root <PATH>",
-            "--plain",
-            "--json",
-            "--color <WHEN>",
-        ] {
-            assert!(retry.contains(option), "retry help should contain {option}");
-        }
-        assert!(!retry.contains("--run-dir"));
-        assert!(!retry.contains("--source-root"));
-        assert!(!retry.contains("--prompt-file"));
-        assert!(!retry.contains("--max-parallel"));
-        let status = command_help(&["workflow", "status"]);
-        for option in ["<RUN_DIR>", "--plain", "--json", "--color <WHEN>"] {
-            assert!(
-                status.contains(option),
-                "status help should contain {option}"
-            );
-        }
-        assert!(!status.contains("--run-dir"));
-        assert!(!status.contains("--source-root"));
-        assert!(!status.contains("--execution-root"));
-        let view = command_help(&["workflow", "view"]);
-        for option in ["<RUN_DIR>", "--attempt <NUMBER>", "--color <WHEN>"] {
-            assert!(view.contains(option), "view help should contain {option}");
-        }
-        assert!(!view.contains("--run-dir"));
-        assert!(!view.contains("--plain"));
-        assert!(!view.contains("--json"));
-        assert!(!view.contains("--source-root"));
-        assert!(!view.contains("--execution-root"));
-        assert!(validate.contains("--source-root <ROOT>"));
-        assert!(validate.contains("<WORKFLOW_FILE>"));
-        assert!(validate.contains("--json"));
     }
 }

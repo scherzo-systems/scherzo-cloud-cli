@@ -1,0 +1,27 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5ad0",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sequence": 14,
+  "sentAt": "2026-07-23T00:00:13Z",
+  "type": "execution_transition",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "executionEventSequence": 5,
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 8,
+      "from": { "state": "executing", "gate": "open" },
+      "to": {
+        "state": "executing",
+        "gate": "cancelling",
+        "reason": "finalization_force_abort"
+      }
+    }
+  }
+}

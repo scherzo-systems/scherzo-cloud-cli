@@ -65,7 +65,7 @@ impl Command {
             // Validate store access and prune an expired selected credential
             // before starting its replacement login.
             store
-                .selected(deployment.fingerprint(), crate::timing::utc_now())
+                .selected(deployment.fingerprint())
                 .map_err(|error| anyhow!(error))
                 .context("access credential store")?;
         } else {
@@ -278,7 +278,12 @@ fn finish_login(
     // Credential persistence commits the login. Ignore later interrupts so a
     // cancelled result can never conceal a newly stored token.
     store
-        .replace(deployment.fingerprint(), token.access_token(), expires_at)
+        .replace(
+            deployment.fingerprint(),
+            token.access_token(),
+            expires_at,
+            token.refresh_token(),
+        )
         .map_err(|error| anyhow!(error))
         .context("access credential store")?;
 
@@ -308,9 +313,7 @@ fn handle_status_error(
     error: StatusError,
 ) -> anyhow::Result<Completion> {
     match error {
-        StatusError::CredentialStore(error) => {
-            Err(anyhow!(error).context("access credential store"))
-        }
+        StatusError::Session(error) => Err(anyhow!(error).context("acquire human session")),
         StatusError::PublicApi(error) if error.is_local() => {
             Err(anyhow!(error).context(phase.operation_context(deployment)))
         }

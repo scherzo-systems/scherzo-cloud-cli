@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow view",
+  "outcome": "error",
+  "exitStatus": 1,
+  "attemptNumber": 1,
+  "error": {
+    "code": "run_directory_unavailable",
+    "message": "The run directory is unavailable."
+  }
+}

@@ -105,7 +105,6 @@ def local_assets(dist: Path, version: str, expected_names: Sequence[str]) -> tup
     targets = (
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
         "x86_64-unknown-linux-gnu",
     )
     archive_paths: dict[str, Path] = {}
@@ -237,6 +236,18 @@ def wait_for_created_draft(inspection: Inspection) -> object:
         time.sleep(RELEASE_VISIBILITY_POLL_SECONDS)
 
 
+def wait_for_created_tag(inspection: Inspection) -> str | None:
+    verification = inspection.verification
+    deadline = time.monotonic() + RELEASE_VISIBILITY_TIMEOUT_SECONDS
+    while True:
+        target = tag_target(
+            inspection.github, inspection.github.repository, verification.tag
+        )
+        if target is not None or time.monotonic() >= deadline:
+            return target
+        time.sleep(RELEASE_VISIBILITY_POLL_SECONDS)
+
+
 def create_tag(inspection: Inspection) -> None:
     verification = inspection.verification
     inspection.github.run(
@@ -249,9 +260,7 @@ def create_tag(inspection: Inspection) -> None:
         f"sha={verification.allocated_mirror}",
         f"repos/{inspection.github.repository}/git/refs",
     )
-    if tag_target(inspection.github, inspection.github.repository, verification.tag) != (
-        verification.allocated_mirror
-    ):
+    if wait_for_created_tag(inspection) != verification.allocated_mirror:
         fail("GitHub did not create the stable tag at the allocated mirror")
 
 

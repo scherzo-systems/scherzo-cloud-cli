@@ -92,7 +92,7 @@ async fn execute_workflow<Clock, Observer, Dispatcher>(
     agents: AgentExecution<Dispatcher>,
     clock: Clock,
     observer: Observer,
-) -> Result<WorkflowExecutionResult, CoordinationError>
+) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
@@ -360,6 +360,74 @@ async fn command_stdin_fixture_process() {
     .await
     .unwrap();
     assert_eq!(result.outcome, RunOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn command_finalizer_receives_the_engine_context_after_ordinary_quiescence() {
+    with_watchdog(async {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let executable = env::current_exe().unwrap();
+        let fixture_args = fixture_arguments();
+        let source = format!(
+            "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: {}\nfinalizers:\n  release:\n    kind: cmd\n    inputs:\n      context: {{ ref: finalization.context }}\n    command:\n      argv: {}\n",
+            command_argv(
+                &fixture_script(0, "work", false),
+                &executable,
+                &fixture_args
+            ),
+            command_argv(
+                &fixture_script(0, "release", false),
+                &executable,
+                &fixture_args
+            ),
+        );
+        let fixture = execution_fixture(
+            &source,
+            ResolvedImports::default(),
+            fixture_environment(&listener),
+            CancellationSource::new(),
+            1,
+            32,
+        );
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn(async move {
+            execute_workflow(
+                fixture.admitted,
+                &artifacts,
+                &inputs,
+                &StepDiagnosticLog::default(),
+                AgentExecution::disabled(),
+                TestClock,
+                NoopExecutionObserver,
+            )
+            .await
+        });
+
+        let (role, work) = accept_fixture(&listener).await;
+        assert_eq!(role, "work");
+        release_fixture(work).await;
+        let (role, release) = accept_fixture(&listener).await;
+        assert_eq!(role, "release");
+        release_fixture(release).await;
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert!(matches!(
+            result.steps["release"],
+            StepState::Succeeded { .. }
+        ));
+        let summary = result.finalization_summary.unwrap();
+        assert_eq!(
+            summary.trigger,
+            crate::execution::workflow::document::FinalizationTrigger::Succeeded
+        );
+        assert!(matches!(
+            summary.finalizers[0].disposition,
+            StepState::Succeeded { .. }
+        ));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1777,13 +1845,11 @@ async fn harness_start_failure_is_a_start_failure() {
         let result = execution.await.unwrap().unwrap();
         assert!(
             matches!(
-                result.steps["task"],
+                &result.steps["task"],
                 StepState::Failed {
                     phase: FailurePhase::Start,
-                    cause: StepFailureCause::Start(StepStartFailure::Agent(
-                        AgentFailureCause::HarnessStartFailed
-                    )),
-                }
+                    cause: StepFailureCause::Start(StepStartFailure::Agent(failure)),
+                } if matches!(failure.cause(), AgentFailureCause::HarnessStartFailed)
             ),
             "a pre-start harness failure must not transition the step through running: {:?}",
             result.steps["task"]

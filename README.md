@@ -10,18 +10,18 @@ executable.
 ## Current capabilities
 
 The current release supports help, version inspection, OAuth Device Authorization,
-server-confirmed human authentication status, explicit human-principal signup, local
-human-credential logout, organization profile management and one-page member-directory
+server-confirmed human authentication status, explicit human-principal signup, renewable
+human sessions and revoking logout, organization profile management and one-page member-directory
 reads, local Workflow V1 definition validation, portable artifact-set validation, mixed
-command and agent execution, durable run status inspection, runner diagnostics, and a
-enrolled outbound runner transport. `runner serve` connects only to the
-Cloud-issued endpoint retained in protected state, transport-acknowledges assignment effects,
-and resolves and admits one configured local command workflow without claiming that
-execution occurred.
+command and agent execution, durable run status inspection, runner diagnostics, and an
+enrolled outbound runner transport. `runner serve` connects only to the Cloud-issued
+endpoint retained in protected state and resolves, admits, and executes one configured
+inputless Workflow V1 command, Pi, Claude Code, or mixed assignment after explicit start
+authorization.
 
 The CLI can create an organization, read or update its initial profile, and list one
-page of active members. It cannot configure repositories, invite or change members,
-submit workflows, or execute runner assignments. Agent-guided organization creation
+page of active members. It cannot configure repositories, invite or change members, or
+submit workflows. Agent-guided organization creation
 and the rest of Cloud onboarding are not implemented yet.
 
 ## Local workflow validation
@@ -117,13 +117,13 @@ First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable stat
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and import bytes, durable closed run and attempt
 state, and attempt 1's atomic result beneath
-`attempts/000001/result`. Every PiJsonV1 invocation also receives a fresh native session
-directory beneath `attempts/<attempt>/diagnostics/pi-json-v1/`; it remains after normal
-private-staging cleanup together with metadata identifying the attempt, step, invocation,
-profile, and exact Pi version. ClaudeCodeStreamJsonV1 stores correlation metadata beneath
-`attempts/<attempt>/diagnostics/claude-code-stream-json-v1/`, including the exact Claude
-Code version and the fact that native session persistence is disabled. The run-directory
-path is the local run handle. Add
+`attempts/000001/result`. Every PiJsonV1 and ClaudeCodeStreamJsonV1 invocation receives
+fresh native session storage beneath its profile directory under
+`attempts/<attempt>/diagnostics/`. It remains after
+normal private-staging cleanup together with metadata identifying the attempt, step,
+invocation, immutable profile, exact harness version, and native format. Claude sessions
+are never resumed and are removed from ambient Claude history when the invocation
+quiesces. The run-directory path is the local run handle. Add
 `--json` for one terminal schema-version-1 object on stdout while the live presentation
 remains on stderr, or `--plain` to force the line presentation on stdout.
 
@@ -160,10 +160,32 @@ the cursor before invoking the shared standard plain-summary renderer. The summa
 process status are therefore the same contracts used by forced plain output. Inspect the
 durable run later with `workflow status <RUN_DIR>`; retry is always explicit.
 
+A Claude Code profile is configured independently from Pi:
+
+```yaml
+agentProfiles:
+  claude:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+        effort: high
+```
+
+`model` is a nonempty native Claude model string. `effort` is one of `low`, `medium`,
+`high`, `xhigh`, or `max`; both fields are required and additional configuration is
+rejected. Scherzo does not query a model catalog, install Claude Code, or supply a
+fallback model or harness.
+
 Local execution snapshots the inherited environment after resolution and removes
-`SCHERZO_` variables before launching commands or agents. It inspects the resolved agent
-steps and validates each required harness once: `pi` for PiJsonV1 and `claude` for
-ClaudeCodeStreamJsonV1. Each search selects the first executable candidate in inherited
+`SCHERZO_` variables before launching commands or agents. Other caller-provided values are
+retained unless the closed harness profile fixes them. ClaudeCodeStreamJsonV1 removes
+`CLAUDE_CODE_PROJECT_DIR_NAME` to keep retained-session routing authoritative and applies
+its documented native controls; values such as `GH_TOKEN`, `GITHUB_TOKEN`, and Git or SSH
+credential-helper configuration remain available for local repository setup and cloning.
+The local caller owns that authority; Runner Serve applies a separate managed credential-isolation policy. The CLI
+inspects the resolved agent steps and validates each required harness once: `pi` for
+PiJsonV1 and `claude` for ClaudeCodeStreamJsonV1. Each search selects the first executable candidate in inherited
 `PATH` and pins its canonical absolute path, exact version, profile, and capabilities for
 the run. Later `PATH` changes cannot switch either executable. Command-only workflows
 probe neither harness; Pi-only and Claude-only workflows do not require the unrelated
@@ -226,21 +248,43 @@ respectively.
 
 ## Local workflow archived view
 
-Inspect a successfully published terminal attempt in the read-only terminal viewer:
+View a successfully published terminal attempt from one stable read-only snapshot:
 
 ```sh
-scherzo-cloud workflow view ./runs/check-001 [--attempt 1]
+scherzo-cloud workflow view ./runs/check-001 [--attempt 1] [--plain | --json]
 ```
 
-Omitting `--attempt` selects the current attempt from one stable durable snapshot. The
-viewer requires terminal stdin, terminal stdout, and a usable `TERM`; it has no plain or
-JSON fallback. It loads the immutable retained workflow and selected published result,
-then displays a frozen DAG, inspector, and separate retained stdout and stderr prefixes.
-It does not acquire run ownership, resume execution, retry work, or follow later state.
+Omitting `--attempt` selects the current attempt from the snapshot. Without an explicit
+mode, terminal stdin plus terminal stdout plus a usable `TERM` opens the existing frozen
+archived TUI; every other stream arrangement prints a plain completed-attempt summary.
+`--plain` and `--json` force their modes regardless of terminal capability and conflict
+with each other. The command never opens `/dev/tty` or falls back after selecting the
+TUI.
 
-Use `q` to restore the terminal and return 0 without a workflow-run summary. `Ctrl-C`
-and SIGTERM restore the terminal and return 130 or 143, respectively. Terminal and
-durable-read failures return 1.
+The plain summary contains retained attempt and execution identity, lifecycle, duration,
+node disposition, direct typed causes, terminal counts, outcome, cancellation, and
+finalization facts. It does not replay events or print retained stdout or stderr,
+commands, exports, artifact contents, or agent observations, and it claims no ordering
+between retained streams.
+
+`--json` writes exactly one ANSI-free document conforming to
+[`schemas/workflow-view-result-v1.schema.json`](schemas/workflow-view-result-v1.schema.json).
+A successful view returns 0 and embeds the complete validated immutable selected result,
+including when the workflow outcome is failed or cancelled. Expected acquisition and
+attempt-selection failures return 1 as the schema's closed error variant on stdout
+without duplicate stderr prose. Usage errors return 2. Local serialization, output, or
+terminal failures return 1 and do not append a replacement document after a partial
+prefix.
+
+The loader validates the retained workflow, published result, cross-document identity,
+artifact set, and retained budget before exposing either the safe archived projection or
+the complete wire result. It opens only the state-recorded publication once, never
+acquires execution ownership, and does not retarget if a retry advances the run.
+
+Use `q` to restore an active TUI and return 0 without a workflow-run summary. SIGINT and
+SIGTERM interrupt any mode with status 130 or 143; noninteractive rendering, writing,
+and flushing remain abandonable even when stdout is full. Viewer signals never cancel a
+workflow. `--color` affects only plain and TUI styling; JSON is always ANSI-free.
 
 ## Version inspection
 
@@ -275,15 +319,22 @@ results preserve any server actions as complete opaque JSON values. The CLI does
 validate action IDs or guide origins, fetch guides, infer commands, or execute actions.
 Status always contacts the public API, including when no local credential exists.
 
+One successful login establishes a renewable human session. The CLI stores the one-hour
+access token, its expiration, and a rotating refresh token in
+`~/.scherzo/credentials.json`, then silently renews access for every human-authenticated
+command while the refresh session remains valid. Auth0 expires refresh sessions after 30
+days idle or 90 days total.
+
 Use `scherzo-cloud auth logout` to remove the human credential for the active deployment
-without making a network request. Normal operation stores short-lived human access
-tokens in `~/.scherzo/credentials.json`; this store is separate from workflow-run state
-and all runner credentials.
+and ask Auth0 to revoke its refresh token. The result distinguishes confirmed and
+unconfirmed server revocation; local removal still completes when Auth0 is unreachable.
+The human store remains separate from workflow-run state and all runner credentials.
 
 Development deployments that use HTTP require `--allow-insecure-http` on the networked
-leaf command: `auth login`, `auth status`, `account signup`, `organization create`,
-`organization show`, `organization update`, or `organization members list`. The option
-is not global and does not apply to local commands such as `auth logout`.
+leaf command: `auth login`, `auth status`, `auth logout`, `account signup`,
+`organization create`, `organization show`, `organization update`, or
+`organization members list`. The option
+is not global.
 
 ## Account signup
 
@@ -391,10 +442,11 @@ decisions. Missing, unexecutable, malformed, unsupported-version, and missing-ca
 outcomes have distinct report codes.
 
 The Claude Code check follows the same first-candidate and immutable-path rules for
-`claude`, but accepts only exact release `2.1.222`. Its isolated `--version` and `--help`
-probes require the closed stream input/output, partial-message, subagent-forwarding,
-no-session-persistence, permission-mode, setting-source, model, effort, append-system-
-prompt-file, and JSON-schema capabilities used by `ClaudeCodeStreamJsonV1`. The report
+`claude`, but accepts only exact release `2.1.234`. Scherzo does not install or upgrade
+that executable. Its isolated `--version` and `--help` probes require the closed stream
+input/output, partial-message, subagent-forwarding, explicit-session-identity,
+permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
+capabilities used by `ClaudeCodeStreamJsonV1`. The report
 contains only status, profile, expected and observed version, closed capabilities, and
 the selected absolute path. It never exposes environment values, credentials, or loaded
 Claude settings. The JSON report has no `ready` field.
@@ -411,12 +463,7 @@ closed operator configuration:
   "deploymentMode": "production",
   "runnerStatePath": "/var/lib/scherzo-cloud/runner-state.json",
   "controlSocketPath": "/run/scherzo-cloud/runner.sock",
-  "workRoot": "/var/lib/scherzo-cloud/work",
-  "developmentWorkflow": {
-    "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-    "sourceRoot": "/srv/scherzo-workflows",
-    "workflowPath": ".scherzo/workflows/check.yaml"
-  }
+  "workRoot": "/var/lib/scherzo-cloud/work"
 }
 ```
 
@@ -426,12 +473,19 @@ After enrollment has committed protected state, start the service with one value
 scherzo-cloud runner serve --config /etc/scherzo/runner.json
 ```
 
+Production operators should follow the private monorepo's
+`docs/operations/runner-v1-deployment.md` runbook for confidential activation transfer,
+service-manager shutdown allowance, control-plane cutover, drain, and recovery. That
+operator runbook is intentionally outside this public CLI source mirror.
+
 The connection URL, runner ID, and current credential come only from enrolled state.
 There are no endpoint environment overrides or command-line aliases for the removed
 Gateway, credential, transport-mode, workflow-mapping, source, workflow-path, and work
 root options. `production` requires the Cloud-issued `wss://` connection URL.
 `development` additionally permits `ws://` only for exact `localhost`, IPv4 loopback,
-or `[::1]` hosts; it never permits a caller-selected endpoint.
+or `[::1]` hosts; it never permits a caller-selected endpoint. Deployment mode changes
+transport security only. Every assignment supplies a pinned Cloud repository source,
+and every runner materializes and verifies that source before admission.
 
 Rotate a running host only with a replacement activation issued for its existing runner:
 
@@ -456,23 +510,31 @@ grace or revoke it immediately if compromise is suspected. Never print an activa
 artifact or runner state while transferring or verifying it.
 
 Runner startup selects `pi` and `claude` independently from its inherited
-operator-controlled `PATH`. Each successful initialization is validated once and retained
+operator-controlled `PATH`. Install exact Claude Code 2.1.234 in that service
+environment before starting a runner that should accept Claude work; Scherzo never
+installs it automatically. Each successful initialization is validated once and retained
 as an immutable snapshot for the process lifetime: Pi requires a version in
-`>=0.83.0 <0.84.0`, while Claude Code requires exact `2.1.222`. Admission and invocation
+`>=0.83.0 <0.84.0`, while Claude Code requires exact `2.1.234`. Admission and invocation
 never repeat either lookup or probe. A missing or incompatible installation leaves only
 that harness unavailable, so Runner Serve remains available for command-only and
 unrelated-harness assignments. An assignment requiring the unavailable harness is rejected
 before launch, and selection never falls through to another executable. Assignments and
-workflow data cannot influence selection.
+workflow data cannot influence selection. Claude runs in the profile's fixed unattended
+`bypassPermissions` mode, which is not a sandbox. The runner owner remains responsible
+for filesystem, process, network, resource, and secret isolation and for trusted user,
+project, and local Claude settings, instructions, skills, hooks, MCP servers, and plugins.
+An operator rollout installs and validates Claude in the existing service environment,
+restarts that runner, canaries one deterministic Claude assignment, stops new Claude work
+on failure, and rolls back by restoring the previous service environment or runner release.
 
 The runner reconnects after retryable network, timeout, rate-limit, Gateway restart, and
 server failures with jittered backoff while retaining boot-scoped assignment state.
 Credential rejection is terminal authentication; unsupported subprotocol or malformed
 Cloud protocol is terminal protocol. Terminal outcomes exit nonzero without exposing
-bearer material. The source and work roots must be existing, nonoverlapping directories,
-and the workflow path must remain within its source root. The service maps only the
-configured workflow ID, validates the welcomed execution-lease policy and local clock
-health, and reserves its one local slot before reporting semantic acceptance. Transport
+bearer material. The work root must be an existing directory. Every offer supplies a
+pinned source that the service materializes and verifies beneath that root. The service
+validates the welcomed execution-lease policy and local clock health and reserves its
+one local slot before reporting semantic acceptance. Transport
 receipt and semantic acceptance remain separate; execution requires a later start
 effect and remains bounded by the latest received execution lease across same-boot
 reconnects.
@@ -563,8 +625,8 @@ allocation record with the source. Metadata-branch creation is ignored by workfl
 triggers, and provider rules forbid updating or deleting those content-addressed refs.
 GitHub Actions verifies the allocation and any separately approved recovery chain from the
 accompanying public `main` push; it never chooses a version from mutable tags. The
-four native builds always check out the original allocated mirror for x86-64 and ARM64
-Linux and for Intel and Apple Silicon macOS. The final write-scoped job creates or
+three native builds always check out the original allocated mirror for x86-64 and ARM64
+Linux and for Apple Silicon macOS. The final write-scoped job creates or
 reconciles only matching tag and draft state, then publishes the exact archives,
 `SHA256SUMS`, and GitHub build-provenance attestations on the
 [Releases](https://github.com/scherzo-systems/scherzo-cloud-cli/releases) page. Exact
@@ -595,19 +657,14 @@ self-contained.
 ## Development
 
 The repository contains a standalone devenv environment with the pinned Rust toolchain.
-Enter it and run the canonical check from the repository root:
+Run the canonical check from the repository root:
 
 ```sh
-devenv shell
 ./scripts/check
 ```
 
-For the same entrypoint used by CI, run:
-
-```sh
-./scripts/strict-devenv test
-```
-
+The command uses `scripts/strict-devenv` to remove the caller's environment before
+Devenv constructs the declared test environment. This is the same entrypoint used by CI.
 The check verifies public-source isolation, formatting, every target and feature on the
 `rust-version` declared in `Cargo.toml`, checked-in Clippy policy, unit and integration
 tests, and a release build.

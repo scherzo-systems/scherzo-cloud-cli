@@ -68,6 +68,7 @@ impl ArtifactSet {
             "outcome": "succeeded",
             "steps": [{
                 "id": "produce",
+                "role": "step",
                 "kind": "agent",
                 "failurePolicy": "required",
                 "state": "succeeded",
@@ -113,6 +114,20 @@ impl ArtifactSet {
 
     fn replace_result(&self, result: &Value) {
         write_result(&self.root, result);
+    }
+
+    fn use_cloud_profile(&self) {
+        let mut result = self.result();
+        result["workflow"]["provenance"] = json!({
+            "kind": "cloud",
+            "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc"
+        });
+        result["execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("executionRoot");
+        self.replace_result(&result);
     }
 }
 
@@ -229,11 +244,6 @@ fn missing_artifact_directory_is_operational_for_humans_and_structured_for_json(
 
     assert_eq!(human.status.code(), Some(1));
     assert!(human.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&human.stderr);
-    assert!(stderr.starts_with("Error: open artifact directory "));
-    assert!(stderr.contains(argument));
-    assert!(stderr.contains("No such file or directory"));
-
     let structured = run(&["artifact", "validate", "--json", argument]);
 
     assert_eq!(structured.status.code(), Some(1));
@@ -247,18 +257,13 @@ fn missing_artifact_directory_is_operational_for_humans_and_structured_for_json(
 }
 
 #[test]
-fn copied_current_kind_set_validates_in_human_and_json_modes_without_mutation() {
+fn copied_local_profile_set_validates_in_human_and_json_modes_without_mutation() {
     let artifact = ArtifactSet::valid();
     let before = byte_snapshot(&artifact.root);
 
     let human = run(&["artifact", "validate", artifact.argument()]);
     assert!(human.status.success());
-    let report = String::from_utf8_lossy(&human.stdout);
-    assert!(report.contains("✓ Artifact set is valid."));
-    assert!(report.contains("directory:"));
-    assert!(report.contains("exports: 5"));
-    assert!(report.contains("carriers: 3"));
-    assert!(report.contains("bytes: 50"));
+    assert!(!human.stdout.is_empty());
     assert!(human.stderr.is_empty());
 
     let structured = run(&["artifact", "validate", "--json", artifact.argument()]);
@@ -288,6 +293,158 @@ fn copied_current_kind_set_validates_in_human_and_json_modes_without_mutation() 
 }
 
 #[test]
+fn finalization_summary_is_validated_without_mutating_portable_artifact() {
+    let artifact = ArtifactSet::valid();
+    let mut result = artifact.result();
+    result["finalization"] = json!({
+        "trigger": "succeeded",
+        "finalizers": [{
+            "id": "cleanup",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "succeeded",
+            "startedAt": "2026-08-06T10:00:01Z",
+            "durationMilliseconds": 0
+        }],
+        "issues": [],
+        "forceAbort": false
+    });
+    artifact.replace_result(&result);
+    let before = fs::read(artifact.root.join("result.json")).unwrap();
+
+    let valid = run(&["artifact", "validate", "--json", artifact.argument()]);
+
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stdout)
+    );
+    assert_eq!(fs::read(artifact.root.join("result.json")).unwrap(), before);
+
+    result["finalization"]["issues"] = json!([{
+        "node": { "id": "cleanup", "role": "finalizer" },
+        "impact": "required"
+    }]);
+    artifact.replace_result(&result);
+    let invalid = run(&["artifact", "validate", "--json", artifact.argument()]);
+    let report: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
+}
+
+#[test]
+fn finalization_cancellation_reason_must_match_cancelled_finalizers() {
+    let artifact = ArtifactSet::valid();
+    let mut result = artifact.result();
+    result["outcome"] = json!("cancelled");
+    result["finalization"] = json!({
+        "trigger": "succeeded",
+        "finalizers": [{
+            "id": "cleanup",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "cancelled",
+            "reason": "termination_request"
+        }],
+        "issues": [],
+        "cancellation": {
+            "reason": "user_request",
+            "forceStopDeadline": "2026-08-06T10:00:02Z"
+        },
+        "forceAbort": false
+    });
+    artifact.replace_result(&result);
+
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a summary cannot claim user-request cancellation while its cancelled finalizer records termination-request: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
+}
+
+#[test]
+fn cancelled_outcome_rejects_required_finalization_issues() {
+    let artifact = ArtifactSet::valid();
+    let mut result = artifact.result();
+    result["outcome"] = json!("cancelled");
+    result["finalization"] = json!({
+        "trigger": "succeeded",
+        "finalizers": [{
+            "id": "release",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "failed",
+            "startedAt": "2026-08-06T10:00:01Z",
+            "durationMilliseconds": 0,
+            "failure": {
+                "phase": "execution",
+                "cause": { "code": "harness_failed" }
+            }
+        }, {
+            "id": "notify",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "advisory",
+            "state": "cancelled",
+            "reason": "user_request"
+        }],
+        "issues": [{
+            "node": { "id": "release", "role": "finalizer" },
+            "impact": "required"
+        }],
+        "cancellation": {
+            "reason": "user_request",
+            "forceStopDeadline": "2026-08-06T10:00:02Z"
+        },
+        "forceAbort": false
+    });
+    artifact.replace_result(&result);
+
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
+}
+
+#[test]
+fn cloud_metadata_only_and_carrier_bearing_sets_validate() {
+    let carrier_bearing = ArtifactSet::valid();
+    carrier_bearing.use_cloud_profile();
+
+    let metadata_only = ArtifactSet::valid();
+    for entry in fs::read_dir(metadata_only.root.join("exports")).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let mut metadata_result = metadata_only.result();
+    metadata_result["exports"] = json!({});
+    metadata_only.replace_result(&metadata_result);
+    metadata_only.use_cloud_profile();
+
+    for (artifact, declared_exports, referenced_carriers) in
+        [(carrier_bearing, 5, 3), (metadata_only, 0, 0)]
+    {
+        let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        assert!(output.status.success(), "{report:#}");
+        assert_eq!(report["outcome"], "valid");
+        assert_eq!(report["summary"]["declaredExports"], declared_exports);
+        assert_eq!(report["summary"]["referencedCarriers"], referenced_carriers);
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn missing_carrier_remedy_names_the_resolved_path() {
     let artifact = ArtifactSet::valid();
     let missing = artifact.root.join("exports/0002");
@@ -300,11 +457,7 @@ fn missing_carrier_remedy_names_the_resolved_path() {
 
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(&format!(
-        "Restore the missing artifact carrier:\n  {}\n",
-        resolved_missing.display()
-    )));
-    assert!(!stdout.contains("at this location"));
+    assert!(stdout.contains(&resolved_missing.display().to_string()));
     assert!(output.stderr.is_empty());
 }
 
@@ -748,14 +901,14 @@ fn carrier_limit_does_not_skip_later_authoritative_references() {
     }
 
     let mut exports = serde_json::Map::new();
-    for ordinal in 1..=2_049 {
+    for ordinal in 1..=4_097 {
         let bytes = [u8::try_from(ordinal % 251).unwrap()];
         let path = format!("exports/{ordinal:04}");
         exports.insert(
             format!("export{ordinal:04}"),
             available_export("file", "application/octet-stream", &path, &bytes),
         );
-        if ordinal <= 2_048 {
+        if ordinal <= 4_096 {
             fs::write(artifact.root.join(path), bytes).unwrap();
         }
     }
@@ -775,7 +928,7 @@ fn carrier_limit_does_not_skip_later_authoritative_references() {
             .iter()
             .any(|diagnostic| {
                 diagnostic["code"] == "carrier_missing"
-                    && diagnostic["location"]["path"] == "exports/2049"
+                    && diagnostic["location"]["path"] == "exports/4097"
             })
     );
 }

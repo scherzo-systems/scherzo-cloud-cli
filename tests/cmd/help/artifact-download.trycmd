@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud artifact download --help
+Download and verify a run's Artifact Set
+
+Usage: scherzo-cloud artifact download [OPTIONS] --output <PATH> <ORGANIZATION> <RUN>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUN>           Run identifier containing the Artifact Set
+
+Options:
+      --output <PATH>        Directory to create for the complete Artifact Set (must not already exist)
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

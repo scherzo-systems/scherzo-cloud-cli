@@ -597,6 +597,7 @@ pub(crate) fn assignment_offer() -> Message {
                 "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
                 "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
                 "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+                "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "executionSpec": {
                     "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -605,6 +606,17 @@ pub(crate) fn assignment_offer() -> Message {
                     "executionLimits": {
                         "maximumParallelSteps": 1,
                         "cancellationGraceSeconds": 1
+                    },
+                    "source": {
+                        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "objectFormat": "sha1",
+                        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+                        "workflowPath": "workflow.yaml",
+                        "workflowSourceClosureDigest": {
+                            "algorithm": "sha256",
+                            "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        },
+                        "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
                     }
                 },
                 "offerExpiresAt": "2026-07-23T01:00:00Z"

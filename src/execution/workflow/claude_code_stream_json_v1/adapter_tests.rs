@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::future::{Future, pending, ready};
+use std::io::{BufRead as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -9,34 +10,43 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
-use super::adapter::{ClaudeCodeStreamJsonV1Adapter, prepare_launch};
+use super::adapter::{ClaudeCodeStreamJsonV1Adapter, native_project_slug, prepare_launch};
 use super::test_support::{
-    PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
+    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
 };
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationReason, CancellationSource, EnvironmentSnapshot,
 };
 use crate::execution::workflow::agent::{
-    AgentAdapter, AgentInvocation, AgentInvocationLimits, AgentInvocationStaging,
-    AgentProcessContext, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver, AgentValueMode,
-    PositiveDuration, RetainedResultSchema, StagedAgentAttachment, agent_start_channel,
-    agent_terminal_channel, invoke_agent_adapter,
+    AgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationLimits,
+    AgentInvocationStaging, AgentProcessContext, AgentPrompt, AgentStartReceiver,
+    AgentTerminalReceiver, AgentValueMode, PositiveDuration, RetainedResultSchema,
+    StagedAgentAttachment, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
-use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
+use crate::execution::workflow::agent_diagnostics::{
+    AgentDiagnosticSession, AgentDiagnosticSessionStore,
+};
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::observation::NoopExecutionObserver;
+use crate::execution::workflow::private_staging::open_directory_path;
 use crate::execution::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
 use crate::execution::workflow::result_validation::{
     ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
     ValidationWorkerRequest,
+};
+use crate::execution::workflow::test_support::{
+    process_fixture_interrupt_receiver, spawn_process_fixture, write_process_fixture_id,
+    write_process_fixture_signal,
 };
 
 const MODEL: &str = "scherzo-loopback";
@@ -49,19 +59,26 @@ done > "$CLAUDE_FIXTURE_ARGUMENTS"
 cat > "$CLAUDE_FIXTURE_INPUT"
 prompt=
 model=
+session=
 previous=
 for argument in "$@"; do
   case "$previous" in
     --append-system-prompt-file) prompt=$argument ;;
     --model) model=$argument ;;
+    --session-id) session=$argument ;;
   esac
   previous=$argument
 done
+native_project=$CLAUDE_FIXTURE_NATIVE_PROJECT
+printf '{malformed retained transcript' > "$native_project/$session.jsonl"
+mkdir -p "$native_project/$session/subagents"
+printf 'retained subagent activity\n' > "$native_project/$session/subagents/agent-fixture.jsonl"
 cat "$prompt" > "$CLAUDE_FIXTURE_PROMPT"
 printf '%s\n' "$PWD" > "$CLAUDE_FIXTURE_CWD"
 {
   printf 'runner=%s\n' "$ONLY_RUNNER_VALUE"
   printf 'config=%s\n' "$CLAUDE_CONFIG_DIR"
+  printf 'project_dir_name=%s\n' "${CLAUDE_CODE_PROJECT_DIR_NAME-unset}"
   printf 'updates=%s\n' "$DISABLE_UPDATES"
   printf 'traffic=%s\n' "$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
   printf 'marketplace=%s\n' "$CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL"
@@ -69,9 +86,8 @@ printf '%s\n' "$PWD" > "$CLAUDE_FIXTURE_CWD"
   printf 'git=%s\n' "$CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"
 } > "$CLAUDE_FIXTURE_ENVIRONMENT"
 printf 'fixture diagnostic\n' >&2
-session=00000000-0000-4000-8000-000000000001
 output=$(
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
 printf '{"type":"system","subtype":"status","status":"requesting","session_id":"%s"}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-driver","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -85,55 +101,19 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 printf '%s\n' "$output"
 "#;
 
-// The cooperative and stubborn scripts repeat only the exact mandatory init frame; keeping
-// their signal behavior independent makes cancellation-phase regressions auditable.
-// jscpd:ignore-start
 const CANCELLATION_FAKE_CLAUDE: &str = r#"#!/bin/sh
-set -eu
-model=
-previous=
-for argument in "$@"; do
-  if [ "$previous" = --model ]; then model=$argument; fi
-  previous=$argument
-done
-IFS= read -r _initial
-session=00000000-0000-4000-8000-000000000001
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
-printf '%s\n' "$$" > "$CLAUDE_FIXTURE_ARGUMENTS"
-printf 'ready\n' > "$CLAUDE_FIXTURE_CWD"
-on_interrupt() {
-  printf 'interrupted\n' >> "$CLAUDE_FIXTURE_ENVIRONMENT"
-  exit 130
-}
-trap on_interrupt INT TERM
-while :; do sleep 1; done
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact execution::workflow::claude_code_stream_json_v1::adapter_tests::cancellation_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
 "#;
 
 const STUBBORN_DESCENDANT_FAKE_CLAUDE: &str = r#"#!/bin/sh
-set -eu
-model=
-previous=
-for argument in "$@"; do
-  if [ "$previous" = --model ]; then model=$argument; fi
-  previous=$argument
-done
-IFS= read -r _initial
-session=00000000-0000-4000-8000-000000000001
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
-(
-  trap '' INT TERM
-  while :; do :; done
-) &
-descendant=$!
-printf '%s\n' "$$" > "$CLAUDE_FIXTURE_ARGUMENTS"
-printf '%s\n' "$descendant" > "$CLAUDE_FIXTURE_CWD"
-on_interrupt() { printf 'interrupted\n' > "$CLAUDE_FIXTURE_ENVIRONMENT"; }
-trap on_interrupt INT TERM
-while kill -0 "$descendant" 2>/dev/null; do
-  wait "$descendant" || :
-done
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact execution::workflow::claude_code_stream_json_v1::adapter_tests::stubborn_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
 "#;
-// jscpd:ignore-end
 
 type TestInvocation = AgentInvocation<
     ClaudeCodeConfig,
@@ -152,7 +132,14 @@ struct ProcessFixture {
     prompt: PathBuf,
     cwd: PathBuf,
     environment: PathBuf,
+    config: PathBuf,
+    native_session: PathBuf,
+    session_id: Arc<str>,
+    ready: FixtureSignal,
+    descendant_ready: FixtureSignal,
+    interrupted: FixtureSignal,
     expected_cwd: PathBuf,
+    diagnostic_directory: PathBuf,
 }
 
 struct AttachmentFixture<'a> {
@@ -179,6 +166,7 @@ impl ProcessFixture {
         let result_endpoint = staging.join("result-endpoint");
         let controls = temporary.path().join("controls");
         let config = temporary.path().join("runner-claude-config");
+        let attempt = temporary.path().join("attempt");
         for directory in [
             &cwd,
             &staging,
@@ -186,6 +174,7 @@ impl ProcessFixture {
             &result_endpoint,
             &controls,
             &config,
+            &attempt,
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
@@ -198,7 +187,10 @@ impl ProcessFixture {
         let prompt = controls.join("prompt");
         let captured_cwd = controls.join("cwd");
         let environment = controls.join("environment");
-        let runner_environment = BTreeMap::from([
+        let ready = FixtureSignal::create(controls.join("ready"));
+        let descendant_ready = FixtureSignal::create(controls.join("descendant-ready"));
+        let interrupted = FixtureSignal::create(controls.join("interrupted"));
+        let mut runner_environment = BTreeMap::from([
             (
                 OsString::from("PATH"),
                 std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
@@ -210,6 +202,10 @@ impl ProcessFixture {
             (
                 OsString::from("CLAUDE_CONFIG_DIR"),
                 config.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_CODE_PROJECT_DIR_NAME"),
+                OsString::from("ambient-project-name"),
             ),
             (OsString::from("DISABLE_UPDATES"), OsString::from("0")),
             (
@@ -231,6 +227,22 @@ impl ProcessFixture {
             (
                 OsString::from("CLAUDE_FIXTURE_ENVIRONMENT"),
                 environment.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_FIXTURE_PROCESS_HELPER"),
+                std::env::current_exe().unwrap().into_os_string(),
+            ),
+            (
+                OsString::from("CLAUDE_FIXTURE_READY"),
+                ready.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_FIXTURE_DESCENDANT_READY"),
+                descendant_ready.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_FIXTURE_INTERRUPTED"),
+                interrupted.path().as_os_str().to_owned(),
             ),
         ]);
         let attachments = attachment_fixtures
@@ -258,20 +270,55 @@ impl ProcessFixture {
             .select_working_directory(Some("worktree"))
             .unwrap();
         let expected_cwd = working_directory.protocol_path().unwrap();
+        // Give the fake upstream writer the exact ambient directory so this fixture does
+        // not duplicate Claude's bounded slug algorithm; that algorithm has its own test.
+        runner_environment.insert(
+            OsString::from("CLAUDE_FIXTURE_NATIVE_PROJECT"),
+            config
+                .join("projects")
+                .join(native_project_slug(expected_cwd.to_str().unwrap()))
+                .into_os_string(),
+        );
         let observations = RecordingObservationSink::default();
         let diagnostics = StepDiagnosticLog::default();
+        let identity = invocation_identity("run-claude-driver", "agent-step");
+        let attempt_directory = open_directory_path(&attempt).unwrap();
+        let diagnostic_session = AgentDiagnosticSessionStore::create(
+            &attempt_directory,
+            &attempt,
+            Arc::from("00000000-0000-4000-8000-000000000001"),
+            1,
+        )
+        .unwrap()
+        .allocate(
+            &identity,
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+            CLAUDE_CODE_STREAM_JSON_V1_VERSION,
+        )
+        .unwrap();
+        let native_session = diagnostic_session
+            .claude_code_native_session_directory()
+            .unwrap()
+            .to_owned();
+        let session_id =
+            Arc::<str>::from(diagnostic_session.claude_code_native_session_id().unwrap());
+        runner_environment.insert(
+            OsString::from("CLAUDE_FIXTURE_SESSION"),
+            OsString::from(session_id.as_ref()),
+        );
+        let diagnostic_directory = diagnostic_session.directory().to_owned();
         // The normal-driver and result-driver fixtures intentionally construct distinct
         // production invocations so their stdin closure and correction scripts cannot mix.
         // jscpd:ignore-start
         let invocation = AgentInvocation::new(
-            invocation_identity("run-claude-driver", "agent-step"),
+            identity,
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(
                 working_directory,
                 EnvironmentSnapshot::new(runner_environment),
             ),
             AgentInvocationStaging::new(result_endpoint),
-            AgentDiagnosticSession::fixture(temporary.path().join("diagnostics/session")),
+            diagnostic_session,
             AgentPrompt::new(
                 Arc::from("exact system prompt\n"),
                 Arc::from("exact message @literal\nsecond line"),
@@ -295,7 +342,14 @@ impl ProcessFixture {
             prompt,
             cwd: captured_cwd,
             environment,
+            config,
+            native_session,
+            session_id,
+            ready,
+            descendant_ready,
+            interrupted,
             expected_cwd,
+            diagnostic_directory,
         }
     }
 }
@@ -358,13 +412,13 @@ fn start_process_fixture(
     AgentTerminalReceiver,
 ) {
     let value_mode = invocation.value_mode().clone();
-    let adapter = ClaudeCodeStreamJsonV1Adapter::new(
+    let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
         PendingClock,
         NoopExecutionObserver,
-    )
-    .unwrap();
+        InlineValidationWorker,
+    );
     let (started, start) = agent_start_channel();
     let (terminal, outcome) = agent_terminal_channel(&value_mode);
     let task = tokio::spawn(async move {
@@ -382,7 +436,19 @@ fn assert_user_cancelled(outcome: AgentOutcome) {
     );
 }
 
-fn production_transcript_script(events: &[Value], malformed_tail: bool, exit_status: u8) -> String {
+fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    assert_eq!(failure.cause(), &cause);
+}
+
+fn production_transcript_script(
+    events: &[Value],
+    malformed_tail: bool,
+    exit_status: u8,
+    session: &str,
+) -> String {
     let mut output = String::new();
     for event in events {
         let event = serde_json::to_string(event).unwrap();
@@ -392,6 +458,7 @@ fn production_transcript_script(events: &[Value], malformed_tail: bool, exit_sta
     if malformed_tail {
         output.push_str("printf 'not-json\\n'\n");
     }
+    assert!(!session.contains('\''));
     format!(
         r#"#!/bin/sh
 set -eu
@@ -402,8 +469,8 @@ for argument in "$@"; do
   previous=$argument
 done
 IFS= read -r _initial
-session=00000000-0000-4000-8000-000000000001
-printf '{{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}}\n' "$PWD" "$session" "$model"
+session='{session}'
+printf '{{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}}\n' "$PWD" "$session" "$model"
 {output}exit {exit_status}
 "#
     )
@@ -436,6 +503,7 @@ where
 const RESULT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$$" > "$CLAUDE_RESULT_PROCESS"
+printf 'ready\n' > "$CLAUDE_RESULT_PROCESS_READY"
 IFS= read -r initial
 printf '%s\n' "$initial" > "$CLAUDE_RESULT_INPUT"
 cat "$CLAUDE_RESULT_FIRST"
@@ -454,12 +522,13 @@ case "${CLAUDE_RESULT_MODE:-settle}" in
   settle) ;;
   delayed-exit)
     printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
-    while [ ! -s "$CLAUDE_RESULT_SETTLEMENT_RELEASE" ]; do sleep 0.01; done
+    IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
     ;;
   post-work) cat "$CLAUDE_RESULT_POST_WORK" ;;
   hang)
     trap '' INT TERM
-    while :; do :; done
+    IFS= read -r unexpected < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
+    exit 75
     ;;
   *) exit 74 ;;
 esac
@@ -509,7 +578,8 @@ struct ResultProcessFixture {
     observations: RecordingObservationSink,
     captured_input: PathBuf,
     process: PathBuf,
-    settlement_ready: PathBuf,
+    process_ready: FixtureSignal,
+    settlement_ready: FixtureSignal,
     settlement_release: PathBuf,
 }
 
@@ -526,7 +596,9 @@ impl ResultProcessFixture {
         let staging = temporary.path().join("staging");
         let result_endpoint = staging.join("result-endpoint");
         let controls = temporary.path().join("controls");
-        for directory in [&cwd, &staging, &result_endpoint, &controls] {
+        let home = temporary.path().join("home");
+        let config = temporary.path().join("claude-config");
+        for directory in [&cwd, &staging, &result_endpoint, &controls, &home, &config] {
             std::fs::create_dir_all(directory).unwrap();
         }
         let executable = temporary.path().join("claude");
@@ -575,14 +647,17 @@ impl ResultProcessFixture {
         .unwrap();
         let captured_input = controls.join("input.jsonl");
         let process = controls.join("process.pid");
-        let settlement_ready = controls.join("settlement.ready");
+        let process_ready = FixtureSignal::create(controls.join("process.ready"));
+        let settlement_ready = FixtureSignal::create(controls.join("settlement.ready"));
         let settlement_release = controls.join("settlement.release");
-        std::fs::write(&settlement_release, b"").unwrap();
+        mkfifo(&settlement_release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let runner_environment = EnvironmentSnapshot::new([
             (
                 OsString::from("PATH"),
                 std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
             ),
+            (OsString::from("HOME"), home.into_os_string()),
+            (OsString::from("CLAUDE_CONFIG_DIR"), config.into_os_string()),
             (
                 OsString::from("CLAUDE_RESULT_INPUT"),
                 captured_input.as_os_str().to_owned(),
@@ -592,8 +667,12 @@ impl ResultProcessFixture {
                 process.as_os_str().to_owned(),
             ),
             (
+                OsString::from("CLAUDE_RESULT_PROCESS_READY"),
+                process_ready.path().as_os_str().to_owned(),
+            ),
+            (
                 OsString::from("CLAUDE_RESULT_SETTLEMENT_READY"),
-                settlement_ready.as_os_str().to_owned(),
+                settlement_ready.path().as_os_str().to_owned(),
             ),
             (
                 OsString::from("CLAUDE_RESULT_SETTLEMENT_RELEASE"),
@@ -632,7 +711,9 @@ impl ResultProcessFixture {
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(working_directory, runner_environment),
             AgentInvocationStaging::new(result_endpoint),
-            AgentDiagnosticSession::fixture(temporary.path().join("diagnostics/session")),
+            AgentDiagnosticSession::claude_code_fixture(
+                temporary.path().join("diagnostics/session"),
+            ),
             AgentPrompt::new(Arc::from("system"), Arc::from("produce one result")),
             Arc::from([]),
             AgentValueMode::Result {
@@ -650,6 +731,7 @@ impl ResultProcessFixture {
             observations,
             captured_input,
             process,
+            process_ready,
             settlement_ready,
             settlement_release,
         }
@@ -677,7 +759,7 @@ fn result_exchange_transcript(
         "session_id": SESSION,
         "model": MODEL,
         "permissionMode": "bypassPermissions",
-        "claude_code_version": "2.1.222",
+        "claude_code_version": "2.1.234",
     })];
     if let Some(candidate) = &fixture.candidate {
         values.push(stream_event(json!({
@@ -947,16 +1029,6 @@ where
     (fixture, outcome)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time only keeps polling schedulable; file contents are the success evidence"
-)]
-async fn wait_for_path(path: &std::path::Path) {
-    while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
 fn fixture_process(path: &std::path::Path) -> Pid {
     let process = std::fs::read_to_string(path)
         .unwrap()
@@ -964,6 +1036,68 @@ fn fixture_process(path: &std::path::Path) -> Pid {
         .parse::<i32>()
         .unwrap();
     Pid::from_raw(process).unwrap()
+}
+
+fn write_fixture_init() {
+    let mut initial = String::new();
+    assert!(std::io::stdin().lock().read_line(&mut initial).unwrap() > 0);
+    let mut protocol = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/fd/3")
+        .unwrap();
+    serde_json::to_writer(
+        &mut protocol,
+        &json!({
+            "type": "system",
+            "subtype": "init",
+            "cwd": std::env::current_dir().unwrap(),
+            "session_id": std::env::var("CLAUDE_FIXTURE_SESSION").unwrap(),
+            "model": MODEL,
+            "permissionMode": "bypassPermissions",
+            "claude_code_version": "2.1.234",
+        }),
+    )
+    .unwrap();
+    protocol.write_all(b"\n").unwrap();
+}
+
+#[test]
+#[ignore = "launched as the cooperative Claude Code cancellation process fixture"]
+fn cancellation_process_fixture() {
+    write_fixture_init();
+    let interrupted = process_fixture_interrupt_receiver();
+    write_process_fixture_id("CLAUDE_FIXTURE_ARGUMENTS");
+    write_process_fixture_signal("CLAUDE_FIXTURE_READY", b"ready\n");
+    interrupted.recv().unwrap();
+    write_process_fixture_signal("CLAUDE_FIXTURE_INTERRUPTED", b"interrupted\n");
+    std::process::exit(130);
+}
+
+#[test]
+#[ignore = "launched as the stubborn Claude Code process fixture"]
+fn stubborn_process_fixture() {
+    write_fixture_init();
+    let interrupted = process_fixture_interrupt_receiver();
+    write_process_fixture_id("CLAUDE_FIXTURE_ARGUMENTS");
+    let _descendant = spawn_process_fixture(
+        "execution::workflow::claude_code_stream_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+    );
+    interrupted.recv().unwrap();
+    write_process_fixture_signal("CLAUDE_FIXTURE_INTERRUPTED", b"interrupted\n");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+#[ignore = "launched as the interrupt-resistant Claude Code descendant fixture"]
+fn stubborn_descendant_process_fixture() {
+    ctrlc::set_handler(|| {}).unwrap();
+    write_process_fixture_id("CLAUDE_FIXTURE_CWD");
+    write_process_fixture_signal("CLAUDE_FIXTURE_DESCENDANT_READY", b"ready\n");
+    loop {
+        std::thread::park();
+    }
 }
 
 #[expect(
@@ -999,6 +1133,43 @@ fn launch_plan_stages_exact_prompt_and_lf_delimited_input() {
         })
     );
     assert_eq!(plan.arguments()[0], OsStr::new("-p"));
+    let session_argument = plan
+        .arguments()
+        .windows(2)
+        .find(|arguments| arguments[0] == OsStr::new("--session-id"))
+        .unwrap();
+    assert_eq!(session_argument[1], OsStr::new(plan.session_id()));
+}
+
+#[test]
+fn an_existing_native_session_entry_is_never_selected_or_replaced() {
+    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+    let ambient_project = fixture
+        .config
+        .join("projects")
+        .join(native_project_slug(fixture.expected_cwd.to_str().unwrap()));
+    std::fs::create_dir_all(&ambient_project).unwrap();
+    let existing = ambient_project.join(format!("{}.jsonl", fixture.session_id));
+    std::fs::write(&existing, b"existing conversation sentinel").unwrap();
+
+    assert!(matches!(
+        prepare_launch(fixture.invocation.as_ref().unwrap()),
+        Err(AgentFailureCause::HarnessStartFailed)
+    ));
+    assert_eq!(
+        std::fs::read(existing).unwrap(),
+        b"existing conversation sentinel"
+    );
+}
+
+#[test]
+fn native_project_slug_matches_the_pinned_claude_code_storage_format() {
+    assert_eq!(native_project_slug("/tmp/emoji-😀"), "-tmp-emoji---");
+    let long = format!("/{}", "a".repeat(201));
+    assert_eq!(
+        native_project_slug(&long),
+        format!("-{}-85qkr6", "a".repeat(199))
+    );
 }
 
 #[test]
@@ -1171,6 +1342,7 @@ async fn permissive_native_envelope_preserves_every_authoritatively_valid_json_r
                 OsStr::new(RESULT_ENVELOPE_SCHEMA)
             ]
         );
+        drop(plan);
         let (_, outcome) = run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
         let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
             panic!("{root_type} root must complete through authoritative validation");
@@ -1271,9 +1443,8 @@ async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
             run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
         assert!(matches!(
             outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            }
+            AgentOutcome::Failed(failure)
+                if matches!(failure.cause(), AgentFailureCause::HarnessProtocolFailed)
         ));
         let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
         assert_eq!(input.lines().count(), 2);
@@ -1293,9 +1464,7 @@ async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
     let (_, outcome) = run_result_fixture(missing, PendingClock, InlineValidationWorker).await;
     assert_eq!(
         outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::MissingResult,
-        }
+        failed_agent_outcome(AgentFailureCause::MissingResult)
     );
 }
 
@@ -1320,11 +1489,9 @@ async fn validation_timeout_stops_its_worker_and_discards_the_candidate() {
     let (_, outcome) = task.await.unwrap();
     assert_eq!(
         outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::ResultValidationLimitExceeded {
-                deadline: PositiveDuration::new(Duration::from_secs(1)).unwrap(),
-            },
-        }
+        failed_agent_outcome(AgentFailureCause::ResultValidationLimitExceeded {
+            deadline: PositiveDuration::new(Duration::from_secs(1)).unwrap(),
+        })
     );
     assert!(stopped.load(Ordering::SeqCst));
     assert!(quiesced.load(Ordering::SeqCst));
@@ -1348,7 +1515,7 @@ async fn accepted_result_closes_input_and_remains_provisional_until_process_exit
             InlineValidationWorker,
         ));
 
-        wait_for_path(&ready).await;
+        assert_eq!(ready.receive().await, b"ready\n");
         assert_eq!(
             std::fs::read_to_string(captured_input)
                 .unwrap()
@@ -1382,11 +1549,15 @@ async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_resu
         );
         let (_, post_work_outcome) =
             run_result_fixture(post_work, PendingClock, InlineValidationWorker).await;
+        assert_agent_failure(&post_work_outcome, AgentFailureCause::HarnessProtocolFailed);
+        let AgentOutcome::Failed(post_work_failure) = post_work_outcome else {
+            unreachable!();
+        };
+        let rejection =
+            serde_json::to_value(post_work_failure.protocol_rejection().unwrap()).unwrap();
         assert_eq!(
-            post_work_outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            }
+            rejection["detail"]["reason"],
+            "terminal_drain_event_invalid"
         );
 
         let (clock, mut registered, release) = controlled_clock();
@@ -1407,9 +1578,7 @@ async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_resu
         let (_, settlement_outcome) = task.await.unwrap();
         assert_eq!(
             settlement_outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed,
-            }
+            failed_agent_outcome(AgentFailureCause::ResultSettlementFailed)
         );
     })
     .await;
@@ -1433,9 +1602,10 @@ async fn cancellation_during_validation_stops_the_worker_and_quiesces_the_proces
         );
         let cancellation = fixture.invocation.as_ref().unwrap().cancellation().clone();
         let process_path = fixture.process.clone();
+        let process_ready = fixture.process_ready.clone();
         let task = tokio::spawn(run_result_fixture(fixture, clock, worker));
         assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        wait_for_path(&process_path).await;
+        assert_eq!(process_ready.receive().await, b"ready\n");
         let process = fixture_process(&process_path);
 
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
@@ -1462,10 +1632,11 @@ async fn cancellation_after_a_provisional_result_forces_containment_quiescent() 
         let cancellation = invocation.cancellation().clone();
         let process_control = invocation.process_control().clone();
         let process_path = fixture.process.clone();
+        let process_ready = fixture.process_ready.clone();
         let task = tokio::spawn(run_result_fixture(fixture, clock, InlineValidationWorker));
         assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
         assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        wait_for_path(&process_path).await;
+        assert_eq!(process_ready.receive().await, b"ready\n");
         let process = fixture_process(&process_path);
         assert!(
             !task.is_finished(),
@@ -1503,20 +1674,21 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
         .filter(|argument| !argument.is_empty())
         .map(OsStr::from_bytes)
         .collect::<Vec<_>>();
-    assert_eq!(arguments.len(), 19);
+    assert_eq!(arguments.len(), 20);
     for rejected in [
         "--bare",
         "--continue",
         "--resume",
+        "--fork-session",
         "--fallback-model",
         "--replay-user-messages",
         "--worktree",
-        "--session-id",
+        "--no-session-persistence",
     ] {
         assert!(!arguments.contains(&OsStr::new(rejected)));
     }
     assert_eq!(
-        arguments[..18],
+        arguments[..19],
         [
             "-p",
             "--input-format",
@@ -1526,7 +1698,8 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
             "--verbose",
             "--include-partial-messages",
             "--forward-subagent-text",
-            "--no-session-persistence",
+            "--session-id",
+            fixture.session_id.as_ref(),
             "--permission-mode",
             "bypassPermissions",
             "--setting-sources",
@@ -1550,7 +1723,7 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
     assert_eq!(
         std::fs::read_to_string(&fixture.environment).unwrap(),
         format!(
-            "runner=runner exact\nconfig={}\nupdates=1\ntraffic=1\nmarketplace=1\nmemory=1\ngit=1\n",
+            "runner=runner exact\nconfig={}\nproject_dir_name=unset\nupdates=1\ntraffic=1\nmarketplace=1\nmemory=1\ngit=1\n",
             fixture
                 ._temporary
                 .path()
@@ -1561,6 +1734,24 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
     let input = std::fs::read(&fixture.input).unwrap();
     assert_eq!(input.last(), Some(&b'\n'));
     assert_eq!(input.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert_eq!(
+        std::fs::read(fixture.native_session.join("transcript.jsonl")).unwrap(),
+        b"{malformed retained transcript"
+    );
+    assert_eq!(
+        std::fs::read(
+            fixture
+                .native_session
+                .join("resources/subagents/agent-fixture.jsonl")
+        )
+        .unwrap(),
+        b"retained subagent activity\n"
+    );
+    let ambient_project = fixture
+        .config
+        .join("projects")
+        .join(native_project_slug(fixture.expected_cwd.to_str().unwrap()));
+    assert_eq!(std::fs::read_dir(ambient_project).unwrap().count(), 0);
 
     let observations = fixture.observations.snapshot();
     assert_eq!(
@@ -1596,52 +1787,80 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
 
 #[tokio::test]
 async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
-    let session = "00000000-0000-4000-8000-000000000001";
-    let success = json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "terminal_reason": "completed",
-        "result": "terminal convenience text",
-        "session_id": session,
-    });
-    let native_failure = json!({
-        "type": "result",
-        "subtype": "error_during_execution",
-        "is_error": true,
-        "terminal_reason": "error_during_execution",
-        "session_id": session,
-    });
+    enum Transcript {
+        Malformed,
+        Success,
+        NativeFailure,
+    }
+
     let cases = [
         (
             AgentValueMode::None,
-            production_transcript_script(&[], true, 0),
+            Transcript::Malformed,
+            0,
             AgentFailureCause::HarnessProtocolFailed,
         ),
         (
             AgentValueMode::Response {
                 output: Arc::from("response"),
             },
-            production_transcript_script(std::slice::from_ref(&success), false, 0),
+            Transcript::Success,
+            0,
             AgentFailureCause::MissingResponse,
         ),
         (
             AgentValueMode::None,
-            production_transcript_script(std::slice::from_ref(&native_failure), false, 17),
+            Transcript::NativeFailure,
+            17,
             AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::ModelError,
             },
         ),
         (
             AgentValueMode::None,
-            production_transcript_script(std::slice::from_ref(&success), false, 17),
+            Transcript::Success,
+            17,
             AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::UnsuccessfulExit,
             },
         ),
     ];
-    for (value_mode, script, cause) in cases {
+    for (value_mode, transcript, exit_status, cause) in cases {
         let fixture = ProcessFixture::new(value_mode, 1024);
+        let session = fixture
+            .invocation
+            .as_ref()
+            .unwrap()
+            .diagnostic_session()
+            .claude_code_native_session_id()
+            .unwrap()
+            .to_owned();
+        let (events, malformed_tail) = match transcript {
+            Transcript::Malformed => (Vec::new(), true),
+            Transcript::Success => (
+                vec![json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "terminal_reason": "completed",
+                    "result": "terminal convenience text",
+                    "session_id": session,
+                })],
+                false,
+            ),
+            Transcript::NativeFailure => (
+                vec![json!({
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": true,
+                    "terminal_reason": "error_during_execution",
+                    "session_id": session,
+                })],
+                false,
+            ),
+        };
+        let script =
+            production_transcript_script(&events, malformed_tail, exit_status, session.as_str());
         std::fs::write(
             fixture.invocation.as_ref().unwrap().adapter().executable(),
             script,
@@ -1649,7 +1868,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
         .unwrap();
         let (_, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
         assert!(started);
-        assert_eq!(outcome, AgentOutcome::Failed { cause });
+        assert_agent_failure(&outcome, cause);
     }
 
     let startup = ProcessFixture::new(AgentValueMode::None, 1024);
@@ -1658,9 +1877,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     assert!(!started);
     assert_eq!(
         startup_outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessStartFailed,
-        }
+        failed_agent_outcome(AgentFailureCause::HarnessStartFailed)
     );
 
     let validation = ResultProcessFixture::new(
@@ -1673,10 +1890,105 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
         run_result_fixture(validation, PendingClock, FailingValidationWorker).await;
     assert_eq!(
         validation_outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        }
+        failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
     );
+}
+
+#[tokio::test]
+async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_metadata() {
+    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+    let session = fixture
+        .invocation
+        .as_ref()
+        .unwrap()
+        .diagnostic_session()
+        .claude_code_native_session_id()
+        .unwrap()
+        .to_owned();
+    let rejected = json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 7,
+            "delta": {
+                "type": "text_delta",
+                "text": "SENTINEL_ASSISTANT_TEXT",
+                "tool_input": "SENTINEL_TOOL_INPUT",
+            },
+        },
+        "session_id": session,
+        "parent_tool_use_id": "SENTINEL_PARENT_ID",
+        "provider_payload": "SENTINEL_PROVIDER_PAYLOAD",
+        "request_id": "SENTINEL_REQUEST_ID",
+        "structured_output": "SENTINEL_STRUCTURED_OUTPUT",
+        "tool_result": "SENTINEL_TOOL_RESULT",
+    });
+    std::fs::write(
+        fixture.invocation.as_ref().unwrap().adapter().executable(),
+        production_transcript_script(&[rejected], false, 0, session.as_str()),
+    )
+    .unwrap();
+
+    let (fixture, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
+    assert!(started);
+    assert_agent_failure(&outcome, AgentFailureCause::HarnessProtocolFailed);
+    let AgentOutcome::Failed(failure) = &outcome else {
+        unreachable!();
+    };
+    let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+    assert_eq!(surfaced["profile"], "ClaudeCodeStreamJsonV1");
+    assert_eq!(
+        surfaced["detail"]["reason"],
+        "active_stream_parent_mismatch"
+    );
+    assert_eq!(surfaced["detail"]["outerEvent"], "stream_event");
+    assert_eq!(surfaced["detail"]["streamEvent"], "content_block_delta");
+    assert_eq!(surfaced["detail"]["contentIndex"], 7);
+    assert_eq!(surfaced["detail"]["contentBlock"], "text");
+
+    let retained_bytes =
+        std::fs::read(fixture.diagnostic_directory.join("protocol-rejection.json")).unwrap();
+    let retained: Value = serde_json::from_slice(&retained_bytes).unwrap();
+    assert_eq!(retained, surfaced);
+    assert!(retained_bytes.len() < 16 * 1024);
+    let metadata: Value = serde_json::from_slice(
+        &std::fs::read(fixture.diagnostic_directory.join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata["localRunId"],
+        "00000000-0000-4000-8000-000000000001"
+    );
+    assert_eq!(metadata["attemptNumber"], 1);
+    assert_eq!(metadata["stepId"], "agent-step");
+    assert!(metadata["invocationId"].is_u64());
+    assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
+    assert_eq!(
+        metadata["claudeCodeVersion"],
+        CLAUDE_CODE_STREAM_JSON_V1_VERSION
+    );
+    assert_eq!(
+        metadata["nativeSession"],
+        json!({
+            "relativeDirectory": "session",
+            "formatVersion": 1,
+        })
+    );
+    assert!(metadata.get("nativeSessionPersistence").is_none());
+
+    let serialized = surfaced.to_string();
+    for sentinel in [
+        "SENTINEL_ASSISTANT_TEXT",
+        "SENTINEL_TOOL_INPUT",
+        "SENTINEL_PARENT_ID",
+        "SENTINEL_PROVIDER_PAYLOAD",
+        "SENTINEL_REQUEST_ID",
+        "SENTINEL_STRUCTURED_OUTPUT",
+        "SENTINEL_TOOL_RESULT",
+        session.as_str(),
+    ] {
+        assert!(!serialized.contains(sentinel));
+    }
 }
 
 #[tokio::test]
@@ -1714,13 +2026,15 @@ async fn cancellation_during_native_work_drains_and_quiesces_before_reporting() 
         let invocation = fixture.invocation.take().unwrap();
         let cancellation = invocation.cancellation().clone();
         let process_path = fixture.arguments.clone();
-        let ready = fixture.cwd.clone();
+        let ready = fixture.ready.clone();
+        let interrupted = fixture.interrupted.clone();
         let (task, start, outcome) = start_process_fixture(invocation, fixture.diagnostics.clone());
 
         start.receive().await.unwrap();
-        wait_for_path(&ready).await;
+        assert_eq!(ready.receive().await, b"ready\n");
         let process = fixture_process(&process_path);
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        assert_eq!(interrupted.receive().await, b"interrupted\n");
         assert_user_cancelled(outcome.receive().await.unwrap());
         task.await.unwrap();
         assert!(process_group_is_quiescent(process));
@@ -1750,12 +2064,12 @@ async fn forced_cancellation_removes_a_stubborn_in_group_descendant() {
         let process_control = invocation.process_control().clone();
         let leader_path = fixture.arguments.clone();
         let descendant_path = fixture.cwd.clone();
-        let interrupted = fixture.environment.clone();
+        let descendant_ready = fixture.descendant_ready.clone();
+        let interrupted = fixture.interrupted.clone();
         let (task, start, outcome) = start_process_fixture(invocation, fixture.diagnostics.clone());
 
         start.receive().await.unwrap();
-        wait_for_path(&leader_path).await;
-        wait_for_path(&descendant_path).await;
+        assert_eq!(descendant_ready.receive().await, b"ready\n");
         let leader = fixture_process(&leader_path);
         let descendant = fixture_process(&descendant_path);
         assert_eq!(getpgid(Some(leader)).unwrap(), leader);
@@ -1763,8 +2077,9 @@ async fn forced_cancellation_removes_a_stubborn_in_group_descendant() {
 
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         process_control.interrupt();
-        wait_for_path(&interrupted).await;
-        assert!(!task.is_finished());
+        assert_eq!(interrupted.receive().await, b"interrupted\n");
+        assert!(!process_group_is_quiescent(leader));
+        assert_eq!(getpgid(Some(descendant)).unwrap(), leader);
         process_control.force();
         assert_user_cancelled(outcome.receive().await.unwrap());
         task.await.unwrap();
@@ -1791,8 +2106,6 @@ async fn no_value_and_over_limit_runs_report_one_existing_terminal_outcome() {
     let (_, outcome) = run_fixture(over_limit).await;
     assert_eq!(
         outcome,
-        AgentOutcome::Failed {
-            cause: AgentFailureCause::CapturedValueTooLarge,
-        }
+        failed_agent_outcome(AgentFailureCause::CapturedValueTooLarge)
     );
 }

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow view",
+  "outcome": "error",
+  "exitStatus": 1,
+  "error": {
+    "code": "attempt_unknown",
+    "message": "The selected attempt does not exist."
+  }
+}

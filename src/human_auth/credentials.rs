@@ -30,6 +30,7 @@ const FILE_MODE: u32 = 0o600;
 )]
 const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(45);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const TOKEN_EXPIRY_MARGIN: time::Duration = time::Duration::seconds(30);
 pub(crate) const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
@@ -42,11 +43,14 @@ pub(crate) struct CredentialStore {
     path: PathBuf,
     lock_path: PathBuf,
     lock_timeout: Duration,
+    refresh_lock_timeout: Duration,
 }
 
+#[derive(Clone)]
 pub(crate) struct StoredCredential {
     access_token: String,
     expires_at: OffsetDateTime,
+    refresh_token: String,
 }
 
 impl fmt::Debug for StoredCredential {
@@ -55,19 +59,37 @@ impl fmt::Debug for StoredCredential {
             .debug_struct("StoredCredential")
             .field("access_token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
+            .field("refresh_token", &"[REDACTED]")
             .finish()
     }
 }
 
 impl StoredCredential {
+    // Stored and freshly issued credentials deliberately remain separate states;
+    // their small secret-borrowing APIs are clearer than a shared token trait.
+    // jscpd:ignore-start
     pub(crate) fn access_token(&self) -> &str {
         &self.access_token
+    }
+
+    pub(crate) fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+    // jscpd:ignore-end
+
+    pub(crate) fn needs_refresh(&self, now: OffsetDateTime) -> bool {
+        let expiry_cutoff = now.checked_add(TOKEN_EXPIRY_MARGIN).unwrap_or(now);
+        self.expires_at <= expiry_cutoff
     }
 
     #[cfg(test)]
     pub(crate) fn expires_at(&self) -> OffsetDateTime {
         self.expires_at
     }
+}
+
+pub(crate) struct RefreshAuthority {
+    _lock: CredentialLock,
 }
 
 impl CredentialStore {
@@ -78,31 +100,14 @@ impl CredentialStore {
     pub(crate) fn selected(
         &self,
         deployment: &DeploymentFingerprint,
-        now: OffsetDateTime,
     ) -> Result<Option<StoredCredential>, CredentialError> {
         let _lock = self.acquire_lock()?;
-        let mut file = self.read_file()?;
-        let Some(index) = file
-            .credentials
+        let file = self.read_file()?;
+        file.credentials
             .iter()
-            .position(|credential| &credential.deployment == deployment)
-        else {
-            return Ok(None);
-        };
-
-        let expires_at = parse_expiration(&file.credentials[index].expires_at)?;
-        let expiry_cutoff = now.checked_add(TOKEN_EXPIRY_MARGIN).unwrap_or(now);
-        if expires_at <= expiry_cutoff {
-            file.credentials.remove(index);
-            self.write_file(&file)?;
-            return Ok(None);
-        }
-
-        let credential = &file.credentials[index];
-        Ok(Some(StoredCredential {
-            access_token: credential.access_token.clone(),
-            expires_at,
-        }))
+            .find(|credential| &credential.deployment == deployment)
+            .map(stored_credential)
+            .transpose()
     }
 
     pub(crate) fn replace(
@@ -110,42 +115,43 @@ impl CredentialStore {
         deployment: &DeploymentFingerprint,
         access_token: &str,
         expires_at: OffsetDateTime,
+        refresh_token: &str,
     ) -> Result<(), CredentialError> {
-        validate_access_token(access_token)?;
-        let expires_at =
-            expires_at
-                .format(&Rfc3339)
-                .map_err(|_| CredentialError::InvalidCredentialFile {
-                    reason: "access-token expiration cannot be represented as RFC 3339",
-                })?;
-        let _lock = self.acquire_lock()?;
-        let mut file = self.read_file()?;
-        let replacement = CredentialEntry {
-            deployment: deployment.clone(),
-            access_token: access_token.to_owned(),
-            expires_at,
-        };
-
-        match file
-            .credentials
-            .iter()
-            .position(|credential| &credential.deployment == deployment)
-        {
-            Some(index) => file.credentials[index] = replacement,
-            None => file.credentials.push(replacement),
-        }
-
-        self.write_file(&file)
+        let _authority = self.refresh_authority(deployment)?;
+        self.replace_under_authority(deployment, access_token, expires_at, refresh_token)
     }
 
+    pub(crate) fn replace_if_refresh_token_matches(
+        &self,
+        deployment: &DeploymentFingerprint,
+        expected_refresh_token: &str,
+        access_token: &str,
+        expires_at: OffsetDateTime,
+        refresh_token: &str,
+    ) -> Result<Option<StoredCredential>, CredentialError> {
+        let replacement = credential_entry(deployment, access_token, expires_at, refresh_token)?;
+        let _lock = self.acquire_lock()?;
+        let mut file = self.read_file()?;
+        let Some(index) = credential_index(&file, deployment) else {
+            return Ok(None);
+        };
+        if file.credentials[index].refresh_token == expected_refresh_token {
+            file.credentials[index] = replacement;
+            self.write_file(&file)?;
+        }
+        stored_credential(&file.credentials[index]).map(Some)
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove(
         &self,
         deployment: &DeploymentFingerprint,
     ) -> Result<bool, CredentialError> {
+        let _authority = self.refresh_authority(deployment)?;
         self.remove_matching(deployment, |_| true)
     }
 
-    pub(crate) fn remove_if_access_token_matches(
+    pub(crate) fn remove_if_access_token_matches_under_authority(
         &self,
         deployment: &DeploymentFingerprint,
         access_token: &str,
@@ -153,6 +159,57 @@ impl CredentialStore {
         self.remove_matching(deployment, |credential| {
             credential.access_token == access_token
         })
+    }
+
+    pub(crate) fn remove_if_refresh_token_matches_under_authority(
+        &self,
+        deployment: &DeploymentFingerprint,
+        refresh_token: &str,
+    ) -> Result<bool, CredentialError> {
+        self.remove_matching(deployment, |credential| {
+            credential.refresh_token == refresh_token
+        })
+    }
+
+    pub(crate) fn take_under_authority(
+        &self,
+        deployment: &DeploymentFingerprint,
+    ) -> Result<Option<StoredCredential>, CredentialError> {
+        let _lock = self.acquire_lock()?;
+        let mut file = self.read_file()?;
+        let Some(index) = credential_index(&file, deployment) else {
+            return Ok(None);
+        };
+        let credential = stored_credential(&file.credentials[index])?;
+        file.credentials.remove(index);
+        self.write_file(&file)?;
+        Ok(Some(credential))
+    }
+
+    pub(crate) fn refresh_authority(
+        &self,
+        deployment: &DeploymentFingerprint,
+    ) -> Result<RefreshAuthority, CredentialError> {
+        let path = self.refresh_lock_path(deployment)?;
+        self.acquire_lock_at(&path, self.refresh_lock_timeout, true)
+            .map(|lock| RefreshAuthority { _lock: lock })
+    }
+
+    fn replace_under_authority(
+        &self,
+        deployment: &DeploymentFingerprint,
+        access_token: &str,
+        expires_at: OffsetDateTime,
+        refresh_token: &str,
+    ) -> Result<(), CredentialError> {
+        let replacement = credential_entry(deployment, access_token, expires_at, refresh_token)?;
+        let _lock = self.acquire_lock()?;
+        let mut file = self.read_file()?;
+        match credential_index(&file, deployment) {
+            Some(index) => file.credentials[index] = replacement,
+            None => file.credentials.push(replacement),
+        }
+        self.write_file(&file)
     }
 
     fn remove_matching<F>(
@@ -169,11 +226,9 @@ impl CredentialStore {
         file.credentials
             .retain(|credential| &credential.deployment != deployment || !predicate(credential));
         let removed = file.credentials.len() != original_len;
-
         if removed {
             self.write_file(&file)?;
         }
-
         Ok(removed)
     }
 
@@ -213,13 +268,23 @@ impl CredentialStore {
             path,
             lock_path,
             lock_timeout: LOCK_TIMEOUT,
+            refresh_lock_timeout: REFRESH_LOCK_TIMEOUT,
         })
     }
 
     fn acquire_lock(&self) -> Result<CredentialLock, CredentialError> {
+        self.acquire_lock_at(&self.lock_path, self.lock_timeout, false)
+    }
+
+    fn acquire_lock_at(
+        &self,
+        path: &Path,
+        timeout: Duration,
+        refresh: bool,
+    ) -> Result<CredentialLock, CredentialError> {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
-        let file = open_or_create_private_file(&self.lock_path)?;
+        let file = open_or_create_private_file(path)?;
         let start = crate::timing::monotonic_now();
 
         loop {
@@ -227,22 +292,52 @@ impl CredentialStore {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
                     let elapsed = crate::timing::elapsed(start);
-                    if elapsed >= self.lock_timeout {
-                        return Err(CredentialError::LockTimeout);
+                    if elapsed >= timeout {
+                        return Err(if refresh {
+                            CredentialError::RefreshLockTimeout
+                        } else {
+                            CredentialError::LockTimeout
+                        });
                     }
-                    crate::timing::sleep(
-                        LOCK_RETRY_INTERVAL.min(self.lock_timeout.saturating_sub(elapsed)),
-                    );
+                    crate::timing::sleep(LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)));
                 }
                 Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {
-                        operation: "acquire credential lock",
-                        path: self.lock_path.clone(),
+                        operation: if refresh {
+                            "acquire refresh lock"
+                        } else {
+                            "acquire credential lock"
+                        },
+                        path: path.to_owned(),
                         source,
                     });
                 }
             }
         }
+    }
+
+    fn refresh_lock_path(
+        &self,
+        deployment: &DeploymentFingerprint,
+    ) -> Result<PathBuf, CredentialError> {
+        let file_name = self
+            .path
+            .file_name()
+            .ok_or(CredentialError::InvalidCredentialPath {
+                reason: "the credential path has no file name",
+            })?;
+        let bytes = serde_json::to_vec(deployment).map_err(CredentialError::SerializeJson)?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let digest = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(sibling_path(
+            &self.path,
+            file_name,
+            &format!(".refresh.{digest}.lock"),
+        ))
     }
 
     fn read_file(&self) -> Result<CredentialFile, CredentialError> {
@@ -352,6 +447,7 @@ pub(crate) enum CredentialError {
         requirement: &'static str,
     },
     LockTimeout,
+    RefreshLockTimeout,
     CredentialFileTooLarge,
     MalformedJson(serde_json::Error),
     UnsupportedSchema(u64),
@@ -381,6 +477,9 @@ impl fmt::Display for CredentialError {
             }
             Self::LockTimeout => {
                 write!(formatter, "credential lock remained busy for five seconds")
+            }
+            Self::RefreshLockTimeout => {
+                write!(formatter, "refresh lock remained busy for 45 seconds")
             }
             Self::CredentialFileTooLarge => {
                 write!(formatter, "credential file exceeds the 1 MiB safety limit")
@@ -441,6 +540,7 @@ struct CredentialEntry {
     deployment: DeploymentFingerprint,
     access_token: String,
     expires_at: String,
+    refresh_token: String,
 }
 
 struct CredentialLock {
@@ -489,6 +589,7 @@ fn validate_credential_file(file: &CredentialFile) -> Result<(), CredentialError
         }
         validate_access_token(&credential.access_token)?;
         parse_expiration(&credential.expires_at)?;
+        validate_refresh_token(&credential.refresh_token)?;
     }
 
     Ok(())
@@ -508,10 +609,60 @@ fn validate_access_token(access_token: &str) -> Result<(), CredentialError> {
     Ok(())
 }
 
+fn validate_refresh_token(refresh_token: &str) -> Result<(), CredentialError> {
+    if refresh_token.is_empty() {
+        return Err(CredentialError::InvalidCredentialFile {
+            reason: "a refresh token is empty",
+        });
+    }
+    if refresh_token.len() > MAX_ACCESS_TOKEN_BYTES {
+        return Err(CredentialError::InvalidCredentialFile {
+            reason: "a refresh token exceeds 64 KiB",
+        });
+    }
+    Ok(())
+}
+
 fn parse_expiration(value: &str) -> Result<OffsetDateTime, CredentialError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| CredentialError::InvalidCredentialFile {
         reason: "an access-token expiration is not valid RFC 3339",
     })
+}
+
+fn credential_entry(
+    deployment: &DeploymentFingerprint,
+    access_token: &str,
+    expires_at: OffsetDateTime,
+    refresh_token: &str,
+) -> Result<CredentialEntry, CredentialError> {
+    validate_access_token(access_token)?;
+    validate_refresh_token(refresh_token)?;
+    let expires_at =
+        expires_at
+            .format(&Rfc3339)
+            .map_err(|_| CredentialError::InvalidCredentialFile {
+                reason: "access-token expiration cannot be represented as RFC 3339",
+            })?;
+    Ok(CredentialEntry {
+        deployment: deployment.clone(),
+        access_token: access_token.to_owned(),
+        expires_at,
+        refresh_token: refresh_token.to_owned(),
+    })
+}
+
+fn stored_credential(entry: &CredentialEntry) -> Result<StoredCredential, CredentialError> {
+    Ok(StoredCredential {
+        access_token: entry.access_token.clone(),
+        expires_at: parse_expiration(&entry.expires_at)?,
+        refresh_token: entry.refresh_token.clone(),
+    })
+}
+
+fn credential_index(file: &CredentialFile, deployment: &DeploymentFingerprint) -> Option<usize> {
+    file.credentials
+        .iter()
+        .position(|credential| &credential.deployment == deployment)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), CredentialError> {

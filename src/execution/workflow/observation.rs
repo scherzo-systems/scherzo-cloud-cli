@@ -58,6 +58,9 @@ pub(crate) enum ObservedStepTransition {
     Blocked {
         dependency: String,
     },
+    InputUnavailable {
+        references: Vec<String>,
+    },
     NotRun {
         reason: NotRunReason,
     },

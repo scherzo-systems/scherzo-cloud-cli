@@ -42,6 +42,10 @@ use crate::execution::workflow::result_validation::{
     ValidationWorkerRequest,
 };
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
+use crate::execution::workflow::test_support::{
+    process_fixture_interrupt_receiver, process_fixture_output, spawn_process_fixture,
+    write_process_fixture_id, write_process_fixture_signal,
+};
 
 const MAXIMUM_INPUT_BYTES: u64 = MAXIMUM_AGENT_PROMPT_BYTES;
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
@@ -51,6 +55,13 @@ const NATIVE_RECOVERY: &str = include_str!("fixtures/native-recovery.jsonl");
 const TERMINAL_TOOL_USE: &str = include_str!("fixtures/terminal-tool-use.jsonl");
 const STREAMED_THINKING: &str = "**Reading package.json contents**";
 const EXPECTED_RESPONSE: &str = "package contents";
+
+fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    assert_eq!(failure.cause(), &cause);
+}
 
 #[derive(Clone)]
 enum TestClock {
@@ -203,7 +214,8 @@ case "$PI_FIXTURE_MODE" in
     ;;
   result-bridge-settlement-expiry)
     printf 'settlement-ready\n' > "$PI_FIXTURE_RESULT_SETTLEMENT_READY"
-    while :; do :; done
+    IFS= read -r released < "$PI_FIXTURE_RESULT_SETTLEMENT_RELEASE"
+    exit 75
     ;;
   result-bridge-settlement-eof-after-grace)
     "$PI_FIXTURE_DETACHED_HOLDER" \
@@ -219,31 +231,17 @@ esac
 "#;
 
 const PHASE_CANCELLATION_PI: &str = r#"#!/bin/sh
-set -eu
-trap '
-  printf "interrupted\n" > "$PI_FIXTURE_STDIN"
-  IFS= read -r released < "$PI_FIXTURE_AGENT_RELEASE"
-  printf "%s\n" "{\"type\":\"late_native_event\"}"
-  printf "late diagnostic\n" >&2
-  exit 41
-' INT
-printf '%s\n' "$$" > "$PI_FIXTURE_PROCESS"
-cat "$PI_FIXTURE_PHASE_TRANSCRIPT"
-printf 'phase diagnostic\n' >&2
-printf 'ready\n' > "$PI_FIXTURE_READY"
-while :; do :; done
+exec "$PI_FIXTURE_DETACHED_HOLDER" \
+  --exact execution::workflow::pi_json_v1::adapter_tests::phase_cancellation_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 4>&2 >/dev/null 2>&1
 "#;
 
 const STUBBORN_DESCENDANT_PI: &str = r#"#!/bin/sh
-set -eu
-trap 'printf "interrupted\n" > "$PI_FIXTURE_STDIN"; exit 0' INT
-printf '%s\n' "$$" > "$PI_FIXTURE_PROCESS"
-sh -c 'trap "" INT; printf "descendant-ready\n" > "$PI_FIXTURE_DESCENDANT_READY"; while :; do :; done' &
-descendant=$!
-printf '%s\n' "$descendant" > "$PI_FIXTURE_DESCENDANT"
-printf 'phase diagnostic\n' >&2
-printf 'ready\n' > "$PI_FIXTURE_READY"
-while :; do :; done
+exec "$PI_FIXTURE_DETACHED_HOLDER" \
+  --exact execution::workflow::pi_json_v1::adapter_tests::stubborn_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 4>&2 >/dev/null 2>&1
 "#;
 
 #[derive(Clone)]
@@ -688,6 +686,7 @@ impl RunningResultValidation for InlineValidation {
 }
 
 struct CapturedRun {
+    _temporary: tempfile::TempDir,
     arguments: Vec<Vec<u8>>,
     cwd: Vec<u8>,
     standard_input: Vec<u8>,
@@ -750,20 +749,7 @@ fn start_invocation_with_clock<Clock>(
 where
     Clock: CoordinatorClock,
 {
-    let value_mode = invocation.value_mode().clone();
-    let (started_callback, started) = agent_start_channel();
-    let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-    let adapter = PiJsonV1Adapter::<Clock, _>::new(
-        diagnostics,
-        NonZeroU64::new(1024).unwrap(),
-        clock,
-        NoopExecutionObserver,
-    )
-    .unwrap();
-    let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, invocation, started_callback, terminal_callback).await;
-    });
-    (task, started, terminal)
+    start_invocation_with_clock_and_worker(invocation, diagnostics, clock, InlineValidationWorker)
 }
 
 fn start_invocation_with_clock_and_worker<Clock, Worker>(
@@ -871,6 +857,7 @@ async fn run_success(mut fixture: ProcessFixture) -> CapturedRun {
         expected_input_extension,
         expected_attachments: fixture.expected_attachments,
         expected_diagnostic_session: fixture.expected_diagnostic_session,
+        _temporary: fixture._temporary,
     }
 }
 
@@ -1510,6 +1497,45 @@ fn thinking_finalization_fixture(
     fixture
 }
 
+fn invalid_thinking_end_fixture() -> (ProcessFixture, PathBuf) {
+    let fixture = thinking_finalization_fixture("\n\n", "**Reading package-lock.json contents**");
+    let transcript = fs::read_to_string(&fixture.phase_transcript).unwrap();
+    let mut events = transcript
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let thinking_end = events
+        .iter_mut()
+        .find(|event| {
+            event["assistantMessageEvent"]["type"] == Value::String("thinking_end".to_owned())
+        })
+        .unwrap();
+    thinking_end["assistantMessageEvent"]["content"] =
+        Value::String("**Mismatched thinking finalization**".to_owned());
+    let mut invalid_transcript = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut invalid_transcript, &event).unwrap();
+        invalid_transcript.push(b'\n');
+    }
+    fs::write(&fixture.phase_transcript, invalid_transcript).unwrap();
+    let retained_path = fixture
+        .expected_diagnostic_session
+        .parent()
+        .unwrap()
+        .join("protocol-rejection.json");
+    (fixture, retained_path)
+}
+
+async fn run_and_surface_protocol_rejection(fixture: ProcessFixture) -> (CapturedRun, Value) {
+    let run = run_success(fixture).await;
+    assert_agent_failure(&run.outcome, AgentFailureCause::HarnessProtocolFailed);
+    let AgentOutcome::Failed(failure) = &run.outcome else {
+        unreachable!();
+    };
+    let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+    (run, surfaced)
+}
+
 #[tokio::test]
 async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agent_start() {
     with_watchdog(async {
@@ -1654,39 +1680,77 @@ async fn thinking_end_may_remove_trailing_line_breaks_before_response_completion
 }
 
 #[tokio::test]
-async fn thinking_end_may_not_remove_trailing_spaces_or_tabs() {
+async fn thinking_end_accepts_provider_finalization_rewrite() {
     with_watchdog(async {
-        for streamed_suffix in [" ", "\t"] {
-            let run = run_success(thinking_finalization_fixture(
-                streamed_suffix,
-                STREAMED_THINKING,
-            ))
-            .await;
-            assert_eq!(
-                run.outcome,
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessProtocolFailed
-                }
-            );
-        }
+        let streamed_suffix = "\n\n";
+        let run = run_success(thinking_finalization_fixture(
+            streamed_suffix,
+            "**Importing path for test support**",
+        ))
+        .await;
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = run.outcome
+        else {
+            panic!("provider-finalized thinking rewrite must complete");
+        };
+        assert_eq!(response.as_str(), EXPECTED_RESPONSE);
+        let reasoning = run
+            .observations
+            .iter()
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::Reasoning { text } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(reasoning, format!("{STREAMED_THINKING}{streamed_suffix}"));
     })
     .await;
 }
 
 #[tokio::test]
-async fn thinking_end_substantive_rewrite_remains_a_protocol_failure() {
+async fn invalid_thinking_end_replaces_harness_preseeded_diagnostic() {
     with_watchdog(async {
-        let run = run_success(thinking_finalization_fixture(
-            "\n\n",
-            "**Reading package-lock.json contents**",
-        ))
-        .await;
-        assert_eq!(
-            run.outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed
-            }
+        let (fixture, retained_path) = invalid_thinking_end_fixture();
+        fs::write(&retained_path, b"SENTINEL_HARNESS_PRESEED\n").unwrap();
+
+        let (_run, surfaced) = run_and_surface_protocol_rejection(fixture).await;
+        let retained_bytes = fs::read(retained_path).unwrap();
+        let retained: Value = serde_json::from_slice(&retained_bytes).unwrap();
+        assert_eq!(retained, surfaced);
+        let retained_text = String::from_utf8(retained_bytes).unwrap();
+        assert!(!retained_text.contains("SENTINEL_HARNESS_PRESEED"));
+        assert!(!retained_text.contains(STREAMED_THINKING));
+        assert!(!retained_text.contains("package-lock.json"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_thinking_end_replaces_unreadable_harness_directory() {
+    with_watchdog(async {
+        let (fixture, retained_path) = invalid_thinking_end_fixture();
+        fs::create_dir(&retained_path).unwrap();
+        fs::write(
+            retained_path.join("provider-transcript"),
+            b"SENTINEL_UNTRUSTED_PROVIDER_CONTENT",
+        )
+        .unwrap();
+        fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (_run, surfaced) = run_and_surface_protocol_rejection(fixture).await;
+        let residue_remained = retained_path.is_dir();
+        let untrusted_content_remained = if residue_remained {
+            fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::read(retained_path.join("provider-transcript")).unwrap()
+                == b"SENTINEL_UNTRUSTED_PROVIDER_CONTENT"
+        } else {
+            false
+        };
+        assert!(
+            !residue_remained && !untrusted_content_remained,
+            "harness residue at the reserved diagnostic path must be replaced"
         );
+        let retained: Value = serde_json::from_slice(&fs::read(retained_path).unwrap()).unwrap();
+        assert_eq!(retained, surfaced);
     })
     .await;
 }
@@ -1783,11 +1847,9 @@ async fn settlement_expiry_terminates_the_process_group_and_discards_the_candida
 
         now_seconds.store(130, Ordering::SeqCst);
         deadline_release.send_replace(true);
-        assert_eq!(
-            running.finish().await,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed
-            }
+        assert_agent_failure(
+            &running.finish().await,
+            AgentFailureCause::ResultSettlementFailed,
         );
         assert!(getpgid(Some(process)).is_err());
     })
@@ -1817,11 +1879,9 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
         );
 
         write_signal(running.settlement_release.clone()).await;
-        assert_eq!(
-            running.finish().await,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed
-            }
+        assert_agent_failure(
+            &running.finish().await,
+            AgentFailureCause::ResultSettlementFailed,
         );
         assert!(process_group_is_quiescent(process));
     })
@@ -1841,12 +1901,7 @@ async fn stdout_eof_after_settlement_grace_discards_the_candidate() {
         write_signal(running.settlement_release.clone()).await;
         (&mut running.task).await.unwrap();
 
-        assert_eq!(
-            outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed
-            }
-        );
+        assert_agent_failure(&outcome, AgentFailureCause::ResultSettlementFailed);
     })
     .await;
 }
@@ -1866,20 +1921,21 @@ async fn wrong_bridge_identity_is_fatal_without_authoritative_acceptance() {
             &running.socket_address,
             json!({
                 "kind": "ValidatePiResultV1",
-                "toolCallId": "call-invalid",
-                "toolName": "scherzo_result_wrong",
+                "toolCallId": "call-wrong",
+                "toolName": running.tool_name,
                 "arguments": {"result": {"count": 1}}
             }),
         )
         .await;
         assert_eq!(response["kind"], "Fatal");
 
-        assert_eq!(
-            running.finish().await,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed
-            }
-        );
+        let outcome = running.finish().await;
+        assert_agent_failure(&outcome, AgentFailureCause::HarnessProtocolFailed);
+        let AgentOutcome::Failed(failure) = outcome else {
+            unreachable!();
+        };
+        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(rejection["detail"]["reason"], "result_correlation_invalid");
         assert!(!running.socket_path.exists());
         assert!(!running.extension_path.exists());
     })
@@ -1903,13 +1959,11 @@ async fn validation_exhaustion_returns_fatal_before_the_typed_failure() {
         }
         deadline_release.send_replace(true);
         assert_eq!(response.await.unwrap()["kind"], "Fatal");
-        assert_eq!(
-            running.finish().await,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultValidationLimitExceeded {
-                    deadline: PositiveDuration::new(Duration::from_secs(5)).unwrap()
-                }
-            }
+        assert_agent_failure(
+            &running.finish().await,
+            AgentFailureCause::ResultValidationLimitExceeded {
+                deadline: PositiveDuration::new(Duration::from_secs(5)).unwrap(),
+            },
         );
     })
     .await;
@@ -2076,15 +2130,13 @@ async fn exact_input_limits_prepare_unchanged_and_one_excess_byte_never_launches
                 terminal_callback,
             )
             .await;
-            assert_eq!(
-                terminal.receive().await.unwrap(),
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessInputTooLarge {
-                        input,
-                        admitted_bytes: NonZeroU64::new(MAXIMUM_INPUT_BYTES).unwrap(),
-                        observed_bytes: MAXIMUM_INPUT_BYTES + 1,
-                    }
-                }
+            assert_agent_failure(
+                &terminal.receive().await.unwrap(),
+                AgentFailureCause::HarnessInputTooLarge {
+                    input,
+                    admitted_bytes: NonZeroU64::new(MAXIMUM_INPUT_BYTES).unwrap(),
+                    observed_bytes: MAXIMUM_INPUT_BYTES + 1,
+                },
             );
             assert!(started.receive().await.is_err());
             assert!(!capture.exists());
@@ -2107,12 +2159,7 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
                 release_agent,
             )
             .await;
-            assert_eq!(
-                outcome,
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessStartFailed,
-                }
-            );
+            assert_agent_failure(&outcome, AgentFailureCause::HarnessStartFailed);
             assert!(!lifecycle_started);
             assert!(!observations.iter().any(|observation| matches!(
                 observation.observation(),
@@ -2142,11 +2189,9 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
             terminal_callback,
         )
         .await;
-        assert_eq!(
-            terminal.receive().await.unwrap(),
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessStartFailed,
-            }
+        assert_agent_failure(
+            &terminal.receive().await.unwrap(),
+            AgentFailureCause::HarnessStartFailed,
         );
         assert!(started.receive().await.is_err());
     })
@@ -2199,18 +2244,17 @@ async fn cancellation_wins_during_every_native_phase_and_drains_late_events() {
             let cancellation = fixture.invocation.cancellation().clone();
             let diagnostics = fixture.diagnostics.clone();
             let release = fixture.agent_release.clone();
+            let process_path = fixture.process.clone();
             let (task, started, terminal) =
                 start_invocation(fixture.invocation, diagnostics.clone());
 
             read_signal(fixture.ready).await;
             wait_for_phase(phase, &mut fixture.observations).await;
             started.receive().await.unwrap();
+            let process = process_id(&fs::read(process_path).unwrap());
             assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
             interrupted.receive().await;
-            assert!(
-                !task.is_finished(),
-                "the {phase:?} invocation must not report before its process releases"
-            );
+            assert!(!process_group_is_quiescent(process));
             write_signal(release).await;
             assert_eq!(
                 terminal.receive().await.unwrap(),
@@ -2347,7 +2391,7 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             Duration::from_secs(47),
             "escalation must use the admitted five-second cancellation grace"
         );
-        assert!(!task.is_finished());
+        assert!(!process_group_is_quiescent(process));
         assert_eq!(getpgid(Some(descendant)).unwrap(), process);
 
         deadline_release.send(true).unwrap();
@@ -2380,6 +2424,67 @@ async fn valid_lexical_cwd_uses_the_path_reported_by_the_launched_process() {
         );
     })
     .await;
+}
+
+fn begin_pi_process_fixture() -> std::sync::mpsc::Receiver<()> {
+    let interrupted = process_fixture_interrupt_receiver();
+    write_process_fixture_id("PI_FIXTURE_PROCESS");
+    interrupted
+}
+
+fn signal_pi_process_fixture_ready() -> fs::File {
+    let mut diagnostic = process_fixture_output(4);
+    diagnostic.write_all(b"phase diagnostic\n").unwrap();
+    diagnostic.flush().unwrap();
+    write_process_fixture_signal("PI_FIXTURE_READY", b"ready\n");
+    diagnostic
+}
+
+#[test]
+#[ignore = "launched as the cooperative Pi cancellation process fixture"]
+fn phase_cancellation_process_fixture() {
+    let interrupted = begin_pi_process_fixture();
+    let mut protocol = process_fixture_output(3);
+    protocol
+        .write_all(&fs::read(std::env::var_os("PI_FIXTURE_PHASE_TRANSCRIPT").unwrap()).unwrap())
+        .unwrap();
+    protocol.flush().unwrap();
+    let mut diagnostic = signal_pi_process_fixture_ready();
+
+    interrupted.recv().unwrap();
+    write_process_fixture_signal("PI_FIXTURE_STDIN", b"interrupted\n");
+    let release = fs::read(std::env::var_os("PI_FIXTURE_AGENT_RELEASE").unwrap()).unwrap();
+    assert!(!release.is_empty());
+    protocol
+        .write_all(b"{\"type\":\"late_native_event\"}\n")
+        .unwrap();
+    diagnostic.write_all(b"late diagnostic\n").unwrap();
+    std::process::exit(41);
+}
+
+#[test]
+#[ignore = "launched as the stubborn Pi cancellation process fixture"]
+fn stubborn_process_fixture() {
+    let interrupted = begin_pi_process_fixture();
+    let _descendant = spawn_process_fixture(
+        "execution::workflow::pi_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+    );
+    let _diagnostic = signal_pi_process_fixture_ready();
+
+    interrupted.recv().unwrap();
+    write_process_fixture_signal("PI_FIXTURE_STDIN", b"interrupted\n");
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "launched as the interrupt-resistant Pi descendant fixture"]
+fn stubborn_descendant_process_fixture() {
+    ctrlc::set_handler(|| {}).unwrap();
+    write_process_fixture_id("PI_FIXTURE_DESCENDANT");
+    write_process_fixture_signal("PI_FIXTURE_DESCENDANT_READY", b"descendant-ready\n");
+    loop {
+        std::thread::park();
+    }
 }
 
 #[expect(

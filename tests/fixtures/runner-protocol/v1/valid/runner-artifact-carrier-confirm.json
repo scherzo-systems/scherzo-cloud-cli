@@ -1,0 +1,17 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5ac1",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 13,
+  "sentAt": "2026-07-23T00:00:13Z",
+  "type": "artifact_carrier_confirm",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abk",
+    "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5ac0",
+    "carrierId": "acr_01k0z6r1w8f4jy2m7q9v3x5ac0"
+  }
+}

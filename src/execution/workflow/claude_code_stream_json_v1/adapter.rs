@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::{Future, pending};
 use std::io::{self, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::ops::Add as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use rustix::fs::{AtFlags, FileType, statat, symlinkat, unlinkat};
 use rustix::process::Pid;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -31,7 +34,7 @@ use crate::execution::workflow::agent::{
     AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
     AgentValueMode, OrderedAgentObservationSink, PositiveDuration, StagedAgentAttachment,
-    check_agent_input_bound, failed_agent_outcome,
+    check_agent_input_bound, failed_agent_outcome, finish_agent_diagnostic_capture,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::execution::workflow::child_guard::StoppedChildGuard;
@@ -39,6 +42,7 @@ use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::observation::ExecutionObserver;
+use crate::execution::workflow::private_staging::open_directory_path;
 // Both native adapters use the same containment and validator primitives, but their
 // protocol state machines decide independently when those primitives gain authority.
 // jscpd:ignore-start
@@ -236,6 +240,7 @@ where
         let parser = ClaudeCodeStreamJsonV1Parser::profile(
             Arc::clone(&plan.expected_cwd),
             Arc::from(invocation.adapter().native_configuration().model.as_str()),
+            Arc::clone(&plan.session_id),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
         );
@@ -251,15 +256,10 @@ where
             invocation.limits().result_settlement_grace(),
         )
         .await;
-        if matches!(
-            outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed,
-            }
-        ) {
-            diagnostic.abort();
-        }
-        diagnostic.finish().await;
+        invocation
+            .diagnostic_session()
+            .retain_protocol_rejection_from(&outcome);
+        finish_agent_diagnostic_capture(diagnostic, &outcome).await;
         outcome
     }
 }
@@ -267,7 +267,9 @@ where
 pub(super) struct ClaudeCodeStreamJsonV1LaunchPlan {
     arguments: Vec<OsString>,
     expected_cwd: Arc<str>,
+    session_id: Arc<str>,
     input: Vec<u8>,
+    _native_session_bridge: ClaudeCodeNativeSessionBridge,
     _system_prompt_file: tempfile::NamedTempFile,
 }
 
@@ -280,6 +282,11 @@ impl ClaudeCodeStreamJsonV1LaunchPlan {
     #[cfg(test)]
     pub(super) fn input(&self) -> &[u8] {
         &self.input
+    }
+
+    #[cfg(test)]
+    pub(super) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     #[cfg(test)]
@@ -309,7 +316,7 @@ where
         || !invocation.adapter().executable().is_absolute()
         || invocation
             .diagnostic_session()
-            .verify_path_binding()
+            .verify_claude_code_native_session_path_binding()
             .is_err()
     {
         return Err(AgentFailureCause::HarnessStartFailed);
@@ -318,11 +325,19 @@ where
     // Claude correlates this path in system/init and stages a native prompt file; Pi's
     // corresponding preparation uses a persisted session and injected input extension.
     // jscpd:ignore-start
-    let expected_cwd = invocation
+    let expected_cwd_path = invocation
         .process()
         .protocol_cwd()
         .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-    let expected_cwd = expected_cwd
+    let session_id = Arc::from(
+        invocation
+            .diagnostic_session()
+            .claude_code_native_session_id()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?,
+    );
+    let native_session_bridge =
+        ClaudeCodeNativeSessionBridge::prepare(invocation, &expected_cwd_path, &session_id)?;
+    let expected_cwd = expected_cwd_path
         .to_str()
         .map(Arc::from)
         .ok_or(AgentFailureCause::HarnessStartFailed)?;
@@ -346,12 +361,14 @@ where
         result_mode_arguments(
             &configuration.model,
             configuration.effort.as_str(),
+            &session_id,
             system_prompt_file.path(),
         )
     } else {
         normal_mode_arguments(
             &configuration.model,
             configuration.effort.as_str(),
+            &session_id,
             system_prompt_file.path(),
         )
     };
@@ -359,9 +376,185 @@ where
     Ok(ClaudeCodeStreamJsonV1LaunchPlan {
         arguments,
         expected_cwd,
+        session_id,
         input,
+        _native_session_bridge: native_session_bridge,
         _system_prompt_file: system_prompt_file,
     })
+}
+
+struct ClaudeCodeNativeSessionBridge {
+    ambient_project_directory: OwnedFd,
+    links: Vec<OwnedAmbientSessionLink>,
+}
+
+struct OwnedAmbientSessionLink {
+    name: OsString,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+impl ClaudeCodeNativeSessionBridge {
+    fn prepare<Sink>(
+        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+        expected_cwd: &Path,
+        session_id: &str,
+    ) -> Result<Self, AgentFailureCause>
+    where
+        Sink: AgentObservationSink,
+    {
+        invocation
+            .diagnostic_session()
+            .verify_claude_code_native_session_path_binding()
+            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let transcript = invocation
+            .diagnostic_session()
+            .claude_code_native_transcript_path()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        let resources = invocation
+            .diagnostic_session()
+            .claude_code_native_resources_directory()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        if !transcript.is_absolute() || !resources.is_absolute() {
+            return Err(AgentFailureCause::HarnessStartFailed);
+        }
+
+        let config = claude_code_config_directory(invocation, expected_cwd)?;
+        let project = config.join("projects").join(native_project_slug(
+            expected_cwd
+                .to_str()
+                .ok_or(AgentFailureCause::HarnessStartFailed)?,
+        ));
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(&project)
+            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let project =
+            fs::canonicalize(project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let ambient_project_directory =
+            open_directory_path(&project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let mut bridge = Self {
+            ambient_project_directory,
+            links: Vec::with_capacity(2),
+        };
+        bridge.create_link(&transcript, OsString::from(format!("{session_id}.jsonl")))?;
+        bridge.create_link(&resources, OsString::from(session_id))?;
+        Ok(bridge)
+    }
+
+    fn create_link(&mut self, target: &Path, name: OsString) -> Result<(), AgentFailureCause> {
+        symlinkat(target, &self.ambient_project_directory, &name)
+            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let metadata = statat(
+            &self.ambient_project_directory,
+            &name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Symlink {
+            return Err(AgentFailureCause::HarnessStartFailed);
+        }
+        self.links.push(OwnedAmbientSessionLink {
+            name,
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        });
+        Ok(())
+    }
+}
+
+impl Drop for ClaudeCodeNativeSessionBridge {
+    fn drop(&mut self) {
+        for link in self.links.iter().rev() {
+            let Ok(metadata) = statat(
+                &self.ambient_project_directory,
+                &link.name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) else {
+                continue;
+            };
+            if FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink
+                && metadata.st_dev == link.device
+                && metadata.st_ino == link.inode
+            {
+                let _ = unlinkat(
+                    &self.ambient_project_directory,
+                    &link.name,
+                    AtFlags::empty(),
+                );
+            }
+        }
+    }
+}
+
+fn claude_code_config_directory<Sink>(
+    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    expected_cwd: &Path,
+) -> Result<PathBuf, AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    let environment = invocation.process().environment().variables();
+    let configured = environment
+        .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+        .map(PathBuf::from);
+    let directory = if let Some(configured) = configured {
+        configured
+    } else {
+        let home = environment
+            .get(std::ffi::OsStr::new("HOME"))
+            .map(PathBuf::from)
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        home.join(".claude")
+    };
+    if directory.is_absolute() {
+        Ok(directory)
+    } else {
+        Ok(expected_cwd.join(directory))
+    }
+}
+
+pub(super) fn native_project_slug(cwd: &str) -> String {
+    const MAXIMUM_SLUG_CODE_UNITS: usize = 200;
+    let code_units = cwd.encode_utf16().collect::<Vec<_>>();
+    let mut slug = String::with_capacity(code_units.len());
+    for code_unit in &code_units {
+        if let Ok(ascii) = u8::try_from(*code_unit)
+            && ascii.is_ascii_alphanumeric()
+        {
+            slug.push(char::from(ascii));
+        } else {
+            slug.push('-');
+        }
+    }
+    if code_units.len() <= MAXIMUM_SLUG_CODE_UNITS {
+        return slug;
+    }
+
+    let mut hash = 0_i32;
+    for code_unit in code_units {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(code_unit));
+    }
+    format!(
+        "{}-{}",
+        &slug[..MAXIMUM_SLUG_CODE_UNITS],
+        base36(hash.unsigned_abs())
+    )
+}
+
+fn base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut reversed = Vec::new();
+    while value > 0 {
+        let index = usize::try_from(value % 36).unwrap_or_default();
+        reversed.push(char::from(DIGITS[index]));
+        value /= 36;
+    }
+    reversed.iter().rev().collect()
 }
 
 fn initial_user_frame<Sink>(
@@ -596,7 +789,7 @@ fn release_guarded_claude_code(
     release: impl FnOnce() -> Result<(), ()>,
 ) -> Result<(), AgentFailureCause> {
     diagnostic_session
-        .verify_path_binding()
+        .verify_claude_code_native_session_path_binding()
         .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
     release().map_err(|()| AgentFailureCause::HarnessStartFailed)
 }
@@ -614,6 +807,7 @@ where
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    environment.remove(OsStr::new("CLAUDE_CODE_PROJECT_DIR_NAME"));
     for (name, value) in FIXED_INVOCATION_ENVIRONMENT {
         environment.insert(OsString::from(name), OsString::from(value));
     }
@@ -910,7 +1104,7 @@ where
         return AgentOutcome::Cancelled { reason };
     }
     if let Some(cause) = failure {
-        return failed_agent_outcome(cause);
+        return AgentOutcome::Failed(parser.agent_failure(cause));
     }
     if wait_failed || !supervisor_quiesced {
         return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
@@ -1001,7 +1195,14 @@ async fn initialize_standard_input(
                 biased;
                 reason = &mut cancelled => InitialInputProgress::Cancelled(reason),
                 result = &mut shutdown => {
-                    if result.is_ok() {
+                    // NotConnected: see close_standard_input. A harness that
+                    // exited after reading its prompt has already observed
+                    // end of input.
+                    if result.is_ok()
+                        || result.is_err_and(|error| {
+                            error.kind() == io::ErrorKind::NotConnected
+                        })
+                    {
                         InitialInputProgress::Ready
                     } else if let Some(reason) = cancellation.cancellation_reason() {
                         InitialInputProgress::Cancelled(reason)
@@ -1244,7 +1445,15 @@ async fn close_standard_input(standard_input: &mut Option<UnixStream>) -> Result
     let Some(mut input) = standard_input.take() else {
         return Ok(());
     };
-    input.shutdown().await.map_err(|_| ())
+    match input.shutdown().await {
+        Ok(()) => Ok(()),
+        // A write-side close only guarantees the harness observes end of
+        // input. When the harness already closed its side of the socket pair,
+        // macOS reports NotConnected where Linux reports success; the peer has
+        // necessarily observed end of input either way.
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(_) => Err(()),
+    }
 }
 
 fn bounded_feedback(feedback: &str, maximum_bytes: u64) -> Arc<str> {

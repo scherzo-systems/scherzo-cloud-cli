@@ -25,10 +25,11 @@ use super::{
 use crate::execution::pi::{PiCompatibilityProfile, compatibility_profile_for_version};
 use crate::execution::workflow::admission::{CancellationReason, CancellationSource};
 use crate::execution::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
-    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentAdapter, AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentInputKind,
+    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
     AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
+    failed_agent_outcome, finish_agent_diagnostic_capture,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::execution::workflow::child_guard::{StoppedChildGuard, force_stop_direct_child};
@@ -209,16 +210,11 @@ where
             },
         )
         .await;
+        invocation
+            .diagnostic_session()
+            .retain_protocol_rejection_from(&outcome);
         let bridge_shutdown = shutdown_result_bridge(result_bridge).await;
-        if matches!(
-            &outcome,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::ResultSettlementFailed,
-            }
-        ) {
-            diagnostic.abort();
-        }
-        diagnostic.finish().await;
+        finish_agent_diagnostic_capture(diagnostic, &outcome).await;
         if bridge_shutdown.is_err() && matches!(outcome, AgentOutcome::Completed(_)) {
             failed(AgentFailureCause::HarnessProtocolFailed)
         } else {
@@ -655,7 +651,8 @@ where
     let mut settlement_active = false;
     let mut pending_result_event = None;
     let mut parser_enabled = true;
-    let mut failure = None;
+    let mut start_reported = false;
+    let mut failure: Option<AgentFailure> = None;
     let mut cancelled = None;
     let mut wait_failed = false;
 
@@ -682,7 +679,7 @@ where
                             && !settlement_admitted
                         {
                             if begin_settlement.send(()).is_err() {
-                                failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                                failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
                                 parser_enabled = false;
                                 child.force_process_group(process_group);
                             } else {
@@ -698,11 +695,16 @@ where
                                         milestone: AgentLifecycleMilestone::HarnessStarted,
                                     }
                                 );
-                                if reports_start && started.report().is_err() {
-                                    failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                                    parser_enabled = false;
-                                    child.force_process_group(process_group);
-                                    break;
+                                // Pi emits agent_start for each native retry, while the
+                                // workflow invocation start callback is intentionally one-shot.
+                                if reports_start && !start_reported {
+                                    if started.report().is_err() {
+                                        failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                                        parser_enabled = false;
+                                        child.force_process_group(process_group);
+                                        break;
+                                    }
+                                    start_reported = true;
                                 }
                                 let emitted = invocation.observations().emit(observation).await;
                                 if let Some(reason) = cancellation_source.cancellation_reason() {
@@ -711,17 +713,15 @@ where
                                     break;
                                 }
                                 if emitted.is_err() {
-                                    failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                                    failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
                                     parser_enabled = false;
                                     child.force_process_group(process_group);
                                     break;
                                 }
                             }
                         }
-                        if parser_enabled
-                            && let Err(cause) = parsed
-                        {
-                            failure = Some(cause);
+                        if parser_enabled && parsed.is_err() {
+                            failure = Some(parser.agent_failure_for_current_phase());
                             parser_enabled = false;
                             child.force_process_group(process_group);
                         }
@@ -733,7 +733,7 @@ where
                             if let Some(reason) = cancellation_source.cancellation_reason() {
                                 cancelled = Some(reason);
                             } else {
-                                failure = Some(parser.failure_for_current_phase());
+                                failure = Some(parser.agent_failure_for_current_phase());
                                 child.force_process_group(process_group);
                             }
                             parser_enabled = false;
@@ -751,7 +751,7 @@ where
                 match outcome {
                     Some(SettlementDeadlineOutcome::Expired) | None => {
                         standard_output_closed = true;
-                        failure = Some(AgentFailureCause::ResultSettlementFailed);
+                        failure = Some(AgentFailureCause::ResultSettlementFailed.into());
                         parser_enabled = false;
                         child.force_process_group(process_group);
                     }
@@ -764,7 +764,7 @@ where
                         wait_failed = true;
                         parser_enabled = false;
                         if cancelled.is_none() {
-                            failure = Some(parser.failure_for_current_phase());
+                            failure = Some(parser.agent_failure_for_current_phase());
                         }
                         child.force_process_group(process_group);
                     }
@@ -784,7 +784,7 @@ where
                             cancelled = Some(reason);
                             parser_enabled = false;
                         } else if emitted.is_err() {
-                            failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                            failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
                             parser_enabled = false;
                             child.force_process_group(process_group);
                         }
@@ -793,8 +793,8 @@ where
                 ResultEventProgress::Pending(incoming) => {
                     pending_result_event = Some(ResultSocketEvent::Request(incoming));
                 }
-                ResultEventProgress::Failed(cause) => {
-                    failure = Some(cause);
+                ResultEventProgress::Failed(result_failure) => {
+                    failure = Some(result_failure);
                     parser_enabled = false;
                     child.force_process_group(process_group);
                 }
@@ -842,14 +842,14 @@ where
             reason,
         ));
     }
-    if let Some(cause) = failure {
-        return failed(cause);
+    if let Some(failure) = failure {
+        return AgentOutcome::Failed(failure);
     }
     if wait_failed {
-        return failed(parser.failure_for_current_phase());
+        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
     }
     let Some(status) = process_completion else {
-        return failed(parser.failure_for_current_phase());
+        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
     };
     parser.finish(PiJsonV1ProcessCompletion::exited(status.success()))
 }
@@ -864,7 +864,7 @@ enum ResultEventProgress {
         observation: Option<AgentObservation>,
     },
     Pending(IncomingResultRequest),
-    Failed(AgentFailureCause),
+    Failed(AgentFailure),
     Cancelled(CancellationReason),
 }
 
@@ -888,10 +888,10 @@ where
     Worker: ResultValidationWorker,
 {
     let ResultSocketEvent::Request(incoming) = event else {
-        return ResultEventProgress::Failed(parser.failure_for_current_phase());
+        return ResultEventProgress::Failed(parser.agent_failure_for_current_phase());
     };
     let Some(result_bridge) = result_bridge.as_mut() else {
-        return ResultEventProgress::Failed(parser.failure_for_current_phase());
+        return ResultEventProgress::Failed(parser.agent_failure_for_current_phase());
     };
 
     let request = incoming.request();
@@ -935,7 +935,7 @@ where
                     }),
                 },
                 ResponseProgress::Failed => {
-                    ResultEventProgress::Failed(parser.failure_for_current_phase())
+                    ResultEventProgress::Failed(parser.agent_failure_for_current_phase())
                 }
                 ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
             }
@@ -950,16 +950,24 @@ where
             .await
             {
                 ResponseProgress::Delivered | ResponseProgress::Failed => {
-                    ResultEventProgress::Failed(cause)
+                    ResultEventProgress::Failed(cause.into())
                 }
                 ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
             }
         }
         ResultValidationOutcome::Decided(ResultValidationDecision::Valid(result)) => {
-            if let Err(cause) = parser.accept_result(AcceptedPiJsonV1Result::new(
-                call_id, tool_name, arguments, result,
-            )) {
-                return fail_request_with_cause(incoming, cause, cancellation).await;
+            if parser
+                .accept_result(AcceptedPiJsonV1Result::new(
+                    call_id, tool_name, arguments, result,
+                ))
+                .is_err()
+            {
+                return fail_request_with_failure(
+                    incoming,
+                    parser.agent_failure_for_current_phase(),
+                    cancellation,
+                )
+                .await;
             }
             match respond_with_cancellation(
                 incoming,
@@ -970,7 +978,7 @@ where
             {
                 ResponseProgress::Delivered => ResultEventProgress::Continue { observation: None },
                 ResponseProgress::Failed => {
-                    ResultEventProgress::Failed(parser.failure_for_current_phase())
+                    ResultEventProgress::Failed(parser.agent_failure_for_current_phase())
                 }
                 ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
             }
@@ -983,12 +991,17 @@ async fn fail_correlated_request(
     parser: &PiJsonV1Parser,
     cancellation: &CancellationSource,
 ) -> ResultEventProgress {
-    fail_request_with_cause(incoming, parser.failure_for_current_phase(), cancellation).await
+    fail_request_with_failure(
+        incoming,
+        parser.agent_failure_for_current_phase(),
+        cancellation,
+    )
+    .await
 }
 
-async fn fail_request_with_cause(
+async fn fail_request_with_failure(
     incoming: IncomingResultRequest,
-    cause: AgentFailureCause,
+    failure: AgentFailure,
     cancellation: &CancellationSource,
 ) -> ResultEventProgress {
     match respond_with_cancellation(
@@ -999,7 +1012,7 @@ async fn fail_request_with_cause(
     .await
     {
         ResponseProgress::Delivered | ResponseProgress::Failed => {
-            ResultEventProgress::Failed(cause)
+            ResultEventProgress::Failed(failure)
         }
         ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
     }
@@ -1126,8 +1139,10 @@ async fn supervise_process_group<Clock: CoordinatorClock>(
 }
 
 impl PiJsonV1Parser {
-    fn failure_for_current_phase(&self) -> AgentFailureCause {
-        self.protocol_failure()
+    fn agent_failure_for_current_phase(&self) -> AgentFailure {
+        self.failure
+            .clone()
+            .unwrap_or_else(|| AgentFailure::new(self.protocol_failure()))
     }
 }
 
@@ -1139,7 +1154,7 @@ async fn stop_child(child: &mut Child, process_group: Option<Pid>) {
 }
 
 fn failed(cause: AgentFailureCause) -> AgentOutcome {
-    AgentOutcome::Failed { cause }
+    failed_agent_outcome(cause)
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ use crate::execution::workflow::publication::{
 };
 use crate::execution::workflow::resolution::{self, WorkflowContentDigest};
 use crate::execution::workflow::runtime::{ActionId, StepFailure, TransitionSequence};
+use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::execution::workflow::value::CapturedValue;
 
 const TEST_CHILD_FRAGMENT_BYTES: usize = 16 * 1024;
@@ -269,6 +270,7 @@ impl Fixture {
                 .keys()
                 .map(|id| WorkflowRunStep {
                     id: id.clone(),
+                    role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
                     kind: WorkflowRunStepKind::Command,
                     failure_policy: FailurePolicy::Required,
                     state: StepState::Succeeded {
@@ -281,6 +283,7 @@ impl Fixture {
                     command_output: Some(empty_command_output()),
                 })
                 .collect(),
+            finalization: None,
             exports: BTreeMap::new(),
             export_sources: BTreeMap::new(),
         }
@@ -380,6 +383,7 @@ fn step_transition(
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
+            role: WorkflowNodeRole::Step,
             failure_policy: FailurePolicy::Required,
             from: StepStateKind::Pending,
             to,
@@ -973,6 +977,7 @@ steps:
 
     let step = WorkflowRunStep {
         id: "plan".to_owned(),
+        role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
         kind: WorkflowRunStepKind::Agent,
         failure_policy: FailurePolicy::Required,
         state: StepState::Succeeded {
@@ -1062,7 +1067,7 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     let plain_view = plain_stdout.text();
     assert!(plain_view.contains("a          stdout      plain child"));
     assert!(plain_view.contains("── summary ─"));
-    assert!(plain_view.contains("step  kind  state"));
+    assert!(plain_view.contains("node  kind  state"));
     assert!(plain_view.find("a     cmd").unwrap() < plain_view.find("b     cmd").unwrap());
     assert!(plain_view.find("b     cmd").unwrap() < plain_view.find("c     cmd").unwrap());
     assert!(plain_view.contains("succeeded · exit 0 · 3 succeeded · 1.2s total"));
@@ -1073,7 +1078,7 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
 
     let json_view = json_stderr.text();
     assert!(json_view.contains("a          stdout      json child"));
-    assert!(json_view.contains("step  kind  state"));
+    assert!(json_view.contains("node  kind  state"));
     assert!(json_view.contains("succeeded · exit 0 · 3 succeeded · 1.2s total"));
     let terminal_bytes = json_stdout.text();
     assert!(terminal_bytes.contains("\n  \"schemaVersion\""));
@@ -1156,7 +1161,7 @@ fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
     ));
     let summary = stdout.text();
     assert!(summary.starts_with("\n── summary ─"));
-    assert!(summary.contains("step  kind  state"));
+    assert!(summary.contains("node  kind  state"));
     assert!(summary.contains("succeeded · exit 0 · 3 succeeded"));
     assert!(!summary.contains("started 2026"));
 }
@@ -1179,6 +1184,7 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     failed.steps[2].command_output = None;
     failed.outcome = RunOutcome::Failed {
         primary_failure: StepFailure {
+            role: WorkflowNodeRole::Step,
             step: "b".to_owned(),
             phase: FailurePhase::Execution,
             cause,
@@ -1206,10 +1212,10 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     );
     let failed_view = failed_output.text();
     assert!(failed_view.contains("failed · exit 1"));
-    assert!(failed_view.contains("failure: b · execution · exit 23"));
+    assert!(failed_view.contains("failure: step b · execution · exit 23"));
     let header = failed_view
         .lines()
-        .find(|line| line.starts_with("step"))
+        .find(|line| line.starts_with("node"))
         .unwrap();
     let not_run = failed_view
         .lines()
@@ -1299,7 +1305,7 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
         WorkflowRunPresentationResult::PublicationFailed(failure)
     );
     assert!(stdout.text().is_empty());
-    assert!(stderr.text().contains("step  kind  state"));
+    assert!(stderr.text().contains("node  kind  state"));
     assert!(stderr.text().contains("workflow succeeded"));
     assert!(stderr.text().contains("result publication failed"));
     assert!(!stderr.text().contains("run result succeeded · exit"));

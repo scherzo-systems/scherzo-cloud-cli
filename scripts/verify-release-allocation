@@ -181,12 +181,23 @@ def expected_asset_names(version: str) -> list[str]:
         [
             f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
             f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
             f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
             "SHA256SUMS",
         ],
         key=os.fsencode,
     )
+
+
+def prior_release_asset_inventories(version: str) -> tuple[list[str], list[str]]:
+    current = expected_asset_names(version)
+    legacy = sorted(
+        [
+            *current,
+            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
+        ],
+        key=os.fsencode,
+    )
+    return current, legacy
 
 
 @dataclass(frozen=True)
@@ -515,7 +526,8 @@ def normalize_latest_release(
         draft_value is False
         and prerelease_value is False
         and name == f"Scherzo Cloud CLI {tag}"
-        and [asset.name for asset in assets] == expected_asset_names(tag.removeprefix("v"))
+        and [asset.name for asset in assets]
+        in prior_release_asset_inventories(tag.removeprefix("v"))
     )
     if not complete:
         fail("approved latest GitHub Release is no longer complete")

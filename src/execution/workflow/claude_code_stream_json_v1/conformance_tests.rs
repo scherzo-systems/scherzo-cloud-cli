@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
@@ -15,8 +17,8 @@ use tokio::process::Command;
 
 use super::adapter::ClaudeCodeStreamJsonV1Adapter;
 use super::test_support::{
-    LoopbackProvider, PendingClock, RecordingObservationSink, SyntheticClaudeCodeRoot,
-    admitted_adapter, invocation_identity, version_probe_environment,
+    FixtureSignal, LoopbackBlock, LoopbackProvider, PendingClock, RecordingObservationSink,
+    SyntheticClaudeCodeRoot, admitted_adapter, invocation_identity, version_probe_environment,
 };
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, CancellationSource};
@@ -35,10 +37,22 @@ use crate::execution::workflow::process_group::{ProcessGuardRegistry, process_gr
 const MODEL: &str = "scherzo-loopback";
 const EFFORT: &str = "xhigh";
 const RESPONSE: &str = "loopback complete";
+const DIRECT_SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const WATCHDOG: Duration = Duration::from_secs(20);
+
+static EXACT_BINARY_CONFORMANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn conformance_executable() -> Option<PathBuf> {
     option_env!("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE").map(PathBuf::from)
+}
+
+async fn exclusive_conformance_executable()
+-> Option<(PathBuf, tokio::sync::MutexGuard<'static, ()>)> {
+    let executable = conformance_executable()?;
+    // Native startup is resource-intensive enough that concurrent qualification cases can
+    // exhaust their independent anti-hang watchdogs before reaching controlled provider I/O.
+    let exclusive = EXACT_BINARY_CONFORMANCE.lock().await;
+    Some((executable, exclusive))
 }
 
 fn conformance_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits> {
@@ -70,6 +84,7 @@ impl RunningProductionClaudeCode {
         root: &SyntheticClaudeCodeRoot,
         provider: &LoopbackProvider,
         value_mode: AgentValueMode,
+        observations: RecordingObservationSink,
     ) -> Self {
         // Lifecycle cases deliberately build their own invocation instead of borrowing the
         // attachment case's resources, so native cancellation cannot contaminate another root.
@@ -82,7 +97,7 @@ impl RunningProductionClaudeCode {
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(working_directory, root.environment_snapshot(provider)),
             AgentInvocationStaging::new(root.private().to_owned()),
-            AgentDiagnosticSession::fixture(root.private().join("diagnostics/session")),
+            AgentDiagnosticSession::claude_code_fixture(root.private().join("diagnostics/session")),
             AgentPrompt::new(
                 Arc::from(fs::read_to_string(root.system_prompt()).unwrap()),
                 Arc::from("Complete the controlled lifecycle exchange."),
@@ -92,7 +107,7 @@ impl RunningProductionClaudeCode {
             conformance_limits(),
             cancellation.clone(),
             ProcessGuardRegistry::default(),
-            RecordingObservationSink::default(),
+            observations,
         );
         let process_control = invocation.process_control().clone();
         let adapter = ClaudeCodeStreamJsonV1Adapter::new(
@@ -148,6 +163,21 @@ async fn launch_response_lifecycle(
     root: &SyntheticClaudeCodeRoot,
     provider: &LoopbackProvider,
 ) -> RunningStartedClaudeCode {
+    launch_recorded_response_lifecycle(
+        executable,
+        root,
+        provider,
+        &RecordingObservationSink::default(),
+    )
+    .await
+}
+
+async fn launch_recorded_response_lifecycle(
+    executable: PathBuf,
+    root: &SyntheticClaudeCodeRoot,
+    provider: &LoopbackProvider,
+    observations: &RecordingObservationSink,
+) -> RunningStartedClaudeCode {
     RunningProductionClaudeCode::launch(
         executable,
         root,
@@ -155,6 +185,7 @@ async fn launch_response_lifecycle(
         AgentValueMode::Response {
             output: Arc::from("response"),
         },
+        observations.clone(),
     )
     .await_started()
     .await
@@ -169,19 +200,34 @@ async fn assert_user_cancelled(running: RunningStartedClaudeCode) {
     );
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time only keeps polling schedulable; file contents are the success evidence"
-)]
-async fn wait_for_path(path: &std::path::Path) {
-    while !fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+fn process_id(bytes: &[u8]) -> Pid {
+    let raw = std::str::from_utf8(bytes).unwrap().trim().parse().unwrap();
+    Pid::from_raw(raw).unwrap()
 }
 
-fn process_id(path: &std::path::Path) -> Pid {
-    let raw = fs::read_to_string(path).unwrap().trim().parse().unwrap();
-    Pid::from_raw(raw).unwrap()
+fn assert_retained_native_session(root: &SyntheticClaudeCodeRoot, expected: &[&str]) {
+    let transcript = fs::read_to_string(root.retained_transcript()).unwrap();
+    for fragment in expected {
+        assert!(
+            transcript.contains(fragment),
+            "missing retained fragment: {fragment}"
+        );
+    }
+    assert!(root.retained_resources().is_dir());
+    let ambient_paths = root.ambient_session_paths(DIRECT_SESSION_ID);
+    for ambient in &ambient_paths {
+        assert!(
+            !ambient.exists(),
+            "ambient session residue: {}",
+            ambient.display()
+        );
+    }
+    let ambient_project = ambient_paths[0].parent().unwrap();
+    assert_eq!(
+        fs::read_dir(ambient_project).unwrap().count(),
+        0,
+        "ambient project history retained an unrelated entry"
+    );
 }
 
 #[test]
@@ -222,7 +268,7 @@ async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_ro
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
     // jscpd:ignore-start
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -234,7 +280,12 @@ async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_ro
 
         let mut command = Command::new(executable);
         command
-            .args(normal_mode_arguments(MODEL, EFFORT, root.system_prompt()))
+            .args(normal_mode_arguments(
+                MODEL,
+                EFFORT,
+                DIRECT_SESSION_ID,
+                root.system_prompt(),
+            ))
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -259,12 +310,15 @@ async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_ro
 
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success());
-        assert!(output.stderr.is_empty());
+        // The pinned release diagnoses the synthetic model on stderr. Its bytes are an
+        // actionable process diagnostic, not protocol, and their wording is not a contract.
+        assert!(!output.stderr.is_empty());
         assert!(!provider.has_pending_request());
 
         let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
             Arc::from(expected_cwd.to_str().unwrap()),
             Arc::from(MODEL),
+            Arc::from(DIRECT_SESSION_ID),
             crate::execution::workflow::agent::AgentValueKind::Response,
             NonZeroU64::new(1024).unwrap(),
         );
@@ -294,7 +348,7 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
     // Production-adapter cases each need independent native process and provider state;
     // sharing their synthetic roots would invalidate same-process correction evidence.
     // jscpd:ignore-start
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -336,7 +390,9 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(working_directory, root.environment_snapshot(&provider)),
             AgentInvocationStaging::new(root.private().to_owned()),
-            AgentDiagnosticSession::fixture(root.private().join("diagnostics/session")),
+            AgentDiagnosticSession::claude_code_fixture(
+                root.private().join("diagnostics/session"),
+            ),
             AgentPrompt::new(
                 Arc::from(fs::read_to_string(root.system_prompt()).unwrap()),
                 Arc::from("Complete through the production Scherzo adapter."),
@@ -348,8 +404,9 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
             ProcessGuardRegistry::default(),
             observations.clone(),
         );
+        let diagnostics = StepDiagnosticLog::default();
         let adapter = ClaudeCodeStreamJsonV1Adapter::new(
-            StepDiagnosticLog::default(),
+            diagnostics.clone(),
             NonZeroU64::new(1024).unwrap(),
             PendingClock,
             NoopExecutionObserver,
@@ -401,22 +458,21 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
             panic!("production exact-binary adapter must return one response outcome");
         };
         assert_eq!(response.as_str(), RESPONSE);
-        let observations = observations.snapshot();
-        assert_eq!(
-            observations
-                .iter()
-                .filter_map(|observation| match observation.observation() {
-                    AgentObservation::AssistantText { text } => Some(text.as_ref()),
-                    _ => None,
-                })
-                .collect::<String>(),
-            RESPONSE
-        );
-        assert!(!observations.iter().any(|observation| matches!(
+        assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
+        let diagnostic = diagnostics.get("agent").unwrap();
+        assert!(diagnostic.standard_output().bytes().is_empty());
+        assert!(!diagnostic.standard_error().bytes().is_empty());
+        assert_eq!(diagnostic.standard_error().truncation(), None);
+        assert!(diagnostic.standard_error().fully_drained());
+        assert!(!observations.snapshot().iter().any(|observation| matches!(
             observation.observation(),
             AgentObservation::UnrecognizedHarnessEvent { .. }
         )));
         assert!(!provider.has_pending_request());
+        assert_retained_native_session(
+            &root,
+            &["Complete through the production Scherzo adapter.", RESPONSE],
+        );
         provider.shutdown().await;
     })
     .await
@@ -429,7 +485,7 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
 )]
 #[tokio::test]
 async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation() {
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -454,7 +510,7 @@ async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation(
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(working_directory, root.environment_snapshot(&provider)),
             AgentInvocationStaging::new(root.private().to_owned()),
-            AgentDiagnosticSession::fixture(root.private().join("diagnostics/session")),
+            AgentDiagnosticSession::claude_code_fixture(root.private().join("diagnostics/session")),
             AgentPrompt::new(
                 Arc::from(fs::read_to_string(root.system_prompt()).unwrap()),
                 Arc::from("Return the requested structured result."),
@@ -526,6 +582,13 @@ async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation(
             }
         )));
         assert!(!provider.has_pending_request());
+        assert_retained_native_session(
+            &root,
+            &[
+                "Return the requested structured result.",
+                "Result rejected by the workflow schema:",
+            ],
+        );
         provider.shutdown().await;
     })
     .await
@@ -538,7 +601,7 @@ async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation(
 )]
 #[tokio::test]
 async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed() {
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -549,6 +612,7 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
             &success_root,
             &success_provider,
             AgentValueMode::None,
+            RecordingObservationSink::default(),
         )
         .await_started()
         .await;
@@ -558,6 +622,7 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
             AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
         );
         assert!(!success_provider.has_pending_request());
+        assert_retained_native_session(&success_root, &[RESPONSE]);
         success_provider.shutdown().await;
 
         let mut failure_provider = LoopbackProvider::start().await;
@@ -567,6 +632,7 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
             &failure_root,
             &failure_provider,
             AgentValueMode::None,
+            RecordingObservationSink::default(),
         )
         .await_started()
         .await;
@@ -576,13 +642,15 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
             .release_invalid_request();
         assert_eq!(
             failure.finish().await,
-            AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelError,
-                },
-            }
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::ModelError,
+            })
         );
         assert!(!failure_provider.has_pending_request());
+        assert_retained_native_session(
+            &failure_root,
+            &["Complete the controlled lifecycle exchange."],
+        );
         failure_provider.shutdown().await;
     })
     .await
@@ -595,7 +663,7 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
 )]
 #[tokio::test]
 async fn pinned_claude_code_05_cancels_a_blocked_provider_request() {
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -613,6 +681,7 @@ async fn pinned_claude_code_05_cancels_a_blocked_provider_request() {
         assert_user_cancelled(running).await;
         drop(blocked_request);
         assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
         provider.shutdown().await;
     })
     .await
@@ -625,7 +694,7 @@ async fn pinned_claude_code_05_cancels_a_blocked_provider_request() {
 )]
 #[tokio::test]
 async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
-    let Some(executable) = conformance_executable() else {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
         return;
     };
     #[cfg(target_os = "linux")]
@@ -633,11 +702,14 @@ async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
-        let child_path = root.private().join("stubborn-child.pid");
+        let child = FixtureSignal::create(root.private().join("stubborn-child.pid"));
+        let blocker = root.private().join("stubborn-child.blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let running = launch_response_lifecycle(executable, &root, &provider).await;
         let command = format!(
-            "trap '' INT TERM; printf '%s\\n' \"$$\" > '{}'; while :; do :; done",
-            child_path.display()
+            "trap '' INT TERM; printf '%s\\n' \"$$\" > '{}'; IFS= read -r unexpected < '{}'",
+            child.path().display(),
+            blocker.display()
         );
         provider.next_request().await.release_tool_use(
             "Bash",
@@ -646,8 +718,7 @@ async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
                 "description": "Run a controlled stubborn descendant",
             }),
         );
-        wait_for_path(&child_path).await;
-        let child = process_id(&child_path);
+        let child = process_id(&child.receive().await);
         let process_group = getpgid(Some(child)).unwrap();
 
         assert!(
@@ -660,10 +731,202 @@ async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
         assert_user_cancelled(running).await;
         assert!(process_group_is_quiescent(process_group));
         assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
         provider.shutdown().await;
     })
     .await
     .expect("pinned Claude Code stubborn-child cancellation watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_claude_code_07_retains_forwarded_subagent_activity() {
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
+        return;
+    };
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let running = launch_response_lifecycle(executable, &root, &provider).await;
+
+        provider.next_request().await.release_tool_use(
+            "Agent",
+            json!({
+                "description": "Run a controlled subagent",
+                "prompt": "Return the exact subagent retained marker.",
+                "subagent_type": "general-purpose",
+                "run_in_background": false,
+            }),
+        );
+        provider
+            .next_request()
+            .await
+            .release_text("subagent retained marker");
+        provider.next_request().await.release_text(RESPONSE);
+
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+            running.finish().await
+        else {
+            panic!("subagent exchange must complete through the production adapter");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+        assert_retained_native_session(&root, &["subagent retained marker", RESPONSE]);
+        let subagents = root.retained_resources().join("subagents");
+        let retained = fs::read_dir(subagents)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!retained.is_empty());
+        assert!(
+            retained
+                .iter()
+                .any(|transcript| transcript.contains("subagent retained marker"))
+        );
+        assert!(!provider.has_pending_request());
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code subagent-retention watchdog expired");
+}
+
+/// Ordered thinking segments deliberately carry multibyte, newline, tab, and trailing
+/// whitespace so the case fails if Claude Code trims or normalizes reconstructed
+/// thinking before restating it in its nominal assistant envelope.
+const THINKING_SEGMENTS: [&str; 3] = [
+    "Step one: \u{e9}\u{4e2d}\u{6587} ",
+    "line\nbreak\ttab  ",
+    "trailing space   ",
+];
+
+fn assistant_text(observation: &AgentObservation) -> Option<&str> {
+    match observation {
+        AgentObservation::AssistantText { text } => Some(text.as_ref()),
+        _ => None,
+    }
+}
+
+fn reasoning_text(observation: &AgentObservation) -> Option<&str> {
+    match observation {
+        AgentObservation::Reasoning { text } => Some(text.as_ref()),
+        _ => None,
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_claude_code_08_correlates_a_nominal_thinking_envelope_before_text() {
+    // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
+    // synthetic root; sharing those resources would let one native case contaminate another.
+    // jscpd:ignore-start
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
+        return;
+    };
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        // jscpd:ignore-end
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+
+        provider.next_request().await.release_blocks(vec![
+            LoopbackBlock::thinking(&THINKING_SEGMENTS),
+            LoopbackBlock::text(RESPONSE),
+        ]);
+
+        // Claude Code 2.1.234 emits a nominal `assistant` envelope restating the thinking
+        // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
+        // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
+        // at all proves the equality invariant holds for native thinking.
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+            running.finish().await
+        else {
+            panic!("a thinking block must not prevent an ordinary response outcome");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+
+        // Thinking is observational only: it never contributes to the response, and the
+        // response is exactly the text block that followed it.
+        assert_eq!(
+            observations.concatenated_text(reasoning_text),
+            THINKING_SEGMENTS.concat()
+        );
+        assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
+        // Thinking additionally makes Claude Code interleave `system` events with subtype
+        // `thinking_tokens` between content-block events. They carry no authority, so they
+        // must degrade to ordered unrecognized observations without breaking correlation.
+        assert!(observations.snapshot().iter().any(|observation| matches!(
+            observation.observation(),
+            AgentObservation::UnrecognizedHarnessEvent { event }
+                if event["type"] == "system" && event["subtype"] == "thinking_tokens"
+        )));
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &[RESPONSE]);
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code nominal-thinking watchdog expired");
+}
+
+/// Opaque payload of a native `redacted_thinking` block. The native API delivers this
+/// block complete in its `content_block_start`, with no deltas.
+const REDACTED_THINKING_DATA: &str = "EmwKAhgBEgy3va3scherzoredacted";
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_claude_code_09_every_block_kind_correlates_its_own_nominal_envelope() {
+    // Fresh per-case native resources, as in every other exact-binary case.
+    // jscpd:ignore-start
+    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
+        return;
+    };
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        // jscpd:ignore-end
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+
+        // One native message carrying every content-block kind. `redacted_thinking` is an
+        // unrecognized kind, so it correlates through `ActiveContentBlock::Unknown`, whose
+        // rule is stricter than the text and thinking rules: the nominal envelope must equal
+        // the whole `content_block_start` block. A tool_use block additionally proves the
+        // exchange survives block-kind interleaving and continues into a second message.
+        provider.next_request().await.release_blocks(vec![
+            LoopbackBlock::thinking(&["deciding to call a tool "]),
+            LoopbackBlock::redacted_thinking(REDACTED_THINKING_DATA),
+            LoopbackBlock::tool_use(
+                "Bash",
+                json!({"command": "echo probe-marker", "description": "controlled probe"}),
+            ),
+        ]);
+        provider.next_request().await.release_text(RESPONSE);
+
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+            running.finish().await
+        else {
+            panic!("interleaved block kinds must still reach an ordinary response outcome");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+        // Only the final message's text is the response; nothing from the tool-calling
+        // message contributes to it.
+        assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &[RESPONSE]);
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code block-kind correlation watchdog expired");
 }
 
 fn contains_exact_value(value: &Value, expected: &Value) -> bool {

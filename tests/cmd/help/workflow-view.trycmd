@@ -9,11 +9,17 @@ Arguments:
 
 Options:
       --attempt <NUMBER>  Attempt number to view (defaults to the current attempt)
+      --plain             Force plain human presentation
+      --json              Print the result as JSON
       --color <WHEN>      Select renderer color behavior [default: auto] [possible values: auto, always, never]
   -h, --help              Print help
 
+Presentation mode:
+  Without an explicit mode, an eligible terminal opens the interactive viewer. Every
+  other stream arrangement receives a frozen plain summary.
+
 Attempt selection:
   When --attempt is omitted, the command selects the current attempt from a stable run
-  snapshot before opening the interactive view.
+  snapshot before opening the selected view.
 
 ```

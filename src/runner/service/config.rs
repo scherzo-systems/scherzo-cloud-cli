@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use url::Url;
 
@@ -9,66 +9,16 @@ use crate::execution::pi::ValidatedPiInstallation;
 use crate::runner::credential::Credential;
 use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct AssignmentConfig {
-    workflow_id: String,
-    workflow_source_root: PathBuf,
-    workflow_path: PathBuf,
     work_root: PathBuf,
 }
 
-impl fmt::Debug for AssignmentConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AssignmentConfig")
-            .field("workflow_id", &self.workflow_id)
-            .finish_non_exhaustive()
-    }
-}
-
 impl AssignmentConfig {
-    pub(crate) fn new(
-        workflow_id: String,
-        workflow_source_root: &Path,
-        workflow_path: &Path,
-        work_root: &Path,
-    ) -> Result<Self, ConfigError> {
-        if workflow_id
-            .parse::<crate::runner_protocol::generated::WorkflowId>()
-            .is_err()
-        {
-            return Err(ConfigError::InvalidWorkflowId);
-        }
-        let workflow_source_root = canonical_directory(
-            workflow_source_root,
-            ConfigError::WorkflowSourceRootUnavailable,
-        )?;
-        let work_root = canonical_directory(work_root, ConfigError::WorkRootUnavailable)?;
-        if workflow_source_root.starts_with(&work_root)
-            || work_root.starts_with(&workflow_source_root)
-        {
-            return Err(ConfigError::OverlappingRoots);
-        }
-        let workflow_path =
-            normalized_relative_path(workflow_path).ok_or(ConfigError::InvalidWorkflowPath)?;
+    pub(crate) fn new(work_root: &Path) -> Result<Self, ConfigError> {
         Ok(Self {
-            workflow_id,
-            workflow_source_root,
-            workflow_path,
-            work_root,
+            work_root: canonical_directory(work_root, ConfigError::WorkRootUnavailable)?,
         })
-    }
-
-    pub(crate) fn workflow_id(&self) -> &str {
-        &self.workflow_id
-    }
-
-    pub(crate) fn workflow_source_root(&self) -> &Path {
-        &self.workflow_source_root
-    }
-
-    pub(crate) fn workflow_path(&self) -> &Path {
-        &self.workflow_path
     }
 
     pub(crate) fn work_root(&self) -> &Path {
@@ -84,6 +34,8 @@ pub(crate) struct Config {
     state_access: Option<RunnerStateAccess>,
     control_socket_path: Option<PathBuf>,
     assignment: AssignmentConfig,
+    #[cfg(test)]
+    fixture_materialized_source: Option<(PathBuf, PathBuf)>,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
 }
@@ -94,7 +46,6 @@ impl fmt::Debug for Config {
             .debug_struct("Config")
             .field("endpoint", &self.endpoint)
             .field("credential", &self.credential)
-            .field("workflow_id", &self.assignment.workflow_id)
             .field(
                 "agent_capable",
                 &(self.pi_installation.is_some() || self.claude_code_installation.is_some()),
@@ -110,11 +61,7 @@ pub(crate) enum ConfigError {
     InvalidGatewayUrl,
     #[cfg(test)]
     InsecureGatewayUrl,
-    InvalidWorkflowId,
-    WorkflowSourceRootUnavailable,
-    InvalidWorkflowPath,
     WorkRootUnavailable,
-    OverlappingRoots,
 }
 
 impl fmt::Display for ConfigError {
@@ -129,19 +76,9 @@ impl fmt::Display for ConfigError {
             Self::InsecureGatewayUrl => {
                 formatter.write_str("insecure runner gateway URL is not allowed")
             }
-            Self::InvalidWorkflowId => formatter.write_str("invalid registered workflow ID"),
-            Self::WorkflowSourceRootUnavailable => {
-                formatter.write_str("workflow source root is not an existing directory")
-            }
-            Self::InvalidWorkflowPath => {
-                formatter.write_str("workflow path must remain within the workflow source root")
-            }
             Self::WorkRootUnavailable => {
                 formatter.write_str("runner work root is not an existing directory")
             }
-            Self::OverlappingRoots => formatter.write_str(
-                "workflow source root and runner work root must be separate directory trees",
-            ),
         }
     }
 }
@@ -164,12 +101,7 @@ impl Config {
             let _ = validate_pending_credential(pending)?;
         }
         let startup_pending = enrolled.pending_credential;
-        let assignment = AssignmentConfig::new(
-            enrolled.workflow_id,
-            &enrolled.workflow_source_root,
-            &enrolled.workflow_path,
-            &enrolled.work_root,
-        )?;
+        let assignment = AssignmentConfig::new(&enrolled.work_root)?;
         Ok(Self {
             endpoint,
             credential,
@@ -177,6 +109,8 @@ impl Config {
             state_access: Some(enrolled.state_access),
             control_socket_path: Some(enrolled.control_socket_path),
             assignment,
+            #[cfg(test)]
+            fixture_materialized_source: None,
             pi_installation: None,
             claude_code_installation: None,
         })
@@ -209,6 +143,7 @@ impl Config {
             state_access: None,
             control_socket_path: None,
             assignment,
+            fixture_materialized_source: None,
             pi_installation: None,
             claude_code_installation: None,
         })
@@ -221,13 +156,13 @@ impl Config {
         allow_insecure_http: bool,
     ) -> Result<Self, ConfigError> {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let assignment = AssignmentConfig::new(
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abs".to_owned(),
-            &manifest.join("schemas"),
-            Path::new("workflow-v1.schema.json"),
-            &manifest.join("tests"),
-        )?;
-        Self::new(gateway_url, credential, allow_insecure_http, assignment)
+        let assignment = AssignmentConfig::new(&manifest.join("tests"))?;
+        Self::new(gateway_url, credential, allow_insecure_http, assignment).map(|config| {
+            config.with_materialized_source_fixture(
+                manifest.join("tests"),
+                PathBuf::from("missing-workflow-fixture.yaml"),
+            )
+        })
     }
 
     pub(crate) fn endpoint(&self) -> &Url {
@@ -264,6 +199,21 @@ impl Config {
 
     pub(crate) fn assignment(&self) -> &AssignmentConfig {
         &self.assignment
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_materialized_source_fixture(
+        mut self,
+        source_root: PathBuf,
+        workflow_path: PathBuf,
+    ) -> Self {
+        self.fixture_materialized_source = Some((source_root, workflow_path));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_materialized_source(&self) -> Option<&(PathBuf, PathBuf)> {
+        self.fixture_materialized_source.as_ref()
     }
 
     pub(crate) fn pi_installation(&self) -> Option<&ValidatedPiInstallation> {
@@ -310,49 +260,18 @@ fn canonical_directory(path: &Path, failure: ConfigError) -> Result<PathBuf, Con
     Ok(canonical)
 }
 
-fn normalized_relative_path(path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::Normal(part) => parts.push(part.to_owned()),
-            Component::Prefix(_) | Component::RootDir => return None,
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(parts.into_iter().collect())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
-
     use tempfile::TempDir;
 
     use super::{AssignmentConfig, Config, ConfigError};
     use crate::runner::credential::test_credential;
 
     fn assignment_fixture(temporary: &TempDir) -> AssignmentConfig {
-        let source = temporary.path().join("source");
         let work = temporary.path().join("work");
-        fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&work).unwrap();
-        AssignmentConfig::new(
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr".to_owned(),
-            &source,
-            Path::new("workflows/../workflow.yaml"),
-            &work,
-        )
-        .unwrap()
+        AssignmentConfig::new(&work).unwrap()
     }
 
     #[test]
@@ -399,51 +318,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_the_registered_workflow_mapping_without_resolving_it() {
+    fn requires_an_existing_work_root() {
         let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("source");
-        let work = temporary.path().join("work");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&work).unwrap();
-
-        let mapping = AssignmentConfig::new(
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr".to_owned(),
-            &source,
-            Path::new("missing/../workflow.yaml"),
-            &work,
-        )
-        .unwrap();
-        assert_eq!(mapping.workflow_path(), Path::new("workflow.yaml"));
-
         assert_eq!(
-            AssignmentConfig::new(
-                "not-a-workflow".to_owned(),
-                &source,
-                Path::new("workflow.yaml"),
-                &work,
-            )
-            .unwrap_err(),
-            ConfigError::InvalidWorkflowId,
-        );
-        assert_eq!(
-            AssignmentConfig::new(
-                "wfl_01k0z6r1w8f4jy2m7q9v3x5abr".to_owned(),
-                &source,
-                Path::new("../workflow.yaml"),
-                &work,
-            )
-            .unwrap_err(),
-            ConfigError::InvalidWorkflowPath,
-        );
-        assert_eq!(
-            AssignmentConfig::new(
-                "wfl_01k0z6r1w8f4jy2m7q9v3x5abr".to_owned(),
-                &source,
-                Path::new("workflow.yaml"),
-                &source,
-            )
-            .unwrap_err(),
-            ConfigError::OverlappingRoots,
+            AssignmentConfig::new(&temporary.path().join("missing")).unwrap_err(),
+            ConfigError::WorkRootUnavailable,
         );
     }
 }

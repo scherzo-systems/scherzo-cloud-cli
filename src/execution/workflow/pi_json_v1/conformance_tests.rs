@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::future::{Future, pending, ready};
+use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt as _;
@@ -28,7 +29,8 @@ use crate::execution::workflow::agent::{
     AgentInvocationStaging, AgentObservation, AgentObservationEnvelope, AgentObservationSink,
     AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver,
     AgentValueMode, CompletedAgentInvocation, RetainedResultSchema, StagedAgentAttachment,
-    WorkflowRunId, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
+    WorkflowRunId, agent_start_channel, agent_terminal_channel, failed_agent_outcome,
+    invoke_agent_adapter,
 };
 // The black-box fixture intentionally owns its imports instead of depending on the
 // executable-stub fixture module solely to share test wiring.
@@ -240,11 +242,15 @@ struct RealPiFixture {
 
 impl RealPiFixture {
     fn new(value_mode: AgentValueMode, retry: bool, hold_settlement: bool) -> Option<Self> {
-        Self::new_with_options(value_mode, retry, hold_settlement, false)
+        Self::new_with_options(value_mode, retry, hold_settlement, false, 600_000)
+    }
+
+    fn with_immediate_retry(value_mode: AgentValueMode) -> Option<Self> {
+        Self::new_with_options(value_mode, true, false, false, 0)
     }
 
     fn with_threshold_compaction(value_mode: AgentValueMode) -> Option<Self> {
-        Self::new_with_options(value_mode, false, false, true)
+        Self::new_with_options(value_mode, false, false, true, 600_000)
     }
 
     fn new_with_options(
@@ -252,6 +258,7 @@ impl RealPiFixture {
         retry: bool,
         hold_settlement: bool,
         force_compaction: bool,
+        retry_base_delay_ms: u64,
     ) -> Option<Self> {
         let executable = conformance_executable()?;
         let temporary = tempfile::tempdir().unwrap();
@@ -282,7 +289,7 @@ impl RealPiFixture {
         }
         fs::set_permissions(&result_endpoint, fs::Permissions::from_mode(0o700)).unwrap();
 
-        materialize_project(&project_directory, retry);
+        materialize_project(&project_directory, retry, retry_base_delay_ms);
         let mut settings = json!({"defaultProjectTrust": "ask"});
         if force_compaction {
             settings["compaction"] = json!({"keepRecentTokens": 100});
@@ -335,6 +342,10 @@ impl RealPiFixture {
             (
                 OsString::from("SCHERZO_PI_FAKE_PROVIDER_SOCKET"),
                 controller.socket_path.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("SCHERZO_PI_STUBBORN_FIXTURE_EXECUTABLE"),
+                std::env::current_exe().unwrap().into_os_string(),
             ),
         ]);
         if hold_settlement {
@@ -521,7 +532,7 @@ impl RealPiFixture {
     }
 }
 
-fn materialize_project(project: &Path, retry: bool) {
+fn materialize_project(project: &Path, retry: bool, retry_base_delay_ms: u64) {
     fs::create_dir_all(project.join(".pi/extensions")).unwrap();
     fs::create_dir_all(project.join(".pi/prompts")).unwrap();
     fs::create_dir_all(project.join(".pi/skills/pi-resource-skill")).unwrap();
@@ -586,7 +597,7 @@ fn materialize_project(project: &Path, retry: bool) {
             "retry": {
                 "enabled": retry,
                 "maxRetries": 3,
-                "baseDelayMs": 600_000
+                "baseDelayMs": retry_base_delay_ms
             }
         }))
         .unwrap(),
@@ -856,6 +867,17 @@ async fn launch_result_case() -> (RunningRealPi, ControlledRequest, String) {
     (running, first, tool_name)
 }
 
+fn count_one_result_response(call_id: &str, tool_name: &str) -> Value {
+    json!({
+        "kind": "toolCalls",
+        "calls": [{
+            "id": call_id,
+            "name": tool_name,
+            "arguments": {"result": {"count": 1}}
+        }]
+    })
+}
+
 async fn assert_count_one_result(fixture: RealPiFixture, outcome: AgentOutcome) {
     let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
         panic!("corrected terminating result did not complete");
@@ -1080,38 +1102,30 @@ async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
             (
                 AgentValueMode::Response { output: Arc::from("response") },
                 json!({"kind": "text", "blocks": ["truncated"], "stopReason": "length"}),
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessFailed {
-                        detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelOutputTruncated,
-                    },
-                },
+                failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                    detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelOutputTruncated,
+                }),
             ),
             (
                 AgentValueMode::None,
                 json!({"kind": "failure", "stopReason": "error", "message": "deterministic model rejection"}),
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessFailed {
-                        detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelError,
-                    },
-                },
+                failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                    detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelError,
+                }),
             ),
             (
                 AgentValueMode::None,
                 json!({"kind": "failure", "stopReason": "aborted", "message": "provider aborted"}),
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessFailed {
-                        detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelAborted,
-                    },
-                },
+                failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                    detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelAborted,
+                }),
             ),
             (
                 AgentValueMode::Response { output: Arc::from("response") },
                 json!({"kind": "toolCalls", "calls": [{"id": "call-terminal", "name": "conformance_terminate", "arguments": {}}]}),
-                AgentOutcome::Failed {
-                    cause: AgentFailureCause::HarnessFailed {
-                        detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::UnexpectedTerminalToolUse,
-                    },
-                },
+                failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                    detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::UnexpectedTerminalToolUse,
+                }),
             ),
         ];
         for (value_mode, response, expected) in cases {
@@ -1286,11 +1300,15 @@ async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persistence() {
+async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement() {
     if conformance_executable().is_none() {
         return;
     }
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        const FIRST_REASONING_SUMMARY: &str = "Inspecting the requested result shape.";
+        const SECOND_REASONING_SUMMARY: &str = "Submitting one nested result call.";
+        const FINALIZED_THINKING: &str =
+            "Provider finalized the reasoning for the nested result call.";
         let fixture = RealPiFixture::new(streamed_nested_result_mode(), false, false).unwrap();
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
@@ -1319,10 +1337,8 @@ async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persis
         );
         model_request.release(json!({
             "kind": "streamedToolCall",
-            "thinking": [
-                "Inspecting the requested result shape. ",
-                "Submitting one nested result call."
-            ],
+            "thinking": [FIRST_REASONING_SUMMARY, SECOND_REASONING_SUMMARY],
+            "finalizedThinking": FINALIZED_THINKING,
             "call": {
                 "id": "call-streamed-nested-result",
                 "name": tool_name,
@@ -1360,14 +1376,14 @@ async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persis
                 task.await.unwrap();
                 fixture.controller.shutdown().await;
                 panic!(
-                    "streamed result requested correction instead of settling; provider context assistant={rejected_assistant}; outcome={outcome:?}"
+                    "provider-finalized result requested correction instead of settling; provider context assistant={rejected_assistant}; outcome={outcome:?}"
                 );
             }
             outcome = &mut terminal => outcome.unwrap(),
         };
         task.await.unwrap();
         let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("streamed nested result did not complete: {outcome:?}");
+            panic!("provider-finalized nested result did not complete: {outcome:?}");
         };
 
         let retained = retained_assistant_tool_call(
@@ -1381,15 +1397,28 @@ async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persis
             .position(|block| block["id"] == "call-streamed-nested-result")
             .unwrap();
         assert!(content[..tool_call_index].iter().any(|block| {
-            block["type"] == "thinking"
-                && block["thinking"]
-                    .as_str()
-                    .is_some_and(|thinking| thinking.contains("one nested result call"))
+            block["type"] == "thinking" && block["thinking"] == FINALIZED_THINKING
         }));
         assert_eq!(
             content[tool_call_index]["arguments"],
             json!({"result": result_value.clone()})
         );
+        let reasoning = std::iter::from_fn(|| fixture.observations.try_recv().ok())
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::Reasoning { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasoning,
+            [
+                Arc::<str>::from(FIRST_REASONING_SUMMARY),
+                Arc::<str>::from(SECOND_REASONING_SUMMARY)
+            ]
+        );
+        assert!(!reasoning
+            .iter()
+            .any(|text| text.as_ref() == FINALIZED_THINKING));
 
         assert_eq!(result.value(), &result_value);
         let mut expected_canonical = Vec::new();
@@ -1400,7 +1429,7 @@ async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persis
         .unwrap();
         assert_eq!(result.canonical_json(), expected_canonical);
         println!(
-            "streamed result outcome=CompletedAgentInvocation::Result provider_arguments_bytes={}",
+            "provider-finalized result outcome=CompletedAgentInvocation::Result provider_arguments_bytes={}",
             provider_bytes.len()
         );
 
@@ -1409,6 +1438,208 @@ async fn pinned_real_pi_04_streamed_nested_result_survives_validation_and_persis
     })
     .await
     .expect("pinned real-Pi streamed-result conformance watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_real_pi_04_rejects_thinking_end_snapshot_disagreement() {
+    if conformance_executable().is_none() {
+        return;
+    }
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        const STREAMED_THINKING: &str = "An observational reasoning summary.";
+        const FINALIZED_THINKING: &str = "The provider-finalized thinking snapshot.";
+        const MISMATCHED_EVENT_CONTENT: &str = "A different thinking-end event snapshot.";
+        let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        running.await_started().await;
+        let model_request = running.fixture.controller.next("model").await;
+        model_request.release(json!({
+            "kind": "streamedToolCall",
+            "thinking": [STREAMED_THINKING],
+            "finalizedThinking": FINALIZED_THINKING,
+            "thinkingEndContent": MISMATCHED_EVENT_CONTENT,
+            "call": {
+                "id": "call-mismatched-thinking-end",
+                "name": "conformance_gate",
+                "arguments": {"value": "must-not-execute"}
+            }
+        }));
+
+        let (fixture, outcome) = running.finish().await;
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("mismatched thinking-end snapshots must fail: {outcome:?}");
+        };
+        assert!(matches!(
+            failure.cause(),
+            AgentFailureCause::HarnessProtocolFailed
+        ));
+        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(
+            rejection["detail"]["reason"],
+            "thinking_finalization_rewrite"
+        );
+        assert_eq!(rejection["detail"]["stage"], "assistant_transition");
+        assert_eq!(rejection["detail"]["assistantUpdate"], "thinking_end");
+        let serialized = rejection.to_string();
+        for content in [
+            STREAMED_THINKING,
+            FINALIZED_THINKING,
+            MISMATCHED_EVENT_CONTENT,
+        ] {
+            assert!(!serialized.contains(content));
+        }
+        assert!(serialized.len() < 16 * 1024);
+
+        fixture.assert_retained_diagnostic_state();
+        assert!(
+            fixture.native_sessions().len() <= 1,
+            "a protocol-rejected invocation may retain at most one native Pi session artifact"
+        );
+        fixture.controller.shutdown().await;
+    })
+    .await
+    .expect("pinned real-Pi thinking-end rejection watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
+    if conformance_executable().is_none() {
+        return;
+    }
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::with_immediate_retry(result_mode()).unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let interrupted = running.fixture.controller.next("model").await;
+        let tool_name = result_tool_name(&interrupted.value).to_owned();
+        interrupted.release(json!({
+            "kind": "partialToolCallFailure",
+            "thinking": ["Preparing work before the connection closes."],
+            "call": {
+                "id": "call-interrupted",
+                "name": "conformance_gate",
+                "arguments": {"value": "must-not-execute"}
+            },
+            "message": "WebSocket closed 1006 Connection ended"
+        }));
+        running.await_started().await;
+
+        let (mut fixture, task, terminal) = running.into_finishing();
+        let mut terminal = Box::pin(terminal.receive());
+        // Receiving the retry model request rather than a tool request is the execution barrier:
+        // Pi discarded the interrupted call before beginning any extension tool execution.
+        let recovered = tokio::select! {
+            request = fixture.controller.next("model") => request,
+            outcome = &mut terminal => {
+                panic!(
+                    "PiJsonV1 ended before Pi's partial-call retry: outcome={outcome:?}, diagnostic={:?}",
+                    fixture.diagnostics.get("agent-step")
+                )
+            }
+        };
+        assert!(!recovered.value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "toolResult"
+                    && message["toolCallId"] == "call-interrupted"
+            }));
+        recovered.release(count_one_result_response(
+            "call-recovered-result",
+            &tool_name,
+        ));
+
+        let outcome = terminal.await.unwrap();
+        task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("Pi's partial-call native retry did not complete: {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!({"count": 1}));
+
+        let mut provider_error = false;
+        let mut retry_lifecycle = Vec::new();
+        let mut interrupted_started = false;
+        let mut interrupted_updated = false;
+        while let Ok(envelope) = fixture.observations.try_recv() {
+            match envelope.observation() {
+                AgentObservation::Diagnostic { message, .. }
+                    if message.as_ref() == "WebSocket closed 1006 Connection ended" =>
+                {
+                    provider_error = true;
+                }
+                AgentObservation::Lifecycle { milestone }
+                    if matches!(
+                        milestone,
+                        crate::execution::workflow::agent::AgentLifecycleMilestone::RetryStarted
+                            | crate::execution::workflow::agent::AgentLifecycleMilestone::RetryCompleted
+                    ) => retry_lifecycle.push(*milestone),
+                AgentObservation::ToolCall {
+                    call_id,
+                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Started,
+                    ..
+                } if call_id.as_ref() == "call-interrupted" => interrupted_started = true,
+                AgentObservation::ToolCall {
+                    call_id,
+                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Updated,
+                    ..
+                } if call_id.as_ref() == "call-interrupted" => interrupted_updated = true,
+                AgentObservation::ToolCall {
+                    call_id,
+                    phase: crate::execution::workflow::agent::AgentToolCallPhase::Completed,
+                    ..
+                } if call_id.as_ref() == "call-interrupted" => {
+                    panic!("the interrupted tool call was reported complete")
+                }
+                AgentObservation::ToolResult { call_id, .. }
+                    if call_id.as_ref() == "call-interrupted" =>
+                {
+                    panic!("the interrupted tool call produced a result")
+                }
+                _ => {}
+            }
+        }
+        assert!(provider_error);
+        assert!(interrupted_started && interrupted_updated);
+        assert_eq!(
+            retry_lifecycle,
+            [
+                crate::execution::workflow::agent::AgentLifecycleMilestone::RetryStarted,
+                crate::execution::workflow::agent::AgentLifecycleMilestone::RetryCompleted
+            ]
+        );
+
+        let retained = retained_assistant_tool_call(
+            &fixture,
+            "conformance_gate",
+            "call-interrupted",
+        );
+        let diagnostic = retained["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["type"] == "provider_transport_failure")
+            .unwrap();
+        assert_eq!(diagnostic["details"]["eventsEmitted"], true);
+        assert_eq!(
+            diagnostic["details"]["phase"],
+            "after_message_stream_start"
+        );
+
+        fixture.assert_configuration_unchanged();
+        fixture.controller.shutdown().await;
+    })
+    .await
+    .expect("pinned real-Pi partial-call retry watchdog expired");
 }
 
 #[expect(
@@ -1449,14 +1680,7 @@ async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
                     .unwrap()
                     .contains("output token limit")
         }));
-        corrected.release(json!({
-            "kind": "toolCalls",
-            "calls": [{
-                "id": "call-corrected",
-                "name": tool_name,
-                "arguments": {"result": {"count": 1}}
-            }]
-        }));
+        corrected.release(count_one_result_response("call-corrected", &tool_name));
 
         let outcome = terminal.await.unwrap();
         task.await.unwrap();
@@ -1624,6 +1848,18 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
     })
     .await
     .expect("pinned real-Pi cancellation conformance watchdog expired");
+}
+
+#[test]
+#[ignore = "launched as the interrupt-resistant Pi conformance descendant fixture"]
+fn stubborn_descendant_process_fixture() {
+    ctrlc::set_handler(|| {}).unwrap();
+    let mut ready = std::io::stdout().lock();
+    ready.write_all(b"SCHERZO_STUBBORN_READY").unwrap();
+    ready.flush().unwrap();
+    loop {
+        std::thread::park();
+    }
 }
 
 #[expect(

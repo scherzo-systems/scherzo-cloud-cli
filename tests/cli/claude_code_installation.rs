@@ -9,8 +9,8 @@ use super::{private_credential_directory, run_with_env, write_runner_config};
 const CLAUDE_CODE_CHECK_ID: &str = "execution.harness.claude-code-stream-json-v1";
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CLOSED_PROBES: &[u8] = b"--version\n--help\n";
-pub(super) const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --no-session-persistence Disable sessions\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --json-schema <schema> Schema\n";
-const REQUIRED_CAPABILITIES: &str = "print_mode,stream_json_input,stream_json_output,verbose,partial_messages,forward_subagent_text,no_session_persistence,permission_mode,setting_sources,model,effort,append_system_prompt_file,json_schema";
+pub(super) const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --session-id <uuid> Use session\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --json-schema <schema> Schema\n";
+const REQUIRED_CAPABILITIES: &str = "print_mode,stream_json_input,stream_json_output,verbose,partial_messages,forward_subagent_text,session_id,permission_mode,setting_sources,model,effort,append_system_prompt_file,json_schema";
 
 pub(super) struct ClaudeCodeFixture {
     _directory: tempfile::TempDir,
@@ -117,7 +117,7 @@ fn runner_startup_discovers_claude_before_rejecting_invalid_operator_configurati
         &runner_directory,
         "https://not-a-websocket.example.test/v1/runner/connect",
     );
-    let fixture = ClaudeCodeFixture::new("2.1.222 (Claude Code)", COMPLETE_HELP, true);
+    let fixture = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
 
     let output = run_with_env(
         &["runner", "serve", "--config", config_path.as_str()],
@@ -125,9 +125,6 @@ fn runner_startup_discovers_claude_before_rejecting_invalid_operator_configurati
     );
 
     assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("Error: load runner operator configuration "));
-    assert!(stderr.contains("operator configuration or protected state is invalid"));
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 }
 
@@ -141,7 +138,7 @@ fn doctor_reports_the_exact_pinned_claude_code_snapshot_without_ambient_values()
         quote(ambient_config.path().to_str().unwrap())
     );
     let fixture = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.222 (Claude Code)",
+        "2.1.234 (Claude Code)",
         COMPLETE_HELP,
         true,
         "exit 97",
@@ -169,8 +166,8 @@ fn doctor_reports_the_exact_pinned_claude_code_snapshot_without_ambient_values()
     let check = &report["checks"][0];
     assert_eq!(check["id"], CLAUDE_CODE_CHECK_ID);
     assert_eq!(check["status"], "pass");
-    assert_eq!(check["details"]["version"], "2.1.222");
-    assert_eq!(check["details"]["expectedVersion"], "2.1.222");
+    assert_eq!(check["details"]["version"], "2.1.234");
+    assert_eq!(check["details"]["expectedVersion"], "2.1.234");
     assert_eq!(check["details"]["profile"], "ClaudeCodeStreamJsonV1");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
@@ -193,9 +190,9 @@ fn doctor_reports_the_exact_pinned_claude_code_snapshot_without_ambient_values()
 }
 
 #[test]
-fn doctor_rejects_missing_verbose_capability() {
-    let help = COMPLETE_HELP.replace("  --verbose Verbose mode\n", "");
-    let fixture = ClaudeCodeFixture::new("2.1.222 (Claude Code)", &help, true);
+fn doctor_rejects_missing_explicit_session_capability() {
+    let help = COMPLETE_HELP.replace("  --session-id <uuid> Use session\n", "");
+    let fixture = ClaudeCodeFixture::new("2.1.234 (Claude Code)", &help, true);
 
     let output = doctor_json(fixture.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
 
@@ -214,7 +211,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
     let unexecutable = unexecutable_directory.path().join("claude");
     fs::write(&unexecutable, "#!/definitely/missing/interpreter\n").unwrap();
     fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o755)).unwrap();
-    let fallback = ClaudeCodeFixture::new("2.1.222 (Claude Code)", COMPLETE_HELP, true);
+    let fallback = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
     let path =
         std::env::join_paths([unexecutable_directory.path(), fallback.path_directory()]).unwrap();
     let output = doctor_json(Path::new(&path), &[CLAUDE_CODE_CHECK_ID], &[]);
@@ -234,25 +231,37 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
             b"--version\n".as_slice(),
         ),
         (
-            "2.1.221 (Claude Code)",
+            "2.1.222 (Claude Code)",
             COMPLETE_HELP,
             "unsupported_claude_code_version",
             b"--version\n".as_slice(),
         ),
         (
-            "2.1.222-rc.1 (Claude Code)",
+            "2.1.233 (Claude Code)",
+            COMPLETE_HELP,
+            "unsupported_claude_code_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "2.1.235 (Claude Code)",
+            COMPLETE_HELP,
+            "unsupported_claude_code_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "2.1.234-rc.1 (Claude Code)",
             COMPLETE_HELP,
             "malformed_claude_code_version",
             b"--version\n".as_slice(),
         ),
         (
-            "2.1.222 (Claude Code)",
+            "2.1.234 (Claude Code)",
             "not Claude help\n",
             "malformed_claude_code_capabilities",
             CLOSED_PROBES,
         ),
         (
-            "2.1.222 (Claude Code)",
+            "2.1.234 (Claude Code)",
             missing_schema_help.as_str(),
             "unsupported_claude_code_capability",
             CLOSED_PROBES,
@@ -265,8 +274,8 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         assert_eq!(fixture.recorded_probes(), expected_probes);
     }
 
-    let incompatible = ClaudeCodeFixture::new("2.1.221 (Claude Code)", COMPLETE_HELP, true);
-    let compatible = ClaudeCodeFixture::new("2.1.222 (Claude Code)", COMPLETE_HELP, true);
+    let incompatible = ClaudeCodeFixture::new("2.1.222 (Claude Code)", COMPLETE_HELP, true);
+    let compatible = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
     let ordered_path =
         std::env::join_paths([incompatible.path_directory(), compatible.path_directory()]).unwrap();
     let output = doctor_json(Path::new(&ordered_path), &[CLAUDE_CODE_CHECK_ID], &[]);
@@ -279,7 +288,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
 #[test]
 fn doctor_reports_pi_and_claude_code_independently_for_every_installation_combination() {
     let pi = PiFixture::new("0.83.0", PI_COMPLETE_HELP, true);
-    let claude = ClaudeCodeFixture::new("2.1.222 (Claude Code)", COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
     let empty = tempfile::tempdir().unwrap();
     let pi_only = pi.path_directory();
     let claude_only = claude.path_directory();

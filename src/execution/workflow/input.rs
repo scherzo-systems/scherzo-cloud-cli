@@ -136,6 +136,7 @@ impl std::error::Error for InputPreparationFailure {}
 pub(crate) enum InputValue<'a> {
     Prompt(&'a str),
     Attachments(&'a [ResolvedAttachment]),
+    CanonicalJson(&'a [u8]),
     Captured {
         expected_type: WorkflowValueType,
         value: &'a CapturedValue,
@@ -472,6 +473,16 @@ impl InputStaging {
                         ManifestInput::collection(relative_directory, items),
                     );
                 }
+                InputValue::CanonicalJson(bytes) => {
+                    ensure_directory(&values_root, &mut values_created)?;
+                    let relative_path = format!("values/{input_identity}");
+                    write_bytes_read_only(&root.join(&relative_path), bytes)
+                        .map_err(|_| staging_for_input(input_identity))?;
+                    manifest_inputs.insert(
+                        input_identity.clone(),
+                        ManifestInput::scalar("json", "application/json", relative_path),
+                    );
+                }
                 InputValue::Captured {
                     expected_type,
                     value,
@@ -678,6 +689,13 @@ impl MaterializationPlan {
                         )?;
                     }
                 }
+                InputValue::CanonicalJson(bytes) => add_payload_size(
+                    staging,
+                    &mut total_bytes,
+                    byte_length(bytes, input_identity)?,
+                    input_identity,
+                    None,
+                )?,
                 InputValue::Captured {
                     expected_type,
                     value,

@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
+use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
     AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentRenewal,
     AssignmentStart, PendingAssignmentObservation, WelcomePolicyFailure,
@@ -142,7 +143,6 @@ impl<'a> ProtocolLog<'a> {
                 telemetry::attribute::RUNNER_VERSION,
                 crate::build_info::VERSION,
             ),
-            KeyValue::new(telemetry::attribute::RUNNER_MAX_CONCURRENT_RUNS, 1_i64),
         ]);
         self.emit(attributes);
     }
@@ -220,6 +220,46 @@ impl<'a> ProtocolLog<'a> {
                 assignment_id,
                 ..
             } => (envelope, "execution_aborted", None, Some(assignment_id)),
+            RunnerFrame::ArtifactCarrierRegister {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "artifact_carrier_register",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::ArtifactCarrierConfirm {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "artifact_carrier_confirm",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::ArtifactResultRegister {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "artifact_result_register",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::ArtifactResultConfirm {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "artifact_result_confirm",
+                None,
+                Some(assignment_id),
+            ),
             RunnerFrame::Hello { .. } => return,
         };
         let mut attributes = protocol_text_attributes(
@@ -243,6 +283,19 @@ impl<'a> ProtocolLog<'a> {
                 telemetry::attribute::ASSIGNMENT_ID,
                 assignment_id.clone(),
             ));
+        }
+        if let RunnerFrame::AssignmentRejected { decline, .. } = frame {
+            let (decline_type, decline_reason) = decline.protocol_type_and_reason();
+            attributes.push(KeyValue::new(
+                telemetry::attribute::PROTOCOL_DECLINE_TYPE,
+                decline_type,
+            ));
+            if let Some(reason) = decline_reason {
+                attributes.push(KeyValue::new(
+                    telemetry::attribute::PROTOCOL_DECLINE_REASON,
+                    reason,
+                ));
+            }
         }
         self.emit(attributes);
     }
@@ -290,6 +343,18 @@ impl<'a> ProtocolLog<'a> {
                     ),
                 ],
             ),
+            CloudFrame::ArtifactCarrierRegistration { envelope, .. } => {
+                (envelope, "artifact_carrier_registration", Vec::new())
+            }
+            CloudFrame::ArtifactCarrierConfirmation { envelope, .. } => {
+                (envelope, "artifact_carrier_confirmation", Vec::new())
+            }
+            CloudFrame::ArtifactResultRegistration { envelope, .. } => {
+                (envelope, "artifact_result_registration", Vec::new())
+            }
+            CloudFrame::ArtifactResultConfirmation { envelope, .. } => {
+                (envelope, "artifact_result_confirmation", Vec::new())
+            }
             CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id,
@@ -1121,6 +1186,7 @@ pub(super) async fn authenticate_candidate(
 enum PendingObservationKind {
     EffectReceipt,
     AssignmentObservation { id: u64 },
+    ArtifactObservation { id: u64, delivery_id: u64 },
 }
 
 struct PendingObservation {
@@ -1461,7 +1527,8 @@ where
             let in_flight_ids: BTreeSet<_> = in_flight
                 .iter()
                 .filter_map(|pending| match pending.kind {
-                    PendingObservationKind::AssignmentObservation { id } => Some(id),
+                    PendingObservationKind::AssignmentObservation { id }
+                    | PendingObservationKind::ArtifactObservation { id, .. } => Some(id),
                     PendingObservationKind::EffectReceipt => None,
                 })
                 .collect();
@@ -1706,7 +1773,53 @@ where
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .acknowledge_observation(id);
                     }
+                    PendingObservationKind::ArtifactObservation { id, .. } => {
+                        assignment_manager
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .acknowledge_observation(id);
+                    }
                 }
+            }
+            CloudFrame::ArtifactCarrierRegistration { response, .. }
+                if progress.handshake_completed =>
+            {
+                handle_artifact_cloud_response(
+                    assignment_manager,
+                    &in_flight,
+                    ArtifactCloudResponse::CarrierRegistration(response),
+                )
+                .map_err(|cause| ConnectionError::terminal(progress, cause))?;
+            }
+            CloudFrame::ArtifactCarrierConfirmation { response, .. }
+                if progress.handshake_completed =>
+            {
+                handle_artifact_cloud_response(
+                    assignment_manager,
+                    &in_flight,
+                    ArtifactCloudResponse::CarrierConfirmation(response),
+                )
+                .map_err(|cause| ConnectionError::terminal(progress, cause))?;
+            }
+            CloudFrame::ArtifactResultRegistration { response, .. }
+                if progress.handshake_completed =>
+            {
+                handle_artifact_cloud_response(
+                    assignment_manager,
+                    &in_flight,
+                    ArtifactCloudResponse::ResultRegistration(response),
+                )
+                .map_err(|cause| ConnectionError::terminal(progress, cause))?;
+            }
+            CloudFrame::ArtifactResultConfirmation { response, .. }
+                if progress.handshake_completed =>
+            {
+                handle_artifact_cloud_response(
+                    assignment_manager,
+                    &in_flight,
+                    ArtifactCloudResponse::ResultConfirmation(response),
+                )
+                .map_err(|cause| ConnectionError::terminal(progress, cause))?;
             }
             effect @ CloudFrame::AssignmentOffer { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
@@ -1740,6 +1853,31 @@ where
     }
 }
 
+fn handle_artifact_cloud_response(
+    assignment_manager: &Mutex<AssignmentManager>,
+    in_flight: &VecDeque<PendingObservation>,
+    response: ArtifactCloudResponse,
+) -> Result<(), ConnectionCause> {
+    let request_message_id = match &response {
+        ArtifactCloudResponse::CarrierRegistration(response) => &response.request_message_id,
+        ArtifactCloudResponse::CarrierConfirmation(response) => &response.request_message_id,
+        ArtifactCloudResponse::ResultRegistration(response) => &response.request_message_id,
+        ArtifactCloudResponse::ResultConfirmation(response) => &response.request_message_id,
+    };
+    let pending = in_flight
+        .iter()
+        .find(|pending| pending.message_id == *request_message_id)
+        .ok_or(ConnectionCause::UnexpectedGatewayFrame)?;
+    let PendingObservationKind::ArtifactObservation { id, delivery_id } = pending.kind else {
+        return Err(ConnectionCause::UnexpectedGatewayFrame);
+    };
+    assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .handle_artifact_response(id, delivery_id, response)
+        .map_err(|_| ConnectionCause::UnexpectedGatewayFrame)
+}
+
 // Effect receipts and semantic observations have different telemetry and state effects;
 // explicit sender boundaries are clearer than one mode-switched transport operation.
 // jscpd:ignore-start
@@ -1770,6 +1908,7 @@ where
             effect_id,
             assignment_id,
             run_id,
+            project_id,
             attempt_id,
             execution_spec,
             ..
@@ -1778,6 +1917,7 @@ where
                 effect_id: effect_id.clone(),
                 assignment_id: assignment_id.clone(),
                 run_id: run_id.clone(),
+                project_id,
                 attempt_id,
                 execution_spec: *execution_spec,
             };
@@ -2000,6 +2140,13 @@ where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     // jscpd:ignore-end
+    let kind = match pending.artifact_delivery_id() {
+        Some(delivery_id) => PendingObservationKind::ArtifactObservation {
+            id: pending.id,
+            delivery_id,
+        },
+        None => PendingObservationKind::AssignmentObservation { id: pending.id },
+    };
     let emission = next_sequence.lock_emission().await;
     let envelope = next_envelope(config, frame_source, boot_id, next_sequence, progress)?;
     let sequence = envelope.sequence;
@@ -2034,7 +2181,7 @@ where
     Ok(PendingObservation {
         message_id,
         sequence,
-        kind: PendingObservationKind::AssignmentObservation { id: pending.id },
+        kind,
     })
 }
 
@@ -2111,7 +2258,6 @@ pub(crate) fn opening_hello(
             sent_at,
         },
         runner_version: runner_version.to_owned(),
-        max_concurrent_runs: 1,
     })
     .map_err(|_| {
         ConnectionError::terminal(
@@ -2123,12 +2269,16 @@ pub(crate) fn opening_hello(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use base64::Engine as _;
     use futures_util::{Sink, SinkExt, StreamExt};
+    use ring::digest::SHA256;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
@@ -2147,17 +2297,22 @@ mod tests {
         run_established,
     };
     use crate::runner::credential::test_credential;
+    use crate::runner::service::artifact_delivery::{ArtifactDeliverySpec, ArtifactUploadBody};
     use crate::runner::service::assignment::AssignmentManager;
     use crate::runner::service::config::Config;
     use crate::runner::service::test_support::{
-        DeterminismTranscript, SleepRelease, accept_fixture_socket, accept_opened_fixture_socket,
-        assignment_offer, controlled_sleeper, deterministic_frame_source, effect_acknowledgement,
-        expect_close_frame, expect_opening_hello, fixture_listener, healthy_wall_clock,
-        observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
-        sleep_request, welcome, with_watchdog,
+        DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
+        accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
+        deterministic_frame_source, effect_acknowledgement, expect_close_frame,
+        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
+        offer_assignment_after_handshake, scripted_duplex, sleep_request, welcome, with_watchdog,
     };
     use crate::runner::service::{Sequence, Sleeper};
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
+    use crate::runner_protocol::{
+        AssignmentDecline, ExecutionSpecInvalidReason, RunnerEnvelope, RunnerFrame,
+        RunnerUnableReason,
+    };
 
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -2225,6 +2380,35 @@ mod tests {
         }
     }
 
+    fn established_fixture<'a>(
+        context: &'a EstablishedTestContext,
+        next_sequence: &'a mut u64,
+    ) -> (
+        ScriptedInbound,
+        mpsc::UnboundedReceiver<Message>,
+        impl std::future::Future<Output = Result<ConnectionProgress, ConnectionError>> + 'a,
+    ) {
+        let (inbound, reader, writer, outbound) = scripted_duplex(DeterminismTranscript::default());
+        let established = run_established(
+            context.dependencies(),
+            context.opening(),
+            next_sequence,
+            reader,
+            writer,
+        );
+        (inbound, outbound, established)
+    }
+
+    struct FixtureArtifactBody {
+        path: PathBuf,
+    }
+
+    impl ArtifactUploadBody for FixtureArtifactBody {
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            File::open(&self.path).map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
+        }
+    }
+
     struct BackpressuredEffectWriter {
         sent: usize,
         blocked: Arc<Notify>,
@@ -2273,16 +2457,9 @@ mod tests {
             .lock()
             .unwrap()
             .enqueue_fixture_transitions(40);
-        let (inbound, reader, writer, mut outbound) =
-            scripted_duplex(DeterminismTranscript::default());
         let mut next_sequence = 2;
-        let established = run_established(
-            context.dependencies(),
-            context.opening(),
-            &mut next_sequence,
-            reader,
-            writer,
-        );
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
         let peer = async {
             let hello = with_watchdog(outbound.recv())
                 .await
@@ -2338,11 +2515,11 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_only_unacknowledged_semantics_with_fresh_identity() {
         let context = EstablishedTestContext::new();
-        context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .enqueue_fixture_transitions(2);
+        {
+            let assignments = context.assignment_manager.lock().unwrap();
+            assignments.enqueue_fixture_transitions(1);
+            assignments.enqueue_fixture_finalization_terminal();
+        }
         let mut next_sequence = 2;
 
         let (first_inbound, first_reader, first_writer, mut first_outbound) =
@@ -2388,7 +2565,12 @@ mod tests {
                 .await
                 .expect("first connection timed out");
         first_result.expect("first connection failed");
-        assert_eq!(original["payload"]["executionEventSequence"], 2);
+        assert_eq!(original["type"], "execution_finished");
+        assert_eq!(
+            original["payload"]["outcome"]["finalization"]["finalizers"][0]["id"],
+            "cleanup"
+        );
+        let original_payload = serde_json::to_string(&original["payload"]).unwrap();
         assert_eq!(next_sequence, 4);
 
         let (second_inbound, second_reader, second_writer, mut second_outbound) =
@@ -2425,10 +2607,357 @@ mod tests {
                 .expect("replacement connection timed out");
         second_result.expect("replacement connection failed");
 
-        assert_eq!(replay["payload"], original["payload"]);
+        assert_eq!(
+            serde_json::to_string(&replay["payload"]).unwrap(),
+            original_payload,
+            "replay must preserve the complete finalization payload"
+        );
         assert_ne!(replay["messageId"], original["messageId"]);
         assert_eq!(replay["sequence"], 4);
         assert_eq!(next_sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_puts_directly_and_confirms_success_and_precondition_replay() {
+        for upload_status in [200, 412] {
+            run_artifact_delivery_case(upload_status).await;
+        }
+    }
+
+    async fn run_artifact_delivery_case(upload_status: u16) {
+        const ASSIGNMENT_ID: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abh";
+        const ATTEMPT_ID: &str = "atm_01k0z6r1w8f4jy2m7q9v3x5abk";
+        const ARTIFACT_SET_ID: &str = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0";
+        const CARRIER_ID: &str = "acr_01k0z6r1w8f4jy2m7q9v3x5ac0";
+        let bytes = b"carrier bytes";
+        let digest = ring::digest::digest(&SHA256, bytes);
+        let sha256 = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let checksum = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+        let temporary = tempfile::tempdir().unwrap();
+        let carrier_path = temporary.path().join("carrier");
+        fs::write(&carrier_path, bytes).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upload_url = format!("http://{}/carrier", listener.local_addr().unwrap());
+        let context = EstablishedTestContext::new();
+        let broker = context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .artifact_delivery();
+        let completion = broker
+            .start(ArtifactDeliverySpec::fixture(
+                (ASSIGNMENT_ID.to_owned(), ATTEMPT_ID.to_owned()),
+                (
+                    "exports/0001".to_owned(),
+                    "capture:produce:report".to_owned(),
+                ),
+                (
+                    "application/octet-stream".to_owned(),
+                    u64::try_from(bytes.len()).unwrap(),
+                    sha256,
+                ),
+                Arc::new(FixtureArtifactBody { path: carrier_path }),
+            ))
+            .unwrap();
+
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            outbound.recv().await.expect("artifact opening hello");
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+
+            let registration = outbound.recv().await.expect("artifact registration");
+            let registration: serde_json::Value =
+                serde_json::from_str(registration.to_text().expect("registration text")).unwrap();
+            assert_eq!(registration["type"], "artifact_carrier_register");
+            assert_eq!(registration["payload"]["portableOwnerPath"], "exports/0001");
+            assert_eq!(
+                registration["payload"]["idempotencyKey"],
+                "capture:produce:report"
+            );
+            let registration_message_id = registration["messageId"].as_str().unwrap();
+            let registration_sequence = registration["sequence"].as_u64().unwrap();
+            inbound.send(Message::Text(
+                json!({
+                    "protocolVersion": 1,
+                    "direction": "cloud_to_runner",
+                    "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5ac0",
+                    "sentAt": "2026-07-23T00:00:12Z",
+                    "type": "artifact_carrier_registration",
+                    "payloadVersion": 1,
+                    "payload": {
+                        "requestMessageId": registration_message_id,
+                        "outcome": "succeeded",
+                        "artifactSetId": ARTIFACT_SET_ID,
+                        "carrierId": CARRIER_ID,
+                        "uploadCapability": {
+                            "url": upload_url,
+                            "headers": {
+                                "Content-Length": bytes.len().to_string(),
+                                "Content-Type": "application/octet-stream",
+                                "If-None-Match": "*",
+                                "X-Amz-Checksum-Sha256": checksum,
+                            },
+                            "expiresAt": "2026-07-23T00:05:12Z"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ));
+            inbound.send(observation_acknowledgement(
+                registration_message_id,
+                registration_sequence,
+            ));
+
+            let uploaded = accept_artifact_put(&listener, upload_status).await;
+            assert_eq!(uploaded, bytes);
+            let confirmation = outbound.recv().await.expect("artifact confirmation");
+            let confirmation: serde_json::Value =
+                serde_json::from_str(confirmation.to_text().expect("confirmation text")).unwrap();
+            assert_eq!(confirmation["type"], "artifact_carrier_confirm");
+            assert_eq!(confirmation["payload"]["artifactSetId"], ARTIFACT_SET_ID);
+            assert_eq!(confirmation["payload"]["carrierId"], CARRIER_ID);
+            let confirmation_message_id = confirmation["messageId"].as_str().unwrap();
+            let confirmation_sequence = confirmation["sequence"].as_u64().unwrap();
+            inbound.send(Message::Text(
+                json!({
+                    "protocolVersion": 1,
+                    "direction": "cloud_to_runner",
+                    "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5ac1",
+                    "sentAt": "2026-07-23T00:00:13Z",
+                    "type": "artifact_carrier_confirmation",
+                    "payloadVersion": 1,
+                    "payload": {
+                        "requestMessageId": confirmation_message_id,
+                        "outcome": "confirmed",
+                        "artifactSetId": ARTIFACT_SET_ID,
+                        "carrierId": CARRIER_ID
+                    }
+                })
+                .to_string()
+                .into(),
+            ));
+            inbound.send(observation_acknowledgement(
+                confirmation_message_id,
+                confirmation_sequence,
+            ));
+            assert!(matches!(
+                completion.await.unwrap(),
+                crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::Delivered { .. }
+            ));
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("artifact delivery fixture timed out");
+        result.expect("artifact delivery connection failed");
+        assert_eq!(next_sequence, 4);
+    }
+
+    async fn accept_artifact_put(listener: &tokio::net::TcpListener, status: u16) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "upload ended before request headers");
+            received.extend_from_slice(&chunk[..read]);
+            if let Some(position) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(received[..header_end].to_vec())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(headers.starts_with("put /carrier http/1.1\r\n"));
+        assert!(headers.contains("content-type: application/octet-stream\r\n"));
+        assert!(headers.contains("if-none-match: *\r\n"));
+        assert!(headers.contains("x-amz-checksum-sha256: "));
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        while received.len() - header_end < content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "upload ended before exact content length");
+            received.extend_from_slice(&chunk[..read]);
+        }
+        let reason = if status == 412 {
+            "Precondition Failed"
+        } else {
+            "OK"
+        };
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        received[header_end..header_end + content_length].to_vec()
+    }
+
+    #[test]
+    fn assignment_rejection_protocol_events_record_bounded_decline_values() {
+        let cases = [
+            (
+                AssignmentDecline::CapacityUnavailable,
+                "capacity_unavailable",
+                None,
+            ),
+            (
+                AssignmentDecline::RunnerUnable(
+                    RunnerUnableReason::ExecutionEnvironmentUnavailable,
+                ),
+                "runner_unable",
+                Some("execution_environment_unavailable"),
+            ),
+            (
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+                "runner_unable",
+                Some("source_service_unavailable"),
+            ),
+            (
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowEnvironmentUnsupported),
+                "runner_unable",
+                Some("workflow_environment_unsupported"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
+                ),
+                "execution_spec_invalid",
+                Some("unsupported_schema_version"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InvalidExecutionLimits,
+                ),
+                "execution_spec_invalid",
+                Some("invalid_execution_limits"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InvalidSourceProjection,
+                ),
+                "execution_spec_invalid",
+                Some("invalid_source_projection"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
+                ),
+                "execution_spec_invalid",
+                Some("unsupported_source_object_format"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCommitMismatch,
+                ),
+                "execution_spec_invalid",
+                Some("source_commit_mismatch"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCheckoutDirty,
+                ),
+                "execution_spec_invalid",
+                Some("source_checkout_dirty"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch,
+                ),
+                "execution_spec_invalid",
+                Some("workflow_source_digest_mismatch"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+                ),
+                "execution_spec_invalid",
+                Some("workflow_source_invalid"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowContractInvalid,
+                ),
+                "execution_spec_invalid",
+                Some("workflow_contract_invalid"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowAdmissionInvalid,
+                ),
+                "execution_spec_invalid",
+                Some("workflow_admission_invalid"),
+            ),
+        ];
+
+        for (decline, expected_type, expected_reason) in cases {
+            let (recorder, capture) = test_recorder(BOOT_ID);
+            let mut protocol =
+                ProtocolLog::new(&recorder, "rnr_01k0z6r1w8f4jy2m7q9v3x5abd", BOOT_ID, 1);
+            protocol.runner_text(&RunnerFrame::AssignmentRejected {
+                envelope: RunnerEnvelope {
+                    message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                    boot_id: BOOT_ID.to_owned(),
+                    sequence: 7,
+                    sent_at: "2026-07-23T00:00:00Z".to_owned(),
+                },
+                effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+                decline,
+            });
+
+            let records = capture.records();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record["scherzo.protocol.frame_type"], "assignment_rejected");
+            assert_eq!(record["scherzo.protocol.decline_type"], expected_type);
+            assert_eq!(
+                record
+                    .get("scherzo.protocol.decline_reason")
+                    .and_then(serde_json::Value::as_str),
+                expected_reason,
+            );
+            assert_eq!(
+                record["scherzo.effect.id"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+            );
+            assert_eq!(
+                record["scherzo.assignment.id"],
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abh"
+            );
+
+            let decline_keys: Vec<_> = record
+                .keys()
+                .filter(|key| key.contains("decline"))
+                .collect();
+            assert_eq!(
+                decline_keys.len(),
+                if expected_reason.is_some() { 2 } else { 1 },
+            );
+            assert!(decline_keys.iter().all(|key| matches!(
+                key.as_str(),
+                "scherzo.protocol.decline_type" | "scherzo.protocol.decline_reason"
+            )));
+        }
     }
 
     #[tokio::test]
@@ -2856,7 +3385,7 @@ mod tests {
             assert_eq!(response["type"], "assignment_rejected");
             assert_eq!(
                 response["payload"]["decline"]["reason"],
-                "workflow_mapping_unavailable"
+                "workflow_source_invalid"
             );
             socket
                 .send(observation_acknowledgement(

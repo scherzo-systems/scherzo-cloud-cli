@@ -39,7 +39,7 @@ jobs:
       - name: Install devenv
         run: nix profile add github:cachix/devenv/8dc0eea065722488f5e127dbcc0c3f4e40bdbb2d
       - name: Check public source
-        run: ./scripts/strict-devenv test
+        run: ./scripts/check
 
   check_macos:
     name: macOS compile
@@ -144,8 +144,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
           - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
@@ -322,8 +320,8 @@ jobs:
 
           root = Path("dist")
           archives = sorted(root.glob("*.tar.gz"), key=lambda path: os.fsencode(path.name))
-          if len(archives) != 4:
-              raise SystemExit(f"expected four native archives, found {len(archives)}")
+          if len(archives) != 3:
+              raise SystemExit(f"expected three native archives, found {len(archives)}")
           lines = []
           for archive in archives:
               digest = hashlib.sha256(archive.read_bytes()).hexdigest()

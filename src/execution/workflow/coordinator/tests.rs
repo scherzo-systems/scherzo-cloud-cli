@@ -59,7 +59,7 @@ impl CoordinatorClock for TestClock {
 
 type TestAction = RequestedAction<String, String, String, TestInstant>;
 type TestCommit = CommittedReduction<String, String, TestInstant>;
-type TestResult = CoordinationResult<String, String>;
+type TestResult = CoordinationResult<String, String, TestInstant>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TimelineEntry {
@@ -82,6 +82,30 @@ impl CommitPort<TestCommit> for RecordingCommitPort {
             .push(TimelineEntry::Commit(commit.occurrence_ordinal));
         let _ = self.commits.send(commit);
         ready(Ok(()))
+    }
+}
+
+struct CommitRelease {
+    commit: TestCommit,
+    resume: oneshot::Sender<()>,
+}
+
+struct ControlledCommitPort {
+    commits: mpsc::UnboundedSender<CommitRelease>,
+}
+
+impl CommitPort<TestCommit> for ControlledCommitPort {
+    type Error = std::convert::Infallible;
+
+    fn commit(&mut self, commit: TestCommit) -> impl Future<Output = Result<(), Self::Error>> {
+        let (resume, resumed) = oneshot::channel();
+        let sent = self.commits.send(CommitRelease { commit, resume });
+        async move {
+            if sent.is_ok() {
+                let _ = resumed.await;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -117,12 +141,20 @@ struct AdmittedFixture {
 }
 
 fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixture {
+    admitted_fixture_for_workflow(source, grace, WORKFLOW)
+}
+
+fn admitted_fixture_for_workflow(
+    source: CancellationSource,
+    grace: Duration,
+    workflow: &str,
+) -> AdmittedFixture {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("execution");
     fs::create_dir(&source_root).unwrap();
     fs::create_dir(&execution_root).unwrap();
-    fs::write(source_root.join("workflow.yaml"), WORKFLOW).unwrap();
+    fs::write(source_root.join("workflow.yaml"), workflow).unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
         ResolvedImports::default(),
@@ -291,6 +323,138 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
         timeline: timeline.lock().unwrap().clone(),
         result: result.unwrap(),
     }
+}
+
+#[tokio::test]
+async fn cancellation_during_boundary_commit_is_retained_for_finalization() {
+    const FINALIZER_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#;
+    let cancellation = CancellationSource::new();
+    let fixture = admitted_fixture_for_workflow(
+        cancellation.clone(),
+        Duration::from_secs(7),
+        FINALIZER_WORKFLOW,
+    );
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        ControlledCommitPort {
+            commits: commit_sender,
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let initialization = commits.recv().await.unwrap();
+        initialization.resume.send(()).unwrap();
+        let start = actions.recv().await.unwrap();
+        let Action::StartStep { step, .. } = &start.action.action else {
+            panic!("workflow did not request its ordinary start");
+        };
+        assert_eq!(step, "task");
+        let start_id = start.action.id;
+        start.resume.send(()).unwrap();
+        sender
+            .send(DriverOccurrence::step_started("task".to_owned(), start_id))
+            .await
+            .unwrap();
+        let started = commits.recv().await.unwrap();
+        started.resume.send(()).unwrap();
+
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        let ordinary_cancellation = commits.recv().await.unwrap();
+        ordinary_cancellation.resume.send(()).unwrap();
+        let cancel = actions.recv().await.unwrap();
+        assert!(matches!(cancel.action.action, Action::CancelStep { .. }));
+        let cancel_id = cancel.action.id;
+        cancel.resume.send(()).unwrap();
+        sender
+            .send(DriverOccurrence::step_quiesced(
+                "task".to_owned(),
+                cancel_id,
+            ))
+            .await
+            .unwrap();
+
+        // The commit port has durably accepted the boundary but deliberately keeps
+        // its future pending so another producer can request phase-local cancellation.
+        let boundary = commits.recv().await.unwrap();
+        assert!(matches!(
+            boundary.commit.state.workflow,
+            WorkflowState::Finalizing { .. }
+        ));
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::UserRequest)
+        );
+        assert!(cancellation.request_cancellation(CancellationReason::RunnerShutdown));
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::UserRequest)
+        );
+        boundary.resume.send(()).unwrap();
+
+        let finalizer_start = actions.recv().await.unwrap();
+        let Action::StartStep { step, .. } = &finalizer_start.action.action else {
+            panic!("workflow did not request its finalizer start");
+        };
+        assert_eq!(step, "cleanup");
+        finalizer_start.resume.send(()).unwrap();
+        let cancelled = commits.recv().await.unwrap();
+        assert!(cancelled.commit.events.iter().any(|event| matches!(
+            event,
+            TransitionEvent::FinalizationCancellationAccepted {
+                reason: CancellationReason::RunnerShutdown,
+                ..
+            }
+        )));
+        cancelled.resume.send(()).unwrap();
+        let cancel = actions.recv().await.unwrap();
+        assert!(matches!(cancel.action.action, Action::CancelStep { .. }));
+        let cancel_id = cancel.action.id;
+        cancel.resume.send(()).unwrap();
+        sender
+            .send(DriverOccurrence::step_quiesced(
+                "cleanup".to_owned(),
+                cancel_id,
+            ))
+            .await
+            .unwrap();
+        let terminal = commits.recv().await.unwrap();
+        terminal.resume.send(()).unwrap();
+        let finish = actions.recv().await.unwrap();
+        assert!(matches!(finish.action.action, Action::FinishRun { .. }));
+        finish.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert!(matches!(
+        result.unwrap().state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::UserRequest
+        }
+    ));
 }
 
 struct FailingCommitPort;
@@ -464,6 +628,10 @@ async fn execution_start_samples_an_already_admitted_cancellation() {
             WorkflowState::Cancelled {
                 reason: CancellationReason::RunnerShutdown,
             }
+        );
+        assert_eq!(
+            commit.state.last_cancellation_operation,
+            Some(crate::execution::workflow::admission::CancellationOperationId::fixture(1))
         );
         let release = actions.recv().await.unwrap();
         assert!(matches!(release.action.action, Action::FinishRun { .. }));

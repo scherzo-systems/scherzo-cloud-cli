@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use clap::Args;
 
-use crate::execution::workflow::admission::{CancellationSource, admit_workflow};
+use crate::execution::workflow::admission::{CancellationSource, admit_local_workflow};
 use crate::execution::workflow::local_run::{
     LocalRetryBeginError, LocalRetryOpen, acquire_local_retry,
 };
@@ -73,7 +73,7 @@ impl Command {
                 );
             }
         };
-        let admitted = match admit_workflow(workflow.clone(), imports, context) {
+        let admitted = match admit_local_workflow(workflow.clone(), imports, context) {
             Ok(admitted) => admitted,
             Err(failure) => {
                 signal_task.abort();

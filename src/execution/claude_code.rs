@@ -13,7 +13,7 @@ use super::harness_installation::{
 use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
 // jscpd:ignore-end
 
-pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_VERSION: &str = "2.1.222";
+pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_VERSION: &str = "2.1.234";
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 1] = ["--help"];
 
 const REQUIRED_CAPABILITIES: [ClaudeCodeCapability; 13] = [
@@ -23,7 +23,7 @@ const REQUIRED_CAPABILITIES: [ClaudeCodeCapability; 13] = [
     ClaudeCodeCapability::Verbose,
     ClaudeCodeCapability::PartialMessages,
     ClaudeCodeCapability::ForwardSubagentText,
-    ClaudeCodeCapability::NoSessionPersistence,
+    ClaudeCodeCapability::SessionId,
     ClaudeCodeCapability::PermissionMode,
     ClaudeCodeCapability::SettingSources,
     ClaudeCodeCapability::Model,
@@ -79,7 +79,7 @@ pub(crate) enum ClaudeCodeCapability {
     Verbose,
     PartialMessages,
     ForwardSubagentText,
-    NoSessionPersistence,
+    SessionId,
     PermissionMode,
     SettingSources,
     Model,
@@ -97,7 +97,7 @@ impl ClaudeCodeCapability {
             Self::Verbose => "verbose",
             Self::PartialMessages => "partial_messages",
             Self::ForwardSubagentText => "forward_subagent_text",
-            Self::NoSessionPersistence => "no_session_persistence",
+            Self::SessionId => "session_id",
             Self::PermissionMode => "permission_mode",
             Self::SettingSources => "setting_sources",
             Self::Model => "model",
@@ -115,7 +115,7 @@ impl ClaudeCodeCapability {
             Self::Verbose => has_option(help, "--verbose"),
             Self::PartialMessages => has_option(help, "--include-partial-messages"),
             Self::ForwardSubagentText => has_option(help, "--forward-subagent-text"),
-            Self::NoSessionPersistence => has_option(help, "--no-session-persistence"),
+            Self::SessionId => has_option(help, "--session-id <uuid>"),
             Self::PermissionMode => has_option(help, "--permission-mode <mode>"),
             Self::SettingSources => has_option(help, "--setting-sources <sources>"),
             Self::Model => has_option(help, "--model <model>"),
@@ -296,6 +296,10 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
 
     fn validate_capability_output(
         output: &CommandOutput,
+        _isolation: &ProbeIsolation,
+        _executable: &Path,
+        _version: &Self::Version,
+        _profile: &Self::CompatibilityProfile,
     ) -> Result<Self::Capabilities, Self::Failure> {
         validate_capability_output(output)?;
         Ok(ClaudeCodeStreamJsonV1Capabilities {

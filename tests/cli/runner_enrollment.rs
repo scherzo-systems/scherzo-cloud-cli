@@ -61,12 +61,7 @@ impl PendingEnrollmentFixture {
                 "deploymentMode": "development",
                 "runnerStatePath": state,
                 "controlSocketPath": socket,
-                "workRoot": root.path().join("work"),
-                "developmentWorkflow": {
-                    "workflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
-                    "sourceRoot": root.path().join("source"),
-                    "workflowPath": "workflow.yaml"
-                }
+                "workRoot": root.path().join("work")
             }))
             .unwrap(),
         )

@@ -1,15 +1,16 @@
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
 
 use super::*;
 use crate::execution::workflow::archived_attempt::{
-    ArchivedCancellationReason, ArchivedDiagnosticStream, ArchivedFailure, ArchivedFailureCause,
-    ArchivedFailurePhase, ArchivedStep, ArchivedStepDetail, ArchivedStepState,
+    ArchivedDiagnosticStream, ArchivedStep, ArchivedStepDetail, ArchivedStepState,
     ArchivedWorkflowOutcome, LocalArchivedAttempt,
 };
+use crate::execution::workflow::archived_presentation::{
+    archived_cancellation_reason, archived_failure_detail, archived_finalization_trigger,
+    safe_path, safe_text,
+};
 use crate::execution::workflow::presentation_feed::{
-    NormalizedRetainedRecord, normalize_retained_prefix, normalize_terminal_scalar,
-    normalize_terminal_shell_argument,
+    NormalizedRetainedRecord, normalize_retained_prefix, normalize_terminal_shell_argument,
 };
 
 const ARCHIVED_WORKFLOW_COLUMN_PERCENTAGE: u16 = 52;
@@ -261,6 +262,7 @@ fn fail_archived_terminal<Boundary: TerminalBoundary>(
 struct ArchivedTerminalView {
     summary: Vec<ArchivedSummaryLine>,
     steps: Vec<ArchivedTerminalStepView>,
+    phase_boundary: Option<StepPhaseBoundary>,
 }
 
 struct ArchivedSummaryLine {
@@ -270,6 +272,7 @@ struct ArchivedSummaryLine {
 
 struct ArchivedTerminalStepView {
     id: String,
+    role: crate::execution::workflow::validated::WorkflowNodeRole,
     definition: WorkflowPresentationStep,
     command: Option<String>,
     state: StepStateKind,
@@ -307,6 +310,14 @@ enum ArchivedStreamSource {
 impl ArchivedTerminalView {
     fn new(attempt: LocalArchivedAttempt) -> Self {
         let summary = archived_summary(&attempt);
+        let phase_boundary = attempt
+            .workflow
+            .finalization_start
+            .zip(attempt.finalization.as_ref())
+            .map(|(finalization_start, finalization)| StepPhaseBoundary {
+                finalization_start,
+                trigger: Some(archived_finalization_trigger(finalization.trigger)),
+            });
         let mut definitions = attempt.workflow.steps;
         let expected_step_count = attempt.steps.len();
         let steps = attempt
@@ -318,7 +329,11 @@ impl ArchivedTerminalView {
             })
             .collect::<Vec<_>>();
         debug_assert_eq!(steps.len(), expected_step_count);
-        Self { summary, steps }
+        Self {
+            summary,
+            steps,
+            phase_boundary,
+        }
     }
 }
 
@@ -352,6 +367,7 @@ impl ArchivedTerminalStepView {
                 });
         Self {
             id: safe_text(&step.id),
+            role: step.role,
             definition: safe_definition(definition),
             command,
             state: archived_step_state(step.state),
@@ -425,7 +441,15 @@ impl StepProjection for ArchivedTerminalStepView {
                 &self.definition,
                 self.state,
             )),
+            ArchivedStepDetail::InputUnavailable { references } => Some(issue_detail_for_step(
+                format!("inputs unavailable: {}", references.join(", ")),
+                &self.definition,
+                self.state,
+            )),
             ArchivedStepDetail::NotRun => Some("failure_stop".to_owned()),
+            ArchivedStepDetail::TriggerNotSelected => {
+                Some("finalizer_trigger_not_selected".to_owned())
+            }
             ArchivedStepDetail::Cancelled { reason } => {
                 Some(archived_cancellation_reason(*reason).to_owned())
             }
@@ -433,7 +457,13 @@ impl StepProjection for ArchivedTerminalStepView {
     }
 
     fn inspector_command(&self) -> Option<String> {
-        self.command.clone()
+        self.command.clone().map(|command| {
+            if self.role == crate::execution::workflow::validated::WorkflowNodeRole::Finalizer {
+                format!("finalizer · {command}")
+            } else {
+                command
+            }
+        })
     }
 
     fn inspector_fact(&self) -> Option<InspectorField> {
@@ -453,9 +483,19 @@ impl StepProjection for ArchivedTerminalStepView {
                 safe_text(dependency),
                 Tone::Blocked,
             )),
+            ArchivedStepDetail::InputUnavailable { references } => Some(InspectorField::new(
+                "inputs unavailable",
+                references.join(", "),
+                Tone::Blocked,
+            )),
             ArchivedStepDetail::NotRun => {
                 Some(InspectorField::new("not run", "failure_stop", Tone::Muted))
             }
+            ArchivedStepDetail::TriggerNotSelected => Some(InspectorField::new(
+                "not run",
+                "finalizer_trigger_not_selected",
+                Tone::Muted,
+            )),
             ArchivedStepDetail::Cancelled { reason } => Some(InspectorField::new(
                 "cancellation",
                 archived_cancellation_reason(*reason),
@@ -561,7 +601,12 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
     if let Some(primary) = &attempt.primary_failure {
         lines.push(ArchivedSummaryLine {
             text: format!(
-                "primary failure {} · {}",
+                "primary failure {} {} · {}",
+                match primary.role {
+                    crate::execution::workflow::validated::WorkflowNodeRole::Step => "step",
+                    crate::execution::workflow::validated::WorkflowNodeRole::Finalizer =>
+                        "finalizer",
+                },
                 safe_text(&primary.step),
                 archived_failure_detail(&primary.failure)
             ),
@@ -577,6 +622,40 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
                 header_timestamp(cancellation.force_stop_deadline),
             ),
             tone: Tone::Blocked,
+        });
+    }
+    if let Some(finalization) = &attempt.finalization {
+        let trigger = match finalization.trigger {
+            crate::execution::workflow::publication::FinalizationTriggerV1::Succeeded => {
+                "succeeded"
+            }
+            crate::execution::workflow::publication::FinalizationTriggerV1::Failed => "failed",
+            crate::execution::workflow::publication::FinalizationTriggerV1::Cancelled => {
+                "cancelled"
+            }
+        };
+        let cleanup = if finalization.force_abort {
+            "incomplete · force abort accepted".to_owned()
+        } else if let Some(cancellation) = &finalization.cancellation {
+            format!(
+                "incomplete · cancelled {}",
+                archived_cancellation_reason(cancellation.reason)
+            )
+        } else {
+            "complete".to_owned()
+        };
+        lines.push(ArchivedSummaryLine {
+            text: format!(
+                "finalization trigger {trigger} · {} issues · cleanup {cleanup}",
+                finalization.issues.len()
+            ),
+            tone: if finalization.force_abort || finalization.cancellation.is_some() {
+                Tone::Blocked
+            } else if finalization.issues.is_empty() {
+                Tone::Success
+            } else {
+                Tone::Failure
+            },
         });
     }
     lines
@@ -597,59 +676,6 @@ fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
         ArchivedStepState::Blocked => StepStateKind::Blocked,
         ArchivedStepState::NotRun => StepStateKind::NotRun,
         ArchivedStepState::Cancelled => StepStateKind::Cancelled,
-    }
-}
-
-fn archived_failure_detail(failure: &ArchivedFailure) -> String {
-    let phase = match failure.phase {
-        ArchivedFailurePhase::Start => "start",
-        ArchivedFailurePhase::Execution => "execution",
-        ArchivedFailurePhase::OutputCapture => "output_capture",
-    };
-    format!("{phase} · {}", archived_failure_cause(&failure.cause))
-}
-
-fn archived_failure_cause(cause: &ArchivedFailureCause) -> String {
-    let mut detail = snake_case_debug(cause.code);
-    if let Some(input) = &cause.input {
-        detail.push_str(" · input ");
-        detail.push_str(&safe_text(input));
-    }
-    if let Some(index) = cause.collection_index {
-        detail.push_str(&format!(" · collection index {index}"));
-    }
-    if let Some(output) = &cause.output {
-        detail.push_str(" · output ");
-        detail.push_str(&safe_text(output));
-    }
-    if let Some(exit_code) = cause.exit_code {
-        detail.push_str(&format!(" · exit {exit_code}"));
-    }
-    detail
-}
-
-fn snake_case_debug(value: impl std::fmt::Debug) -> String {
-    let value = format!("{value:?}");
-    let mut result = String::with_capacity(value.len());
-    for (index, character) in value.chars().enumerate() {
-        if character.is_ascii_uppercase() {
-            if index != 0 {
-                result.push('_');
-            }
-            result.push(character.to_ascii_lowercase());
-        } else {
-            result.push(character);
-        }
-    }
-    result
-}
-
-fn archived_cancellation_reason(reason: ArchivedCancellationReason) -> &'static str {
-    match reason {
-        ArchivedCancellationReason::UserRequest => "user_request",
-        ArchivedCancellationReason::TerminationRequest => "termination_request",
-        ArchivedCancellationReason::CallerOutputFailure => "caller_output_failure",
-        ArchivedCancellationReason::RunnerShutdown => "runner_shutdown",
     }
 }
 
@@ -735,14 +761,6 @@ fn normalize_outputs(outputs: &mut std::collections::BTreeMap<String, WorkflowOu
             }
         }
     }
-}
-
-fn safe_text(value: &str) -> String {
-    normalize_terminal_scalar(value.as_bytes())
-}
-
-fn safe_path(value: &std::path::Path) -> String {
-    normalize_terminal_scalar(value.as_os_str().as_bytes())
 }
 
 #[derive(Default)]
@@ -993,6 +1011,7 @@ fn render_archived_split(
         layout,
         &view.steps,
         graph,
+        view.phase_boundary,
         interaction.selected,
         color,
     );
@@ -1391,12 +1410,13 @@ mod tests {
     use super::*;
     use crate::execution::workflow::archived_attempt::{
         ArchivedAttemptState, ArchivedAttemptTrigger, ArchivedCommandOutput, ArchivedExecution,
-        ArchivedPrimaryFailure,
+        ArchivedFailure, ArchivedFailureCause, ArchivedFailurePhase, ArchivedPrimaryFailure,
     };
     use crate::execution::workflow::document::Output;
     use crate::execution::workflow::presentation_feed::WorkflowPresentationDefinition;
     use crate::execution::workflow::publication::FailureCodeV1;
     use crate::execution::workflow::resolution::{ContentDigestAlgorithm, WorkflowContentDigest};
+    use crate::execution::workflow::validated::WorkflowNodeRole;
 
     #[test]
     fn frozen_archive_renders_context_dag_inspector_and_declarations() {
@@ -1414,7 +1434,7 @@ mod tests {
             "result /tmp/archive-run/attempts/0002/r",
             "created 2026-08-06 12:00:00Z",
             "execution 2026-08-06 12:00:01Z → 2026-08-06 12:00:04Z · 3.0s",
-            "primary failure verify · execution · command_exit · exit 17",
+            "primary failure step verify · execution · command_exit · exit 17",
             "▏ ✓ prepare",
             "× verify",
             "prepare   cmd",
@@ -1846,9 +1866,14 @@ mod tests {
             workflow: WorkflowPresentationDefinition {
                 workflow_path: "workflows/archive.yaml".to_owned(),
                 presentation_order: vec!["prepare".to_owned(), "verify".to_owned()],
+                finalization_start: None,
                 steps: BTreeMap::from([
                     ("prepare".to_owned(), prepare_definition),
                     ("verify".to_owned(), verify_definition),
+                ]),
+                node_roles: BTreeMap::from([
+                    ("prepare".to_owned(), WorkflowNodeRole::Step),
+                    ("verify".to_owned(), WorkflowNodeRole::Step),
                 ]),
             },
             execution: ArchivedExecution {
@@ -1861,12 +1886,15 @@ mod tests {
             outcome: ArchivedWorkflowOutcome::Failed,
             primary_failure: Some(ArchivedPrimaryFailure {
                 step: "verify".to_owned(),
+                role: WorkflowNodeRole::Step,
                 failure: failure.clone(),
             }),
             cancellation: None,
+            finalization: None,
             steps: vec![
                 ArchivedStep {
                     id: "prepare".to_owned(),
+                    role: WorkflowNodeRole::Step,
                     failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Succeeded,
                     started_at: Some(started),
@@ -1876,6 +1904,7 @@ mod tests {
                 },
                 ArchivedStep {
                     id: "verify".to_owned(),
+                    role: WorkflowNodeRole::Step,
                     failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Failed,
                     started_at: Some(started + Duration::from_secs(1)),

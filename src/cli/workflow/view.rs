@@ -6,12 +6,13 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::execution::workflow::archived_attempt::{
-    ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
-    ArchivedAttemptOperationalErrorCode, load_local_archived_attempt,
+    ArchivedAttemptLoadError, load_local_archived_attempt,
+};
+use crate::execution::workflow::archived_presentation::{
+    ArchivedViewOutput, ineligibility_code, operational_error_code,
 };
 use crate::execution::workflow::presentation::{
-    ColorChoice, PresentationConfig, PresentationFailure, PresentationMode,
-    RequestedPresentationMode, TerminalCapabilities,
+    PresentationConfig, PresentationFailure, PresentationMode, TerminalCapabilities,
 };
 use crate::execution::workflow::presentation_feed::normalize_terminal_scalar;
 use crate::execution::workflow::terminal_host::archived::{
@@ -20,10 +21,17 @@ use crate::execution::workflow::terminal_host::archived::{
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
-pub(super) const AFTER_HELP: &str = "Attempt selection:
-  When --attempt is omitted, the command selects the current attempt from a stable run
-  snapshot before opening the interactive view.";
+pub(super) const AFTER_HELP: &str = "Presentation mode:
+  Without an explicit mode, an eligible terminal opens the interactive viewer. Every
+  other stream arrangement receives a frozen plain summary.
 
+Attempt selection:
+  When --attempt is omitted, the command selects the current attempt from a stable run
+  snapshot before opening the selected view.";
+
+// View keeps its attempt selector beside its leaf-specific presentation surface; sharing
+// this clap shape with execution commands would incorrectly share their inputs.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -37,15 +45,10 @@ pub(super) struct Command {
     )]
     attempt: Option<NonZeroU64>,
 
-    #[arg(
-        long,
-        value_enum,
-        value_name = "WHEN",
-        default_value_t = super::ColorArgument::Auto,
-        help = "Select renderer color behavior"
-    )]
-    color: super::ColorArgument,
+    #[command(flatten)]
+    presentation: super::PresentationOptions,
 }
+// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
@@ -55,14 +58,8 @@ impl Command {
     async fn execute_async(self) -> super::super::CommandResult {
         let (mut interrupt, mut terminate) = super::observe_workflow_signals("view")?;
 
-        let config = viewer_config(self.color, TerminalCapabilities::detect());
-        if config.mode() != PresentationMode::Tui {
-            return Err(anyhow!(
-                "workflow view requires terminal stdin, terminal stdout, and a usable TERM\n\nUse workflow status for non-interactive output:\n  scherzo-cloud workflow status <RUN_DIR>"
-            )
-            .into());
-        }
-
+        let config = viewer_config(&self.presentation, TerminalCapabilities::detect());
+        let mode = config.mode();
         let requested = self.run.run_dir;
         let load_path = requested.clone();
         let selected_attempt = self.attempt;
@@ -77,6 +74,13 @@ impl Command {
             result = &mut load => {
                 match result {
                     Ok(Ok(attempt)) => attempt,
+                    Ok(Err(error)) if mode == PresentationMode::Json => {
+                        return write_noninteractive(
+                            ArchivedViewOutput::JsonError(error),
+                            &mut interrupt,
+                            &mut terminate,
+                        ).await;
+                    }
                     Ok(Err(error)) => return Err(load_error(&requested, error).into()),
                     Err(error) => {
                         return Err(anyhow::Error::new(error)
@@ -87,7 +91,27 @@ impl Command {
             }
         };
 
-        let host = ArchivedWorkflowTerminalHost::start(attempt, config.color_enabled())
+        if mode == PresentationMode::Plain {
+            return write_noninteractive(
+                ArchivedViewOutput::Plain {
+                    attempt: Box::new(attempt.projection),
+                    color: config.color_enabled(),
+                },
+                &mut interrupt,
+                &mut terminate,
+            )
+            .await;
+        }
+        if mode == PresentationMode::Json {
+            return write_noninteractive(
+                ArchivedViewOutput::JsonSuccess(Box::new(attempt)),
+                &mut interrupt,
+                &mut terminate,
+            )
+            .await;
+        }
+
+        let host = ArchivedWorkflowTerminalHost::start(attempt.projection, config.color_enabled())
             .map_err(anyhow::Error::new)
             .context("start workflow view terminal")?;
         let request = host.exit_request();
@@ -119,19 +143,10 @@ fn parse_attempt(value: &str) -> Result<NonZeroU64, String> {
 }
 
 fn viewer_config(
-    color: super::ColorArgument,
+    presentation: &super::PresentationOptions,
     capabilities: TerminalCapabilities,
 ) -> PresentationConfig {
-    PresentationConfig {
-        requested_mode: RequestedPresentationMode::Automatic,
-        color: match color {
-            super::ColorArgument::Auto => ColorChoice::Auto,
-            super::ColorArgument::Always => ColorChoice::Always,
-            super::ColorArgument::Never => ColorChoice::Never,
-        },
-        capabilities,
-        standard_input_reserved: false,
-    }
+    super::run::presentation_config_with(presentation, false, capabilities)
 }
 
 async fn first_view_signal(
@@ -153,6 +168,25 @@ fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
     }
 }
 
+async fn write_noninteractive(
+    output: ArchivedViewOutput,
+    interrupt: &mut tokio::signal::unix::Signal,
+    terminate: &mut tokio::signal::unix::Signal,
+) -> super::super::CommandResult {
+    let mut job = tokio::task::spawn_blocking(move || output.write_stdout());
+    tokio::select! {
+        biased;
+        result = &mut job => match result {
+            Ok(Ok(exit)) => Ok(exit),
+            Ok(Err(error)) => Err(anyhow::Error::new(error).into()),
+            Err(error) => Err(anyhow::Error::new(error)
+                .context("produce workflow view output")
+                .into()),
+        },
+        exit = first_view_signal(interrupt, terminate) => Ok(viewer_exit_code(exit)),
+    }
+}
+
 fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Error {
     match error {
         ArchivedAttemptLoadError::Operational(error) => {
@@ -162,37 +196,12 @@ fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Erro
                 safe_path(run_directory)
             ))
         }
-        ArchivedAttemptLoadError::Ineligible(error) => anyhow!(ineligibility_reason(error.reason))
+        ArchivedAttemptLoadError::Ineligible(error) => anyhow!(ineligibility_code(error.reason))
             .context(format!(
                 "workflow view cannot open run {} attempt {}",
                 safe_path(&error.run_directory),
                 error.attempt_number
             )),
-    }
-}
-
-fn operational_error_code(code: ArchivedAttemptOperationalErrorCode) -> &'static str {
-    match code {
-        ArchivedAttemptOperationalErrorCode::RunDirectoryUnavailable => "run_directory_unavailable",
-        ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid => "run_directory_invalid",
-        ArchivedAttemptOperationalErrorCode::LockQueryFailed => "lock_query_failed",
-        ArchivedAttemptOperationalErrorCode::StatusSnapshotUnstable => "status_snapshot_unstable",
-        ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable => {
-            "published_result_unavailable"
-        }
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid => "published_result_invalid",
-        ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid => "retained_workflow_invalid",
-    }
-}
-
-fn ineligibility_reason(reason: ArchivedAttemptIneligibilityReason) -> &'static str {
-    match reason {
-        ArchivedAttemptIneligibilityReason::Unknown => "attempt_unknown",
-        ArchivedAttemptIneligibilityReason::Nonterminal => "attempt_nonterminal",
-        ArchivedAttemptIneligibilityReason::Interrupted => "attempt_interrupted",
-        ArchivedAttemptIneligibilityReason::Rejected => "attempt_rejected",
-        ArchivedAttemptIneligibilityReason::PublicationFailed => "attempt_publication_failed",
-        ArchivedAttemptIneligibilityReason::Unpublished => "attempt_unpublished",
     }
 }
 

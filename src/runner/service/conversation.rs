@@ -15,9 +15,13 @@ use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError, FrameSource,
     OpeningHello, opening_hello, run_established,
 };
+use super::source::{
+    CredentialBrokerFailure, CredentialOperation, ProviderCredential, SourceCredentialBroker,
+};
 use super::test_support::{
     DeterminismTranscript, healthy_wall_clock, scripted_duplex, with_watchdog,
 };
+use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::test_credential;
 use crate::runner::service::Config;
 use crate::runner::telemetry::test_recorder;
@@ -25,6 +29,20 @@ use crate::runner::telemetry::test_recorder;
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
 const REPLAY_TIMESTAMP: &str = "2026-07-23T00:00:00Z";
 const REPLAY_OVERRIDE: &str = "SCHERZO_RUNNER_CONVERSATION_FIXTURE";
+
+struct UnavailableSourceBroker;
+
+impl SourceCredentialBroker for UnavailableSourceBroker {
+    fn issue(
+        &self,
+        _assignment_id: &str,
+        _repository_connection_id: &str,
+        _operation: CredentialOperation,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -436,11 +454,10 @@ async fn replay_conversation(conversation: Conversation) -> Result<(), Connectio
     let (recorder, _capture) = test_recorder(REPLAY_BOOT_ID);
     let connection_event = recorder.start("runner.conversation_replay", []);
     let active_effect_event = ActiveEffectEvent::new();
-    let assignment_manager = Mutex::new(AssignmentManager::new(
-        &config,
-        REPLAY_BOOT_ID.to_owned(),
-        healthy_wall_clock(),
-    ));
+    let mut assignment_manager =
+        AssignmentManager::new(&config, REPLAY_BOOT_ID.to_owned(), healthy_wall_clock());
+    assignment_manager.use_source_broker_fixture(Arc::new(UnavailableSourceBroker));
+    let assignment_manager = Mutex::new(assignment_manager);
     let transcript = DeterminismTranscript::default();
     let (inbound, reader, writer, mut outbound) = scripted_duplex(transcript);
     let mut next_sequence = opening

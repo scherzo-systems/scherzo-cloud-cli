@@ -2,34 +2,4 @@
 set -euo pipefail
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-
-long_tmp_parent=$(mktemp -d)
-cleanup() {
-  rm -rf "$long_tmp_parent"
-}
-trap cleanup EXIT
-long_tmp_physical="$long_tmp_parent/physical/portable-workflow-test-temporary-directory/with-a-deliberately-long-path/to-detect-path-length-dependent-test-fixtures"
-tmp_alias="$long_tmp_parent/t"
-mkdir -p "$long_tmp_physical"
-chmod 700 "$long_tmp_physical"
-# Exercise the lexical-versus-resolved path distinction on every platform,
-# including Linux where /tmp is ordinarily not an alias. Keep the lexical path
-# short enough for Unix-domain sockets while retaining a long physical target.
-ln -s "$long_tmp_physical" "$tmp_alias"
-
-"$public_root/scripts/check-structure"
-"$public_root/scripts/check-help-output-style"
-"$public_root/scripts/check-pi-json-v1-extension"
-
-cd "$public_root"
-export CARGO_TERM_COLOR=never
-cargo fmt --all -- --check
-"$public_root/scripts/check-msrv"
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-"$public_root/scripts/check-lint-policy"
-TMPDIR="$tmp_alias" cargo test --locked --workspace --all-targets --all-features
-TMPDIR="$tmp_alias" SCHERZO_CLOUD_VERSION=0.2.7 \
-  cargo test --locked --workspace --all-targets --all-features resolved_build_version
-cargo build --locked --workspace --all-features --release
-
-printf 'Public CLI source checks passed.\n'
+exec "$public_root/scripts/strict-devenv" test

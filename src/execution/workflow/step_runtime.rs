@@ -17,9 +17,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot};
 use super::agent::dispatch::{AgentInvocationDispatcher, invoke_agent_dispatcher};
 use super::agent::{
-    AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope, AgentObservationSink,
-    AgentOutcome, AgentProcessControl, AgentStartReceiveError, AgentTerminalReceiveError,
-    CompletedAgentInvocation, WorkflowRunId, agent_start_channel, agent_terminal_channel,
+    AgentFailure, AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope,
+    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentStartReceiveError,
+    AgentTerminalReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
+    agent_terminal_channel, failed_agent_outcome,
 };
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
@@ -90,7 +91,7 @@ pub(crate) enum StepStartFailure {
     InputsUnavailable,
     InputPreparation(InputPreparationFailure),
     AgentInput(Box<AgentInputStartFailure>),
-    Agent(AgentFailureCause),
+    Agent(AgentFailure),
     AgentRuntimeUnavailable,
     OutputsUnsupported,
     WorkingDirectory(WorkingDirectoryFailure),
@@ -107,7 +108,7 @@ pub(crate) enum CommandExecutionFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StepExecutionFailure {
     Command(CommandExecutionFailure),
-    Agent(AgentFailureCause),
+    Agent(AgentFailure),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,9 +198,9 @@ where
         _started: super::agent::AgentStartCallback,
         terminal: super::agent::AgentTerminalCallback,
     ) {
-        let _ = terminal.report(AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        });
+        let _ = terminal.report(failed_agent_outcome(
+            AgentFailureCause::HarnessProtocolFailed,
+        ));
     }
 }
 
@@ -737,7 +738,7 @@ where
                     .settle_start_failure(
                         step,
                         action,
-                        StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed),
+                        StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed.into()),
                     )
                     .await;
             }
@@ -793,9 +794,8 @@ where
                 (false, outcome)
             }
         };
-        let outcome = outcome.unwrap_or(AgentOutcome::Failed {
-            cause: AgentFailureCause::HarnessProtocolFailed,
-        });
+        let outcome = outcome
+            .unwrap_or_else(|_| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
 
         if matches!(outcome, AgentOutcome::Cancelled { .. }) {
             drop(staging);
@@ -806,14 +806,14 @@ where
 
         if !lifecycle_started {
             drop(staging);
-            let cause = match outcome {
-                AgentOutcome::Failed { cause } => cause,
+            let failure = match outcome {
+                AgentOutcome::Failed(failure) => failure,
                 AgentOutcome::Completed(_) | AgentOutcome::Cancelled { .. } => {
-                    AgentFailureCause::HarnessProtocolFailed
+                    AgentFailureCause::HarnessProtocolFailed.into()
                 }
             };
             return self
-                .settle_start_failure(step, action, StepStartFailure::Agent(cause))
+                .settle_start_failure(step, action, StepStartFailure::Agent(failure))
                 .await;
         }
 
@@ -832,12 +832,12 @@ where
                     ProvisionalStepOutputs::agent(values, staging),
                 )
             }
-            AgentOutcome::Failed { cause } => {
+            AgentOutcome::Failed(failure) => {
                 drop(staging);
                 DriverOccurrence::step_execution_failed(
                     step,
                     action,
-                    StepFailureCause::Execution(StepExecutionFailure::Agent(cause)),
+                    StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
                 )
             }
             AgentOutcome::Cancelled { .. } => unreachable!("cancelled outcomes settle above"),
@@ -875,7 +875,7 @@ where
             self.settle_start_failure(
                 step,
                 action,
-                StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed),
+                StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed.into()),
             )
             .await
         }
@@ -892,7 +892,7 @@ where
             DriverOccurrence::step_execution_failed(
                 step,
                 action,
-                StepFailureCause::Execution(StepExecutionFailure::Agent(cause)),
+                StepFailureCause::Execution(StepExecutionFailure::Agent(cause.into())),
             ),
         )
         .await
@@ -1064,7 +1064,8 @@ where
         action: ActionId,
         cancellation: CommandCancellation<Clock::Instant>,
     ) -> Result<(), StepRuntimeError> {
-        let deadline_finished = self.with_work(|work| work.finish_cancellation(action));
+        let (cancellation, deadline_finished) =
+            self.with_work(|work| work.finish_cancellation(action, cancellation));
         if let Some(deadline_finished) = deadline_finished {
             let _ = deadline_finished.await;
         }
@@ -1084,13 +1085,8 @@ where
         PreparedStep<AgentExecutionObservationSink<Clock::Instant, Observer>>,
         StepStartFailure,
     > {
-        let definition = self
-            .admitted
-            .workflow()
-            .definition
-            .steps
-            .get(step)
-            .ok_or(StepStartFailure::StepUnavailable)?;
+        let definition =
+            workflow_node(&self.admitted, step).ok_or(StepStartFailure::StepUnavailable)?;
         let body = match StepBody::from(definition) {
             StepBody::Command(command) => {
                 if command.common.outputs.values().any(|output| {
@@ -1136,6 +1132,10 @@ where
                     return Err(StepStartFailure::AgentRuntimeUnavailable);
                 };
                 let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
+                let finalization_context = action_inputs.values().find_map(|input| match input {
+                    ActionInput::FinalizationContext(bytes) => Some(bytes.as_ref()),
+                    ActionInput::Import | ActionInput::Output(_) | ActionInput::Unavailable => None,
+                });
                 let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
                 let materialized = materialize_agent_invocation(
                     &self.admitted,
@@ -1144,6 +1144,7 @@ where
                     diagnostic_sessions,
                     identity,
                     &upstream,
+                    finalization_context,
                     self.admitted.execution().cancellation().source().clone(),
                     self.process_guards.clone(),
                     AgentExecutionObservationSink {
@@ -1190,6 +1191,10 @@ where
                         ResolvedValueSource::Import(WorkflowImport::Attachments),
                         ActionInput::Import,
                     ) => InputValue::Attachments(self.admitted.imports().attachments()),
+                    (
+                        ResolvedValueSource::FinalizationContext,
+                        ActionInput::FinalizationContext(bytes),
+                    ) => InputValue::CanonicalJson(bytes),
                     (ResolvedValueSource::Output(source), ActionInput::Output(value)) => {
                         if let CapturedValue::File(file) = value
                             && file.output_identity() != source.output
@@ -1223,6 +1228,15 @@ where
 
     fn cancellation_for(&self, action: ActionId) -> Option<CommandCancellation<Clock::Instant>> {
         self.with_work(|work| work.cancellation_for(action))
+    }
+
+    fn request_force_abort(
+        &self,
+        step: String,
+        action: ActionId,
+        deadline: Clock::Instant,
+    ) -> ForceAbortRegistration {
+        self.with_work(|work| work.force_abort(step, action, deadline))
     }
 
     fn with_work<Output>(
@@ -1262,6 +1276,14 @@ where
         self.with_capture_work(|work| work.cancel(step, action))
     }
 
+    fn request_capture_force_abort(
+        &self,
+        step: &str,
+        action: ActionId,
+    ) -> CaptureCancellationRegistration {
+        self.with_capture_work(|work| work.force_abort(step, action))
+    }
+
     fn with_capture_work<Output>(
         &self,
         operation: impl FnOnce(&mut CaptureWorkRegistry) -> Output,
@@ -1288,6 +1310,16 @@ where
             }
         }
         self.shutdown().await;
+    }
+
+    fn schedule_quiesced_report(&self, step: String, action: ActionId) {
+        let runtime = self.clone();
+        let tasks = self.tasks.clone();
+        tasks.spawn(async move {
+            let _ = runtime
+                .send(DriverOccurrence::step_quiesced(step, action))
+                .await;
+        });
     }
 
     async fn shutdown(&self) {
@@ -1357,12 +1389,12 @@ impl CaptureWorker {
         provisional_values: &BTreeSet<String>,
         cancellation: &CaptureCancellation,
     ) -> Result<CaptureCandidateSet, CaptureWorkerFailure> {
-        let definition = self.admitted.workflow().definition.steps.get(step).ok_or(
+        let definition = workflow_node(&self.admitted, step).ok_or(
             CaptureWorkerFailure::Failed(OutputCaptureFailure::StepUnavailable),
         )?;
         let body = StepBody::from(definition);
         let common = body.common();
-        let expected_values = common
+        let declared_values = common
             .outputs
             .iter()
             .filter(|(_, output)| {
@@ -1373,7 +1405,15 @@ impl CaptureWorker {
             })
             .map(|(output_identity, _)| output_identity.clone())
             .collect::<BTreeSet<_>>();
-        if &expected_values != provisional_values {
+        let required_results = common
+            .outputs
+            .iter()
+            .filter(|(_, output)| matches!(output.definition, Output::AgentResult { .. }))
+            .map(|(output_identity, _)| output_identity.clone())
+            .collect::<BTreeSet<_>>();
+        if !provisional_values.is_subset(&declared_values)
+            || !required_results.is_subset(provisional_values)
+        {
             return Err(CaptureWorkerFailure::Failed(
                 OutputCaptureFailure::UnsupportedOutput,
             ));
@@ -1657,7 +1697,20 @@ impl CaptureWorkRegistry {
     }
 
     fn cancel(&mut self, step: &str, action: ActionId) -> CaptureCancellationRegistration {
-        if self.known_cancellations.contains(&action) {
+        self.revoke(step, action, false)
+    }
+
+    fn force_abort(&mut self, step: &str, action: ActionId) -> CaptureCancellationRegistration {
+        self.revoke(step, action, true)
+    }
+
+    fn revoke(
+        &mut self,
+        step: &str,
+        action: ActionId,
+        replace_existing: bool,
+    ) -> CaptureCancellationRegistration {
+        if !self.known_cancellations.insert(action) {
             return CaptureCancellationRegistration::Duplicate;
         }
         let Some(capture_action) = self.active_by_step.get(step).copied() else {
@@ -1666,8 +1719,7 @@ impl CaptureWorkRegistry {
         let Some(work) = self.active.get_mut(&capture_action) else {
             return CaptureCancellationRegistration::NotFound;
         };
-        self.known_cancellations.insert(action);
-        if work.revocation.is_some() {
+        if work.revocation.is_some() && !replace_existing {
             return CaptureCancellationRegistration::Duplicate;
         }
         work.revocation = Some(CaptureRevocation {
@@ -1898,6 +1950,42 @@ where
         self.active.get(&action)?.cancellation.clone()
     }
 
+    fn force_abort(
+        &mut self,
+        step: String,
+        action: ActionId,
+        deadline: Deadline,
+    ) -> ForceAbortRegistration {
+        if !self.known_actions.insert(action) {
+            return ForceAbortRegistration::Duplicate;
+        }
+        self.cancelled_steps.insert(step.clone());
+        let Some(start_action) = self.active_by_step.get(&step).copied() else {
+            return ForceAbortRegistration::Quiesced;
+        };
+        let Some(work) = self.active.get_mut(&start_action) else {
+            return ForceAbortRegistration::Quiesced;
+        };
+        match work.cancellation.as_mut() {
+            Some(cancellation) => {
+                cancellation.action = action;
+                cancellation.deadline = deadline;
+            }
+            None => {
+                work.cancellation = Some(CommandCancellation {
+                    step: step.clone(),
+                    action,
+                    deadline,
+                });
+            }
+        }
+        ForceAbortRegistration::Active {
+            wake: work.cancellation_wake.take(),
+            process_group: work.process_group.clone(),
+            agent_process_control: work.agent_process_control.clone(),
+        }
+    }
+
     fn revoke_all_for_commit_failure(
         &mut self,
         deadline: Deadline,
@@ -1972,8 +2060,18 @@ where
         }
     }
 
-    fn finish_cancellation(&mut self, action: ActionId) -> Option<oneshot::Receiver<()>> {
-        self.remove_active(action)
+    fn finish_cancellation(
+        &mut self,
+        action: ActionId,
+        fallback: CommandCancellation<Deadline>,
+    ) -> (CommandCancellation<Deadline>, Option<oneshot::Receiver<()>>) {
+        let cancellation = self
+            .active
+            .get(&action)
+            .and_then(|work| work.cancellation.clone())
+            .unwrap_or(fallback);
+        let deadline_finished = self.remove_active(action);
+        (cancellation, deadline_finished)
     }
 
     fn abandon(&mut self, action: ActionId) {
@@ -2035,6 +2133,16 @@ struct AgentCancellationDeadline<Deadline> {
     deadline: Deadline,
     shutdown: oneshot::Receiver<()>,
     finished: oneshot::Sender<()>,
+}
+
+enum ForceAbortRegistration {
+    Active {
+        wake: Option<oneshot::Sender<()>>,
+        process_group: Option<AuthenticatedProcessGroup>,
+        agent_process_control: Option<AgentProcessControl>,
+    },
+    Quiesced,
+    Duplicate,
 }
 
 enum CancellationRegistration<Deadline> {
@@ -2128,17 +2236,41 @@ where
                                     }
                                 }
                                 CancellationRegistration::Quiesced => {
-                                    let tasks = runtime.tasks.clone();
-                                    tasks.spawn(async move {
-                                        let _ = runtime
-                                            .send(DriverOccurrence::step_quiesced(
-                                                step,
-                                                requested.id,
-                                            ))
-                                            .await;
-                                    });
+                                    runtime.schedule_quiesced_report(step, requested.id);
                                 }
                                 CancellationRegistration::Duplicate => {}
+                            }
+                        }
+                    }
+                }
+                Action::ForceAbortStep { step, deadline, .. } => {
+                    match runtime.request_capture_force_abort(&step, requested.id) {
+                        CaptureCancellationRegistration::Active
+                        | CaptureCancellationRegistration::Duplicate => {}
+                        CaptureCancellationRegistration::NotFound => {
+                            match runtime.request_force_abort(step.clone(), requested.id, deadline)
+                            {
+                                ForceAbortRegistration::Active {
+                                    wake,
+                                    process_group,
+                                    agent_process_control,
+                                } => {
+                                    if let Some(group) = process_group {
+                                        let _ = super::process_group::terminate_authenticated_process_group(
+                                            &group,
+                                        );
+                                    }
+                                    if let Some(control) = agent_process_control {
+                                        control.force();
+                                    }
+                                    if let Some(wake) = wake {
+                                        let _ = wake.send(());
+                                    }
+                                }
+                                ForceAbortRegistration::Quiesced => {
+                                    runtime.schedule_quiesced_report(step, requested.id);
+                                }
+                                ForceAbortRegistration::Duplicate => {}
                             }
                         }
                     }
@@ -2175,7 +2307,7 @@ pub(crate) async fn execute_workflow<Clock, Commits>(
     diagnostics: &StepDiagnosticLog,
     clock: Clock,
     commits: Commits,
-) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
+) -> Result<CoordinationResult<StepFailureCause, CapturedValue, Clock::Instant>, CoordinationError>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
@@ -2209,7 +2341,7 @@ pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Dispatch
     observer: Observer,
     agents: AgentExecution<Dispatcher>,
     process_guards: ProcessGuardRegistry,
-) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
+) -> Result<CoordinationResult<StepFailureCause, CapturedValue, Clock::Instant>, CoordinationError>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
@@ -2280,16 +2412,29 @@ impl StepBody<'_> {
     }
 }
 
+fn workflow_node<'a>(admitted: &'a AdmittedWorkflow, id: &str) -> Option<&'a ValidatedStep> {
+    admitted.workflow().definition.steps.get(id).or_else(|| {
+        admitted
+            .workflow()
+            .definition
+            .finalizers
+            .get(id)
+            .map(|finalizer| &finalizer.body)
+    })
+}
+
 fn resolve_agent_upstream_outputs(
     agent: &ValidatedAgentStep,
     action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
 ) -> Result<BTreeMap<ResolvedOutputSource, CapturedValue>, StepStartFailure> {
-    let sources = agent
+    let mut message_sources = agent
         .agent
         .message
         .text
         .iter()
-        .chain(&agent.agent.message.attachments)
+        .chain(&agent.agent.message.attachments);
+    let sources = message_sources
+        .clone()
         .filter_map(|source| match source {
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(source),
@@ -2302,7 +2447,25 @@ fn resolve_agent_upstream_outputs(
             } => None,
         })
         .collect::<BTreeSet<_>>();
-    if sources.len() != action_inputs.len() {
+    let consumes_finalization_context = message_sources.any(|source| {
+        matches!(
+            source,
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::FinalizationContext,
+                ..
+            }
+        )
+    });
+    let expected_input_count = sources
+        .len()
+        .saturating_add(usize::from(consumes_finalization_context));
+    if expected_input_count != action_inputs.len()
+        || (consumes_finalization_context
+            && !matches!(
+                action_inputs.get("finalization.context"),
+                Some(ActionInput::FinalizationContext(_))
+            ))
+    {
         return Err(StepStartFailure::InputsUnavailable);
     }
     sources
@@ -2310,7 +2473,12 @@ fn resolve_agent_upstream_outputs(
         .map(|source| {
             let value = match action_inputs.get(&source.reference()) {
                 Some(ActionInput::Output(value)) => value.clone(),
-                Some(ActionInput::Import | ActionInput::Unavailable) | None => {
+                Some(
+                    ActionInput::Import
+                    | ActionInput::FinalizationContext(_)
+                    | ActionInput::Unavailable,
+                )
+                | None => {
                     return Err(StepStartFailure::InputsUnavailable);
                 }
             };
@@ -2324,14 +2492,20 @@ fn completed_agent_outputs(
     completed: CompletedAgentInvocation,
 ) -> Result<BTreeMap<String, CapturedValue>, AgentFailureCause> {
     let output = match (output, completed) {
-        (None, CompletedAgentInvocation::NoValue) => return Ok(BTreeMap::new()),
+        (None, CompletedAgentInvocation::NoValue)
+        | (Some(_), CompletedAgentInvocation::NoResponse) => return Ok(BTreeMap::new()),
         (Some(output), CompletedAgentInvocation::Response(response)) => {
             (output, CapturedValue::Text(response.into_text()))
         }
         (Some(output), CompletedAgentInvocation::Result(result)) => {
             (output, CapturedValue::Json(result.into_value()))
         }
-        (None, CompletedAgentInvocation::Response(_) | CompletedAgentInvocation::Result(_))
+        (
+            None,
+            CompletedAgentInvocation::NoResponse
+            | CompletedAgentInvocation::Response(_)
+            | CompletedAgentInvocation::Result(_),
+        )
         | (Some(_), CompletedAgentInvocation::NoValue) => {
             return Err(AgentFailureCause::HarnessProtocolFailed);
         }

@@ -18,6 +18,7 @@ struct TestDeadline {
 type TestAction = RequestedAction<String, String, String, TestDeadline>;
 type TestOccurrence = Occurrence<String, String, String, TestDeadline>;
 type TestReduction = Reduction<String, String, String, TestDeadline>;
+type TestRuntimeState = RuntimeState<String, String, TestDeadline>;
 
 fn deadline(arbiter_tick: u64) -> TestDeadline {
     TestDeadline { arbiter_tick }
@@ -36,6 +37,10 @@ fn definition(
     exports: &[(&str, &str, &str)],
     maximum_parallel_steps: usize,
 ) -> RuntimeDefinition {
+    let ordinary_ids = steps
+        .iter()
+        .map(|(step, _, _)| (*step).to_owned())
+        .collect();
     RuntimeDefinition {
         steps: steps
             .iter()
@@ -43,6 +48,7 @@ fn definition(
                 (
                     (*step).to_owned(),
                     RuntimeStep {
+                        role: WorkflowNodeRole::Step,
                         failure_policy: FailurePolicy::Required,
                         prerequisites: dependencies
                             .iter()
@@ -58,10 +64,14 @@ fn definition(
                             .iter()
                             .map(|output| (*output).to_owned())
                             .collect(),
+                        when: BTreeSet::new(),
                     },
                 )
             })
             .collect(),
+        ordinary_ids,
+        finalizer_ids: BTreeSet::new(),
+        finalizer_presentation_order: Vec::new(),
         exports: exports
             .iter()
             .map(|(name, step, output)| {
@@ -82,6 +92,7 @@ fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
     initialize_definition(ExecutionStart {
         definition,
         initial_cancellation: None,
+        initial_cancellation_operation: None,
     })
 }
 
@@ -94,6 +105,7 @@ fn step_event(
     TransitionEvent::Step {
         sequence: sequence(value),
         step: step.to_owned(),
+        role: WorkflowNodeRole::Step,
         failure_policy: FailurePolicy::Required,
         from,
         to,
@@ -102,8 +114,8 @@ fn step_event(
 
 fn workflow_event(
     value: u64,
-    from: WorkflowState<String>,
-    to: WorkflowState<String>,
+    from: WorkflowState<String, TestDeadline>,
+    to: WorkflowState<String, TestDeadline>,
 ) -> TransitionEvent<String, TestDeadline> {
     TransitionEvent::Workflow {
         sequence: sequence(value),
@@ -137,6 +149,7 @@ fn cancellation_event(
 fn failure(step: &str, phase: FailurePhase, cause: &str) -> StepFailure<String> {
     StepFailure {
         step: step.to_owned(),
+        role: WorkflowNodeRole::Step,
         phase,
         cause: cause.to_owned(),
     }
@@ -155,7 +168,7 @@ fn cancellation(
 fn cancelling_workflow(
     reason: CancellationReason,
     prior_failure: Option<StepFailure<String>>,
-) -> WorkflowState<String> {
+) -> WorkflowState<String, TestDeadline> {
     WorkflowState::Executing {
         gate: SchedulingGate::Cancelling {
             reason,
@@ -250,6 +263,99 @@ fn finish_cancelled_action(
     }
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "the compact fixture tuples keep graph scenarios readable at call sites"
+)]
+fn finalizer_definition(
+    steps: &[(
+        &str,
+        FailurePolicy,
+        &[FinalizationTrigger],
+        &[&str],
+        &[&str],
+    )],
+    finalizers: &[(
+        &str,
+        FailurePolicy,
+        &[FinalizationTrigger],
+        &[(&str, &str)],
+        &[&str],
+    )],
+    maximum_parallel_steps: usize,
+) -> RuntimeDefinition {
+    let ordinary_ids = steps.iter().map(|(id, ..)| (*id).to_owned()).collect();
+    let finalizer_ids = finalizers.iter().map(|(id, ..)| (*id).to_owned()).collect();
+    let runtime_steps = steps
+        .iter()
+        .map(|(id, policy, _, _, outputs)| {
+            (
+                (*id).to_owned(),
+                RuntimeStep {
+                    role: WorkflowNodeRole::Step,
+                    failure_policy: *policy,
+                    prerequisites: Arc::from([]),
+                    inputs: BTreeMap::new(),
+                    declared_outputs: outputs.iter().map(|output| (*output).to_owned()).collect(),
+                    when: BTreeSet::new(),
+                },
+            )
+        })
+        .chain(finalizers.iter().map(|(id, policy, when, inputs, predecessors)| {
+            (
+                (*id).to_owned(),
+                RuntimeStep {
+                    role: WorkflowNodeRole::Finalizer,
+                    failure_policy: *policy,
+                    prerequisites: predecessors
+                        .iter()
+                        .map(|producer| ResolvedDirectPrerequisite {
+                            producer: (*producer).to_owned(),
+                            control: true,
+                            data: false,
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    inputs: inputs
+                        .iter()
+                        .map(|(name, source)| {
+                            let source = if *source == "finalization.context" {
+                                ResolvedValueSource::FinalizationContext
+                            } else {
+                                let (producer, output) = source
+                                    .strip_prefix("outputs.")
+                                    .and_then(|tail| tail.split_once('.'))
+                                    .expect("fixture output reference");
+                                ResolvedValueSource::Output(
+                                    crate::execution::workflow::validated::ResolvedOutputSource {
+                                        node: crate::execution::workflow::validated::WorkflowNode {
+                                            id: producer.to_owned(),
+                                            role: WorkflowNodeRole::Step,
+                                        },
+                                        output: output.to_owned(),
+                                        value_type: crate::execution::workflow::validated::WorkflowValueType::File,
+                                    },
+                                )
+                            };
+                            ((*name).to_owned(), source)
+                        })
+                        .collect(),
+                    declared_outputs: BTreeSet::new(),
+                    when: when.iter().copied().collect(),
+                },
+            )
+        }))
+        .collect();
+    RuntimeDefinition {
+        steps: runtime_steps,
+        ordinary_ids,
+        finalizer_ids,
+        finalizer_presentation_order: finalizers.iter().map(|(id, ..)| (*id).to_owned()).collect(),
+        exports: BTreeMap::new(),
+        maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
+    }
+}
+
 fn output_set(entries: &[(&str, &str)]) -> OutputSet<String> {
     entries
         .iter()
@@ -271,27 +377,24 @@ fn available_exports(entries: &[(&str, &str)]) -> ExportSet<String> {
         .collect()
 }
 
-fn assert_step(state: &RuntimeState<String, String>, step: &str, expected: StepStateKind) {
+fn assert_step(state: &TestRuntimeState, step: &str, expected: StepStateKind) {
     assert_eq!(state.steps[step].state.kind(), expected);
 }
 
-fn assert_noop(before: &RuntimeState<String, String>, reduction: &TestReduction) {
+fn assert_noop(before: &TestRuntimeState, reduction: &TestReduction) {
     assert_eq!(&reduction.state, before);
     assert!(reduction.events.is_empty());
     assert!(reduction.actions.is_empty());
 }
 
-fn reduce_and_advance(
-    state: &mut RuntimeState<String, String>,
-    occurrence: TestOccurrence,
-) -> TestReduction {
+fn reduce_and_advance(state: &mut TestRuntimeState, occurrence: TestOccurrence) -> TestReduction {
     let reduction = reduce(state, occurrence);
     *state = reduction.state.clone();
     reduction
 }
 
 fn reduce_ordered(
-    state: &RuntimeState<String, String>,
+    state: &TestRuntimeState,
     last_ordinal: &mut u64,
     ordinal: u64,
     occurrence: TestOccurrence,
@@ -302,7 +405,7 @@ fn reduce_ordered(
 }
 
 fn reduce_ordered_and_advance(
-    state: &mut RuntimeState<String, String>,
+    state: &mut TestRuntimeState,
     last_ordinal: &mut u64,
     ordinal: u64,
     occurrence: TestOccurrence,
@@ -314,12 +417,7 @@ fn reduce_ordered_and_advance(
 
 fn prepare_failure_phase(
     phase: FailurePhase,
-) -> (
-    RuntimeState<String, String>,
-    TestOccurrence,
-    StepStateKind,
-    u64,
-) {
+) -> (TestRuntimeState, TestOccurrence, StepStateKind, u64) {
     let initialization = initialize_test(definition(
         &[
             ("aFail", &[], &["result"]),
@@ -537,6 +635,7 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
             1,
         ),
         initial_cancellation: Some(cancellation(reason, 5_000)),
+        initial_cancellation_operation: None,
     });
     let cancelling = cancelling_workflow(reason, None);
 
@@ -1167,6 +1266,13 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     assert_eq!(state.workflow, WorkflowState::Succeeded);
     assert_eq!(state.exports, Some(expected_exports.clone()));
     assert_eq!(captured.events.last(), Some(&workflow_succeeded_event(5)));
+    assert!(!captured.events.iter().any(|event| matches!(
+        event,
+        TransitionEvent::Workflow {
+            to: WorkflowState::Finalizing { .. },
+            ..
+        }
+    )));
     assert_eq!(captured.actions, [finish_action(5, expected_exports)]);
     assert_eq!(
         actions
@@ -1177,6 +1283,7 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     );
 
     assert_eq!(state.last_transition_sequence, sequence(5));
+    assert!(state.finalization_summary.is_none());
 
     let mut last_ordinal = 3;
     let late_cancellation = reduce_ordered(
@@ -2394,4 +2501,931 @@ fn replaying_the_same_ordered_transcript_is_structurally_identical() {
         terminal.exports,
         Some(available_exports(&[("finalReport", "d-committed")]))
     );
+}
+#[test]
+fn trace_succeeded_trigger_and_failed_release() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".to_owned(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let release = boundary
+        .actions
+        .iter()
+        .find(
+            |action| matches!(&action.action, Action::StartStep { step, .. } if step == "release"),
+        )
+        .unwrap()
+        .id;
+    assert!(matches!(
+        state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Succeeded,
+            gate: FinalizationGate::Open,
+            ..
+        }
+    ));
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".to_owned(),
+            action: release,
+        },
+    );
+    let finished = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "release".to_owned(),
+            action: release,
+            cause: "release failed".to_owned(),
+        },
+    );
+    let WorkflowState::Failed {
+        primary_failure, ..
+    } = &state.workflow
+    else {
+        panic!("required release failure did not fail the workflow");
+    };
+    assert_eq!(primary_failure.role, WorkflowNodeRole::Finalizer);
+    assert_eq!(primary_failure.step, "release");
+    assert!(matches!(
+        finished.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun { .. },
+            ..
+        }]
+    ));
+    assert!(state.finalization_summary.is_some());
+}
+
+#[test]
+fn trace_cancelled_trigger_and_successful_release() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Cancelled],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialized =
+        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
+            definition,
+            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
+            initial_cancellation_operation: None,
+        });
+    let start = initialized
+        .actions
+        .iter()
+        .find(
+            |action| matches!(&action.action, Action::StartStep { step, .. } if step == "release"),
+        )
+        .unwrap();
+    assert!(matches!(
+        initialized.state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Cancelled,
+            gate: FinalizationGate::Open,
+            ..
+        }
+    ));
+    assert!(matches!(
+        initialized.state.steps["work"].state,
+        StepState::Cancelled { .. }
+    ));
+    assert!(matches!(start.action, Action::StartStep { .. }));
+}
+
+#[test]
+fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is_inert() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[
+            (
+                "release",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+            (
+                "verifyCleanup",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+        ],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let start = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: start,
+        },
+    );
+    let aborted = reduce_and_advance(
+        &mut state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(7),
+            deadline: deadline(30),
+        },
+    );
+    let force = aborted
+        .actions
+        .iter()
+        .find(|action| matches!(&action.action, Action::ForceAbortStep { step, .. } if step == "release"))
+        .unwrap();
+    assert!(matches!(
+        state.steps["release"].state,
+        StepState::Cancelling { .. }
+    ));
+    assert!(matches!(
+        state.steps["verifyCleanup"].state,
+        StepState::Cancelled { .. }
+    ));
+    assert!(matches!(state.workflow, WorkflowState::Finalizing { .. }));
+    let replay = reduce::<String, String, String, TestDeadline>(
+        &state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(7),
+            deadline: deadline(31),
+        },
+    );
+    assert_noop(&state, &replay);
+    let force_id = force.id;
+    let terminal = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "release".into(),
+            action: force_id,
+        },
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::FinalizationForceAbort
+        }
+    );
+    assert!(matches!(
+        terminal.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun { .. },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn trace_failed_finalizer_output_producer_blocks_consumer_without_replacing_primary() {
+    let mut definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[
+            (
+                "archive",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[] as &[(&str, &str)],
+                &[] as &[&str],
+            ),
+            (
+                "notify",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[("receipt", "outputs.archive.receipt")],
+                &["archive"],
+            ),
+        ],
+        1,
+    );
+    definition
+        .steps
+        .get_mut("archive")
+        .unwrap()
+        .declared_outputs
+        .insert("receipt".into());
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let archive = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "archive".into(),
+            action: archive,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "archive".into(),
+            action: archive,
+            cause: "archive failed".into(),
+        },
+    );
+    let StepState::InputUnavailable { references } = &state.steps["notify"].state else {
+        panic!("notify was not classified at the fixed point");
+    };
+    assert_eq!(references, &["outputs.archive.receipt"]);
+    let WorkflowState::Failed {
+        primary_failure, ..
+    } = &state.workflow
+    else {
+        panic!("archive was not primary");
+    };
+    assert_eq!(primary_failure.step, "archive");
+}
+
+#[test]
+fn trace_advisory_finalizer_failure_preserves_success() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "notify",
+            FailurePolicy::Advisory,
+            &[FinalizationTrigger::Succeeded],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let notify = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "notify".into(),
+            action: notify,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "notify".into(),
+            action: notify,
+            cause: "offline".into(),
+        },
+    );
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert!(
+        state
+            .finalization_summary
+            .as_ref()
+            .is_some_and(|summary| matches!(
+                summary.finalizers[0].disposition,
+                StepState::Failed { .. }
+            ))
+    );
+}
+
+#[test]
+fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Cancelled],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialized =
+        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
+            definition,
+            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
+            initial_cancellation_operation: None,
+        });
+    let mut state = initialized.state;
+    let release = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+    let cancelled = reduce_and_advance(
+        &mut state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(2),
+            reason: CancellationReason::RunnerShutdown,
+            deadline: deadline(20),
+        },
+    );
+    let cancel = cancelled.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "release".into(),
+            action: cancel,
+        },
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::UserRequest
+        }
+    );
+    let summary = state.finalization_summary.as_ref().unwrap();
+    assert_eq!(
+        summary.cancellation,
+        Some(FinalizationCancellation {
+            reason: CancellationReason::RunnerShutdown,
+            deadline: Some(deadline(20)),
+        })
+    );
+}
+
+#[test]
+fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_outputs() {
+    let definition = finalizer_definition(
+        &[("producer", FailurePolicy::Required, &[], &[], &["resource"])],
+        &[
+            (
+                "aContext",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Cancelled],
+                &[("context", "finalization.context")],
+                &[],
+            ),
+            (
+                "bOutput",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Cancelled],
+                &[("resource", "outputs.producer.resource")],
+                &[],
+            ),
+        ],
+        2,
+    );
+    let initialized =
+        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
+            definition,
+            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
+            initial_cancellation_operation: Some(CancellationOperationId::fixture(1)),
+        });
+    let state = initialized.state;
+
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Cancelled,
+            gate: FinalizationGate::Open,
+            primary_failure: None,
+        }
+    );
+    assert_eq!(
+        state.steps["bOutput"].state,
+        StepState::InputUnavailable {
+            references: vec!["outputs.producer.resource".to_owned()],
+        }
+    );
+    let [
+        RequestedAction {
+            action: Action::StartStep { step, inputs },
+            ..
+        },
+    ] = initialized.actions.as_slice()
+    else {
+        panic!("only the context-only finalizer should start");
+    };
+    assert_eq!(step, "aContext");
+    let ActionInput::FinalizationContext(context) = &inputs["context"] else {
+        panic!("context bytes were not committed with the phase boundary");
+    };
+    assert_eq!(
+        context.as_ref(),
+        br#"{"schemaVersion":1,"trigger":"cancelled","primaryFailureStepId":null,"cancellationReason":"user_request","ordinaryIssues":[]}"#
+    );
+
+    let stale: TestReduction = reduce(
+        &state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(11),
+        },
+    );
+    assert_noop(&state, &stale);
+}
+
+#[test]
+fn finalizer_classification_precedes_bytewise_independent_selection() {
+    let definition = finalizer_definition(
+        &[(
+            "source",
+            FailurePolicy::Advisory,
+            &[],
+            &[],
+            &["alpha", "zeta"],
+        )],
+        &[
+            (
+                "aBlocked",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[
+                    ("one", "outputs.source.zeta"),
+                    ("two", "outputs.source.alpha"),
+                    ("again", "outputs.source.zeta"),
+                ],
+                &[],
+            ),
+            (
+                "mFiltered",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Failed],
+                &[],
+                &[],
+            ),
+            (
+                "zIndependent",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+        ],
+        2,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "source".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "source".into(),
+            action: action_id(1),
+            cause: "advisory".into(),
+        },
+    );
+
+    assert_eq!(
+        state.steps["aBlocked"].state,
+        StepState::InputUnavailable {
+            references: vec![
+                "outputs.source.alpha".to_owned(),
+                "outputs.source.zeta".to_owned(),
+            ],
+        }
+    );
+    assert_eq!(
+        state.steps["mFiltered"].state,
+        StepState::NotRun {
+            reason: NotRunReason::FinalizerTriggerNotSelected,
+        }
+    );
+    assert_eq!(
+        boundary
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TransitionEvent::Step {
+                    step,
+                    role: WorkflowNodeRole::Finalizer,
+                    to,
+                    ..
+                } => Some((step.as_str(), *to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("mFiltered", StepStateKind::NotRun),
+            ("aBlocked", StepStateKind::Blocked),
+            ("zIndependent", StepStateKind::Starting),
+        ]
+    );
+    assert!(matches!(
+        boundary.actions.as_slice(),
+        [RequestedAction {
+            action: Action::StartStep { step, .. },
+            ..
+        }] if step == "zIndependent"
+    ));
+}
+
+#[test]
+fn finalizer_ready_prefix_is_bytewise_and_uses_the_execution_parallelism_limit() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[
+            (
+                "zeta",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+            (
+                "alpha",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+            (
+                "middle",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+        ],
+        2,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+
+    assert_eq!(
+        boundary
+            .actions
+            .iter()
+            .filter_map(|requested| match &requested.action {
+                Action::StartStep { step, .. } => Some(step.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["alpha", "middle"]
+    );
+    assert_eq!(state.steps["zeta"].state, StepState::Pending);
+}
+
+#[test]
+fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let release = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+    let graceful = reduce_and_advance(
+        &mut state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(4),
+            reason: CancellationReason::RunnerShutdown,
+            deadline: deadline(40),
+        },
+    );
+    let graceful_action = graceful.actions[0].id;
+    let forced = reduce_and_advance(
+        &mut state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(5),
+            deadline: deadline(41),
+        },
+    );
+    let forced_action = forced.actions[0].id;
+    assert_ne!(forced_action, graceful_action);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Succeeded,
+            gate: FinalizationGate::Cancelling {
+                reason: CancellationReason::RunnerShutdown,
+                deadline: Some(deadline(40)),
+                force_abort: true,
+            },
+            primary_failure: None,
+        }
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "release".into(),
+            action: forced_action,
+        },
+    );
+    let summary = state.finalization_summary.as_ref().unwrap();
+    assert_eq!(
+        summary.cancellation,
+        Some(FinalizationCancellation {
+            reason: CancellationReason::RunnerShutdown,
+            deadline: Some(deadline(40)),
+        })
+    );
+    assert!(summary.force_abort);
+}
+
+#[test]
+fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
+    let definition = finalizer_definition(
+        &[("lint", FailurePolicy::Advisory, &[], &[], &[])],
+        &[(
+            "notify",
+            FailurePolicy::Advisory,
+            &[FinalizationTrigger::Succeeded],
+            &[("context", "finalization.context")],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "lint".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".into(),
+            action: action_id(1),
+            cause: "lint failed".into(),
+        },
+    );
+    let Action::StartStep { inputs, .. } = &boundary.actions[0].action else {
+        panic!()
+    };
+    let ActionInput::FinalizationContext(bytes) = &inputs["context"] else {
+        panic!()
+    };
+    assert_eq!(bytes.as_ref(), br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"}]}"#);
+    let retained = Arc::clone(bytes);
+    let notify = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "notify".into(),
+            action: notify,
+            cause: "later".into(),
+        },
+    );
+    assert_eq!(retained.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn finalizer_is_admitted_at_most_once_per_healthy_attempt() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let release = boundary.actions[0].id;
+    let started = reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+    assert!(started.actions.is_empty());
+    let replay: TestReduction = reduce(
+        &state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+    assert!(!replay.occurrence_accepted);
+    let completed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "release".into(),
+            action: release,
+            provisional: String::new(),
+        },
+    );
+    assert_eq!(
+        completed
+            .actions
+            .iter()
+            .filter(|action| matches!(action.action, Action::FinishRun { .. }))
+            .count(),
+        1
+    );
+    let terminal_replay: TestReduction = reduce(
+        &state,
+        Occurrence::StepExecutionCompleted {
+            step: "release".into(),
+            action: release,
+            provisional: String::new(),
+        },
+    );
+    assert!(!terminal_replay.occurrence_accepted);
+}
+
+#[test]
+fn force_abort_allocates_one_distinct_containment_action_per_active_finalizer() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[
+            (
+                "alpha",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+            (
+                "beta",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+        ],
+        2,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    for requested in boundary.actions {
+        let Action::StartStep { step, .. } = requested.action else {
+            continue;
+        };
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step,
+                action: requested.id,
+            },
+        );
+    }
+
+    let forced = reduce::<String, String, String, TestDeadline>(
+        &state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(3),
+            deadline: deadline(30),
+        },
+    );
+    let containment_ids = forced
+        .actions
+        .iter()
+        .filter_map(|requested| {
+            matches!(requested.action, Action::ForceAbortStep { .. }).then_some(requested.id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(containment_ids.len(), 2);
+    assert!(
+        containment_ids
+            .iter()
+            .all(|id| id.transition_sequence.get() > (1_u64 << 63))
+    );
+}
+
+#[test]
+fn general_transition_bound_is_exact_and_piecewise() {
+    assert_eq!(maximum_transition_count(256, 0), 1_283);
+    assert_eq!(maximum_transition_count(255, 1), 1_286);
+    assert_eq!(maximum_transition_count(1, 0), 8);
+    assert_eq!(maximum_transition_count(1, 1), 16);
 }

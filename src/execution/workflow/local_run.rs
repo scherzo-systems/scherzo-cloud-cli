@@ -35,13 +35,17 @@ use super::process_group::{
     ProcessGuardRegistry, ProcessIdentityObservation, system_process_identity_observation,
     terminate_authenticated_process_group,
 };
-use super::publication::{CancellationReasonV1, cancellation_reason};
+use super::publication::{
+    CancellationReasonV1, FailureV1, FinalizationTriggerV1, StepReasonV1, cancellation_reason,
+    cancellation_step_reason, failure_v1, finalization_trigger,
+};
 use super::resolution::{ResolvedWorkflow, resolve_retained};
-use super::runtime::{StepState, WorkflowState};
+use super::runtime::{FinalizationSummary, StepState, WorkflowState};
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex, lowercase_hex,
     utc_timestamp,
 };
+use super::step_runtime::StepFailureCause;
 
 const RUN_FILE: &str = "run.json";
 const STATE_FILE: &str = "state.json";
@@ -212,6 +216,8 @@ pub(super) struct LocalAttemptV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection: Option<AttemptRejectionV1>,
     pub(super) progress: AttemptProgressV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) finalization: Option<AttemptFinalizationV1>,
     process_guards: Vec<ProcessGuardV1>,
     pub(super) result: AttemptResultV1,
 }
@@ -322,8 +328,76 @@ pub(super) struct AttemptProgressV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AttemptStepV1 {
     pub(super) id: String,
+    pub(super) role: AttemptNodeRoleV1,
     pub(super) failure_policy: FailurePolicy,
     pub(super) state: AttemptStepStateV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AttemptNodeRoleV1 {
+    Step,
+    Finalizer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(super) enum AttemptFinalizationV1 {
+    Progress(AttemptFinalizationProgressV1),
+    Complete(AttemptFinalizationCompleteV1),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptFinalizationProgressV1 {
+    complete: bool,
+    trigger: FinalizationTriggerV1,
+    finalizers: Vec<AttemptStepV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancellation: Option<DurableFinalizationCancellationV1>,
+    force_abort: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptFinalizationCompleteV1 {
+    pub(super) complete: bool,
+    pub(super) trigger: FinalizationTriggerV1,
+    pub(super) finalizers: Vec<DurableFinalizerV1>,
+    pub(super) issues: Vec<DurableFinalizationIssueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation: Option<DurableFinalizationCancellationV1>,
+    pub(super) force_abort: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizerV1 {
+    pub(super) id: String,
+    pub(super) role: AttemptNodeRoleV1,
+    pub(super) failure_policy: FailurePolicy,
+    pub(super) state: AttemptStepStateV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) failure: Option<FailureV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<StepReasonV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) unavailable_references: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizationIssueV1 {
+    pub(super) finalizer_id: String,
+    pub(super) impact: FailurePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizationCancellationV1 {
+    pub(super) reason: CancellationReasonV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) force_stop_deadline: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,6 +422,8 @@ struct OutstandingActionV1 {
     kind: OutstandingActionKindV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_role: Option<AttemptNodeRoleV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -365,6 +441,7 @@ struct ProcessGuardV1 {
     guard_id: String,
     action_id: u64,
     step_id: String,
+    node_role: AttemptNodeRoleV1,
     state: ProcessGuardStateV1,
     execution_host: ExecutionHostV1,
     process_group_id: i64,
@@ -691,6 +768,7 @@ pub(crate) struct LocalAttemptOwner {
     attempt_directory: OwnedFd,
     result_directory: PathBuf,
     attempt_number: u64,
+    finalizers: Arc<[AttemptStepV1]>,
     state: Arc<StateStore>,
 }
 
@@ -776,6 +854,7 @@ impl LocalAttemptOwner {
     pub(crate) fn commit_port(&self) -> LocalRunCommitPort {
         LocalRunCommitPort {
             state: Arc::clone(&self.state),
+            finalizers: Arc::clone(&self.finalizers),
         }
     }
 
@@ -915,9 +994,11 @@ impl Drop for LocalAttemptOwner {
 
 pub(crate) struct LocalRunCommitPort {
     state: Arc<StateStore>,
+    finalizers: Arc<[AttemptStepV1]>,
 }
 
-impl<Cause, Output, Deadline> CommitPort<CommittedReduction<Cause, Output, Deadline>>
+impl<Deadline>
+    CommitPort<CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>>
     for LocalRunCommitPort
 where
     Deadline: DurableDeadline,
@@ -926,9 +1007,9 @@ where
 
     fn commit(
         &mut self,
-        commit: CommittedReduction<Cause, Output, Deadline>,
+        commit: CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
     ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(self.state.commit_runtime(&commit))
+        ready(self.state.commit_runtime(&commit, &self.finalizers))
     }
 }
 
@@ -939,9 +1020,10 @@ struct StateStore {
 }
 
 impl StateStore {
-    fn commit_runtime<Cause, Output, Deadline>(
+    fn commit_runtime<Deadline>(
         &self,
-        commit: &CommittedReduction<Cause, Output, Deadline>,
+        commit: &CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
+        finalizers: &[AttemptStepV1],
     ) -> Result<(), LocalRunDirectoryError>
     where
         Deadline: DurableDeadline,
@@ -957,14 +1039,19 @@ impl StateStore {
                 attempt.progress.accepted_occurrence_ordinal = commit.occurrence_ordinal.get();
             }
             attempt.progress.last_transition_sequence = commit.state.last_transition_sequence.get();
-            update_step_progress(attempt, &commit.state.steps)?;
+            update_step_progress(attempt, &commit.state, finalizers)?;
             attempt.progress.outstanding_actions =
-                outstanding_actions(&attempt.progress.steps, &commit.state.steps)?;
+                outstanding_actions(attempt, &commit.state.steps)?;
             for requested in &commit.actions {
                 if !matches!(requested.kind, CommittedActionKind::FinishRun)
                     && !attempt.progress.outstanding_actions.iter().any(|action| {
                         action.action_id == requested.id.transition_sequence.get()
                             && action.step_id == requested.step
+                            && action.node_role
+                                == requested
+                                    .step
+                                    .as_deref()
+                                    .and_then(|id| attempt_node_role(attempt, id))
                     })
                 {
                     return Err(LocalRunDirectoryError::StateConflict);
@@ -988,8 +1075,16 @@ impl StateStore {
             attempt.state = match &commit.state.workflow {
                 WorkflowState::Executing {
                     gate: super::runtime::SchedulingGate::Cancelling { .. },
+                }
+                | WorkflowState::Finalizing {
+                    gate: super::runtime::FinalizationGate::Cancelling { .. },
+                    ..
                 } => AttemptStateV1::Cancelling,
-                WorkflowState::Executing { .. } => AttemptStateV1::Running,
+                WorkflowState::Executing { .. }
+                | WorkflowState::Finalizing {
+                    gate: super::runtime::FinalizationGate::Open,
+                    ..
+                } => AttemptStateV1::Running,
                 WorkflowState::Succeeded => AttemptStateV1::Succeeded,
                 WorkflowState::Failed { .. } => AttemptStateV1::WorkflowFailed,
                 WorkflowState::Cancelled { .. } => AttemptStateV1::Cancelled,
@@ -1061,16 +1156,21 @@ impl DurableProcessGuardStore for StateStore {
         let guard_id = generate_uuid().map_err(|_| ())?;
         self.update(|state| {
             let attempt = current_attempt_mut(state)?;
-            let registered_action = attempt.progress.outstanding_actions.iter().any(|action| {
-                action.action_id == action_id
-                    && matches!(action.kind, OutstandingActionKindV1::StartStep)
-                    && action.step_id.as_deref() == Some(step)
-            });
-            if !registered_action
-                || attempt
-                    .process_guards
-                    .iter()
-                    .any(|guard| guard.action_id == action_id || guard.guard_id == guard_id)
+            let registered_action = attempt
+                .progress
+                .outstanding_actions
+                .iter()
+                .find(|action| {
+                    action.action_id == action_id
+                        && matches!(action.kind, OutstandingActionKindV1::StartStep)
+                        && action.step_id.as_deref() == Some(step)
+                })
+                .and_then(|action| action.node_role)
+                .ok_or(LocalRunDirectoryError::StateConflict)?;
+            if attempt
+                .process_guards
+                .iter()
+                .any(|guard| guard.action_id == action_id || guard.guard_id == guard_id)
             {
                 return Err(LocalRunDirectoryError::StateConflict);
             }
@@ -1078,6 +1178,7 @@ impl DurableProcessGuardStore for StateStore {
                 guard_id: guard_id.clone(),
                 action_id,
                 step_id: step.to_owned(),
+                node_role: registered_action,
                 state: ProcessGuardStateV1::Prepared,
                 execution_host: attempt.owner.execution_host.clone(),
                 process_group_id: i64::from(identity.process_group().as_raw_pid()),
@@ -1253,6 +1354,7 @@ fn create_with_observer(
         attempt_directory,
         result_directory,
         attempt_number: INITIAL_ATTEMPT_NUMBER,
+        finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
         state,
     })
 }
@@ -1491,41 +1593,262 @@ fn initial_state(
     })
 }
 
-fn update_step_progress<Cause, Output>(
+fn update_step_progress<Deadline>(
     attempt: &mut LocalAttemptV1,
-    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
-) -> Result<(), LocalRunDirectoryError> {
-    if attempt.progress.steps.len() != runtime_steps.len() {
+    runtime: &super::runtime::RuntimeState<StepFailureCause, super::value::CapturedValue, Deadline>,
+    finalizers: &[AttemptStepV1],
+) -> Result<(), LocalRunDirectoryError>
+where
+    Deadline: DurableDeadline,
+{
+    if attempt.progress.steps.len() + finalizers.len() != runtime.steps.len() {
         return Err(LocalRunDirectoryError::StateConflict);
     }
-    for step in &mut attempt.progress.steps {
+    update_progress_nodes(&mut attempt.progress.steps, &runtime.steps)?;
+
+    if let Some(summary) = &runtime.finalization_summary {
+        if finalizers.is_empty() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let mut complete = durable_finalization_summary(summary)?;
+        let finalizer_count = complete.finalizers.len();
+        let mut retained = complete
+            .finalizers
+            .into_iter()
+            .map(|finalizer| (finalizer.id.clone(), finalizer))
+            .collect::<BTreeMap<_, _>>();
+        if retained.len() != finalizer_count || retained.len() != finalizers.len() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        complete.finalizers = finalizers
+            .iter()
+            .map(|expected| {
+                let finalizer = retained
+                    .remove(&expected.id)
+                    .ok_or(LocalRunDirectoryError::StateConflict)?;
+                if finalizer.role != expected.role
+                    || finalizer.failure_policy != expected.failure_policy
+                {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                Ok(finalizer)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !retained.is_empty() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        complete.issues = durable_finalization_issues(&complete.finalizers);
+        attempt.finalization = Some(AttemptFinalizationV1::Complete(complete));
+        return Ok(());
+    }
+
+    let WorkflowState::Finalizing { trigger, gate, .. } = &runtime.workflow else {
+        if attempt.finalization.is_some()
+            || (!finalizers.is_empty()
+                && matches!(
+                    runtime.workflow,
+                    WorkflowState::Succeeded
+                        | WorkflowState::Failed { .. }
+                        | WorkflowState::Cancelled { .. }
+                ))
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        return Ok(());
+    };
+
+    if finalizers.is_empty() {
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    if attempt.finalization.is_none() {
+        attempt.finalization = Some(AttemptFinalizationV1::Progress(
+            AttemptFinalizationProgressV1 {
+                complete: false,
+                trigger: finalization_trigger(*trigger),
+                finalizers: finalizers.to_vec(),
+                cancellation: None,
+                force_abort: false,
+            },
+        ));
+    }
+    let Some(AttemptFinalizationV1::Progress(progress)) = &mut attempt.finalization else {
+        return Err(LocalRunDirectoryError::StateConflict);
+    };
+    progress.trigger = finalization_trigger(*trigger);
+    match gate {
+        super::runtime::FinalizationGate::Open => {
+            progress.cancellation = None;
+            progress.force_abort = false;
+        }
+        super::runtime::FinalizationGate::Cancelling {
+            reason,
+            deadline,
+            force_abort,
+        } => {
+            progress.cancellation = Some(DurableFinalizationCancellationV1 {
+                reason: cancellation_reason(*reason),
+                force_stop_deadline: deadline
+                    .as_ref()
+                    .map(|deadline| timestamp(deadline.deadline_utc()))
+                    .transpose()?,
+            });
+            progress.force_abort = *force_abort;
+        }
+    }
+    update_progress_nodes(&mut progress.finalizers, &runtime.steps)
+}
+
+fn update_progress_nodes<Cause, Output>(
+    nodes: &mut [AttemptStepV1],
+    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
+) -> Result<(), LocalRunDirectoryError> {
+    for node in nodes {
         let runtime = runtime_steps
-            .get(&step.id)
+            .get(&node.id)
             .ok_or(LocalRunDirectoryError::StateConflict)?;
-        step.state = match &runtime.state {
-            StepState::Pending => AttemptStepStateV1::Pending,
-            StepState::Starting => AttemptStepStateV1::Starting,
-            StepState::Running => AttemptStepStateV1::Running,
-            StepState::CapturingOutputs => AttemptStepStateV1::CapturingOutputs,
-            StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
-            StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
-            StepState::Failed { .. } => AttemptStepStateV1::Failed,
-            StepState::Blocked { .. } => AttemptStepStateV1::Blocked,
-            StepState::NotRun { .. } => AttemptStepStateV1::NotRun,
-            StepState::Cancelled { .. } => AttemptStepStateV1::Cancelled,
-        };
+        node.state = attempt_step_state(&runtime.state);
     }
     Ok(())
 }
 
+fn attempt_step_state<Cause, Output>(state: &StepState<Cause, Output>) -> AttemptStepStateV1 {
+    match state {
+        StepState::Pending => AttemptStepStateV1::Pending,
+        StepState::Starting => AttemptStepStateV1::Starting,
+        StepState::Running => AttemptStepStateV1::Running,
+        StepState::CapturingOutputs => AttemptStepStateV1::CapturingOutputs,
+        StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
+        StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
+        StepState::Failed { .. } => AttemptStepStateV1::Failed,
+        StepState::Blocked { .. } | StepState::InputUnavailable { .. } => {
+            AttemptStepStateV1::Blocked
+        }
+        StepState::NotRun { .. } => AttemptStepStateV1::NotRun,
+        StepState::Cancelled { .. } => AttemptStepStateV1::Cancelled,
+    }
+}
+
+fn durable_finalization_summary<Deadline>(
+    summary: &FinalizationSummary<StepFailureCause, Deadline>,
+) -> Result<AttemptFinalizationCompleteV1, LocalRunDirectoryError>
+where
+    Deadline: DurableDeadline,
+{
+    let finalizers = summary
+        .finalizers
+        .iter()
+        .map(|finalizer| {
+            let (state, failure, reason, unavailable_references) = match &finalizer.disposition {
+                StepState::Succeeded { .. } => (AttemptStepStateV1::Succeeded, None, None, None),
+                StepState::Failed { phase, cause } => (
+                    AttemptStepStateV1::Failed,
+                    Some(
+                        failure_v1(*phase, cause)
+                            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?,
+                    ),
+                    None,
+                    None,
+                ),
+                StepState::InputUnavailable { references } => (
+                    AttemptStepStateV1::Blocked,
+                    None,
+                    Some(StepReasonV1::InputUnavailable),
+                    Some(references.clone()),
+                ),
+                StepState::NotRun {
+                    reason: super::runtime::NotRunReason::FinalizerTriggerNotSelected,
+                } => (
+                    AttemptStepStateV1::NotRun,
+                    None,
+                    Some(StepReasonV1::FinalizerTriggerNotSelected),
+                    None,
+                ),
+                StepState::Cancelled { reason } => (
+                    AttemptStepStateV1::Cancelled,
+                    None,
+                    Some(cancellation_step_reason(*reason)),
+                    None,
+                ),
+                StepState::Pending
+                | StepState::Starting
+                | StepState::Running
+                | StepState::CapturingOutputs
+                | StepState::Cancelling { .. }
+                | StepState::Blocked { .. }
+                | StepState::NotRun {
+                    reason: super::runtime::NotRunReason::FailureStop,
+                } => return Err(LocalRunDirectoryError::StateConflict),
+            };
+            Ok(DurableFinalizerV1 {
+                id: finalizer.finalizer.clone(),
+                role: AttemptNodeRoleV1::Finalizer,
+                failure_policy: finalizer.failure_policy,
+                state,
+                failure,
+                reason,
+                unavailable_references,
+            })
+        })
+        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
+    let issues = durable_finalization_issues(&finalizers);
+    let cancellation = summary
+        .cancellation
+        .as_ref()
+        .map(|cancellation| {
+            Ok(DurableFinalizationCancellationV1 {
+                reason: cancellation_reason(cancellation.reason),
+                force_stop_deadline: cancellation
+                    .deadline
+                    .as_ref()
+                    .map(|deadline| timestamp(deadline.deadline_utc()))
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
+    Ok(AttemptFinalizationCompleteV1 {
+        complete: true,
+        trigger: finalization_trigger(summary.trigger),
+        finalizers,
+        issues,
+        cancellation,
+        force_abort: summary.force_abort,
+    })
+}
+
+fn durable_finalization_issues(
+    finalizers: &[DurableFinalizerV1],
+) -> Vec<DurableFinalizationIssueV1> {
+    finalizers
+        .iter()
+        .filter(|finalizer| {
+            finalizer.state == AttemptStepStateV1::Failed
+                || (finalizer.state == AttemptStepStateV1::Blocked
+                    && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+        })
+        .map(|finalizer| DurableFinalizationIssueV1 {
+            finalizer_id: finalizer.id.clone(),
+            impact: finalizer.failure_policy,
+        })
+        .collect()
+}
+
 fn outstanding_actions<Cause, Output>(
-    ordered_steps: &[AttemptStepV1],
+    attempt: &LocalAttemptV1,
     runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
 ) -> Result<Vec<OutstandingActionV1>, LocalRunDirectoryError> {
-    let mut actions = ordered_steps
-        .iter()
-        .filter_map(|step| {
-            let runtime = match runtime_steps.get(&step.id) {
+    let ordered_nodes = attempt.progress.steps.iter().chain(
+        attempt
+            .finalization
+            .iter()
+            .filter_map(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => Some(progress.finalizers.as_slice()),
+                AttemptFinalizationV1::Complete(_) => None,
+            })
+            .flatten(),
+    );
+    let mut actions = ordered_nodes
+        .filter_map(|node| {
+            let runtime = match runtime_steps.get(&node.id) {
                 Some(runtime) => runtime,
                 None => return Some(Err(LocalRunDirectoryError::StateConflict)),
             };
@@ -1538,6 +1861,7 @@ fn outstanding_actions<Cause, Output>(
                 | StepState::Succeeded { .. }
                 | StepState::Failed { .. }
                 | StepState::Blocked { .. }
+                | StepState::InputUnavailable { .. }
                 | StepState::NotRun { .. }
                 | StepState::Cancelled { .. } => {
                     return Some(Err(LocalRunDirectoryError::StateConflict));
@@ -1546,7 +1870,8 @@ fn outstanding_actions<Cause, Output>(
             Some(Ok(OutstandingActionV1 {
                 action_id: action.transition_sequence.get(),
                 kind,
-                step_id: Some(step.id.clone()),
+                step_id: Some(node.id.clone()),
+                node_role: Some(node.role),
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1554,12 +1879,40 @@ fn outstanding_actions<Cause, Output>(
     Ok(actions)
 }
 
+fn attempt_node_role(attempt: &LocalAttemptV1, id: &str) -> Option<AttemptNodeRoleV1> {
+    if attempt.progress.steps.iter().any(|node| node.id == id) {
+        return Some(AttemptNodeRoleV1::Step);
+    }
+    attempt
+        .finalization
+        .as_ref()
+        .and_then(|finalization| match finalization {
+            AttemptFinalizationV1::Progress(progress) => progress
+                .finalizers
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.role),
+            AttemptFinalizationV1::Complete(complete) => complete
+                .finalizers
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.role),
+        })
+}
+
 fn settle_interrupted_attempt(
     attempt: &mut LocalAttemptV1,
     cause: InterruptionCauseV1,
     execution_may_have_started: bool,
 ) -> Result<(), LocalRunDirectoryError> {
-    let cancellation_requested = attempt.cancellation.is_some();
+    let cancellation_requested = attempt.cancellation.is_some()
+        || attempt
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
+                AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
+            });
     attempt.state = AttemptStateV1::Interrupted;
     attempt.settled_at = Some(timestamp(crate::timing::utc_now())?);
     attempt.interruption = Some(AttemptInterruptionV1 {
@@ -2398,6 +2751,7 @@ fn begin_local_retry(
         attempt_directory,
         result_directory,
         attempt_number: next_attempt_number,
+        finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
         state: pending.state,
     })
 }
@@ -2449,17 +2803,15 @@ fn fresh_attempt(
         .presentation_order
         .iter()
         .map(|id| {
-            let failure_policy = match &admitted.workflow().definition.steps[id] {
-                super::validated::ValidatedStep::Command(command) => command.common.failure_policy,
-                super::validated::ValidatedStep::Agent(agent) => agent.common.failure_policy,
-            };
-            AttemptStepV1 {
-                id: id.clone(),
-                failure_policy,
-                state: AttemptStepStateV1::Pending,
-            }
+            let node = admitted
+                .workflow()
+                .definition
+                .steps
+                .get(id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            fresh_progress_node(id, AttemptNodeRoleV1::Step, node)
         })
-        .collect();
+        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
     Ok(LocalAttemptV1 {
         attempt_id: generate_uuid()?,
         attempt_number,
@@ -2483,10 +2835,49 @@ fn fresh_attempt(
             steps,
             outstanding_actions: Vec::new(),
         },
+        finalization: None,
         process_guards: Vec::new(),
         result: AttemptResultV1::NotPublished {
             reason: ResultAbsentReasonV1::AttemptNonterminal,
         },
+    })
+}
+
+fn fresh_finalizer_progress(
+    admitted: &AdmittedWorkflow,
+) -> Result<Vec<AttemptStepV1>, LocalRunDirectoryError> {
+    admitted
+        .workflow()
+        .definition
+        .finalizer_presentation_order
+        .iter()
+        .map(|id| {
+            let node = &admitted
+                .workflow()
+                .definition
+                .finalizers
+                .get(id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?
+                .body;
+            fresh_progress_node(id, AttemptNodeRoleV1::Finalizer, node)
+        })
+        .collect()
+}
+
+fn fresh_progress_node(
+    id: &str,
+    role: AttemptNodeRoleV1,
+    node: &super::validated::ValidatedStep,
+) -> Result<AttemptStepV1, LocalRunDirectoryError> {
+    let failure_policy = match node {
+        super::validated::ValidatedStep::Command(command) => command.common.failure_policy,
+        super::validated::ValidatedStep::Agent(agent) => agent.common.failure_policy,
+    };
+    Ok(AttemptStepV1 {
+        id: id.to_owned(),
+        role,
+        failure_policy,
+        state: AttemptStepStateV1::Pending,
     })
 }
 
@@ -2934,20 +3325,31 @@ fn validate_attempt(
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
+    let finalization_cancelled =
+        attempt
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
+                AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
+            });
     if attempt.cancellation.as_ref().is_some_and(|cancellation| {
-        !valid_timestamp(&cancellation.requested_at)
+        cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+            || !valid_timestamp(&cancellation.requested_at)
             || !valid_timestamp(&cancellation.force_stop_deadline)
     }) || matches!(
         attempt.state,
         AttemptStateV1::Cancelling | AttemptStateV1::Cancelled
     ) && attempt.cancellation.is_none()
+        && !finalization_cancelled
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
     if attempt.cancellation.as_ref().is_some_and(|cancellation| {
         cancellation.workflow_confirmed != matches!(attempt.state, AttemptStateV1::Cancelled)
     }) || attempt.interruption.as_ref().is_some_and(|interruption| {
-        interruption.cancellation_requested != attempt.cancellation.is_some()
+        interruption.cancellation_requested
+            != (attempt.cancellation.is_some() || finalization_cancelled)
     }) {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
@@ -2960,19 +3362,27 @@ fn validate_attempt(
     }
     let mut step_ids = BTreeSet::new();
     for step in &attempt.progress.steps {
-        if step.id.is_empty() || !step_ids.insert(step.id.as_str()) {
+        if step.id.is_empty()
+            || step.role != AttemptNodeRoleV1::Step
+            || !step_ids.insert(step.id.as_str())
+        {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
     }
+    validate_attempt_finalization(attempt, &mut step_ids)?;
     let mut action_ids = BTreeSet::new();
     let mut prior_action_id = 0;
     for action in &attempt.progress.outstanding_actions {
         let requires_step = !matches!(action.kind, OutstandingActionKindV1::FinishRun);
         if action.action_id == 0
             || action.action_id <= prior_action_id
-            || action.action_id > attempt.progress.last_transition_sequence
             || !action_ids.insert(action.action_id)
             || requires_step != action.step_id.is_some()
+            || requires_step != action.node_role.is_some()
+            || action
+                .step_id
+                .as_deref()
+                .is_some_and(|id| attempt_node_role(attempt, id) != action.node_role)
         {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
@@ -2986,8 +3396,8 @@ fn validate_attempt(
         if !is_canonical_uuid(&guard.guard_id)
             || !guard_ids.insert(guard.guard_id.as_str())
             || guard.action_id == 0
-            || guard.action_id > attempt.progress.last_transition_sequence
             || !step_ids.contains(guard.step_id.as_str())
+            || attempt_node_role(attempt, &guard.step_id) != Some(guard.node_role)
             || !validate_execution_host(&guard.execution_host)
             || guard.process_group_id <= 0
             || guard.liveness.value.is_empty()
@@ -2997,6 +3407,174 @@ fn validate_attempt(
         }
     }
     validate_attempt_result(attempt)
+}
+
+fn validate_attempt_finalization<'a>(
+    attempt: &'a LocalAttemptV1,
+    node_ids: &mut BTreeSet<&'a str>,
+) -> Result<(), LocalRunDirectoryError> {
+    let Some(finalization) = &attempt.finalization else {
+        return Ok(());
+    };
+    match finalization {
+        AttemptFinalizationV1::Progress(progress) => {
+            if progress.complete
+                || progress.finalizers.is_empty()
+                || progress.finalizers.iter().any(|finalizer| {
+                    finalizer.role != AttemptNodeRoleV1::Finalizer
+                        || finalizer.id.is_empty()
+                        || !node_ids.insert(finalizer.id.as_str())
+                })
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if matches!(
+                attempt.state,
+                AttemptStateV1::Created | AttemptStateV1::Rejected
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if !valid_finalization_interruption(
+                progress.cancellation.as_ref(),
+                progress.force_abort,
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if matches!(
+                attempt.state,
+                AttemptStateV1::Succeeded
+                    | AttemptStateV1::WorkflowFailed
+                    | AttemptStateV1::Cancelled
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        AttemptFinalizationV1::Complete(complete) => {
+            if !complete.complete
+                || complete.finalizers.is_empty()
+                || !matches!(
+                    attempt.state,
+                    AttemptStateV1::Succeeded
+                        | AttemptStateV1::WorkflowFailed
+                        | AttemptStateV1::Cancelled
+                )
+                || complete.finalizers.iter().any(|finalizer| {
+                    finalizer.role != AttemptNodeRoleV1::Finalizer
+                        || finalizer.id.is_empty()
+                        || !node_ids.insert(finalizer.id.as_str())
+                        || !durable_finalizer_valid(finalizer)
+                })
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            let expected_issues = complete
+                .finalizers
+                .iter()
+                .filter(|finalizer| {
+                    finalizer.state == AttemptStepStateV1::Failed
+                        || (finalizer.state == AttemptStepStateV1::Blocked
+                            && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+                })
+                .map(|finalizer| (finalizer.id.as_str(), finalizer.failure_policy))
+                .collect::<Vec<_>>();
+            if complete.issues.len() != expected_issues.len()
+                || complete
+                    .issues
+                    .iter()
+                    .zip(expected_issues)
+                    .any(|(issue, (id, impact))| issue.finalizer_id != id || issue.impact != impact)
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if !valid_finalization_interruption(
+                complete.cancellation.as_ref(),
+                complete.force_abort,
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_finalization_interruption(
+    cancellation: Option<&DurableFinalizationCancellationV1>,
+    force_abort: bool,
+) -> bool {
+    match (cancellation, force_abort) {
+        (None, false) => true,
+        (Some(cancellation), false) => {
+            cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                && cancellation
+                    .force_stop_deadline
+                    .as_deref()
+                    .is_some_and(valid_timestamp)
+        }
+        (Some(cancellation), true) => {
+            (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+                && cancellation.force_stop_deadline.is_none())
+                || (cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                    && cancellation
+                        .force_stop_deadline
+                        .as_deref()
+                        .is_some_and(valid_timestamp))
+        }
+        (None, true) => false,
+    }
+}
+
+fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
+    match finalizer.state {
+        AttemptStepStateV1::Succeeded => {
+            finalizer.failure.is_none()
+                && finalizer.reason.is_none()
+                && finalizer.unavailable_references.is_none()
+        }
+        AttemptStepStateV1::Failed => {
+            finalizer
+                .failure
+                .as_ref()
+                .is_some_and(|failure| super::result_metadata::validate_failure(failure).is_ok())
+                && finalizer.reason.is_none()
+                && finalizer.unavailable_references.is_none()
+        }
+        AttemptStepStateV1::Blocked => {
+            finalizer.failure.is_none()
+                && finalizer.reason == Some(StepReasonV1::InputUnavailable)
+                && finalizer
+                    .unavailable_references
+                    .as_ref()
+                    .is_some_and(|references| {
+                        !references.is_empty()
+                            && references.windows(2).all(|pair| pair[0] < pair[1])
+                    })
+        }
+        AttemptStepStateV1::NotRun => {
+            finalizer.failure.is_none()
+                && finalizer.reason == Some(StepReasonV1::FinalizerTriggerNotSelected)
+                && finalizer.unavailable_references.is_none()
+        }
+        AttemptStepStateV1::Cancelled => {
+            finalizer.failure.is_none()
+                && matches!(
+                    finalizer.reason,
+                    Some(
+                        StepReasonV1::UserRequest
+                            | StepReasonV1::TerminationRequest
+                            | StepReasonV1::CallerOutputFailure
+                            | StepReasonV1::RunnerShutdown
+                            | StepReasonV1::ExecutionLeaseExpired
+                            | StepReasonV1::FinalizationForceAbort
+                    )
+                )
+                && finalizer.unavailable_references.is_none()
+        }
+        AttemptStepStateV1::Pending
+        | AttemptStepStateV1::Starting
+        | AttemptStepStateV1::Running
+        | AttemptStepStateV1::CapturingOutputs
+        | AttemptStepStateV1::Cancelling => false,
+    }
 }
 
 fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
@@ -3192,29 +3770,7 @@ fn valid_timestamp(value: &str) -> bool {
 }
 
 fn generate_uuid() -> Result<String, LocalRunDirectoryError> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| LocalRunDirectoryError::IdentityUnavailable)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
-    ))
+    super::identity::random_uuid_v4().map_err(|()| LocalRunDirectoryError::IdentityUnavailable)
 }
 
 fn is_canonical_uuid(value: &str) -> bool {

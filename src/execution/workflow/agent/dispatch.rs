@@ -3,8 +3,8 @@ use std::io;
 use std::num::NonZeroU64;
 
 use super::{
-    AgentAdapter, AgentFailureCause, AgentObservationSink, AgentOutcome, AgentStartCallback,
-    AgentTerminalCallback, invoke_agent_adapter,
+    AgentAdapter, AgentFailureCause, AgentObservationSink, AgentStartCallback,
+    AgentTerminalCallback, failed_agent_outcome, invoke_agent_adapter,
 };
 use crate::execution::workflow::agent_input::ClosedAgentInvocation;
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
@@ -36,9 +36,9 @@ pub(crate) async fn invoke_agent_dispatcher<Dispatcher, Sink>(
 {
     let unreported_return = terminal.clone();
     dispatcher.invoke(invocation, started, terminal).await;
-    let _ = unreported_return.report(AgentOutcome::Failed {
-        cause: AgentFailureCause::HarnessProtocolFailed,
-    });
+    let _ = unreported_return.report(failed_agent_outcome(
+        AgentFailureCause::HarnessProtocolFailed,
+    ));
 }
 
 #[derive(Clone)]

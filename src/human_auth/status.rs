@@ -5,8 +5,8 @@ use crate::api::{
     UnreachableCategory,
 };
 
-use super::credentials::{CredentialError, CredentialStore};
 use super::deployment::Deployment;
+use super::session::{self, SessionError};
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticationStatus {
@@ -38,27 +38,27 @@ pub(crate) fn check(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<AuthenticationStatus, StatusError> {
-    let store = CredentialStore::from_environment().map_err(StatusError::CredentialStore)?;
-    let credential = store
-        .selected(deployment.fingerprint(), crate::timing::utc_now())
-        .map_err(StatusError::CredentialStore)?;
-    let access_token = credential
-        .as_ref()
-        .map(|credential| credential.access_token());
-    let outcome =
-        api::get_current_principal(client, deployment.fingerprint().api_url(), access_token);
+    let outcome = match session::execute_optional(
+        client,
+        deployment,
+        |access_token| {
+            api::get_current_principal(client, deployment.fingerprint().api_url(), access_token)
+        },
+        |outcome| {
+            matches!(outcome, Ok(CurrentPrincipalOutcome::Unauthenticated))
+                || outcome
+                    .as_ref()
+                    .is_err_and(CurrentPrincipalError::credential_rejected)
+        },
+    ) {
+        Ok(outcome) => outcome.map_err(StatusError::PublicApi)?,
+        Err(error) => match error.unreachable_category() {
+            Some(category) => CurrentPrincipalOutcome::Unreachable(category),
+            None => return Err(StatusError::Session(error)),
+        },
+    };
 
-    let credential_rejected = matches!(&outcome, Ok(CurrentPrincipalOutcome::Unauthenticated))
-        || outcome
-            .as_ref()
-            .is_err_and(|error| error.credential_rejected());
-    if credential_rejected && let Some(access_token) = access_token {
-        store
-            .remove_if_access_token_matches(deployment.fingerprint(), access_token)
-            .map_err(StatusError::CredentialStore)?;
-    }
-
-    let state = match outcome.map_err(StatusError::PublicApi)? {
+    let state = match outcome {
         CurrentPrincipalOutcome::Authenticated(authenticated) => {
             AuthenticationState::Authenticated(authenticated)
         }
@@ -79,14 +79,14 @@ pub(crate) fn check(
 
 #[derive(Debug)]
 pub(crate) enum StatusError {
-    CredentialStore(CredentialError),
+    Session(SessionError),
     PublicApi(CurrentPrincipalError),
 }
 
 impl fmt::Display for StatusError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CredentialStore(error) => write!(formatter, "access credential store: {error}"),
+            Self::Session(error) => write!(formatter, "acquire human session: {error}"),
             Self::PublicApi(error) => write!(formatter, "contact Scherzo Cloud: {error}"),
         }
     }

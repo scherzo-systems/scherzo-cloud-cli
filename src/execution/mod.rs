@@ -1,4 +1,5 @@
 pub(crate) mod claude_code;
+pub(crate) mod codex;
 mod harness_installation;
 pub(crate) mod pi;
 pub(crate) mod workflow;
@@ -7,4 +8,5 @@ pub(crate) mod workflow;
 pub(crate) enum AgentHarnessInstallationFailure {
     Pi(pi::PiInstallationFailure),
     ClaudeCode(claude_code::ClaudeCodeInstallationFailure),
+    Codex(codex::CodexInstallationFailure),
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::admission::AdmittedWorkflow;
+use super::admission::{AdmittedWorkflow, CancellationOperation};
 use super::runtime::{
     self, ActionId, CancellationRequest, Occurrence, OutputSet, Reduction, RequestedAction,
     RuntimeState, TransitionEvent, WorkflowState,
@@ -139,6 +139,15 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             },
             Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
             Occurrence::CancellationRequested { deadline, .. } => match deadline {},
+            Occurrence::CancellationOperationRequested {
+                operation: _,
+                deadline,
+                ..
+            } => match deadline {},
+            Occurrence::ForceAbortRequested {
+                operation: _,
+                deadline,
+            } => match deadline {},
         }
     }
 }
@@ -458,6 +467,7 @@ pub(crate) enum CommittedActionKind {
     StartStep,
     CaptureOutputs,
     CancelStep,
+    ForceAbortStep,
     FinishRun,
 }
 
@@ -472,7 +482,7 @@ pub(crate) struct CommittedAction {
 pub(crate) struct CommittedReduction<Cause, Output, Deadline> {
     pub(crate) occurrence_ordinal: OccurrenceOrdinal,
     pub(crate) occurrence_accepted: bool,
-    pub(crate) state: RuntimeState<Cause, Output>,
+    pub(crate) state: RuntimeState<Cause, Output, Deadline>,
     pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
     pub(crate) actions: Vec<CommittedAction>,
 }
@@ -500,8 +510,8 @@ pub(crate) enum CoordinationError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CoordinationResult<Cause, Output> {
-    pub(crate) state: RuntimeState<Cause, Output>,
+pub(crate) struct CoordinationResult<Cause, Output, Deadline = ()> {
+    pub(crate) state: RuntimeState<Cause, Output, Deadline>,
     pub(crate) last_occurrence_ordinal: OccurrenceOrdinal,
 }
 
@@ -522,7 +532,7 @@ where
     clock: Clock,
     commits: Commits,
     actions: Actions,
-    state: Option<RuntimeState<Cause, Output>>,
+    state: Option<RuntimeState<Cause, Output, Clock::Instant>>,
 }
 
 impl<Provisional, Cause, Output, Clock, Commits, Actions>
@@ -553,27 +563,30 @@ where
 
     pub(crate) async fn run(
         mut self,
-    ) -> Result<CoordinationResult<Cause, Output>, CoordinationError> {
-        let mut cancellation = self
-            .admitted
-            .execution()
-            .cancellation()
-            .source()
-            .subscribe();
+    ) -> Result<CoordinationResult<Cause, Output, Clock::Instant>, CoordinationError> {
+        let cancellation_source = self.admitted.execution().cancellation().source().clone();
+        let mut cancellation = cancellation_source.subscribe_operations();
         let grace = self.admitted.execution().cancellation().grace();
-        let initial_reason = *cancellation.borrow_and_update();
-        let mut cancellation_admitted = initial_reason.is_some();
-        let initial_cancellation = initial_reason.map(|reason| CancellationRequest {
-            reason,
-            deadline: self.clock.now() + grace,
-        });
+        let initial_operation = cancellation.next_operation();
+        let (initial_cancellation, initial_cancellation_operation) = match initial_operation {
+            Some(CancellationOperation::Graceful { id, reason }) => (
+                Some(CancellationRequest {
+                    reason,
+                    deadline: self.clock.now() + grace,
+                }),
+                Some(id),
+            ),
+            Some(CancellationOperation::ForceAbort { .. }) | None => (None, None),
+        };
         let mut ordinal = OccurrenceOrdinal(0)
             .next()
             .ok_or(CoordinationError::OccurrenceOrdinalExhausted)?;
-        let initialization = runtime::initialize::<Provisional, Cause, Output, Clock::Instant>(
-            &self.admitted,
-            initial_cancellation,
-        );
+        let initialization =
+            runtime::initialize_with_operation::<Provisional, Cause, Output, Clock::Instant>(
+                &self.admitted,
+                initial_cancellation,
+                initial_cancellation_operation,
+            );
         if self.commit(ordinal, initialization, None).await? {
             return self.result(ordinal);
         }
@@ -582,59 +595,67 @@ where
             let (occurrence, acknowledgement, ordinal_assigned) = loop {
                 let input = tokio::select! {
                     biased;
-                    changed = cancellation.changed(), if !cancellation_admitted => {
+                    changed = cancellation.changed() => {
                         if changed.is_err() {
                             return Err(CoordinationError::OccurrenceChannelClosed);
                         }
-                        let Some(reason) = *cancellation.borrow_and_update() else {
+                        let Some(operation) = cancellation.next_operation() else {
                             continue;
                         };
-                        cancellation_admitted = true;
-                        CoordinatorInput::Cancellation(Occurrence::CancellationRequested {
-                            reason,
-                            deadline: self.clock.now() + grace,
-                        })
+                        let occurrence = match operation {
+                            CancellationOperation::Graceful { id, reason } => {
+                                Occurrence::CancellationOperationRequested {
+                                    operation: id,
+                                    reason,
+                                    deadline: self.clock.now() + grace,
+                                }
+                            }
+                            CancellationOperation::ForceAbort { id } => {
+                                Occurrence::ForceAbortRequested {
+                                    operation: id,
+                                    deadline: self.clock.now(),
+                                }
+                            }
+                        };
+                        CoordinatorInput::Cancellation(occurrence)
                     }
                     driver_occurrence = self.occurrences.recv_delivery() => {
                         let Some(driver_occurrence) = driver_occurrence else {
                             return Err(CoordinationError::OccurrenceChannelClosed);
                         };
-                        if cancellation_admitted {
+                        // Bias only orders this select poll. The operation queue is read again
+                        // before assigning a driver ordinal so cancellation cannot be skipped.
+                        if let Some(operation) = cancellation.next_operation() {
+                            self.occurrences.retain_delivery(driver_occurrence);
+                            let occurrence = match operation {
+                                CancellationOperation::Graceful { id, reason } => {
+                                    Occurrence::CancellationOperationRequested {
+                                        operation: id,
+                                        reason,
+                                        deadline: self.clock.now() + grace,
+                                    }
+                                }
+                                CancellationOperation::ForceAbort { id } => {
+                                    Occurrence::ForceAbortRequested {
+                                        operation: id,
+                                        deadline: self.clock.now(),
+                                    }
+                                }
+                            };
+                            CoordinatorInput::Cancellation(occurrence)
+                        } else {
                             let Some(selected) = driver_occurrence.select() else {
                                 continue;
                             };
+                            let ordinal_assigned = selected.is_resolved();
+                            if ordinal_assigned {
+                                ordinal = ordinal.next().ok_or(
+                                    CoordinationError::OccurrenceOrdinalExhausted,
+                                )?;
+                            }
                             CoordinatorInput::Driver {
                                 selected,
-                                ordinal_assigned: false,
-                            }
-                        } else {
-                            // Bias only orders this select poll. This read guard serializes
-                            // admission until the delivery is retained, assigned an ordinal,
-                            // or selected and acknowledged as a claim.
-                            let admitted_reason = cancellation.borrow_and_update();
-                            if let Some(reason) = *admitted_reason {
-                                self.occurrences.retain_delivery(driver_occurrence);
-                                cancellation_admitted = true;
-                                CoordinatorInput::Cancellation(
-                                    Occurrence::CancellationRequested {
-                                        reason,
-                                        deadline: self.clock.now() + grace,
-                                    },
-                                )
-                            } else {
-                                let Some(selected) = driver_occurrence.select() else {
-                                    continue;
-                                };
-                                let ordinal_assigned = selected.is_resolved();
-                                if ordinal_assigned {
-                                    ordinal = ordinal.next().ok_or(
-                                        CoordinationError::OccurrenceOrdinalExhausted,
-                                    )?;
-                                }
-                                CoordinatorInput::Driver {
-                                    selected,
-                                    ordinal_assigned,
-                                }
+                                ordinal_assigned,
                             }
                         }
                     }
@@ -687,10 +708,28 @@ where
             actions,
             occurrence_accepted,
         } = reduction;
-        let terminal = !matches!(&state.workflow, WorkflowState::Executing { .. });
+        let terminal = matches!(
+            &state.workflow,
+            WorkflowState::Succeeded
+                | WorkflowState::Failed { .. }
+                | WorkflowState::Cancelled { .. }
+        );
+        let entered_finalization = events.iter().any(|event| {
+            matches!(
+                event,
+                TransitionEvent::Workflow {
+                    to: WorkflowState::Finalizing { .. },
+                    ..
+                }
+            )
+        });
         let committed_actions = actions.iter().map(committed_action).collect();
         let committed_state = state.clone();
-        self.commits
+        let cancellation = self.admitted.execution().cancellation().source();
+        let finalization_arm_started =
+            entered_finalization && cancellation.begin_finalization_arm();
+        if self
+            .commits
             .commit(CommittedReduction {
                 occurrence_ordinal,
                 occurrence_accepted,
@@ -699,8 +738,17 @@ where
                 actions: committed_actions,
             })
             .await
-            .map_err(|_| CoordinationError::CommitFailed)?;
+            .is_err()
+        {
+            if finalization_arm_started {
+                cancellation.abort_finalization_arm();
+            }
+            return Err(CoordinationError::CommitFailed);
+        }
         self.state = Some(state);
+        if finalization_arm_started {
+            cancellation.complete_finalization_arm();
+        }
         if let Some(finalization) =
             acknowledgement.and_then(|acknowledgement| acknowledgement.resolve(occurrence_accepted))
         {
@@ -718,7 +766,7 @@ where
     fn result(
         &self,
         last_occurrence_ordinal: OccurrenceOrdinal,
-    ) -> Result<CoordinationResult<Cause, Output>, CoordinationError> {
+    ) -> Result<CoordinationResult<Cause, Output, Clock::Instant>, CoordinationError> {
         let Some(state) = self.state.clone() else {
             return Err(CoordinationError::ReducerStateUnavailable);
         };
@@ -741,6 +789,9 @@ fn committed_action<Provisional, Cause, Output, Deadline>(
         }
         runtime::Action::CancelStep { step, .. } => {
             (CommittedActionKind::CancelStep, Some(step.clone()))
+        }
+        runtime::Action::ForceAbortStep { step, .. } => {
+            (CommittedActionKind::ForceAbortStep, Some(step.clone()))
         }
         runtime::Action::FinishRun { .. } => (CommittedActionKind::FinishRun, None),
     };

@@ -42,6 +42,14 @@ impl FinalizationTrigger {
             .into_iter()
             .collect()
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

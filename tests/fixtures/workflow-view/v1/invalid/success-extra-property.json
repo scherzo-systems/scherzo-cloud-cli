@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow view",
+  "outcome": "view",
+  "exitStatus": 0,
+  "runDirectory": "/tmp/run",
+  "currentAttemptNumber": 1,
+  "attemptNumber": 1,
+  "selection": "current",
+  "trigger": "initial",
+  "attemptState": "succeeded",
+  "resultDirectory": "/tmp/run/attempts/000001/result",
+  "result": {},
+  "extra": true
+}

@@ -10,7 +10,6 @@
   "payloadVersion": 1,
   "payload": {
     "runnerVersion": "0.2.0",
-    "maxConcurrentRuns": 1,
-    "unexpected": true
+    "maxConcurrentRuns": 1
   }
 }

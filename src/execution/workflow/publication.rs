@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -23,13 +24,13 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
-use super::agent::AgentFailureCause;
+use super::agent::{AgentFailure, AgentFailureCause, AgentProtocolRejectionDiagnostic};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind, StagedCarrier};
 use super::artifact_set;
 use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
-use super::document::FailurePolicy;
+use super::document::{FailurePolicy, FinalizationTrigger};
 use super::execution_root::open_directory;
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
@@ -45,6 +46,7 @@ use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
+use super::validated::WorkflowNodeRole;
 use super::validated::{ResolvedOutputSource, WorkflowValueType};
 use super::value::CapturedValue;
 
@@ -61,7 +63,7 @@ pub(crate) struct WorkflowRunTiming {
     pub(crate) duration: Duration,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowStepTiming {
     pub(crate) started_at: OffsetDateTime,
     pub(crate) duration: Duration,
@@ -79,14 +81,29 @@ pub(crate) enum WorkflowRunStepKind {
     Agent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowRunStep {
     pub(crate) id: String,
+    pub(crate) role: WorkflowNodeRole,
     pub(crate) kind: WorkflowRunStepKind,
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: StepState<StepFailureCause, CapturedValue>,
     pub(crate) timing: Option<WorkflowStepTiming>,
     pub(crate) command_output: Option<StepDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunFinalization {
+    pub(crate) trigger: FinalizationTrigger,
+    pub(crate) finalizers: Vec<WorkflowRunStep>,
+    pub(crate) cancellation: Option<WorkflowRunFinalizationCancellation>,
+    pub(crate) force_abort: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunFinalizationCancellation {
+    pub(crate) reason: CancellationReason,
+    pub(crate) force_stop_deadline: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,8 +119,82 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) outcome: RunOutcome<StepFailureCause>,
     pub(crate) cancellation: Option<WorkflowRunCancellation>,
     pub(crate) steps: Vec<WorkflowRunStep>,
+    pub(crate) finalization: Option<WorkflowRunFinalization>,
     pub(crate) exports: ExportSet<CapturedValue>,
     pub(crate) export_sources: BTreeMap<String, ResolvedOutputSource>,
+}
+
+#[derive(Clone)]
+pub(crate) enum CloudCarrierBody {
+    Staged(StagedCarrier),
+    Bytes(Arc<[u8]>),
+}
+
+#[derive(Clone)]
+pub(crate) struct CloudResultCarrier {
+    pub(crate) portable_owner_path: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) media_type: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) body: CloudCarrierBody,
+}
+
+pub(crate) struct PreparedCloudWorkflowResult {
+    pub(crate) result_json: Arc<[u8]>,
+    pub(crate) carriers: Vec<CloudResultCarrier>,
+}
+
+pub(crate) fn summary_disposition_matches(
+    summarized: &StepState<StepFailureCause, ()>,
+    state: &StepState<StepFailureCause, CapturedValue>,
+) -> bool {
+    match (summarized, state) {
+        (StepState::Succeeded { .. }, StepState::Succeeded { .. }) => true,
+        (
+            StepState::Failed {
+                phase: left_phase,
+                cause: left_cause,
+            },
+            StepState::Failed {
+                phase: right_phase,
+                cause: right_cause,
+            },
+        ) => left_phase == right_phase && left_cause == right_cause,
+        (
+            StepState::Blocked {
+                dependency: left_dependency,
+            },
+            StepState::Blocked {
+                dependency: right_dependency,
+            },
+        ) => left_dependency == right_dependency,
+        (
+            StepState::InputUnavailable {
+                references: left_references,
+            },
+            StepState::InputUnavailable {
+                references: right_references,
+            },
+        ) => left_references == right_references,
+        (
+            StepState::NotRun {
+                reason: left_reason,
+            },
+            StepState::NotRun {
+                reason: right_reason,
+            },
+        ) => left_reason == right_reason,
+        (
+            StepState::Cancelled {
+                reason: left_reason,
+            },
+            StepState::Cancelled {
+                reason: right_reason,
+            },
+        ) => left_reason == right_reason,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +218,7 @@ pub(crate) enum LocalPublicationFailureKind {
     ExportWriteUnavailable,
     UnsupportedExport,
     InvalidRunResult,
+    ResultConflict,
     SerializationUnavailable,
     VerificationUnavailable,
     AtomicPublicationUnavailable,
@@ -262,6 +354,12 @@ pub(crate) struct WorkflowResultV1 {
     )]
     pub(crate) cancellation: Option<CancellationV1>,
     pub(crate) steps: Vec<WorkflowStepV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) finalization: Option<FinalizationV1>,
     pub(crate) exports: BTreeMap<String, ExportV1>,
 }
 
@@ -274,16 +372,29 @@ pub(crate) struct WorkflowIdentityV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct WorkflowProvenanceV1 {
-    pub(crate) kind: String,
-    pub(crate) source_root: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum WorkflowProvenanceV1 {
+    Local {
+        #[serde(rename = "sourceRoot")]
+        source_root: String,
+    },
+    Cloud {
+        #[serde(rename = "projectId")]
+        project_id: String,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowExecutionV1 {
-    pub(crate) execution_root: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) execution_root: Option<String>,
     pub(crate) maximum_parallel_steps: usize,
     pub(crate) started_at: String,
     pub(crate) finished_at: String,
@@ -319,6 +430,7 @@ pub(crate) enum CancellationReasonV1 {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
+    FinalizationForceAbort,
 }
 
 // The published result's terminal-only enum must remain closed independently of the
@@ -335,10 +447,25 @@ pub(crate) enum WorkflowStepStateV1 {
 }
 // jscpd:ignore-end
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkflowNodeRoleV1 {
+    Step,
+    Finalizer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowNodeV1 {
+    pub(crate) id: String,
+    pub(crate) role: WorkflowNodeRoleV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowStepV1 {
     pub(crate) id: String,
+    pub(crate) role: WorkflowNodeRoleV1,
     pub(crate) kind: String,
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: WorkflowStepStateV1,
@@ -377,7 +504,55 @@ pub(crate) struct WorkflowStepV1 {
         deserialize_with = "deserialize_non_null_option",
         skip_serializing_if = "Option::is_none"
     )]
+    pub(crate) unavailable_references: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) command_output: Option<CommandOutputV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FinalizationV1 {
+    pub(crate) trigger: FinalizationTriggerV1,
+    pub(crate) finalizers: Vec<WorkflowStepV1>,
+    pub(crate) issues: Vec<FinalizationIssueV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) cancellation: Option<FinalizationCancellationV1>,
+    pub(crate) force_abort: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalizationTriggerV1 {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FinalizationIssueV1 {
+    pub(crate) node: WorkflowNodeV1,
+    pub(crate) impact: FailurePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FinalizationCancellationV1 {
+    pub(crate) reason: CancellationReasonV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) force_stop_deadline: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -389,6 +564,9 @@ pub(crate) enum StepReasonV1 {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
+    FinalizationForceAbort,
+    InputUnavailable,
+    FinalizerTriggerNotSelected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -522,6 +700,12 @@ pub(crate) struct FailureCauseV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) exit_code: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) protocol_rejection: Option<AgentProtocolRejectionDiagnostic>,
 }
 
 fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -540,6 +724,7 @@ impl FailureCauseV1 {
             collection_index: None,
             output: None,
             exit_code: None,
+            protocol_rejection: None,
         }
     }
 }
@@ -547,7 +732,7 @@ impl FailureCauseV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrimaryFailureV1 {
-    pub(crate) step: String,
+    pub(crate) node: WorkflowNodeV1,
     pub(crate) phase: FailurePhaseV1,
     pub(crate) cause: FailureCauseV1,
 }
@@ -746,8 +931,12 @@ pub(crate) enum ExportUnavailableReasonV1 {
     Failed,
     #[serde(rename = "source_blocked")]
     Blocked,
+    #[serde(rename = "source_input_unavailable")]
+    InputUnavailable,
     #[serde(rename = "source_not_run")]
     NotRun,
+    #[serde(rename = "source_trigger_not_selected")]
+    TriggerNotSelected,
     #[serde(rename = "source_cancelled")]
     Cancelled,
 }
@@ -829,6 +1018,204 @@ pub(crate) fn publish_workflow_result(
     publish_prepared_workflow_result(&destination, artifacts, run)
 }
 
+pub(crate) fn prepare_cloud_workflow_result(
+    run: &WorkflowRunResult,
+    project_id: String,
+    workflow_id: String,
+) -> Result<PreparedCloudWorkflowResult, LocalPublicationError> {
+    if !run.exports.keys().eq(run.export_sources.keys()) {
+        return Err(invalid_run_result());
+    }
+    let mut exports = BTreeMap::new();
+    let mut carriers = Vec::new();
+    let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
+    for (index, (name, export)) in run.exports.iter().enumerate() {
+        let ordinal = index.checked_add(1).ok_or_else(invalid_run_result)?;
+        let source = run
+            .export_sources
+            .get(name)
+            .ok_or_else(invalid_run_result)?;
+        let identity = (source.node.id.clone(), source.output.clone());
+        let metadata = match export {
+            ExportValue::Unavailable { reason } => {
+                unavailable_export(&mut sources, identity, source, *reason)?
+            }
+            ExportValue::Available { output } => {
+                if !captured_type_matches(source.value_type, output) {
+                    return Err(invalid_run_result());
+                }
+                match existing_available_export(&sources, &identity, source, output)? {
+                    Some(metadata) => metadata,
+                    None => {
+                        let (metadata, carrier) =
+                            cloud_available_export(name, ordinal, source, output)?;
+                        if let Some(carrier) = carrier {
+                            carriers.push(carrier);
+                        }
+                        insert_available_source(&mut sources, identity, source, output, &metadata);
+                        metadata
+                    }
+                }
+            }
+        };
+        exports.insert(name.clone(), metadata);
+    }
+    let result = build_result_with_provenance(
+        run,
+        WorkflowProvenanceV1::Cloud {
+            project_id,
+            workflow_id,
+        },
+        exports,
+    )?;
+    let result_json = encode_result_json(&result)?;
+    Ok(PreparedCloudWorkflowResult {
+        result_json: Arc::from(result_json),
+        carriers,
+    })
+}
+
+fn encode_result_json(result: &WorkflowResultV1) -> Result<Vec<u8>, LocalPublicationError> {
+    result_metadata::validate(result).map_err(|_| invalid_run_result())?;
+    let mut bytes = serde_json::to_vec_pretty(result).map_err(|_| {
+        LocalPublicationError::new(
+            LocalPublicationPhase::Serialization,
+            LocalPublicationFailureKind::SerializationUnavailable,
+        )
+    })?;
+    bytes.push(b'\n');
+    if u64::try_from(bytes.len())
+        .ok()
+        .is_none_or(|size| size > result_metadata::MAXIMUM_RESULT_JSON_BYTES)
+    {
+        return Err(LocalPublicationError::new(
+            LocalPublicationPhase::Serialization,
+            LocalPublicationFailureKind::SerializationUnavailable,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn cloud_available_export(
+    name: &str,
+    ordinal: usize,
+    source: &ResolvedOutputSource,
+    output: &CapturedValue,
+) -> Result<(ExportV1, Option<CloudResultCarrier>), LocalPublicationError> {
+    let path = format!("{EXPORT_DIRECTORY}/{ordinal:04}");
+    let idempotency_key = format!("capture:{}:{}", source.node.id, source.output);
+    let (metadata, body) = match output {
+        CapturedValue::File(file) => (
+            ExportV1::Available {
+                kind: "file".to_owned(),
+                media_type: file.media_type().to_owned(),
+                path: path.clone(),
+                size_bytes: file.size(),
+                digest: DigestV1 {
+                    algorithm: "sha256".to_owned(),
+                    value: file.sha256().to_owned(),
+                },
+            },
+            Some(CloudCarrierBody::Staged(file.carrier().clone())),
+        ),
+        CapturedValue::Text(text) => byte_backed_cloud_export(
+            name,
+            "text",
+            "text/plain; charset=utf-8",
+            &path,
+            Arc::from(text.as_bytes()),
+        )?,
+        CapturedValue::Json(value) => {
+            let mut encoded = Vec::new();
+            canonical_json::to_writer(&mut encoded, value).map_err(|_| export_write_error(name))?;
+            byte_backed_cloud_export(name, "json", "application/json", &path, Arc::from(encoded))?
+        }
+        CapturedValue::GitBranch(branch) => {
+            let branch_metadata = branch.metadata();
+            let carrier = branch.carrier().map(|carrier| GitBranchCarrierV1 {
+                path: path.clone(),
+                media_type: carrier.media_type().to_owned(),
+                size_bytes: carrier.size(),
+                digest: DigestV1 {
+                    algorithm: "sha256".to_owned(),
+                    value: carrier.sha256().to_owned(),
+                },
+            });
+            if (branch_metadata.base_oid() != branch_metadata.head_oid()) != carrier.is_some() {
+                return Err(invalid_run_result());
+            }
+            let body = branch
+                .carrier()
+                .map(|carrier| CloudCarrierBody::Staged(carrier.staged().clone()));
+            (
+                ExportV1::GitBranch {
+                    artifact_version: branch_metadata.artifact_version(),
+                    object_format: branch_metadata.object_format().as_str().to_owned(),
+                    base_oid: branch_metadata.base_oid().to_owned(),
+                    head_oid: branch_metadata.head_oid().to_owned(),
+                    tree_oid: branch_metadata.tree_oid().to_owned(),
+                    carrier,
+                },
+                body,
+            )
+        }
+    };
+    let carrier = body.map(|body| {
+        let (media_type, size_bytes, sha256) = match &metadata {
+            ExportV1::Available {
+                media_type,
+                size_bytes,
+                digest,
+                ..
+            } => (media_type.clone(), *size_bytes, digest.value.clone()),
+            ExportV1::GitBranch {
+                carrier: Some(carrier),
+                ..
+            } => (
+                carrier.media_type.clone(),
+                carrier.size_bytes,
+                carrier.digest.value.clone(),
+            ),
+            ExportV1::GitBranch { carrier: None, .. } | ExportV1::Unavailable { .. } => {
+                unreachable!("a Cloud carrier body always has carrier metadata")
+            }
+        };
+        CloudResultCarrier {
+            portable_owner_path: path,
+            idempotency_key,
+            media_type,
+            size_bytes,
+            sha256,
+            body,
+        }
+    });
+    Ok((metadata, carrier))
+}
+
+fn byte_backed_cloud_export(
+    name: &str,
+    kind: &str,
+    media_type: &str,
+    path: &str,
+    bytes: Arc<[u8]>,
+) -> Result<(ExportV1, Option<CloudCarrierBody>), LocalPublicationError> {
+    let size_bytes = u64::try_from(bytes.len()).map_err(|_| export_write_error(name))?;
+    let sha256 = lowercase_hex(ring::digest::digest(&SHA256, &bytes).as_ref());
+    Ok((
+        ExportV1::Available {
+            kind: kind.to_owned(),
+            media_type: media_type.to_owned(),
+            path: path.to_owned(),
+            size_bytes,
+            digest: DigestV1 {
+                algorithm: "sha256".to_owned(),
+                value: sha256,
+            },
+        },
+        Some(CloudCarrierBody::Bytes(bytes)),
+    ))
+}
+
 #[cfg(test)]
 fn publish_with_observer(
     destination: &Path,
@@ -879,8 +1266,9 @@ fn publish_prepared_with_observer(
                 if !captured_type_matches(source.value_type, output) {
                     return Err(invalid_run_result());
                 }
-                match sources.entry(identity) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
+                match existing_available_export(&sources, &identity, source, output)? {
+                    Some(metadata) => metadata,
+                    None => {
                         let metadata = write_available_export(
                             &mut staging,
                             observer,
@@ -889,53 +1277,13 @@ fn publish_prepared_with_observer(
                             ordinal,
                             output,
                         )?;
-                        entry.insert(SourcePublication::Available {
-                            source: source.clone(),
-                            output: output.clone(),
-                            metadata: Box::new(metadata.clone()),
-                        });
+                        insert_available_source(&mut sources, identity, source, output, &metadata);
                         metadata
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        let SourcePublication::Available {
-                            source: owner_source,
-                            output: owner_output,
-                            metadata,
-                        } = entry.get()
-                        else {
-                            return Err(invalid_run_result());
-                        };
-                        if owner_source != source || owner_output != output {
-                            return Err(invalid_run_result());
-                        }
-                        metadata.as_ref().clone()
                     }
                 }
             }
             ExportValue::Unavailable { reason } => {
-                match sources.entry(identity) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(SourcePublication::Unavailable {
-                            source: source.clone(),
-                            reason: *reason,
-                        });
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        let SourcePublication::Unavailable {
-                            source: retained_source,
-                            reason: retained_reason,
-                        } = entry.get()
-                        else {
-                            return Err(invalid_run_result());
-                        };
-                        if retained_source != source || retained_reason != reason {
-                            return Err(invalid_run_result());
-                        }
-                    }
-                }
-                ExportV1::Unavailable {
-                    reason: export_unavailable_reason(*reason),
-                }
+                unavailable_export(&mut sources, identity, source, *reason)?
             }
         };
         exports.insert(name.clone(), metadata);
@@ -949,23 +1297,7 @@ fn publish_prepared_with_observer(
         None,
     )?;
     let result = build_result(run, exports)?;
-    result_metadata::validate(&result).map_err(|_| invalid_run_result())?;
-    let mut result_bytes = serde_json::to_vec_pretty(&result).map_err(|_| {
-        LocalPublicationError::new(
-            LocalPublicationPhase::Serialization,
-            LocalPublicationFailureKind::SerializationUnavailable,
-        )
-    })?;
-    result_bytes.push(b'\n');
-    if u64::try_from(result_bytes.len())
-        .ok()
-        .is_none_or(|size| size > result_metadata::MAXIMUM_RESULT_JSON_BYTES)
-    {
-        return Err(LocalPublicationError::new(
-            LocalPublicationPhase::Serialization,
-            LocalPublicationFailureKind::SerializationUnavailable,
-        ));
-    }
+    let result_bytes = encode_result_json(&result)?;
     let result_file = staging.write_result(&result_bytes)?;
     observer
         .close_staged_file(result_file, &StagedFile::Result)
@@ -989,14 +1321,32 @@ fn publish_prepared_with_observer(
         LocalPublicationFailureKind::AtomicPublicationUnavailable,
         None,
     )?;
-    target.verify_parent_and_absence()?;
+    target.verify_parent()?;
     staging.verify(&result).map_err(|_| {
         LocalPublicationError::new(
             LocalPublicationPhase::Verification,
             LocalPublicationFailureKind::VerificationUnavailable,
         )
     })?;
-    staging.commit(target)?;
+    match target.existing_publication(&result, &result_bytes)? {
+        ExistingPublication::Absent => {
+            if let Err(error) = staging.commit(target)
+                && (error.kind() != LocalPublicationFailureKind::DestinationExists
+                    || target.existing_publication(&result, &result_bytes)?
+                        != ExistingPublication::Identical)
+            {
+                return Err(
+                    if error.kind() == LocalPublicationFailureKind::DestinationExists {
+                        result_conflict()
+                    } else {
+                        error
+                    },
+                );
+            }
+        }
+        ExistingPublication::Identical => {}
+        ExistingPublication::Conflict => return Err(result_conflict()),
+    }
     drop(staging);
 
     let outcome = result.outcome;
@@ -1023,6 +1373,73 @@ enum SourcePublication {
         source: ResolvedOutputSource,
         reason: ExportUnavailableReason,
     },
+}
+
+fn insert_available_source(
+    sources: &mut BTreeMap<(String, String), SourcePublication>,
+    identity: (String, String),
+    source: &ResolvedOutputSource,
+    output: &CapturedValue,
+    metadata: &ExportV1,
+) {
+    sources.insert(
+        identity,
+        SourcePublication::Available {
+            source: source.clone(),
+            output: output.clone(),
+            metadata: Box::new(metadata.clone()),
+        },
+    );
+}
+
+fn existing_available_export(
+    sources: &BTreeMap<(String, String), SourcePublication>,
+    identity: &(String, String),
+    source: &ResolvedOutputSource,
+    output: &CapturedValue,
+) -> Result<Option<ExportV1>, LocalPublicationError> {
+    let Some(publication) = sources.get(identity) else {
+        return Ok(None);
+    };
+    let SourcePublication::Available {
+        source: owner_source,
+        output: owner_output,
+        metadata,
+    } = publication
+    else {
+        return Err(invalid_run_result());
+    };
+    if owner_source != source || owner_output != output {
+        return Err(invalid_run_result());
+    }
+    Ok(Some(metadata.as_ref().clone()))
+}
+
+fn unavailable_export(
+    sources: &mut BTreeMap<(String, String), SourcePublication>,
+    identity: (String, String),
+    source: &ResolvedOutputSource,
+    reason: ExportUnavailableReason,
+) -> Result<ExportV1, LocalPublicationError> {
+    match sources.get(&identity) {
+        None => {
+            sources.insert(
+                identity,
+                SourcePublication::Unavailable {
+                    source: source.clone(),
+                    reason,
+                },
+            );
+        }
+        Some(SourcePublication::Unavailable {
+            source: owner_source,
+            reason: owner_reason,
+        }) if owner_source == source && *owner_reason == reason => {}
+        Some(_) => return Err(invalid_run_result()),
+    }
+    Ok(ExportV1::Unavailable {
+        reason: export_unavailable_reason(reason),
+    })
 }
 
 fn captured_type_matches(value_type: WorkflowValueType, output: &CapturedValue) -> bool {
@@ -1292,35 +1709,45 @@ fn build_result(
 ) -> Result<WorkflowResultV1, LocalPublicationError> {
     let source_root = retained_path(&run.source_root)?;
     let execution_root = retained_path(&run.execution_root)?;
-    let (outcome, primary_failure, expected_cancellation) = match &run.outcome {
-        RunOutcome::Succeeded => (WorkflowOutcomeV1::Succeeded, None, None),
+    build_result_with_provenance(run, WorkflowProvenanceV1::Local { source_root }, exports).map(
+        |mut result| {
+            result.execution.execution_root = Some(execution_root);
+            result
+        },
+    )
+}
+
+fn build_result_with_provenance(
+    run: &WorkflowRunResult,
+    provenance: WorkflowProvenanceV1,
+    exports: BTreeMap<String, ExportV1>,
+) -> Result<WorkflowResultV1, LocalPublicationError> {
+    let (outcome, primary_failure) = match &run.outcome {
+        RunOutcome::Succeeded => (WorkflowOutcomeV1::Succeeded, None),
         RunOutcome::Failed {
-            primary_failure,
-            later_cancellation,
+            primary_failure, ..
         } => (
             WorkflowOutcomeV1::Failed,
             Some(primary_failure_v1(primary_failure)?),
-            *later_cancellation,
         ),
-        RunOutcome::Cancelled { reason } => (WorkflowOutcomeV1::Cancelled, None, Some(*reason)),
+        RunOutcome::Cancelled { .. } => (WorkflowOutcomeV1::Cancelled, None),
     };
-    let cancellation = match (&run.cancellation, expected_cancellation) {
-        (None, None) => None,
-        (Some(cancellation), Some(reason)) if cancellation.reason == reason => {
-            Some(CancellationV1 {
-                reason: cancellation_reason(reason),
+    let cancellation = run
+        .cancellation
+        .as_ref()
+        .map(|cancellation| {
+            Ok(CancellationV1 {
+                reason: cancellation_reason(cancellation.reason),
                 force_stop_deadline: timestamp(cancellation.force_stop_deadline)?,
             })
-        }
-        (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
-            return Err(invalid_run_result());
-        }
-    };
+        })
+        .transpose()?;
     let steps = run
         .steps
         .iter()
         .map(step_v1)
         .collect::<Result<Vec<_>, _>>()?;
+    let finalization = run.finalization.as_ref().map(finalization_v1).transpose()?;
 
     if run.attempt_number == 0 {
         return Err(invalid_run_result());
@@ -1330,17 +1757,14 @@ fn build_result(
         attempt_number: run.attempt_number,
         workflow: WorkflowIdentityV1 {
             path: run.workflow_path.clone(),
-            provenance: WorkflowProvenanceV1 {
-                kind: "local".to_owned(),
-                source_root,
-            },
+            provenance,
             digest: DigestV1 {
                 algorithm: run.content_digest.algorithm.as_str().to_owned(),
                 value: run.content_digest.value.clone(),
             },
         },
         execution: WorkflowExecutionV1 {
-            execution_root,
+            execution_root: None,
             maximum_parallel_steps: run.maximum_parallel_steps.get(),
             started_at: timestamp(run.timing.started_at)?,
             finished_at: timestamp(run.timing.finished_at)?,
@@ -1354,7 +1778,59 @@ fn build_result(
         primary_failure,
         cancellation,
         steps,
+        finalization,
         exports,
+    })
+}
+
+fn finalization_v1(
+    finalization: &WorkflowRunFinalization,
+) -> Result<FinalizationV1, LocalPublicationError> {
+    let finalizers = finalization
+        .finalizers
+        .iter()
+        .map(step_v1)
+        .collect::<Result<Vec<_>, _>>()?;
+    if finalizers
+        .iter()
+        .any(|finalizer| finalizer.role != WorkflowNodeRoleV1::Finalizer)
+    {
+        return Err(invalid_run_result());
+    }
+    let issues = finalizers
+        .iter()
+        .filter(|finalizer| {
+            finalizer.state == WorkflowStepStateV1::Failed
+                || (finalizer.state == WorkflowStepStateV1::Blocked
+                    && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+        })
+        .map(|finalizer| FinalizationIssueV1 {
+            node: WorkflowNodeV1 {
+                id: finalizer.id.clone(),
+                role: WorkflowNodeRoleV1::Finalizer,
+            },
+            impact: finalizer.failure_policy,
+        })
+        .collect();
+    let cancellation = finalization
+        .cancellation
+        .as_ref()
+        .map(|cancellation| {
+            Ok(FinalizationCancellationV1 {
+                reason: cancellation_reason(cancellation.reason),
+                force_stop_deadline: cancellation
+                    .force_stop_deadline
+                    .map(timestamp)
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
+    Ok(FinalizationV1 {
+        trigger: finalization_trigger(finalization.trigger),
+        finalizers,
+        issues,
+        cancellation,
+        force_abort: finalization.force_abort,
     })
 }
 
@@ -1366,11 +1842,12 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         ),
         None => (None, None),
     };
-    let (state, failure, dependency, reason) = match &step.state {
-        StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None, None, None),
+    let (state, failure, dependency, reason, unavailable_references) = match &step.state {
+        StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None, None, None, None),
         StepState::Failed { phase, cause } => (
             WorkflowStepStateV1::Failed,
             Some(failure_v1(*phase, cause)?),
+            None,
             None,
             None,
         ),
@@ -1379,6 +1856,14 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             None,
             Some(dependency.clone()),
             None,
+            None,
+        ),
+        StepState::InputUnavailable { references } => (
+            WorkflowStepStateV1::Blocked,
+            None,
+            None,
+            Some(StepReasonV1::InputUnavailable),
+            Some(references.clone()),
         ),
         StepState::NotRun {
             reason: NotRunReason::FailureStop,
@@ -1387,12 +1872,23 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             None,
             None,
             Some(StepReasonV1::FailureStop),
+            None,
+        ),
+        StepState::NotRun {
+            reason: NotRunReason::FinalizerTriggerNotSelected,
+        } => (
+            WorkflowStepStateV1::NotRun,
+            None,
+            None,
+            Some(StepReasonV1::FinalizerTriggerNotSelected),
+            None,
         ),
         StepState::Cancelled { reason } => (
             WorkflowStepStateV1::Cancelled,
             None,
             None,
             Some(cancellation_step_reason(*reason)),
+            None,
         ),
         StepState::Pending
         | StepState::Starting
@@ -1412,6 +1908,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
 
     Ok(WorkflowStepV1 {
         id: step.id.clone(),
+        role: workflow_node_role(step.role),
         kind: match step.kind {
             WorkflowRunStepKind::Command => "cmd",
             WorkflowRunStepKind::Agent => "agent",
@@ -1424,6 +1921,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         failure,
         dependency,
         reason,
+        unavailable_references,
         command_output,
     })
 }
@@ -1462,13 +1960,16 @@ fn primary_failure_v1(
 ) -> Result<PrimaryFailureV1, LocalPublicationError> {
     let failure_v1 = failure_v1(failure.phase, &failure.cause)?;
     Ok(PrimaryFailureV1 {
-        step: failure.step.clone(),
+        node: WorkflowNodeV1 {
+            id: failure.step.clone(),
+            role: workflow_node_role(failure.role),
+        },
         phase: failure_v1.phase,
         cause: failure_v1.cause,
     })
 }
 
-fn failure_v1(
+pub(super) fn failure_v1(
     phase: FailurePhase,
     cause: &StepFailureCause,
 ) -> Result<FailureV1, LocalPublicationError> {
@@ -1532,7 +2033,7 @@ fn start_failure_cause(
         StepStartFailure::AgentRuntimeUnavailable => {
             FailureCauseV1::code(FailureCodeV1::AgentRuntimeUnavailable)
         }
-        StepStartFailure::Agent(failure) => FailureCauseV1::code(agent_failure_code(failure)),
+        StepStartFailure::Agent(failure) => agent_failure_cause(failure),
         StepStartFailure::OutputsUnsupported => {
             FailureCauseV1::code(FailureCodeV1::OutputsUnsupported)
         }
@@ -1597,9 +2098,17 @@ fn agent_input_failure_cause(failure: &AgentInputStartFailure) -> FailureCauseV1
     })
 }
 
+fn agent_failure_cause(failure: &AgentFailure) -> FailureCauseV1 {
+    let mut cause = FailureCauseV1::code(agent_failure_code(failure.cause()));
+    cause.protocol_rejection = failure.protocol_rejection().cloned();
+    cause
+}
+
 fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
     match failure {
-        AgentFailureCause::HarnessStartFailed => FailureCodeV1::HarnessStartFailed,
+        AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessSetupFailed { .. } => {
+            FailureCodeV1::HarnessStartFailed
+        }
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCodeV1::HarnessInputTooLarge,
         AgentFailureCause::HarnessFailed { .. } => FailureCodeV1::HarnessFailed,
         AgentFailureCause::HarnessProtocolFailed => FailureCodeV1::HarnessProtocolFailed,
@@ -1623,7 +2132,7 @@ fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
         StepExecutionFailure::Command(CommandExecutionFailure::Wait) => {
             FailureCauseV1::code(FailureCodeV1::CommandWaitFailed)
         }
-        StepExecutionFailure::Agent(failure) => FailureCauseV1::code(agent_failure_code(failure)),
+        StepExecutionFailure::Agent(failure) => agent_failure_cause(failure),
     }
 }
 
@@ -1736,27 +2245,40 @@ fn invalid_run_result() -> LocalPublicationError {
     )
 }
 
+fn workflow_node_role(role: WorkflowNodeRole) -> WorkflowNodeRoleV1 {
+    match role {
+        WorkflowNodeRole::Step => WorkflowNodeRoleV1::Step,
+        WorkflowNodeRole::Finalizer => WorkflowNodeRoleV1::Finalizer,
+    }
+}
+
+pub(super) fn finalization_trigger(trigger: FinalizationTrigger) -> FinalizationTriggerV1 {
+    match trigger {
+        FinalizationTrigger::Succeeded => FinalizationTriggerV1::Succeeded,
+        FinalizationTrigger::Failed => FinalizationTriggerV1::Failed,
+        FinalizationTrigger::Cancelled => FinalizationTriggerV1::Cancelled,
+    }
+}
+
 pub(super) fn cancellation_reason(reason: CancellationReason) -> CancellationReasonV1 {
     match reason {
         CancellationReason::UserRequest => CancellationReasonV1::UserRequest,
         CancellationReason::TerminationRequest => CancellationReasonV1::TerminationRequest,
         CancellationReason::CallerOutputFailure => CancellationReasonV1::CallerOutputFailure,
-        CancellationReason::RunnerShutdown | CancellationReason::ExecutionLeaseExpired => {
-            // ExecutionLeaseExpired is Runner Serve-only and never reaches local publication.
-            CancellationReasonV1::RunnerShutdown
-        }
+        CancellationReason::RunnerShutdown => CancellationReasonV1::RunnerShutdown,
+        CancellationReason::ExecutionLeaseExpired => CancellationReasonV1::ExecutionLeaseExpired,
+        CancellationReason::FinalizationForceAbort => CancellationReasonV1::FinalizationForceAbort,
     }
 }
 
-fn cancellation_step_reason(reason: CancellationReason) -> StepReasonV1 {
+pub(super) fn cancellation_step_reason(reason: CancellationReason) -> StepReasonV1 {
     match reason {
         CancellationReason::UserRequest => StepReasonV1::UserRequest,
         CancellationReason::TerminationRequest => StepReasonV1::TerminationRequest,
         CancellationReason::CallerOutputFailure => StepReasonV1::CallerOutputFailure,
-        CancellationReason::RunnerShutdown | CancellationReason::ExecutionLeaseExpired => {
-            // ExecutionLeaseExpired is Runner Serve-only and never reaches local publication.
-            StepReasonV1::RunnerShutdown
-        }
+        CancellationReason::RunnerShutdown => StepReasonV1::RunnerShutdown,
+        CancellationReason::ExecutionLeaseExpired => StepReasonV1::ExecutionLeaseExpired,
+        CancellationReason::FinalizationForceAbort => StepReasonV1::FinalizationForceAbort,
     }
 }
 
@@ -1764,7 +2286,11 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
     match reason {
         ExportUnavailableReason::Failed => ExportUnavailableReasonV1::Failed,
         ExportUnavailableReason::Blocked => ExportUnavailableReasonV1::Blocked,
+        ExportUnavailableReason::InputUnavailable => ExportUnavailableReasonV1::InputUnavailable,
         ExportUnavailableReason::NotRun => ExportUnavailableReasonV1::NotRun,
+        ExportUnavailableReason::TriggerNotSelected => {
+            ExportUnavailableReasonV1::TriggerNotSelected
+        }
         ExportUnavailableReason::Cancelled => ExportUnavailableReasonV1::Cancelled,
     }
 }
@@ -1772,11 +2298,36 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
 fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
     use crate::exit_code::ExitCode;
 
-    if run.steps.iter().any(|step| {
-        step.command_output.as_ref().is_some_and(|output| {
-            !output.standard_output().fully_drained() || !output.standard_error().fully_drained()
+    if run
+        .steps
+        .iter()
+        .chain(
+            run.finalization
+                .iter()
+                .flat_map(|finalization| &finalization.finalizers),
+        )
+        .any(|step| {
+            step.command_output.as_ref().is_some_and(|output| {
+                !output.standard_output().fully_drained()
+                    || !output.standard_error().fully_drained()
+            })
         })
-    }) {
+        || run.finalization.as_ref().is_some_and(|finalization| {
+            finalization.force_abort
+                || finalization
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|cancellation| {
+                        matches!(
+                            cancellation.reason,
+                            CancellationReason::CallerOutputFailure
+                                | CancellationReason::RunnerShutdown
+                                | CancellationReason::ExecutionLeaseExpired
+                                | CancellationReason::FinalizationForceAbort
+                        )
+                    })
+        })
+    {
         return ExitCode::GeneralFailure.as_u16();
     }
     match outcome {
@@ -1793,7 +2344,8 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                 reason:
                     CancellationReason::CallerOutputFailure
                     | CancellationReason::RunnerShutdown
-                    | CancellationReason::ExecutionLeaseExpired,
+                    | CancellationReason::ExecutionLeaseExpired
+                    | CancellationReason::FinalizationForceAbort,
             }
             | RunOutcome::Succeeded
             | RunOutcome::Failed { .. } => ExitCode::GeneralFailure.as_u16(),
@@ -1877,9 +2429,6 @@ impl PublicationTarget {
                 LocalPublicationFailureKind::ParentUnavailable,
             )
         })?;
-        ensure_absent(&parent, name).map_err(|kind| {
-            LocalPublicationError::new(LocalPublicationPhase::TargetValidation, kind)
-        })?;
         let normalized = canonical_parent
             .join(name)
             .to_str()
@@ -1929,7 +2478,7 @@ impl PublicationTarget {
         })
     }
 
-    fn verify_parent_and_absence(&self) -> Result<(), LocalPublicationError> {
+    fn verify_parent(&self) -> Result<(), LocalPublicationError> {
         let rebound = std::fs::canonicalize(&self.supplied_parent).map_err(|_| {
             LocalPublicationError::new(
                 LocalPublicationPhase::Commit,
@@ -1953,9 +2502,83 @@ impl PublicationTarget {
                 LocalPublicationFailureKind::ParentUnavailable,
             ));
         }
-        ensure_absent(&self.parent, &self.name)
-            .map_err(|kind| LocalPublicationError::new(LocalPublicationPhase::Commit, kind))
+        Ok(())
     }
+
+    fn existing_publication(
+        &self,
+        expected: &WorkflowResultV1,
+        expected_bytes: &[u8],
+    ) -> Result<ExistingPublication, LocalPublicationError> {
+        let named = match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => return Ok(ExistingPublication::Absent),
+            Ok(named) => named,
+            Err(_) => return Ok(ExistingPublication::Conflict),
+        };
+        if FileType::from_raw_mode(named.st_mode) != FileType::Directory {
+            return Ok(ExistingPublication::Conflict);
+        }
+        let root = match openat(
+            &self.parent,
+            &self.name,
+            directory_open_flags(),
+            Mode::empty(),
+        ) {
+            Ok(root) => root,
+            Err(_) => return Ok(ExistingPublication::Conflict),
+        };
+        let opened = fstat(&root).map_err(|_| result_conflict())?;
+        if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+            return Ok(ExistingPublication::Conflict);
+        }
+        let retained = match artifact_set::read_and_validate(
+            &root,
+            result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+        ) {
+            Ok(retained) => retained,
+            Err(_) => return Ok(ExistingPublication::Conflict),
+        };
+        if retained != *expected {
+            return Ok(ExistingPublication::Conflict);
+        }
+        let descriptor = match openat(
+            &root,
+            RESULT_FILE,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(_) => return Ok(ExistingPublication::Conflict),
+        };
+        let mut file = File::from(descriptor);
+        let mut bytes = Vec::new();
+        if Read::by_ref(&mut file)
+            .take(result_metadata::MAXIMUM_RESULT_JSON_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return Ok(ExistingPublication::Conflict);
+        }
+        Ok(if bytes == expected_bytes {
+            ExistingPublication::Identical
+        } else {
+            ExistingPublication::Conflict
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingPublication {
+    Absent,
+    Identical,
+    Conflict,
+}
+
+fn result_conflict() -> LocalPublicationError {
+    LocalPublicationError::new(
+        LocalPublicationPhase::Commit,
+        LocalPublicationFailureKind::ResultConflict,
+    )
 }
 
 fn invalid_publication_parent() -> LocalPublicationError {
@@ -2280,14 +2903,6 @@ fn close_file(file: File) -> io::Result<()> {
 
 fn directory_entries(directory: &OwnedFd) -> Result<BTreeSet<Vec<u8>>, Errno> {
     directory_entry_names(directory)
-}
-
-fn ensure_absent(parent: &OwnedFd, name: &OsStr) -> Result<(), LocalPublicationFailureKind> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Err(LocalPublicationFailureKind::DestinationExists),
-        Err(Errno::NOENT) => Ok(()),
-        Err(_) => Err(LocalPublicationFailureKind::ParentUnavailable),
-    }
 }
 
 #[cfg(test)]

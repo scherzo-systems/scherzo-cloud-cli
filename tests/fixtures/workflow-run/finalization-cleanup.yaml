@@ -1,0 +1,29 @@
+schemaVersion: 1
+steps:
+  fail:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "exit 17"]
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf cleanup-complete > cleanup.txt"]
+  report:
+    kind: cmd
+    when: [succeeded]
+    command:
+      argv: ["true"]
+    outputs:
+      receipt:
+        kind: file
+        path: receipt.json
+        mediaType: application/json
+  notify:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv: ["/bin/sh", "-c", "exit 5"]
+exports:
+  cleanupReceipt:
+    ref: outputs.report.receipt

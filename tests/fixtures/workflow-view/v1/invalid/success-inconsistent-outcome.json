@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow view",
+  "outcome": "view",
+  "exitStatus": 0,
+  "runDirectory": "/tmp/run",
+  "currentAttemptNumber": 1,
+  "attemptNumber": 1,
+  "selection": "current",
+  "trigger": "initial",
+  "attemptState": "cancelled",
+  "resultDirectory": "/tmp/run/attempts/000001/result",
+  "result": {
+    "schemaVersion": 1,
+    "attemptNumber": 1,
+    "workflow": {
+      "path": "workflow.yaml",
+      "provenance": { "kind": "local", "sourceRoot": "/tmp/source" },
+      "digest": {
+        "algorithm": "sha256",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "execution": {
+      "executionRoot": "/tmp/execution",
+      "maximumParallelSteps": 1,
+      "startedAt": "2026-08-17T00:00:00Z",
+      "finishedAt": "2026-08-17T00:00:01Z",
+      "durationMilliseconds": 1000
+    },
+    "commandOutputPolicy": {
+      "encoding": "base64",
+      "maximumRetainedBytesPerStream": 4194304
+    },
+    "outcome": "succeeded",
+    "steps": [
+      {
+        "id": "complete",
+        "role": "step",
+        "kind": "cmd",
+        "failurePolicy": "required",
+        "state": "succeeded",
+        "startedAt": "2026-08-17T00:00:00Z",
+        "durationMilliseconds": 1000,
+        "commandOutput": {
+          "stdout": { "encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true },
+          "stderr": { "encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true }
+        }
+      }
+    ],
+    "exports": {}
+  }
+}

@@ -1732,7 +1732,10 @@ impl ArtifactStaging {
         Err(CaptureFailureKind::StagingUnavailable)
     }
 
-    fn open_artifact(&self, handle: &ArtifactHandle) -> Result<File, ArtifactReadFailure> {
+    pub(crate) fn open_artifact(
+        &self,
+        handle: &ArtifactHandle,
+    ) -> Result<File, ArtifactReadFailure> {
         let lifecycle = self
             .inner
             .lifecycle

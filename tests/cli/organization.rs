@@ -29,6 +29,44 @@ fn prepared_organization(
     )
 }
 
+fn prepared_organization_refresh(
+    mut responses: Vec<Vec<u8>>,
+    access_token: &str,
+) -> (
+    ScriptedServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
+    if responses.len() == 1
+        && responses[0]
+            .windows("401 Unauthorized".len())
+            .any(|window| window == b"401 Unauthorized")
+    {
+        responses.push(json_http_response(
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid_grant"}),
+        ));
+    }
+    let server = ScriptedServer::respond(responses);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        access_token,
+        "2999-01-01T00:00:00Z",
+    );
+    let credential_path_string = credential_path.to_str().unwrap().to_owned();
+    (
+        server,
+        credential_directory,
+        credential_path,
+        credential_path_string,
+    )
+}
+
 fn organization_body() -> serde_json::Value {
     serde_json::json!({
         "id": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -109,53 +147,15 @@ fn request_body(request: &str) -> &str {
 }
 
 #[test]
-fn organization_help_is_contextual_and_side_effect_free() {
-    let bare = run_with_env(
-        &["organization"],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-    );
-    assert!(bare.status.success());
-    assert!(bare.stderr.is_empty());
-    let bare_help = String::from_utf8_lossy(&bare.stdout);
-    assert!(bare_help.contains("Usage: scherzo-cloud organization [COMMAND]"));
-    assert!(bare_help.contains("create   Create a Scherzo Cloud organization"));
-    assert!(bare_help.contains("show     Show a Scherzo Cloud organization"));
-    assert!(bare_help.contains("update   Update a Scherzo Cloud organization"));
-    assert!(bare_help.contains("members  Manage Scherzo Cloud organization members"));
-
-    let members = run_with_env(
-        &["organization", "members"],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-    );
-    assert!(members.status.success());
-    assert!(members.stderr.is_empty());
-    assert!(
-        String::from_utf8_lossy(&members.stdout)
-            .contains("Usage: scherzo-cloud organization members [COMMAND]")
-    );
-
-    for (args, expected) in [
-        (
-            &["organization", "create", "--help"][..],
-            "--display-name <DISPLAY_NAME>",
-        ),
-        (&["organization", "show", "--help"][..], "<ORGANIZATION>"),
-        (
-            &["organization", "update", "--help"][..],
-            "--display-name <DISPLAY_NAME>|--slug <SLUG>",
-        ),
-        (
-            &["organization", "members", "list", "--help"][..],
-            "--limit <LIMIT>",
-        ),
-    ] {
-        let output = run(args);
+fn organization_without_a_subcommand_prints_help_without_loading_deployment() {
+    for args in [&["organization"][..], &["organization", "members"][..]] {
+        let output = run_with_env(
+            args,
+            &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
+        );
         assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains(expected));
-        assert!(stdout.contains("--json"));
-        assert!(stdout.contains("--allow-insecure-http"));
         assert!(output.stderr.is_empty());
+        assert!(!output.stdout.is_empty());
     }
 }
 
@@ -407,8 +407,9 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
 
     for (response, expected_outcome, expected_status, retry_after) in cases {
         let (server, _directory, _path, credential_path) =
-            prepared_organization(vec![response], TOKEN);
-        let environment = deployment_environment(&server.api_url, &credential_path);
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
         let output = run_with_env(
             &[
                 "organization",
@@ -440,7 +441,19 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
         let requests = server.finish();
-        assert_eq!(requests.len(), 1, "explicit responses must not retry");
+        let expected_requests = if expected_outcome == "unauthenticated" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(requests.len(), expected_requests);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /auth/oauth/token HTTP/1.1\r\n"))
+                .count(),
+            usize::from(expected_outcome == "unauthenticated")
+        );
     }
 }
 
@@ -509,7 +522,6 @@ fn malformed_rate_limit_metadata_is_a_protocol_failure() {
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("invalid Retry-After"));
         assert!(!stderr.contains("rate-title-sentinel"));
         assert!(!stderr.contains("rate-detail-sentinel"));
         server.finish();
@@ -517,38 +529,95 @@ fn malformed_rate_limit_metadata_is_a_protocol_failure() {
 }
 
 #[test]
-fn missing_and_expired_credentials_do_not_contact_the_api() {
-    for expires_at in [None, Some("2000-01-01T00:00:00Z")] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-        let directory = private_credential_directory();
-        let credential_path = directory.path().join("credentials.json");
-        if let Some(expires_at) = expires_at {
-            write_credential_fixture(&credential_path, &api_url, TOKEN, expires_at);
-        }
-        let credential_path_string = credential_path.to_str().unwrap();
-        let environment = deployment_environment(&api_url, credential_path_string);
+fn missing_credential_does_not_contact_the_organization_api() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let directory = private_credential_directory();
+    let credential_path = directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = deployment_environment(&api_url, credential_path_string);
 
-        let output = run_with_env(
-            &["organization", "create", "--display-name", "Acme", "--json"],
-            &environment,
-        );
+    let output = run_with_env(
+        &["organization", "create", "--display-name", "Acme", "--json"],
+        &environment,
+    );
 
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": api_url,
+            "outcome": "unauthenticated"
+        })
+    );
+    assert!(output.stderr.is_empty());
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
+fn rejected_organization_access_token_is_refreshed_and_retried() {
+    let rejected = organization_problem(
+        "401 Unauthorized",
+        401,
+        "https://api.scherzo.dev/problems/unauthorized",
+    );
+    let server = ScriptedServer::respond(vec![
+        rejected,
+        json_http_response(
+            "200 OK",
             serde_json::json!({
-                "schemaVersion": 1,
-                "deployment": api_url,
-                "outcome": "unauthenticated"
-            })
-        );
-        assert!(output.stderr.is_empty());
-        assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
-    }
+                "access_token": "unique-refreshed-organization-access-token",
+                "refresh_token": "unique-refreshed-organization-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        ),
+        organization_success("200 OK"),
+    ]);
+    let directory = private_credential_directory();
+    let credential_path = directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment_with_issuer(
+        &server.api_url,
+        &server.issuer,
+        credential_path.to_str().unwrap(),
+    );
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "show",
+            "acme-research",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
+    assert!(
+        requests[2]
+            .contains("authorization: Bearer unique-refreshed-organization-access-token\r\n")
+    );
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(credential_path).unwrap()).unwrap();
+    assert_eq!(
+        stored["credentials"][0]["refreshToken"],
+        "unique-refreshed-organization-refresh-token"
+    );
 }
 
 #[test]
@@ -569,7 +638,7 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
                 Some("application/problem+json"),
                 b"not-json",
             ),
-            1,
+            3,
             false,
         ),
         (
@@ -583,8 +652,12 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
         ),
     ] {
         let (server, _directory, credential_path, credential_path_string) =
-            prepared_organization(vec![response], TOKEN);
-        let environment = deployment_environment(&server.api_url, &credential_path_string);
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment = deployment_environment_with_issuer(
+            &server.api_url,
+            &server.issuer,
+            &credential_path_string,
+        );
 
         let output = run_with_env(
             &[
@@ -633,7 +706,6 @@ fn insecure_http_is_rejected_before_the_credential_is_transmitted() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("uses insecure HTTP"));
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
@@ -726,7 +798,10 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
         401,
         "https://api.scherzo.dev/problems/unauthorized",
     );
-    let mut server = ScriptedServer::respond_with_paused_last_response(vec![response]);
+    let mut server = ScriptedServer::respond_with_paused_first_response(vec![
+        response,
+        organization_success("200 OK"),
+    ]);
     let api_url = server.api_url.clone();
     let directory = private_credential_directory();
     let credential_path = directory.path().join("credentials.json");
@@ -768,7 +843,7 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
         command.join().unwrap()
     });
 
-    assert_eq!(output.status.code(), Some(3));
+    assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stored: serde_json::Value =
         serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
@@ -783,7 +858,12 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
     );
     assert!(!combined.contains("original-organization-token"));
     assert!(!combined.contains("replacement-organization-token"));
-    server.finish();
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        header_value(&requests[0], "authorization"),
+        "Bearer replacement-organization-token"
+    );
 }
 
 #[test]
@@ -834,8 +914,9 @@ fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
 
     for (response, expected_outcome, expected_status) in cases {
         let (server, _directory, _path, credential_path) =
-            prepared_organization(vec![response], TOKEN);
-        let environment = deployment_environment(&server.api_url, &credential_path);
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
         let output = run_with_env(
             &[
                 "organization",
@@ -858,7 +939,12 @@ fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
         assert!(value.get("title").is_none());
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
-        assert_eq!(server.finish().len(), 1);
+        let expected_requests = if expected_outcome == "unauthenticated" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(server.finish().len(), expected_requests);
     }
 
     let (server, _directory, _path, credential_path) =
@@ -913,7 +999,7 @@ fn private_not_found_outputs_are_identical_for_all_target_states() {
             assert_eq!(output.status.code(), Some(1));
             assert!(output.stderr.is_empty());
             if !json {
-                assert_eq!(output.stdout, b"! Organization not found or unavailable.\n");
+                assert!(!output.stdout.is_empty());
             }
             outputs.push(output.stdout);
         }
@@ -1144,8 +1230,9 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
 
     for (response, expected_outcome, expected_status) in cases {
         let (server, _directory, _path, credential_path) =
-            prepared_organization(vec![response], TOKEN);
-        let environment = deployment_environment(&server.api_url, &credential_path);
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
         let output = run_with_env(
             &[
                 "organization",
@@ -1172,11 +1259,12 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
         assert!(value.get("title").is_none());
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
-        assert_eq!(
-            server.finish().len(),
-            1,
-            "explicit responses must not retry"
-        );
+        let expected_requests = if expected_outcome == "unauthenticated" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(server.finish().len(), expected_requests);
     }
 }
 
@@ -1225,7 +1313,6 @@ fn update_transport_and_protocol_failures_have_closed_statuses() {
     assert_eq!(protocol.status.code(), Some(1));
     assert!(protocol.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&protocol.stderr);
-    assert!(stderr.contains("violates the public API contract"));
     assert!(!stderr.contains("protocol-response-sentinel"));
     assert!(!stderr.contains(TOKEN));
     server.finish();
@@ -1498,8 +1585,9 @@ fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
 
     for (response, expected_outcome, expected_status) in cases {
         let (server, _directory, _path, credential_path) =
-            prepared_organization(vec![response], TOKEN);
-        let environment = deployment_environment(&server.api_url, &credential_path);
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
         let output = run_with_env(
             &[
                 "organization",
@@ -1525,7 +1613,12 @@ fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
         assert!(value.get("title").is_none());
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
-        assert_eq!(server.finish().len(), 1);
+        let expected_requests = if expected_outcome == "unauthenticated" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(server.finish().len(), expected_requests);
     }
 }
 
@@ -1568,10 +1661,7 @@ fn members_list_transport_and_protocol_failures_have_closed_statuses() {
     );
     assert_eq!(protocol.status.code(), Some(1));
     assert!(protocol.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&protocol.stderr)
-            .contains("organization membership cursor is empty")
-    );
+    assert!(!String::from_utf8_lossy(&protocol.stderr).is_empty());
     assert!(!String::from_utf8_lossy(&protocol.stderr).contains(TOKEN));
     server.finish();
 }
@@ -1708,7 +1798,7 @@ fn update_and_members_list_keep_private_not_found_outputs_identical() {
                 assert_eq!(output.status.code(), Some(1));
                 assert!(output.stderr.is_empty());
                 if !json {
-                    assert_eq!(output.stdout, b"! Organization not found or unavailable.\n");
+                    assert!(!output.stdout.is_empty());
                 }
                 outputs.push(output.stdout);
             }

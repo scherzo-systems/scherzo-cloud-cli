@@ -20,34 +20,43 @@ boundary, mirror contents, CI workflow, or implementation are welcome.
 
 ## Human credentials
 
-The initial human credential store contains short-lived OAuth access tokens without
-application-level encryption. Normal operation protects the `~/.scherzo/` application
-home with mode `0700` and `credentials.json` with mode `0600`. The CLI refuses unsafe
-ownership, permissions, symbolic links, malformed schemas, and unbounded token values
-rather than silently repairing or replacing them. Human credentials are never runner
-credentials.
+The human credential store contains one-hour OAuth access tokens and rotating refresh
+tokens without application-level encryption. Normal operation protects the
+`~/.scherzo/` application home with mode `0700` and `credentials.json` with mode `0600`.
+The CLI refuses unsafe ownership, permissions, symbolic links, malformed schemas, and
+unbounded token values rather than silently repairing or replacing them. Human
+credentials are never runner credentials.
 
 Treat the credential file as a secret. Do not copy it into bug reports, command output,
 logs, repositories, or runner configuration. Use `scherzo-cloud auth logout` to remove
 the active deployment's local credential.
 
-`auth login` requests only `openid profile email`, stores no refresh token, opens no
-browser, and listens on no inbound port. The private OAuth device code and issued tokens
-must never be copied from memory into output or diagnostics; only the activation URL and
-user code are displayed. Interrupting a pending login stops polling and reports
-cancellation.
+`auth login` requests `openid profile email offline_access`, requires both access and
+refresh tokens, opens no browser, and listens on no inbound port. The private OAuth
+device code and issued tokens must never be copied from memory into output or
+diagnostics; only the activation URL and user code are displayed. Interrupting a pending
+login stops polling and reports cancellation.
 
-`auth status` sends a selected access token only to the exact API deployment recorded
-beside it. OAuth and public API requests reject redirects, use a 20-second deadline,
-disable general retries, and reject response bodies larger than 1 MiB. A `401` response
-removes the rejected credential without deleting a token that another process replaced
-while the request was in flight.
+Every human-authenticated command sends a selected access token only to the exact API
+deployment recorded beside it. Expired, near-expiry, or API-rejected access tokens are
+renewed through one shared path. Refresh use is serialized across processes by exact
+deployment fingerprint; a process re-reads after acquiring authority and atomically
+replaces the access token, expiration, and rotated refresh token. OAuth and public API
+requests reject redirects, use a 20-second deadline, and reject response bodies larger
+than 1 MiB. Refresh retries one ambiguous response at most once within Auth0's bounded
+overlap; an authenticated API request is retried at most once after renewal.
+
+An explicit invalid, expired, or revoked refresh token removes only the matching local
+session. Transport, rate-limit, and server failures preserve it. `auth logout` first
+removes the selected local session and then submits its refresh token to Auth0's
+revocation endpoint while retaining refresh authority. It distinguishes confirmed,
+unconfirmed, and inapplicable revocation without exposing credential material.
 
 ## Organization commands
 
 Organization commands send only the selected human OAuth access token to the exact
 configured API deployment. They never discover or read runner credentials, initiate
-OAuth, or accept credentials or idempotency keys as command input. HTTP is rejected
+interactive OAuth, or accept credentials or idempotency keys as command input. HTTP is rejected
 unless the individual leaf explicitly opts into insecure development transport.
 
 Create and update serialize one request and keep one random idempotency key only in
@@ -59,8 +68,9 @@ automatically.
 Organization output and diagnostics never copy bearer tokens, idempotency keys, complete
 response bodies, or API problem title and detail. Private absent, inactive, and
 inaccessible organizations share one `not_found` result. A contracted or malformed HTTP
-401 conditionally removes only the matching token, while 403 and other failures retain
-it. Successful response values are decoded through generated contract DTOs and projected
+401 first uses the shared bounded refresh path; a second rejection conditionally removes
+only the matching renewable credential, while 403 and other failures retain it.
+Successful response values are decoded through generated contract DTOs and projected
 into the documented schema-version-1 output rather than printing generated debug data.
 
 ## Runner service telemetry
@@ -136,11 +146,12 @@ help probe verifies the one-run `--approve` flag without reading `defaultProject
 reading or mutating the operator's `trust.json`.
 
 The operator-selected ClaudeCodeStreamJsonV1 check applies the same first-executable,
-canonical-path, no-fallback rule to executable name `claude`. Its probes run from fresh
-private project, home, Claude configuration, and XDG directories with a cleared child
+canonical-path, no-fallback rule to executable name `claude`. Scherzo does not install,
+upgrade, repair, or substitute that executable. Its probes run from a fresh private
+project, home, Claude configuration, and XDG directories with a cleared child
 environment, inherited `PATH` only for launcher interpreter resolution, fixed update and
 nonessential-traffic disables, and deterministic no-color controls. It requires exact
-version `2.1.222` and the closed non-model capabilities used by the production adapter.
+version `2.1.234` and the closed non-model capabilities used by the production adapter.
 The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
@@ -155,3 +166,37 @@ assignments, imports, and
 remote values cannot supply or alter the search path. Once validation succeeds,
 admission and execution retain the absolute installation identity and never search
 `PATH` again, so a later `PATH` change cannot redirect an admitted invocation.
+
+## Claude Code execution authority
+
+ClaudeCodeStreamJsonV1 launches normal Claude Code with the fixed unattended
+`bypassPermissions` mode and runner-owned user, project, and local setting sources. That
+mode suppresses interactive permission prompts; it does not reduce native tool authority,
+confine filesystem paths, filter network access, isolate processes, restrict resources,
+or protect ambient secrets. Scherzo's update, nonessential-traffic, marketplace, memory,
+Git-instruction, and fresh retained-session controls are deterministic profile behavior,
+not a sandbox. The profile removes `CLAUDE_CODE_PROJECT_DIR_NAME` so an inherited native
+path override cannot redirect the pinned release away from Scherzo's fresh retained-session
+links.
+
+Local users and runner operators own the security boundary around Claude Code. They must
+trust or isolate the execution root and every loaded project instruction, skill, hook,
+MCP server, plugin, provider configuration, and credential. They also own filesystem,
+process, network, resource, and secret policy. Scherzo does not claim that runner-owned
+settings can contain a hostile same-user process, and the maintained conformance suite
+runs only in fresh synthetic roots against a loopback provider without live credentials.
+
+Each invocation drains Claude Code's bounded stderr as a generic process-diagnostic
+stream, independently of stream-JSON stdout. Stderr bytes remain observable and retained;
+the parser never consumes their release-specific prose, and their presence cannot alter
+protocol or result authority.
+
+Each durable local invocation retains its potentially sensitive native Claude transcript
+inside the owner-private run diagnostics tree and removes its temporary ambient history
+links after containment quiesces. The transcript can be incomplete or malformed and is
+never workflow, result, failure, retry, or recovery authority. There is no automatic
+installation or cross-harness fallback. A missing or incompatible Claude installation
+fails Claude-required admission before launch while command-only and Pi work remain
+independent. Removing Claude from a runner service environment and restarting prevents
+future Claude admission; it is not an emergency sandbox or a way to
+revoke authority from already-running native work.

@@ -1,8 +1,9 @@
 //! Read-only Git workspace capture for semantic branch artifacts.
 //!
 //! The adapter pins committed object identities and verifies the staged carrier. It never creates
-//! a ref or invokes a named remote; Git's promisor-object reads are the only permitted hydration
-//! path, so they retain the workspace's configured source authority.
+//! a ref or invokes a named remote. Local capture may use the workspace's retained promisor
+//! authority; Cloud capture disables implicit lazy fetch and requires its admitted checkout to be
+//! self-contained.
 //!
 //! Capture does not provide snapshot isolation from arbitrary concurrent repository mutation. The
 //! final head and cleanliness observations detect changes present at that boundary only.
@@ -11,15 +12,15 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use ring::digest::{Context as DigestContext, SHA256};
-use rustix::process::{Pid, Signal, kill_process_group};
 
 use super::admission::{AdmittedExecutionContext, EnvironmentSnapshot};
 use super::artifact::{
@@ -30,6 +31,7 @@ use super::artifact::{
 };
 use super::execution_root::{AdmittedExecutionRoot, WorkingDirectorySelectionFailure};
 use super::schema_common::{is_lowercase_hex, lowercase_hex};
+use crate::process::ManagedProcessGroup;
 
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -54,6 +56,7 @@ pub(crate) enum GitWorkspaceAdmissionFailure {
     ExecutionRootNotWorkTreeRoot,
     UnsupportedObjectFormat,
     BaselineUnavailable,
+    InitialWorkspaceDirty,
 }
 
 impl fmt::Display for GitWorkspaceAdmissionFailure {
@@ -113,19 +116,86 @@ pub(crate) enum GitAwareCaptureDeclaration<'a> {
     GitBranch(&'a str),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+pub(crate) struct CloudGitCaptureProjection {
+    source_commit: Arc<str>,
+    workflow_digest: Arc<str>,
+    admission_cancellation: CaptureCancellation,
+}
+
+impl fmt::Debug for CloudGitCaptureProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloudGitCaptureProjection")
+            .field("source_commit", &self.source_commit)
+            .field("workflow_digest", &self.workflow_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CloudGitCaptureProjection {
+    pub(crate) fn new(
+        source_commit: Arc<str>,
+        workflow_digest: Arc<str>,
+        admission_cancellation: CaptureCancellation,
+    ) -> Self {
+        Self {
+            source_commit,
+            workflow_digest,
+            admission_cancellation,
+        }
+    }
+
+    pub(crate) fn workflow_digest(&self) -> &str {
+        &self.workflow_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitMetadataIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone)]
 pub(crate) struct GitCaptureContext {
     root: AdmittedExecutionRoot,
+    git_metadata: GitMetadataIdentity,
     environment: EnvironmentSnapshot,
     baseline_oid: Arc<str>,
+    workflow_digest: Option<Arc<str>>,
     source_authority: Arc<[u8]>,
     object_format: GitObjectFormat,
+    carrier_limits: (usize, u64, u64),
+    disable_implicit_fetch: bool,
     git_program: Arc<PathBuf>,
     command_timeout: Duration,
 }
 
+impl fmt::Debug for GitCaptureContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitCaptureContext")
+            .field("root", &self.root)
+            .field("git_metadata", &self.git_metadata)
+            .field("baseline_oid", &self.baseline_oid)
+            .field("workflow_digest", &self.workflow_digest)
+            .field("object_format", &self.object_format)
+            .field("carrier_limits", &self.carrier_limits)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GitCaptureContext {
     pub(crate) fn admit(
+        execution: &AdmittedExecutionContext,
+        cancellation: &CaptureCancellation,
+    ) -> Result<Self, GitWorkspaceAdmissionFailure> {
+        Self::admit_local(execution, cancellation)
+    }
+
+    pub(crate) fn admit_local(
         execution: &AdmittedExecutionContext,
         cancellation: &CaptureCancellation,
     ) -> Result<Self, GitWorkspaceAdmissionFailure> {
@@ -137,9 +207,38 @@ impl GitCaptureContext {
         )
     }
 
+    pub(crate) fn admit_cloud(
+        execution: &AdmittedExecutionContext,
+        projection: &CloudGitCaptureProjection,
+    ) -> Result<Self, GitWorkspaceAdmissionFailure> {
+        Self::admit_with_program_and_cloud(
+            execution,
+            &projection.admission_cancellation,
+            Some(projection),
+            PathBuf::from("git"),
+            GIT_COMMAND_TIMEOUT,
+        )
+    }
+
     fn admit_with_program(
         execution: &AdmittedExecutionContext,
         cancellation: &CaptureCancellation,
+        git_program: PathBuf,
+        command_timeout: Duration,
+    ) -> Result<Self, GitWorkspaceAdmissionFailure> {
+        Self::admit_with_program_and_cloud(
+            execution,
+            cancellation,
+            None,
+            git_program,
+            command_timeout,
+        )
+    }
+
+    fn admit_with_program_and_cloud(
+        execution: &AdmittedExecutionContext,
+        cancellation: &CaptureCancellation,
+        cloud: Option<&CloudGitCaptureProjection>,
         git_program: PathBuf,
         command_timeout: Duration,
     ) -> Result<Self, GitWorkspaceAdmissionFailure> {
@@ -148,10 +247,28 @@ impl GitCaptureContext {
             .map_err(|_| GitWorkspaceAdmissionFailure::Cancelled)?;
         let mut context = Self {
             root: execution.root_identity().clone(),
+            git_metadata: GitMetadataIdentity {
+                path: PathBuf::new(),
+                device: 0,
+                inode: 0,
+            },
             environment: execution.environment().clone(),
             baseline_oid: Arc::from(""),
+            workflow_digest: cloud.map(|projection| Arc::clone(&projection.workflow_digest)),
             source_authority: Arc::from([]),
             object_format: GitObjectFormat::Sha1,
+            carrier_limits: (
+                execution.limits().maximum_captured_git_carriers().get(),
+                execution
+                    .limits()
+                    .maximum_captured_git_carrier_bytes()
+                    .get(),
+                execution
+                    .limits()
+                    .maximum_total_captured_git_carrier_bytes()
+                    .get(),
+            ),
+            disable_implicit_fetch: cloud.is_some(),
             git_program: Arc::new(git_program),
             command_timeout,
         };
@@ -221,6 +338,36 @@ impl GitCaptureContext {
         }
         let source_authority = source_authority_snapshot(&source_authority)
             .ok_or(GitWorkspaceAdmissionFailure::GitUnavailable)?;
+        if let Some(cloud) = cloud
+            && baseline_oid.as_ref() != cloud.source_commit.as_ref()
+        {
+            return Err(GitWorkspaceAdmissionFailure::BaselineUnavailable);
+        }
+        context.git_metadata = context.read_git_metadata(cancellation)?;
+        if cloud.is_some() {
+            let status = context
+                .run_source(
+                    &[
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=normal",
+                        "--ignore-submodules=none",
+                    ],
+                    ProcessInput::None,
+                    1,
+                    cancellation,
+                    true,
+                    None,
+                )
+                .map_err(admission_process_failure)?;
+            if !status.status.success()
+                || status.stdout.truncated
+                || !status.stdout.bytes.is_empty()
+            {
+                return Err(GitWorkspaceAdmissionFailure::InitialWorkspaceDirty);
+            }
+        }
         context.baseline_oid = baseline_oid;
         context.source_authority = source_authority;
         Ok(context)
@@ -232,6 +379,14 @@ impl GitCaptureContext {
 
     pub(crate) fn object_format(&self) -> GitObjectFormat {
         self.object_format
+    }
+
+    pub(crate) fn workflow_digest(&self) -> Option<&str> {
+        self.workflow_digest.as_deref()
+    }
+
+    pub(crate) fn carrier_limits(&self) -> (usize, u64, u64) {
+        self.carrier_limits
     }
 
     /// Stages and verifies one branch candidate. The returned set remains provisional until its
@@ -495,7 +650,7 @@ impl GitCaptureContext {
                 ProcessInput::None,
                 MAXIMUM_OBJECT_LIST_BYTES,
                 cancellation,
-                false,
+                self.disable_implicit_fetch,
                 Some(shallow_file),
             )
             .map_err(|failure| {
@@ -522,7 +677,7 @@ impl GitCaptureContext {
                 ProcessInput::Bytes(&objects.stdout.bytes),
                 MAXIMUM_OBJECT_SIZE_LIST_BYTES,
                 cancellation,
-                false,
+                self.disable_implicit_fetch,
                 None,
             )
             .map_err(|failure| {
@@ -731,6 +886,55 @@ impl GitCaptureContext {
         Ok(shallow)
     }
 
+    fn read_git_metadata(
+        &self,
+        cancellation: &CaptureCancellation,
+    ) -> Result<GitMetadataIdentity, GitWorkspaceAdmissionFailure> {
+        let output = self
+            .run_source(
+                &["rev-parse", "--absolute-git-dir"],
+                ProcessInput::None,
+                MAXIMUM_SMALL_OUTPUT_BYTES,
+                cancellation,
+                true,
+                None,
+            )
+            .map_err(admission_process_failure)?;
+        if !output.status.success() || output.stdout.truncated {
+            return Err(GitWorkspaceAdmissionFailure::GitUnavailable);
+        }
+        let path = output
+            .stdout
+            .bytes
+            .strip_suffix(b"\n")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(PathBuf::from)
+            .ok_or(GitWorkspaceAdmissionFailure::GitUnavailable)?;
+        let path = std::fs::canonicalize(path)
+            .map_err(|_| GitWorkspaceAdmissionFailure::GitUnavailable)?;
+        let metadata =
+            std::fs::metadata(&path).map_err(|_| GitWorkspaceAdmissionFailure::GitUnavailable)?;
+        if !metadata.is_dir() {
+            return Err(GitWorkspaceAdmissionFailure::NotWorkTree);
+        }
+        Ok(GitMetadataIdentity {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn git_metadata_is_bound(&self) -> bool {
+        if self.git_metadata.path.as_os_str().is_empty() {
+            return true;
+        }
+        std::fs::metadata(&self.git_metadata.path).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.dev() == self.git_metadata.device
+                && metadata.ino() == self.git_metadata.inode
+        })
+    }
+
     fn read_tracked_entry_modes(
         &self,
         cancellation: &CaptureCancellation,
@@ -810,6 +1014,9 @@ impl GitCaptureContext {
         no_lazy_fetch: bool,
         shallow_file: Option<&Path>,
     ) -> Result<ProcessOutput, ProcessFailure> {
+        if !self.git_metadata_is_bound() {
+            return Err(ProcessFailure::ExecutionRootRebound);
+        }
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         let mut command = self.git_command(&arguments, no_lazy_fetch, shallow_file);
         self.root
@@ -921,7 +1128,8 @@ impl GitCaptureContext {
             OsString::from("--window=0"),
             OsString::from("--depth=0"),
         ];
-        let mut command = self.git_command(&arguments, false, Some(shallow_file));
+        let mut command =
+            self.git_command(&arguments, self.disable_implicit_fetch, Some(shallow_file));
         self.root
             .bind_command_ref(&mut command)
             .map_err(|_| PackStreamFailure::Process(ProcessFailure::ExecutionRootRebound))?;
@@ -1112,6 +1320,13 @@ fn reserved_git_environment(name: &OsStr) -> bool {
             | b"GIT_CONFIG_GLOBAL"
             | b"GIT_CONFIG_NOSYSTEM"
             | b"GIT_CONFIG_SYSTEM"
+            | b"GIT_ASKPASS"
+            | b"GIT_ASKPASS_REQUIRE"
+            | b"GIT_TERMINAL_PROMPT"
+            | b"GIT_SSH"
+            | b"GIT_SSH_COMMAND"
+            | b"SSH_ASKPASS"
+            | b"SSH_ASKPASS_REQUIRE"
     ) || name.starts_with(b"GIT_CONFIG_KEY_")
         || name.starts_with(b"GIT_CONFIG_VALUE_")
         || name.starts_with(b"GIT_TRACE")
@@ -1217,11 +1432,12 @@ fn execute_process(
         }
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(&mut command)?;
-    let stdout = child.child.stdout.take().ok_or(ProcessFailure::Io)?;
-    let stderr = child.child.stderr.take().ok_or(ProcessFailure::Io)?;
+    let mut child = ManagedProcessGroup::spawn(&mut command).map_err(|_| ProcessFailure::Spawn)?;
+    let child_process = child.child_mut();
+    let stdout = child_process.stdout.take().ok_or(ProcessFailure::Io)?;
+    let stderr = child_process.stderr.take().ok_or(ProcessFailure::Io)?;
     let stdin = match input {
-        ProcessInput::Bytes(_) => child.child.stdin.take(),
+        ProcessInput::Bytes(_) => child_process.stdin.take(),
         ProcessInput::None | ProcessInput::File(_) => None,
     };
 
@@ -1235,7 +1451,8 @@ fn execute_process(
             (ProcessInput::Bytes(_), None) => return Err(ProcessFailure::Input),
             (ProcessInput::None | ProcessInput::File(_), _) => None,
         };
-        let status = child.wait(
+        let status = wait_managed_child(
+            &mut child,
             cancellation,
             timeout,
             command_description,
@@ -1283,19 +1500,18 @@ fn stream_process_stdout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(&mut command).map_err(PackStreamFailure::Process)?;
-    let mut stdin = child
-        .child
+    let mut child = ManagedProcessGroup::spawn(&mut command)
+        .map_err(|_| PackStreamFailure::Process(ProcessFailure::Spawn))?;
+    let child_process = child.child_mut();
+    let mut stdin = child_process
         .stdin
         .take()
         .ok_or(PackStreamFailure::Process(ProcessFailure::Input))?;
-    let mut stdout = child
-        .child
+    let mut stdout = child_process
         .stdout
         .take()
         .ok_or(PackStreamFailure::Process(ProcessFailure::Io))?;
-    let stderr = child
-        .child
+    let stderr = child_process
         .stderr
         .take()
         .ok_or(PackStreamFailure::Process(ProcessFailure::Io))?;
@@ -1313,7 +1529,8 @@ fn stream_process_stdout(
             }
         });
         let stderr = scope.spawn(move || drain_bounded(stderr, MAXIMUM_SMALL_OUTPUT_BYTES));
-        let status = child.wait(
+        let status = wait_managed_child(
+            &mut child,
             cancellation,
             timeout,
             command_description,
@@ -1351,98 +1568,55 @@ fn stream_process_stdout(
     })
 }
 
-struct ManagedChild {
-    child: Child,
-    process_group: Option<Pid>,
-    reaped: bool,
-}
-
-impl ManagedChild {
-    fn spawn(command: &mut Command) -> Result<Self, ProcessFailure> {
-        command
-            .spawn()
-            .map(|child| Self {
-                process_group: i32::try_from(child.id()).ok().and_then(Pid::from_raw),
-                child,
-                reaped: false,
-            })
-            .map_err(|_| ProcessFailure::Spawn)
-    }
-
-    fn wait(
-        &mut self,
-        cancellation: &CaptureCancellation,
-        timeout: Duration,
-        command: Arc<str>,
-        stream_finished: impl Fn() -> bool,
-        workers_finished: impl Fn() -> bool,
-    ) -> Result<ExitStatus, ProcessFailure> {
-        let started = crate::timing::monotonic_now();
-        let mut status = None;
-        let mut stream_closed_at = None;
-        loop {
-            if cancellation.is_cancelled() {
-                self.terminate();
-                return Err(ProcessFailure::Cancelled);
-            }
-            if status.is_none() {
-                match self.child.try_wait() {
-                    Ok(Some(observed)) => {
-                        self.reaped = true;
-                        status = Some(observed);
-                    }
-                    Ok(None) => {}
-                    Err(_) => {
-                        self.terminate();
-                        return Err(ProcessFailure::Wait);
-                    }
+fn wait_managed_child(
+    child: &mut ManagedProcessGroup,
+    cancellation: &CaptureCancellation,
+    timeout: Duration,
+    command: Arc<str>,
+    stream_finished: impl Fn() -> bool,
+    workers_finished: impl Fn() -> bool,
+) -> Result<ExitStatus, ProcessFailure> {
+    let started = crate::timing::monotonic_now();
+    let mut status = None;
+    let mut stream_closed_at = None;
+    loop {
+        if cancellation.is_cancelled() {
+            child.terminate();
+            return Err(ProcessFailure::Cancelled);
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(observed)) => status = Some(observed),
+                Ok(None) => {}
+                Err(_) => {
+                    child.terminate();
+                    return Err(ProcessFailure::Wait);
                 }
             }
-            if let Some(status) = status
-                && workers_finished()
-            {
-                self.terminate_process_group();
-                return Ok(status);
-            }
-            if status.is_none() && stream_finished() {
-                let closed_at = stream_closed_at.get_or_insert_with(crate::timing::monotonic_now);
-                if crate::timing::elapsed(*closed_at) >= Duration::from_millis(100) {
-                    self.terminate();
-                    return Err(ProcessFailure::StreamClosed);
-                }
-            } else {
-                stream_closed_at = None;
-            }
-            if crate::timing::elapsed(started) >= timeout {
-                self.terminate();
-                return Err(ProcessFailure::TimedOut {
-                    command,
-                    limit: timeout,
-                });
-            }
-            crate::timing::sleep(PROCESS_POLL_INTERVAL);
         }
-    }
-
-    fn terminate_process_group(&self) {
-        if let Some(process_group) = self.process_group {
-            let _ = kill_process_group(process_group, Signal::KILL);
+        if let Some(status) = status
+            && workers_finished()
+        {
+            child.terminate_process_group();
+            return Ok(status);
         }
-    }
-
-    fn terminate(&mut self) {
-        self.terminate_process_group();
-        if !self.reaped {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.reaped = true;
+        if status.is_none() && stream_finished() {
+            let closed_at = stream_closed_at.get_or_insert_with(crate::timing::monotonic_now);
+            if crate::timing::elapsed(*closed_at) >= Duration::from_millis(100) {
+                child.terminate();
+                return Err(ProcessFailure::StreamClosed);
+            }
+        } else {
+            stream_closed_at = None;
         }
-    }
-}
-
-impl Drop for ManagedChild {
-    fn drop(&mut self) {
-        self.terminate();
+        if crate::timing::elapsed(started) >= timeout {
+            child.terminate();
+            return Err(ProcessFailure::TimedOut {
+                command,
+                limit: timeout,
+            });
+        }
+        crate::timing::sleep(PROCESS_POLL_INTERVAL);
     }
 }
 

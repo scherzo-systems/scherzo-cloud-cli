@@ -557,6 +557,7 @@ enum AgentMaterializationBoundaryInternal {
 enum PlannedAttachment<'a> {
     Bytes(&'a [u8]),
     Json(&'a Value),
+    CanonicalJson(&'a [u8]),
     Artifact(&'a CapturedArtifact),
 }
 
@@ -636,6 +637,7 @@ pub(crate) fn materialize_agent_invocation<Sink>(
     diagnostic_sessions: &AgentDiagnosticSessionStore,
     identity: AgentInvocationIdentity,
     upstream_outputs: &BTreeMap<ResolvedOutputSource, CapturedValue>,
+    finalization_context: Option<&[u8]>,
     cancellation: CancellationSource,
     process_guards: ProcessGuardRegistry,
     observation_sink: Sink,
@@ -650,6 +652,14 @@ where
         .definition
         .steps
         .get(step_name)
+        .or_else(|| {
+            admitted
+                .workflow()
+                .definition
+                .finalizers
+                .get(step_name)
+                .map(|finalizer| &finalizer.body)
+        })
         .ok_or_else(|| start_error(AgentInputStartFailure::StepUnavailable))?;
     let ValidatedStep::Agent(step) = definition else {
         return Err(start_error(AgentInputStartFailure::StepUnavailable));
@@ -669,7 +679,14 @@ where
         step.common.cwd.as_deref(),
     )
     .map_err(|failure| start_error(AgentInputStartFailure::WorkingDirectory(failure)))?;
-    let plan = build_plan(admitted, step_name, step, upstream_outputs, admitted_step)?;
+    let plan = build_plan(
+        admitted,
+        step_name,
+        step,
+        upstream_outputs,
+        finalization_context,
+        admitted_step,
+    )?;
     check_cancellation(&cancellation)?;
     let lifecycle = staging
         .inner
@@ -798,6 +815,7 @@ fn build_plan<'a>(
     step_name: &str,
     step: &'a ValidatedAgentStep,
     upstream_outputs: &'a BTreeMap<ResolvedOutputSource, CapturedValue>,
+    finalization_context: Option<&'a [u8]>,
     harness: &AdmittedHarness,
 ) -> Result<AgentMaterializationPlan<'a>, AgentInputMaterializationError> {
     let system_prompt = retained_text(admitted, &step.agent.system_prompt)?;
@@ -821,6 +839,7 @@ fn build_plan<'a>(
             admitted,
             source,
             upstream_outputs,
+            finalization_context,
             &mut attachment_budget,
             &mut attachments,
         )?;
@@ -868,6 +887,7 @@ fn resolve_attachments<'a>(
     admitted: &'a AdmittedWorkflow,
     source: &'a ValidatedMessageSource,
     upstream_outputs: &'a BTreeMap<ResolvedOutputSource, CapturedValue>,
+    finalization_context: Option<&'a [u8]>,
     budget: &mut AttachmentBudget,
     attachments: &mut Vec<PlannedAgentAttachment<'a>>,
 ) -> Result<(), AgentInputMaterializationError> {
@@ -930,6 +950,21 @@ fn resolve_attachments<'a>(
             };
             budget.push(attachment, attachments)?;
         }
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::FinalizationContext,
+            value_type: WorkflowValueType::Json,
+        } => {
+            let bytes = finalization_context
+                .ok_or_else(|| start_error(AgentInputStartFailure::InputsUnavailable))?;
+            budget.push(
+                PlannedAgentAttachment {
+                    payload: PlannedAttachment::CanonicalJson(bytes),
+                    media_type: Arc::from("application/json"),
+                    diagnostic_source_name: Some(Arc::from("finalization.context")),
+                },
+                attachments,
+            )?;
+        }
         ValidatedMessageSource::Reference { .. } => {
             return Err(start_error(AgentInputStartFailure::InputsUnavailable));
         }
@@ -958,6 +993,12 @@ fn planned_attachment_size(
                 Err(start_error(AgentInputStartFailure::InputsUnavailable))
             }
         },
+        PlannedAttachment::CanonicalJson(bytes) => u64::try_from(bytes.len())
+            .ok()
+            .filter(|bytes| *bytes <= remaining)
+            .ok_or_else(|| {
+                start_error(AgentInputStartFailure::AttachmentBytesLimitExceeded { maximum })
+            }),
         PlannedAttachment::Artifact(artifact) if artifact.size() <= remaining => {
             Ok(artifact.size())
         }
@@ -1074,6 +1115,9 @@ fn stage_attachments(
         let write_result = match &attachment.payload {
             PlannedAttachment::Bytes(bytes) => write_bytes(&mut destination, bytes, cancellation),
             PlannedAttachment::Json(value) => write_json(&mut destination, value, cancellation),
+            PlannedAttachment::CanonicalJson(bytes) => {
+                write_bytes(&mut destination, bytes, cancellation)
+            }
             PlannedAttachment::Artifact(artifact) => {
                 write_artifact(artifacts, &mut destination, artifact, cancellation)
             }

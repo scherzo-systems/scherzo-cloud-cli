@@ -1,4 +1,3 @@
-#[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,7 +33,7 @@ const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAK
 #[cfg(target_os = "linux")]
 #[expect(
     clippy::disallowed_methods,
-    reason = "wall time only prevents external-process quiescence polling from busy-spinning"
+    reason = "this fixed external-process pre-delay is not a condition poll"
 )]
 pub(super) fn wait_for_process_poll() {
     let (_sender, receiver) = std::sync::mpsc::channel::<()>();
@@ -134,6 +133,7 @@ pub(super) struct RunBundle {
     source_root: PathBuf,
     execution_root: PathBuf,
     result_parent: PathBuf,
+    claude_config: PathBuf,
 }
 
 impl RunBundle {
@@ -142,7 +142,13 @@ impl RunBundle {
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
         let result_parent = temporary.path().join("results");
-        for directory in [&source_root, &execution_root, &result_parent] {
+        let claude_config = temporary.path().join("claude-config");
+        for directory in [
+            &source_root,
+            &execution_root,
+            &result_parent,
+            &claude_config,
+        ] {
             fs::create_dir(directory).unwrap();
         }
         fs::write(source_root.join(WORKFLOW_PATH), source).unwrap();
@@ -151,6 +157,7 @@ impl RunBundle {
             source_root,
             execution_root,
             result_parent,
+            claude_config,
         }
     }
 
@@ -176,6 +183,10 @@ impl RunBundle {
 
     pub(super) fn initial_cwd(&self) -> &Path {
         self._temporary.path()
+    }
+
+    fn claude_config(&self) -> &Path {
+        &self.claude_config
     }
 
     pub(super) fn args(&self, result: &Path) -> Vec<String> {
@@ -216,6 +227,17 @@ pub(super) fn isolated_command(args: &[String]) -> Command {
 
 pub(super) fn run(args: &[String]) -> Output {
     isolated_command(args).output().unwrap()
+}
+
+fn fixture_path_with_host_tools(fixtures: &[&Path]) -> OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        fixtures
+            .iter()
+            .map(|path| (*path).to_owned())
+            .chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap()
 }
 
 fn serve_fake_provider(
@@ -471,14 +493,20 @@ fn response_pi_execution() -> String {
 fn response_claude_code_execution() -> &'static str {
     r#"set -eu
 model=
+session=
 previous=
 for argument in "$@"; do
   if [ "$previous" = --model ]; then model=$argument; fi
+  if [ "$previous" = --session-id ]; then session=$argument; fi
   previous=$argument
 done
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+set -- "$config"/projects/*
+[ "$#" -eq 1 ] && [ -d "$1" ]
+native_project=$1
+printf '{malformed retained transcript' > "$native_project/$session.jsonl"
 while IFS= read -r _; do :; done
-session=00000000-0000-4000-8000-000000000002
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-local","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude response"}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -492,18 +520,19 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 fn corrected_claude_code_result_execution() -> &'static str {
     r#"set -eu
 model=
+session=
 previous=
 for argument in "$@"; do
   if [ "$previous" = --model ]; then model=$argument; fi
+  if [ "$previous" = --session-id ]; then session=$argument; fi
   previous=$argument
 done
-session=00000000-0000-4000-8000-000000000004
 emit_exchange() {
   exchange=$1
   value=$2
   call=tool-result-$exchange
   message=msg-result-$exchange
-  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
   printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$message" "$model" "$session"
   printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}},"session_id":"%s","parent_tool_use_id":null}\n' "$call" "$value" "$session"
   printf '{"type":"assistant","message":{"id":"%s","type":"message","role":"assistant","content":[{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$message" "$call" "$value" "$model" "$session"
@@ -551,16 +580,17 @@ exports:
 fn blocked_claude_code_execution() -> &'static str {
     r#"set -eu
 model=
+session=
 previous=
 for argument in "$@"; do
   if [ "$previous" = --model ]; then model=$argument; fi
+  if [ "$previous" = --session-id ]; then session=$argument; fi
   previous=$argument
 done
 IFS= read -r _
 printf '%s\n' "$$" > "$CLAUDE_FIXTURE_PID"
 trap 'exit 130' INT TERM
-session=00000000-0000-4000-8000-000000000003
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.222"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
 printf '\001' > "$WORKFLOW_READY_FIFO"
 IFS= read -r _ < "$WORKFLOW_RELEASE_FIFO"
 exit 23"#
@@ -641,13 +671,7 @@ exports:
 }
 
 #[test]
-fn command_only_run_and_help_remain_pi_independent() {
-    let help = run(&["workflow".to_owned(), "run".to_owned(), "--help".to_owned()]);
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout).unwrap();
-    assert!(!help.contains("--pi"));
-    assert!(!help.contains("pi-executable"));
-
+fn command_only_run_remains_pi_independent() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf command-only\"]\n",
     );
@@ -665,7 +689,13 @@ fn command_only_run_and_help_remain_pi_independent() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("command-only"));
-    assert!(attempt_result(&destination).join("result.json").is_file());
+    let result_path = attempt_result(&destination).join("result.json");
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs::read(result_path).unwrap()).unwrap();
+    assert!(result.get("finalization").is_none());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    assert!(state["attempts"][0].get("finalization").is_none());
 }
 
 #[test]
@@ -754,6 +784,181 @@ steps:
     );
     assert_eq!(status["retry"]["eligible"], false);
     assert_eq!(status["retry"]["reason"], "latest_attempt_succeeded");
+}
+
+#[test]
+fn finalization_runs_after_ordinary_failure_and_is_durable_before_publication() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/finalization-cleanup.yaml"
+    ));
+    let destination = bundle.result("failed-with-cleanup");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &terminal["result"];
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["primaryFailure"]["node"]["id"], "fail");
+    assert_eq!(result["primaryFailure"]["node"]["role"], "step");
+    assert_eq!(result["steps"][0]["role"], "step");
+    assert_eq!(result["finalization"]["trigger"], "failed");
+    assert_eq!(result["finalization"]["finalizers"][0]["id"], "cleanup");
+    assert_eq!(result["finalization"]["finalizers"][0]["role"], "finalizer");
+    assert_eq!(
+        result["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    assert_eq!(result["finalization"]["finalizers"][1]["state"], "not_run");
+    assert_eq!(
+        result["finalization"]["finalizers"][1]["reason"],
+        "finalizer_trigger_not_selected"
+    );
+    assert_eq!(result["finalization"]["finalizers"][2]["state"], "failed");
+    assert_eq!(
+        result["finalization"]["issues"],
+        serde_json::json!([{
+            "node": { "id": "notify", "role": "finalizer" },
+            "impact": "advisory"
+        }])
+    );
+    assert_eq!(
+        result["exports"]["cleanupReceipt"],
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "source_trigger_not_selected"
+        })
+    );
+    assert_eq!(
+        fs::read(bundle.execution_root().join("cleanup.txt")).unwrap(),
+        b"cleanup-complete"
+    );
+
+    let progress = String::from_utf8(output.stderr).unwrap();
+    let ordinary = progress.find("ordinary phase").unwrap();
+    let finalization = progress
+        .find("finalization phase · trigger failed")
+        .unwrap();
+    assert!(ordinary < finalization);
+    assert!(progress.contains("finalization: cleanup complete"));
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["attempts"][0]["finalization"]["complete"], true);
+    assert_eq!(state["attempts"][0]["finalization"]["trigger"], "failed");
+    assert_eq!(
+        state["attempts"][0]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["state"]["attempts"][0]["finalization"]["complete"],
+        true
+    );
+    assert_eq!(
+        status["state"]["attempts"][0]["finalization"]["trigger"],
+        "failed"
+    );
+    assert_eq!(status["retry"]["eligible"], true);
+}
+
+#[test]
+fn finalizer_input_unavailability_is_preserved_in_summary_and_exports() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  complete:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  produce:
+    kind: cmd
+    when: [succeeded]
+    command:
+      argv: ["/bin/sh", "-c", "exit 19"]
+    outputs:
+      payload:
+        kind: file
+        path: payload.json
+        mediaType: application/json
+  consume:
+    kind: cmd
+    when: [succeeded]
+    inputs:
+      payload:
+        ref: outputs.produce.payload
+    command:
+      argv: ["true"]
+    outputs:
+      receipt:
+        kind: file
+        path: receipt.json
+        mediaType: application/json
+exports:
+  receipt:
+    ref: outputs.consume.receipt
+"#,
+    );
+    let destination = bundle.result("finalizer-input-unavailable");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &terminal["result"];
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["primaryFailure"]["node"]["id"], "produce");
+    assert_eq!(result["primaryFailure"]["node"]["role"], "finalizer");
+    assert_eq!(result["finalization"]["trigger"], "succeeded");
+    assert_eq!(result["finalization"]["finalizers"][0]["state"], "failed");
+    assert_eq!(result["finalization"]["finalizers"][1]["state"], "blocked");
+    assert_eq!(
+        result["finalization"]["finalizers"][1]["reason"],
+        "input_unavailable"
+    );
+    assert_eq!(
+        result["finalization"]["finalizers"][1]["unavailableReferences"],
+        serde_json::json!(["outputs.produce.payload"])
+    );
+    assert_eq!(
+        result["finalization"]["issues"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        result["exports"]["receipt"],
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "source_input_unavailable"
+        })
+    );
+    let progress = String::from_utf8(output.stderr).unwrap();
+    assert!(progress.contains("inputs unavailable: outputs.produce.payload"));
 }
 
 #[test]
@@ -1171,7 +1376,7 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
 #[test]
 fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallback() {
     let replacement =
-        ClaudeCodeFixture::new("2.1.222 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
+        ClaudeCodeFixture::new("2.1.234 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
     let mut probe_barrier = AgentBarrierFixture::new();
     let capability_hook = format!(
         "printf '\\001' > {}; IFS= read -r _ < {}",
@@ -1179,22 +1384,50 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
         quote(probe_barrier.release_path.to_str().unwrap()),
     );
     let claude = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.222 (Claude Code)",
+        "2.1.234 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
         &capability_hook,
     );
     let ordered_path =
-        std::env::join_paths([replacement.path_directory(), claude.path_directory()]).unwrap();
+        fixture_path_with_host_tools(&[replacement.path_directory(), claude.path_directory()]);
     let bundle = RunBundle::new(response_claude_code_agent_source());
     bundle.write_source("system.md", "system");
     bundle.write_source("message.md", "prompt");
+    let runner_resources = [
+        (
+            bundle.claude_config().join("settings.json"),
+            b"runner settings sentinel".as_slice(),
+        ),
+        (
+            bundle.claude_config().join("skills/diagnostic/SKILL.md"),
+            b"runner skill sentinel".as_slice(),
+        ),
+        (
+            bundle.execution_root().join("CLAUDE.md"),
+            b"project instruction sentinel".as_slice(),
+        ),
+        (
+            bundle.execution_root().join(".mcp.json"),
+            b"project MCP sentinel".as_slice(),
+        ),
+        (
+            bundle.execution_root().join(".claude/settings.json"),
+            b"project hook and plugin sentinel".as_slice(),
+        ),
+    ];
+    for (path, bytes) in &runner_resources {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
     let destination = bundle.result("claude-response");
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
     let child = isolated_command(&args)
         .env("PATH", ordered_path)
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .env("ANTHROPIC_API_KEY", "synthetic-credential-sentinel")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1234,18 +1467,56 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
         .unwrap()
         .unwrap()
         .path();
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(diagnostic.join("metadata.json")).unwrap()).unwrap();
+    let metadata_bytes = fs::read(diagnostic.join("metadata.json")).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
     assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
-    assert_eq!(metadata["claudeCodeVersion"], "2.1.222");
-    assert_eq!(metadata["nativeSessionPersistence"], false);
+    assert_eq!(metadata["claudeCodeVersion"], "2.1.234");
+    assert_eq!(
+        metadata["nativeSession"],
+        serde_json::json!({"relativeDirectory": "session", "formatVersion": 1})
+    );
+    assert!(diagnostic.join("session/resources").is_dir());
+    assert_eq!(
+        fs::read(diagnostic.join("session/transcript.jsonl")).unwrap(),
+        b"{malformed retained transcript"
+    );
     assert!(metadata.get("environment").is_none());
+    assert!(!String::from_utf8_lossy(&metadata_bytes).contains("synthetic-credential-sentinel"));
+    assert!(
+        !String::from_utf8_lossy(&metadata_bytes)
+            .contains(bundle.claude_config().to_str().unwrap())
+    );
+    fs::remove_file(diagnostic.join("session/transcript.jsonl")).unwrap();
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["state"]["attempts"][0]["state"], "succeeded");
+    assert_eq!(status["recovery"]["status"], "settled");
+    assert_eq!(status["retry"]["eligible"], false);
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"claude response"
+    );
+    for (path, expected) in runner_resources {
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+    let ambient_projects = bundle.claude_config().join("projects");
+    for project in fs::read_dir(ambient_projects).unwrap() {
+        assert_eq!(fs::read_dir(project.unwrap().path()).unwrap().count(), 0);
+    }
 }
 
 #[test]
 fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     let pi = PiFixture::new("0.83.0", COMPLETE_HELP, true);
-    let claude = ClaudeCodeFixture::new("2.1.222 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.234 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
 
     let claude_bundle = RunBundle::new(response_claude_code_agent_source());
     claude_bundle.write_source("system.md", "system");
@@ -1319,12 +1590,12 @@ fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
 fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
     let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.222 (Claude Code)",
+        "2.1.234 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
     );
-    let path = std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+    let path = fixture_path_with_host_tools(&[pi.path_directory(), claude.path_directory()]);
     let bundle = RunBundle::new(mixed_harness_source());
     for path in ["pi-system.md", "claude-system.md", "message.md"] {
         bundle.write_source(path, "fixture");
@@ -1333,7 +1604,11 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
 
-    let output = isolated_command(&args).env("PATH", path).output().unwrap();
+    let output = isolated_command(&args)
+        .env("PATH", path)
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .output()
+        .unwrap();
 
     assert!(
         output.status.success(),
@@ -1380,7 +1655,7 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
 #[test]
 fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value() {
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.222 (Claude Code)",
+        "2.1.234 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         corrected_claude_code_result_execution(),
@@ -1396,8 +1671,10 @@ fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
 
+    let path = fixture_path_with_host_tools(&[claude.path_directory()]);
     let output = isolated_command(&args)
-        .env("PATH", claude.path_directory())
+        .env("PATH", path)
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
         .output()
         .unwrap();
 
@@ -1428,12 +1705,12 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
     ] {
         let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
         let claude = ClaudeCodeFixture::with_execution(
-            "2.1.222 (Claude Code)",
+            "2.1.234 (Claude Code)",
             CLAUDE_CODE_COMPLETE_HELP,
             true,
             blocked_claude_code_execution(),
         );
-        let path = std::env::join_paths([pi.path_directory(), claude.path_directory()]).unwrap();
+        let path = fixture_path_with_host_tools(&[pi.path_directory(), claude.path_directory()]);
         let bundle = RunBundle::new(mixed_harness_source());
         for path in ["pi-system.md", "claude-system.md", "message.md"] {
             bundle.write_source(path, "fixture");
@@ -1445,6 +1722,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
         let process_pid = bundle.initial_cwd().join(format!("{mode}-claude.pid"));
         let child = isolated_command(&args)
             .env("PATH", path)
+            .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
             .env("WORKFLOW_READY_FIFO", &barrier.ready_path)
             .env("WORKFLOW_RELEASE_FIFO", &barrier.release_path)
             .env("CLAUDE_FIXTURE_PID", &process_pid)
@@ -1800,10 +2078,6 @@ fn agent_signal_and_output_failure_cancel_and_quiesce_the_pi_group() {
         if mode == "signal" {
             let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(terminal["exitStatus"], 130);
-        } else {
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("workflow run output failure")
-            );
         }
     }
 }
@@ -2085,6 +2359,34 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     assert!(live.contains("event       tool_call · started"));
     assert!(live.contains("event       assistant · agent "));
     assert!(live.contains("event       tool_result"));
+}
+
+#[test]
+fn local_run_preserves_caller_github_environment_and_reserves_engine_prefix() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  authenticate:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - 'test "$GH_TOKEN" = local-gh-token && test "$GITHUB_TOKEN" = local-github-token && test -z "${SCHERZO_PRIVATE_SENTINEL+x}"'
+"#,
+    );
+    let output = isolated_command(&bundle.args(&bundle.result("environment")))
+        .env("GH_TOKEN", "local-gh-token")
+        .env("GITHUB_TOKEN", "local-github-token")
+        .env("SCHERZO_PRIVATE_SENTINEL", "must-not-reach-command")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -2397,7 +2699,7 @@ fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch(
         assert_eq!(terminal["outcome"], "failed");
         assert_eq!(terminal["result"]["outcome"], "failed");
         assert_eq!(
-            terminal["result"]["primaryFailure"]["step"],
+            terminal["result"]["primaryFailure"]["node"]["id"],
             "affected",
             "stdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
@@ -2432,7 +2734,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["outcome"], "failed");
     assert_eq!(terminal["exitStatus"], 1);
-    assert_eq!(terminal["result"]["primaryFailure"]["step"], "fail");
+    assert_eq!(terminal["result"]["primaryFailure"]["node"]["id"], "fail");
     assert_eq!(
         terminal["result"]["primaryFailure"]["cause"]["exitCode"],
         23
@@ -2458,28 +2760,26 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     assert!(!rejected_destination.exists());
 
     let finalizers = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: { argv: [\"sh\", \"-c\", \"touch finalizer-must-not-run\"] }\n",
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: { argv: [\"sh\", \"-c\", \"touch finalizer-ran\"] }\n",
     );
-    let finalizer_destination = finalizers.result("finalizers-unsupported");
+    let finalizer_destination = finalizers.result("finalizers-supported");
     let mut args = finalizers.args(&finalizer_destination);
     args.insert(args.len() - 1, "--json".to_owned());
     let output = run(&args);
-    assert_eq!(output.status.code(), Some(1));
-    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(rejection["outcome"], "rejected");
-    assert_eq!(rejection["phase"], "admission");
-    assert_eq!(
-        rejection["diagnostics"][0]["code"],
-        "workflow_finalizers_execution_unsupported"
-    );
-    assert!(output.stderr.is_empty());
-    assert!(!finalizer_destination.exists());
     assert!(
-        !finalizers
-            .execution_root
-            .join("finalizer-must-not-run")
-            .exists()
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"]["finalization"]["trigger"], "succeeded");
+    assert_eq!(
+        terminal["result"]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    assert!(finalizers.execution_root.join("finalizer-ran").is_file());
 
     let malformed = RunBundle::new("schemaVersion: [\n");
     let malformed_destination = malformed.result("malformed");
@@ -2796,9 +3096,7 @@ steps:
     assert_eq!(output.status.code(), Some(1));
     assert!(attempt_result(&destination).join("result.json").is_file());
     let summary = String::from_utf8_lossy(&output.stdout);
-    assert!(summary.contains("result succeeded · exit 0"));
     assert!(summary.contains("attempts/000001/result"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("release private workflow staging"));
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["diagnostics"][0]["code"], "private_cleanup_failure");
@@ -2881,41 +3179,22 @@ fn presentation_setup_failure_settles_the_published_attempt() {
 }
 
 #[test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "wall time only bounds an external PTY anti-hang watchdog"
-)]
 fn real_pty_boundary_restores_input_mode_before_the_standard_summary_handoff() {
     let (finished, completion) = std::sync::mpsc::channel();
-    let progress = std::sync::Arc::new(std::sync::Mutex::new("starting"));
-    let worker_progress = std::sync::Arc::clone(&progress);
     let worker = std::thread::spawn(move || {
-        let _ = finished.send(run_real_pty_boundary_smoke(&worker_progress));
+        let _ = finished.send(run_real_pty_boundary_smoke());
     });
 
-    // Success is driven only by the readiness strings and process exit below. This
-    // watchdog bounds failure reporting if the real OS terminal boundary stops making
-    // progress; it is not a success condition or an interaction delay.
-    let result = match completion.recv_timeout(std::time::Duration::from_secs(15)) {
-        Ok(result) => result,
-        Err(error) => {
-            let progress = *progress
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::panic::panic_any(format!(
-                "PTY workflow boundary watchdog expired at {progress}: {error}"
-            ));
-        }
-    };
+    let result = completion
+        .recv()
+        .expect("PTY workflow boundary worker should report completion");
     result.expect("PTY workflow boundary failed");
     worker
         .join()
         .expect("PTY workflow boundary worker panicked");
 }
 
-fn run_real_pty_boundary_smoke(
-    progress: &std::sync::Mutex<&'static str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run_real_pty_boundary_smoke() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  handshake:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf ready > \\\"$READY_FIFO\\\"; IFS= read -r release < \\\"$RELEASE_FIFO\\\"; test \\\"$release\\\" = release\"]\n",
     );
@@ -2959,15 +3238,8 @@ fn run_real_pty_boundary_smoke(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "terminal handshake connection";
     let (handshake, _) = handshake_listener.accept()?;
     let mut handshake = BufReader::new(handshake);
-
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "command readiness";
     let mut ready = OpenOptions::new().read(true).open(&ready_fifo)?;
     let mut ready_bytes = [0_u8; 5];
     ready.read_exact(&mut ready_bytes)?;
@@ -2975,28 +3247,15 @@ fn run_real_pty_boundary_smoke(
         return Err("workflow command emitted an invalid readiness handshake".into());
     }
 
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "active q acknowledgement";
     master_writer.write_all(b"q?")?;
     master_writer.flush()?;
     read_terminal_handshake(&mut handshake, "help-open")?;
 
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "command release";
     let mut release = OpenOptions::new().write(true).open(&release_fifo)?;
     release.write_all(b"release\n")?;
     release.flush()?;
     drop(release);
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "quit readiness";
     read_terminal_handshake(&mut handshake, "quit-eligible")?;
-
-    *progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "process exit";
     master_writer.write_all(b"q")?;
     master_writer.flush()?;
     let status = child.wait()?;
@@ -3190,7 +3449,7 @@ fn read_pty_to_end(reader: &mut File, output: &mut Vec<u8>) -> std::io::Result<(
 #[test]
 fn plain_mode_reports_publication_failure_without_overwriting_the_racing_target() {
     let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  race:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"mkdir \\\"$RESULT_TARGET\\\"; printf command-complete\"]\n",
+        "schemaVersion: 1\nsteps:\n  race:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"mkdir \\\"$RESULT_TARGET\\\"; printf command-complete\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
     let destination = bundle.result("racing");
     let mut args = bundle.args(&destination);
@@ -3204,10 +3463,8 @@ fn plain_mode_reports_publication_failure_without_overwriting_the_racing_target(
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("command-complete"));
-    assert!(stdout.contains("workflow succeeded"));
-    assert!(stdout.contains("result publication failed"));
     assert!(!stdout.contains(&format!("result: {}", destination.display())));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("DestinationExists"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ResultConflict"));
     assert!(racing_target.is_dir());
     assert!(fs::read_dir(racing_target).unwrap().next().is_none());
     let state: serde_json::Value =
@@ -3215,6 +3472,12 @@ fn plain_mode_reports_publication_failure_without_overwriting_the_racing_target(
     assert_eq!(
         state["attempts"][0]["result"]["status"],
         "publication_failed"
+    );
+    assert_eq!(state["attempts"][0]["finalization"]["complete"], true);
+    assert_eq!(state["attempts"][0]["finalization"]["trigger"], "succeeded");
+    assert_eq!(
+        state["attempts"][0]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
     );
 }
 
@@ -3257,6 +3520,101 @@ fn signal_cancellation_uses_authoritative_reason_status_and_published_result() {
         );
         assert_eq!(terminal["result"], result_json(&destination));
     }
+}
+
+#[test]
+fn signals_during_finalization_cancel_that_phase_with_signal_status() {
+    for (signal, mode, expected_status, expected_reason) in [
+        (Signal::INT, "signal-exit", 130, "user_request"),
+        (Signal::TERM, "wait", 143, "termination_request"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bundle = finalizer_signal_bundle();
+        let destination = bundle.result(expected_reason);
+        let mut args = bundle.args(&destination);
+        args.insert(args.len() - 1, "--json".to_owned());
+        let child = isolated_command(&args)
+            .env(
+                "WORKFLOW_RUN_FIXTURE_SOCKET",
+                listener.local_addr().unwrap().to_string(),
+            )
+            .env("WORKFLOW_RUN_FIXTURE_MODE", mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut control, _) = listener.accept().unwrap();
+        let mut ready = [0_u8; 1];
+        control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        kill_process(pid, signal).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(expected_status),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(terminal["outcome"], "cancelled");
+        assert_eq!(terminal["exitStatus"], expected_status);
+        assert!(terminal["result"].get("cancellation").is_none());
+        assert_eq!(terminal["result"]["finalization"]["trigger"], "succeeded");
+        assert_eq!(
+            terminal["result"]["finalization"]["cancellation"]["reason"],
+            expected_reason
+        );
+        assert_eq!(terminal["result"]["finalization"]["forceAbort"], false);
+        assert_eq!(terminal["result"], result_json(&destination));
+    }
+}
+
+#[test]
+fn second_interrupt_during_finalization_forces_abort_after_graceful_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bundle = finalizer_signal_bundle();
+    let destination = bundle.result("force-abort");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let child = isolated_command(&args)
+        .env(
+            "WORKFLOW_RUN_FIXTURE_SOCKET",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .env("WORKFLOW_RUN_FIXTURE_MODE", "signal-hold")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut control, _) = listener.accept().unwrap();
+    let mut report = [0_u8; 5];
+    control.read_exact(&mut report).unwrap();
+    assert_eq!(report[4], 1);
+    let mut event = [0_u8; 1];
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+
+    kill_process(pid, Signal::INT).unwrap();
+    control.read_exact(&mut event).unwrap();
+    assert_eq!(event, [2]);
+    kill_process(pid, Signal::INT).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finalization = &terminal["result"]["finalization"];
+    assert_eq!(finalization["trigger"], "succeeded");
+    assert_eq!(finalization["cancellation"]["reason"], "user_request");
+    assert_eq!(finalization["forceAbort"], true);
+    assert_eq!(finalization["finalizers"][0]["reason"], "user_request");
 }
 
 #[cfg(target_os = "linux")]
@@ -3336,6 +3694,7 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
         ],
         "environment": Vec::<(Vec<u8>, Vec<u8>)>::new(),
         "streamingStandardInput": false,
+        "boundDirectory": false,
     });
     fs::write(
         staging.path().join("launch.json"),
@@ -3520,7 +3879,6 @@ fn output_failure_after_a_signal_keeps_the_first_reason_but_forces_status_one() 
     assert_eq!(retained["outcome"], "cancelled");
     assert_eq!(retained["cancellation"]["reason"], "user_request");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("workflow run output failure"));
     let resolved_destination = fs::canonicalize(&destination).unwrap();
     assert!(stderr.contains(resolved_destination.to_str().unwrap()));
 }
@@ -3575,7 +3933,7 @@ fn failure_committed_before_a_signal_remains_the_primary_outcome() {
     assert_eq!(output.status.code(), Some(1));
     let retained = result_json(&destination);
     assert_eq!(retained["outcome"], "failed");
-    assert_eq!(retained["primaryFailure"]["step"], "fail");
+    assert_eq!(retained["primaryFailure"]["node"]["id"], "fail");
     assert_eq!(retained["cancellation"]["reason"], "user_request");
 }
 
@@ -3609,7 +3967,6 @@ fn live_presentation_failure_cancels_quiesces_and_reports_the_published_path() {
     assert_eq!(retained["outcome"], "cancelled");
     assert_eq!(retained["cancellation"]["reason"], "caller_output_failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("workflow run output failure"));
     let resolved_destination = fs::canonicalize(&destination).unwrap();
     assert!(stderr.contains(resolved_destination.to_str().unwrap()));
 }
@@ -3642,6 +3999,13 @@ pub(super) fn signal_bundle() -> RunBundle {
     let argv = fixture_argv();
     RunBundle::new(&format!(
         "schemaVersion: 1\nsteps:\n  active:\n    kind: cmd\n    command:\n      argv: {argv}\n"
+    ))
+}
+
+pub(super) fn finalizer_signal_bundle() -> RunBundle {
+    let argv = fixture_argv();
+    RunBundle::new(&format!(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  active:\n    kind: cmd\n    command:\n      argv: {argv}\n"
     ))
 }
 

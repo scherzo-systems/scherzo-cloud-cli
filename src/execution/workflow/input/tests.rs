@@ -280,6 +280,28 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
 }
 
 #[test]
+fn canonical_json_bytes_are_materialized_without_reserialization() {
+    let fixture = Fixture::new(1, 8, 1024, 2048);
+    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
+    let view = fixture
+        .inputs
+        .materialize(
+            &BTreeMap::from([(
+                "context".to_owned(),
+                InputValue::CanonicalJson(exact.as_slice()),
+            )]),
+            &fixture.artifacts,
+        )
+        .unwrap();
+
+    assert_eq!(fs::read(view.path().join("values/context")).unwrap(), exact);
+    assert_eq!(
+        fs::read_to_string(view.path().join("manifest.json")).unwrap(),
+        "{\"schemaVersion\":1,\"inputs\":{\"context\":{\"kind\":\"json\",\"mediaType\":\"application/json\",\"path\":\"values/context\"}}}"
+    );
+}
+
+#[test]
 fn live_byte_reservations_are_run_wide_and_reusable_at_high_parallelism() {
     const MAXIMUM_LIVE_BYTES: u64 = 256 * 1024 * 1024;
     let fixture = Fixture::with_live_limit(
