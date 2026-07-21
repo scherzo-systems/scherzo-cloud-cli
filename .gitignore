@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# devenv and direnv
+.devenv*
+.direnv/
+devenv.local.nix
+devenv.local.yaml
+
+# Nix build results
+/result
+/result-*

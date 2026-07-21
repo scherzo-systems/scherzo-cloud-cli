@@ -1,0 +1,16 @@
+[package]
+name = "scherzo-cloud"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Command-line interface and runner for Scherzo Cloud"
+license = "Apache-2.0"
+repository = "https://github.com/scherzo-systems/scherzo-cloud-cli"
+publish = false
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
