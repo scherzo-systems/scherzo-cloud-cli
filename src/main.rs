@@ -1,3 +1,4 @@
+mod api;
 mod build_info;
 mod cli;
 

@@ -84,10 +84,17 @@ Versioned OpenAPI and runner protocol contracts define the interface with the Sc
 Cloud control plane. Generated clients, types, and codecs needed to build this
 executable will be committed here.
 
-A normal public build will consume the committed generated assets and will not require
-the contract source files or generator. Generated files must identify their generator
-version and source-contract digest and must be checked for drift before they are
-mirrored.
+A normal public build consumes the committed client beneath `src/api/generated` and
+does not require the contract source files or generator. Each generated Rust file
+identifies OpenAPI Generator 7.22.0 and the canonical contract digest. Monorepo tooling
+regenerates the client and checks it for drift before the public source is mirrored.
+
+The generated module remains private to the handwritten API boundary so generated DTOs
+do not become command or workflow domain types. Generation overlays the public contract's
+typed playbook action with raw `serde_json::Value` objects in problem responses; this
+preserves opaque server actions without teaching the CLI their vocabulary. Handwritten
+transport construction remains responsible for redirect, timeout, response-size, and
+secret-handling policy.
 
 ## Rust source shape
 
