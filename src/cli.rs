@@ -1,108 +1,95 @@
-pub const ROOT_HELP: &str = "Scherzo Cloud CLI
+mod runner;
+mod version;
 
-Usage: scherzo-cloud <COMMAND>
+use std::ffi::OsString;
+use std::io;
+use std::process::ExitCode;
 
-Commands:
-  version  Print version information
-  runner   Run and manage the Scherzo Cloud runner
+use clap::{CommandFactory, Parser, Subcommand};
 
-Options:
-  -h, --help     Print help
-  -V, --version  Print version";
-
-pub const RUNNER_HELP: &str = "Run and manage the Scherzo Cloud runner
-
-Usage: scherzo-cloud runner <COMMAND>
-
-Commands:
-  serve  Connect to Scherzo Cloud and serve run assignments
-
-Options:
-  -h, --help  Print help";
-
-pub const RUNNER_SERVE_HELP: &str = "Connect to Scherzo Cloud and serve run assignments
-
-Usage: scherzo-cloud runner serve
-
-Options:
-  -h, --help  Print help";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Command {
-    RootHelp,
-    Version,
-    RunnerHelp,
-    RunnerServe,
-    RunnerServeHelp,
+#[derive(Debug, Parser)]
+#[command(
+    name = "scherzo-cloud",
+    about = "Scherzo Cloud CLI",
+    version = crate::build_info::VERSION
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct ParseError {
-    pub message: String,
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = version::ABOUT)]
+    Version(version::Command),
+    #[command(about = runner::ABOUT)]
+    Runner(runner::Command),
 }
 
-pub fn parse<I, S>(args: I) -> Result<Command, ParseError>
+pub fn parse<I, S>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = S>,
-    S: Into<String>,
+    S: Into<OsString> + Clone,
 {
-    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    Cli::try_parse_from(args)
+}
 
-    match args.as_slice() {
-        [] => Ok(Command::RootHelp),
-        [arg] if is_help(arg) => Ok(Command::RootHelp),
-        [arg] if is_version(arg) || arg == "version" => Ok(Command::Version),
-        [runner] if runner == "runner" => Ok(Command::RunnerHelp),
-        [runner, arg] if runner == "runner" && is_help(arg) => Ok(Command::RunnerHelp),
-        [runner, serve] if runner == "runner" && serve == "serve" => Ok(Command::RunnerServe),
-        [runner, serve, arg] if runner == "runner" && serve == "serve" && is_help(arg) => {
-            Ok(Command::RunnerServeHelp)
+impl Cli {
+    pub fn execute(self) -> ExitCode {
+        match self.command {
+            None => print_help(&[]),
+            Some(Command::Version(command)) => command.execute(),
+            Some(Command::Runner(command)) => command.execute(),
         }
-        [arg, ..] => Err(ParseError {
-            message: format!("unrecognized command or option: {arg}"),
-        }),
     }
 }
 
-fn is_help(arg: &str) -> bool {
-    matches!(arg, "-h" | "--help")
-}
+fn print_help(command_path: &[&str]) -> ExitCode {
+    let mut root = Cli::command();
+    root.build();
+    let mut command = &mut root;
 
-fn is_version(arg: &str) -> bool {
-    matches!(arg, "-V" | "--version")
+    for name in command_path {
+        let Some(subcommand) = command.find_subcommand_mut(name) else {
+            eprintln!("Error: command help metadata is unavailable for {name}");
+            return ExitCode::FAILURE;
+        };
+        command = subcommand;
+    }
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    match command.write_help(&mut stdout) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: failed to write command help: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, ParseError, parse};
+    use clap::CommandFactory;
+
+    use super::Cli;
 
     #[test]
-    fn no_arguments_select_root_help() {
-        assert_eq!(parse(Vec::<String>::new()), Ok(Command::RootHelp));
+    fn root_help_is_composed_from_command_metadata() {
+        let help = Cli::command().render_help().to_string();
+
+        assert!(help.contains("version  Print version information"));
+        assert!(help.contains("runner   Run and manage the Scherzo Cloud runner"));
     }
 
     #[test]
-    fn version_flag_selects_version() {
-        assert_eq!(parse(["--version"]), Ok(Command::Version));
-    }
+    fn runner_help_is_composed_from_serve_metadata() {
+        let mut root = Cli::command();
+        let runner = root
+            .find_subcommand_mut("runner")
+            .expect("runner command should exist");
+        let help = runner.render_help().to_string();
 
-    #[test]
-    fn version_command_selects_version() {
-        assert_eq!(parse(["version"]), Ok(Command::Version));
-    }
-
-    #[test]
-    fn runner_serve_selects_runner_service() {
-        assert_eq!(parse(["runner", "serve"]), Ok(Command::RunnerServe));
-    }
-
-    #[test]
-    fn unknown_command_is_rejected() {
-        assert_eq!(
-            parse(["unknown"]),
-            Err(ParseError {
-                message: "unrecognized command or option: unknown".to_owned(),
-            })
-        );
+        assert!(help.contains("serve  Connect to Scherzo Cloud and serve run assignments"));
     }
 }

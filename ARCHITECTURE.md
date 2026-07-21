@@ -96,6 +96,16 @@ will separate human CLI commands, runner connectivity and assignment ownership, 
 DTOs, and one-run execution. Additional workspace crates are not introduced until a
 real compile-time dependency boundary requires them.
 
+The CLI uses a typed `clap` command tree. Each command module owns its arguments, help
+metadata, and execution dispatch; parent modules compose those commands so parsing and
+rendered help come from the same structure. Bare command groups may print their composed
+help, but only an explicit leaf command may start long-running behavior.
+
+Local builds report the package version from `Cargo.toml`. Reproducible release builds
+inject `SCHERZO_CLOUD_VERSION` at compile time, and both `scherzo-cloud version` and
+`scherzo-cloud --version` read the same build identity. Packaging must verify the
+installed executable reports the exact version used to name the build.
+
 The runner and execution components should use owned state and explicit message passing
 rather than shared mutable global state. Protocol DTOs must be translated into domain
 types at their boundary instead of becoming the workflow model.
@@ -105,7 +115,6 @@ types at their boundary instead of becoming the workflow model.
 The following decisions remain open because the runner implementation is the main
 technical unknown:
 
-- CLI parsing framework beyond the dependency-free initial stub;
 - runner transport and reconnect behavior;
 - supported operating systems and service managers;
 - installation, update, and release packaging; and

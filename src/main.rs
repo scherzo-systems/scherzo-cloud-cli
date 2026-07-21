@@ -1,35 +1,28 @@
+mod build_info;
 mod cli;
 
 use std::env;
 use std::process::ExitCode;
 
-use cli::Command;
-
 fn main() -> ExitCode {
-    match cli::parse(env::args().skip(1)) {
-        Ok(Command::RootHelp) => {
-            println!("{}", cli::ROOT_HELP);
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Version) => {
-            println!("scherzo-cloud {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Ok(Command::RunnerHelp) => {
-            println!("{}", cli::RUNNER_HELP);
-            ExitCode::SUCCESS
-        }
-        Ok(Command::RunnerServeHelp) => {
-            println!("{}", cli::RUNNER_SERVE_HELP);
-            ExitCode::SUCCESS
-        }
-        Ok(Command::RunnerServe) => {
-            eprintln!("Error: scherzo-cloud runner serve is not implemented yet");
-            ExitCode::FAILURE
-        }
+    match cli::parse(env::args_os()) {
+        Ok(command) => command.execute(),
         Err(error) => {
-            eprintln!("Error: {}\n\n{}", error.message, cli::ROOT_HELP);
-            ExitCode::from(2)
+            let exit_code = error.exit_code();
+
+            if let Err(write_error) = error.print() {
+                eprintln!("Error: failed to write command output: {write_error}");
+                return ExitCode::FAILURE;
+            }
+
+            to_exit_code(exit_code)
         }
+    }
+}
+
+fn to_exit_code(code: i32) -> ExitCode {
+    match u8::try_from(code) {
+        Ok(code) => ExitCode::from(code),
+        Err(_) => ExitCode::FAILURE,
     }
 }
