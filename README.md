@@ -49,15 +49,21 @@ This prints `0.1.8`.
 
 After every releaseable mirror update passes the public check, GitHub Actions builds and
 runs native archives for x86-64 and ARM64 Linux and for Intel and Apple Silicon macOS.
-It then publishes the archives, `SHA256SUMS`, and GitHub build-provenance attestations in
-a GitHub Release. Markdown, test, workflow, and development-environment-only changes do
-not increment the patch after the initial release.
+It then publishes the archives, `SHA256SUMS`, and GitHub build-provenance attestations on
+the [Releases](https://github.com/scherzo-systems/scherzo-cloud-cli/releases) page.
+Markdown, test, workflow, and development-environment-only changes do not increment the
+patch after the initial release.
 
 Release binaries are not currently signed or notarized. Verify a downloaded archive
 with the attached checksums and GitHub attestation before running it:
 
 ```sh
+# Linux
 sha256sum --check SHA256SUMS
+
+# macOS
+shasum -a 256 --check SHA256SUMS
+
 gh attestation verify scherzo-cloud-<version>-<target>.tar.gz \
   --repo scherzo-systems/scherzo-cloud-cli
 ```
