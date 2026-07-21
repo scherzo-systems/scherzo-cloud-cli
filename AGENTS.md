@@ -26,6 +26,17 @@ validation entrypoint. It must continue to run deterministic formatting checks, 
 unit and integration tests, dependency and import boundary validation, and a complete
 release build.
 
+## Release intent
+
+Keep `release.toml` as the authoritative `MAJOR.MINOR` release series. Keep the Cargo
+package fallback at the matching `MAJOR.MINOR.0`; packaged builds inject their complete
+version. Run `scripts/check-release` and its fixture suite when changing release logic.
+Do not duplicate version-transition rules in workflow YAML or Nix.
+
+Before `1.0`, breaking behavior requires an adjacent minor-series bump. Major-series
+bumps must be adjacent and reset minor to zero. Automatic publication is not implied by
+the presence of release configuration.
+
 ## Generated source
 
 Generated API clients and protocol codecs needed for a normal build must be committed.

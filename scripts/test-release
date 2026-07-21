@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-release" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+fixture=$test_root/fixture
+mkdir -p "$fixture/scripts"
+cp "$script_dir/check-release" "$fixture/scripts/check-release"
+chmod +x "$fixture/scripts/check-release"
+validator=$fixture/scripts/check-release
+
+write_release() {
+  local series=$1
+  cat >"$fixture/release.toml" <<EOF
+schema = 1
+series = "$series"
+EOF
+}
+
+write_manifest() {
+  local version=$1
+  cat >"$fixture/Cargo.toml" <<EOF
+[package]
+name = "fixture"
+version = "$version"
+
+[workspace]
+members = ["."]
+EOF
+}
+
+reset_fixture() {
+  local series=${1:-0.1}
+  local version=${2:-${series}.0}
+  write_release "$series"
+  write_manifest "$version"
+}
+
+expect_output() {
+  local expected=$1
+  shift
+  local output
+  if ! output=$("$@" 2>&1); then
+    fail "Expected success with output '$expected', got failure: $output"
+  fi
+  if [[ "$output" != "$expected" ]]; then
+    fail "Expected output '$expected', got: $output"
+  fi
+}
+
+expect_failure() {
+  local expected=$1
+  shift
+  local output
+  if output=$("$@" 2>&1); then
+    fail "Expected failure containing '$expected', got success: $output"
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    fail "Expected failure containing '$expected', got: $output"
+  fi
+}
+
+reset_fixture
+expect_output \
+  "CLI release configuration is valid for series 0.1." \
+  "$validator"
+expect_output "0.1.0" "$validator" --next-version
+expect_output "0.1.8" "$validator" --next-version v0.1.7
+
+cat >"$fixture/release.toml" <<'EOF'
+# The release schema is intentionally small.
+
+ schema = 1 # current schema
+ series = "0.1" # current release line
+EOF
+expect_output \
+  "CLI release configuration is valid for series 0.1." \
+  "$validator"
+
+reset_fixture 0.2
+expect_output "0.2.0" "$validator" --next-version v0.1.7
+
+reset_fixture 1.0
+expect_output "1.0.0" "$validator" --next-version v0.7.2
+
+reset_fixture
+rm "$fixture/release.toml"
+expect_failure \
+  "CLI release configuration is missing: release.toml" \
+  "$validator"
+
+reset_fixture
+cat >>"$fixture/release.toml" <<'EOF'
+channel = "stable"
+EOF
+expect_failure \
+  "Unknown or malformed CLI release configuration on line 3." \
+  "$validator"
+
+reset_fixture
+cat >>"$fixture/release.toml" <<'EOF'
+schema = 1
+EOF
+expect_failure \
+  "CLI release configuration contains duplicate field: schema" \
+  "$validator"
+
+reset_fixture
+cat >>"$fixture/release.toml" <<'EOF'
+series = "0.1"
+EOF
+expect_failure \
+  "CLI release configuration contains duplicate field: series" \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/release.toml" <<'EOF'
+series = "0.1"
+EOF
+expect_failure \
+  "CLI release configuration is missing required field: schema" \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/release.toml" <<'EOF'
+schema = 1
+EOF
+expect_failure \
+  "CLI release configuration is missing required field: series" \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/release.toml" <<'EOF'
+schema = 2
+series = "0.1"
+EOF
+expect_failure \
+  "Unsupported CLI release configuration schema: 2" \
+  "$validator"
+
+for malformed_series in 01.1 0.01 0.1.0 v0.1; do
+  reset_fixture
+  write_release "$malformed_series"
+  expect_failure \
+    "CLI release series must use canonical MAJOR.MINOR syntax: $malformed_series" \
+    "$validator"
+done
+
+reset_fixture
+write_release 1000000.0
+expect_failure \
+  "CLI release series components must not exceed 999999: 1000000.0" \
+  "$validator"
+
+reset_fixture 0.1 0.2.0
+expect_failure \
+  "Cargo package version must match the release-series fallback 0.1.0; found 0.2.0." \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/Cargo.toml" <<'EOF'
+[package]
+name = "fixture"
+EOF
+expect_failure \
+  "Cargo.toml is missing package.version." \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/Cargo.toml" <<'EOF'
+[package]
+name = "fixture"
+version = 0.1.0
+EOF
+expect_failure \
+  "Malformed Cargo package version on line 3." \
+  "$validator"
+
+reset_fixture
+cat >"$fixture/Cargo.toml" <<'EOF'
+[package]
+name = "fixture"
+version = "0.1.0"
+version = "0.1.0"
+EOF
+expect_failure \
+  "Cargo.toml contains duplicate package.version fields." \
+  "$validator"
+
+reset_fixture
+for malformed_tag in 0.1.7 v0.1 v0.1.7-beta.1 v01.1.7; do
+  expect_failure \
+    "Latest CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $malformed_tag" \
+    "$validator" --next-version "$malformed_tag"
+done
+
+reset_fixture 0.1
+expect_failure \
+  "CLI release series 0.1 regresses from latest tag v0.2.0." \
+  "$validator" --next-version v0.2.0
+
+reset_fixture 0.3
+expect_failure \
+  "CLI release series 0.3 skips a minor release after v0.1.7." \
+  "$validator" --next-version v0.1.7
+
+reset_fixture 2.0
+expect_failure \
+  "CLI release series 2.0 skips a major release after v0.7.2." \
+  "$validator" --next-version v0.7.2
+
+reset_fixture 1.1
+expect_failure \
+  "CLI major release series 1.1 must reset the minor component to zero after v0.7.2." \
+  "$validator" --next-version v0.7.2
+
+reset_fixture 0.1
+expect_failure \
+  "CLI release patch cannot advance beyond 999999 for series 0.1." \
+  "$validator" --next-version v0.1.999999
+
+reset_fixture
+expect_failure \
+  "Latest CLI release tag components must not exceed 999999: v0.1.1000000" \
+  "$validator" --next-version v0.1.1000000
+
+printf 'CLI release checks passed.\n'

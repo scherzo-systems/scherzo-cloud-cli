@@ -31,6 +31,22 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 Packaged builds replace the local `unknown` build identity with their source revision.
 The schema does not define a release channel.
 
+## Release series
+
+`release.toml` declares the manually selected `MAJOR.MINOR` release series. The current
+series is `0.1`. Future release automation will derive patches from immutable public
+release tags, so the first release in this series will be `0.1.0` and later compatible
+releases will increment the patch.
+
+Run `./scripts/check-release` to validate the declaration and its Cargo fallback. To
+preview version planning from an explicit latest tag, run:
+
+```sh
+./scripts/check-release --next-version v0.1.7
+```
+
+This prints `0.1.8`. The repository does not publish releases automatically yet.
+
 ## Intended responsibilities
 
 The `scherzo-cloud` executable is expected to support two kinds of work:

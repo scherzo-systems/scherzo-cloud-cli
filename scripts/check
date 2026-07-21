@@ -10,6 +10,7 @@ required_files=(
   CONTRIBUTING.md
   SECURITY.md
   LICENSE
+  release.toml
   Cargo.toml
   Cargo.lock
   devenv.nix
@@ -37,6 +38,9 @@ fi
 while IFS= read -r -d '' script_file; do
   bash -n "$script_file"
 done < <(find "$public_root/scripts" -type f -print0)
+
+"$public_root/scripts/test-release"
+"$public_root/scripts/check-release"
 
 workspace_manifest=$(
   cargo locate-project \

@@ -101,12 +101,19 @@ metadata, and execution dispatch; parent modules compose those commands so parsi
 rendered help come from the same structure. Bare command groups may print their composed
 help, but only an explicit leaf command may start long-running behavior.
 
+`release.toml` is the public release-intent contract. It selects only the manually
+managed `MAJOR.MINOR` series; immutable public release tags will provide patch history.
+The Cargo package version remains the matching `MAJOR.MINOR.0` fallback so source builds
+are coherent without pretending to know an automatically assigned patch.
+
 Local builds report the package version from `Cargo.toml`. Reproducible release builds
 inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at compile time, and
 both `scherzo-cloud version` and `scherzo-cloud --version` read the same version.
 Structured version output also reports the resolved executable path and separately
 injected build identity. Packaging must verify the installed executable reports these
-exact values. The version schema does not infer or advertise a release channel.
+exact values. `scripts/check-release` validates release-series syntax, Cargo fallback
+consistency, and candidate transitions before packaging. The version schema does not
+infer or advertise a release channel.
 
 The runner and execution components should use owned state and explicit message passing
 rather than shared mutable global state. Protocol DTOs must be translated into domain

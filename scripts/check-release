@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+usage() {
+  echo "Usage: scripts/check-release [--next-version [LATEST_TAG]]" >&2
+}
+
+mode=check
+latest_tag=
+case $# in
+  0)
+    ;;
+  1)
+    if [[ "$1" != "--next-version" ]]; then
+      usage
+      exit 2
+    fi
+    mode=next-version
+    ;;
+  2)
+    if [[ "$1" != "--next-version" ]]; then
+      usage
+      exit 2
+    fi
+    mode=next-version
+    latest_tag=$2
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+release_file=$public_root/release.toml
+manifest_file=$public_root/Cargo.toml
+maximum_component=999999
+schema_pattern='^[[:space:]]*schema[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$'
+series_pattern='^[[:space:]]*series[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
+section_pattern='^[[:space:]]*\[([^]]+)\][[:space:]]*(#.*)?$'
+package_version_pattern='^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$'
+tag_pattern='^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$'
+
+if [[ ! -f "$release_file" ]]; then
+  fail "CLI release configuration is missing: release.toml"
+fi
+if [[ ! -f "$manifest_file" ]]; then
+  fail "CLI Cargo manifest is missing: Cargo.toml"
+fi
+
+schema=
+series=
+schema_count=0
+series_count=0
+line_number=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  ((line_number += 1))
+  line=${line%$'\r'}
+
+  if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
+    continue
+  fi
+
+  if [[ "$line" =~ $schema_pattern ]]; then
+    ((schema_count += 1))
+    schema=${BASH_REMATCH[1]}
+    continue
+  fi
+
+  if [[ "$line" =~ $series_pattern ]]; then
+    ((series_count += 1))
+    series=${BASH_REMATCH[1]}
+    continue
+  fi
+
+  fail "Unknown or malformed CLI release configuration on line $line_number."
+done <"$release_file"
+
+if ((schema_count == 0)); then
+  fail "CLI release configuration is missing required field: schema"
+fi
+if ((schema_count > 1)); then
+  fail "CLI release configuration contains duplicate field: schema"
+fi
+if ((series_count == 0)); then
+  fail "CLI release configuration is missing required field: series"
+fi
+if ((series_count > 1)); then
+  fail "CLI release configuration contains duplicate field: series"
+fi
+if [[ "$schema" != "1" ]]; then
+  fail "Unsupported CLI release configuration schema: $schema"
+fi
+if [[ ! "$series" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
+  fail "CLI release series must use canonical MAJOR.MINOR syntax: $series"
+fi
+
+series_major=${BASH_REMATCH[1]}
+series_minor=${BASH_REMATCH[2]}
+if ((series_major > maximum_component || series_minor > maximum_component)); then
+  fail "CLI release series components must not exceed $maximum_component: $series"
+fi
+
+package_version=
+package_version_count=0
+in_package=0
+line_number=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  ((line_number += 1))
+  line=${line%$'\r'}
+
+  if [[ "$line" =~ $section_pattern ]]; then
+    if [[ "${BASH_REMATCH[1]}" == "package" ]]; then
+      in_package=1
+    else
+      in_package=0
+    fi
+    continue
+  fi
+
+  if ((in_package == 1)) && [[ "$line" =~ ^[[:space:]]*version[[:space:]]*= ]]; then
+    if [[ ! "$line" =~ $package_version_pattern ]]; then
+      fail "Malformed Cargo package version on line $line_number."
+    fi
+    ((package_version_count += 1))
+    package_version=${BASH_REMATCH[1]}
+  fi
+done <"$manifest_file"
+
+if ((package_version_count == 0)); then
+  fail "Cargo.toml is missing package.version."
+fi
+if ((package_version_count > 1)); then
+  fail "Cargo.toml contains duplicate package.version fields."
+fi
+expected_package_version=${series}.0
+if [[ "$package_version" != "$expected_package_version" ]]; then
+  fail "Cargo package version must match the release-series fallback $expected_package_version; found $package_version."
+fi
+
+if [[ "$mode" == "check" ]]; then
+  printf 'CLI release configuration is valid for series %s.\n' "$series"
+  exit 0
+fi
+
+if [[ -z "$latest_tag" ]]; then
+  printf '%s.0\n' "$series"
+  exit 0
+fi
+
+if [[ ! "$latest_tag" =~ $tag_pattern ]]; then
+  fail "Latest CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $latest_tag"
+fi
+latest_major=${BASH_REMATCH[1]}
+latest_minor=${BASH_REMATCH[2]}
+latest_patch=${BASH_REMATCH[3]}
+if ((latest_major > maximum_component \
+  || latest_minor > maximum_component \
+  || latest_patch > maximum_component)); then
+  fail "Latest CLI release tag components must not exceed $maximum_component: $latest_tag"
+fi
+
+if ((series_major < latest_major \
+  || (series_major == latest_major && series_minor < latest_minor))); then
+  fail "CLI release series $series regresses from latest tag $latest_tag."
+fi
+
+if ((series_major == latest_major && series_minor == latest_minor)); then
+  if ((latest_patch == maximum_component)); then
+    fail "CLI release patch cannot advance beyond $maximum_component for series $series."
+  fi
+  printf '%s.%d\n' "$series" "$((latest_patch + 1))"
+  exit 0
+fi
+
+if ((series_major == latest_major)); then
+  if ((series_minor == latest_minor + 1)); then
+    printf '%s.0\n' "$series"
+    exit 0
+  fi
+  fail "CLI release series $series skips a minor release after $latest_tag."
+fi
+
+if ((series_major == latest_major + 1)); then
+  if ((series_minor != 0)); then
+    fail "CLI major release series $series must reset the minor component to zero after $latest_tag."
+  fi
+  printf '%s.0\n' "$series"
+  exit 0
+fi
+
+fail "CLI release series $series skips a major release after $latest_tag."
