@@ -4,14 +4,20 @@
 > This repository is a read-only mirror. Public Discussions are welcome, but pull
 > requests cannot be merged into the mirror directly.
 
-This repository contains the open-source source for `scherzo-cloud`, the command-line
-interface to Scherzo Cloud.
+This repository contains the open-source source for the early `scherzo-cloud`
+executable.
 
-## Status
+## Current capabilities
 
-The initial Rust executable is a command-surface stub. It supports help and version
-output, and reserves `scherzo-cloud runner serve` for the future long-running runner.
-The runner, authentication, and Cloud API commands are not implemented yet.
+The current release is a command-surface preview, not a functional Scherzo Cloud
+client. It supports help and version inspection. The `auth login`, `auth status`,
+`auth logout`, and `runner serve` commands are present only as explicit stubs and exit
+with an error.
+
+The CLI cannot currently authenticate a customer, create or inspect cloud resources,
+configure a repository, submit workflows, or serve runner assignments. Current releases
+are useful for verifying distribution and the structured version contract; Cloud
+onboarding is not implemented yet.
 
 ## Version inspection
 
@@ -58,37 +64,23 @@ Release binaries are not currently signed or notarized. Verify a downloaded arch
 with the attached checksums and GitHub attestation before running it:
 
 ```sh
+archive='scherzo-cloud-<version>-<target>.tar.gz'
+
 # Linux
-sha256sum --check SHA256SUMS
+sha256sum --ignore-missing --check SHA256SUMS
 
 # macOS
-shasum -a 256 --check SHA256SUMS
+shasum -a 256 --ignore-missing --check SHA256SUMS
 
-gh attestation verify scherzo-cloud-<version>-<target>.tar.gz \
+gh attestation verify "$archive" \
   --repo scherzo-systems/scherzo-cloud-cli
 ```
 
-## Intended responsibilities
-
-The `scherzo-cloud` executable is expected to support two kinds of work:
-
-- short-lived commands that call the public Scherzo Cloud API; and
-- the long-running customer-hosted or local runner started explicitly with
-  `scherzo-cloud runner serve`.
-
-The runner will connect outbound to Scherzo Cloud and invoke the embedded Scherzo
-execution component. Runner connectivity and assignment handling will remain separate
-from workflow scheduling, step execution, and recovery policy.
-
 ## Source boundary
 
-Everything in this repository must build and test using only its checked-in source and
-declared external dependencies. Generated API clients and protocol codecs will be
-committed here when they are introduced, so normal builds will not require their
-contract inputs or generators.
-
-The CLI and runner will share one executable initially, but their command handling,
-credentials, and runtime responsibilities will remain separate internally.
+Everything in this repository builds and tests using only its checked-in source and
+declared external dependencies. The canonical check verifies that the public source is
+self-contained.
 
 ## Development
 

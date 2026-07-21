@@ -1,3 +1,4 @@
+mod auth;
 mod runner;
 mod version;
 
@@ -14,12 +15,21 @@ use clap::{CommandFactory, Parser, Subcommand};
     version = crate::build_info::VERSION
 )]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Allow authentication over insecure HTTP connections"
+    )]
+    allow_insecure_http: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = auth::ABOUT)]
+    Auth(auth::Command),
     #[command(about = version::ABOUT)]
     Version(version::Command),
     #[command(about = runner::ABOUT)]
@@ -38,6 +48,7 @@ impl Cli {
     pub fn execute(self) -> ExitCode {
         match self.command {
             None => print_help(&[]),
+            Some(Command::Auth(command)) => command.execute(self.allow_insecure_http),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
         }
@@ -78,8 +89,23 @@ mod tests {
     fn root_help_is_composed_from_command_metadata() {
         let help = Cli::command().render_help().to_string();
 
+        assert!(help.contains("auth     Authenticate a human with Scherzo Cloud"));
         assert!(help.contains("version  Print version information"));
         assert!(help.contains("runner   Run and manage the Scherzo Cloud runner"));
+        assert!(help.contains("--allow-insecure-http"));
+    }
+
+    #[test]
+    fn auth_help_is_composed_from_command_metadata() {
+        let mut root = Cli::command();
+        let auth = root
+            .find_subcommand_mut("auth")
+            .expect("auth command should exist");
+        let help = auth.render_help().to_string();
+
+        assert!(help.contains("login   Authenticate through a browser on any machine"));
+        assert!(help.contains("status  Inspect the server-confirmed authentication state"));
+        assert!(help.contains("logout  Remove the local human credential"));
     }
 
     #[test]

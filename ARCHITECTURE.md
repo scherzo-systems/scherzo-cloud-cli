@@ -4,8 +4,8 @@
 
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary is a command-surface stub: it provides help and version
-output and reserves `scherzo-cloud runner serve`, but it does not yet call the Cloud API
-or run assignments.
+output and reserves the human authentication commands and `scherzo-cloud runner serve`,
+but it does not yet call the Cloud API or run assignments.
 
 ## One executable with separate roles
 
