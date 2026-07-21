@@ -13,6 +13,7 @@ Do not open a public Discussion for a suspected vulnerability. Do not include li
 credentials, customer data, or unrelated secrets in the report. Use minimal synthetic
 examples whenever possible.
 
-The project is pre-release and does not yet publish a CLI binary. Security reports about
-the source boundary, mirror contents, CI workflow, or future implementation are still
-welcome.
+The project is pre-1.0 and publishes unsigned CLI archives through GitHub Releases.
+Verify the attached SHA-256 checksums and GitHub build-provenance attestation before
+running an archive. Security reports about release artifacts, provenance, the source
+boundary, mirror contents, CI workflow, or implementation are welcome.

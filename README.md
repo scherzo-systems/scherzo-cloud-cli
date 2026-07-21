@@ -34,9 +34,9 @@ The schema does not define a release channel.
 ## Release series
 
 `release.toml` declares the manually selected `MAJOR.MINOR` release series. The current
-series is `0.1`. Future release automation will derive patches from immutable public
-release tags, so the first release in this series will be `0.1.0` and later compatible
-releases will increment the patch.
+series is `0.1`. Automatic release planning derives patches from immutable public tags,
+so the first release in this series is `0.1.0` and later compatible releases increment
+the patch.
 
 Run `./scripts/check-release` to validate the declaration and its Cargo fallback. To
 preview version planning from an explicit latest tag, run:
@@ -45,7 +45,22 @@ preview version planning from an explicit latest tag, run:
 ./scripts/check-release --next-version v0.1.7
 ```
 
-This prints `0.1.8`. The repository does not publish releases automatically yet.
+This prints `0.1.8`.
+
+After every releaseable mirror update passes the public check, GitHub Actions builds and
+runs native archives for x86-64 and ARM64 Linux and for Intel and Apple Silicon macOS.
+It then publishes the archives, `SHA256SUMS`, and GitHub build-provenance attestations in
+a GitHub Release. Markdown, test, workflow, and development-environment-only changes do
+not increment the patch after the initial release.
+
+Release binaries are not currently signed or notarized. Verify a downloaded archive
+with the attached checksums and GitHub attestation before running it:
+
+```sh
+sha256sum --check SHA256SUMS
+gh attestation verify scherzo-cloud-<version>-<target>.tar.gz \
+  --repo scherzo-systems/scherzo-cloud-cli
+```
 
 ## Intended responsibilities
 

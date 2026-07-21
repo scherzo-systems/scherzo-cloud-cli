@@ -11,6 +11,7 @@ required_files=(
   SECURITY.md
   LICENSE
   release.toml
+  .github/workflows/check.yml
   Cargo.toml
   Cargo.lock
   devenv.nix
@@ -40,7 +41,14 @@ while IFS= read -r -d '' script_file; do
 done < <(find "$public_root/scripts" -type f -print0)
 
 "$public_root/scripts/test-release"
+"$public_root/scripts/test-release-planner"
 "$public_root/scripts/check-release"
+
+if ! command -v actionlint >/dev/null 2>&1; then
+  echo "actionlint is required to check public release automation." >&2
+  exit 1
+fi
+actionlint "$public_root/.github/workflows/check.yml"
 
 workspace_manifest=$(
   cargo locate-project \

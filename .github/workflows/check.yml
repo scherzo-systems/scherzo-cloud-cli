@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check:
     name: Public source
@@ -28,3 +32,295 @@ jobs:
         run: nix profile add github:cachix/devenv/8dc0eea065722488f5e127dbcc0c3f4e40bdbb2d
       - name: Check public source
         run: devenv test
+
+  plan_release:
+    name: Plan release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      reason: ${{ steps.plan.outputs.reason }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      latest_tag: ${{ steps.plan.outputs.latest_tag }}
+      mirror_commit: ${{ steps.plan.outputs.mirror_commit }}
+      source_revision: ${{ steps.plan.outputs.source_revision }}
+    steps:
+      - name: Check out release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Plan release
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          remote_main=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            {
+              echo "release=false"
+              echo "reason=mirror-advanced"
+              echo "version="
+              echo "tag="
+              echo "latest_tag="
+              echo "mirror_commit=$GITHUB_SHA"
+              echo "source_revision="
+            } >>"$GITHUB_OUTPUT"
+            echo "Public main advanced to $remote_main; this workflow will not release $GITHUB_SHA."
+            exit 0
+          fi
+          ./scripts/plan-release | tee -a "$GITHUB_OUTPUT"
+
+  build_release:
+    name: Build ${{ matrix.target }}
+    if: needs.plan_release.outputs.release == 'true'
+    needs: plan_release
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_version=$(awk -F '"' '/^rust-version = / { print $2 }' Cargo.toml)
+          if [[ ! "$rust_version" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
+            echo "Could not read a canonical rust-version from Cargo.toml: $rust_version" >&2
+            exit 1
+          fi
+          rustup toolchain install "$rust_version" \
+            --profile minimal \
+            --target "${{ matrix.target }}"
+          echo "RUSTUP_TOOLCHAIN=$rust_version" >>"$GITHUB_ENV"
+      - name: Build release binary
+        shell: bash
+        env:
+          SCHERZO_CLOUD_VERSION: ${{ needs.plan_release.outputs.version }}
+          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.plan_release.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify release identity
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.plan_release.outputs.version }}
+          EXPECTED_SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/scherzo-cloud"
+          test "$("$binary" --version)" = "scherzo-cloud $EXPECTED_VERSION"
+          version_json=$("$binary" version --json)
+          python3 - "$version_json" "$EXPECTED_VERSION" "$EXPECTED_SOURCE_REVISION" <<'PY'
+          import json
+          import sys
+
+          document = json.loads(sys.argv[1])
+          expected_version = sys.argv[2]
+          expected_source = sys.argv[3]
+          expected = {
+              "schemaVersion": 1,
+              "command": "scherzo-cloud",
+              "version": expected_version,
+              "buildIdentity": expected_source,
+          }
+          for key, value in expected.items():
+              if document.get(key) != value:
+                  raise SystemExit(
+                      f"unexpected {key}: {document.get(key)!r}; expected {value!r}"
+                  )
+          if not document.get("executablePath"):
+              raise SystemExit("release binary reported an empty executablePath")
+          PY
+      - name: Package release archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan_release.outputs.version }}
+        run: |
+          set -euo pipefail
+          package="scherzo-cloud-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$package"
+          install -m 0755 \
+            "target/${{ matrix.target }}/release/scherzo-cloud" \
+            "dist/$package/scherzo-cloud"
+          cp README.md LICENSE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          rm -rf "dist/$package"
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish_release:
+    name: Publish ${{ needs.plan_release.outputs.tag }}
+    if: needs.plan_release.outputs.release == 'true'
+    needs:
+      - plan_release
+      - build_release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Recheck release plan
+        id: recheck
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.plan_release.outputs.version }}
+          EXPECTED_TAG: ${{ needs.plan_release.outputs.tag }}
+          EXPECTED_SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          git fetch --force --no-tags origin main:refs/remotes/origin/main
+          remote_main=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+            echo "reason=mirror-advanced" >>"$GITHUB_OUTPUT"
+            echo "Public main advanced to $remote_main; a later workflow will release it."
+            exit 0
+          fi
+
+          plan_file=$(mktemp)
+          trap 'rm -f "$plan_file"' EXIT
+          ./scripts/plan-release >"$plan_file"
+          planned_release=$(awk -F= '$1 == "release" { print $2 }' "$plan_file")
+          planned_reason=$(awk -F= '$1 == "reason" { print $2 }' "$plan_file")
+          planned_version=$(awk -F= '$1 == "version" { print $2 }' "$plan_file")
+          planned_tag=$(awk -F= '$1 == "tag" { print $2 }' "$plan_file")
+          planned_source=$(awk -F= '$1 == "source_revision" { print $2 }' "$plan_file")
+
+          if [[ "$planned_release" == "false" && "$planned_reason" == "already-released" ]]; then
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+            echo "reason=already-released" >>"$GITHUB_OUTPUT"
+            echo "$planned_tag already targets this mirror commit."
+            exit 0
+          fi
+          if [[ "$planned_release" != "true" \
+            || "$planned_version" != "$EXPECTED_VERSION" \
+            || "$planned_tag" != "$EXPECTED_TAG" \
+            || "$planned_source" != "$EXPECTED_SOURCE_REVISION" ]]; then
+            echo "Release plan changed between build and publication." >&2
+            cat "$plan_file" >&2
+            exit 1
+          fi
+          echo "publish=true" >>"$GITHUB_OUTPUT"
+          echo "reason=releaseable-changes" >>"$GITHUB_OUTPUT"
+      - name: Validate archives and create checksums
+        if: steps.recheck.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan_release.outputs.version }}
+        run: |
+          set -euo pipefail
+          targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+          archive_count=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
+          if [[ "$archive_count" != "${#targets[@]}" ]]; then
+            echo "Expected ${#targets[@]} release archives, found $archive_count." >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+          for target in "${targets[@]}"; do
+            package="scherzo-cloud-$VERSION-$target"
+            archive="dist/$package.tar.gz"
+            if [[ ! -f "$archive" ]]; then
+              echo "Missing release archive: $archive" >&2
+              exit 1
+            fi
+            expected_members=$(printf '%s\n' \
+              "$package/" \
+              "$package/LICENSE" \
+              "$package/README.md" \
+              "$package/scherzo-cloud" | LC_ALL=C sort)
+            actual_members=$(tar -tzf "$archive" | LC_ALL=C sort)
+            if [[ "$actual_members" != "$expected_members" ]]; then
+              echo "Unexpected members in $archive:" >&2
+              printf '%s\n' "$actual_members" >&2
+              exit 1
+            fi
+          done
+
+          (
+            cd dist
+            LC_ALL=C sha256sum -- *.tar.gz | LC_ALL=C sort -k2 >SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+      - name: Attest release artifacts
+        if: steps.recheck.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
+      - name: Write release notes
+        if: steps.recheck.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan_release.outputs.version }}
+          SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
+        run: |
+          cat >"$RUNNER_TEMP/release-notes.md" <<EOF
+          Scherzo Cloud CLI v$VERSION
+
+          Mirror commit: \`$GITHUB_SHA\`
+          Source revision: \`$SOURCE_REVISION\`
+
+          This release contains unsigned binaries, SHA-256 checksums, and GitHub build-provenance attestations.
+          EOF
+      - name: Publish GitHub Release
+        if: steps.recheck.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Scherzo Cloud CLI $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest

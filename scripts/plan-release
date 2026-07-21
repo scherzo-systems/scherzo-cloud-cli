@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/plan-release" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+public_root=$(cd "$script_dir/.." && pwd -P)
+if ! repository_root=$(git -C "$public_root" rev-parse --show-toplevel 2>/dev/null); then
+  fail "CLI release planning requires a Git checkout."
+fi
+repository_root=$(cd "$repository_root" && pwd)
+if [[ "$repository_root" != "$public_root" ]]; then
+  fail "CLI release planning must run from the public repository root."
+fi
+cd "$public_root"
+
+checker=$script_dir/check-release
+"$checker" >/dev/null
+
+mirror_commit=$(git rev-parse --verify 'HEAD^{commit}')
+source_revision=$(
+  git log -1 --format='%(trailers:key=Source-Revision,valueonly)' HEAD \
+    | tr -d '[:space:]'
+)
+if [[ ! "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
+  fail "Current mirror commit must contain one canonical Source-Revision trailer."
+fi
+
+latest_tag=
+latest_major=-1
+latest_minor=-1
+latest_patch=-1
+head_tag=
+while IFS= read -r release_tag; do
+  [[ -n "$release_tag" ]] || continue
+  "$checker" --validate-tag "$release_tag" >/dev/null
+
+  tag_version=${release_tag#v}
+  IFS=. read -r tag_major tag_minor tag_patch <<<"$tag_version"
+
+  if ! git merge-base --is-ancestor "${release_tag}^{commit}" HEAD; then
+    fail "CLI release tag is not an ancestor of the current mirror commit: $release_tag"
+  fi
+
+  tag_commit=$(git rev-parse --verify "${release_tag}^{commit}")
+  if [[ "$tag_commit" == "$mirror_commit" ]]; then
+    if [[ -n "$head_tag" ]]; then
+      fail "Current mirror commit has more than one CLI release tag: $head_tag, $release_tag"
+    fi
+    head_tag=$release_tag
+  fi
+
+  if ((tag_major > latest_major \
+    || (tag_major == latest_major && tag_minor > latest_minor) \
+    || (tag_major == latest_major && tag_minor == latest_minor && tag_patch > latest_patch))); then
+    latest_tag=$release_tag
+    latest_major=$tag_major
+    latest_minor=$tag_minor
+    latest_patch=$tag_patch
+  fi
+done < <(git tag --list 'v*')
+
+if [[ -n "$latest_tag" ]]; then
+  version=$("$checker" --next-version "$latest_tag")
+else
+  version=$("$checker" --next-version)
+fi
+tag=v$version
+
+release=false
+reason=no-releaseable-changes
+if [[ -n "$head_tag" ]]; then
+  reason=already-released
+  version=${head_tag#v}
+  tag=$head_tag
+elif [[ -z "$latest_tag" ]]; then
+  release=true
+  reason=initial-release
+else
+  releaseable_change=0
+  while IFS= read -r -d '' changed_path; do
+    case "$changed_path" in
+      *.md | .github/* | scripts/* | tests/* | devenv.nix | devenv.yaml | devenv.lock)
+        ;;
+      *)
+        releaseable_change=1
+        ;;
+    esac
+  done < <(git diff --name-only -z "${latest_tag}^{commit}" HEAD)
+
+  if ((releaseable_change == 1)); then
+    release=true
+    reason=releaseable-changes
+  fi
+fi
+
+printf 'release=%s\n' "$release"
+printf 'reason=%s\n' "$reason"
+printf 'version=%s\n' "$version"
+printf 'tag=%s\n' "$tag"
+printf 'latest_tag=%s\n' "$latest_tag"
+printf 'mirror_commit=%s\n' "$mirror_commit"
+printf 'source_revision=%s\n' "$source_revision"

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-release-planner" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+fixture=$test_root/fixture
+source_one=1111111111111111111111111111111111111111
+source_two=2222222222222222222222222222222222222222
+source_three=3333333333333333333333333333333333333333
+source_four=4444444444444444444444444444444444444444
+source_five=5555555555555555555555555555555555555555
+
+write_release() {
+  local series=$1
+  cat >"$fixture/release.toml" <<EOF
+schema = 1
+series = "$series"
+EOF
+  cat >"$fixture/Cargo.toml" <<EOF
+[package]
+name = "fixture"
+version = "${series}.0"
+EOF
+}
+
+commit_mirror() {
+  local source_revision=$1
+  git -C "$fixture" add --all
+  git -C "$fixture" commit --quiet \
+    --message="Mirror CLI source" \
+    --message="Source-Revision: $source_revision"
+}
+
+expect_plan() {
+  local expected_release=$1
+  local expected_reason=$2
+  local expected_version=$3
+  local expected_tag=$4
+  local expected_latest_tag=$5
+  local expected_source=$6
+  local expected output mirror_commit
+  mirror_commit=$(git -C "$fixture" rev-parse HEAD)
+  expected=$(cat <<EOF
+release=$expected_release
+reason=$expected_reason
+version=$expected_version
+tag=$expected_tag
+latest_tag=$expected_latest_tag
+mirror_commit=$mirror_commit
+source_revision=$expected_source
+EOF
+)
+  if ! output=$("$fixture/scripts/plan-release" 2>&1); then
+    fail "Expected release plan success, got failure: $output"
+  fi
+  if [[ "$output" != "$expected" ]]; then
+    fail "Unexpected release plan. Expected:\n$expected\nActual:\n$output"
+  fi
+}
+
+expect_failure() {
+  local expected=$1
+  local output
+  if output=$("$fixture/scripts/plan-release" 2>&1); then
+    fail "Expected planner failure containing '$expected', got success: $output"
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    fail "Expected planner failure containing '$expected', got: $output"
+  fi
+}
+
+mkdir -p "$fixture/scripts" "$fixture/src"
+cp "$script_dir/check-release" "$fixture/scripts/check-release"
+cp "$script_dir/plan-release" "$fixture/scripts/plan-release"
+chmod +x "$fixture/scripts/check-release" "$fixture/scripts/plan-release"
+write_release 0.1
+printf 'fn main() {}\n' >"$fixture/src/main.rs"
+printf '# Fixture\n' >"$fixture/README.md"
+git -C "$fixture" init --quiet --initial-branch=main
+git -C "$fixture" config user.name "Scherzo Cloud Mirror"
+git -C "$fixture" config user.email "mirror@scherzo.dev"
+git -C "$fixture" config commit.gpgSign false
+commit_mirror "$source_one"
+
+expect_plan true initial-release 0.1.0 v0.1.0 "" "$source_one"
+
+git -C "$fixture" update-ref refs/tags/v0.1.0 HEAD
+expect_plan false already-released 0.1.0 v0.1.0 v0.1.0 "$source_one"
+
+printf '\nDocumentation only.\n' >>"$fixture/README.md"
+commit_mirror "$source_two"
+expect_plan false no-releaseable-changes 0.1.1 v0.1.1 v0.1.0 "$source_two"
+
+printf 'fn changed() {}\n' >>"$fixture/src/main.rs"
+commit_mirror "$source_three"
+expect_plan true releaseable-changes 0.1.1 v0.1.1 v0.1.0 "$source_three"
+
+git -C "$fixture" update-ref refs/tags/v0.1.1 HEAD
+write_release 0.2
+commit_mirror "$source_four"
+expect_plan true releaseable-changes 0.2.0 v0.2.0 v0.1.1 "$source_four"
+
+git -C "$fixture" update-ref refs/tags/v01.0.0 HEAD
+expect_failure \
+  "Latest CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: v01.0.0"
+git -C "$fixture" update-ref -d refs/tags/v01.0.0
+
+git -C "$fixture" switch --quiet --create divergent v0.1.1
+printf '\nDivergent documentation.\n' >>"$fixture/README.md"
+commit_mirror "$source_five"
+git -C "$fixture" update-ref refs/tags/v0.1.9 HEAD
+git -C "$fixture" switch --quiet main
+expect_failure \
+  "CLI release tag is not an ancestor of the current mirror commit: v0.1.9"
+git -C "$fixture" update-ref -d refs/tags/v0.1.9
+git -C "$fixture" branch --delete --force divergent >/dev/null
+
+printf '\nMissing source trailer.\n' >>"$fixture/README.md"
+git -C "$fixture" add README.md
+git -C "$fixture" commit --quiet --message="Mirror CLI source"
+expect_failure \
+  "Current mirror commit must contain one canonical Source-Revision trailer."
+
+printf 'CLI release planner checks passed.\n'

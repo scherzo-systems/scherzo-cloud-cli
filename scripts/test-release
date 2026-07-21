@@ -77,6 +77,9 @@ expect_output \
   "$validator"
 expect_output "0.1.0" "$validator" --next-version
 expect_output "0.1.8" "$validator" --next-version v0.1.7
+expect_output \
+  "CLI release tag is valid: v99.42.7." \
+  "$validator" --validate-tag v99.42.7
 
 cat >"$fixture/release.toml" <<'EOF'
 # The release schema is intentionally small.

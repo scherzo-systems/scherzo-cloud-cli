@@ -27,13 +27,16 @@ build checks used by CI.
 ## Release intent
 
 `release.toml` is the visible source of truth for the CLI's `MAJOR.MINOR` release series.
-Compatible work remains in the configured series and will eventually receive automatic
-patch versions. Before `1.0`, a breaking command or output change must advance the minor
-series by exactly one. A major bump must advance by exactly one and reset minor to zero.
+Compatible releaseable work remains in the configured series and receives automatic
+patch versions after public checks pass. Before `1.0`, a breaking command or output
+change must advance the minor series by exactly one. A major bump must advance by exactly
+one and reset minor to zero.
 
 When changing the series, update the package fallback in `Cargo.toml` and `Cargo.lock` to
 `MAJOR.MINOR.0` in the same change. `./scripts/check-release` rejects inconsistent,
-regressing, skipped, or malformed release intent.
+regressing, skipped, or malformed release intent. `./scripts/plan-release` inspects a
+synthetic public Git history and must remain the sole source of tag discovery,
+releaseable-path classification, and next-version planning for workflow automation.
 
 ## Security reports
 

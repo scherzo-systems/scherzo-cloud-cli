@@ -7,7 +7,7 @@ fail() {
 }
 
 usage() {
-  echo "Usage: scripts/check-release [--next-version [LATEST_TAG]]" >&2
+  echo "Usage: scripts/check-release [--next-version [LATEST_TAG] | --validate-tag TAG]" >&2
 }
 
 mode=check
@@ -23,12 +23,20 @@ case $# in
     mode=next-version
     ;;
   2)
-    if [[ "$1" != "--next-version" ]]; then
-      usage
-      exit 2
-    fi
-    mode=next-version
-    latest_tag=$2
+    case "$1" in
+      --next-version)
+        mode=next-version
+        latest_tag=$2
+        ;;
+      --validate-tag)
+        mode=validate-tag
+        latest_tag=$2
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
     ;;
   *)
     usage
@@ -163,6 +171,11 @@ if ((latest_major > maximum_component \
   || latest_minor > maximum_component \
   || latest_patch > maximum_component)); then
   fail "Latest CLI release tag components must not exceed $maximum_component: $latest_tag"
+fi
+
+if [[ "$mode" == "validate-tag" ]]; then
+  printf 'CLI release tag is valid: %s.\n' "$latest_tag"
+  exit 0
 fi
 
 if ((series_major < latest_major \

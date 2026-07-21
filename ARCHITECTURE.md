@@ -102,9 +102,9 @@ rendered help come from the same structure. Bare command groups may print their 
 help, but only an explicit leaf command may start long-running behavior.
 
 `release.toml` is the public release-intent contract. It selects only the manually
-managed `MAJOR.MINOR` series; immutable public release tags will provide patch history.
-The Cargo package version remains the matching `MAJOR.MINOR.0` fallback so source builds
-are coherent without pretending to know an automatically assigned patch.
+managed `MAJOR.MINOR` series; immutable public release tags provide patch history. The
+Cargo package version remains the matching `MAJOR.MINOR.0` fallback so source builds are
+coherent without pretending to know an automatically assigned patch.
 
 Local builds report the package version from `Cargo.toml`. Reproducible release builds
 inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at compile time, and
@@ -112,8 +112,17 @@ both `scherzo-cloud version` and `scherzo-cloud --version` read the same version
 Structured version output also reports the resolved executable path and separately
 injected build identity. Packaging must verify the installed executable reports these
 exact values. `scripts/check-release` validates release-series syntax, Cargo fallback
-consistency, and candidate transitions before packaging. The version schema does not
-infer or advertise a release channel.
+consistency, and candidate transitions before packaging. `scripts/plan-release`
+validates synthetic public history, selects the latest tag numerically, suppresses stale
+or non-releaseable work, and emits the only version plan consumed by GitHub Actions. The
+version schema does not infer or advertise a release channel.
+
+Public GitHub Actions builds each supported target on its native architecture and grants
+write permission only to the final job after checks and builds pass. Release tags point
+directly to exact synthetic mirror commits; automation never writes generated version
+commits to `main`. Archives contain the executable, public README, and license, and ship
+with aggregate checksums and GitHub provenance attestations. Signing, notarization,
+installers, package-manager metadata, and update channels remain separate decisions.
 
 The runner and execution components should use owned state and explicit message passing
 rather than shared mutable global state. Protocol DTOs must be translated into domain
