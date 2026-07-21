@@ -1,4 +1,6 @@
 {
+  buildIdentity ? "unknown",
+  jq,
   lib,
   rustPlatform,
   version,
@@ -20,7 +22,12 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  env.SCHERZO_CLOUD_VERSION = version;
+  nativeBuildInputs = [ jq ];
+
+  env = {
+    SCHERZO_CLOUD_BUILD_IDENTITY = buildIdentity;
+    SCHERZO_CLOUD_VERSION = version;
+  };
 
   postInstall = ''
     expected="scherzo-cloud ${version}"
@@ -32,6 +39,22 @@ rustPlatform.buildRustPackage {
         exit 1
       fi
     done
+
+    json="$($out/bin/scherzo-cloud version --json)"
+    if ! printf '%s\n' "$json" | jq --exit-status \
+      --arg buildIdentity ${lib.escapeShellArg buildIdentity} \
+      --arg executablePath "$out/bin/scherzo-cloud" \
+      --arg version ${lib.escapeShellArg version} \
+      '. == {
+        "schemaVersion": 1,
+        "command": "scherzo-cloud",
+        "version": $version,
+        "executablePath": $executablePath,
+        "buildIdentity": $buildIdentity
+      }' >/dev/null; then
+      echo "unexpected JSON version output: $json" >&2
+      exit 1
+    fi
   '';
 
   meta = {

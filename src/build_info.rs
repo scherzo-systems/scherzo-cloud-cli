@@ -1,29 +1,28 @@
-pub const VERSION: &str = select_version(
+pub const VERSION: &str = select_value(
     option_env!("SCHERZO_CLOUD_VERSION"),
     env!("CARGO_PKG_VERSION"),
 );
+pub const BUILD_IDENTITY: &str =
+    select_value(option_env!("SCHERZO_CLOUD_BUILD_IDENTITY"), "unknown");
 
-const fn select_version<'a>(injected: Option<&'a str>, package: &'a str) -> &'a str {
+const fn select_value<'a>(injected: Option<&'a str>, fallback: &'a str) -> &'a str {
     match injected {
-        Some(version) => version,
-        None => package,
+        Some(value) => value,
+        None => fallback,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_version;
+    use super::select_value;
 
     #[test]
-    fn package_version_is_the_local_fallback() {
-        assert_eq!(select_version(None, "0.1.0"), "0.1.0");
+    fn missing_build_value_uses_the_fallback() {
+        assert_eq!(select_value(None, "fallback"), "fallback");
     }
 
     #[test]
-    fn injected_build_version_takes_precedence() {
-        assert_eq!(
-            select_version(Some("0.1.42+rev-abc123"), "0.1.0"),
-            "0.1.42+rev-abc123"
-        );
+    fn injected_build_value_takes_precedence() {
+        assert_eq!(select_value(Some("injected"), "fallback"), "injected");
     }
 }

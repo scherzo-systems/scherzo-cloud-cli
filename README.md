@@ -13,6 +13,24 @@ The initial Rust executable is a command-surface stub. It supports help and vers
 output, and reserves `scherzo-cloud runner serve` for the future long-running runner.
 The runner, authentication, and Cloud API commands are not implemented yet.
 
+## Version inspection
+
+Use `scherzo-cloud --version` or `scherzo-cloud version` for conventional one-line
+output. Use `scherzo-cloud version --json` for the schema-version-1 structured contract:
+
+```json
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud",
+  "version": "0.1.0",
+  "executablePath": "/resolved/path/to/scherzo-cloud",
+  "buildIdentity": "unknown"
+}
+```
+
+Packaged builds replace the local `unknown` build identity with their source revision.
+The schema does not define a release channel.
+
 ## Intended responsibilities
 
 The `scherzo-cloud` executable is expected to support two kinds of work:

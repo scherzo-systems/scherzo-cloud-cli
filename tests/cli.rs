@@ -4,6 +4,10 @@ const BUILD_VERSION: &str = match option_env!("SCHERZO_CLOUD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
+const BUILD_IDENTITY: &str = match option_env!("SCHERZO_CLOUD_BUILD_IDENTITY") {
+    Some(identity) => identity,
+    None => "unknown",
+};
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
@@ -63,6 +67,27 @@ fn version_command_and_flag_report_the_build_version() {
         assert_eq!(output.stdout, expected.as_bytes());
         assert!(output.stderr.is_empty());
     }
+}
+
+#[test]
+fn structured_version_reports_the_version_one_contract() {
+    let output = run(&["version", "--json"]);
+    let executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .expect("scherzo-cloud executable path should resolve");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("version output should be JSON");
+    let expected = serde_json::json!({
+        "schemaVersion": 1,
+        "command": "scherzo-cloud",
+        "version": BUILD_VERSION,
+        "executablePath": executable_path.to_string_lossy(),
+        "buildIdentity": BUILD_IDENTITY,
+    });
+
+    assert!(output.status.success());
+    assert_eq!(actual, expected);
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
