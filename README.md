@@ -10,9 +10,9 @@ executable.
 ## Current capabilities
 
 The current release supports help, version inspection, OAuth Device Authorization,
-server-confirmed human authentication status, explicit human-principal signup, and
-local human-credential logout. The `runner serve` command remains an explicit stub and
-exits with an error.
+server-confirmed human authentication status, explicit human-principal signup, local
+human-credential logout, and a narrow local runner prerequisite diagnostic. The
+`runner serve` command remains an explicit stub and exits with an error.
 
 Apart from creating the signed-in human's account, the CLI cannot currently create cloud
 resources, configure a repository, submit workflows, or serve runner assignments. The
@@ -66,6 +66,35 @@ status is `signup_required` and the deployment advertises signup, use
 Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
 with the existing human credential and retries an ambiguous transport failure once with
 the same opaque idempotency key.
+
+## Runner doctor
+
+Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to
+the runner. Today the default set contains only `environment.command.git`. It executes
+the `git` resolved from the runner process's `PATH`, requires a parseable version at
+least `0.0.1`, and reports a pass or failure for that check. A successful result does
+not mean the runner is ready to serve assignments: runner configuration, machine
+identity, connectivity, and execution requirements are not implemented or checked yet.
+
+```sh
+# Run the default checks.
+scherzo-cloud runner doctor
+
+# Run a named check. Repeat --check to select more than one registered check.
+scherzo-cloud runner doctor --check environment.command.git
+
+# List IDs without running any checks.
+scherzo-cloud runner doctor --list-checks
+
+# Emit the schema-version-1 JSON report.
+scherzo-cloud runner doctor --json
+```
+
+Checks are registered statically by components compiled into this executable. The
+command does not load plugins, read human credentials, contact Scherzo Cloud, or change
+runner configuration. It executes `git --version` with a five-second deadline, bounds
+captured standard output, drains standard error without reporting it, and exposes only
+a normalized numeric version in its report. The JSON report has no `ready` field.
 
 ## Release series
 

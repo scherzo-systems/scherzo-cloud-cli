@@ -57,6 +57,24 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     command.output().expect("scherzo-cloud should run")
 }
 
+fn fake_git(body: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temporary Git directory should be created");
+    let git_path = directory.path().join("git");
+    let mut git = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(git_path)
+        .expect("fake Git should be created");
+    git.write_all(b"#!/bin/sh\n")
+        .expect("fake Git should include its interpreter");
+    git.write_all(body.as_bytes())
+        .expect("fake Git should include its body");
+    git.write_all(b"\n")
+        .expect("fake Git should end with a newline");
+    directory
+}
+
 struct OneShotServer {
     api_url: String,
     request: Receiver<String>,
@@ -360,7 +378,8 @@ fn runner_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud runner [COMMAND]"));
-    assert!(stdout.contains("serve  Connect to Scherzo Cloud and serve run assignments"));
+    assert!(stdout.contains("doctor  Inspect local runner prerequisites"));
+    assert!(stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
     assert!(output.stderr.is_empty());
 }
 
@@ -369,6 +388,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     let auth = run(&["auth", "--help"]);
     let login = run(&["auth", "login", "--help"]);
     let runner = run(&["runner", "--help"]);
+    let doctor = run(&["runner", "doctor", "--help"]);
     let serve = run(&["runner", "serve", "--help"]);
 
     assert!(auth.status.success());
@@ -387,11 +407,18 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(login.stderr.is_empty());
 
     assert!(runner.status.success());
-    assert!(
-        String::from_utf8_lossy(&runner.stdout)
-            .contains("serve  Connect to Scherzo Cloud and serve run assignments")
-    );
+    let runner_stdout = String::from_utf8_lossy(&runner.stdout);
+    assert!(runner_stdout.contains("doctor  Inspect local runner prerequisites"));
+    assert!(runner_stdout.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
     assert!(runner.stderr.is_empty());
+
+    assert!(doctor.status.success());
+    let doctor_stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor_stdout.contains("Usage: scherzo-cloud runner doctor [OPTIONS]"));
+    assert!(doctor_stdout.contains("--check <ID>"));
+    assert!(doctor_stdout.contains("--list-checks"));
+    assert!(doctor_stdout.contains("--json"));
+    assert!(doctor.stderr.is_empty());
 
     assert!(serve.status.success());
     assert!(String::from_utf8_lossy(&serve.stdout).contains("Usage: scherzo-cloud runner serve"));
@@ -1051,6 +1078,179 @@ fn logout_preserves_malformed_credentials_without_leaking_contents() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("credential file is malformed"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("unique-malformed-synthetic-secret"));
     assert_eq!(fs::read(credential_path).unwrap(), malformed);
+}
+
+#[test]
+fn runner_doctor_lists_registered_checks_without_running_git() {
+    let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
+    let path = empty_path
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+
+    let output = run_with_env(&["runner", "doctor", "--list-checks"], &[("PATH", path)]);
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"environment.command.git\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn runner_doctor_reports_git_success_in_human_form() {
+    let git_directory = fake_git(
+        "printf '%s\\n' 'git version 2.42.0 unique-raw-command-output'\nprintf '%s\\n' 'unique-child-standard-error' >&2",
+    );
+    let path = git_directory
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+
+    let output = run_with_env(&["runner", "doctor"], &[("PATH", path)]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        "Scherzo Cloud runner doctor\n\n✓ Git\n  Git 2.42.0 is available (minimum 0.0.1).\n\nSummary: 1 passed, 0 failed\nSelected checks passed.\n"
+    );
+    assert!(!stdout.contains("unique-raw-command-output"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn runner_doctor_reports_schema_one_json() {
+    let git_directory = fake_git("printf '%s\\n' 'git version 2.42.0'");
+    let path = git_directory
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "doctor",
+            "--check",
+            "environment.command.git",
+            "--json",
+        ],
+        &[("PATH", path)],
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("runner doctor report should be JSON");
+
+    assert!(output.status.success());
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "command": "scherzo-cloud runner doctor",
+            "checks": [{
+                "id": "environment.command.git",
+                "title": "Git",
+                "status": "pass",
+                "code": "ok",
+                "message": "Git 2.42.0 is available (minimum 0.0.1).",
+                "details": {
+                    "minimumVersion": "0.0.1",
+                    "version": "2.42.0"
+                }
+            }],
+            "summary": {
+                "passed": 1,
+                "failed": 0
+            }
+        })
+    );
+    assert!(report.get("ready").is_none());
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn runner_doctor_reports_missing_git() {
+    let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
+    let path = empty_path
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+
+    let output = run_with_env(&["runner", "doctor"], &[("PATH", path)]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout.contains("✗ Git"));
+    assert!(stdout.contains("Code: command_not_found"));
+    assert!(stdout.contains("Summary: 0 passed, 1 failed"));
+    assert!(stdout.contains("Selected checks failed."));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn runner_doctor_rejects_unknown_check_without_running_git() {
+    let git_directory =
+        fake_git("printf invoked > \"$MARKER\"\nprintf '%s\\n' 'git version 2.42.0'");
+    let marker = git_directory.path().join("invoked");
+    let path = git_directory
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+    let marker_path = marker.to_str().expect("marker path should be UTF-8");
+
+    let output = run_with_env(
+        &["runner", "doctor", "--check", "no.such.check"],
+        &[("PATH", path), ("MARKER", marker_path)],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"Error: unknown runner doctor check 'no.such.check'; use 'scherzo-cloud runner doctor --list-checks' to list available checks\n"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn runner_doctor_does_not_load_human_configuration() {
+    let git_directory = fake_git("printf '%s\\n' 'git version 2.42.0'");
+    let path = git_directory
+        .path()
+        .to_str()
+        .expect("temporary PATH should be UTF-8");
+
+    let output = run_with_env(
+        &["runner", "doctor"],
+        &[
+            ("PATH", path),
+            ("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored"),
+            (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
+        ],
+    );
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Selected checks passed."));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn runner_doctor_list_options_conflict() {
+    for args in [
+        ["runner", "doctor", "--list-checks", "--json"].as_slice(),
+        [
+            "runner",
+            "doctor",
+            "--list-checks",
+            "--check",
+            "environment.command.git",
+        ]
+        .as_slice(),
+    ] {
+        let output = run(args);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Scherzo Cloud runner doctor"));
+    }
 }
 
 #[test]

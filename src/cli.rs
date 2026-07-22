@@ -177,9 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn runner_help_is_composed_from_serve_metadata() {
+    fn runner_help_is_composed_from_leaf_metadata() {
         let help = command_help(&["runner"]);
 
-        assert!(help.contains("serve  Connect to Scherzo Cloud and serve run assignments"));
+        assert!(help.contains("doctor  Inspect local runner prerequisites"));
+        assert!(help.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
     }
 }

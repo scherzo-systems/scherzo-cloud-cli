@@ -41,3 +41,17 @@ beside it. OAuth and public API requests reject redirects, use a 20-second deadl
 disable general retries, and reject response bodies larger than 1 MiB. A `401` response
 removes the rejected credential without deleting a token that another process replaced
 while the request was in flight.
+
+## Runner doctor
+
+`runner doctor` is offline. It does not load human deployment configuration, read the
+human credential store, contact a network service, or create persistent state. Its only
+built-in probe executes the `git` resolved from the runner process's `PATH` with the
+fixed `--version` argument.
+
+The probe has a five-second deadline, drains both child output streams so a child cannot
+block on a full pipe, retains at most 8 KiB of standard output, kills and waits for a
+child that exceeds the deadline, and rejects truncated output. It never copies raw
+standard output, standard error, operating-system error text, or process exit text into
+a human report, JSON report, or diagnostic. The only command-derived value reported is
+the strictly parsed and normalized numeric Git version.

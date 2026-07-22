@@ -1,3 +1,4 @@
+mod doctor;
 mod serve;
 
 use std::process::ExitCode;
@@ -15,6 +16,8 @@ pub struct Command {
 
 #[derive(Debug, Subcommand)]
 enum RunnerCommand {
+    #[command(about = doctor::ABOUT)]
+    Doctor(doctor::Command),
     #[command(about = serve::ABOUT)]
     Serve(serve::Command),
 }
@@ -23,6 +26,7 @@ impl Command {
     pub fn execute(self) -> ExitCode {
         match self.command {
             None => super::print_help(&[NAME]),
+            Some(RunnerCommand::Doctor(command)) => command.execute(),
             Some(RunnerCommand::Serve(command)) => command.execute(),
         }
     }

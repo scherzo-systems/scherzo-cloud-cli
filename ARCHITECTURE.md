@@ -7,6 +7,8 @@ executable. The current binary provides help, version output, deployment selecti
 secure local human credential store, OAuth Device Authorization, server-confirmed
 authentication status, explicit human-principal signup, and local logout.
 `scherzo-cloud runner serve` remains a stub; the binary does not yet run assignments.
+`scherzo-cloud runner doctor` currently performs one local Git prerequisite check and
+does not claim that the runner is ready to run assignments.
 
 ## One executable with separate roles
 
@@ -26,6 +28,24 @@ entrypoint will dispatch to components with distinct responsibilities:
 The long-running runner starts only through an explicit command such as
 `scherzo-cloud runner serve`. Bare `scherzo-cloud runner` will not implicitly start a
 service.
+
+## Runner diagnostics
+
+`src/cli/runner/doctor.rs` is a typed Clap adapter: it parses runner-doctor arguments
+and renders human or JSON output. Its machine behavior lives separately in
+`src/runner/doctor/`. That internal module owns the pass/fail report model, ordered
+registry, selection rules, bounded process probe, and built-in Git check. The registry
+is crate-private and accepts boxed checks from components assembled into this executable;
+it is not a dynamic plugin API, does not discover libraries or scripts, and is not a
+third-party extension contract.
+
+The first registry entry is `environment.command.git`. It is deliberately the sole
+default check until the runner service has concrete configuration, identity, transport,
+and execution contracts. Doctor does not construct human deployment state, read the
+human credential store, or make a network request. Future runner bootstrap code can add
+compiled-in checks through the same registry without adding a central check-name enum,
+but it must keep those boundaries intact.
+
 
 These are component boundaries before they are separate packages or executables. A
 second runner binary should be introduced only if platform dependencies, privilege
