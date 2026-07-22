@@ -3,9 +3,10 @@
 ## Current state
 
 This repository defines the public source boundary for the Rust `scherzo-cloud`
-executable. The current binary is a command-surface stub: it provides help and version
-output and reserves the human authentication commands and `scherzo-cloud runner serve`,
-but it does not yet call the Cloud API or run assignments.
+executable. The current binary provides help, version output, deployment selection, a
+secure local human credential store, OAuth Device Authorization, server-confirmed
+authentication status, and local logout. `scherzo-cloud runner serve` remains a stub;
+the binary does not yet run assignments.
 
 ## One executable with separate roles
 
@@ -34,15 +35,25 @@ isolation, artifact size, or independent release cadence creates a demonstrated 
 
 Human commands and the runner use different security identities.
 
-Human commands will use an interactive OAuth credential store. Human login will use
-OAuth Device Authorization so the browser may run on a different machine from the CLI;
-the CLI will not require an inbound connection or loopback callback. It will display the
-short-lived activation URL and user code, keep the private device code and OAuth tokens
-out of command output and logs, and poll the authorization server until the transaction
-finishes.
+Human commands use the credential implementation beneath `src/human_auth/`. The store
+binds each short-lived access token to the exact API URL, issuer, audience, and public
+client ID that issued it. It rejects symbolic links, unexpected ownership or modes,
+malformed schemas, duplicate fingerprints, and oversized tokens; serializes access with
+a bounded inter-process lock; and atomically replaces files using user-private modes.
+Local logout removes only the active deployment's entry and never contacts the network.
 
-After OAuth login, the CLI will ask the public API whether the identity is linked to a
-principal. Login alone will never create one. An onboarding agent may invoke the separate
+Human login uses OAuth Device Authorization so the browser may run on a different
+machine from the CLI; the CLI does not require an inbound connection or loopback
+callback. It displays the short-lived activation URL and user code, keeps the private
+device code and OAuth tokens out of command output and logs, and polls the authorization
+server until the transaction finishes. Polling honors the server interval, slows down
+when directed, stops at the transaction deadline, and remains interruptible while
+waiting.
+
+After OAuth login, the CLI asks the public API whether the identity is linked to a
+principal. It persists the short-lived access token before that confirmation so a
+temporary API failure does not require another browser flow. Login alone never creates a
+principal. An onboarding agent may invoke the separate
 signup command only after reporting that signup is required and obtaining explicit human
 approval.
 
@@ -93,8 +104,10 @@ The generated module remains private to the handwritten API boundary so generate
 do not become command or workflow domain types. Generation overlays the public contract's
 typed playbook action with raw `serde_json::Value` objects in problem responses; this
 preserves opaque server actions without teaching the CLI their vocabulary. Handwritten
-transport construction remains responsible for redirect, timeout, response-size, and
-secret-handling policy.
+transport construction remains responsible for redirect, timeout, retry,
+response-size, and secret-handling policy. The authentication-status path translates
+generated principal and problem DTOs into handwritten domain states before the CLI
+renders human or structured output.
 
 ## Rust source shape
 

@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Allow authentication over insecure HTTP connections"
+        help = "Allow sign-in over insecure HTTP connections"
     )]
     allow_insecure_http: bool,
 
@@ -89,7 +89,7 @@ mod tests {
     fn root_help_is_composed_from_command_metadata() {
         let help = Cli::command().render_help().to_string();
 
-        assert!(help.contains("auth     Authenticate a human with Scherzo Cloud"));
+        assert!(help.contains("auth     Manage your Scherzo Cloud sign-in"));
         assert!(help.contains("version  Print version information"));
         assert!(help.contains("runner   Run and manage the Scherzo Cloud runner"));
         assert!(help.contains("--allow-insecure-http"));
@@ -103,9 +103,9 @@ mod tests {
             .expect("auth command should exist");
         let help = auth.render_help().to_string();
 
-        assert!(help.contains("login   Authenticate through a browser on any machine"));
-        assert!(help.contains("status  Inspect the server-confirmed authentication state"));
-        assert!(help.contains("logout  Remove the local human credential"));
+        assert!(help.contains("login   Sign in to Scherzo Cloud"));
+        assert!(help.contains("status  Show your Scherzo Cloud sign-in status"));
+        assert!(help.contains("logout  Sign out of Scherzo Cloud on this device"));
     }
 
     #[test]

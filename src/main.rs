@@ -1,6 +1,7 @@
 mod api;
 mod build_info;
 mod cli;
+mod human_auth;
 
 use std::env;
 use std::process::ExitCode;

@@ -1,3 +1,12 @@
+mod current_principal;
+mod http_client;
+
+pub(crate) use current_principal::{
+    CurrentPrincipalError, CurrentPrincipalOutcome, HumanPrincipal, UnreachableCategory,
+    classify_reqwest_error, get_current_principal,
+};
+pub(crate) use http_client::{HttpClient, HttpClientError};
+
 #[allow(
     dead_code,
     unused_imports,

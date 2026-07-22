@@ -1,5 +1,6 @@
 {
   buildIdentity ? "unknown",
+  cacert,
   jq,
   lib,
   rustPlatform,
@@ -27,6 +28,7 @@ rustPlatform.buildRustPackage {
   env = {
     SCHERZO_CLOUD_BUILD_IDENTITY = buildIdentity;
     SCHERZO_CLOUD_VERSION = version;
+    SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
   postInstall = ''

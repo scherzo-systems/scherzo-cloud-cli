@@ -9,15 +9,13 @@ executable.
 
 ## Current capabilities
 
-The current release is a command-surface preview, not a functional Scherzo Cloud
-client. It supports help and version inspection. The `auth login`, `auth status`,
-`auth logout`, and `runner serve` commands are present only as explicit stubs and exit
-with an error.
+The current release supports help, version inspection, OAuth Device Authorization,
+server-confirmed human authentication status, and local human-credential logout. The
+`runner serve` command remains an explicit stub and exits with an error.
 
-The CLI cannot currently authenticate a customer, create or inspect cloud resources,
-configure a repository, submit workflows, or serve runner assignments. Current releases
-are useful for verifying distribution and the structured version contract; Cloud
-onboarding is not implemented yet.
+The CLI cannot currently create cloud resources, configure a repository, submit
+workflows, or serve runner assignments. Explicit principal signup and the rest of Cloud
+onboarding are not implemented yet.
 
 ## Version inspection
 
@@ -36,6 +34,24 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 
 Packaged builds replace the local `unknown` build identity with their source revision.
 The schema does not define a release channel.
+
+## Human authentication
+
+Use `scherzo-cloud auth login` to authenticate through a browser on the same machine or
+another machine. The CLI prints an activation URL and user code, never opens a browser,
+and never listens for an inbound callback. Add `--json` to receive newline-delimited
+schema-version-1 events. Use `--force` to start a new device authorization transaction
+without checking an existing credential with the API.
+
+Use `scherzo-cloud auth status` to ask the selected deployment whether the current
+identity is authenticated, requires signup, is unauthenticated, or is unreachable. Add
+`--json` for the schema-version-1 structured result. Status always contacts the public
+API, including when no local credential exists.
+
+Use `scherzo-cloud auth logout` to remove the human credential for the active deployment
+without making a network request. Normal operation stores short-lived human access
+tokens in `~/.scherzo-cloud/credentials.json`; this store is separate from all future
+runner credentials.
 
 ## Release series
 

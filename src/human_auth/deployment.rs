@@ -3,6 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 const PRODUCTION_API_URL: &str = "https://api.scherzo.dev";
@@ -22,7 +23,14 @@ const OVERRIDE_VARIABLES: [&str; 4] = [
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Deployment {
+pub(crate) struct Deployment {
+    fingerprint: DeploymentFingerprint,
+    allow_insecure_http: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct DeploymentFingerprint {
     api_url: String,
     issuer: String,
     audience: String,
@@ -30,12 +38,28 @@ pub(super) struct Deployment {
 }
 
 impl Deployment {
-    pub(super) fn load(allow_insecure_http: bool) -> Result<Self, DeploymentError> {
+    pub(crate) fn load(allow_insecure_http: bool) -> Result<Self, DeploymentError> {
         Self::load_from(|name| env::var_os(name), allow_insecure_http)
     }
 
-    pub(super) fn fingerprint(&self) -> (&str, &str, &str, &str) {
-        (&self.api_url, &self.issuer, &self.audience, &self.client_id)
+    pub(crate) fn fingerprint(&self) -> &DeploymentFingerprint {
+        &self.fingerprint
+    }
+
+    pub(crate) fn allows_insecure_http(&self) -> bool {
+        self.allow_insecure_http
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(api_url: String, issuer: String) -> Self {
+        Self::from_values(
+            api_url,
+            issuer,
+            "https://api.fixture.example".to_owned(),
+            "fixture-public-client".to_owned(),
+            true,
+        )
+        .expect("test deployment should be valid")
     }
 
     fn load_from<F>(lookup: F, allow_insecure_http: bool) -> Result<Self, DeploymentError>
@@ -85,16 +109,51 @@ impl Deployment {
         validate_nonempty(CLIENT_ID_VARIABLE, &client_id)?;
 
         Ok(Self {
-            api_url,
-            issuer,
-            audience,
-            client_id,
+            fingerprint: DeploymentFingerprint::new(api_url, issuer, audience, client_id),
+            allow_insecure_http,
         })
     }
 }
 
+impl DeploymentFingerprint {
+    pub(crate) fn new(
+        api_url: String,
+        issuer: String,
+        audience: String,
+        client_id: String,
+    ) -> Self {
+        Self {
+            api_url,
+            issuer,
+            audience,
+            client_id,
+        }
+    }
+
+    pub(crate) fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_tuple(&self) -> (&str, &str, &str, &str) {
+        (&self.api_url, &self.issuer, &self.audience, &self.client_id)
+    }
+}
+
 #[derive(Debug)]
-pub(super) enum DeploymentError {
+pub(crate) enum DeploymentError {
     PartialOverride {
         missing: Vec<&'static str>,
     },
@@ -245,7 +304,7 @@ mod tests {
         let deployment = load(&[], false).expect("production deployment should be valid");
 
         assert_eq!(
-            deployment.fingerprint(),
+            deployment.fingerprint().as_tuple(),
             (
                 PRODUCTION_API_URL,
                 PRODUCTION_ISSUER,
@@ -264,7 +323,7 @@ mod tests {
         let deployment = load(&values, false).expect("complete override should be valid");
 
         assert_eq!(
-            deployment.fingerprint(),
+            deployment.fingerprint().as_tuple(),
             (
                 "https://api.fixture.example/base/",
                 "https://auth.fixture.example/tenant/",
@@ -331,8 +390,8 @@ mod tests {
         );
         let deployment = load(&values, true).expect("HTTP override should be permitted");
 
-        assert_eq!(deployment.fingerprint().0, values[0].1);
-        assert_eq!(deployment.fingerprint().1, values[1].1);
+        assert_eq!(deployment.fingerprint().as_tuple().0, values[0].1);
+        assert_eq!(deployment.fingerprint().as_tuple().1, values[1].1);
     }
 
     #[test]
