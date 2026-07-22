@@ -7,9 +7,9 @@ use reqwest::{Response, StatusCode, Url};
 
 use super::generated::models;
 use super::http_client::HttpClient;
+use super::http_util::{self, BoundedBodyError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
 const PRINCIPAL_NOT_PROVISIONED: &str =
     "https://api.scherzo.dev/problems/principal-not-provisioned";
 const JSON_MEDIA_TYPE: &str = "application/json";
@@ -131,7 +131,8 @@ fn get_current_principal_with_timeout(
     access_token: Option<&str>,
     timeout: Duration,
 ) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
-    let endpoint = current_principal_endpoint(api_url)?;
+    let endpoint = http_util::endpoint(api_url, &["v1", "me"])
+        .map_err(|()| CurrentPrincipalError::local(CurrentPrincipalErrorKind::InvalidEndpoint))?;
     let authorization = access_token
         .map(|access_token| HeaderValue::from_str(&format!("Bearer {access_token}")))
         .transpose()
@@ -184,19 +185,6 @@ async fn execute_current_principal_request(
     decode_response(response).await
 }
 
-fn current_principal_endpoint(api_url: &str) -> Result<Url, CurrentPrincipalError> {
-    let mut endpoint = Url::parse(api_url)
-        .map_err(|_| CurrentPrincipalError::local(CurrentPrincipalErrorKind::InvalidEndpoint))?;
-    let mut segments = endpoint
-        .path_segments_mut()
-        .map_err(|()| CurrentPrincipalError::local(CurrentPrincipalErrorKind::InvalidEndpoint))?;
-    segments.pop_if_empty();
-    segments.push("v1");
-    segments.push("me");
-    drop(segments);
-    Ok(endpoint)
-}
-
 async fn decode_response(
     response: Response,
 ) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
@@ -205,7 +193,7 @@ async fn decode_response(
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
-        .map(parse_media_type)
+        .map(http_util::media_type)
         .transpose()
         .map_err(|()| {
             CurrentPrincipalError::protocol(
@@ -213,15 +201,15 @@ async fn decode_response(
                 credential_rejected,
             )
         })?;
-    let body = match read_bounded_body(response).await {
+    let body = match http_util::read_bounded_body(response).await {
         Ok(body) => body,
-        Err(ResponseReadError::TooLarge) => {
+        Err(BoundedBodyError::TooLarge) => {
             return Err(CurrentPrincipalError::protocol(
                 "the response body exceeds 1 MiB",
                 credential_rejected,
             ));
         }
-        Err(ResponseReadError::Transport(error)) => {
+        Err(BoundedBodyError::Transport(error)) => {
             return Ok(CurrentPrincipalOutcome::Unreachable(
                 classify_reqwest_error(&error),
             ));
@@ -269,20 +257,6 @@ async fn decode_response(
     }
 }
 
-fn parse_media_type(value: &HeaderValue) -> Result<String, ()> {
-    value
-        .to_str()
-        .map(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .map_err(|_| ())
-}
-
 fn require_media_type(
     actual: Option<&str>,
     expected: &'static str,
@@ -298,50 +272,13 @@ fn require_media_type(
     }
 }
 
-enum ResponseReadError {
-    TooLarge,
-    Transport(reqwest::Error),
-}
-
-async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, ResponseReadError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES)
-    {
-        return Err(ResponseReadError::TooLarge);
-    }
-
-    let initial_capacity = response
-        .content_length()
-        .unwrap_or_default()
-        .min(MAX_RESPONSE_BODY_BYTES) as usize;
-    let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(ResponseReadError::Transport)?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES as usize {
-            return Err(ResponseReadError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn decode_principal(body: &[u8]) -> Result<HumanPrincipal, CurrentPrincipalError> {
     let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
         CurrentPrincipalError::protocol("the 200 response body is not valid JSON", false)
     })?;
-    let object = value.as_object().ok_or_else(|| {
-        CurrentPrincipalError::protocol("the 200 response body is not a JSON object", false)
-    })?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "id" | "type" | "state" | "displayName"))
-    {
+    if !value.is_object() {
         return Err(CurrentPrincipalError::protocol(
-            "the principal contains an unknown property",
+            "the 200 response body is not a JSON object",
             false,
         ));
     }

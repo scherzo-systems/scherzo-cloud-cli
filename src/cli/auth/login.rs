@@ -17,7 +17,7 @@ use crate::human_auth::device_authorization::{
 };
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
 
-use super::status::StatusResult;
+use super::status::{HumanStatusError, StatusResult, write_human_status};
 
 pub const ABOUT: &str = "Sign in to Scherzo Cloud";
 const CANCELLED_EXIT_CODE: u8 = 130;
@@ -52,6 +52,8 @@ impl Command {
         let mut output = LoginOutput { json: self.json };
 
         if self.force {
+            // Validate store access and prune an expired selected credential
+            // before starting its replacement login.
             store
                 .selected(deployment.fingerprint(), OffsetDateTime::now_utc())
                 .map_err(CommandError::CredentialStore)?;
@@ -156,14 +158,10 @@ impl Command {
                 output.cancelled(deployment)?;
                 return Ok(Completion::Cancelled);
             }
-            if schedule.expired(Instant::now()) {
-                output.failed(
-                    deployment,
-                    FailureOutcome::Expired,
-                    Phase::TokenPolling,
-                    None,
-                )?;
-                return Ok(Completion::Failure);
+            if let Some(completion) =
+                polling_interruption(&mut output, deployment, &cancellation, &schedule)?
+            {
+                return Ok(completion);
             }
 
             let poll = match device_authorization::poll_token(
@@ -185,18 +183,10 @@ impl Command {
                     );
                 }
             };
-            if cancellation.is_cancelled() {
-                output.cancelled(deployment)?;
-                return Ok(Completion::Cancelled);
-            }
-            if schedule.expired(Instant::now()) {
-                output.failed(
-                    deployment,
-                    FailureOutcome::Expired,
-                    Phase::TokenPolling,
-                    None,
-                )?;
-                return Ok(Completion::Failure);
+            if let Some(completion) =
+                polling_interruption(&mut output, deployment, &cancellation, &schedule)?
+            {
+                return Ok(completion);
             }
             match poll {
                 TokenPoll::Pending => {}
@@ -232,6 +222,28 @@ impl Command {
             }
         }
     }
+}
+
+fn polling_interruption(
+    output: &mut LoginOutput,
+    deployment: &Deployment,
+    cancellation: &Cancellation,
+    schedule: &PollSchedule,
+) -> Result<Option<Completion>, CommandError> {
+    if cancellation.is_cancelled() {
+        output.cancelled(deployment)?;
+        return Ok(Some(Completion::Cancelled));
+    }
+    if schedule.expired(Instant::now()) {
+        output.failed(
+            deployment,
+            FailureOutcome::Expired,
+            Phase::TokenPolling,
+            None,
+        )?;
+        return Ok(Some(Completion::Failure));
+    }
+    Ok(None)
 }
 
 fn finish_login(
@@ -455,7 +467,7 @@ impl LoginOutput {
                 status: StatusResult::from_status(status),
             })
         } else {
-            write_human_status(status)
+            write_human_status(status).map_err(CommandError::from)
         }
     }
 
@@ -521,37 +533,6 @@ impl LoginOutput {
     }
 }
 
-fn write_human_status(status: &AuthenticationStatus) -> Result<(), CommandError> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    match status.state() {
-        AuthenticationState::Authenticated(principal) => {
-            let account = principal.display_name.as_ref().unwrap_or(&principal.id);
-            writeln!(stdout, "✓ Signed in as {account}.").map_err(CommandError::WriteOutput)
-        }
-        AuthenticationState::SignupRequired { actions } => {
-            writeln!(stdout, "✓ Signed in to Scherzo Cloud.").map_err(CommandError::WriteOutput)?;
-            writeln!(
-                stdout,
-                "! Your Scherzo Cloud account still needs to be set up."
-            )
-            .map_err(CommandError::WriteOutput)?;
-            if let Some(actions) = actions {
-                for action in actions {
-                    serde_json::to_writer(&mut stdout, action).map_err(CommandError::WriteJson)?;
-                    writeln!(stdout).map_err(CommandError::WriteOutput)?;
-                }
-            }
-            Ok(())
-        }
-        AuthenticationState::Unauthenticated => {
-            writeln!(stdout, "! You're not signed in to Scherzo Cloud.")
-                .map_err(CommandError::WriteOutput)
-        }
-        AuthenticationState::Unreachable(_) => unreachable!("unreachable is emitted as failure"),
-    }
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivationEvent<'a> {
@@ -603,6 +584,15 @@ enum CommandError {
     FormatTime(time::error::Format),
     WriteJson(serde_json::Error),
     WriteOutput(io::Error),
+}
+
+impl From<HumanStatusError> for CommandError {
+    fn from(error: HumanStatusError) -> Self {
+        match error {
+            HumanStatusError::Json(error) => Self::WriteJson(error),
+            HumanStatusError::Output(error) => Self::WriteOutput(error),
+        }
+    }
 }
 
 impl fmt::Display for CommandError {

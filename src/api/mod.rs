@@ -1,5 +1,6 @@
 mod current_principal;
 mod http_client;
+pub(crate) mod http_util;
 
 pub(crate) use current_principal::{
     CurrentPrincipalError, CurrentPrincipalOutcome, HumanPrincipal, UnreachableCategory,

@@ -296,15 +296,27 @@ fn version_command_and_flag_report_the_build_version() {
 #[test]
 fn structured_version_reports_the_version_one_contract() {
     let output = run(&["version", "--json"]);
-    let executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let expected_executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_scherzo-cloud"))
         .expect("scherzo-cloud executable path should resolve");
-    let actual: serde_json::Value =
+    let mut actual: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("version output should be JSON");
+    let actual_executable_path = actual
+        .get("executablePath")
+        .and_then(serde_json::Value::as_str)
+        .expect("version output should contain an executable path");
+    assert_eq!(
+        std::fs::canonicalize(actual_executable_path)
+            .expect("reported executable path should resolve"),
+        expected_executable_path
+    );
+    actual
+        .as_object_mut()
+        .expect("version output should be an object")
+        .remove("executablePath");
     let expected = serde_json::json!({
         "schemaVersion": 1,
         "command": "scherzo-cloud",
         "version": BUILD_VERSION,
-        "executablePath": executable_path.to_string_lossy(),
         "buildIdentity": BUILD_IDENTITY,
     });
 
@@ -330,7 +342,7 @@ fn insecure_http_flag_is_global() {
 
         let output = run_with_env(&args, &environment);
 
-        assert!(output.status.success());
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stderr.is_empty());
         server.finish();
     }
@@ -370,7 +382,7 @@ fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
         b"Error: configure Scherzo Cloud sign-in: SCHERZO_CLOUD_API_URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
     );
 
-    assert!(accepted.status.success());
+    assert_eq!(accepted.status.code(), Some(2));
     assert!(accepted.stderr.is_empty());
 
     assert!(local_logout.status.success());
@@ -534,7 +546,7 @@ fn status_without_a_credential_still_contacts_the_server_without_authorization()
         &environment,
     );
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
@@ -576,7 +588,7 @@ fn rejected_or_expired_status_credentials_are_removed() {
             &environment,
         );
 
-        assert!(output.status.success());
+        assert_eq!(output.status.code(), Some(2));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["state"],
             "unauthenticated"
@@ -594,7 +606,7 @@ fn rejected_or_expired_status_credentials_are_removed() {
 }
 
 #[test]
-fn unreachable_status_is_a_successful_recognized_result() {
+fn unreachable_status_exits_3() {
     for (http_status, expected_category) in [
         ("429 Too Many Requests", "rate_limited"),
         ("503 Service Unavailable", "server"),
@@ -610,7 +622,7 @@ fn unreachable_status_is_a_successful_recognized_result() {
             &environment,
         );
 
-        assert!(output.status.success());
+        assert_eq!(output.status.code(), Some(3));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
             serde_json::json!({
@@ -626,7 +638,7 @@ fn unreachable_status_is_a_successful_recognized_result() {
 }
 
 #[test]
-fn connection_failure_is_a_successful_unreachable_status() {
+fn connection_failure_exits_3_with_an_unreachable_status() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let api_url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
@@ -640,7 +652,7 @@ fn connection_failure_is_a_successful_unreachable_status() {
         &environment,
     );
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
@@ -759,7 +771,7 @@ fn human_status_writes_the_recognized_result_to_stdout() {
 
     let output = run_with_env(&["auth", "status", "--allow-insecure-http"], &environment);
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     assert_eq!(output.stdout, b"! You're not signed in to Scherzo Cloud.\n");
     assert!(output.stderr.is_empty());
     server.finish();

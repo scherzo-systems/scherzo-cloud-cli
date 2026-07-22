@@ -1,17 +1,17 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 
+use crate::api::http_util::{self, BoundedBodyError};
 use crate::api::{HttpClient, UnreachableCategory, classify_reqwest_error};
 
+use super::credentials::MAX_ACCESS_TOKEN_BYTES;
 use super::deployment::Deployment;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
-const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const JSON_MEDIA_TYPE: &str = "application/json";
 const DEVICE_CODE_PATH: [&str; 3] = ["oauth", "device", "code"];
@@ -106,7 +106,8 @@ pub(crate) fn authorize(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<DeviceAuthorization, AuthorizationError> {
-    let endpoint = endpoint(deployment.fingerprint().issuer(), &DEVICE_CODE_PATH)?;
+    let endpoint = http_util::endpoint(deployment.fingerprint().issuer(), &DEVICE_CODE_PATH)
+        .map_err(|()| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
     let fields = [
         ("client_id", deployment.fingerprint().client_id()),
         ("audience", deployment.fingerprint().audience()),
@@ -139,7 +140,8 @@ pub(crate) fn poll_token(
     deployment: &Deployment,
     device_code: &str,
 ) -> Result<TokenPoll, AuthorizationError> {
-    let endpoint = endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)?;
+    let endpoint = http_util::endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
+        .map_err(|()| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
     let fields = [
         ("grant_type", DEVICE_GRANT_TYPE),
         ("device_code", device_code),
@@ -160,7 +162,7 @@ pub(crate) fn poll_token(
         return Err(AuthorizationError::Unreachable(UnreachableCategory::Server));
     }
     if response.status.is_client_error() {
-        if media_type(&response).is_some_and(|value| value.eq_ignore_ascii_case(JSON_MEDIA_TYPE)) {
+        if response.content_type.as_deref() == Some(JSON_MEDIA_TYPE) {
             if let Ok(error) = serde_json::from_slice::<OAuthErrorResponse>(&response.body) {
                 return match error.error.as_str() {
                     "authorization_pending" => Ok(TokenPoll::Pending),
@@ -237,7 +239,7 @@ impl fmt::Display for AuthorizationLocalError {
 
 struct RawResponse {
     status: StatusCode,
-    content_type: Option<HeaderValue>,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -281,34 +283,27 @@ async fn post_form_async(
         .await
         .map_err(|error| AuthorizationError::Unreachable(classify_reqwest_error(&error)))?;
     let status = response.status();
-    let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
-    {
-        return Err(AuthorizationError::Protocol {
-            reason: "the response body exceeds 1 MiB",
-        });
-    }
-    let mut response = response;
-    let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(MAX_RESPONSE_BODY_BYTES as u64) as usize,
-    );
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| AuthorizationError::Unreachable(classify_reqwest_error(&error)))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(http_util::media_type)
+        .transpose()
+        .map_err(|()| AuthorizationError::Protocol {
+            reason: "the response Content-Type is not valid text",
+        })?;
+    let body = match http_util::read_bounded_body(response).await {
+        Ok(body) => body,
+        Err(BoundedBodyError::TooLarge) => {
             return Err(AuthorizationError::Protocol {
                 reason: "the response body exceeds 1 MiB",
             });
         }
-        body.extend_from_slice(&chunk);
-    }
+        Err(BoundedBodyError::Transport(error)) => {
+            return Err(AuthorizationError::Unreachable(classify_reqwest_error(
+                &error,
+            )));
+        }
+    };
 
     Ok(RawResponse {
         status,
@@ -317,31 +312,8 @@ async fn post_form_async(
     })
 }
 
-fn endpoint(issuer: &str, path: &[&str]) -> Result<Url, AuthorizationError> {
-    let mut endpoint = Url::parse(issuer)
-        .map_err(|_| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
-    let mut segments = endpoint
-        .path_segments_mut()
-        .map_err(|()| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
-    segments.pop_if_empty();
-    for segment in path {
-        segments.push(segment);
-    }
-    drop(segments);
-    Ok(endpoint)
-}
-
-fn media_type(response: &RawResponse) -> Option<&str> {
-    response
-        .content_type
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-}
-
 fn require_json(response: &RawResponse) -> Result<(), AuthorizationError> {
-    if media_type(response).is_some_and(|value| value.eq_ignore_ascii_case(JSON_MEDIA_TYPE)) {
+    if response.content_type.as_deref() == Some(JSON_MEDIA_TYPE) {
         Ok(())
     } else {
         Err(AuthorizationError::Protocol {

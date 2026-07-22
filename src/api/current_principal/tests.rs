@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
 use super::*;
+use crate::api::http_util::MAX_RESPONSE_BODY_BYTES;
 
 struct TestServer {
     api_url: String,
@@ -99,8 +100,8 @@ fn problem(status: u16, problem_type: &str, actions: Option<serde_json::Value>) 
 }
 
 #[test]
-fn authenticated_response_uses_the_generated_principal_contract() {
-    let body = br#"{"id":"prn_fixture","type":"human","state":"active","displayName":"Ada"}"#;
+fn authenticated_response_ignores_additive_principal_fields() {
+    let body = br#"{"id":"prn_fixture","type":"human","state":"active","displayName":"Ada","future":{"nested":true}}"#;
     let server = TestServer::respond(response(
         "200 OK",
         Some("application/json; charset=utf-8"),
@@ -197,11 +198,6 @@ fn malformed_or_unexpected_responses_are_protocol_failures() {
         ),
         ("200 OK", Some(JSON_MEDIA_TYPE), b"not-json".as_slice()),
         (
-            "200 OK",
-            Some(JSON_MEDIA_TYPE),
-            br#"{"id":"prn_fixture","type":"human","state":"active","future":true}"#.as_slice(),
-        ),
-        (
             "403 Forbidden",
             Some(PROBLEM_MEDIA_TYPE),
             br#"{"type":"https://example.invalid/different","title":"No","status":403}"#.as_slice(),
@@ -258,7 +254,7 @@ fn redirect_is_returned_as_a_protocol_failure_without_being_followed() {
 
 #[test]
 fn response_body_is_bounded_before_any_status_is_reported() {
-    let body = vec![b'x'; MAX_RESPONSE_BODY_BYTES as usize + 1];
+    let body = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 1];
     for status in ["200 OK", "503 Service Unavailable"] {
         let mut raw = format!(
             "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n"

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fs2::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -25,10 +25,11 @@ const NORMAL_FILE_NAME: &str = "credentials.json";
 const SCHEMA_VERSION: u64 = 1;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const TOKEN_EXPIRY_MARGIN: time::Duration = time::Duration::seconds(30);
-const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -218,9 +219,9 @@ impl CredentialStore {
         let start = Instant::now();
 
         loop {
-            match file.try_lock_exclusive() {
+            match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(TryLockError::WouldBlock) => {
                     let elapsed = start.elapsed();
                     if elapsed >= self.lock_timeout {
                         return Err(CredentialError::LockTimeout);
@@ -229,7 +230,7 @@ impl CredentialStore {
                         LOCK_RETRY_INTERVAL.min(self.lock_timeout.saturating_sub(elapsed)),
                     );
                 }
-                Err(source) => {
+                Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {
                         operation: "acquire credential lock",
                         path: self.lock_path.clone(),
@@ -602,7 +603,7 @@ fn validate_mode(
 fn open_existing_private_file(path: &Path) -> Result<File, CredentialError> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(NOFOLLOW_FLAG)
         .open(path)
         .map_err(|source| CredentialError::Io {
             operation: "open credential file",
@@ -624,7 +625,7 @@ fn open_or_create_private_file(path: &Path) -> Result<File, CredentialError> {
         .write(true)
         .create_new(true)
         .mode(FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(NOFOLLOW_FLAG)
         .open(path)
     {
         Ok(file) => {
@@ -646,7 +647,7 @@ fn open_or_create_private_file(path: &Path) -> Result<File, CredentialError> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(NOFOLLOW_FLAG)
                 .open(path)
                 .map_err(|source| CredentialError::Io {
                     operation: "open credential lock",
@@ -675,7 +676,7 @@ fn create_private_file(path: &Path) -> Result<File, CredentialError> {
         .write(true)
         .create_new(true)
         .mode(FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(NOFOLLOW_FLAG)
         .open(path)
         .map_err(|source| CredentialError::Io {
             operation: "create temporary credential file",

@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::*;
+use crate::api::http_util::MAX_RESPONSE_BODY_BYTES;
 
 struct ScriptedServer {
     issuer: String,
@@ -428,13 +429,11 @@ fn oauth_request_deadline_bounds_the_complete_exchange() {
 #[test]
 fn redirects_oversized_responses_and_temporary_failures_are_classified() {
     let oversized = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         MAX_RESPONSE_BODY_BYTES + 1
     )
     .into_bytes();
-    let redirect =
-        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/escaped\r\nContent-Length: 0\r\n\r\n"
-            .to_vec();
+    let redirect = b"HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: http://127.0.0.1:1/escaped\r\nContent-Length: 0\r\n\r\n".to_vec();
     let server = ScriptedServer::new(vec![
         redirect,
         oversized,

@@ -10,6 +10,8 @@ use crate::human_auth::deployment::Deployment;
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
 
 pub const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
+const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
+const UNREACHABLE_EXIT_CODE: u8 = 3;
 
 #[derive(Debug, Args)]
 pub struct Command {
@@ -20,7 +22,7 @@ pub struct Command {
 impl Command {
     pub fn execute(self, deployment: &Deployment) -> ExitCode {
         match self.run(deployment) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(exit_code) => exit_code,
             Err(error) => {
                 eprintln!("Error: {error}");
                 ExitCode::FAILURE
@@ -28,14 +30,22 @@ impl Command {
         }
     }
 
-    fn run(self, deployment: &Deployment) -> Result<(), CommandError> {
+    fn run(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
         let client = HttpClient::new().map_err(CommandError::HttpClient)?;
         let status = status::check(&client, deployment).map_err(CommandError::Status)?;
+        let exit_code = match status.state() {
+            AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
+                ExitCode::SUCCESS
+            }
+            AuthenticationState::Unauthenticated => ExitCode::from(UNAUTHENTICATED_EXIT_CODE),
+            AuthenticationState::Unreachable(_) => ExitCode::from(UNREACHABLE_EXIT_CODE),
+        };
         if self.json {
-            write_json_status(&status)
+            write_json_status(&status)?;
         } else {
-            write_human_status(&status)
+            write_human_status(&status).map_err(CommandError::from)?;
         }
+        Ok(exit_code)
     }
 }
 
@@ -123,42 +133,50 @@ fn write_json_status(status: &AuthenticationStatus) -> Result<(), CommandError> 
     writeln!(stdout).map_err(CommandError::WriteOutput)
 }
 
-fn write_human_status(status: &AuthenticationStatus) -> Result<(), CommandError> {
+pub(super) fn write_human_status(status: &AuthenticationStatus) -> Result<(), HumanStatusError> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     match status.state() {
         AuthenticationState::Authenticated(principal) => {
             let account = principal.display_name.as_ref().unwrap_or(&principal.id);
-            writeln!(stdout, "✓ Signed in as {account}.").map_err(CommandError::WriteOutput)
+            writeln!(stdout, "✓ Signed in as {account}.").map_err(HumanStatusError::Output)
         }
         AuthenticationState::SignupRequired { actions } => {
-            writeln!(stdout, "✓ Signed in to Scherzo Cloud.").map_err(CommandError::WriteOutput)?;
+            writeln!(stdout, "✓ Signed in to Scherzo Cloud.").map_err(HumanStatusError::Output)?;
             writeln!(
                 stdout,
                 "! Your Scherzo Cloud account still needs to be set up."
             )
-            .map_err(CommandError::WriteOutput)?;
+            .map_err(HumanStatusError::Output)?;
             if let Some(actions) = actions {
                 for action in actions {
-                    serde_json::to_writer(&mut stdout, action).map_err(CommandError::WriteJson)?;
-                    writeln!(stdout).map_err(CommandError::WriteOutput)?;
+                    serde_json::to_writer(&mut stdout, action).map_err(HumanStatusError::Json)?;
+                    writeln!(stdout).map_err(HumanStatusError::Output)?;
                 }
             }
             Ok(())
         }
         AuthenticationState::Unauthenticated => {
             writeln!(stdout, "! You're not signed in to Scherzo Cloud.")
-                .map_err(CommandError::WriteOutput)
+                .map_err(HumanStatusError::Output)
         }
         AuthenticationState::Unreachable(category) => writeln!(
             stdout,
             "! Couldn't reach Scherzo Cloud ({}).",
             category.as_str()
         )
-        .map_err(CommandError::WriteOutput),
+        .map_err(HumanStatusError::Output),
     }
 }
 
+pub(super) enum HumanStatusError {
+    Json(serde_json::Error),
+    Output(io::Error),
+}
+
+// Keep this command-local adapter explicit even though login maps the same
+// human-status errors into its larger command error type.
+// jscpd:ignore-start
 #[derive(Debug)]
 enum CommandError {
     HttpClient(HttpClientError),
@@ -166,6 +184,16 @@ enum CommandError {
     WriteJson(serde_json::Error),
     WriteOutput(io::Error),
 }
+
+impl From<HumanStatusError> for CommandError {
+    fn from(error: HumanStatusError) -> Self {
+        match error {
+            HumanStatusError::Json(error) => Self::WriteJson(error),
+            HumanStatusError::Output(error) => Self::WriteOutput(error),
+        }
+    }
+}
+// jscpd:ignore-end
 
 impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
