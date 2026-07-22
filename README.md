@@ -10,12 +10,13 @@ executable.
 ## Current capabilities
 
 The current release supports help, version inspection, OAuth Device Authorization,
-server-confirmed human authentication status, and local human-credential logout. The
-`runner serve` command remains an explicit stub and exits with an error.
+server-confirmed human authentication status, explicit human-principal signup, and
+local human-credential logout. The `runner serve` command remains an explicit stub and
+exits with an error.
 
-The CLI cannot currently create cloud resources, configure a repository, submit
-workflows, or serve runner assignments. Explicit principal signup and the rest of Cloud
-onboarding are not implemented yet.
+Apart from creating the signed-in human's account, the CLI cannot currently create cloud
+resources, configure a repository, submit workflows, or serve runner assignments. The
+rest of Cloud onboarding is not implemented yet.
 
 ## Version inspection
 
@@ -52,6 +53,15 @@ Use `scherzo-cloud auth logout` to remove the human credential for the active de
 without making a network request. Normal operation stores short-lived human access
 tokens in `~/.scherzo-cloud/credentials.json`; this store is separate from all future
 runner credentials.
+
+## Account signup
+
+OAuth login does not implicitly create a Scherzo Cloud account. When authentication
+status is `signup_required` and the deployment advertises signup, use
+`scherzo-cloud account signup` after the customer explicitly approves account creation.
+Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
+with the existing human credential and retries an ambiguous transport failure once with
+the same opaque idempotency key.
 
 ## Release series
 

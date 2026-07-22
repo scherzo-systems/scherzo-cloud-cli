@@ -7,6 +7,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[path = "cli/account_signup.rs"]
+mod account_signup;
 #[path = "cli/auth_login.rs"]
 mod auth_login;
 
@@ -99,6 +101,121 @@ impl OneShotServer {
         self.thread.join().expect("fixture server should stop");
         request
     }
+}
+
+struct ScriptedServer {
+    api_url: String,
+    issuer: String,
+    requests: Receiver<String>,
+    thread: JoinHandle<()>,
+    remaining_requests: usize,
+    response_release: Option<mpsc::SyncSender<()>>,
+}
+
+impl ScriptedServer {
+    fn respond(responses: Vec<Vec<u8>>) -> Self {
+        Self::start(responses, false)
+    }
+
+    fn respond_with_paused_last_response(responses: Vec<Vec<u8>>) -> Self {
+        Self::start(responses, true)
+    }
+
+    fn start(responses: Vec<Vec<u8>>, pause_last_response: bool) -> Self {
+        let remaining_requests = responses.len();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
+        let address = listener.local_addr().unwrap();
+        let (sender, requests) = mpsc::channel();
+        let (response_release, mut release_receiver) = if pause_last_response {
+            let (sender, receiver) = mpsc::sync_channel(0);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let thread = thread::spawn(move || {
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().expect("fixture request should arrive");
+                let request = read_request(&mut stream);
+                sender
+                    .send(String::from_utf8(request).expect("request should be text"))
+                    .unwrap();
+                if index + 1 == remaining_requests {
+                    if let Some(receiver) = release_receiver.take() {
+                        receiver.recv().expect("paused response should be released");
+                    }
+                }
+                let _ = stream.write_all(&response);
+            }
+        });
+
+        Self {
+            api_url: format!("http://{address}/api"),
+            issuer: format!("http://{address}/auth/"),
+            requests,
+            thread,
+            remaining_requests,
+            response_release,
+        }
+    }
+
+    fn next_request(&mut self) -> String {
+        let request = self
+            .requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture should capture request");
+        self.remaining_requests -= 1;
+        request
+    }
+
+    fn release_paused_response(&mut self) {
+        self.response_release
+            .take()
+            .expect("fixture should have a paused response")
+            .send(())
+            .expect("paused response should be released");
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        assert!(
+            self.response_release.is_none(),
+            "paused response should be released before finishing"
+        );
+        let mut requests = Vec::with_capacity(self.remaining_requests);
+        while self.remaining_requests > 0 {
+            requests.push(self.next_request());
+        }
+        self.thread.join().expect("fixture server should stop");
+        requests
+    }
+}
+
+fn http_response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let content_type = content_type
+        .map(|value| format!("Content-Type: {value}\r\n"))
+        .unwrap_or_default();
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nConnection: close\r\n{content_type}Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn json_http_response(status: &str, value: serde_json::Value) -> Vec<u8> {
+    http_response(
+        status,
+        Some("application/json"),
+        &serde_json::to_vec(&value).unwrap(),
+    )
+}
+
+fn problem_http_response(status: &str, value: serde_json::Value) -> Vec<u8> {
+    http_response(
+        status,
+        Some("application/problem+json"),
+        &serde_json::to_vec(&value).unwrap(),
+    )
 }
 
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -212,6 +329,7 @@ fn no_arguments_print_composed_root_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud [OPTIONS] [COMMAND]"));
+    assert!(stdout.contains("account  Manage your Scherzo Cloud account"));
     assert!(stdout.contains("auth     Manage your Scherzo Cloud sign-in"));
     assert!(stdout.contains("version  Print version information"));
     assert!(stdout.contains("runner   Run and manage the Scherzo Cloud runner"));

@@ -5,9 +5,11 @@ use std::process::ExitCode;
 use clap::Args;
 use serde::Serialize;
 
-use crate::api::{HttpClient, HttpClientError, HumanPrincipal};
+use crate::api::{HttpClient, HttpClientError};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
+
+use super::super::principal::PrincipalResult;
 
 pub const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
 const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
@@ -76,27 +78,6 @@ enum StatusBody<'a> {
         deployment: &'a str,
         category: &'static str,
     },
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PrincipalResult<'a> {
-    id: &'a str,
-    r#type: &'static str,
-    state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<&'a str>,
-}
-
-impl<'a> PrincipalResult<'a> {
-    fn from_principal(principal: &'a HumanPrincipal) -> Self {
-        Self {
-            id: &principal.id,
-            r#type: "human",
-            state: "active",
-            display_name: principal.display_name.as_deref(),
-        }
-    }
 }
 
 impl<'a> StatusResult<'a> {

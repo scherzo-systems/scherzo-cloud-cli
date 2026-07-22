@@ -951,6 +951,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "fs4",
+ "getrandom 0.4.3",
  "reqwest",
  "rustix",
  "rustls",

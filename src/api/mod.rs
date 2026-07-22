@@ -1,12 +1,17 @@
 mod current_principal;
 mod http_client;
 pub(crate) mod http_util;
+mod human_principal;
+mod problem;
+mod signup;
 
 pub(crate) use current_principal::{
-    CurrentPrincipalError, CurrentPrincipalOutcome, HumanPrincipal, UnreachableCategory,
-    classify_reqwest_error, get_current_principal,
+    CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory, classify_reqwest_error,
+    get_current_principal,
 };
 pub(crate) use http_client::{HttpClient, HttpClientError};
+pub(crate) use human_principal::HumanPrincipal;
+pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 #[allow(
     dead_code,

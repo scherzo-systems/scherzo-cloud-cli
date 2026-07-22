@@ -15,17 +15,19 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// UpdateCurrentPrincipalPatch : A merge patch for the authenticated principal's mutable profile.
+/// LinkHumanOidcIdentityRequest : The separate proof of control for the proposed human OIDC identity.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateCurrentPrincipalPatch {
-    /// The new display name. Surrounding Unicode whitespace is removed. A null value clears the display name.
-    #[serde(rename = "displayName", deserialize_with = "Option::deserialize")]
-    pub display_name: Option<String>,
+pub struct LinkHumanOidcIdentityRequest {
+    /// A separately issued access-token JWT for this API. This bearer value is secret and is never retained in cleartext.
+    #[serde(rename = "proposedIdentityAccessToken")]
+    pub proposed_identity_access_token: String,
 }
 
-impl UpdateCurrentPrincipalPatch {
-    /// A merge patch for the authenticated principal's mutable profile.
-    pub fn new(display_name: Option<String>) -> UpdateCurrentPrincipalPatch {
-        UpdateCurrentPrincipalPatch { display_name }
+impl LinkHumanOidcIdentityRequest {
+    /// The separate proof of control for the proposed human OIDC identity.
+    pub fn new(proposed_identity_access_token: String) -> LinkHumanOidcIdentityRequest {
+        LinkHumanOidcIdentityRequest {
+            proposed_identity_access_token,
+        }
     }
 }

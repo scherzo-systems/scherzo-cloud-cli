@@ -5,9 +5,10 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
-use super::generated::models;
 use super::http_client::HttpClient;
 use super::http_util::{self, BoundedBodyError};
+use super::human_principal::{self, HumanPrincipal};
+use super::problem;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const PRINCIPAL_NOT_PROVISIONED: &str =
@@ -24,12 +25,6 @@ pub(crate) enum CurrentPrincipalOutcome {
     },
     Unauthenticated,
     Unreachable(UnreachableCategory),
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct HumanPrincipal {
-    pub(crate) id: String,
-    pub(crate) display_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,56 +268,16 @@ fn require_media_type(
 }
 
 fn decode_principal(body: &[u8]) -> Result<HumanPrincipal, CurrentPrincipalError> {
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
-        CurrentPrincipalError::protocol("the 200 response body is not valid JSON", false)
-    })?;
-    if !value.is_object() {
-        return Err(CurrentPrincipalError::protocol(
-            "the 200 response body is not a JSON object",
-            false,
-        ));
-    }
-
-    let principal: models::CurrentHumanPrincipal = serde_json::from_value(value)
-        .map_err(|_| CurrentPrincipalError::protocol("the principal fields are invalid", false))?;
-    if principal.id.is_empty() {
-        return Err(CurrentPrincipalError::protocol(
-            "the principal id is empty",
-            false,
-        ));
-    }
-    if principal
-        .display_name
-        .as_ref()
-        .is_some_and(String::is_empty)
-    {
-        return Err(CurrentPrincipalError::protocol(
-            "the principal display name is empty",
-            false,
-        ));
-    }
-
-    Ok(HumanPrincipal {
-        id: principal.id,
-        display_name: principal.display_name,
-    })
+    human_principal::decode(body).map_err(|reason| CurrentPrincipalError::protocol(reason, false))
 }
 
 fn decode_problem(
     body: &[u8],
     expected_status: StatusCode,
     credential_rejected: bool,
-) -> Result<models::Problem, CurrentPrincipalError> {
-    let problem: models::Problem = serde_json::from_slice(body).map_err(|_| {
-        CurrentPrincipalError::protocol("the problem response body is invalid", credential_rejected)
-    })?;
-    if problem.status != i32::from(expected_status.as_u16()) {
-        return Err(CurrentPrincipalError::protocol(
-            "the problem status does not match the HTTP status",
-            credential_rejected,
-        ));
-    }
-    Ok(problem)
+) -> Result<super::generated::models::Problem, CurrentPrincipalError> {
+    problem::decode(body, expected_status)
+        .map_err(|reason| CurrentPrincipalError::protocol(reason, credential_rejected))
 }
 
 pub(crate) fn classify_reqwest_error(error: &reqwest::Error) -> UnreachableCategory {

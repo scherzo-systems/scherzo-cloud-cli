@@ -6,8 +6,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::human_auth::deployment::Deployment;
-
 pub const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
 const NAME: &str = "auth";
 
@@ -29,16 +27,19 @@ enum AuthCommand {
 
 impl Command {
     pub fn execute(self, allow_insecure_http: bool) -> ExitCode {
-        let Some(command) = self.command else {
-            return super::print_help(&[NAME]);
-        };
-        let permit_http = allow_insecure_http || !command.uses_network();
-        let deployment = match Deployment::load(permit_http) {
-            Ok(deployment) => deployment,
-            Err(error) => {
-                eprintln!("Error: configure Scherzo Cloud sign-in: {error}");
-                return ExitCode::FAILURE;
-            }
+        let permit_http = allow_insecure_http
+            || self
+                .command
+                .as_ref()
+                .is_some_and(|command| !command.uses_network());
+        let (command, deployment) = match super::prepare_network_command(
+            self.command,
+            &[NAME],
+            permit_http,
+            "configure Scherzo Cloud sign-in",
+        ) {
+            Ok(prepared) => prepared,
+            Err(exit_code) => return exit_code,
         };
 
         match command {

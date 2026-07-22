@@ -5,8 +5,8 @@
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
-authentication status, and local logout. `scherzo-cloud runner serve` remains a stub;
-the binary does not yet run assignments.
+authentication status, explicit human-principal signup, and local logout.
+`scherzo-cloud runner serve` remains a stub; the binary does not yet run assignments.
 
 ## One executable with separate roles
 
@@ -55,7 +55,10 @@ principal. It persists the short-lived access token before that confirmation so 
 temporary API failure does not require another browser flow. Login alone never creates a
 principal. An onboarding agent may invoke the separate
 signup command only after reporting that signup is required and obtaining explicit human
-approval.
+approval. `scherzo-cloud account signup` uses the existing human credential, creates
+one opaque idempotency key per invocation, and retries an ambiguous transport failure
+once with that same key. It reports an authenticated principal only from the signup
+response and never begins another device authorization transaction.
 
 The runner will use a machine identity issued for that runner installation or managed
 runtime. Runner startup must use explicit machine configuration and must never discover

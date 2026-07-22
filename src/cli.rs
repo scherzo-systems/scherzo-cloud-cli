@@ -1,4 +1,6 @@
+mod account;
 mod auth;
+mod principal;
 mod runner;
 mod version;
 
@@ -7,6 +9,8 @@ use std::io;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
+
+use crate::human_auth::deployment::Deployment;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,7 +22,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Allow sign-in over insecure HTTP connections"
+        help = "Allow Scherzo Cloud requests over insecure HTTP connections"
     )]
     allow_insecure_http: bool,
 
@@ -28,6 +32,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = account::ABOUT)]
+    Account(account::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
     #[command(about = version::ABOUT)]
@@ -48,11 +54,28 @@ impl Cli {
     pub fn execute(self) -> ExitCode {
         match self.command {
             None => print_help(&[]),
+            Some(Command::Account(command)) => command.execute(self.allow_insecure_http),
             Some(Command::Auth(command)) => command.execute(self.allow_insecure_http),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
         }
     }
+}
+
+fn prepare_network_command<T>(
+    command: Option<T>,
+    command_path: &[&str],
+    permit_http: bool,
+    error_context: &'static str,
+) -> Result<(T, Deployment), ExitCode> {
+    let Some(command) = command else {
+        return Err(print_help(command_path));
+    };
+    let deployment = Deployment::load(permit_http).map_err(|error| {
+        eprintln!("Error: {error_context}: {error}");
+        ExitCode::FAILURE
+    })?;
+    Ok((command, deployment))
 }
 
 fn print_help(command_path: &[&str]) -> ExitCode {
@@ -89,10 +112,22 @@ mod tests {
     fn root_help_is_composed_from_command_metadata() {
         let help = Cli::command().render_help().to_string();
 
+        assert!(help.contains("account  Manage your Scherzo Cloud account"));
         assert!(help.contains("auth     Manage your Scherzo Cloud sign-in"));
         assert!(help.contains("version  Print version information"));
         assert!(help.contains("runner   Run and manage the Scherzo Cloud runner"));
         assert!(help.contains("--allow-insecure-http"));
+    }
+
+    #[test]
+    fn account_help_is_composed_from_command_metadata() {
+        let mut root = Cli::command();
+        let account = root
+            .find_subcommand_mut("account")
+            .expect("account command should exist");
+        let help = account.render_help().to_string();
+
+        assert!(help.contains("signup  Create your Scherzo Cloud account"));
     }
 
     #[test]
