@@ -20,19 +20,14 @@ enum AccountCommand {
 }
 
 impl Command {
-    pub fn execute(self, allow_insecure_http: bool) -> ExitCode {
-        let (command, deployment) = match super::prepare_network_command(
+    pub fn execute(self) -> ExitCode {
+        super::execute_deployment_command(
             self.command,
             &[NAME],
-            allow_insecure_http,
             "configure Scherzo Cloud account",
-        ) {
-            Ok(prepared) => prepared,
-            Err(exit_code) => return exit_code,
-        };
-
-        match command {
-            AccountCommand::Signup(command) => command.execute(&deployment),
-        }
+            |command, deployment| match command {
+                AccountCommand::Signup(command) => command.execute(deployment),
+            },
+        )
     }
 }

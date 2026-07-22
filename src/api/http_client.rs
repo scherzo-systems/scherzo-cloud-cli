@@ -4,17 +4,38 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use reqwest::Client;
+use reqwest::{Client, Url};
+
+use super::http_util;
 
 static TLS_PROVIDER: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HttpTransportPolicy {
+    HttpsOnly,
+    AllowInsecureHttp,
+}
+
+impl HttpTransportPolicy {
+    pub(crate) fn permits(self, url: &Url) -> bool {
+        url.scheme() == "https" || (self == Self::AllowInsecureHttp && url.scheme() == "http")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HttpEndpointError {
+    Invalid,
+    InsecureHttp,
+}
 
 pub(crate) struct HttpClient {
     runtime: Option<tokio::runtime::Runtime>,
     client: Client,
+    transport_policy: HttpTransportPolicy,
 }
 
 impl HttpClient {
-    pub(crate) fn new() -> Result<Self, HttpClientError> {
+    pub(crate) fn new(transport_policy: HttpTransportPolicy) -> Result<Self, HttpClientError> {
         install_tls_provider();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -23,13 +44,31 @@ impl HttpClient {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
             .build()
             .map_err(HttpClientError::BuildClient)?;
 
         Ok(Self {
             runtime: Some(runtime),
             client,
+            transport_policy,
         })
+    }
+
+    pub(crate) fn endpoint(&self, base_url: &str, path: &[&str]) -> Result<Url, HttpEndpointError> {
+        let endpoint =
+            http_util::endpoint(base_url, path).map_err(|()| HttpEndpointError::Invalid)?;
+        if self.transport_policy.permits(&endpoint) {
+            Ok(endpoint)
+        } else if endpoint.scheme() == "http" {
+            Err(HttpEndpointError::InsecureHttp)
+        } else {
+            Err(HttpEndpointError::Invalid)
+        }
+    }
+
+    pub(crate) fn transport_policy(&self) -> HttpTransportPolicy {
+        self.transport_policy
     }
 
     pub(crate) fn inner(&self) -> &Client {
@@ -78,4 +117,35 @@ fn install_tls_provider() {
     TLS_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_only_policy_rejects_http_endpoints() {
+        let client = HttpClient::new(HttpTransportPolicy::HttpsOnly).unwrap();
+
+        assert_eq!(
+            client.endpoint("http://api.fixture.example/base/", &["v1", "me"]),
+            Err(HttpEndpointError::InsecureHttp)
+        );
+        assert!(
+            client
+                .endpoint("https://api.fixture.example/base/", &["v1", "me"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn insecure_http_policy_permits_http_endpoints() {
+        let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+
+        assert!(
+            client
+                .endpoint("http://api.fixture.example/base/", &["v1", "me"])
+                .is_ok()
+        );
+    }
 }

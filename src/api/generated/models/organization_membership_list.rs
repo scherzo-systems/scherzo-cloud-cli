@@ -15,17 +15,24 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// UpdateCurrentPrincipalPatch : A merge patch for the authenticated principal's mutable profile.
+/// OrganizationMembershipList : A page of active organization directory entries.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateCurrentPrincipalPatch {
-    /// The new display name. Surrounding Unicode whitespace is removed. A null value clears the display name.
-    #[serde(rename = "displayName", deserialize_with = "Option::deserialize")]
-    pub display_name: Option<String>,
+pub struct OrganizationMembershipList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::OrganizationMembershipDirectoryEntry>,
+    /// An opaque continuation cursor, omitted on the final page.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
-impl UpdateCurrentPrincipalPatch {
-    /// A merge patch for the authenticated principal's mutable profile.
-    pub fn new(display_name: Option<String>) -> UpdateCurrentPrincipalPatch {
-        UpdateCurrentPrincipalPatch { display_name }
+impl OrganizationMembershipList {
+    /// A page of active organization directory entries.
+    pub fn new(
+        items: Vec<models::OrganizationMembershipDirectoryEntry>,
+    ) -> OrganizationMembershipList {
+        OrganizationMembershipList {
+            items,
+            next_cursor: None,
+        }
     }
 }

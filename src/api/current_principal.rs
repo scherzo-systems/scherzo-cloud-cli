@@ -5,7 +5,7 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
-use super::http_client::HttpClient;
+use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
 use super::human_principal::{self, HumanPrincipal};
 use super::problem;
@@ -82,7 +82,7 @@ impl CurrentPrincipalError {
 
 #[derive(Debug)]
 enum CurrentPrincipalErrorKind {
-    InvalidEndpoint,
+    Endpoint(HttpEndpointError),
     InvalidAuthorizationHeader,
     Protocol { reason: &'static str },
 }
@@ -90,12 +90,14 @@ enum CurrentPrincipalErrorKind {
 impl fmt::Display for CurrentPrincipalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            CurrentPrincipalErrorKind::InvalidEndpoint => {
-                write!(
-                    formatter,
-                    "the deployment API URL cannot form a current-principal endpoint"
-                )
-            }
+            CurrentPrincipalErrorKind::Endpoint(HttpEndpointError::Invalid) => write!(
+                formatter,
+                "the deployment API URL cannot form a current-principal endpoint"
+            ),
+            CurrentPrincipalErrorKind::Endpoint(HttpEndpointError::InsecureHttp) => write!(
+                formatter,
+                "the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it"
+            ),
             CurrentPrincipalErrorKind::InvalidAuthorizationHeader => {
                 write!(
                     formatter,
@@ -126,8 +128,9 @@ fn get_current_principal_with_timeout(
     access_token: Option<&str>,
     timeout: Duration,
 ) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
-    let endpoint = http_util::endpoint(api_url, &["v1", "me"])
-        .map_err(|()| CurrentPrincipalError::local(CurrentPrincipalErrorKind::InvalidEndpoint))?;
+    let endpoint = client.endpoint(api_url, &["v1", "me"]).map_err(|error| {
+        CurrentPrincipalError::local(CurrentPrincipalErrorKind::Endpoint(error))
+    })?;
     let authorization = access_token
         .map(|access_token| HeaderValue::from_str(&format!("Bearer {access_token}")))
         .transpose()

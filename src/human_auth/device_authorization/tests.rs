@@ -145,7 +145,7 @@ fn device_authorization_requests_the_exact_client_audience_and_scopes() {
         }),
     )]);
     let deployment = server.deployment();
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
 
     let authorization = authorize(&client, &deployment).unwrap();
 
@@ -178,7 +178,7 @@ fn device_authorization_defaults_the_poll_interval_and_allows_missing_complete_u
             "expires_in": 60
         }))
         .unwrap(),
-        false,
+        HttpTransportPolicy::HttpsOnly,
     )
     .unwrap();
 
@@ -197,10 +197,10 @@ fn insecure_activation_urls_require_the_invocation_opt_in() {
     .unwrap();
 
     assert!(matches!(
-        decode_device_authorization(&body, false),
+        decode_device_authorization(&body, HttpTransportPolicy::HttpsOnly),
         Err(AuthorizationError::Protocol { .. })
     ));
-    assert!(decode_device_authorization(&body, true).is_ok());
+    assert!(decode_device_authorization(&body, HttpTransportPolicy::AllowInsecureHttp).is_ok());
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn token_polling_handles_standard_device_grant_outcomes() {
     .to_vec();
     let server = ScriptedServer::new(responses);
     let deployment = server.deployment();
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
 
     assert!(matches!(
         poll_token(&client, &deployment, "private-device-code").unwrap(),
@@ -268,7 +268,7 @@ fn token_polling_reuses_one_http_connection() {
         "http://api.fixture.example".to_owned(),
         format!("http://{address}/tenant/"),
     );
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
 
     assert!(matches!(
         poll_token(&client, &deployment, "private-device-code").unwrap(),
@@ -300,7 +300,7 @@ fn issued_token_is_validated_and_refresh_token_is_ignored() {
         }),
     )]);
     let deployment = server.deployment();
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
 
     let TokenPoll::Issued(token) = poll_token(&client, &deployment, "private-device-code").unwrap()
     else {
@@ -351,7 +351,10 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
         }),
     ] {
         assert!(matches!(
-            decode_device_authorization(&serde_json::to_vec(&body).unwrap(), false),
+            decode_device_authorization(
+                &serde_json::to_vec(&body).unwrap(),
+                HttpTransportPolicy::HttpsOnly,
+            ),
             Err(AuthorizationError::Protocol { .. })
         ));
     }
@@ -409,7 +412,7 @@ fn oauth_request_deadline_bounds_the_complete_exchange() {
         let _ = stream.write_all(&json_response("200 OK", serde_json::json!({})));
     });
 
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
     let Err(error) = post_form_with_timeout(
         &client,
         Url::parse(&format!("http://{address}/oauth/token")).unwrap(),
@@ -441,7 +444,7 @@ fn redirects_oversized_responses_and_temporary_failures_are_classified() {
         response("503 Service Unavailable", None, &[]),
     ]);
     let deployment = server.deployment();
-    let client = HttpClient::new().unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
 
     assert!(matches!(
         authorize(&client, &deployment),

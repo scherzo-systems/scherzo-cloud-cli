@@ -7,7 +7,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
-use super::http_client::HttpClient;
+use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
 use super::human_principal::{self, HumanPrincipal};
 use super::problem;
@@ -63,7 +63,7 @@ impl SignupError {
 
 #[derive(Debug)]
 enum SignupErrorKind {
-    InvalidEndpoint,
+    Endpoint(HttpEndpointError),
     InvalidAuthorizationHeader,
     Protocol { reason: &'static str },
 }
@@ -71,12 +71,14 @@ enum SignupErrorKind {
 impl fmt::Display for SignupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            SignupErrorKind::InvalidEndpoint => {
-                write!(
-                    formatter,
-                    "the deployment API URL cannot form a signup endpoint"
-                )
-            }
+            SignupErrorKind::Endpoint(HttpEndpointError::Invalid) => write!(
+                formatter,
+                "the deployment API URL cannot form a signup endpoint"
+            ),
+            SignupErrorKind::Endpoint(HttpEndpointError::InsecureHttp) => write!(
+                formatter,
+                "the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it"
+            ),
             SignupErrorKind::InvalidAuthorizationHeader => write!(
                 formatter,
                 "the stored access token cannot be represented as a bearer credential"
@@ -116,8 +118,9 @@ fn signup_human_with_timeout(
     idempotency_key: &str,
     timeout: Duration,
 ) -> Result<SignupOutcome, SignupError> {
-    let endpoint = http_util::endpoint(api_url, &["v1", "signup"])
-        .map_err(|()| SignupError::local(SignupErrorKind::InvalidEndpoint))?;
+    let endpoint = client
+        .endpoint(api_url, &["v1", "signup"])
+        .map_err(|error| SignupError::local(SignupErrorKind::Endpoint(error)))?;
     let authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
         .map_err(|_| SignupError::local(SignupErrorKind::InvalidAuthorizationHeader))?;
     let idempotency_key = HeaderValue::from_str(idempotency_key).map_err(|_| {

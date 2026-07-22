@@ -71,7 +71,7 @@ fn account_without_a_subcommand_prints_help_without_loading_deployment() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Usage: scherzo-cloud account [OPTIONS] [COMMAND]"));
+    assert!(stdout.contains("Usage: scherzo-cloud account [COMMAND]"));
     assert!(stdout.contains("signup  Create your Scherzo Cloud account"));
     assert!(output.stderr.is_empty());
 }
@@ -177,6 +177,35 @@ fn signup_retries_an_ambiguous_transport_failure_with_the_same_key() {
 }
 
 #[test]
+fn signup_rejects_http_before_transmitting_the_credential() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(
+        &credential_path,
+        &api_url,
+        "unique-untransmitted-signup-token",
+        "2999-01-01T00:00:00Z",
+    );
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = deployment_environment(&api_url, credential_path_string);
+
+    let output = run_with_env(&["account", "signup", "--json"], &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"Error: create Scherzo Cloud account: the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
 fn signup_without_a_credential_does_not_contact_the_api() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -186,10 +215,7 @@ fn signup_without_a_credential_does_not_contact_the_api() {
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = deployment_environment(&api_url, credential_path_string);
 
-    let output = run_with_env(
-        &["account", "signup", "--json", "--allow-insecure-http"],
-        &environment,
-    );
+    let output = run_with_env(&["account", "signup", "--json"], &environment);
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(

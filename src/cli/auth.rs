@@ -26,32 +26,16 @@ enum AuthCommand {
 }
 
 impl Command {
-    pub fn execute(self, allow_insecure_http: bool) -> ExitCode {
-        let permit_http = allow_insecure_http
-            || self
-                .command
-                .as_ref()
-                .is_some_and(|command| !command.uses_network());
-        let (command, deployment) = match super::prepare_network_command(
+    pub fn execute(self) -> ExitCode {
+        super::execute_deployment_command(
             self.command,
             &[NAME],
-            permit_http,
             "configure Scherzo Cloud sign-in",
-        ) {
-            Ok(prepared) => prepared,
-            Err(exit_code) => return exit_code,
-        };
-
-        match command {
-            AuthCommand::Login(command) => command.execute(&deployment),
-            AuthCommand::Status(command) => command.execute(&deployment),
-            AuthCommand::Logout(command) => command.execute(&deployment),
-        }
-    }
-}
-
-impl AuthCommand {
-    fn uses_network(&self) -> bool {
-        matches!(self, Self::Login(_) | Self::Status(_))
+            |command, deployment| match command {
+                AuthCommand::Login(command) => command.execute(deployment),
+                AuthCommand::Status(command) => command.execute(deployment),
+                AuthCommand::Logout(command) => command.execute(deployment),
+            },
+        )
     }
 }

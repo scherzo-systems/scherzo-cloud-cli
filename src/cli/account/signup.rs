@@ -27,6 +27,9 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 pub struct Command {
     #[arg(long, help = "Print the signup result as JSON")]
     json: bool,
+
+    #[command(flatten)]
+    http: super::super::HttpOptions,
 }
 
 impl Command {
@@ -50,7 +53,8 @@ impl Command {
             return self.write_outcome(deployment, &SignupOutcome::Unauthenticated);
         };
         let idempotency_key = generate_idempotency_key().map_err(CommandError::Random)?;
-        let client = HttpClient::new().map_err(CommandError::HttpClient)?;
+        let client =
+            HttpClient::new(self.http.transport_policy()).map_err(CommandError::HttpClient)?;
         let outcome = signup_human(
             &client,
             deployment.fingerprint().api_url(),

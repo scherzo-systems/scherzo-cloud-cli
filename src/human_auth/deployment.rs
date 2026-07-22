@@ -25,7 +25,6 @@ const OVERRIDE_VARIABLES: [&str; 4] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Deployment {
     fingerprint: DeploymentFingerprint,
-    allow_insecure_http: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -38,16 +37,12 @@ pub(crate) struct DeploymentFingerprint {
 }
 
 impl Deployment {
-    pub(crate) fn load(allow_insecure_http: bool) -> Result<Self, DeploymentError> {
-        Self::load_from(|name| env::var_os(name), allow_insecure_http)
+    pub(crate) fn load() -> Result<Self, DeploymentError> {
+        Self::load_from(|name| env::var_os(name))
     }
 
     pub(crate) fn fingerprint(&self) -> &DeploymentFingerprint {
         &self.fingerprint
-    }
-
-    pub(crate) fn allows_insecure_http(&self) -> bool {
-        self.allow_insecure_http
     }
 
     #[cfg(test)]
@@ -57,12 +52,11 @@ impl Deployment {
             issuer,
             "https://api.fixture.example".to_owned(),
             "fixture-public-client".to_owned(),
-            true,
         )
         .expect("test deployment should be valid")
     }
 
-    fn load_from<F>(lookup: F, allow_insecure_http: bool) -> Result<Self, DeploymentError>
+    fn load_from<F>(lookup: F) -> Result<Self, DeploymentError>
     where
         F: Fn(&str) -> Option<OsString>,
     {
@@ -75,7 +69,6 @@ impl Deployment {
                 PRODUCTION_ISSUER.to_owned(),
                 PRODUCTION_AUDIENCE.to_owned(),
                 PRODUCTION_CLIENT_ID.to_owned(),
-                allow_insecure_http,
             );
         }
 
@@ -92,7 +85,6 @@ impl Deployment {
             unicode_value(ISSUER_VARIABLE, issuer)?,
             unicode_value(AUDIENCE_VARIABLE, audience)?,
             unicode_value(CLIENT_ID_VARIABLE, client_id)?,
-            allow_insecure_http,
         )
     }
 
@@ -101,16 +93,14 @@ impl Deployment {
         issuer: String,
         audience: String,
         client_id: String,
-        allow_insecure_http: bool,
     ) -> Result<Self, DeploymentError> {
-        validate_network_url(API_URL_VARIABLE, &api_url, allow_insecure_http)?;
-        validate_network_url(ISSUER_VARIABLE, &issuer, allow_insecure_http)?;
+        validate_network_url(API_URL_VARIABLE, &api_url)?;
+        validate_network_url(ISSUER_VARIABLE, &issuer)?;
         validate_nonempty(AUDIENCE_VARIABLE, &audience)?;
         validate_nonempty(CLIENT_ID_VARIABLE, &client_id)?;
 
         Ok(Self {
             fingerprint: DeploymentFingerprint::new(api_url, issuer, audience, client_id),
-            allow_insecure_http,
         })
     }
 }
@@ -174,9 +164,6 @@ pub(crate) enum DeploymentError {
         variable: &'static str,
         scheme: String,
     },
-    InsecureHttp {
-        variable: &'static str,
-    },
 }
 
 impl fmt::Display for DeploymentError {
@@ -201,10 +188,6 @@ impl fmt::Display for DeploymentError {
             Self::UnsupportedScheme { variable, scheme } => write!(
                 formatter,
                 "{variable} uses unsupported URL scheme {scheme}; expected https or http"
-            ),
-            Self::InsecureHttp { variable } => write!(
-                formatter,
-                "{variable} uses insecure HTTP; rerun with --allow-insecure-http to permit it"
             ),
         }
     }
@@ -243,11 +226,7 @@ fn validate_nonempty(variable: &'static str, value: &str) -> Result<(), Deployme
     }
 }
 
-fn validate_network_url(
-    variable: &'static str,
-    value: &str,
-    allow_insecure_http: bool,
-) -> Result<(), DeploymentError> {
+fn validate_network_url(variable: &'static str, value: &str) -> Result<(), DeploymentError> {
     validate_nonempty(variable, value)?;
     let url =
         Url::parse(value).map_err(|source| DeploymentError::InvalidUrl { variable, source })?;
@@ -263,9 +242,7 @@ fn validate_network_url(
     }
 
     match url.scheme() {
-        "https" => Ok(()),
-        "http" if allow_insecure_http => Ok(()),
-        "http" => Err(DeploymentError::InsecureHttp { variable }),
+        "https" | "http" => Ok(()),
         scheme => Err(DeploymentError::UnsupportedScheme {
             variable,
             scheme: scheme.to_owned(),
@@ -279,15 +256,9 @@ mod tests {
 
     use super::*;
 
-    fn load(
-        values: &[(&str, &str)],
-        allow_insecure_http: bool,
-    ) -> Result<Deployment, DeploymentError> {
+    fn load(values: &[(&str, &str)]) -> Result<Deployment, DeploymentError> {
         let environment: HashMap<&str, &str> = values.iter().copied().collect();
-        Deployment::load_from(
-            |name| environment.get(name).map(|value| OsString::from(*value)),
-            allow_insecure_http,
-        )
+        Deployment::load_from(|name| environment.get(name).map(|value| OsString::from(*value)))
     }
 
     fn complete_override<'a>(api_url: &'a str, issuer: &'a str) -> [(&'static str, &'a str); 4] {
@@ -301,7 +272,7 @@ mod tests {
 
     #[test]
     fn absent_overrides_select_the_production_deployment() {
-        let deployment = load(&[], false).expect("production deployment should be valid");
+        let deployment = load(&[]).expect("production deployment should be valid");
 
         assert_eq!(
             deployment.fingerprint().as_tuple(),
@@ -320,7 +291,7 @@ mod tests {
             "https://api.fixture.example/base/",
             "https://auth.fixture.example/tenant/",
         );
-        let deployment = load(&values, false).expect("complete override should be valid");
+        let deployment = load(&values).expect("complete override should be valid");
 
         assert_eq!(
             deployment.fingerprint().as_tuple(),
@@ -343,7 +314,7 @@ mod tests {
                 .map(|(_, name)| (*name, "configured"))
                 .collect();
 
-            let error = load(&values, false).expect_err("partial override should fail");
+            let error = load(&values).expect_err("partial override should fail");
             let DeploymentError::PartialOverride { missing } = error else {
                 panic!("expected partial-override error");
             };
@@ -359,36 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn insecure_api_and_issuer_urls_require_the_global_opt_in() {
-        for (api_url, issuer, expected_variable) in [
-            (
-                "http://api.fixture.example",
-                "https://auth.fixture.example/",
-                API_URL_VARIABLE,
-            ),
-            (
-                "https://api.fixture.example",
-                "http://auth.fixture.example/",
-                ISSUER_VARIABLE,
-            ),
-        ] {
-            let values = complete_override(api_url, issuer);
-            let error = load(&values, false).expect_err("HTTP URL should require opt-in");
-
-            assert!(matches!(
-                error,
-                DeploymentError::InsecureHttp { variable } if variable == expected_variable
-            ));
-        }
-    }
-
-    #[test]
-    fn global_opt_in_permits_arbitrary_http_hosts() {
+    fn http_urls_are_preserved_for_request_time_transport_policy() {
         let values = complete_override(
             "http://api.fixture.example:8080/base/",
             "http://auth.fixture.example:9090/tenant/",
         );
-        let deployment = load(&values, true).expect("HTTP override should be permitted");
+        let deployment = load(&values).expect("HTTP overrides should be structurally valid");
 
         assert_eq!(deployment.fingerprint().as_tuple().0, values[0].1);
         assert_eq!(deployment.fingerprint().as_tuple().1, values[1].1);
@@ -405,7 +352,7 @@ mod tests {
         ] {
             let values = complete_override(api_url, "https://auth.fixture.example/");
 
-            assert!(load(&values, true).is_err(), "accepted {api_url}");
+            assert!(load(&values).is_err(), "accepted {api_url}");
         }
     }
 
@@ -422,7 +369,7 @@ mod tests {
                 .expect("variable should be present");
             *value = "";
 
-            let error = load(&values, false).expect_err("empty override should fail");
+            let error = load(&values).expect_err("empty override should fail");
             assert!(matches!(
                 error,
                 DeploymentError::EmptyValue { variable: actual } if actual == variable

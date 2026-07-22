@@ -28,27 +28,32 @@ pub struct Command {
     #[arg(long, help = "Emit newline-delimited JSON events")]
     json: bool,
 
+    // Login keeps its force option and three-way completion mapping local;
+    // sharing this command shell with status would couple distinct result contracts.
+    // jscpd:ignore-start
     #[arg(long, help = "Start a new sign-in even if you're already signed in")]
     force: bool,
+
+    #[command(flatten)]
+    http: super::super::HttpOptions,
 }
 
 impl Command {
     pub fn execute(self, deployment: &Deployment) -> ExitCode {
-        match self.run(deployment) {
-            Ok(Completion::Success) => ExitCode::SUCCESS,
-            Ok(Completion::Failure) => ExitCode::FAILURE,
-            Ok(Completion::Cancelled) => ExitCode::from(CANCELLED_EXIT_CODE),
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
-        }
+        let result = self.run(deployment).map(|completion| match completion {
+            Completion::Success => ExitCode::SUCCESS,
+            Completion::Failure => ExitCode::FAILURE,
+            Completion::Cancelled => ExitCode::from(CANCELLED_EXIT_CODE),
+        });
+        super::super::finish_command(result)
     }
+    // jscpd:ignore-end
 
     fn run(self, deployment: &Deployment) -> Result<Completion, CommandError> {
         let cancellation = Cancellation::install().map_err(CommandError::Cancellation)?;
         let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
-        let client = HttpClient::new().map_err(CommandError::HttpClient)?;
+        let client =
+            HttpClient::new(self.http.transport_policy()).map_err(CommandError::HttpClient)?;
         let mut output = LoginOutput { json: self.json };
 
         if self.force {

@@ -9,7 +9,7 @@ pub(crate) use current_principal::{
     CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory, classify_reqwest_error,
     get_current_principal,
 };
-pub(crate) use http_client::{HttpClient, HttpClientError};
+pub(crate) use http_client::{HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

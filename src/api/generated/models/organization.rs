@@ -15,47 +15,50 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CurrentHumanPrincipal : The active human principal making the request.
+/// Organization : An active organization visible to one of its effective members.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CurrentHumanPrincipal {
-    /// An opaque, stable, globally unique principal identifier.
+pub struct Organization {
+    /// The organization's opaque, stable, globally unique identifier.
     #[serde(rename = "id")]
     pub id: String,
-    /// The immutable principal type.
-    #[serde(rename = "type")]
-    pub r#type: Type,
-    /// The principal lifecycle state available to this operation.
+    /// The organization lifecycle state available to these operations.
     #[serde(rename = "state")]
     pub state: State,
-    /// The principal's mutable, non-unique display name, when one has been established.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
+    /// The organization's required mutable, non-unique display name.
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "slug")]
+    pub slug: String,
+    /// The RFC 3339 time at which the organization was created.
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    /// The RFC 3339 time at which the organization last changed.
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
 }
 
-impl CurrentHumanPrincipal {
-    /// The active human principal making the request.
-    pub fn new(id: String, r#type: Type, state: State) -> CurrentHumanPrincipal {
-        CurrentHumanPrincipal {
+impl Organization {
+    /// An active organization visible to one of its effective members.
+    pub fn new(
+        id: String,
+        state: State,
+        display_name: String,
+        slug: String,
+        created_at: String,
+        updated_at: String,
+    ) -> Organization {
+        Organization {
             id,
-            r#type,
             state,
-            display_name: None,
+            display_name,
+            slug,
+            created_at,
+            updated_at,
         }
     }
 }
-/// The immutable principal type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Type {
-    #[serde(rename = "human")]
-    Human,
-}
-
-impl Default for Type {
-    fn default() -> Type {
-        Self::Human
-    }
-}
-/// The principal lifecycle state available to this operation.
+/// The organization lifecycle state available to these operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
     #[serde(rename = "active")]

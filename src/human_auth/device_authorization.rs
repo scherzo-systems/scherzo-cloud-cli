@@ -6,7 +6,9 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 
 use crate::api::http_util::{self, BoundedBodyError};
-use crate::api::{HttpClient, UnreachableCategory, classify_reqwest_error};
+use crate::api::{
+    HttpClient, HttpEndpointError, HttpTransportPolicy, UnreachableCategory, classify_reqwest_error,
+};
 
 use super::credentials::MAX_ACCESS_TOKEN_BYTES;
 use super::deployment::Deployment;
@@ -106,8 +108,9 @@ pub(crate) fn authorize(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<DeviceAuthorization, AuthorizationError> {
-    let endpoint = http_util::endpoint(deployment.fingerprint().issuer(), &DEVICE_CODE_PATH)
-        .map_err(|()| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
+    let endpoint = client
+        .endpoint(deployment.fingerprint().issuer(), &DEVICE_CODE_PATH)
+        .map_err(|error| AuthorizationError::Local(AuthorizationLocalError::Endpoint(error)))?;
     let fields = [
         ("client_id", deployment.fingerprint().client_id()),
         ("audience", deployment.fingerprint().audience()),
@@ -118,7 +121,7 @@ pub(crate) fn authorize(
     match response.status {
         StatusCode::OK => {
             require_json(&response)?;
-            decode_device_authorization(&response.body, deployment.allows_insecure_http())
+            decode_device_authorization(&response.body, client.transport_policy())
         }
         StatusCode::TOO_MANY_REQUESTS => Err(AuthorizationError::Unreachable(
             UnreachableCategory::RateLimited,
@@ -140,8 +143,9 @@ pub(crate) fn poll_token(
     deployment: &Deployment,
     device_code: &str,
 ) -> Result<TokenPoll, AuthorizationError> {
-    let endpoint = http_util::endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
-        .map_err(|()| AuthorizationError::Local(AuthorizationLocalError::InvalidEndpoint))?;
+    let endpoint = client
+        .endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
+        .map_err(|error| AuthorizationError::Local(AuthorizationLocalError::Endpoint(error)))?;
     let fields = [
         ("grant_type", DEVICE_GRANT_TYPE),
         ("device_code", device_code),
@@ -223,15 +227,19 @@ impl fmt::Display for AuthorizationError {
 
 #[derive(Debug)]
 pub(crate) enum AuthorizationLocalError {
-    InvalidEndpoint,
+    Endpoint(HttpEndpointError),
 }
 
 impl fmt::Display for AuthorizationLocalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidEndpoint => write!(
+            Self::Endpoint(HttpEndpointError::Invalid) => write!(
                 formatter,
                 "authorization issuer cannot form an OAuth endpoint"
+            ),
+            Self::Endpoint(HttpEndpointError::InsecureHttp) => write!(
+                formatter,
+                "authorization issuer uses insecure HTTP; rerun with --allow-insecure-http to permit it"
             ),
         }
     }
@@ -334,7 +342,7 @@ struct DeviceAuthorizationResponse {
 
 fn decode_device_authorization(
     body: &[u8],
-    allow_insecure_http: bool,
+    transport_policy: HttpTransportPolicy,
 ) -> Result<DeviceAuthorization, AuthorizationError> {
     let response: DeviceAuthorizationResponse =
         serde_json::from_slice(body).map_err(|_| AuthorizationError::Protocol {
@@ -350,9 +358,9 @@ fn decode_device_authorization(
             reason: "the user code is empty",
         });
     }
-    validate_verification_uri(&response.verification_uri, allow_insecure_http)?;
+    validate_verification_uri(&response.verification_uri, transport_policy)?;
     if let Some(uri) = &response.verification_uri_complete {
-        validate_verification_uri(uri, allow_insecure_http)?;
+        validate_verification_uri(uri, transport_policy)?;
     }
     let expires_in = positive_duration(
         response.expires_in,
@@ -380,15 +388,13 @@ fn decode_device_authorization(
 
 fn validate_verification_uri(
     value: &str,
-    allow_insecure_http: bool,
+    transport_policy: HttpTransportPolicy,
 ) -> Result<(), AuthorizationError> {
     let uri = Url::parse(value).map_err(|_| AuthorizationError::Protocol {
         reason: "an activation URL is invalid",
     })?;
-    let permitted_scheme =
-        uri.scheme() == "https" || (allow_insecure_http && uri.scheme() == "http");
     if uri.host_str().is_none()
-        || !permitted_scheme
+        || !transport_policy.permits(&uri)
         || !uri.username().is_empty()
         || uri.password().is_some()
     {

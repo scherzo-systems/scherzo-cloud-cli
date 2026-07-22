@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
 use super::*;
+use crate::api::HttpTransportPolicy;
 use crate::api::http_util::MAX_RESPONSE_BODY_BYTES;
 
 struct TestServer {
@@ -84,7 +85,7 @@ fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
 }
 
 fn http_client() -> HttpClient {
-    HttpClient::new().expect("HTTP client should build")
+    HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("HTTP client should build")
 }
 
 fn problem(status: u16, problem_type: &str, actions: Option<serde_json::Value>) -> Vec<u8> {

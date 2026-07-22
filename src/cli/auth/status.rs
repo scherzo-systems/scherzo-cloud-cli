@@ -19,21 +19,19 @@ const UNREACHABLE_EXIT_CODE: u8 = 3;
 pub struct Command {
     #[arg(long, help = "Print sign-in status as JSON")]
     json: bool,
+
+    #[command(flatten)]
+    http: super::super::HttpOptions,
 }
 
 impl Command {
     pub fn execute(self, deployment: &Deployment) -> ExitCode {
-        match self.run(deployment) {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::FAILURE
-            }
-        }
+        super::super::finish_command(self.run(deployment))
     }
 
     fn run(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
-        let client = HttpClient::new().map_err(CommandError::HttpClient)?;
+        let client =
+            HttpClient::new(self.http.transport_policy()).map_err(CommandError::HttpClient)?;
         let status = status::check(&client, deployment).map_err(CommandError::Status)?;
         let exit_code = match status.state() {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {

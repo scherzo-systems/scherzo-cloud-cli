@@ -15,17 +15,23 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// UpdateCurrentPrincipalPatch : A merge patch for the authenticated principal's mutable profile.
+/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateCurrentPrincipalPatch {
-    /// The new display name. Surrounding Unicode whitespace is removed. A null value clears the display name.
-    #[serde(rename = "displayName", deserialize_with = "Option::deserialize")]
-    pub display_name: Option<String>,
+pub struct CreateOrganizationRequest {
+    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
 }
 
-impl UpdateCurrentPrincipalPatch {
-    /// A merge patch for the authenticated principal's mutable profile.
-    pub fn new(display_name: Option<String>) -> UpdateCurrentPrincipalPatch {
-        UpdateCurrentPrincipalPatch { display_name }
+impl CreateOrganizationRequest {
+    /// The required organization profile and optional exact requested slug.
+    pub fn new(display_name: String) -> CreateOrganizationRequest {
+        CreateOrganizationRequest {
+            display_name,
+            slug: None,
+        }
     }
 }

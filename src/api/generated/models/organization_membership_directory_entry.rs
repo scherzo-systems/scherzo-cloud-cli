@@ -15,55 +15,68 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CurrentHumanPrincipal : The active human principal making the request.
+/// OrganizationMembershipDirectoryEntry : One active membership held by an active principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CurrentHumanPrincipal {
-    /// An opaque, stable, globally unique principal identifier.
+pub struct OrganizationMembershipDirectoryEntry {
+    /// The membership's opaque, stable, globally unique identifier.
     #[serde(rename = "id")]
     pub id: String,
-    /// The immutable principal type.
-    #[serde(rename = "type")]
-    pub r#type: Type,
-    /// The principal lifecycle state available to this operation.
-    #[serde(rename = "state")]
-    pub state: State,
-    /// The principal's mutable, non-unique display name, when one has been established.
+    /// The member principal's opaque identifier.
+    #[serde(rename = "principalId")]
+    pub principal_id: String,
+    /// The member principal's immutable type.
+    #[serde(rename = "principalType")]
+    pub principal_type: PrincipalType,
+    /// The principal's optional mutable display name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// The membership's organization role.
+    #[serde(rename = "role")]
+    pub role: Role,
 }
 
-impl CurrentHumanPrincipal {
-    /// The active human principal making the request.
-    pub fn new(id: String, r#type: Type, state: State) -> CurrentHumanPrincipal {
-        CurrentHumanPrincipal {
+impl OrganizationMembershipDirectoryEntry {
+    /// One active membership held by an active principal.
+    pub fn new(
+        id: String,
+        principal_id: String,
+        principal_type: PrincipalType,
+        role: Role,
+    ) -> OrganizationMembershipDirectoryEntry {
+        OrganizationMembershipDirectoryEntry {
             id,
-            r#type,
-            state,
+            principal_id,
+            principal_type,
             display_name: None,
+            role,
         }
     }
 }
-/// The immutable principal type.
+/// The member principal's immutable type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Type {
+pub enum PrincipalType {
     #[serde(rename = "human")]
     Human,
+    #[serde(rename = "service")]
+    Service,
 }
 
-impl Default for Type {
-    fn default() -> Type {
+impl Default for PrincipalType {
+    fn default() -> PrincipalType {
         Self::Human
     }
 }
-/// The principal lifecycle state available to this operation.
+/// The membership's organization role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum State {
-    #[serde(rename = "active")]
-    Active,
+pub enum Role {
+    #[serde(rename = "owner")]
+    Owner,
+    #[serde(rename = "member")]
+    Member,
 }
 
-impl Default for State {
-    fn default() -> State {
-        Self::Active
+impl Default for Role {
+    fn default() -> Role {
+        Self::Owner
     }
 }

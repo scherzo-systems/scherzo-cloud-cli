@@ -328,12 +328,12 @@ fn no_arguments_print_composed_root_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Usage: scherzo-cloud [OPTIONS] [COMMAND]"));
+    assert!(stdout.contains("Usage: scherzo-cloud [COMMAND]"));
     assert!(stdout.contains("account  Manage your Scherzo Cloud account"));
     assert!(stdout.contains("auth     Manage your Scherzo Cloud sign-in"));
     assert!(stdout.contains("version  Print version information"));
     assert!(stdout.contains("runner   Run and manage the Scherzo Cloud runner"));
-    assert!(stdout.contains("--allow-insecure-http"));
+    assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }
 
@@ -346,7 +346,7 @@ fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Usage: scherzo-cloud auth [OPTIONS] [COMMAND]"));
+    assert!(stdout.contains("Usage: scherzo-cloud auth [COMMAND]"));
     assert!(stdout.contains("login   Sign in to Scherzo Cloud"));
     assert!(stdout.contains("status  Show your Scherzo Cloud sign-in status"));
     assert!(stdout.contains("logout  Sign out of Scherzo Cloud on this device"));
@@ -359,7 +359,7 @@ fn runner_without_a_subcommand_prints_composed_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Usage: scherzo-cloud runner [OPTIONS] [COMMAND]"));
+    assert!(stdout.contains("Usage: scherzo-cloud runner [COMMAND]"));
     assert!(stdout.contains("serve  Connect to Scherzo Cloud and serve run assignments"));
     assert!(output.stderr.is_empty());
 }
@@ -445,25 +445,28 @@ fn structured_version_reports_the_version_one_contract() {
 }
 
 #[test]
-fn insecure_http_flag_is_global() {
-    for args in [
-        ["--allow-insecure-http", "auth", "status"],
-        ["auth", "status", "--allow-insecure-http"],
-    ] {
-        let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
-        let server =
-            OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
-        let credential_directory = private_credential_directory();
-        let credential_path = credential_directory.path().join("credentials.json");
-        let credential_path_string = credential_path.to_str().unwrap();
-        let environment = deployment_environment(&server.api_url, credential_path_string);
+fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
+    let misplaced = run(&["--allow-insecure-http", "auth", "status"]);
 
-        let output = run_with_env(&args, &environment);
+    assert_eq!(misplaced.status.code(), Some(2));
+    assert!(misplaced.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&misplaced.stderr)
+            .contains("unexpected argument '--allow-insecure-http'")
+    );
 
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stderr.is_empty());
-        server.finish();
-    }
+    let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = deployment_environment(&server.api_url, credential_path_string);
+
+    let output = run_with_env(&["auth", "status", "--allow-insecure-http"], &environment);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    server.finish();
 }
 
 #[test]
@@ -497,7 +500,7 @@ fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
     assert!(rejected.stdout.is_empty());
     assert_eq!(
         rejected.stderr,
-        b"Error: configure Scherzo Cloud sign-in: SCHERZO_CLOUD_API_URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
+        b"Error: check sign-in status: contact Scherzo Cloud: the deployment API URL uses insecure HTTP; rerun with --allow-insecure-http to permit it\n"
     );
 
     assert_eq!(accepted.status.code(), Some(2));
@@ -510,6 +513,26 @@ fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
     );
     assert!(local_logout.stderr.is_empty());
     server.finish();
+}
+
+#[test]
+fn status_does_not_apply_transport_policy_to_the_unused_issuer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_url = format!("https://{}/api", listener.local_addr().unwrap());
+    drop(listener);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = deployment_environment(&api_url, credential_path_string);
+
+    let output = run_with_env(&["auth", "status", "--json"], &environment);
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["state"],
+        "unreachable"
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -586,7 +609,7 @@ fn structured_status_preserves_signup_actions_without_synthesizing_fields() {
     let environment = deployment_environment(&server.api_url, credential_path_string);
 
     let output = run_with_env(
-        &["--allow-insecure-http", "auth", "status", "--json"],
+        &["auth", "status", "--json", "--allow-insecure-http"],
         &environment,
     );
 
