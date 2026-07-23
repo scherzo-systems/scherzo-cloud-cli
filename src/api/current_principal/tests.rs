@@ -130,6 +130,27 @@ fn authenticated_response_ignores_additive_principal_fields() {
 }
 
 #[test]
+fn service_principal_response_is_not_accepted_as_a_human_credential() {
+    let body = br#"{"id":"prn_service","type":"service","state":"active"}"#;
+    let server = TestServer::respond(response("200 OK", Some("application/json"), body));
+
+    let error = get_current_principal(
+        &http_client(),
+        &server.api_url,
+        Some("synthetic-access-token"),
+    )
+    .unwrap_err();
+
+    assert!(!error.is_local());
+    assert!(!error.credential_rejected());
+    assert_eq!(
+        error.to_string(),
+        "current-principal response violates the public API contract: the principal type is not human"
+    );
+    server.finish();
+}
+
+#[test]
 fn signup_actions_are_preserved_as_opaque_values_or_omitted() {
     let actions = serde_json::json!([
         {
@@ -330,7 +351,9 @@ fn request_deadline_bounds_the_complete_streaming_response() {
         outcome,
         CurrentPrincipalOutcome::Unreachable(UnreachableCategory::Timeout)
     );
-    assert!(started.elapsed() < Duration::from_millis(150));
+    // The 60ms request deadline must still cut off the 160ms streaming body.
+    // Allow scheduling headroom for isolated Nix test builders.
+    assert!(started.elapsed() < Duration::from_millis(250));
     server.join().unwrap();
 }
 

@@ -1,8 +1,13 @@
+// Runner service timing raises this restriction to deny within its module.
+#![allow(clippy::disallowed_methods)]
+
 mod api;
 mod build_info;
 mod cli;
 mod human_auth;
 mod runner;
+mod runner_protocol;
+mod tls;
 
 use std::env;
 use std::process::ExitCode;

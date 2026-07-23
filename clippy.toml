@@ -1,0 +1,19 @@
+# Runner service timing must pass through FrameSource or Sleeper so tests can
+# control it. The service module enables this restriction lint; narrow system
+# adapter and test-watchdog exceptions live next to their direct calls.
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "use the runner service Sleeper" },
+  { path = "std::time::Instant::now", reason = "use the runner service timing abstractions" },
+  { path = "std::time::SystemTime::now", reason = "use the runner service FrameSource" },
+  { path = "time::OffsetDateTime::now_utc", reason = "use the runner service FrameSource" },
+  { path = "tokio::time::Instant::now", reason = "use the runner service timing abstractions" },
+  { path = "tokio::time::advance", reason = "release a controlled Sleeper instead", allow-invalid = true },
+  { path = "tokio::time::interval", reason = "use the runner service Sleeper" },
+  { path = "tokio::time::interval_at", reason = "use the runner service Sleeper" },
+  { path = "tokio::time::pause", reason = "release a controlled Sleeper instead", allow-invalid = true },
+  { path = "tokio::time::resume", reason = "release a controlled Sleeper instead", allow-invalid = true },
+  { path = "tokio::time::sleep", reason = "use the runner service Sleeper" },
+  { path = "tokio::time::sleep_until", reason = "use the runner service Sleeper" },
+  { path = "tokio::time::timeout", reason = "use the runner service Sleeper or test watchdog" },
+  { path = "tokio::time::timeout_at", reason = "use the runner service Sleeper or test watchdog" },
+]

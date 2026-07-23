@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve the public checkout from this script's location, never from an
+# enclosing Git or Jujutsu process context.
+while IFS= read -r variable; do
+  unset "$variable"
+done < <(compgen -e GIT_)
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+
 fail() {
   echo "$1" >&2
   exit 1

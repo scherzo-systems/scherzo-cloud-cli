@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
+  "sentAt": "2026-07-23T00:00:02Z",
+  "type": "assignment_offer",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "leaseExpiresAt": "2026-07-23T00:05:00Z"
+  }
+}

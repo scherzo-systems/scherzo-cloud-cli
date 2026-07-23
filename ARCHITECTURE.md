@@ -5,10 +5,11 @@
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
-authentication status, explicit human-principal signup, and local logout.
-`scherzo-cloud runner serve` remains a stub; the binary does not yet run assignments.
-`scherzo-cloud runner doctor` currently performs one local Git prerequisite check and
-does not claim that the runner is ready to run assignments.
+authentication status, explicit human-principal signup, local logout, and an outbound,
+development-only runner transport. `scherzo-cloud runner serve` opens a versioned
+WebSocket connection, durably acknowledges received assignment offers, and never claims
+to execute them. `scherzo-cloud runner doctor` currently performs one local Git
+prerequisite check and does not claim that the runner is ready to execute assignments.
 
 ## One executable with separate roles
 
@@ -80,10 +81,12 @@ one opaque idempotency key per invocation, and retries an ambiguous transport fa
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
 
-The runner will use a machine identity issued for that runner installation or managed
-runtime. Runner startup must use explicit machine configuration and must never discover
-or read the human token store. Human commands likewise must not use runner credentials
-to call the public API.
+The runner uses a machine credential file supplied explicitly to `runner serve`. The
+current development-only format embeds a runner ID and a 43-character base64url secret;
+the loader rejects symlinks, files not owned by the current user, group/other-readable
+files, malformed values, and values larger than 256 bytes. Runner startup must never
+discover or read the human token store. Human commands likewise must not use runner
+credentials to call the public API.
 
 Sharing an executable does not permit sharing credential files, environment variables,
 refresh logic, or authorization scopes accidentally.
@@ -173,10 +176,10 @@ types at their boundary instead of becoming the workflow model.
 
 ## Deferred decisions
 
-The following decisions remain open because the runner implementation is the main
-technical unknown:
+The following decisions remain open:
 
-- runner transport and reconnect behavior;
+- production runner enrollment, credential rotation, and revocation;
+- repository checkout and execution behavior;
 - supported operating systems and service managers;
 - installation, update, and release packaging; and
 - whether the runner eventually warrants a dedicated executable.

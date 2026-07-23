@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+assert_failure_contains() {
+  local expected=$1
+  shift
+  local output status
+  set +e
+  output=$("$@" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "fixture-git command unexpectedly succeeded: $*"
+  [[ "$output" == *"$expected"* ]] \
+    || fail "fixture-git failure did not contain '$expected': $output"
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-fixture-git" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+fixture_git=$script_dir/fixture-git
+test_root=$($fixture_git new-root)
+other_root=$($fixture_git new-root)
+trap 'rm -rf "$test_root" "$other_root"' EXIT
+repo=$test_root/worktree
+bare_repo=$test_root/remote.git
+redirected_git=$test_root/redirected.git
+redirected_worktree=$test_root/redirected-worktree
+caller_home=$test_root/caller-home
+hostile_hooks=$test_root/hostile-hooks
+hostile_hook_marker=$test_root/hostile-hook-ran
+mkdir -p "$repo" "$caller_home" "$hostile_hooks"
+cat >"$caller_home/.gitconfig" <<EOF
+[commit]
+  gpgSign = true
+[core]
+  hooksPath = $hostile_hooks
+[user]
+  name = Hostile Global Fixture
+  email = hostile@example.invalid
+EOF
+printf '#!%s\n' "$(command -v bash)" >"$hostile_hooks/pre-commit"
+printf 'touch %q\n' "$hostile_hook_marker" >>"$hostile_hooks/pre-commit"
+chmod +x "$hostile_hooks/pre-commit"
+printf 'fixture\n' >"$repo/file"
+
+GIT_DIR="$redirected_git" \
+GIT_WORK_TREE="$redirected_worktree" \
+HOME="$caller_home" \
+  "$fixture_git" init-worktree "$test_root" "$repo"
+[[ ! -e "$redirected_git" ]] \
+  || fail "fixture-git initialized the inherited Git directory"
+
+fixture_worktree_git() {
+  GIT_DIR="$redirected_git" \
+  GIT_WORK_TREE="$redirected_worktree" \
+  HOME="$caller_home" \
+    "$fixture_git" worktree "$test_root" "$repo" "$@"
+}
+
+fixture_bare_git() {
+  GIT_DIR="$redirected_git" \
+  GIT_WORK_TREE="$redirected_worktree" \
+  HOME="$caller_home" \
+    "$fixture_git" bare "$test_root" "$bare_repo" "$@"
+}
+
+fixture_worktree_git config user.name "Fixture Author"
+fixture_worktree_git config user.email fixture@example.invalid
+fixture_worktree_git add --all
+fixture_worktree_git commit --quiet --message fixture
+[[ ! -e "$hostile_hook_marker" ]] || fail "fixture-git executed a global hook"
+[[ "$(fixture_worktree_git log -1 --format=%an)" == "Fixture Author" ]] \
+  || fail "fixture-git read the caller's global Git identity"
+[[ ! -e "$redirected_git" ]] \
+  || fail "fixture-git used the inherited Git repository context"
+
+"$fixture_git" init-bare "$test_root" "$bare_repo"
+fixture_worktree_git remote add origin "$bare_repo"
+fixture_worktree_git push --quiet origin HEAD:main
+[[ "$(fixture_bare_git rev-parse refs/heads/main)" == "$(fixture_worktree_git rev-parse HEAD)" ]] \
+  || fail "fixture-git did not address the bounded bare repository"
+
+mkdir "$other_root/repository"
+assert_failure_contains \
+  "REPO must be contained by TEST_ROOT" \
+  "$fixture_git" init-worktree "$test_root" "$other_root/repository"
+assert_failure_contains \
+  "REPO must not equal TEST_ROOT" \
+  "$fixture_git" init-worktree "$test_root" "$test_root"
+ln -s "$repo" "$test_root/repository-link"
+assert_failure_contains \
+  "REPO must not be a symbolic link" \
+  "$fixture_git" worktree "$test_root" "$test_root/repository-link" rev-parse HEAD
+assert_failure_contains \
+  "COMMAND must begin with a Git subcommand" \
+  "$fixture_git" worktree "$test_root" "$repo" -C /tmp status
+assert_failure_contains \
+  "caller-supplied Git repository context is forbidden" \
+  "$fixture_git" worktree "$test_root" "$repo" rev-parse --git-dir=/tmp
+assert_failure_contains \
+  "Git subcommand is not allowed in fixtures" \
+  "$fixture_git" worktree "$test_root" "$repo" worktree add "$test_root/extra"
+
+printf 'Fixture Git isolation checks passed.\n'

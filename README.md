@@ -11,12 +11,15 @@ executable.
 
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
-human-credential logout, and a narrow local runner prerequisite diagnostic. The
-`runner serve` command remains an explicit stub and exits with an error.
+human-credential logout, runner diagnostics, and a development-only outbound runner
+transport. `runner serve` connects to an explicitly configured runner gateway, receives
+and transport-acknowledges assignment offers, and reports that execution is not yet
+implemented.
 
-Apart from creating the signed-in human's account, the CLI cannot currently create cloud
-resources, configure a repository, submit workflows, or serve runner assignments. The
-rest of Cloud onboarding is not implemented yet.
+Apart from creating the signed-in human's account and receiving a development assignment,
+the CLI cannot currently create cloud resources, configure a repository, submit
+workflows, or execute runner assignments. The rest of Cloud onboarding is not
+implemented yet.
 
 ## Version inspection
 
@@ -95,6 +98,37 @@ command does not load plugins, read human credentials, contact Scherzo Cloud, or
 runner configuration. It executes `git --version` with a five-second deadline, bounds
 captured standard output, drains standard error without reporting it, and exposes only
 a normalized numeric version in its report. The JSON report has no `ready` field.
+
+## Runner serve
+
+`runner serve` uses a machine credential that is completely separate from human OAuth
+credentials. The credential file contains exactly one private line in the form
+`rnr_<ulid>.<43-character-base64url-secret>`, must be owned by the current user, and
+must not grant group or other permissions. The command does not search for, read, or
+reuse `~/.scherzo-cloud/credentials.json`.
+
+```sh
+scherzo-cloud runner serve \
+  --gateway-url wss://runners.example.test/v1/connect \
+  --credential-file ~/.scherzo-cloud/runner.credential
+```
+
+For local development only, use a loopback `ws://` URL with the explicit opt-in:
+
+```sh
+scherzo-cloud runner serve \
+  --gateway-url ws://127.0.0.1:8081/v1/connect \
+  --credential-file ./runner.credential \
+  --allow-insecure-http
+```
+
+The runner reconnects after transient failures with jittered backoff, replies to
+WebSocket Ping controls, and uses at-least-once transport acknowledgement. Terminal
+failures — a gateway transport-integrity rejection (WebSocket close status 1008) or a
+rejected credential or configuration at upgrade — exit nonzero instead of retrying;
+restarting the process begins a fresh boot and re-reads the credential file. It
+receives at most one assignment effect at a time. Receiving an offer is not assignment acceptance or execution; repository
+checkout, workflow execution, and production runner enrollment remain unimplemented.
 
 ## Release series
 

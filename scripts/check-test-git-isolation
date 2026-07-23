@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "Test Git isolation check: $1" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 \
+    || fail "$1 is required. Enter the project devenv shell and retry."
+}
+
+static_word() {
+  local word=$1
+  local length=${#word}
+
+  if [[ $length -ge 2 ]]; then
+    if [[ ${word:0:1} == '"' && ${word:length-1:1} == '"' ]] \
+      || [[ ${word:0:1} == "'" && ${word:length-1:1} == "'" ]]; then
+      word=${word:1:length-2}
+    fi
+  fi
+
+  printf '%s\n' "$word"
+}
+
+uri_decode() {
+  printf '%b' "${1//%/\\x}"
+}
+
+is_assignment() {
+  [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]
+}
+
+is_literal_git() {
+  local word
+  word=$(static_word "$1")
+  [[ $word == git || $word == */git ]]
+}
+
+is_wrapper() {
+  local word
+  word=$(static_word "$1")
+  case "$word" in
+    command|*/command|env|*/env|exec|*/exec)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+skip_command_options() {
+  local -n command_words=$1
+  local -n command_index=$2
+  local word
+
+  while [[ $command_index -lt ${#command_words[@]} ]]; do
+    word=$(static_word "${command_words[$command_index]}")
+    case "$word" in
+      --)
+        ((command_index += 1))
+        return 0
+        ;;
+      -p|-pp*)
+        ((command_index += 1))
+        ;;
+      -v|-V|-[p]*[vV]*|-*[vV]*)
+        # `command -v` and `command -V` inspect a name without executing it.
+        return 1
+        ;;
+      -*)
+        return 1
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+skip_env_options() {
+  local -n env_words=$1
+  local -n env_index=$2
+  local word
+
+  while [[ $env_index -lt ${#env_words[@]} ]]; do
+    word=$(static_word "${env_words[$env_index]}")
+    case "$word" in
+      --)
+        ((env_index += 1))
+        break
+        ;;
+      -u|-C|-S|--unset|--chdir|--split-string|--argv0)
+        ((env_index += 2))
+        ;;
+      --unset=*|--chdir=*|--split-string=*|--argv0=*|-*)
+        ((env_index += 1))
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  while [[ $env_index -lt ${#env_words[@]} ]] \
+    && is_assignment "${env_words[$env_index]}"; do
+    ((env_index += 1))
+  done
+}
+
+skip_exec_options() {
+  local -n exec_words=$1
+  local -n exec_index=$2
+  local word
+
+  while [[ $exec_index -lt ${#exec_words[@]} ]]; do
+    word=$(static_word "${exec_words[$exec_index]}")
+    case "$word" in
+      --)
+        ((exec_index += 1))
+        break
+        ;;
+      -a)
+        ((exec_index += 2))
+        ;;
+      -c|-l|-[cl]*)
+        ((exec_index += 1))
+        ;;
+      -*)
+        return 1
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+}
+
+contains_literal_git_invocation() {
+  local -n invocation_words=$1
+  local index=0
+  local executable
+
+  while [[ $index -lt ${#invocation_words[@]} ]] \
+    && is_assignment "${invocation_words[$index]}"; do
+    ((index += 1))
+  done
+
+  while [[ $index -lt ${#invocation_words[@]} ]]; do
+    executable=$(static_word "${invocation_words[$index]}")
+    if is_literal_git "$executable"; then
+      return 0
+    fi
+    is_wrapper "$executable" || return 1
+    ((index += 1))
+
+    case "$executable" in
+      command|*/command)
+        skip_command_options invocation_words index || return 1
+        ;;
+      env|*/env)
+        skip_env_options invocation_words index || return 1
+        ;;
+      exec|*/exec)
+        skip_exec_options invocation_words index || return 1
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+require_command ast-grep
+require_command jq
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ $# -eq 0 ]]; then
+  set -- "$script_dir"
+fi
+
+for path in "$@"; do
+  [[ -e $path ]] || fail "path does not exist: $path"
+done
+
+status=0
+check_file() {
+  local file=$1
+  local first_line ast_output ast_status line column source source_encoded
+  local encoded_word encoded_words
+  local -a words
+
+  IFS= read -r first_line <"$file" || true
+  if [[ ! $first_line =~ ^'#!'.*(ba|z|k)?sh([[:space:]]|$) ]]; then
+    return
+  fi
+
+  set +e
+  # The metavariables belong to ast-grep and must reach it literally.
+  # shellcheck disable=SC2016
+  ast_output=$(ast-grep run \
+    --lang bash \
+    --pattern '$CMD $$$ARGS' \
+    --json=compact \
+    --stdin <"$file")
+  ast_status=$?
+  set -e
+  if [[ $ast_status -eq 1 ]]; then
+    return
+  fi
+  [[ $ast_status -eq 0 ]] || fail "ast-grep could not parse $file"
+
+  while IFS=$'\t' read -r line column source_encoded encoded_words; do
+    words=()
+    for encoded_word in $encoded_words; do
+      words+=("$(uri_decode "$encoded_word")")
+    done
+
+    if ! contains_literal_git_invocation words; then
+      continue
+    fi
+
+    source=$(uri_decode "$source_encoded")
+    printf '%s:%s:%s: literal Git command bypasses fixture isolation: %s\n' \
+      "$file" "$line" "$column" "$source" >&2
+    status=1
+  done < <(
+    jq -r '
+      .[]
+      | [
+          (.range.start.line + 1),
+          (.range.start.column + 1),
+          (.lines | @uri),
+          (
+            ([.metaVariables.single.CMD] + .metaVariables.multi.ARGS)
+            | map(.text | @uri)
+            | join(" ")
+          )
+        ]
+      | @tsv
+    ' <<<"$ast_output"
+  )
+}
+
+for path in "$@"; do
+  if [[ -f $path ]]; then
+    [[ $(basename "$path") == test-* ]] && check_file "$path"
+    continue
+  fi
+
+  while IFS= read -r -d '' file; do
+    check_file "$file"
+  done < <(find "$path" -type f -name 'test-*' -print0)
+done
+
+if [[ $status -ne 0 ]]; then
+  fail "Use fixture-git for test repository operations."
+fi
+
+printf 'Test Git isolation checks passed.\n'

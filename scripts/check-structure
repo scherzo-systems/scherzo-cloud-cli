@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+required_files=(
+  README.md
+  ARCHITECTURE.md
+  AGENTS.md
+  CONTRIBUTING.md
+  SECURITY.md
+  LICENSE
+  release.toml
+  .github/workflows/check.yml
+  Cargo.toml
+  Cargo.lock
+  clippy.toml
+  devenv.nix
+  devenv.yaml
+  devenv.lock
+  scripts/check
+  scripts/check-structure
+)
+
+for required_file in "${required_files[@]}"; do
+  if [[ ! -s "$public_root/$required_file" ]]; then
+    echo "Required public source file is missing or empty: $required_file" >&2
+    exit 1
+  fi
+done
+
+symbolic_link=$(
+  find "$public_root" \
+    \( -name '.devenv*' -o -name .direnv -o -name target \) -prune -o \
+    -type l -print -quit
+)
+if [[ -n "$symbolic_link" ]]; then
+  echo "Symbolic links are not permitted in the public source: $symbolic_link" >&2
+  exit 1
+fi
+
+while IFS= read -r -d '' script_file; do
+  bash -n "$script_file"
+done < <(find "$public_root/scripts" -type f -print0)
+
+"$public_root/scripts/test-fixture-git"
+"$public_root/scripts/test-git-isolation-check"
+"$public_root/scripts/check-test-git-isolation"
+"$public_root/scripts/test-release"
+"$public_root/scripts/test-release-planner"
+"$public_root/scripts/check-release"
+
+if ! command -v actionlint >/dev/null 2>&1; then
+  echo "actionlint is required to check public release automation." >&2
+  exit 1
+fi
+actionlint "$public_root/.github/workflows/check.yml"
+
+workspace_manifest=$(
+  cargo locate-project \
+    --manifest-path "$public_root/Cargo.toml" \
+    --workspace \
+    --message-format plain
+)
+workspace_root=$(cd "$(dirname "$workspace_manifest")" && pwd)
+if [[ "$workspace_root" != "$public_root" ]]; then
+  echo "The Cargo workspace must be rooted inside the public source boundary: $workspace_root" >&2
+  exit 1
+fi
+
+path_dependency=$(
+  find "$public_root" \
+    \( -name '.devenv*' -o -name .direnv -o -name target \) -prune -o \
+    -name Cargo.toml -type f -exec \
+      grep -HEn '(^|[,{])[[:space:]]*path[[:space:]]*=' {} + \
+    | head -n 1 \
+    || true
+)
+if [[ -n "$path_dependency" ]]; then
+  echo "Cargo path dependencies are not permitted in the public source: $path_dependency" >&2
+  exit 1
+fi
+
+parent_source_reference=$(
+  find "$public_root/src" "$public_root/tests" -name '*.rs' -type f -exec \
+    grep -HEn '(#\[path[[:space:]]*=|include(_str|_bytes)?!\()[^)]*"\.\./' {} + \
+    | head -n 1 \
+    || true
+)
+if [[ -n "$parent_source_reference" ]]; then
+  echo "Rust source may not include files outside the public boundary: $parent_source_reference" >&2
+  exit 1
+fi
+
+printf 'Public CLI source structure checks passed.\n'

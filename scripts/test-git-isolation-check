@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+checker=$script_dir/check-test-git-isolation
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+
+expect_rejection() {
+  local name=$1
+  local source=$2
+  local fixture=$test_root/test-$name
+  local output status
+
+  printf '#!/usr/bin/env bash\n%s\n' "$source" >"$fixture"
+  set +e
+  output=$($checker "$fixture" 2>&1)
+  status=$?
+  set -e
+
+  [[ $status -ne 0 ]] || fail "Git isolation checker accepted $name."
+  if [[ $output != *"literal Git command bypasses fixture isolation"* ]]; then
+    printf 'Checker output:\n%s\n' "$output" >&2
+    fail "Git isolation checker did not diagnose $name."
+  fi
+  if [[ $output != *"Use fixture-git for test repository operations."* ]]; then
+    printf 'Checker output:\n%s\n' "$output" >&2
+    fail "Git isolation checker did not explain the required fixture boundary."
+  fi
+}
+
+expect_rejection direct 'git status'
+expect_rejection assignment 'GIT_DIR=elsewhere git status'
+expect_rejection command-wrapper 'command -p -- /usr/local/bin/git status'
+expect_rejection env-wrapper 'env -i HOME=/tmp git status'
+expect_rejection absolute-path '/nix/store/example/bin/git status'
+expect_rejection quoted-path '"/usr/bin/git" status'
+expect_rejection exec-wrapper 'exec -a fixture git status'
+expect_rejection substitution "revision=\$(git rev-parse HEAD)"
+expect_rejection nested-wrappers 'exec env -i command git status'
+unquoted_heredoc_source=$(cat <<'EOF'
+cat <<INNER
+$(git status)
+INNER
+EOF
+)
+expect_rejection unquoted-heredoc "$unquoted_heredoc_source"
+
+safe_fixture=$test_root/test-safe
+printf '#!%s\n' "$BASH" >"$safe_fixture"
+cat >>"$safe_fixture" <<'EOF'
+set -euo pipefail
+fixture_git=/workspace/scripts/fixture-git
+"$fixture_git" worktree "$test_root" "$repo" status
+fixture_repository_git status
+command -v git
+type -P git
+env printf '%s\n' git
+printf '%s\n' 'git status'
+printf '#!%s\n' "$BASH" >"$mock_bin/git"
+chmod +x "$mock_bin/git"
+cat >"$mock_bin/git" <<'MOCK'
+git status
+command git status
+env -i git status
+MOCK
+EOF
+"$checker" "$safe_fixture" >/dev/null
+
+# The checker must ignore its own quoted regression fixtures and every other
+# shell test shipped in the public source tree.
+"$checker" "$script_dir" >/dev/null
+
+printf 'Test Git isolation checker tests passed.\n'

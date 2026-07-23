@@ -1,4 +1,7 @@
+use std::env;
 use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,7 +43,8 @@ impl CommandRunner for SystemCommandRunner {
         args: &[&str],
         timeout: Duration,
     ) -> Result<CommandOutput, CommandProbeError> {
-        let mut child = Command::new(program)
+        let executable = resolve_program(program)?;
+        let mut child = Command::new(executable)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -81,6 +85,39 @@ impl CommandRunner for SystemCommandRunner {
             stdout,
             truncated,
         })
+    }
+}
+
+fn resolve_program(program: &str) -> Result<PathBuf, CommandProbeError> {
+    let program_path = Path::new(program);
+    if program.contains('/') {
+        return Ok(program_path.to_owned());
+    }
+
+    // Resolve bare names ourselves so command classification does not depend
+    // on platform-specific spawn-time PATH lookup.
+    let search_path = env::var_os("PATH").ok_or(CommandProbeError::CommandNotFound)?;
+    let mut inaccessible_candidate = false;
+    for directory in env::split_paths(&search_path) {
+        let candidate = directory.join(program_path);
+        match candidate.metadata() {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                return Ok(candidate);
+            }
+            Ok(_) => inaccessible_candidate = true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => inaccessible_candidate = true,
+        }
+    }
+
+    if inaccessible_candidate {
+        Err(CommandProbeError::Spawn)
+    } else {
+        Err(CommandProbeError::CommandNotFound)
     }
 }
 

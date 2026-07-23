@@ -1,14 +1,11 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::{Client, Url};
 
 use super::http_util;
-
-static TLS_PROVIDER: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HttpTransportPolicy {
@@ -36,7 +33,7 @@ pub(crate) struct HttpClient {
 
 impl HttpClient {
     pub(crate) fn new(transport_policy: HttpTransportPolicy) -> Result<Self, HttpClientError> {
-        install_tls_provider();
+        crate::tls::install_provider();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -111,12 +108,6 @@ impl fmt::Display for HttpClientError {
             Self::BuildClient(error) => write!(formatter, "build HTTP client: {error}"),
         }
     }
-}
-
-fn install_tls_provider() {
-    TLS_PROVIDER.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
 }
 
 #[cfg(test)]

@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abk",
+  "sentAt": "2026-07-23T00:00:01Z",
+  "type": "observation_ack",
+  "payloadVersion": 1,
+  "payload": {
+    "acknowledgedMessageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "acknowledgedSequence": 1
+  }
+}

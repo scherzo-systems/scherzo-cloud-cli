@@ -19,15 +19,20 @@ unsafe_code = "forbid"
 clap = { version = "4.6.3", features = ["derive"] }
 ctrlc = "3.5.1"
 fs4 = "1.1.0"
+futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "query", "rustls-no-provider"] }
+regress = "=0.11.1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 time = { version = "0.3.45", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.1", features = ["net", "rt", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "signal", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+ulid = "3.0.0"
 url = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["sync"] }

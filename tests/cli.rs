@@ -1,3 +1,6 @@
+// Runner service timing raises this restriction within its own module.
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1254,15 +1257,32 @@ fn runner_doctor_list_options_conflict() {
 }
 
 #[test]
-fn runner_serve_is_an_explicit_unimplemented_stub() {
-    let output = run(&["runner", "serve"]);
+fn runner_serve_requires_configuration_and_redacts_invalid_credentials() {
+    let missing = run(&["runner", "serve"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--gateway-url"));
+
+    let directory = tempfile::tempdir().expect("temporary runner credential directory");
+    let credential_path = directory.path().join("runner.credential");
+    let secret_marker = "RUNNER-CREDENTIAL-MUST-NOT-LEAK";
+    fs::write(&credential_path, secret_marker).expect("write invalid runner credential");
+    fs::set_permissions(&credential_path, Permissions::from_mode(0o600))
+        .expect("set runner credential permissions");
+    let credential_path = credential_path.to_string_lossy().into_owned();
+    let output = run(&[
+        "runner",
+        "serve",
+        "--gateway-url",
+        "wss://gateway.example.test/v1/connect",
+        "--credential-file",
+        &credential_path,
+    ]);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"Error: scherzo-cloud runner serve is not implemented yet\n"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid runner credential file"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret_marker));
 }
 
 #[test]

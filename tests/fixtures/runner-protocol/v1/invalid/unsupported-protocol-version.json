@@ -1,0 +1,15 @@
+{
+  "protocolVersion": 2,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 1,
+  "sentAt": "2026-07-23T00:00:00Z",
+  "type": "hello",
+  "payloadVersion": 1,
+  "payload": {
+    "runnerVersion": "0.2.0",
+    "maxConcurrentRuns": 1
+  }
+}

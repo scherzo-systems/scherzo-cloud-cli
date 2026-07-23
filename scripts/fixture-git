@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Start the helper itself with an empty environment before inspecting paths or
+# invoking Git. Only absolute tool locations and deterministic process settings
+# cross this boundary.
+if [[ ${SCHERZO_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
+  script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
+  bash_binary=$(cd "$(dirname "$BASH")" && pwd -P)/$(basename "$BASH")
+  git_binary=$(type -P git) || {
+    echo "fixture-git: git is required" >&2
+    exit 1
+  }
+  git_binary=$(cd "$(dirname "$git_binary")" && pwd -P)/$(basename "$git_binary")
+  env_binary=$(type -P env)
+  utility_path=$(dirname "$(type -P mktemp)")
+  clean_path=$(dirname "$bash_binary"):$(dirname "$git_binary"):$(dirname "$env_binary"):$utility_path:/usr/bin:/bin
+  exec "$env_binary" -i \
+    SCHERZO_FIXTURE_GIT_ISOLATED=1 \
+    SCHERZO_FIXTURE_GIT_BINARY="$git_binary" \
+    HOME=/nonexistent \
+    PATH="$clean_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    "$bash_binary" "$script_path" "$@"
+fi
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  scripts/fixture-git new-root
+  scripts/fixture-git init-worktree TEST_ROOT REPO
+  scripts/fixture-git init-bare TEST_ROOT REPO
+  scripts/fixture-git worktree TEST_ROOT REPO COMMAND [ARGUMENT...]
+  scripts/fixture-git bare TEST_ROOT REPO COMMAND [ARGUMENT...]
+EOF
+}
+
+fail() {
+  echo "fixture-git: $1" >&2
+  exit 1
+}
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+public_root=$(cd "$script_dir/.." && pwd -P)
+git_binary=${SCHERZO_FIXTURE_GIT_BINARY:?}
+git_path=$(dirname "$git_binary"):/usr/bin:/bin
+marker_name=.scherzo-fixture-git-root
+
+reject_source_overlap() {
+  local root=$1
+  case "$script_dir/" in
+    "$root"/*)
+      fail "TEST_ROOT must not contain the fixture helper source tree"
+      ;;
+  esac
+  case "$root/" in
+    "$public_root"/*)
+      fail "TEST_ROOT must not be inside the fixture helper source tree"
+      ;;
+  esac
+}
+
+new_root() {
+  local root
+  root=$(mktemp -d /tmp/scherzo-fixture-git.XXXXXX)
+  root=$(cd "$root" && pwd -P)
+  reject_source_overlap "$root"
+  chmod 700 "$root"
+  printf '%s\n' "$root" >"$root/$marker_name"
+  chmod 600 "$root/$marker_name"
+  mkdir -m 700 "$root/home" "$root/xdg-config" "$root/tmp" "$root/hooks"
+  printf '%s\n' "$root"
+}
+
+canonical_root() {
+  local requested=$1
+  local root marker
+  [[ "$requested" == /* ]] || fail "TEST_ROOT must be an absolute path"
+  [[ -d "$requested" && ! -L "$requested" ]] \
+    || fail "TEST_ROOT must be a non-symbolic-link directory"
+  root=$(cd "$requested" && pwd -P)
+  [[ -O "$root" ]] || fail "TEST_ROOT must be owned by the current user"
+  reject_source_overlap "$root"
+  marker=$root/$marker_name
+  [[ -f "$marker" && ! -L "$marker" ]] \
+    || fail "TEST_ROOT was not created by fixture-git new-root"
+  [[ "$(cat "$marker")" == "$root" ]] \
+    || fail "TEST_ROOT marker does not match its canonical path"
+  for directory in home xdg-config tmp hooks; do
+    [[ -d "$root/$directory" && ! -L "$root/$directory" ]] \
+      || fail "TEST_ROOT isolation directory is missing: $directory"
+  done
+  printf '%s\n' "$root"
+}
+
+canonical_repo() {
+  local root=$1 requested=$2
+  local parent base repo
+  [[ "$requested" == /* ]] || fail "REPO must be an absolute path"
+  case "$requested" in
+    */../* | */.. | */./* | */.)
+      fail "REPO must not contain dot path components"
+      ;;
+  esac
+  [[ ! -L "$requested" ]] || fail "REPO must not be a symbolic link"
+  if [[ -e "$requested" ]]; then
+    [[ -d "$requested" ]] || fail "REPO must be a directory"
+    repo=$(cd "$requested" && pwd -P)
+  else
+    parent=$(dirname "$requested")
+    base=$(basename "$requested")
+    [[ "$base" != "." && "$base" != ".." ]] || fail "REPO has an invalid basename"
+    [[ -d "$parent" && ! -L "$parent" ]] \
+      || fail "REPO parent must be an existing non-symbolic-link directory"
+    parent=$(cd "$parent" && pwd -P)
+    repo=$parent/$base
+  fi
+  [[ "$repo" != "$root" ]] || fail "REPO must not equal TEST_ROOT"
+  case "$repo" in
+    "$root"/*)
+      ;;
+    *)
+      fail "REPO must be contained by TEST_ROOT"
+      ;;
+  esac
+  printf '%s\n' "$repo"
+}
+
+validate_command() {
+  local command=$1
+  shift
+  [[ "$command" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+    || fail "COMMAND must begin with a Git subcommand"
+  case "$command" in
+    add | branch | cat-file | checkout | commit | commit-tree | config | fetch | log | ls-tree | mktree | push | remote | reset | rev-list | rev-parse | show | symbolic-ref | switch | tag | update-ref)
+      ;;
+    *)
+      fail "Git subcommand is not allowed in fixtures: $command"
+      ;;
+  esac
+  local argument
+  for argument in "$@"; do
+    case "$argument" in
+      -C | -C?* | --git-dir | --git-dir=* | --work-tree | --work-tree=*)
+        fail "caller-supplied Git repository context is forbidden: $argument"
+        ;;
+    esac
+  done
+}
+
+invoke_git() {
+  local root=$1
+  shift
+  env -i \
+    HOME="$root/home" \
+    XDG_CONFIG_HOME="$root/xdg-config" \
+    TMPDIR="$root/tmp" \
+    PATH="$git_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_PAGER=cat \
+    GIT_EDITOR=true \
+    GIT_SEQUENCE_EDITOR=true \
+    PAGER=cat \
+    EDITOR=true \
+    "$git_binary" \
+    -c core.hooksPath="$root/hooks" \
+    -c commit.gpgSign=false \
+    -c tag.gpgSign=false \
+    "$@"
+}
+
+run_git() {
+  local root=$1 mode=$2 repo=$3
+  shift 3
+  [[ $# -gt 0 ]] || fail "a Git command is required"
+  validate_command "$@"
+
+  local repository_arguments=()
+  case "$mode" in
+    worktree)
+      [[ -d "$repo/.git" && ! -L "$repo/.git" ]] \
+        || fail "worktree repository is not initialized inside TEST_ROOT"
+      repository_arguments=(--git-dir="$repo/.git" --work-tree="$repo")
+      ;;
+    bare)
+      [[ -d "$repo" && ! -L "$repo" && -f "$repo/HEAD" ]] \
+        || fail "bare repository is not initialized inside TEST_ROOT"
+      repository_arguments=(--git-dir="$repo")
+      ;;
+    *)
+      fail "unknown repository mode: $mode"
+      ;;
+  esac
+
+  invoke_git "$root" "${repository_arguments[@]}" "$@"
+}
+
+[[ $# -gt 0 ]] || {
+  usage
+  exit 2
+}
+mode=$1
+shift
+case "$mode" in
+  new-root)
+    [[ $# -eq 0 ]] || {
+      usage
+      exit 2
+    }
+    new_root
+    ;;
+  init-worktree | init-bare)
+    [[ $# -eq 2 ]] || {
+      usage
+      exit 2
+    }
+    root=$(canonical_root "$1")
+    repo=$(canonical_repo "$root" "$2")
+    case "$mode" in
+      init-worktree)
+        [[ ! -e "$repo/.git" ]] || fail "worktree repository is already initialized"
+        mkdir -p "$repo"
+        invoke_git "$root" \
+          --git-dir="$repo/.git" \
+          --work-tree="$repo" \
+          init --quiet --initial-branch=main
+        ;;
+      init-bare)
+        [[ ! -e "$repo" ]] || fail "bare repository path already exists"
+        invoke_git "$root" \
+          --git-dir="$repo" \
+          init --quiet --bare --initial-branch=main
+        ;;
+    esac
+    ;;
+  worktree | bare)
+    [[ $# -ge 3 ]] || {
+      usage
+      exit 2
+    }
+    root=$(canonical_root "$1")
+    repo=$(canonical_repo "$root" "$2")
+    shift 2
+    run_git "$root" "$mode" "$repo" "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
