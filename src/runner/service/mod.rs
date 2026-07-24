@@ -4,6 +4,8 @@ mod backoff;
 mod config;
 mod connection;
 #[cfg(test)]
+mod determinism_spike;
+#[cfg(test)]
 mod test_support;
 
 use std::fmt;

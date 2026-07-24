@@ -1,9 +1,11 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{Sink, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
@@ -55,18 +57,45 @@ pub(crate) fn deterministic_frame_source() -> Arc<dyn FrameSource> {
     })
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeterminismTranscript {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl DeterminismTranscript {
+    fn record(&self, event: String) {
+        self.events
+            .lock()
+            .expect("determinism transcript mutex poisoned")
+            .push(event);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("determinism transcript mutex poisoned")
+            .clone()
+    }
+}
+
 pub(crate) struct SleepRelease {
     notification: Arc<Notify>,
+    duration: Duration,
+    transcript: Option<DeterminismTranscript>,
 }
 
 impl SleepRelease {
     pub(crate) fn release(self) {
+        if let Some(transcript) = &self.transcript {
+            transcript.record(format!("sleep.released:{}ms", self.duration.as_millis()));
+        }
         self.notification.notify_one();
     }
 }
 
 struct ControlledSleeper {
     requests: mpsc::UnboundedSender<(Duration, SleepRelease)>,
+    transcript: Option<DeterminismTranscript>,
 }
 
 impl Sleeper for ControlledSleeper {
@@ -74,11 +103,16 @@ impl Sleeper for ControlledSleeper {
         let requests = self.requests.clone();
         Box::pin(async move {
             let notification = Arc::new(Notify::new());
+            if let Some(transcript) = &self.transcript {
+                transcript.record(format!("sleep.requested:{}ms", duration.as_millis()));
+            }
             requests
                 .send((
                     duration,
                     SleepRelease {
                         notification: Arc::clone(&notification),
+                        duration,
+                        transcript: self.transcript.clone(),
                     },
                 ))
                 .expect("controlled sleep receiver should remain open");
@@ -91,8 +125,177 @@ pub(crate) fn controlled_sleeper() -> (
     Arc<dyn Sleeper>,
     mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
 ) {
+    controlled_sleeper_with_optional_transcript(None)
+}
+
+pub(crate) fn controlled_sleeper_with_transcript(
+    transcript: DeterminismTranscript,
+) -> (
+    Arc<dyn Sleeper>,
+    mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+) {
+    controlled_sleeper_with_optional_transcript(Some(transcript))
+}
+
+fn controlled_sleeper_with_optional_transcript(
+    transcript: Option<DeterminismTranscript>,
+) -> (
+    Arc<dyn Sleeper>,
+    mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+) {
     let (requests, receiver) = mpsc::unbounded_channel();
-    (Arc::new(ControlledSleeper { requests }), receiver)
+    (
+        Arc::new(ControlledSleeper {
+            requests,
+            transcript,
+        }),
+        receiver,
+    )
+}
+
+struct ScriptedDuplexState {
+    pending_pong: Mutex<Option<Message>>,
+}
+
+pub(crate) struct ScriptedInbound {
+    sender: mpsc::UnboundedSender<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    transcript: DeterminismTranscript,
+}
+
+impl ScriptedInbound {
+    pub(crate) fn send(&self, message: Message) {
+        self.transcript
+            .record(format!("inbound.queued:{}", describe_message(&message)));
+        self.sender
+            .send(Ok(message))
+            .expect("scripted inbound reader should remain open");
+    }
+}
+
+pub(crate) struct ScriptedReader {
+    receiver: mpsc::UnboundedReceiver<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    state: Arc<ScriptedDuplexState>,
+    transcript: DeterminismTranscript,
+}
+
+impl Stream for ScriptedReader {
+    type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = std::task::ready!(Pin::new(&mut self.receiver).poll_recv(context));
+        if let Some(Ok(message)) = &item {
+            self.transcript
+                .record(format!("inbound.read:{}", describe_message(message)));
+            if let Message::Ping(payload) = message {
+                *self
+                    .state
+                    .pending_pong
+                    .lock()
+                    .expect("scripted duplex mutex poisoned") =
+                    Some(Message::Pong(payload.clone()));
+            }
+        }
+        Poll::Ready(item)
+    }
+}
+
+pub(crate) struct ScriptedWriter {
+    outbound: mpsc::UnboundedSender<Message>,
+    state: Arc<ScriptedDuplexState>,
+    transcript: DeterminismTranscript,
+}
+
+impl ScriptedWriter {
+    fn record(&self, message: Message) {
+        self.transcript
+            .record(format!("outbound:{}", describe_message(&message)));
+        self.outbound
+            .send(message)
+            .expect("scripted outbound receiver should remain open");
+    }
+}
+
+impl Sink<Message> for ScriptedWriter {
+    type Error = tokio_tungstenite::tungstenite::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.record(item);
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let pending_pong = self
+            .state
+            .pending_pong
+            .lock()
+            .expect("scripted duplex mutex poisoned")
+            .take();
+        if let Some(pong) = pending_pong {
+            self.record(pong);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub(crate) fn scripted_duplex(
+    transcript: DeterminismTranscript,
+) -> (
+    ScriptedInbound,
+    ScriptedReader,
+    ScriptedWriter,
+    mpsc::UnboundedReceiver<Message>,
+) {
+    let (inbound, receiver) = mpsc::unbounded_channel();
+    let (outbound, outbound_receiver) = mpsc::unbounded_channel();
+    let state = Arc::new(ScriptedDuplexState {
+        pending_pong: Mutex::new(None),
+    });
+    (
+        ScriptedInbound {
+            sender: inbound,
+            transcript: transcript.clone(),
+        },
+        ScriptedReader {
+            receiver,
+            state: Arc::clone(&state),
+            transcript: transcript.clone(),
+        },
+        ScriptedWriter {
+            outbound,
+            state,
+            transcript,
+        },
+        outbound_receiver,
+    )
+}
+
+fn describe_message(message: &Message) -> String {
+    match message {
+        Message::Text(text) => format!("text:{text}"),
+        Message::Binary(payload) => format!("binary:{payload:?}"),
+        Message::Ping(payload) => format!("ping:{payload:?}"),
+        Message::Pong(payload) => format!("pong:{payload:?}"),
+        Message::Close(Some(close)) => format!("close:{}:{}", close.code, close.reason),
+        Message::Close(None) => "close:none".to_owned(),
+        Message::Frame(frame) => format!("frame:{frame:?}"),
+    }
 }
 
 pub(crate) async fn sleep_request(

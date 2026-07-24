@@ -1,16 +1,14 @@
 use std::fmt;
 use std::time::Duration;
 
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::runner::service::Sleeper;
 use crate::runner::service::config::Config;
@@ -23,8 +21,6 @@ const MAX_INBOUND_MESSAGE_BYTES: usize = 65_536;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
-
-type FrameWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub(crate) trait FrameSource: Send + Sync {
     fn public_id(&self, prefix: &str) -> String;
@@ -159,12 +155,14 @@ fn close_outcome(
 
 // close_locally best-effort announces why the runner is abandoning the
 // connection; failures to deliver the close frame are deliberately ignored.
-async fn close_locally(
-    writer: &mut FrameWriter,
+async fn close_locally<W>(
+    writer: &mut W,
     sleeper: &dyn Sleeper,
     code: CloseCode,
     reason: &'static str,
-) {
+) where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
     let close = Message::Close(Some(CloseFrame {
         code,
         reason: reason.into(),
@@ -178,12 +176,15 @@ async fn close_locally(
 
 // protocol_violation closes locally with status 1002 and reports a retryable
 // ending: a misbehaving gateway is indistinguishable from a transient fault.
-async fn protocol_violation(
-    writer: &mut FrameWriter,
+async fn protocol_violation<W>(
+    writer: &mut W,
     sleeper: &dyn Sleeper,
     progress: ConnectionProgress,
     cause: &'static str,
-) -> ConnectionError {
+) -> ConnectionError
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
     close_locally(writer, sleeper, CloseCode::Protocol, cause).await;
     ConnectionError::retryable(progress, cause)
 }
@@ -264,9 +265,35 @@ pub(crate) async fn run(
             "runner gateway did not select the required subprotocol",
         ));
     }
+    let (writer, reader) = socket.split();
+    run_established(
+        config,
+        frame_source,
+        sleeper,
+        opening,
+        next_sequence,
+        reader,
+        writer,
+    )
+    .await
+}
+
+pub(crate) async fn run_established<R, W>(
+    config: &Config,
+    frame_source: &dyn FrameSource,
+    sleeper: &dyn Sleeper,
+    opening: OpeningHello<'_>,
+    next_sequence: &mut u64,
+    mut reader: R,
+    mut writer: W,
+) -> Result<ConnectionProgress, ConnectionError>
+where
+    R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    let unacknowledged = ConnectionProgress::unacknowledged();
     let opening_hello = std::str::from_utf8(opening.encoded)
         .map_err(|_| ConnectionError::terminal(unacknowledged, "encode opening hello as UTF-8"))?;
-    let (mut writer, mut reader) = socket.split();
     writer
         .send(Message::Text(opening_hello.into()))
         .await
