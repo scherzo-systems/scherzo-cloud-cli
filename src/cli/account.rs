@@ -4,11 +4,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-pub const ABOUT: &str = "Manage your Scherzo Cloud account";
+pub(super) const ABOUT: &str = "Manage your Scherzo Cloud account";
 const NAME: &str = "account";
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[command(subcommand)]
     command: Option<AccountCommand>,
 }
@@ -20,7 +20,7 @@ enum AccountCommand {
 }
 
 impl Command {
-    pub fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> ExitCode {
         super::execute_deployment_command(
             self.command,
             &[NAME],

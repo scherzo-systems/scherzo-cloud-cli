@@ -6,10 +6,10 @@ use clap::Args;
 use crate::runner::credential::Credential;
 use crate::runner::service::Config;
 
-pub const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
+pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     /// WebSocket URL of the runner gateway.
     #[arg(long)]
     gateway_url: String,
@@ -24,7 +24,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> ExitCode {
         let credential = match Credential::load(&self.credential_file) {
             Ok(credential) => credential,
             Err(error) => {

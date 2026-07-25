@@ -19,12 +19,12 @@ use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus,
 
 use super::status::{HumanStatusError, StatusResult, write_human_status};
 
-pub const ABOUT: &str = "Sign in to Scherzo Cloud";
+pub(super) const ABOUT: &str = "Sign in to Scherzo Cloud";
 const CANCELLED_EXIT_CODE: u8 = 130;
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[arg(long, help = "Emit newline-delimited JSON events")]
     json: bool,
 
@@ -39,7 +39,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn execute(self, deployment: &Deployment) -> ExitCode {
+    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
         let result = self.run(deployment).map(|completion| match completion {
             Completion::Success => ExitCode::SUCCESS,
             Completion::Failure => ExitCode::FAILURE,

@@ -11,12 +11,12 @@ use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus,
 
 use super::super::principal::PrincipalResult;
 
-pub const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
+pub(super) const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
 const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
 const UNREACHABLE_EXIT_CODE: u8 = 3;
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[arg(long, help = "Print sign-in status as JSON")]
     json: bool,
 
@@ -25,7 +25,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn execute(self, deployment: &Deployment) -> ExitCode {
+    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
         super::super::finish_command(self.run(deployment))
     }
 

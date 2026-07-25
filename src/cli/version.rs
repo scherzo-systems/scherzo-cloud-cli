@@ -6,17 +6,17 @@ use std::process::ExitCode;
 use clap::Args;
 use serde::Serialize;
 
-pub const ABOUT: &str = "Print version information";
+pub(super) const ABOUT: &str = "Print version information";
 const COMMAND_NAME: &str = "scherzo-cloud";
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[arg(long, help = "Print version information as JSON")]
     json: bool,
 }
 
 impl Command {
-    pub fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> ExitCode {
         let result = if self.json {
             write_json_output()
         } else {

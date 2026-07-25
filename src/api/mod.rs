@@ -13,8 +13,11 @@ pub(crate) use http_client::{HttpClient, HttpClientError, HttpEndpointError, Htt
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
+// OpenAPI Generator emits a library-shaped client; keep its public declarations
+// intact and contain the binary crate's visibility exception to this generated tree.
 #[allow(
     dead_code,
+    unreachable_pub,
     unused_imports,
     clippy::derivable_impls,
     clippy::enum_variant_names,

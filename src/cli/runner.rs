@@ -5,11 +5,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-pub const ABOUT: &str = "Run and manage the Scherzo Cloud runner";
+pub(super) const ABOUT: &str = "Run and manage the Scherzo Cloud runner";
 const NAME: &str = "runner";
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[command(subcommand)]
     command: Option<RunnerCommand>,
 }
@@ -23,7 +23,7 @@ enum RunnerCommand {
 }
 
 impl Command {
-    pub fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> ExitCode {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(RunnerCommand::Doctor(command)) => command.execute(),

@@ -8,16 +8,16 @@ use serde::Serialize;
 use crate::human_auth::credentials::{CredentialError, CredentialStore};
 use crate::human_auth::deployment::Deployment;
 
-pub const ABOUT: &str = "Sign out of Scherzo Cloud on this device";
+pub(super) const ABOUT: &str = "Sign out of Scherzo Cloud on this device";
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[arg(long, help = "Print the sign-out result as JSON")]
     json: bool,
 }
 
 impl Command {
-    pub fn execute(self, deployment: &Deployment) -> ExitCode {
+    pub(super) fn execute(self, deployment: &Deployment) -> ExitCode {
         match self.run(deployment) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

@@ -7,12 +7,12 @@ use serde::Serialize;
 
 use crate::runner::doctor::{CheckResult, Report, Status, built_in_registry};
 
-pub const ABOUT: &str = "Inspect local runner prerequisites";
+pub(super) const ABOUT: &str = "Inspect local runner prerequisites";
 const COMMAND_NAME: &str = "scherzo-cloud runner doctor";
 const USAGE_ERROR: u8 = 2;
 
 #[derive(Debug, Args)]
-pub struct Command {
+pub(super) struct Command {
     #[arg(long = "check", value_name = "ID", help = "Run only the named check")]
     checks: Vec<String>,
 
@@ -28,7 +28,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn execute(self) -> ExitCode {
+    pub(super) fn execute(self) -> ExitCode {
         let registry = match built_in_registry() {
             Ok(registry) => registry,
             Err(error) => return report_error(error),

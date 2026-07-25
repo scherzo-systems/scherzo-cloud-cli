@@ -1,8 +1,8 @@
-pub const VERSION: &str = select_value(
+pub(crate) const VERSION: &str = select_value(
     option_env!("SCHERZO_CLOUD_VERSION"),
     env!("CARGO_PKG_VERSION"),
 );
-pub const BUILD_IDENTITY: &str =
+pub(crate) const BUILD_IDENTITY: &str =
     select_value(option_env!("SCHERZO_CLOUD_BUILD_IDENTITY"), "unknown");
 
 const fn select_value<'a>(injected: Option<&'a str>, fallback: &'a str) -> &'a str {

@@ -3,7 +3,9 @@ use std::fmt;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
-// Generated protocol data transfer objects stay private to this boundary.
+// cargo-typify emits public declarations; keep its output reproducible and contain
+// the binary crate's visibility exception to this generated module.
+#[allow(unreachable_pub)]
 pub(crate) mod generated;
 
 const PROTOCOL_VERSION: i64 = 1;

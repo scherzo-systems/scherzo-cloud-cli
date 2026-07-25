@@ -19,7 +19,7 @@ use crate::human_auth::deployment::Deployment;
     about = "Scherzo Cloud CLI",
     version = crate::build_info::VERSION
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -55,7 +55,7 @@ enum Command {
     Runner(runner::Command),
 }
 
-pub fn parse<I, S>(args: I) -> Result<Cli, clap::Error>
+pub(crate) fn parse<I, S>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString> + Clone,
@@ -64,7 +64,7 @@ where
 }
 
 impl Cli {
-    pub fn execute(self) -> ExitCode {
+    pub(crate) fn execute(self) -> ExitCode {
         match self.command {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
