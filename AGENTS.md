@@ -52,6 +52,9 @@ Keep human API commands, runner machine behavior, and workflow execution separat
 internally even while they share the `scherzo-cloud` executable. In particular, never
 allow the runner to discover or read a human OAuth credential store. Workflow scheduling
 and execution belong to the embedded execution component, not runner connectivity code.
+Implement that execution component as new code within this repository. The prior
+single-user Scherzo daemon may inform behavior, but it is not a dependency, subprocess,
+protocol peer, source boundary, or compatibility target.
 
 ## Mirror workflow
 

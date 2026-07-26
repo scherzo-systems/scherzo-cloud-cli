@@ -23,8 +23,8 @@ entrypoint will dispatch to components with distinct responsibilities:
   assignments, and report observations;
 - the runner protocol component will encode, order, acknowledge, and validate runner
   messages; and
-- the Scherzo execution adapter will translate an assigned cloud run into Scherzo
-  Core's one-run execution contract.
+- the new Scherzo Cloud execution engine will implement the one-run contract,
+  workflow scheduler, execution roots, checkpoints, and agent execution in Rust.
 
 The long-running runner starts only through an explicit command such as
 `scherzo-cloud runner serve`. Bare `scherzo-cloud runner` will not implicitly start a
@@ -93,15 +93,44 @@ refresh logic, or authorization scopes accidentally.
 
 ## Execution boundary
 
-The runner coordinates cloud assignments but does not own workflow scheduling, step
-retries, workspaces, checkpoints, or agent execution. Those responsibilities belong to
-a separate Scherzo execution component embedded in the Rust executable. The runner will
-invoke a versioned one-run boundary and translate its structured events and outcome into
-the cloud runner protocol.
+The runner service coordinates cloud assignments and supplies each run's execution
+context, including its filesystem root and lifecycle. It does not schedule workflow
+steps, perform retries, manage checkpoints, or execute agents. Those responsibilities
+belong to a new execution component implemented in this repository and initially
+embedded in the Rust executable. The runner invokes its versioned one-run boundary and
+translates structured events and outcomes into the cloud runner protocol.
 
 The execution component will be organized as an internal source boundary before there
-is evidence that a separately published crate or process is necessary. The existing
-Gleam Scherzo implementation is a behavioral reference, not a module layout to copy.
+is evidence that a separately published crate or process is necessary. All of its
+production code is developed within this public source boundary. The prior single-user
+Scherzo daemon is behavioral and design inspiration only: the Cloud runner does not
+import, embed, invoke, or communicate with it, and its APIs, storage, messages,
+configuration, and runtime layout are not compatibility targets.
+
+## Workflow execution model
+
+A run invocation resolves one workflow and supplies its declared inputs. Workflow
+resolution is a closed union: a local invocation may select an explicit file path,
+while a Cloud invocation selects a registered workflow identity that the control plane
+resolves to an immutable revision and digest. Both paths produce the same internal
+resolved workflow before execution begins.
+
+A workflow contains a schema version, input declarations, one dependency graph of
+command and agent steps, and output declarations. It has no mandatory checkout,
+preparation, or execution phases. Cloning a repository, using an existing working tree,
+creating a Git worktree or Jujutsu workspace, installing dependencies, and other setup
+are ordinary workflow-authorized steps.
+
+The caller supplies the execution root and its lifecycle. An on-demand runner normally
+uses an empty engine-owned ephemeral root, an active local invocation can explicitly
+lend its current directory, and a standalone local invocation can request a new retained
+root. Workflows select the applicable behavior through ordinary inputs, environment, and
+commands; the language may add engine-visible step conditions without introducing a
+separate phase model.
+
+Local execution and Runner Serve call the same execution component. Runner Serve adds
+assignment, lease, durable observation, and cleanup behavior around it, but connectivity
+code does not acquire source, schedule steps, or interpret workflow outputs.
 
 ## Public source isolation
 
