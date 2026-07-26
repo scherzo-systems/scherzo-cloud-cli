@@ -157,7 +157,7 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
     )
     .unwrap();
     assert!(expires_at > time::OffsetDateTime::now_utc());
-    assert!(stored.to_string().find("refresh").is_none());
+    assert!(!stored.to_string().contains("refresh"));
 }
 
 #[test]
@@ -758,7 +758,8 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
     let activation: serde_json::Value = serde_json::from_str(first_line.trim()).unwrap();
     assert_eq!(activation["event"], "activation_required");
 
-    let pid = rustix::process::Pid::from_raw(child.id() as _).unwrap();
+    let raw_pid = i32::try_from(child.id()).expect("child PID should fit in i32");
+    let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
     let status = child.wait().expect("login process should stop");
     let mut remaining_stdout = String::new();
@@ -866,7 +867,8 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
         "unique-committed-access-token"
     );
 
-    let pid = rustix::process::Pid::from_raw(child.id() as _).unwrap();
+    let raw_pid = i32::try_from(child.id()).expect("child PID should fit in i32");
+    let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
     thread::sleep(Duration::from_millis(100));
     server.release_paused_response();

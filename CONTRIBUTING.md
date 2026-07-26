@@ -20,9 +20,9 @@ If you inspect or modify a local copy, run the canonical check from the reposito
 ./scripts/check
 ```
 
-The project uses its standalone devenv environment to provide the pinned Rust toolchain.
-Run `devenv test` for the same formatting, linting, testing, source-boundary, and release
-build checks used by CI.
+The project uses its standalone devenv environment to provide the minimum Rust toolchain
+declared in `Cargo.toml`. Run `devenv test` for the same formatting, linting, testing,
+source-boundary, and release build checks used by CI.
 
 ## Release intent
 

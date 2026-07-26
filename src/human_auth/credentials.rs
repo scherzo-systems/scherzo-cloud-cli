@@ -25,12 +25,17 @@ const NORMAL_FILE_NAME: &str = "credentials.json";
 const SCHEMA_VERSION: u64 = 1;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "O_NOFOLLOW fits in the signed custom_flags value on supported Unix targets"
+)]
 const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const TOKEN_EXPIRY_MARGIN: time::Duration = time::Duration::seconds(30);
 pub(crate) const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
-const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CREDENTIAL_FILE_BYTES: usize = 1024 * 1024;
+const MAX_CREDENTIAL_FILE_BYTES_U64: u64 = 1024 * 1024;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -60,7 +65,7 @@ impl StoredCredential {
         &self.access_token
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn expires_at(&self) -> OffsetDateTime {
         self.expires_at
     }
@@ -256,7 +261,7 @@ impl CredentialStore {
             }
         };
         validate_private_file(&self.path, &metadata)?;
-        if metadata.len() > MAX_CREDENTIAL_FILE_BYTES {
+        if metadata.len() > MAX_CREDENTIAL_FILE_BYTES_U64 {
             return Err(CredentialError::CredentialFileTooLarge);
         }
 
@@ -267,16 +272,18 @@ impl CredentialStore {
             source,
         })?;
         validate_private_file(&self.path, &metadata)?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let initial_capacity =
+            usize::try_from(metadata.len()).map_err(|_| CredentialError::CredentialFileTooLarge)?;
+        let mut bytes = Vec::with_capacity(initial_capacity);
         Read::by_ref(&mut file)
-            .take(MAX_CREDENTIAL_FILE_BYTES + 1)
+            .take(MAX_CREDENTIAL_FILE_BYTES_U64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|source| CredentialError::Io {
                 operation: "read credential file",
                 path: self.path.clone(),
                 source,
             })?;
-        if bytes.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        if bytes.len() > MAX_CREDENTIAL_FILE_BYTES {
             return Err(CredentialError::CredentialFileTooLarge);
         }
 

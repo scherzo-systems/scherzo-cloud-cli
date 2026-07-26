@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$public_root"
+
+metadata=$(cargo metadata --locked --no-deps --format-version 1)
+if ! rust_version=$(
+  jq -er '
+    . as $metadata
+    | .packages[]
+    | select(.manifest_path == ($metadata.workspace_root + "/Cargo.toml"))
+    | .rust_version
+    | select(type == "string")
+  ' <<<"$metadata"
+); then
+  echo "Could not read package.rust-version through Cargo metadata." >&2
+  exit 1
+fi
+if [[ ! "$rust_version" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
+  echo "Cargo metadata returned a non-canonical rust-version: $rust_version" >&2
+  exit 1
+fi
+if [[ "$rust_version" =~ ^[0-9]+[.][0-9]+$ ]]; then
+  expected_rustc_version=$rust_version.0
+else
+  expected_rustc_version=$rust_version
+fi
+
+if [[ -z "${SCHERZO_MSRV_CARGO:-}" || -z "${SCHERZO_MSRV_RUSTC:-}" ]]; then
+  echo "The declared-minimum Rust toolchain is unavailable; enter the devenv environment." >&2
+  exit 1
+fi
+actual_rustc_version=$("$SCHERZO_MSRV_RUSTC" --version --verbose | awk '$1 == "release:" { print $2 }')
+if [[ "$actual_rustc_version" != "$expected_rustc_version" ]]; then
+  echo "The configured minimum rustc does not match Cargo.toml rust-version." >&2
+  echo "Expected: $expected_rustc_version" >&2
+  echo "Actual:   $actual_rustc_version" >&2
+  exit 1
+fi
+
+msrv_target_dir=${CARGO_TARGET_DIR:-$public_root/target}/msrv
+CARGO_TARGET_DIR="$msrv_target_dir" RUSTC="$SCHERZO_MSRV_RUSTC" \
+  "$SCHERZO_MSRV_CARGO" check --locked --workspace --all-targets --all-features
+printf 'All targets and features compile with Rust %s.\n' "$actual_rustc_version"

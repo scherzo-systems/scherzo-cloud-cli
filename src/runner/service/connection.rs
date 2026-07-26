@@ -566,7 +566,10 @@ mod tests {
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-    #[allow(clippy::result_large_err)] // Required by tungstenite's handshake callback type.
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite's handshake callback requires its large error type"
+    )]
     #[tokio::test]
     async fn authenticates_and_completes_hello_and_ping_pong() {
         let (listener, endpoint) = fixture_listener().await;

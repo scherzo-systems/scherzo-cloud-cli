@@ -19,7 +19,10 @@ required_files=(
   devenv.yaml
   devenv.lock
   scripts/check
+  scripts/check-lint-policy
+  scripts/check-msrv
   scripts/check-structure
+  tests/fixtures/lint-policy/main.rs
 )
 
 for required_file in "${required_files[@]}"; do

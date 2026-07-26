@@ -1,5 +1,13 @@
-// Runner service timing raises this restriction within its own module.
-#![allow(clippy::disallowed_methods)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "runner service timing raises this restriction within its own module"
+)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "integration tests use panic shortcuts to express assertion failures"
+)]
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{Read, Write};

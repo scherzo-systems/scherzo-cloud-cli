@@ -2,6 +2,7 @@ use reqwest::header::HeaderValue;
 use reqwest::{Response, Url};
 
 pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BODY_BYTES_U64: u64 = 1024 * 1024;
 
 pub(crate) enum BoundedBodyError {
     TooLarge,
@@ -11,15 +12,16 @@ pub(crate) enum BoundedBodyError {
 pub(crate) async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BoundedBodyError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
+        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64)
     {
         return Err(BoundedBodyError::TooLarge);
     }
 
     let initial_capacity = response
         .content_length()
+        .and_then(|length| usize::try_from(length).ok())
         .unwrap_or_default()
-        .min(MAX_RESPONSE_BODY_BYTES as u64) as usize;
+        .min(MAX_RESPONSE_BODY_BYTES);
     let mut body = Vec::with_capacity(initial_capacity);
     while let Some(chunk) = response
         .chunk()

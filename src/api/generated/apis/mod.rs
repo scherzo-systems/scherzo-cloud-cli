@@ -98,7 +98,10 @@ pub fn parse_deep_object(prefix: &str, value: &serde_json::Value) -> Vec<(String
 
 /// Internal use only
 /// A content type supported by this client.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "generated ContentType variants are contract-dependent"
+)]
 enum ContentType {
     Json,
     Text,

@@ -1,5 +1,16 @@
-// Runner service timing raises this restriction to deny within its module.
-#![allow(clippy::disallowed_methods)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unwrap_used,
+        reason = "unit tests use panic shortcuts to express assertion failures"
+    )
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "runner service timing raises this restriction within its own module"
+)]
 
 mod api;
 mod build_info;

@@ -324,8 +324,10 @@ pub(crate) async fn fixture_listener() -> (TcpListener, String) {
     (listener, endpoint)
 }
 
-// Required by tungstenite's handshake callback type.
-#[allow(clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite's handshake callback requires its large error type"
+)]
 pub(crate) async fn accept_fixture_socket(listener: &TcpListener) -> FixtureSocket {
     let (stream, _) = listener.accept().await.expect("accept fixture connection");
     accept_hdr_async(stream, |_: &Request, mut response: Response| {

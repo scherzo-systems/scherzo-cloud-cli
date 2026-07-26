@@ -72,6 +72,10 @@ impl HttpClient {
         &self.client
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "HttpClient owns its runtime until Drop takes it after all borrows end"
+    )]
     pub(crate) fn run<F>(
         &self,
         timeout: Duration,

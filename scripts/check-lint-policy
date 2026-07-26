@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$public_root"
+
+lint_fixture=$(mktemp -d)
+cleanup() {
+  rm -rf "$lint_fixture"
+}
+trap cleanup EXIT
+
+cp Cargo.toml Cargo.lock clippy.toml "$lint_fixture/"
+mkdir -p "$lint_fixture/src"
+cp tests/fixtures/lint-policy/main.rs "$lint_fixture/src/main.rs"
+
+lint_output=$lint_fixture/clippy-output.json
+clippy_stderr=$lint_fixture/clippy-stderr
+set +e
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$public_root/target} \
+  cargo clippy \
+    --quiet \
+    --locked \
+    --manifest-path "$lint_fixture/Cargo.toml" \
+    --all-targets \
+    --all-features \
+    --message-format=json \
+    >"$lint_output" 2>"$clippy_stderr"
+clippy_status=$?
+set -e
+
+if ((clippy_status == 0)); then
+  echo "Clippy accepted representative production policy violations." >&2
+  exit 1
+fi
+
+error_codes=$(
+  jq -r '
+    select(.reason == "compiler-message" and .message.level == "error")
+    | .message.code.code // empty
+  ' "$lint_output"
+)
+for expected_code in \
+  dead_code \
+  clippy::allow_attributes_without_reason \
+  clippy::cast_possible_truncation \
+  clippy::unwrap_used; do
+  if ! grep --fixed-strings --line-regexp --quiet "$expected_code" <<<"$error_codes"; then
+    echo "Clippy did not reject the representative $expected_code violation." >&2
+    cat "$clippy_stderr" >&2
+    jq -r '
+      select(.reason == "compiler-message")
+      | .message.rendered // empty
+    ' "$lint_output" >&2
+    exit 1
+  fi
+done
+
+printf 'Checked-in Rust lint policy rejects representative production violations.\n'

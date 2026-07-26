@@ -2,10 +2,22 @@
 // Canonical schema SHA-256: 33f3743f584c1d5d33cb384e0d4b9d7e1dff6906811339cfa05dc62a38d69ace
 // jscpd:ignore-start -- cargo-typify output intentionally repeats validation code.
 
-#![allow(clippy::redundant_closure_call)]
-#![allow(clippy::needless_lifetimes)]
-#![allow(clippy::match_single_binding)]
-#![allow(clippy::clone_on_copy)]
+#![allow(
+    clippy::redundant_closure_call,
+    reason = "cargo-typify emits the closure call"
+)]
+#![allow(
+    clippy::needless_lifetimes,
+    reason = "cargo-typify emits explicit lifetimes"
+)]
+#![allow(
+    clippy::match_single_binding,
+    reason = "cargo-typify emits the match shape"
+)]
+#![allow(
+    clippy::clone_on_copy,
+    reason = "cargo-typify emits uniform clone expressions"
+)]
 
 #[doc = r" Error types."]
 pub mod error {

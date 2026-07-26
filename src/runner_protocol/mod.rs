@@ -5,7 +5,11 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 // cargo-typify emits public declarations; keep its output reproducible and contain
 // the binary crate's visibility exception to this generated module.
-#[allow(unreachable_pub)]
+#[allow(
+    unreachable_pub,
+    clippy::unwrap_used,
+    reason = "cargo-typify emits public types and infallible static regex initialization"
+)]
 pub(crate) mod generated;
 
 const PROTOCOL_VERSION: i64 = 1;

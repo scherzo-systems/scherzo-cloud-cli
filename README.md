@@ -191,7 +191,8 @@ For the same entrypoint used by CI, run:
 devenv test
 ```
 
-The check verifies public-source isolation, formatting, Clippy, unit and integration
+The check verifies public-source isolation, formatting, every target and feature on the
+`rust-version` declared in `Cargo.toml`, checked-in Clippy policy, unit and integration
 tests, and a release build.
 
 ## License

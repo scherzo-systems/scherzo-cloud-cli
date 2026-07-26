@@ -24,7 +24,9 @@ pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
     clippy::needless_return,
     clippy::result_large_err,
     clippy::too_many_arguments,
-    clippy::uninlined_format_args
+    clippy::unimplemented,
+    clippy::uninlined_format_args,
+    reason = "OpenAPI Generator emits a library-shaped client outside handwritten policy"
 )]
 mod generated;
 

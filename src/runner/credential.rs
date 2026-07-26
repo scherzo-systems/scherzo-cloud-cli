@@ -4,7 +4,12 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-const MAX_CREDENTIAL_FILE_BYTES: u64 = 256;
+const MAX_CREDENTIAL_FILE_BYTES: usize = 256;
+const MAX_CREDENTIAL_FILE_BYTES_U64: u64 = 256;
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "O_NOFOLLOW fits in the signed custom_flags value on supported Unix targets"
+)]
 const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -44,10 +49,10 @@ impl Credential {
         let mut file = open_private_file(path)?;
         let mut bytes = Vec::new();
         file.by_ref()
-            .take(MAX_CREDENTIAL_FILE_BYTES + 1)
+            .take(MAX_CREDENTIAL_FILE_BYTES_U64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| CredentialError::InvalidFile)?;
-        if bytes.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        if bytes.len() > MAX_CREDENTIAL_FILE_BYTES {
             return Err(CredentialError::InvalidFile);
         }
         if bytes.last() == Some(&b'\n') {
