@@ -179,16 +179,68 @@ server host and port, protocol progress and counts, retry classification, select
 backoff when applicable, and a closed outcome and error type. Each offered effect
 completes one `runner.effect_acknowledgement` event after transport confirmation or an
 earlier safe ending. Its `success` outcome means only that the gateway confirmed the
-runner's transport acknowledgement; the runner does not emit `runner.run` yet. The same
-unit of work is also recorded as a local OpenTelemetry span, but this release configures
-no exporter and makes no telemetry network request. Completed JSON records enter a
-bounded non-blocking queue, so a stalled standard-error consumer cannot delay runner
-protocol work; saturation or output failure drops and counts a record.
+runner's transport acknowledgement; the runner does not emit `runner.run` yet. Completed
+JSON records enter a bounded non-blocking queue, so a stalled standard-error consumer
+cannot delay runner protocol work; saturation or output failure drops and counts a
+record.
+
+`runner serve` can also send those same reviewed spans to a user-owned OTLP/HTTP
+protobuf receiver. There is no default destination: export is enabled only when
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is non-empty. The
+trace-specific endpoint is the complete request URL and takes precedence; `/v1/traces`
+is appended to the generic endpoint. Remote endpoints must use HTTPS. HTTP is accepted
+only for the exact `localhost` host or a loopback IP address. User information, queries,
+fragments, remote cleartext, and non-HTTP protocols disable export without stopping the
+runner.
+
+The following standard OpenTelemetry environment variables are supported, with the
+trace-specific value taking precedence over its generic equivalent:
+
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`;
+- `OTEL_EXPORTER_OTLP_TRACES_HEADERS` / `OTEL_EXPORTER_OTLP_HEADERS`, using the standard
+  comma-separated `name=percent-encoded-value` form;
+- `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT`, as an integer from
+  1 through 30000 milliseconds; and
+- `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL`, when set to
+  `http/protobuf`.
+
+For example, the receiver and its credential both remain under the operator's control:
+
+```sh
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
+OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
+  scherzo-cloud runner serve \
+    --gateway-url wss://runners.example.test/v1/connect \
+    --credential-file ~/.scherzo-cloud/runner.credential
+```
+
+`OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`
+vetoes export even when every exporter variable is set; unset, empty, or
+case-insensitive `false` permits an explicitly configured endpoint. Any other non-empty
+value disables export and emits only a closed local diagnostic. The switch never
+disables local JSON or W3C Trace Context propagation.
+
+OTLP work uses a bounded, non-blocking queue, bounded requests and shutdown, and no
+application retry. Receiver failures, rejection, stalls, saturation, malformed
+configuration, and shutdown timeout cannot change WebSocket traffic, acknowledgements,
+backoff, results, or exit status. Diagnostics are emitted at most once per closed
+classification and contain no endpoint, header, response body, or raw exporter error.
+Local JSON continues alongside export.
+
+The WebSocket upgrade carries only the connection span's W3C `traceparent` (and a
+non-empty `tracestate`, if one exists), never baggage. The gateway can extract it as the
+session's remote parent. Effect acknowledgement spans remain independent roots and use
+the existing runner, boot, run, assignment, and effect IDs for correlation. Exported
+resource metadata contains only `service.name=scherzo-runner`, the package version, and
+the generated boot ID as `service.instance.id`; arbitrary resource environment
+attributes are not imported.
 
 Service events never contain the machine credential, endpoint path or query, raw
-protocol frames, WebSocket close reasons, or arbitrary network errors. Human and JSON
-output contracts for help, version, authentication, account, and `runner doctor` remain
-unchanged and do not initialize runner telemetry.
+protocol frames, WebSocket close reasons, or arbitrary network errors. OTLP credentials
+are supplied only by the user through the standard header variables; the runner ships
+no Scherzo-owned endpoint, ingestion credential, Honeycomb behavior, or collector
+requirement. Human and JSON output contracts for help, version, authentication, account,
+and `runner doctor` remain unchanged and do not initialize runner telemetry.
 
 ## Release series
 

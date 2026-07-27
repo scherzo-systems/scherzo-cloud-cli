@@ -415,8 +415,9 @@ mod tests {
 
     use super::sequence_overflow;
     use super::test_support::{
-        SleepRelease, accept_fixture_socket, accept_opened_fixture_socket, assignment_offer,
-        controlled_sleeper, deterministic_frame_source, effect_acknowledgement, expect_close_frame,
+        SleepRelease, accept_fixture_socket, accept_fixture_socket_with_headers,
+        accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
+        deterministic_frame_source, effect_acknowledgement, expect_close_frame,
         expect_opening_hello, fixture_listener, observation_acknowledgement,
         offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
@@ -522,8 +523,12 @@ mod tests {
     #[tokio::test]
     async fn exits_when_the_gateway_closes_with_policy_violation() {
         let (listener, endpoint) = fixture_listener().await;
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut socket = accept_fixture_socket(&listener).await;
+            let (mut socket, headers) = accept_fixture_socket_with_headers(&listener).await;
+            headers_sent
+                .send(headers)
+                .expect("send captured upgrade headers");
             expect_opening_hello(&mut socket).await;
             socket
                 .send(Message::Close(Some(CloseFrame {
@@ -556,6 +561,9 @@ mod tests {
              gateway closed connection with policy violation"
         );
         server.await.expect("fixture server failed");
+        let headers = headers_received
+            .await
+            .expect("receive captured upgrade headers");
 
         let events = capture.events();
         assert_eq!(events.len(), 1);
@@ -577,6 +585,19 @@ mod tests {
             assert!(!encoded.contains(sentinel));
         }
         assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+        let expected_traceparent = format!(
+            "00-{}-{}-01",
+            event["trace_id"].as_str().expect("connection trace ID"),
+            event["span_id"].as_str().expect("connection span ID"),
+        );
+        assert_eq!(
+            headers
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_traceparent.as_str())
+        );
+        assert!(headers.get("tracestate").is_none());
+        assert!(headers.get("baggage").is_none());
     }
 
     #[tokio::test]

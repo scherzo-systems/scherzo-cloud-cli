@@ -53,7 +53,7 @@ impl Config {
         }
         match endpoint.scheme() {
             "wss" => {}
-            "ws" if allow_insecure_http && is_loopback(&endpoint) => {}
+            "ws" if allow_insecure_http && crate::runner::is_loopback(&endpoint) => {}
             "ws" => return Err(ConfigError::InsecureGatewayUrl),
             _ => return Err(ConfigError::InvalidGatewayUrl),
         }
@@ -69,16 +69,6 @@ impl Config {
 
     pub(crate) fn credential(&self) -> &Credential {
         &self.credential
-    }
-}
-
-fn is_loopback(endpoint: &Url) -> bool {
-    match endpoint.host_str() {
-        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
-        Some(host) => host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-        None => false,
     }
 }
 

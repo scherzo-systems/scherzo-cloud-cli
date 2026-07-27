@@ -51,15 +51,30 @@ but it must keep those boundaries intact.
 
 ## Runner service observability
 
-Long-running runner machine behavior owns a local recorder beneath `src/runner/`. One
-recorder projects each completed unit of work to a newline-delimited JSON object on
-standard error and to an OpenTelemetry span through a process-local SDK provider. JSON
-records enter a bounded queue without waiting; a dedicated local thread owns standard
-error, preserves record framing after partial writes, and counts records dropped by
-queue saturation or output failure. The provider has no span processor or exporter, so
-instrumentation performs no telemetry network requests. Recorder initialization is
-scoped to `runner serve`; interactive and offline commands retain their existing stdout
-and stderr contracts.
+Long-running runner machine behavior owns a recorder beneath `src/runner/`. One recorder
+projects each completed unit of work to a newline-delimited JSON object on standard
+error and to an OpenTelemetry span through a process-local SDK provider. JSON records
+enter a bounded queue without waiting; a dedicated local thread owns standard error,
+preserves record framing after partial writes, and counts records dropped by queue
+saturation or output failure. Recorder initialization is scoped to `runner serve`;
+interactive and offline commands retain their existing stdout and stderr contracts.
+
+The provider has no network exporter by default. A runner-owned OTLP/HTTP protobuf span
+processor is added only when `runner serve` finds an explicit, valid standard
+OpenTelemetry endpoint after runner configuration and credential validation.
+`OTEL_SDK_DISABLED=true` is a hard remote-export veto; malformed privacy or exporter
+configuration disables export without disabling local JSON or propagation. The endpoint
+and any standard OTLP header credentials are user-owned. Transport policy accepts remote
+HTTPS and exact loopback HTTP, performs no application retry, and bounds its non-blocking
+queue, request, batching, and shutdown work. Export failures report only bounded closed
+diagnostics and cannot feed back into runner state.
+
+The SDK resource is built from an empty resource and adds only the fixed runner service
+name, package version, and generated boot ID, so default and environment resource
+detectors cannot expand the reviewed contract. Connection spans inject only W3C Trace
+Context into their WebSocket upgrade. Gateway sessions can use the runner connection as
+a remote parent; baggage is excluded, and effect acknowledgement spans remain
+independent roots correlated by their existing domain IDs.
 
 `runner.gateway_connection` bounds one outbound connection attempt, including live
 handshake progress, attempt-local frame and effect counts, a closed connection cause,
@@ -71,8 +86,9 @@ reserved until the execution component exists.
 
 Telemetry call sites accept only reviewed scalar attributes and closed classifications.
 They do not copy credentials, complete endpoints, protocol frames, peer close reasons,
-or arbitrary errors into either projection. Queue saturation and JSON write failures are counted and do not change connection,
-acknowledgement, retry, or shutdown behavior.
+or arbitrary errors into either projection. Local or export queue saturation, JSON write
+failures, malformed export configuration, receiver failures, and export shutdown timeout
+do not change connection, acknowledgement, retry, terminal result, or shutdown behavior.
 
 These are component boundaries before they are separate packages or executables. A
 second runner binary should be introduced only if platform dependencies, privilege

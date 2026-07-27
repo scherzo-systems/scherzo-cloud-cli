@@ -66,23 +66,48 @@ into the documented schema-version-1 output rather than printing generated debug
 
 `runner serve` writes one newline-delimited JSON event for each gateway connection
 attempt and effect transport acknowledgement. The same reviewed attributes are attached
-to a local OpenTelemetry span, but the runner configures no exporter and sends no
-telemetry over the network.
+to a local OpenTelemetry span. Remote export is absent by default and is constructed
+only by `runner serve`, after its gateway configuration and machine credential are
+valid.
+
+Users may opt in to OTLP/HTTP protobuf export with a standard trace-specific or generic
+OpenTelemetry endpoint environment variable. The trace-specific endpoint takes
+precedence. Remote receivers require HTTPS; cleartext HTTP is limited to the exact
+`localhost` host or a loopback IP. Endpoints containing user information, a query, or a
+fragment are rejected. Standard OTLP header variables may carry credentials, but the
+user owns both those credentials and the receiver. Scherzo supplies no telemetry
+endpoint, ingestion credential, backend-specific behavior, or collector.
+
+`OTEL_SDK_DISABLED` is the only export privacy switch. Case-insensitive `true` is a hard
+veto. Unset, empty, or case-insensitive `false` allows an explicitly configured export;
+any other non-empty value fails closed for remote telemetry. The veto does not disable
+local JSON output, local spans, or W3C Trace Context propagation.
 
 The allowlist contains opaque public runner, boot, effect, assignment, and run IDs;
 closed outcomes and error types; the gateway host and port; protocol sequence, progress,
 and bounded counters; and durations. It excludes the machine credential, authorization
 header, credential path, endpoint path and query, raw protocol frames, peer close
 reasons, and arbitrary network, TLS, HTTP, WebSocket, filesystem, or child-process error
-text. A successful effect event means only that the gateway confirmed transport receipt;
-it is not evidence of assignment acceptance or execution.
+text. Exported resources contain only the fixed runner service name, package version,
+and generated boot ID. Environment resource attributes, host and user identity, process
+arguments, filesystem paths, prompts, outputs, credentials, and raw errors are not
+collected. A successful effect event means only that the gateway confirmed transport
+receipt; it is not evidence of assignment acceptance or execution.
 
-Telemetry is subordinate to runner work. Completed records enter a bounded queue without
-waiting, and a dedicated local thread owns standard error and repairs the line boundary
-after a partial write. Queue saturation or a failed local write drops and counts a
-record rather than changing protocol handling, retry classification, or process
-shutdown. Help, version, authentication, account, and `runner doctor` commands do not
-initialize this recorder or change their output contracts.
+The WebSocket upgrade receives only the connection span's W3C Trace Context. Baggage and
+arbitrary process context are never injected. Effect acknowledgements remain independent
+root spans correlated through the reviewed domain IDs until producing trace context is
+part of the runner protocol.
+
+Telemetry is subordinate to runner work. Local records and export spans enter separate
+bounded queues without waiting. OTLP requests and shutdown are bounded and there is no
+application retry. Malformed configuration, queue saturation, receiver failure,
+rejection, or stalling drops remote telemetry rather than changing protocol handling,
+acknowledgements, backoff, terminal results, exit status, or bounded shutdown. Owned
+telemetry diagnostics are emitted at most once for each closed classification and never
+copy raw errors, endpoint values, header names or values, or response bodies. Help,
+version, authentication, account, usage errors, invalid runner configuration, and
+`runner doctor` do not initialize export or change their output contracts.
 
 ## Runner doctor
 

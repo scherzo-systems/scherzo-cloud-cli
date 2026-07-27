@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use opentelemetry::KeyValue;
+use opentelemetry::propagation::Injector;
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header};
+use tokio_tungstenite::tungstenite::http::{
+    HeaderMap, HeaderName, HeaderValue, StatusCode, header,
+};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
@@ -24,6 +27,23 @@ const MAX_INBOUND_MESSAGE_BYTES: usize = 65_536;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct WebSocketTraceContextInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for WebSocketTraceContextInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if value.is_empty() || !matches!(key, "traceparent" | "tracestate") {
+            return;
+        }
+        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+            return;
+        };
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            return;
+        };
+        self.0.insert(name, value);
+    }
+}
 
 pub(crate) trait FrameSource: Send + Sync {
     fn public_id(&self, prefix: &str) -> String;
@@ -394,6 +414,9 @@ pub(crate) async fn run(
         header::SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(SUBPROTOCOL),
     );
+    dependencies
+        .connection_event
+        .inject_trace_context(&mut WebSocketTraceContextInjector(request.headers_mut()));
     let socket_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));

@@ -7,11 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use opentelemetry::propagation::{Injector, TextMapPropagator};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Context, KeyValue, Value as AttributeValue};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use serde_json::{Map, Number, Value};
 
+mod otlp;
 pub(crate) mod attribute {
     pub(crate) const BACKOFF_MS: &str = "scherzo.connection.backoff_ms";
     pub(crate) const CONNECTION_ATTEMPT: &str = "scherzo.connection.attempt";
@@ -199,6 +203,7 @@ impl<W: Write> FramedWriter<W> {
 }
 
 pub(crate) struct Recorder {
+    provider: SdkTracerProvider,
     tracer: SdkTracer,
     writer: Arc<dyn EventWriter>,
     service_version: Arc<str>,
@@ -214,12 +219,24 @@ impl fmt::Debug for Recorder {
 
 impl Recorder {
     pub(crate) fn stderr(service_version: &str, service_instance_id: &str) -> Arc<Self> {
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("scherzo-runner");
         let dropped_count = Arc::new(AtomicU64::new(0));
+        let writer: Arc<dyn EventWriter> =
+            Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
+        let mut provider = SdkTracerProvider::builder();
+        if let Some(processor) = otlp::configured_processor(Arc::clone(&writer)) {
+            provider = provider.with_span_processor(processor);
+        }
+        let resource = Resource::builder_empty()
+            .with_attributes([
+                KeyValue::new(SERVICE_NAME, "scherzo-runner"),
+                KeyValue::new(SERVICE_VERSION, service_version.to_owned()),
+                KeyValue::new(SERVICE_INSTANCE_ID, service_instance_id.to_owned()),
+            ])
+            .build();
+        let provider = provider.with_resource(resource).build();
         Arc::new(Self::with_dropped_count(
-            tracer,
-            Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count))),
+            provider,
+            writer,
             service_version,
             service_instance_id,
             dropped_count,
@@ -228,13 +245,13 @@ impl Recorder {
 
     #[cfg(test)]
     fn new(
-        tracer: SdkTracer,
+        provider: SdkTracerProvider,
         writer: Arc<dyn EventWriter>,
         service_version: &str,
         service_instance_id: &str,
     ) -> Self {
         Self::with_dropped_count(
-            tracer,
+            provider,
             writer,
             service_version,
             service_instance_id,
@@ -243,13 +260,15 @@ impl Recorder {
     }
 
     fn with_dropped_count(
-        tracer: SdkTracer,
+        provider: SdkTracerProvider,
         writer: Arc<dyn EventWriter>,
         service_version: &str,
         service_instance_id: &str,
         dropped_count: Arc<AtomicU64>,
     ) -> Self {
+        let tracer = provider.tracer("scherzo-runner");
         Self {
+            provider,
             tracer,
             writer,
             service_version: Arc::from(service_version),
@@ -333,6 +352,10 @@ impl fmt::Debug for Event {
 }
 
 impl Event {
+    pub(crate) fn inject_trace_context(&self, injector: &mut dyn Injector) {
+        TraceContextPropagator::new().inject_context(&self.inner.context, injector);
+    }
+
     pub(crate) fn set(&self, attribute: KeyValue) {
         let Some(value) = json_value(&attribute.value) else {
             return;
@@ -411,6 +434,14 @@ impl Event {
                 .dropped_count
                 .fetch_add(prior_dropped_count.saturating_add(1), Ordering::AcqRel);
         }
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self
+            .provider
+            .shutdown_with_timeout(std::time::Duration::from_millis(250));
     }
 }
 
@@ -508,7 +539,7 @@ pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCa
         .with_simple_exporter(capture.clone())
         .build();
     let recorder = Recorder::new(
-        provider.tracer("scherzo-runner-test"),
+        provider,
         Arc::new(capture.clone()),
         "0.2.0-test",
         service_instance_id,
@@ -649,12 +680,7 @@ mod tests {
             captured: captured.clone(),
         });
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let recorder = Recorder::new(
-            opentelemetry::trace::TracerProvider::tracer(&provider, "writer-test"),
-            writer,
-            "0.2.0-test",
-            "rbt_fixture",
-        );
+        let recorder = Recorder::new(provider, writer, "0.2.0-test", "rbt_fixture");
         let dropped = recorder.start("runner.dropped", []);
         let recovered = recorder.start("runner.recovered", []);
         dropped.finish(Outcome::Failure);

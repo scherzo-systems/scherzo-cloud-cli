@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
+use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
@@ -404,8 +404,22 @@ pub(crate) async fn fixture_listener() -> (TcpListener, String) {
     reason = "tungstenite's handshake callback requires its large error type"
 )]
 pub(crate) async fn accept_fixture_socket(listener: &TcpListener) -> FixtureSocket {
+    accept_fixture_socket_with_headers(listener).await.0
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite's handshake callback requires its large error type"
+)]
+pub(crate) async fn accept_fixture_socket_with_headers(
+    listener: &TcpListener,
+) -> (FixtureSocket, HeaderMap) {
     let (stream, _) = listener.accept().await.expect("accept fixture connection");
-    accept_hdr_async(stream, |_: &Request, mut response: Response| {
+    let (captured, capture) = std::sync::mpsc::sync_channel(1);
+    let socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
+        captured
+            .send(request.headers().clone())
+            .expect("capture fixture upgrade headers");
         response.headers_mut().insert(
             header::SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("scherzo.runner.v1"),
@@ -413,7 +427,13 @@ pub(crate) async fn accept_fixture_socket(listener: &TcpListener) -> FixtureSock
         Ok(response)
     })
     .await
-    .expect("accept WebSocket fixture")
+    .expect("accept WebSocket fixture");
+    (
+        socket,
+        capture
+            .try_recv()
+            .expect("fixture upgrade headers should be captured"),
+    )
 }
 
 pub(crate) fn welcome() -> Message {

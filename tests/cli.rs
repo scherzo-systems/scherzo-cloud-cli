@@ -42,6 +42,17 @@ const DEPLOYMENT_VARIABLES: [&str; 4] = [
     "SCHERZO_CLOUD_AUTH_AUDIENCE",
     "SCHERZO_CLOUD_AUTH_CLIENT_ID",
 ];
+const RUNNER_TELEMETRY_VARIABLES: [&str; 9] = [
+    "OTEL_SDK_DISABLED",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+];
 
 fn run(args: &[&str]) -> Output {
     run_with_env(args, &[])
@@ -55,7 +66,10 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     let default_credential_path = credential_directory.path().join("credentials.json");
     let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
     command.args(args).env_remove(CREDENTIALS_FILE_VARIABLE);
-    for variable in DEPLOYMENT_VARIABLES {
+    for variable in DEPLOYMENT_VARIABLES
+        .into_iter()
+        .chain(RUNNER_TELEMETRY_VARIABLES)
+    {
         command.env_remove(variable);
     }
     if !environment
@@ -327,6 +341,18 @@ fn private_credential_directory() -> tempfile::TempDir {
     fs::set_permissions(directory.path(), Permissions::from_mode(0o700))
         .expect("temporary credential directory should be private");
     directory
+}
+
+fn write_runner_credential(directory: &tempfile::TempDir) -> String {
+    let path = directory.path().join("runner.credential");
+    fs::write(
+        &path,
+        "rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678",
+    )
+    .expect("write runner credential");
+    fs::set_permissions(&path, Permissions::from_mode(0o600))
+        .expect("make runner credential private");
+    path.to_string_lossy().into_owned()
 }
 
 fn deployment_environment<'a>(
@@ -1301,6 +1327,121 @@ fn runner_doctor_list_options_conflict() {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("Scherzo Cloud runner doctor"));
+    }
+}
+
+#[test]
+fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused OTLP receiver");
+    listener
+        .set_nonblocking(true)
+        .expect("make unused OTLP receiver nonblocking");
+    let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+    let environment = [
+        ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint.as_str()),
+        (
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "authorization=HEADER-SENTINEL",
+        ),
+        ("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "50"),
+    ];
+
+    for args in [
+        ["--help"].as_slice(),
+        ["version"].as_slice(),
+        ["runner", "--help"].as_slice(),
+        ["runner", "doctor", "--list-checks"].as_slice(),
+        ["runner", "serve", "--help"].as_slice(),
+        ["runner", "serve"].as_slice(),
+    ] {
+        let output = run_with_env(args, &environment);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("HEADER-SENTINEL"));
+    }
+
+    let credential_directory = private_credential_directory();
+    let credential_path = write_runner_credential(&credential_directory);
+    let invalid_config = run_with_env(
+        &[
+            "runner",
+            "serve",
+            "--gateway-url",
+            "https://not-a-websocket.example.test",
+            "--credential-file",
+            &credential_path,
+        ],
+        &environment,
+    );
+    assert_eq!(invalid_config.status.code(), Some(1));
+    assert!(
+        invalid_config
+            .stderr
+            .starts_with(b"Error: invalid runner gateway URL\n")
+    );
+
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
+fn privacy_and_malformed_configuration_make_no_otlp_request() {
+    for (privacy, malformed_endpoint, expected_diagnostic) in [
+        (Some("true"), false, None),
+        (Some("not-a-boolean"), false, Some("privacy_invalid")),
+        (None, true, Some("endpoint_invalid")),
+    ] {
+        let otlp_listener = TcpListener::bind("127.0.0.1:0").expect("bind unused OTLP receiver");
+        otlp_listener
+            .set_nonblocking(true)
+            .expect("make unused OTLP receiver nonblocking");
+        let endpoint = format!(
+            "http://{}/v1/traces{}",
+            otlp_listener.local_addr().unwrap(),
+            if malformed_endpoint {
+                "?secret=value"
+            } else {
+                ""
+            }
+        );
+        let gateway = OneShotServer::respond("401 Unauthorized", None, &[]);
+        let gateway_url = gateway.api_url.replacen("http://", "ws://", 1);
+        let credential_directory = private_credential_directory();
+        let credential_path = write_runner_credential(&credential_directory);
+        let mut environment = vec![
+            ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint.as_str()),
+            ("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "50"),
+        ];
+        if let Some(privacy) = privacy {
+            environment.push(("OTEL_SDK_DISABLED", privacy));
+        }
+
+        let output = run_with_env(
+            &[
+                "runner",
+                "serve",
+                "--gateway-url",
+                &gateway_url,
+                "--credential-file",
+                &credential_path,
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        gateway.finish();
+        assert!(matches!(
+            otlp_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match expected_diagnostic {
+            Some(classification) => assert!(stderr.contains(&format!(
+                "\"diagnostic.classification\":\"{classification}\""
+            ))),
+            None => assert!(!stderr.contains("diagnostic.classification")),
+        }
+        assert!(!stderr.contains("secret=value"));
     }
 }
 

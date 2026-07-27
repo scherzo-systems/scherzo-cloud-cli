@@ -35,7 +35,9 @@ fs4 = "1.1.0"
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+prost = "0.14"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "query", "rustls-no-provider"] }
 regress = "=0.10.4"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
