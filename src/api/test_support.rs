@@ -1,0 +1,193 @@
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+const MAX_REQUEST_BYTES: usize = 128 * 1024;
+
+pub(crate) struct ScriptedHttpServer {
+    pub(crate) api_url: String,
+    requests: Receiver<String>,
+    thread: JoinHandle<()>,
+    response_count: usize,
+}
+
+impl ScriptedHttpServer {
+    pub(crate) fn respond(response: Vec<u8>) -> Self {
+        Self::respond_after(Duration::ZERO, response)
+    }
+
+    pub(crate) fn respond_after(delay: Duration, response: Vec<u8>) -> Self {
+        Self::start(vec![ScriptedResponse {
+            initial_delay: delay,
+            first: response,
+            continuation: None,
+        }])
+    }
+
+    pub(crate) fn respond_with_delayed_suffix(
+        first: Vec<u8>,
+        delay: Duration,
+        suffix: Vec<u8>,
+    ) -> Self {
+        Self::start(vec![ScriptedResponse {
+            initial_delay: Duration::ZERO,
+            first,
+            continuation: Some((delay, suffix)),
+        }])
+    }
+
+    pub(crate) fn respond_in_sequence(responses: Vec<Vec<u8>>) -> Self {
+        Self::start(
+            responses
+                .into_iter()
+                .map(|response| ScriptedResponse {
+                    initial_delay: Duration::ZERO,
+                    first: response,
+                    continuation: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn start(responses: Vec<ScriptedResponse>) -> Self {
+        let response_count = responses.len();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
+        let address = listener.local_addr().expect("fixture address should exist");
+        let (sender, requests) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("fixture request should arrive");
+                let request = read_request(&mut stream);
+                sender
+                    .send(String::from_utf8(request).expect("request should be text"))
+                    .expect("fixture request receiver should remain available");
+                thread::sleep(response.initial_delay);
+                let _ = stream.write_all(&response.first);
+                if let Some((delay, suffix)) = response.continuation {
+                    thread::sleep(delay);
+                    let _ = stream.write_all(&suffix);
+                }
+            }
+        });
+
+        Self {
+            api_url: format!("http://{address}/api/"),
+            requests,
+            thread,
+            response_count,
+        }
+    }
+
+    pub(crate) fn finish_one(self) -> String {
+        let mut requests = self.finish();
+        assert_eq!(requests.len(), 1, "fixture should capture one request");
+        requests.remove(0)
+    }
+
+    pub(crate) fn finish(self) -> Vec<String> {
+        let requests = (0..self.response_count)
+            .map(|_| {
+                self.requests
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("fixture should capture request")
+            })
+            .collect();
+        self.thread.join().expect("fixture server should stop");
+        requests
+    }
+}
+
+struct ScriptedResponse {
+    initial_delay: Duration,
+    first: Vec<u8>,
+    continuation: Option<(Duration, Vec<u8>)>,
+}
+
+pub(crate) fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("fixture read timeout should be configurable");
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut expected_length = None;
+
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .expect("request should be readable");
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        assert!(
+            request.len() <= MAX_REQUEST_BYTES,
+            "fixture request is unexpectedly large"
+        );
+
+        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let body_start = header_end + 4;
+            let length = *expected_length.get_or_insert_with(|| {
+                String::from_utf8_lossy(&request[..body_start])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default()
+            });
+            assert!(
+                body_start.saturating_add(length) <= MAX_REQUEST_BYTES,
+                "fixture request declares an unexpectedly large body"
+            );
+            if request.len() >= body_start + length {
+                request.truncate(body_start + length);
+                break;
+            }
+        }
+    }
+
+    request
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpStream;
+
+    use super::*;
+
+    #[test]
+    fn captures_ordered_complete_request_bodies() {
+        let server = ScriptedHttpServer::respond_in_sequence(vec![
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ]);
+
+        for body in ["first body", "second body is longer"] {
+            let address = server
+                .api_url
+                .strip_prefix("http://")
+                .and_then(|value| value.strip_suffix("/api/"))
+                .expect("fixture URL should have the expected shape");
+            let mut stream = TcpStream::connect(address).expect("fixture should accept a request");
+            write!(
+                stream,
+                "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("fixture request should be writable");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .expect("fixture response should be readable");
+            assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+        }
+
+        let requests = server.finish();
+        assert!(requests[0].ends_with("first body"));
+        assert!(requests[1].ends_with("second body is longer"));
+    }
+}

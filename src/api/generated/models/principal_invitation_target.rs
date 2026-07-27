@@ -15,23 +15,29 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateOrganizationRequest {
-    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+pub struct PrincipalInvitationTarget {
+    /// Selects an exact principal target.
+    #[serde(rename = "kind")]
+    pub kind: Kind,
+    #[serde(rename = "principalId")]
+    pub principal_id: String,
 }
 
-impl CreateOrganizationRequest {
-    /// The required organization profile and optional exact requested slug.
-    pub fn new(display_name: String) -> CreateOrganizationRequest {
-        CreateOrganizationRequest {
-            display_name,
-            slug: None,
-        }
+impl PrincipalInvitationTarget {
+    pub fn new(kind: Kind, principal_id: String) -> PrincipalInvitationTarget {
+        PrincipalInvitationTarget { kind, principal_id }
+    }
+}
+/// Selects an exact principal target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    #[serde(rename = "principal")]
+    Principal,
+}
+
+impl Default for Kind {
+    fn default() -> Kind {
+        Self::Principal
     }
 }

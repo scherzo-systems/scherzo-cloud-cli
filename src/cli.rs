@@ -1,5 +1,6 @@
 mod account;
 mod auth;
+mod organization;
 mod principal;
 mod runner;
 mod version;
@@ -49,6 +50,8 @@ enum Command {
     Account(account::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
+    #[command(about = organization::ABOUT)]
+    Organization(organization::Command),
     #[command(about = version::ABOUT)]
     Version(version::Command),
     #[command(about = runner::ABOUT)]
@@ -69,6 +72,7 @@ impl Cli {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
+            Some(Command::Organization(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
         }
@@ -149,10 +153,11 @@ mod tests {
     fn root_help_is_composed_from_command_metadata() {
         let help = command_help(&[]);
 
-        assert!(help.contains("account  Manage your Scherzo Cloud account"));
-        assert!(help.contains("auth     Manage your Scherzo Cloud sign-in"));
-        assert!(help.contains("version  Print version information"));
-        assert!(help.contains("runner   Run and manage the Scherzo Cloud runner"));
+        assert!(help.contains("account       Manage your Scherzo Cloud account"));
+        assert!(help.contains("auth          Manage your Scherzo Cloud sign-in"));
+        assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
+        assert!(help.contains("version       Print version information"));
+        assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -174,6 +179,19 @@ mod tests {
         assert!(command_help(&["auth", "login"]).contains("--allow-insecure-http"));
         assert!(command_help(&["auth", "status"]).contains("--allow-insecure-http"));
         assert!(!command_help(&["auth", "logout"]).contains("--allow-insecure-http"));
+    }
+
+    #[test]
+    fn organization_help_is_composed_from_command_metadata() {
+        let help = command_help(&["organization"]);
+
+        assert!(help.contains("create  Create a Scherzo Cloud organization"));
+        assert!(help.contains("show    Show a Scherzo Cloud organization"));
+        assert!(command_help(&["organization", "create"]).contains("--display-name"));
+        assert!(command_help(&["organization", "create"]).contains("--allow-insecure-http"));
+        assert!(command_help(&["organization", "show"]).contains("<ORGANIZATION>"));
+        assert!(!help.contains("update"));
+        assert!(!help.contains("members"));
     }
 
     #[test]

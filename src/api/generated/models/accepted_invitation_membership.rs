@@ -15,58 +15,48 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// OrganizationMembershipDirectoryEntry : One active membership held by an active principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrganizationMembershipDirectoryEntry {
-    /// The membership's opaque, stable, globally unique identifier.
+pub struct AcceptedInvitationMembership {
     #[serde(rename = "id")]
     pub id: String,
-    /// The member principal's opaque identifier.
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
     #[serde(rename = "principalId")]
     pub principal_id: String,
-    /// The member principal's immutable type.
-    #[serde(rename = "principalType")]
-    pub principal_type: PrincipalType,
-    /// The principal's optional mutable display name.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// The membership's organization role.
+    /// Existing active memberships retain their role; newly created memberships are member.
     #[serde(rename = "role")]
     pub role: Role,
+    /// The active membership state returned by successful acceptance.
+    #[serde(rename = "state")]
+    pub state: State,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
 }
 
-impl OrganizationMembershipDirectoryEntry {
-    /// One active membership held by an active principal.
+impl AcceptedInvitationMembership {
     pub fn new(
         id: String,
+        organization_id: String,
         principal_id: String,
-        principal_type: PrincipalType,
         role: Role,
-    ) -> OrganizationMembershipDirectoryEntry {
-        OrganizationMembershipDirectoryEntry {
+        state: State,
+        created_at: String,
+        updated_at: String,
+    ) -> AcceptedInvitationMembership {
+        AcceptedInvitationMembership {
             id,
+            organization_id,
             principal_id,
-            principal_type,
-            display_name: None,
             role,
+            state,
+            created_at,
+            updated_at,
         }
     }
 }
-/// The member principal's immutable type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum PrincipalType {
-    #[serde(rename = "human")]
-    Human,
-    #[serde(rename = "service")]
-    Service,
-}
-
-impl Default for PrincipalType {
-    fn default() -> PrincipalType {
-        Self::Human
-    }
-}
-/// The membership's organization role.
+/// Existing active memberships retain their role; newly created memberships are member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Role {
     #[serde(rename = "owner")]
@@ -78,5 +68,17 @@ pub enum Role {
 impl Default for Role {
     fn default() -> Role {
         Self::Owner
+    }
+}
+/// The active membership state returned by successful acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum State {
+    #[serde(rename = "active")]
+    Active,
+}
+
+impl Default for State {
+    fn default() -> State {
+        Self::Active
     }
 }

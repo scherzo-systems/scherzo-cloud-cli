@@ -15,23 +15,19 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateOrganizationRequest {
-    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+pub struct InvitationInboxList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::InvitationInboxEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
-impl CreateOrganizationRequest {
-    /// The required organization profile and optional exact requested slug.
-    pub fn new(display_name: String) -> CreateOrganizationRequest {
-        CreateOrganizationRequest {
-            display_name,
-            slug: None,
+impl InvitationInboxList {
+    pub fn new(items: Vec<models::InvitationInboxEntry>) -> InvitationInboxList {
+        InvitationInboxList {
+            items,
+            next_cursor: None,
         }
     }
 }

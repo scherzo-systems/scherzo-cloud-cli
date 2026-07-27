@@ -15,23 +15,30 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateOrganizationRequest {
-    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+pub struct EmailInvitationTarget {
+    /// Selects a normalized email target.
+    #[serde(rename = "kind")]
+    pub kind: Kind,
+    /// A single bare mailbox normalized before matching and storage.
+    #[serde(rename = "email")]
+    pub email: String,
 }
 
-impl CreateOrganizationRequest {
-    /// The required organization profile and optional exact requested slug.
-    pub fn new(display_name: String) -> CreateOrganizationRequest {
-        CreateOrganizationRequest {
-            display_name,
-            slug: None,
-        }
+impl EmailInvitationTarget {
+    pub fn new(kind: Kind, email: String) -> EmailInvitationTarget {
+        EmailInvitationTarget { kind, email }
+    }
+}
+/// Selects a normalized email target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    #[serde(rename = "email")]
+    Email,
+}
+
+impl Default for Kind {
+    fn default() -> Kind {
+        Self::Email
     }
 }

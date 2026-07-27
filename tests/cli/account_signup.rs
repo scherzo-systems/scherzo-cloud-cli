@@ -53,15 +53,6 @@ fn created_response() -> Vec<u8> {
     )
 }
 
-fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
-    let prefix = format!("{}: ", name.to_ascii_lowercase());
-    request
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix))
-        .expect("request should contain expected header")
-        .trim_end_matches('\r')
-}
-
 #[test]
 fn account_without_a_subcommand_prints_help_without_loading_deployment() {
     let output = run_with_env(

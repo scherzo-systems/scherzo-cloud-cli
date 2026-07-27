@@ -22,6 +22,8 @@ use std::time::Duration;
 mod account_signup;
 #[path = "cli/auth_login.rs"]
 mod auth_login;
+#[path = "cli/organization.rs"]
+mod organization;
 
 const BUILD_VERSION: &str = match option_env!("SCHERZO_CLOUD_VERSION") {
     Some(version) => version,
@@ -32,6 +34,7 @@ const BUILD_IDENTITY: &str = match option_env!("SCHERZO_CLOUD_BUILD_IDENTITY") {
     None => "unknown",
 };
 
+const ECHO_IDEMPOTENCY_KEY: &str = "{request-idempotency-key}";
 const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
 const DEPLOYMENT_VARIABLES: [&str; 4] = [
     "SCHERZO_CLOUD_API_URL",
@@ -164,10 +167,10 @@ impl ScriptedServer {
         let thread = thread::spawn(move || {
             for (index, response) in responses.into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().expect("fixture request should arrive");
-                let request = read_request(&mut stream);
-                sender
-                    .send(String::from_utf8(request).expect("request should be text"))
-                    .unwrap();
+                let request =
+                    String::from_utf8(read_request(&mut stream)).expect("request should be text");
+                let response = response_for_request(response, &request);
+                sender.send(request).unwrap();
                 if index + 1 == remaining_requests {
                     if let Some(receiver) = release_receiver.take() {
                         receiver.recv().expect("paused response should be released");
@@ -218,15 +221,42 @@ impl ScriptedServer {
     }
 }
 
+fn response_for_request(response: Vec<u8>, request: &str) -> Vec<u8> {
+    if response
+        .windows(ECHO_IDEMPOTENCY_KEY.len())
+        .any(|window| window == ECHO_IDEMPOTENCY_KEY.as_bytes())
+    {
+        String::from_utf8(response)
+            .expect("an idempotency-echo response should be text")
+            .replace(
+                ECHO_IDEMPOTENCY_KEY,
+                header_value(request, "idempotency-key"),
+            )
+            .into_bytes()
+    } else {
+        response
+    }
+}
+
 fn http_response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
-    let content_type = content_type
-        .map(|value| format!("Content-Type: {value}\r\n"))
-        .unwrap_or_default();
-    let mut response = format!(
-        "HTTP/1.1 {status}\r\nConnection: close\r\n{content_type}Content-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
+    http_response_with_headers(status, content_type, &[], body)
+}
+
+fn http_response_with_headers(
+    status: &str,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+    if let Some(content_type) = content_type {
+        response.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut response = response.into_bytes();
     response.extend_from_slice(body);
     response
 }
@@ -245,6 +275,15 @@ fn problem_http_response(status: &str, value: serde_json::Value) -> Vec<u8> {
         Some("application/problem+json"),
         &serde_json::to_vec(&value).unwrap(),
     )
+}
+
+fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{}: ", name.to_ascii_lowercase());
+    request
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .expect("request should contain expected header")
+        .trim_end_matches('\r')
 }
 
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -358,10 +397,11 @@ fn no_arguments_print_composed_root_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud [COMMAND]"));
-    assert!(stdout.contains("account  Manage your Scherzo Cloud account"));
-    assert!(stdout.contains("auth     Manage your Scherzo Cloud sign-in"));
-    assert!(stdout.contains("version  Print version information"));
-    assert!(stdout.contains("runner   Run and manage the Scherzo Cloud runner"));
+    assert!(stdout.contains("account       Manage your Scherzo Cloud account"));
+    assert!(stdout.contains("auth          Manage your Scherzo Cloud sign-in"));
+    assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
+    assert!(stdout.contains("version       Print version information"));
+    assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }

@@ -1,75 +1,13 @@
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::io::{self, Write as _};
+use std::net::TcpListener;
+use std::thread;
 
 use super::*;
 use crate::api::HttpTransportPolicy;
 use crate::api::http_util::MAX_RESPONSE_BODY_BYTES;
+use crate::api::test_support::{ScriptedHttpServer, read_request};
 
-struct TestServer {
-    api_url: String,
-    request: Receiver<String>,
-    thread: JoinHandle<()>,
-}
-
-impl TestServer {
-    fn respond(response: Vec<u8>) -> Self {
-        Self::respond_after(Duration::ZERO, response)
-    }
-
-    fn respond_after(delay: Duration, response: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
-        let address = listener.local_addr().unwrap();
-        let (sender, request) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("fixture request should arrive");
-            let request_bytes = read_request(&mut stream);
-            sender
-                .send(String::from_utf8(request_bytes).expect("request should be text"))
-                .unwrap();
-            thread::sleep(delay);
-            let _ = stream.write_all(&response);
-        });
-
-        Self {
-            api_url: format!("http://{address}/api/"),
-            request,
-            thread,
-        }
-    }
-
-    fn finish(self) -> String {
-        let request = self
-            .request
-            .recv_timeout(Duration::from_secs(2))
-            .expect("fixture should capture one request");
-        self.thread.join().expect("fixture server should stop");
-        request
-    }
-}
-
-fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        let read = stream
-            .read(&mut buffer)
-            .expect("request should be readable");
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        assert!(
-            request.len() < 16 * 1024,
-            "fixture request is unexpectedly large"
-        );
-    }
-    request
-}
+type TestServer = ScriptedHttpServer;
 
 fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
     let content_type = content_type
@@ -123,7 +61,7 @@ fn authenticated_response_ignores_additive_principal_fields() {
             display_name: Some("Ada".to_owned()),
         })
     );
-    let request = server.finish();
+    let request = server.finish_one();
     assert!(request.starts_with("GET /api/v1/me HTTP/1.1\r\n"));
     assert!(request.contains("authorization: Bearer synthetic-access-token\r\n"));
     assert!(request.contains("accept: application/json, application/problem+json\r\n"));
@@ -147,7 +85,7 @@ fn service_principal_response_is_not_accepted_as_a_human_credential() {
         error.to_string(),
         "current-principal response violates the public API contract: the principal type is not human"
     );
-    server.finish();
+    server.finish_one();
 }
 
 #[test]
@@ -174,7 +112,7 @@ fn signup_actions_are_preserved_as_opaque_values_or_omitted() {
                 actions: expected_actions.and_then(|value| value.as_array().cloned())
             }
         );
-        let request = server.finish();
+        let request = server.finish_one();
         assert!(!request.contains("authorization:"));
     }
 }
@@ -206,7 +144,7 @@ fn recognized_http_failures_map_to_closed_status_categories() {
         let outcome = get_current_principal(&http_client(), &server.api_url, None).unwrap();
 
         assert_eq!(outcome, expected);
-        server.finish();
+        server.finish_one();
     }
 }
 
@@ -241,7 +179,7 @@ fn malformed_or_unexpected_responses_are_protocol_failures() {
                 .to_string()
                 .contains("violates the public API contract")
         );
-        server.finish();
+        server.finish_one();
     }
 }
 
@@ -255,7 +193,7 @@ fn malformed_unauthorized_response_still_marks_the_credential_rejected() {
 
     assert!(error.credential_rejected());
     assert!(!error.to_string().contains("unique-response-secret"));
-    server.finish();
+    server.finish_one();
 }
 
 #[test]
@@ -271,7 +209,7 @@ fn redirect_is_returned_as_a_protocol_failure_without_being_followed() {
             .to_string()
             .contains("redirect responses are not permitted")
     );
-    server.finish();
+    server.finish_one();
 }
 
 #[test]
@@ -288,7 +226,7 @@ fn response_body_is_bounded_before_any_status_is_reported() {
         let error = get_current_principal(&http_client(), &server.api_url, None).unwrap_err();
 
         assert!(error.to_string().contains("exceeds 1 MiB"));
-        server.finish();
+        server.finish_one();
     }
 }
 
@@ -312,7 +250,7 @@ fn request_deadline_maps_to_timeout() {
         outcome,
         CurrentPrincipalOutcome::Unreachable(UnreachableCategory::Timeout)
     );
-    server.finish();
+    server.finish_one();
 }
 
 #[test]

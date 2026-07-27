@@ -2,8 +2,13 @@ mod current_principal;
 mod http_client;
 pub(crate) mod http_util;
 mod human_principal;
+mod idempotency;
+mod organizations;
 mod problem;
 mod signup;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub(crate) use current_principal::{
     CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory, classify_reqwest_error,
@@ -11,6 +16,17 @@ pub(crate) use current_principal::{
 };
 pub(crate) use http_client::{HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
+pub(crate) use idempotency::generate_idempotency_key;
+pub(crate) use organizations::{
+    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
+    ListOrganizationMembershipsOutcome, Organization, OrganizationError, OrganizationState,
+    UpdateOrganizationOutcome, create_organization, get_organization,
+};
+#[allow(
+    unused_imports,
+    reason = "the milestone-two API boundary includes update and member listing before their commands"
+)]
+pub(crate) use organizations::{list_organization_memberships, update_organization};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations

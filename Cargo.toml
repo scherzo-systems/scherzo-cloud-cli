@@ -46,8 +46,18 @@ time = { version = "0.3.45", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "signal", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 ulid = "3.0.0"
-url = "2.5.8"
+url = { version = "2.5.8", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["sync"] }
+
+# Opaque dot-only path segments are valid API inputs but do not round-trip through
+# the WHATWG URL parser. The endpoint builder uses url's internal Serde boundary
+# with unchanged structural offsets, so dependency debug builds must
+# not reject that intentionally non-round-tripping representation.
+[profile.dev.package.url]
+debug-assertions = false
+
+[profile.test.package.url]
+debug-assertions = false

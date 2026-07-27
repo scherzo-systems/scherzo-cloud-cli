@@ -15,23 +15,29 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateOrganizationRequest {
-    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+/// IssueInvitationRequest : A closed tagged invitation target.
+/// A closed tagged invitation target.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IssueInvitationRequest {
+    PrincipalInvitationTarget(Box<models::PrincipalInvitationTarget>),
+    EmailInvitationTarget(Box<models::EmailInvitationTarget>),
 }
 
-impl CreateOrganizationRequest {
-    /// The required organization profile and optional exact requested slug.
-    pub fn new(display_name: String) -> CreateOrganizationRequest {
-        CreateOrganizationRequest {
-            display_name,
-            slug: None,
-        }
+impl Default for IssueInvitationRequest {
+    fn default() -> Self {
+        Self::PrincipalInvitationTarget(Default::default())
+    }
+}
+/// Selects a normalized email target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    #[serde(rename = "email")]
+    Email,
+}
+
+impl Default for Kind {
+    fn default() -> Kind {
+        Self::Email
     }
 }

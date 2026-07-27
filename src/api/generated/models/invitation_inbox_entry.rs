@@ -15,23 +15,39 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// CreateOrganizationRequest : The required organization profile and optional exact requested slug.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateOrganizationRequest {
-    /// The required mutable organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName")]
-    pub display_name: String,
+pub struct InvitationInboxEntry {
+    #[serde(rename = "id")]
+    pub id: String,
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    #[serde(rename = "organizationDisplayName")]
+    pub organization_display_name: String,
     /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+    #[serde(rename = "organizationSlug")]
+    pub organization_slug: String,
+    #[serde(rename = "issuerPrincipalId")]
+    pub issuer_principal_id: String,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
 }
 
-impl CreateOrganizationRequest {
-    /// The required organization profile and optional exact requested slug.
-    pub fn new(display_name: String) -> CreateOrganizationRequest {
-        CreateOrganizationRequest {
-            display_name,
-            slug: None,
+impl InvitationInboxEntry {
+    pub fn new(
+        id: String,
+        organization_id: String,
+        organization_display_name: String,
+        organization_slug: String,
+        issuer_principal_id: String,
+        expires_at: String,
+    ) -> InvitationInboxEntry {
+        InvitationInboxEntry {
+            id,
+            organization_id,
+            organization_display_name,
+            organization_slug,
+            issuer_principal_id,
+            expires_at,
         }
     }
 }
