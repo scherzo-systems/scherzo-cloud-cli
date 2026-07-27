@@ -19,14 +19,11 @@ pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use idempotency::generate_idempotency_key;
 pub(crate) use organizations::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
-    ListOrganizationMembershipsOutcome, Organization, OrganizationError, OrganizationState,
+    ListOrganizationMembershipsOutcome, MembershipRole, Organization, OrganizationError,
+    OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome, create_organization, get_organization,
+    list_organization_memberships, update_organization,
 };
-#[allow(
-    unused_imports,
-    reason = "the milestone-two API boundary includes update and member listing before their commands"
-)]
-pub(crate) use organizations::{list_organization_memberships, update_organization};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations

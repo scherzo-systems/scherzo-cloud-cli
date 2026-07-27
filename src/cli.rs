@@ -185,13 +185,25 @@ mod tests {
     fn organization_help_is_composed_from_command_metadata() {
         let help = command_help(&["organization"]);
 
-        assert!(help.contains("create  Create a Scherzo Cloud organization"));
-        assert!(help.contains("show    Show a Scherzo Cloud organization"));
+        assert!(help.contains("create   Create a Scherzo Cloud organization"));
+        assert!(help.contains("show     Show a Scherzo Cloud organization"));
+        assert!(help.contains("update   Update a Scherzo Cloud organization"));
+        assert!(help.contains("members  Manage Scherzo Cloud organization members"));
         assert!(command_help(&["organization", "create"]).contains("--display-name"));
         assert!(command_help(&["organization", "create"]).contains("--allow-insecure-http"));
         assert!(command_help(&["organization", "show"]).contains("<ORGANIZATION>"));
-        assert!(!help.contains("update"));
-        assert!(!help.contains("members"));
+
+        let update = command_help(&["organization", "update"]);
+        assert!(update.contains("--display-name"));
+        assert!(update.contains("--slug"));
+        assert!(update.contains("--allow-insecure-http"));
+
+        let members = command_help(&["organization", "members"]);
+        assert!(members.contains("list  List one page of organization members"));
+        let list = command_help(&["organization", "members", "list"]);
+        assert!(list.contains("--limit <LIMIT>"));
+        assert!(list.contains("--cursor <CURSOR>"));
+        assert!(list.contains("--allow-insecure-http"));
     }
 
     #[test]

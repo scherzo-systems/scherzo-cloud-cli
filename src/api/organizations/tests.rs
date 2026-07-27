@@ -767,6 +767,50 @@ fn deadlines_cover_headers_and_reads_do_not_retry() {
 }
 
 #[test]
+fn explicit_server_status_with_interrupted_body_is_not_retried() {
+    let interrupted =
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 1\r\n\r\n"
+            .to_vec();
+    let server = ScriptedHttpServer::respond_in_sequence(vec![interrupted, success("200 OK")]);
+    let shutdown_address = server
+        .api_url
+        .strip_prefix("http://")
+        .unwrap()
+        .trim_end_matches("/api/")
+        .to_owned();
+
+    let outcome = update_organization(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "acme",
+        KEY,
+        Some("Acme"),
+        None,
+    )
+    .expect("the explicit server response should be classified");
+
+    if let Ok(mut stream) = std::net::TcpStream::connect(shutdown_address) {
+        let _ = std::io::Write::write_all(
+            &mut stream,
+            b"GET /fixture-shutdown HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n",
+        );
+    }
+    let requests = server.finish();
+
+    assert!(
+        requests[1].starts_with("GET /fixture-shutdown HTTP/1.1\r\n"),
+        "the mutation sent a second request after receiving HTTP 503"
+    );
+    assert_eq!(
+        outcome,
+        UpdateOrganizationOutcome::Common(CommonOrganizationFailure::Unreachable(
+            UnreachableCategory::Server
+        ))
+    );
+}
+
+#[test]
 fn explicit_server_failures_are_not_retried() {
     let server = ScriptedHttpServer::respond(response("503 Service Unavailable", None, &[], &[]));
 

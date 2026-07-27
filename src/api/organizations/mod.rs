@@ -12,7 +12,10 @@ use super::http_util::{self, BoundedBodyError};
 use super::problem;
 use super::{UnreachableCategory, classify_reqwest_error};
 
-pub(crate) use models::{Organization, OrganizationMembershipPage, OrganizationState};
+pub(crate) use models::{
+    MembershipRole, Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipPage,
+    OrganizationState, PrincipalType,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
@@ -291,13 +294,6 @@ fn get_organization_with_timeout(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the update command follows the complete milestone-two transport boundary"
-    )
-)]
 pub(crate) fn update_organization(
     client: &HttpClient,
     api_url: &str,
@@ -332,13 +328,6 @@ pub(crate) fn update_organization(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the member-list command follows the complete milestone-two transport boundary"
-    )
-)]
 pub(crate) fn list_organization_memberships(
     client: &HttpClient,
     api_url: &str,
@@ -486,7 +475,13 @@ fn execute_request(
         match client.run(remaining, receive_response(spec.operation, response)) {
             Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
-            Ok(Err(AttemptError::Transport(category))) => last_failure = category,
+            Ok(Err(AttemptError::Transport(category))) => {
+                return Ok(RequestExecution::Unreachable(if status.is_server_error() {
+                    UnreachableCategory::Server
+                } else {
+                    category
+                }));
+            }
             Err(_) if status == StatusCode::UNAUTHORIZED => {
                 return Err(OrganizationError::protocol(
                     spec.operation,
@@ -494,7 +489,13 @@ fn execute_request(
                     true,
                 ));
             }
-            Err(_) => last_failure = UnreachableCategory::Timeout,
+            Err(_) => {
+                return Ok(RequestExecution::Unreachable(if status.is_server_error() {
+                    UnreachableCategory::Server
+                } else {
+                    UnreachableCategory::Timeout
+                }));
+            }
         }
     }
 
@@ -797,8 +798,36 @@ fn decode_list_response(
                 JSON_MEDIA_TYPE,
                 false,
             )?;
-            let generated: generated_models::OrganizationMembershipList =
+            let value: serde_json::Value =
                 serde_json::from_slice(&response.body).map_err(|_| {
+                    OrganizationError::protocol(
+                        Operation::ListMemberships,
+                        "the membership-list response body is invalid",
+                        false,
+                    )
+                })?;
+            let has_null_display_name = value
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("displayName")
+                            .is_some_and(serde_json::Value::is_null)
+                    })
+                });
+            if value
+                .get("nextCursor")
+                .is_some_and(serde_json::Value::is_null)
+                || has_null_display_name
+            {
+                return Err(OrganizationError::protocol(
+                    Operation::ListMemberships,
+                    "the membership-list response contains an explicit null optional field",
+                    false,
+                ));
+            }
+            let generated: generated_models::OrganizationMembershipList =
+                serde_json::from_value(value).map_err(|_| {
                     OrganizationError::protocol(
                         Operation::ListMemberships,
                         "the membership-list response body is invalid",

@@ -60,6 +60,23 @@ fn organization_success(status: &str) -> Vec<u8> {
     }
 }
 
+fn update_success() -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&organization_body()).unwrap(),
+    )
+}
+
+fn membership_success(items: serde_json::Value, next_cursor: Option<&str>) -> Vec<u8> {
+    let mut page = serde_json::json!({ "items": items });
+    if let Some(next_cursor) = next_cursor {
+        page["nextCursor"] = serde_json::Value::String(next_cursor.to_owned());
+    }
+    json_http_response("200 OK", page)
+}
+
 fn organization_problem(status_text: &str, status: u16, problem_type: &str) -> Vec<u8> {
     problem_http_response(
         status_text,
@@ -101,10 +118,21 @@ fn organization_help_is_contextual_and_side_effect_free() {
     assert!(bare.stderr.is_empty());
     let bare_help = String::from_utf8_lossy(&bare.stdout);
     assert!(bare_help.contains("Usage: scherzo-cloud organization [COMMAND]"));
-    assert!(bare_help.contains("create  Create a Scherzo Cloud organization"));
-    assert!(bare_help.contains("show    Show a Scherzo Cloud organization"));
-    assert!(!bare_help.contains("update"));
-    assert!(!bare_help.contains("members"));
+    assert!(bare_help.contains("create   Create a Scherzo Cloud organization"));
+    assert!(bare_help.contains("show     Show a Scherzo Cloud organization"));
+    assert!(bare_help.contains("update   Update a Scherzo Cloud organization"));
+    assert!(bare_help.contains("members  Manage Scherzo Cloud organization members"));
+
+    let members = run_with_env(
+        &["organization", "members"],
+        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
+    );
+    assert!(members.status.success());
+    assert!(members.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&members.stdout)
+            .contains("Usage: scherzo-cloud organization members [COMMAND]")
+    );
 
     for (args, expected) in [
         (
@@ -112,6 +140,14 @@ fn organization_help_is_contextual_and_side_effect_free() {
             "--display-name <DISPLAY_NAME>",
         ),
         (&["organization", "show", "--help"][..], "<ORGANIZATION>"),
+        (
+            &["organization", "update", "--help"][..],
+            "--display-name <DISPLAY_NAME>|--slug <SLUG>",
+        ),
+        (
+            &["organization", "members", "list", "--help"][..],
+            "--limit <LIMIT>",
+        ),
     ] {
         let output = run(args);
         assert!(output.status.success());
@@ -884,5 +920,801 @@ fn private_not_found_outputs_are_identical_for_all_target_states() {
         assert_eq!(outputs[0], outputs[1]);
         assert_eq!(outputs[1], outputs[2]);
         assert_eq!(server.finish().len(), 3);
+    }
+}
+
+#[test]
+fn update_and_members_list_reject_invalid_cli_input_before_deployment_loading() {
+    for args in [
+        &["organization", "update", "acme"][..],
+        &["organization", "members", "list", "acme", "--limit", "0"][..],
+        &["organization", "members", "list", "acme", "--limit", "201"][..],
+        &["organization", "members", "list", "acme", "--cursor", ""][..],
+    ] {
+        let output = run_with_env(
+            args,
+            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn update_accepts_each_patch_shape_and_preserves_the_request_contract() {
+    let cases = [
+        (
+            &["--display-name", "\u{2003}Acme Labs\u{2003}"][..],
+            serde_json::json!({"displayName": "\u{2003}Acme Labs\u{2003}"}),
+        ),
+        (
+            &["--slug", "Server_Invalid"][..],
+            serde_json::json!({"slug": "Server_Invalid"}),
+        ),
+        (
+            &["--display-name", "Acme Labs", "--slug", "acme-labs"][..],
+            serde_json::json!({"displayName": "Acme Labs", "slug": "acme-labs"}),
+        ),
+    ];
+
+    for (profile_args, expected_body) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![update_success()], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec![
+            "organization",
+            "update",
+            "org/ Mixed Case",
+            "--json",
+            "--allow-insecure-http",
+        ];
+        args.extend_from_slice(profile_args);
+
+        let output = run_with_env(&args, &environment);
+
+        assert!(output.status.success());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["deployment"], server.api_url);
+        assert_eq!(result["outcome"], "updated");
+        let mut expected_organization = organization_body();
+        expected_organization
+            .as_object_mut()
+            .unwrap()
+            .remove("future");
+        assert_eq!(result["organization"], expected_organization);
+        assert!(output.stdout.ends_with(b"\n"));
+        assert!(output.stderr.is_empty());
+
+        let request = server.finish().pop().unwrap();
+        assert!(
+            request.starts_with("PATCH /api/v1/organizations/org%2F%20Mixed%20Case HTTP/1.1\r\n")
+        );
+        assert_eq!(
+            header_value(&request, "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+        assert_eq!(
+            header_value(&request, "content-type"),
+            "application/merge-patch+json"
+        );
+        let key = header_value(&request, "idempotency-key");
+        assert_eq!(key.len(), 64);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(request_body(&request)).unwrap(),
+            expected_body
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains(TOKEN));
+        assert!(!combined.contains(key));
+    }
+}
+
+#[test]
+fn human_update_has_exact_success_output() {
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![update_success()], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "update",
+            "acme-research",
+            "--display-name",
+            "Acme Research",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            concat!(
+                "✓ Organization updated.\n\n",
+                "  Organization: org_01k0z6r1w8f4jy2m7q9v3x5abc\n",
+                "  Name:         Acme Research\n",
+                "  Slug:         acme-research\n",
+                "  State:        active\n",
+                "  Deployment:   {}\n"
+            ),
+            server.api_url
+        )
+    );
+    assert!(output.stderr.is_empty());
+    server.finish();
+}
+
+#[test]
+fn update_retries_one_ambiguous_failure_with_the_same_complete_request() {
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![Vec::new(), update_success()], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "update",
+            "acme-research",
+            "--display-name",
+            "Acme Labs",
+            "--slug",
+            "acme-labs",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
+    let cases = [
+        (
+            organization_problem(
+                "400 Bad Request",
+                400,
+                "https://api.scherzo.dev/problems/bad-request",
+            ),
+            "invalid_input",
+            1,
+        ),
+        (
+            organization_problem(
+                "401 Unauthorized",
+                401,
+                "https://api.scherzo.dev/problems/unauthorized",
+            ),
+            "unauthenticated",
+            2,
+        ),
+        (
+            organization_problem(
+                "403 Forbidden",
+                403,
+                "https://api.scherzo.dev/problems/forbidden",
+            ),
+            "forbidden",
+            1,
+        ),
+        (
+            organization_problem(
+                "404 Not Found",
+                404,
+                "https://api.scherzo.dev/problems/not-found",
+            ),
+            "not_found",
+            1,
+        ),
+        (
+            organization_problem(
+                "409 Conflict",
+                409,
+                "https://api.scherzo.dev/problems/slug-unavailable",
+            ),
+            "slug_unavailable",
+            1,
+        ),
+        (
+            organization_problem(
+                "409 Conflict",
+                409,
+                "https://api.scherzo.dev/problems/idempotency-conflict",
+            ),
+            "idempotency_conflict",
+            1,
+        ),
+        (
+            http_response("503 Service Unavailable", None, &[]),
+            "unreachable",
+            3,
+        ),
+    ];
+
+    for (response, expected_outcome, expected_status) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![response], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &[
+                "organization",
+                "update",
+                "acme-research",
+                "--slug",
+                "acme-labs",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["deployment"], server.api_url);
+        assert_eq!(value["outcome"], expected_outcome);
+        if expected_outcome == "unreachable" {
+            assert_eq!(value["category"], "server");
+        } else {
+            assert!(value.get("category").is_none());
+        }
+        assert!(value.get("title").is_none());
+        assert!(value.get("detail").is_none());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            server.finish().len(),
+            1,
+            "explicit responses must not retry"
+        );
+    }
+}
+
+#[test]
+fn update_transport_and_protocol_failures_have_closed_statuses() {
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![Vec::new(), Vec::new()], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let transport = run_with_env(
+        &[
+            "organization",
+            "update",
+            "acme",
+            "--slug",
+            "acme-labs",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(transport.status.code(), Some(3));
+    let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
+    assert_eq!(value["outcome"], "unreachable");
+    assert_eq!(value["category"], "connection");
+    assert!(transport.stderr.is_empty());
+    assert_eq!(server.finish().len(), 2);
+
+    let response = json_http_response(
+        "200 OK",
+        serde_json::json!({"protocol-response-sentinel": true}),
+    );
+    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let protocol = run_with_env(
+        &[
+            "organization",
+            "update",
+            "acme",
+            "--slug",
+            "acme-labs",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(protocol.status.code(), Some(1));
+    assert!(protocol.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&protocol.stderr);
+    assert!(stderr.contains("violates the public API contract"));
+    assert!(!stderr.contains("protocol-response-sentinel"));
+    assert!(!stderr.contains(TOKEN));
+    server.finish();
+}
+
+#[test]
+fn members_list_preserves_omitted_and_opaque_query_values() {
+    let cases = [
+        (&[][..], "/api/v1/organizations/acme%2Fresearch/memberships"),
+        (
+            &["--limit", "1"][..],
+            "/api/v1/organizations/acme%2Fresearch/memberships?limit=1",
+        ),
+        (
+            &["--limit", "200"][..],
+            "/api/v1/organizations/acme%2Fresearch/memberships?limit=200",
+        ),
+        (
+            &["--cursor", "opaque /+=?&"][..],
+            "/api/v1/organizations/acme%2Fresearch/memberships?cursor=opaque+%2F%2B%3D%3F%26",
+        ),
+        (
+            &["--limit", "42", "--cursor", "opaque /+=?&"][..],
+            "/api/v1/organizations/acme%2Fresearch/memberships?limit=42&cursor=opaque+%2F%2B%3D%3F%26",
+        ),
+    ];
+
+    for (query_args, expected_target) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![membership_success(serde_json::json!([]), None)], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec![
+            "organization",
+            "members",
+            "list",
+            "acme/research",
+            "--json",
+            "--allow-insecure-http",
+        ];
+        args.extend_from_slice(query_args);
+
+        let output = run_with_env(&args, &environment);
+
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let request = server.finish().pop().unwrap();
+        assert!(request.starts_with(&format!("GET {expected_target} HTTP/1.1\r\n")));
+        assert_eq!(
+            header_value(&request, "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+        assert!(!request.contains("idempotency-key:"));
+    }
+}
+
+#[test]
+fn json_members_list_emits_one_continued_page_exactly() {
+    let items = serde_json::json!([
+        {
+            "id": "mem_owner",
+            "principalId": "prn_human",
+            "principalType": "human",
+            "displayName": "Ada Lovelace",
+            "role": "owner",
+            "future": "member-response-sentinel"
+        },
+        {
+            "id": "mem_service",
+            "principalId": "prn_service",
+            "principalType": "service",
+            "role": "member"
+        }
+    ]);
+    let cursor = "opaque continuation /+=?&";
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![membership_success(items, Some(cursor))], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "listed",
+            "items": [
+                {
+                    "id": "mem_owner",
+                    "principalId": "prn_human",
+                    "principalType": "human",
+                    "displayName": "Ada Lovelace",
+                    "role": "owner"
+                },
+                {
+                    "id": "mem_service",
+                    "principalId": "prn_service",
+                    "principalType": "service",
+                    "role": "member"
+                }
+            ],
+            "nextCursor": cursor
+        })
+    );
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("member-response-sentinel"));
+    assert_eq!(
+        server.finish().len(),
+        1,
+        "nextCursor must not trigger pagination"
+    );
+}
+
+#[test]
+fn human_and_empty_members_pages_have_exact_output() {
+    let items = serde_json::json!([
+        {
+            "id": "mem_owner",
+            "principalId": "prn_human",
+            "principalType": "human",
+            "displayName": "Ada Lovelace",
+            "role": "owner"
+        },
+        {
+            "id": "mem_service",
+            "principalId": "prn_service",
+            "principalType": "service",
+            "role": "member"
+        }
+    ]);
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![membership_success(items, Some("next-page"))], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let human = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        format!(
+            concat!(
+                "✓ Organization members listed.\n\n",
+                "  Membership: mem_owner  Principal: prn_human  Type: human  Role: owner  Name: Ada Lovelace\n",
+                "  Membership: mem_service  Principal: prn_service  Type: service  Role: member\n\n",
+                "  Next cursor: next-page\n",
+                "  Deployment: {}\n"
+            ),
+            server.api_url
+        )
+    );
+    assert!(human.stderr.is_empty());
+    server.finish();
+
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![membership_success(serde_json::json!([]), None)], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let empty_human = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(empty_human.status.success());
+    assert_eq!(
+        String::from_utf8(empty_human.stdout).unwrap(),
+        format!(
+            "✓ Organization members listed.\n\n  Deployment: {}\n",
+            server.api_url
+        )
+    );
+    assert!(empty_human.stderr.is_empty());
+    server.finish();
+
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![membership_success(serde_json::json!([]), None)], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let empty = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(empty.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "listed",
+            "items": []
+        })
+    );
+    assert!(empty.stderr.is_empty());
+    server.finish();
+}
+
+#[test]
+fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
+    let cases = [
+        (
+            organization_problem(
+                "400 Bad Request",
+                400,
+                "https://api.scherzo.dev/problems/bad-request",
+            ),
+            "invalid_input",
+            1,
+        ),
+        (
+            organization_problem(
+                "401 Unauthorized",
+                401,
+                "https://api.scherzo.dev/problems/unauthorized",
+            ),
+            "unauthenticated",
+            2,
+        ),
+        (
+            organization_problem(
+                "403 Forbidden",
+                403,
+                "https://api.scherzo.dev/problems/forbidden",
+            ),
+            "forbidden",
+            1,
+        ),
+        (
+            organization_problem(
+                "404 Not Found",
+                404,
+                "https://api.scherzo.dev/problems/not-found",
+            ),
+            "not_found",
+            1,
+        ),
+        (
+            http_response("500 Internal Server Error", None, &[]),
+            "unreachable",
+            3,
+        ),
+    ];
+
+    for (response, expected_outcome, expected_status) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![response], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &[
+                "organization",
+                "members",
+                "list",
+                "acme",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["deployment"], server.api_url);
+        assert_eq!(value["outcome"], expected_outcome);
+        if expected_outcome == "unreachable" {
+            assert_eq!(value["category"], "server");
+        } else {
+            assert!(value.get("category").is_none());
+        }
+        assert!(value.get("title").is_none());
+        assert!(value.get("detail").is_none());
+        assert!(output.stderr.is_empty());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn members_list_transport_and_protocol_failures_have_closed_statuses() {
+    let (server, _directory, _path, credential_path) =
+        prepared_organization(vec![Vec::new()], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let transport = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(transport.status.code(), Some(3));
+    let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
+    assert_eq!(value["outcome"], "unreachable");
+    assert_eq!(value["category"], "connection");
+    assert!(transport.stderr.is_empty());
+    assert_eq!(server.finish().len(), 1, "reads must not retry");
+
+    let response = json_http_response("200 OK", serde_json::json!({"items": [], "nextCursor": ""}));
+    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let protocol = run_with_env(
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(protocol.status.code(), Some(1));
+    assert!(protocol.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&protocol.stderr)
+            .contains("organization membership cursor is empty")
+    );
+    assert!(!String::from_utf8_lossy(&protocol.stderr).contains(TOKEN));
+    server.finish();
+}
+
+#[test]
+fn members_list_rejects_explicit_null_optional_fields() {
+    let malformed_pages = [
+        serde_json::json!({"items": [], "nextCursor": null}),
+        serde_json::json!({
+            "items": [{
+                "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "principalType": "human",
+                "displayName": null,
+                "role": "member"
+            }]
+        }),
+    ];
+    let mut statuses = Vec::new();
+    let mut standard_outputs = Vec::new();
+
+    for page in malformed_pages {
+        let response = json_http_response("200 OK", page);
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![response], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "organization",
+                "members",
+                "list",
+                "acme",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+        statuses.push(output.status.code());
+        standard_outputs.push(output.stdout);
+        server.finish();
+    }
+
+    assert_eq!(statuses, [Some(1), Some(1)]);
+    assert!(standard_outputs.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn update_and_members_list_report_missing_credentials_without_network_requests() {
+    for args in [
+        &[
+            "organization",
+            "update",
+            "acme",
+            "--slug",
+            "acme-labs",
+            "--json",
+            "--allow-insecure-http",
+        ][..],
+        &[
+            "organization",
+            "members",
+            "list",
+            "acme",
+            "--json",
+            "--allow-insecure-http",
+        ][..],
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = private_credential_directory();
+        let credential_path = directory.path().join("credentials.json");
+        let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
+
+        let output = run_with_env(args, &environment);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "deployment": api_url,
+                "outcome": "unauthenticated"
+            })
+        );
+        assert!(output.stderr.is_empty());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+}
+
+#[test]
+fn update_and_members_list_keep_private_not_found_outputs_identical() {
+    for command in ["update", "members"] {
+        for json in [false, true] {
+            let responses = [
+                "The target is inaccessible.",
+                "The target is inactive.",
+                "The target is absent.",
+            ]
+            .map(response_with_detail)
+            .into_iter()
+            .collect();
+            let (server, _directory, _path, credential_path) =
+                prepared_organization(responses, TOKEN);
+            let environment = deployment_environment(&server.api_url, &credential_path);
+            let mut outputs = Vec::new();
+
+            for _ in 0..3 {
+                let mut args = if command == "update" {
+                    vec![
+                        "organization",
+                        "update",
+                        "private-target",
+                        "--slug",
+                        "still-private",
+                        "--allow-insecure-http",
+                    ]
+                } else {
+                    vec![
+                        "organization",
+                        "members",
+                        "list",
+                        "private-target",
+                        "--allow-insecure-http",
+                    ]
+                };
+                if json {
+                    args.push("--json");
+                }
+                let output = run_with_env(&args, &environment);
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stderr.is_empty());
+                if !json {
+                    assert_eq!(output.stdout, b"! Organization not found or unavailable.\n");
+                }
+                outputs.push(output.stdout);
+            }
+            assert_eq!(outputs[0], outputs[1]);
+            assert_eq!(outputs[1], outputs[2]);
+            assert_eq!(server.finish().len(), 3);
+        }
     }
 }

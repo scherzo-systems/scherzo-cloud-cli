@@ -1,20 +1,29 @@
 use std::process::ExitCode;
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 
-use crate::api::create_organization;
+use crate::api::update_organization;
 use crate::human_auth::deployment::Deployment;
 
 use super::{CommandError, LeafOptions, output};
 
-pub(super) const ABOUT: &str = "Create a Scherzo Cloud organization";
+pub(super) const ABOUT: &str = "Update a Scherzo Cloud organization";
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("profile")
+        .required(true)
+        .multiple(true)
+        .args(["display_name", "slug"])
+))]
 pub(super) struct Command {
-    #[arg(long, help = "Set the organization display name")]
-    display_name: String,
+    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
+    organization_ref: String,
 
-    #[arg(long, help = "Request an exact organization slug")]
+    #[arg(long, help = "Set the organization display name")]
+    display_name: Option<String>,
+
+    #[arg(long, help = "Set the exact organization slug")]
     slug: Option<String>,
 
     // Clap input ownership remains operation-local; shared execution policy lives in LeafOptions.
@@ -26,6 +35,7 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> Result<ExitCode, CommandError> {
         let Self {
+            organization_ref,
             display_name,
             slug,
             options,
@@ -34,17 +44,18 @@ impl Command {
         options.execute_mutation(
             deployment,
             |client, api_url, access_token, idempotency_key| {
-                create_organization(
+                update_organization(
                     client,
                     api_url,
                     access_token,
+                    &organization_ref,
                     idempotency_key,
-                    &display_name,
+                    display_name.as_deref(),
                     slug.as_deref(),
                 )
                 .map_err(CommandError::Organization)
             },
-            output::write_create,
+            output::write_update,
         )
     }
 }

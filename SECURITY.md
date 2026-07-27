@@ -42,6 +42,26 @@ disable general retries, and reject response bodies larger than 1 MiB. A `401` r
 removes the rejected credential without deleting a token that another process replaced
 while the request was in flight.
 
+## Organization commands
+
+Organization commands send only the selected human OAuth access token to the exact
+configured API deployment. They never discover or read runner credentials, initiate
+OAuth, or accept credentials or idempotency keys as command input. HTTP is rejected
+unless the individual leaf explicitly opts into insecure development transport.
+
+Create and update serialize one request and keep one random idempotency key only in
+memory. They retry one ambiguous transport failure with the same request and key, but do
+not retry explicit HTTP responses or claim that two ambiguous attempts failed to commit.
+Show and member listing make one request; member listing follows no continuation cursor
+automatically.
+
+Organization output and diagnostics never copy bearer tokens, idempotency keys, complete
+response bodies, or API problem title and detail. Private absent, inactive, and
+inaccessible organizations share one `not_found` result. A contracted or malformed HTTP
+401 conditionally removes only the matching token, while 403 and other failures retain
+it. Successful response values are decoded through generated contract DTOs and projected
+into the documented schema-version-1 output rather than printing generated debug data.
+
 ## Runner service telemetry
 
 `runner serve` writes one newline-delimited JSON event for each gateway connection

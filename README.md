@@ -11,15 +11,16 @@ executable.
 
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
-human-credential logout, runner diagnostics, and a development-only outbound runner
-transport. `runner serve` connects to an explicitly configured runner gateway, receives
-and transport-acknowledges assignment offers, and emits structured service events
-without claiming that execution occurred.
+human-credential logout, organization profile management and one-page member-directory
+reads, runner diagnostics, and a development-only outbound runner transport. `runner
+serve` connects to an explicitly configured runner gateway, receives and
+transport-acknowledges assignment offers, and emits structured service events without
+claiming that execution occurred.
 
-Apart from creating the signed-in human's account and receiving a development assignment,
-the CLI cannot currently create cloud resources, configure a repository, submit
-workflows, or execute runner assignments. The rest of Cloud onboarding is not
-implemented yet.
+The CLI can create an organization, read or update its initial profile, and list one
+page of active members. It cannot configure repositories, invite or change members,
+submit workflows, or execute runner assignments. Agent-guided organization creation
+and the rest of Cloud onboarding are not implemented yet.
 
 ## Version inspection
 
@@ -58,8 +59,9 @@ tokens in `~/.scherzo-cloud/credentials.json`; this store is separate from all f
 runner credentials.
 
 Development deployments that use HTTP require `--allow-insecure-http` on the networked
-leaf command: `auth login`, `auth status`, or `account signup`. The option is not global
-and does not apply to local commands such as `auth logout`.
+leaf command: `auth login`, `auth status`, `account signup`, `organization create`,
+`organization show`, `organization update`, or `organization members list`. The option
+is not global and does not apply to local commands such as `auth logout`.
 
 ## Account signup
 
@@ -69,6 +71,46 @@ status is `signup_required` and the deployment advertises signup, use
 Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
 with the existing human credential and retries an ambiguous transport failure once with
 the same opaque idempotency key.
+
+## Organization management
+
+Organization commands use only the selected human OAuth credential. They do not start a
+login or signup flow and never read runner credentials. Organization references may be
+an organization ID or exact slug and are passed to the deployment without local
+normalization.
+
+```sh
+# Create an organization. The deployment may assign the slug when it is omitted.
+scherzo-cloud organization create \
+  --display-name "Acme Research" \
+  --slug acme-research
+
+# Read an accessible active organization by ID or exact slug.
+scherzo-cloud organization show acme-research
+
+# Update the display name, slug, or both. At least one option is required.
+scherzo-cloud organization update acme-research \
+  --display-name "Acme Labs" \
+  --slug acme-labs
+
+# Read one member-directory page. Both pagination options are optional.
+scherzo-cloud organization members list acme-labs \
+  --limit 50 \
+  --cursor opaque-continuation
+```
+
+Add `--json` to any of these leaves for its schema-version-1 result. Member listing
+returns exactly one page, preserves `nextCursor`, and does not follow it automatically;
+`--limit` accepts 1 through 200.
+
+Create and update generate a fresh opaque idempotency key per process invocation. After
+an ambiguous transport failure, the CLI retries once with the same key and serialized
+request. If both attempts are ambiguous, it reports `unreachable` because the mutation
+result cannot be confirmed. It does not persist the key or retry a contracted HTTP
+response. Do not issue a new mutation merely because an earlier result was unconfirmed.
+
+These commands are a direct human management surface. This release does not advertise,
+interpret, or execute server actions for agent-guided organization creation.
 
 ## Runner doctor
 

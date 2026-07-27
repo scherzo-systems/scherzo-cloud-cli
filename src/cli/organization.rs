@@ -1,6 +1,8 @@
 mod create;
+mod members;
 mod output;
 mod show;
+mod update;
 
 use std::fmt;
 use std::process::ExitCode;
@@ -31,6 +33,10 @@ enum OrganizationCommand {
     Create(create::Command),
     #[command(about = show::ABOUT)]
     Show(show::Command),
+    #[command(about = update::ABOUT)]
+    Update(update::Command),
+    #[command(about = members::ABOUT)]
+    Members(members::Command),
 }
 
 #[derive(Debug, Args)]
@@ -55,22 +61,56 @@ impl LeafOptions {
         let outcome = with_human_credential(deployment, self.http.transport_policy(), operation)?;
         write(deployment.fingerprint().api_url(), &outcome, self.json).map_err(CommandError::Output)
     }
+
+    fn execute_mutation<O>(
+        self,
+        deployment: &Deployment,
+        operation: impl FnOnce(&HttpClient, &str, &str, &str) -> Result<O, CommandError>,
+        write: impl FnOnce(&str, &O, bool) -> Result<ExitCode, output::OutputError>,
+    ) -> Result<ExitCode, CommandError>
+    where
+        O: HumanCredentialOutcome,
+    {
+        self.execute(
+            deployment,
+            |client, api_url, access_token| {
+                let idempotency_key =
+                    crate::api::generate_idempotency_key().map_err(CommandError::Random)?;
+                operation(client, api_url, access_token, &idempotency_key)
+            },
+            write,
+        )
+    }
 }
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        super::execute_deployment_command(
-            self.command,
-            &[NAME],
-            "configure Scherzo Cloud organization access",
-            |command, deployment| {
-                super::finish_command(match command {
-                    OrganizationCommand::Create(command) => command.execute(deployment),
-                    OrganizationCommand::Show(command) => command.execute(deployment),
-                })
-            },
-        )
+        match self.command {
+            None => super::print_help(&[NAME]),
+            Some(OrganizationCommand::Create(command)) => {
+                execute_leaf(command, create::Command::execute)
+            }
+            Some(OrganizationCommand::Show(command)) => {
+                execute_leaf(command, show::Command::execute)
+            }
+            Some(OrganizationCommand::Update(command)) => {
+                execute_leaf(command, update::Command::execute)
+            }
+            Some(OrganizationCommand::Members(command)) => command.execute(),
+        }
     }
+}
+
+fn execute_leaf<T>(
+    command: T,
+    execute: impl FnOnce(T, &Deployment) -> Result<ExitCode, CommandError>,
+) -> ExitCode {
+    super::execute_deployment_command(
+        Some(command),
+        &[NAME],
+        "configure Scherzo Cloud organization access",
+        |command, deployment| super::finish_command(execute(command, deployment)),
+    )
 }
 
 trait HumanCredentialOutcome: Sized {
@@ -160,7 +200,10 @@ impl fmt::Display for CommandError {
                 write!(formatter, "prepare organization networking: {error}")
             }
             Self::Random(error) => {
-                write!(formatter, "create organization request identity: {error}")
+                write!(
+                    formatter,
+                    "generate organization mutation request identity: {error}"
+                )
             }
             Self::Organization(error) => write!(formatter, "contact organization API: {error}"),
             Self::Output(error) => write!(formatter, "write organization result: {error}"),

@@ -5,7 +5,8 @@
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
-authentication status, explicit human-principal signup, local logout, and an outbound,
+authentication status, explicit human-principal signup, local logout, organization
+profile management, one-page active member-directory reads, and an outbound,
 development-only runner transport. `scherzo-cloud runner serve` opens a versioned
 WebSocket connection, durably acknowledges received assignment offers, and never claims
 to execute them. `scherzo-cloud runner doctor` currently performs one local Git
@@ -106,6 +107,15 @@ one opaque idempotency key per invocation, and retries an ambiguous transport fa
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
 
+The `organization create`, `show`, `update`, and `members list` commands use that same
+selected human OAuth credential boundary and no other identity source. A shared command
+adapter selects the exact deployment credential and conditionally removes only the token
+rejected by HTTP 401. Create and update serialize their request once and retry at most
+one ambiguous transport failure under one in-memory idempotency key. Reads make one
+attempt, and member listing returns one server page without following its opaque
+continuation cursor. Private not-found responses remain one indistinguishable CLI
+outcome. These commands do not interpret or advertise onboarding actions.
+
 The runner uses a machine credential file supplied explicitly to `runner serve`. The
 current development-only format embeds a runner ID and a 43-character base64url secret;
 the loader rejects symlinks, files not owned by the current user, group/other-readable
@@ -189,6 +199,14 @@ response-size, and secret-handling policy. The authentication-status path transl
 generated principal and problem DTOs into handwritten domain states before the CLI
 renders human or structured output.
 
+Organization request and response DTOs follow the same boundary. The handwritten
+`src/api/organizations/` module uses generated DTOs only to serialize merge patches and
+decode successful API representations, then converts successes into validated
+handwritten organization and membership models. It owns route-specific outcomes,
+problem classification, opaque path and query construction, bounded responses, and the
+mutation retry contract. Generated blocking organization transport is not called by the
+command layer.
+
 ## Rust source shape
 
 The implementation begins as one Cargo package and one executable. Internal Rust modules
@@ -200,6 +218,12 @@ The CLI uses a typed `clap` command tree. Each command module owns its arguments
 metadata, and execution dispatch; parent modules compose those commands so parsing and
 rendered help come from the same structure. Bare command groups may print their composed
 help, but only an explicit leaf command may start long-running behavior.
+
+Organization parsing and credential policy live in `src/cli/organization.rs`; its
+`create.rs`, `show.rs`, `update.rs`, and `members.rs` children own leaf arguments and API
+calls. `output.rs` exhaustively maps the four route-specific outcomes to human text,
+schema-version-1 JSON, and process status. The command modules never expose generated
+DTOs or map raw HTTP statuses independently.
 
 `release.toml` is the public release-intent contract. It selects only the manually
 managed `MAJOR.MINOR` series; immutable public release tags provide patch history. The

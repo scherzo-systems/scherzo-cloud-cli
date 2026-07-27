@@ -5,8 +5,10 @@ use std::process::ExitCode;
 use serde::Serialize;
 
 use crate::api::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, Organization,
-    OrganizationState,
+    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
+    ListOrganizationMembershipsOutcome, MembershipRole, Organization,
+    OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
+    UpdateOrganizationOutcome,
 };
 
 const UNAUTHENTICATED_EXIT_CODE: u8 = 2;
@@ -94,16 +96,88 @@ pub(super) fn write_show(
             json,
             "The Scherzo Cloud deployment could not be reached",
         ),
-        GetOrganizationOutcome::NotFound => write_failure(
+        GetOrganizationOutcome::NotFound => write_not_found(deployment, json),
+    }
+}
+
+pub(super) fn write_update(
+    deployment: &str,
+    outcome: &UpdateOrganizationOutcome,
+    json: bool,
+) -> Result<ExitCode, OutputError> {
+    match outcome {
+        UpdateOrganizationOutcome::Updated(organization) => {
+            write_organization_success(deployment, "updated", organization, json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        UpdateOrganizationOutcome::Common(common) => write_common(
             deployment,
-            "not_found",
+            common,
+            json,
+            "Organization update could not be confirmed",
+        ),
+        UpdateOrganizationOutcome::NotFound => write_not_found(deployment, json),
+        UpdateOrganizationOutcome::SlugUnavailable => write_failure(
+            deployment,
+            "slug_unavailable",
             None,
             None,
-            "! Organization not found or unavailable.",
+            "! The requested organization slug is unavailable.",
+            ExitCode::FAILURE,
+            json,
+        ),
+        UpdateOrganizationOutcome::IdempotencyConflict => write_failure(
+            deployment,
+            "idempotency_conflict",
+            None,
+            None,
+            "! The organization request identity conflicted with another request.",
             ExitCode::FAILURE,
             json,
         ),
     }
+}
+
+pub(super) fn write_members_list(
+    deployment: &str,
+    outcome: &ListOrganizationMembershipsOutcome,
+    json: bool,
+) -> Result<ExitCode, OutputError> {
+    match outcome {
+        ListOrganizationMembershipsOutcome::Listed(page) => {
+            if json {
+                write_json(&MembershipListResult {
+                    schema_version: 1,
+                    deployment,
+                    outcome: "listed",
+                    items: &page.items,
+                    next_cursor: page.next_cursor.as_deref(),
+                })?;
+            } else {
+                write_members_human(deployment, &page.items, page.next_cursor.as_deref())?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ListOrganizationMembershipsOutcome::Common(common) => write_common(
+            deployment,
+            common,
+            json,
+            "The Scherzo Cloud deployment could not be reached",
+        ),
+        ListOrganizationMembershipsOutcome::NotFound => write_not_found(deployment, json),
+    }
+}
+
+fn write_not_found(deployment: &str, json: bool) -> Result<ExitCode, OutputError> {
+    write_failure(
+        deployment,
+        "not_found",
+        None,
+        None,
+        "! Organization not found or unavailable.",
+        ExitCode::FAILURE,
+        json,
+    )
 }
 
 fn write_common(
@@ -169,6 +243,7 @@ fn write_organization_success(
         let heading = match outcome {
             "created" => "✓ Organization created.",
             "found" => "✓ Organization found.",
+            "updated" => "✓ Organization updated.",
             _ => "✓ Organization available.",
         };
         let stdout = io::stdout();
@@ -185,6 +260,38 @@ fn write_organization_success(
         writeln!(stdout, "  Deployment:   {deployment}")?;
         Ok(())
     }
+}
+
+fn write_members_human(
+    deployment: &str,
+    items: &[OrganizationMembershipDirectoryEntry],
+    next_cursor: Option<&str>,
+) -> Result<(), OutputError> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "✓ Organization members listed.\n")?;
+    for item in items {
+        write!(
+            stdout,
+            "  Membership: {}  Principal: {}  Type: {}  Role: {}",
+            item.id,
+            item.principal_id,
+            principal_type(item.principal_type),
+            membership_role(item.role)
+        )?;
+        if let Some(display_name) = &item.display_name {
+            write!(stdout, "  Name: {display_name}")?;
+        }
+        writeln!(stdout)?;
+    }
+    if !items.is_empty() {
+        writeln!(stdout)?;
+    }
+    if let Some(next_cursor) = next_cursor {
+        writeln!(stdout, "  Next cursor: {next_cursor}")?;
+    }
+    writeln!(stdout, "  Deployment: {deployment}")?;
+    Ok(())
 }
 
 fn write_failure(
@@ -225,6 +332,20 @@ const fn organization_state(state: OrganizationState) -> &'static str {
     }
 }
 
+const fn principal_type(principal_type: PrincipalType) -> &'static str {
+    match principal_type {
+        PrincipalType::Human => "human",
+        PrincipalType::Service => "service",
+    }
+}
+
+const fn membership_role(role: MembershipRole) -> &'static str {
+    match role {
+        MembershipRole::Owner => "owner",
+        MembershipRole::Member => "member",
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrganizationResult<'a> {
@@ -232,6 +353,17 @@ struct OrganizationResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     organization: &'a Organization,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MembershipListResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    items: &'a [OrganizationMembershipDirectoryEntry],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<&'a str>,
 }
 
 #[derive(Serialize)]
