@@ -8,15 +8,27 @@ const MAXIMUM_CAP: Duration = Duration::from_secs(30);
 // doubles from one second to a thirty-second maximum.
 pub(crate) struct Backoff {
     cap: Duration,
+    fixed_unit: Option<f64>,
 }
 
 impl Backoff {
     pub(crate) fn new() -> Self {
-        Self { cap: INITIAL_CAP }
+        Self {
+            cap: INITIAL_CAP,
+            fixed_unit: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_fixed_unit(unit: f64) -> Self {
+        Self {
+            cap: INITIAL_CAP,
+            fixed_unit: Some(unit),
+        }
     }
 
     pub(crate) fn next_delay(&mut self) -> Duration {
-        self.next_delay_from(random_unit())
+        self.next_delay_from(self.fixed_unit.unwrap_or_else(random_unit))
     }
 
     // `unit` selects a point in the closed range from zero through the current

@@ -15,8 +15,8 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
-use crate::runner::service::Sleeper;
-use crate::runner::service::connection::{ConnectionError, FrameSource};
+use crate::runner::service::connection::{ConnectionError, FrameSource, run_established};
+use crate::runner::service::{ConnectionAttempt, ConnectionFuture, Connector, Sleeper};
 
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
@@ -63,7 +63,7 @@ pub(crate) struct DeterminismTranscript {
 }
 
 impl DeterminismTranscript {
-    fn record(&self, event: String) {
+    pub(crate) fn record(&self, event: String) {
         self.events
             .lock()
             .expect("determinism transcript mutex poisoned")
@@ -286,6 +286,81 @@ pub(crate) fn scripted_duplex(
     )
 }
 
+pub(crate) struct ScriptedConnection {
+    pub(crate) inbound: ScriptedInbound,
+    pub(crate) outbound: mpsc::UnboundedReceiver<Message>,
+}
+
+pub(crate) struct ScriptedConnector {
+    attempts: mpsc::UnboundedSender<ScriptedConnection>,
+    next_attempt: AtomicU64,
+    transcript: DeterminismTranscript,
+}
+
+impl Connector for ScriptedConnector {
+    fn connect<'a>(&'a self, attempt: ConnectionAttempt<'a>) -> ConnectionFuture<'a> {
+        Box::pin(async move {
+            let attempt_number = self.next_attempt.fetch_add(1, Ordering::Relaxed) + 1;
+            self.transcript
+                .record(format!("connection.attempt:{attempt_number}"));
+            let (inbound, reader, writer, outbound) = scripted_duplex(self.transcript.clone());
+            self.attempts
+                .send(ScriptedConnection { inbound, outbound })
+                .expect("scripted connection receiver should remain open");
+            let outcome = run_established(
+                attempt.dependencies,
+                attempt.opening,
+                attempt.next_sequence,
+                reader,
+                writer,
+            )
+            .await;
+            self.transcript
+                .record(describe_connection_outcome(&outcome));
+            outcome
+        })
+    }
+}
+
+pub(crate) fn scripted_connector(
+    transcript: DeterminismTranscript,
+) -> (
+    ScriptedConnector,
+    mpsc::UnboundedReceiver<ScriptedConnection>,
+) {
+    let (attempts, receiver) = mpsc::unbounded_channel();
+    (
+        ScriptedConnector {
+            attempts,
+            next_attempt: AtomicU64::new(0),
+            transcript,
+        },
+        receiver,
+    )
+}
+
+fn describe_connection_outcome(
+    outcome: &Result<super::connection::ConnectionProgress, ConnectionError>,
+) -> String {
+    match outcome {
+        Ok(progress) => format!(
+            "connection.outcome:closed:opening_acknowledged={}:handshake_completed={}",
+            progress.opening_acknowledged, progress.handshake_completed
+        ),
+        Err(error) => format!(
+            "connection.outcome:{}:{}:opening_acknowledged={}:handshake_completed={}",
+            if error.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            },
+            error.cause(),
+            error.progress.opening_acknowledged,
+            error.progress.handshake_completed,
+        ),
+    }
+}
+
 fn describe_message(message: &Message) -> String {
     match message {
         Message::Text(text) => format!("text:{text}"),
@@ -362,17 +437,40 @@ pub(crate) fn welcome() -> Message {
 }
 
 pub(crate) fn observation_acknowledgement(message_id: &str, sequence: u64) -> Message {
+    observation_acknowledgement_with_cloud_id(
+        "cmsg_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "2026-07-23T00:00:01Z",
+        message_id,
+        sequence,
+    )
+}
+
+pub(crate) fn effect_observation_acknowledgement(message_id: &str, sequence: u64) -> Message {
+    observation_acknowledgement_with_cloud_id(
+        "cmsg_01k0z6r1w8f4jy2m7q9v3x5abf",
+        "2026-07-23T00:00:03Z",
+        message_id,
+        sequence,
+    )
+}
+
+fn observation_acknowledgement_with_cloud_id(
+    cloud_message_id: &str,
+    sent_at: &str,
+    acknowledged_message_id: &str,
+    acknowledged_sequence: u64,
+) -> Message {
     Message::Text(
         json!({
             "protocolVersion": 1,
             "direction": "cloud_to_runner",
-            "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abd",
-            "sentAt": "2026-07-23T00:00:01Z",
+            "messageId": cloud_message_id,
+            "sentAt": sent_at,
             "type": "observation_ack",
             "payloadVersion": 1,
             "payload": {
-                "acknowledgedMessageId": message_id,
-                "acknowledgedSequence": sequence
+                "acknowledgedMessageId": acknowledged_message_id,
+                "acknowledgedSequence": acknowledged_sequence
             }
         })
         .to_string()

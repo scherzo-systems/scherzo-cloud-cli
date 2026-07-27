@@ -26,6 +26,8 @@ use connection::{
 };
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type ConnectionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ConnectionProgress, ConnectionError>> + Send + 'a>>;
 type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub(crate) trait Sleeper: Send + Sync {
@@ -68,6 +70,54 @@ impl Sleeper for TokioSleeper {
     )]
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_> {
         Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+struct ConnectionAttempt<'a> {
+    dependencies: ConnectionDependencies<'a>,
+    opening: OpeningHello<'a>,
+    next_sequence: &'a mut u64,
+}
+
+trait Connector: Send + Sync {
+    fn connect<'a>(&'a self, attempt: ConnectionAttempt<'a>) -> ConnectionFuture<'a>;
+}
+
+struct WebSocketConnector;
+
+impl Connector for WebSocketConnector {
+    fn connect<'a>(&'a self, attempt: ConnectionAttempt<'a>) -> ConnectionFuture<'a> {
+        Box::pin(connection::run(
+            attempt.dependencies,
+            attempt.opening,
+            attempt.next_sequence,
+        ))
+    }
+}
+
+struct ConnectionLoopDependencies {
+    config: Config,
+    frame_source: Arc<dyn FrameSource>,
+    sleeper: Arc<dyn Sleeper>,
+    recorder: Arc<Recorder>,
+    boot_id: String,
+}
+
+impl ConnectionLoopDependencies {
+    fn new(
+        config: Config,
+        frame_source: Arc<dyn FrameSource>,
+        sleeper: Arc<dyn Sleeper>,
+        recorder: Arc<Recorder>,
+        boot_id: String,
+    ) -> Self {
+        Self {
+            config,
+            frame_source,
+            sleeper,
+            recorder,
+            boot_id,
+        }
     }
 }
 
@@ -150,6 +200,32 @@ async fn run_service_loop(
     boot_id: String,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
+    run_connection_loop(
+        ConnectionLoopDependencies::new(config, frame_source, sleeper, recorder, boot_id),
+        &WebSocketConnector,
+        Backoff::new(),
+        shutdown.wait(),
+    )
+    .await
+}
+
+async fn run_connection_loop<C>(
+    dependencies: ConnectionLoopDependencies,
+    connector: &dyn Connector,
+    mut backoff: Backoff,
+    cancellation: C,
+) -> Result<(), ServiceError>
+where
+    C: Future<Output = ()>,
+{
+    let ConnectionLoopDependencies {
+        config,
+        frame_source,
+        sleeper,
+        recorder,
+        boot_id,
+    } = dependencies;
+    tokio::pin!(cancellation);
     let mut opening_sequence = 1;
     let mut sequence = opening_sequence;
     let mut opening_message_id = frame_source.public_id("rmsg_");
@@ -165,19 +241,18 @@ async fn run_service_loop(
     sequence = sequence
         .checked_add(1)
         .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
-    let mut backoff = Backoff::new();
     let mut attempt = 1_u64;
 
     loop {
         let connection_event = connection_event(&recorder, &config, &boot_id, attempt);
         let active_effect_event = ActiveEffectEvent::new();
         tokio::select! {
-            _ = shutdown.wait() => {
+            _ = &mut cancellation => {
                 cancel_attempt(&connection_event, &active_effect_event);
                 return Ok(());
             },
-            result = connection::run(
-                ConnectionDependencies::new(
+            result = connector.connect(ConnectionAttempt {
+                dependencies: ConnectionDependencies::new(
                     &config,
                     frame_source.as_ref(),
                     sleeper.as_ref(),
@@ -185,14 +260,14 @@ async fn run_service_loop(
                     &connection_event,
                     &active_effect_event,
                 ),
-                OpeningHello {
+                opening: OpeningHello {
                     boot_id: &boot_id,
                     encoded: &opening,
                     message_id: &opening_message_id,
                     sequence: opening_sequence,
                 },
-                &mut sequence,
-            ) => {
+                next_sequence: &mut sequence,
+            }) => {
                 let (progress, cause, kind) = match result {
                     Ok(progress) => (
                         progress,
@@ -246,7 +321,7 @@ async fn run_service_loop(
                 }
                 attempt = attempt.saturating_add(1);
                 tokio::select! {
-                    _ = shutdown.wait() => return Ok(()),
+                    _ = &mut cancellation => return Ok(()),
                     _ = sleeper.sleep(delay) => {}
                 }
             }
