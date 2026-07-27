@@ -13,18 +13,50 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use opentelemetry::KeyValue;
+
 pub(crate) use config::Config;
 
+use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use backoff::Backoff;
 use connection::{
-    ConnectionError, ConnectionProgress, FrameSource, OpeningHello, SystemFrameSource,
-    opening_hello,
+    ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
+    ConnectionProgress, FailureKind, FrameSource, OpeningHello, SystemFrameSource, opening_hello,
+    record_progress,
 };
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub(crate) trait Sleeper: Send + Sync {
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_>;
+}
+
+trait Shutdown: Send {
+    fn wait(&mut self) -> ShutdownFuture<'_>;
+}
+
+struct ProcessShutdown {
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ProcessShutdown {
+    fn new() -> Result<Self, ServiceError> {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|_| ServiceError::BuildRuntime)?;
+        Ok(Self { terminate })
+    }
+}
+
+impl Shutdown for ProcessShutdown {
+    fn wait(&mut self) -> ShutdownFuture<'_> {
+        Box::pin(async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = self.terminate.recv() => {}
+            }
+        })
+    }
 }
 
 struct TokioSleeper;
@@ -74,22 +106,50 @@ pub(crate) fn run(config: Config) -> Result<(), ServiceError> {
 }
 
 async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
-    run_until_cancelled_with_dependencies(
+    let frame_source: Arc<dyn FrameSource> = Arc::new(SystemFrameSource);
+    let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
+    let boot_id = frame_source.public_id("rbt_");
+    let recorder = Recorder::stderr(env!("CARGO_PKG_VERSION"), &boot_id);
+    let mut shutdown = ProcessShutdown::new()?;
+    run_service_loop(
         config,
-        Arc::new(SystemFrameSource),
-        Arc::new(TokioSleeper),
+        frame_source,
+        sleeper,
+        recorder,
+        boot_id,
+        &mut shutdown,
     )
     .await
 }
 
+#[cfg(test)]
 async fn run_until_cancelled_with_dependencies(
     config: Config,
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
+    recorder: Arc<Recorder>,
+    mut shutdown: Box<dyn Shutdown>,
 ) -> Result<(), ServiceError> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|_| ServiceError::BuildRuntime)?;
     let boot_id = frame_source.public_id("rbt_");
+    run_service_loop(
+        config,
+        frame_source,
+        sleeper,
+        recorder,
+        boot_id,
+        shutdown.as_mut(),
+    )
+    .await
+}
+
+async fn run_service_loop(
+    config: Config,
+    frame_source: Arc<dyn FrameSource>,
+    sleeper: Arc<dyn Sleeper>,
+    recorder: Arc<Recorder>,
+    boot_id: String,
+    shutdown: &mut dyn Shutdown,
+) -> Result<(), ServiceError> {
     let mut opening_sequence = 1;
     let mut sequence = opening_sequence;
     let mut opening_message_id = frame_source.public_id("rmsg_");
@@ -106,15 +166,25 @@ async fn run_until_cancelled_with_dependencies(
         .checked_add(1)
         .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
     let mut backoff = Backoff::new();
+    let mut attempt = 1_u64;
 
     loop {
+        let connection_event = connection_event(&recorder, &config, &boot_id, attempt);
+        let active_effect_event = ActiveEffectEvent::new();
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = terminate.recv() => return Ok(()),
+            _ = shutdown.wait() => {
+                cancel_attempt(&connection_event, &active_effect_event);
+                return Ok(());
+            },
             result = connection::run(
-                &config,
-                frame_source.as_ref(),
-                sleeper.as_ref(),
+                ConnectionDependencies::new(
+                    &config,
+                    frame_source.as_ref(),
+                    sleeper.as_ref(),
+                    &recorder,
+                    &connection_event,
+                    &active_effect_event,
+                ),
                 OpeningHello {
                     boot_id: &boot_id,
                     encoded: &opening,
@@ -123,14 +193,42 @@ async fn run_until_cancelled_with_dependencies(
                 },
                 &mut sequence,
             ) => {
-                let (progress, cause) = match result {
-                    Ok(progress) => (progress, "gateway closed connection"),
-                    Err(error) if error.is_terminal() => return Err(ServiceError::Connection(error)),
-                    Err(error) => (error.progress, error.cause()),
+                let (progress, cause, kind) = match result {
+                    Ok(progress) => (
+                        progress,
+                        ConnectionCause::GatewayClosedConnection,
+                        FailureKind::Retryable,
+                    ),
+                    Err(error) if error.is_terminal() => {
+                        finish_connection_event(
+                            &connection_event,
+                            error.progress,
+                            error.kind(),
+                            error.connection_cause(),
+                            None,
+                            Outcome::Failure,
+                        );
+                        return Err(ServiceError::Connection(error));
+                    }
+                    Err(error) => (error.progress, error.connection_cause(), error.kind()),
                 };
                 if progress.handshake_completed {
                     backoff.reset();
                 }
+                let delay = backoff.next_delay();
+                let outcome = if cause.is_timeout() {
+                    Outcome::Timeout
+                } else {
+                    Outcome::Disconnected
+                };
+                finish_connection_event(
+                    &connection_event,
+                    progress,
+                    kind,
+                    cause,
+                    Some(delay),
+                    outcome,
+                );
                 if progress.opening_acknowledged {
                     opening_message_id = frame_source.public_id("rmsg_");
                     opening_sequence = sequence;
@@ -146,14 +244,9 @@ async fn run_until_cancelled_with_dependencies(
                         .checked_add(1)
                         .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
                 }
-                let delay = backoff.next_delay();
-                eprintln!(
-                    "runner gateway disconnected ({cause}); retrying in {} seconds",
-                    delay.as_secs()
-                );
+                attempt = attempt.saturating_add(1);
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => return Ok(()),
-                    _ = terminate.recv() => return Ok(()),
+                    _ = shutdown.wait() => return Ok(()),
                     _ = sleeper.sleep(delay) => {}
                 }
             }
@@ -161,16 +254,83 @@ async fn run_until_cancelled_with_dependencies(
     }
 }
 
+fn connection_event(recorder: &Recorder, config: &Config, boot_id: &str, attempt: u64) -> Event {
+    let mut attributes = vec![
+        KeyValue::new(
+            telemetry::attribute::RUNNER_ID,
+            config.credential().runner_id().to_owned(),
+        ),
+        KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
+        KeyValue::new(
+            telemetry::attribute::RUNNER_VERSION,
+            env!("CARGO_PKG_VERSION"),
+        ),
+        KeyValue::new(
+            telemetry::attribute::CONNECTION_ATTEMPT,
+            telemetry::integer(attempt),
+        ),
+    ];
+    if let Some(address) = config.endpoint().host_str() {
+        attributes.push(KeyValue::new(
+            telemetry::attribute::SERVER_ADDRESS,
+            address.to_owned(),
+        ));
+    }
+    if let Some(port) = config.endpoint().port_or_known_default() {
+        attributes.push(KeyValue::new(
+            telemetry::attribute::SERVER_PORT,
+            i64::from(port),
+        ));
+    }
+    let event = recorder.start("runner.gateway_connection", attributes);
+    record_progress(&event, ConnectionProgress::unacknowledged());
+    event
+}
+
+fn cancel_attempt(connection_event: &Event, active_effect_event: &ActiveEffectEvent) {
+    active_effect_event.finish(Outcome::Cancelled, None);
+    connection_event.finish(Outcome::Cancelled);
+}
+
+fn finish_connection_event(
+    event: &Event,
+    progress: ConnectionProgress,
+    kind: FailureKind,
+    cause: ConnectionCause,
+    backoff: Option<std::time::Duration>,
+    outcome: Outcome,
+) {
+    record_progress(event, progress);
+    event.set(KeyValue::new(
+        telemetry::attribute::FAILURE_KIND,
+        kind.as_str(),
+    ));
+    event.set(KeyValue::new(
+        telemetry::attribute::ERROR_TYPE,
+        cause.error_type(),
+    ));
+    if let Some(backoff) = backoff {
+        event.set(KeyValue::new(
+            telemetry::attribute::BACKOFF_MS,
+            telemetry::integer_u128(backoff.as_millis()),
+        ));
+    }
+    event.finish(outcome);
+}
+
 const fn sequence_overflow() -> ConnectionError {
     ConnectionError::terminal(
         ConnectionProgress::unacknowledged(),
-        "runner sequence overflow",
+        ConnectionCause::RunnerSequenceOverflow,
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
+
+    use tokio::sync::Notify;
 
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -180,12 +340,17 @@ mod tests {
 
     use super::sequence_overflow;
     use super::test_support::{
-        accept_fixture_socket, assignment_offer, controlled_sleeper, deterministic_frame_source,
-        effect_acknowledgement, expect_opening_hello, fixture_listener,
-        observation_acknowledgement, welcome, with_watchdog,
+        SleepRelease, accept_fixture_socket, accept_opened_fixture_socket, assignment_offer,
+        controlled_sleeper, deterministic_frame_source, effect_acknowledgement, expect_close_frame,
+        expect_opening_hello, fixture_listener, observation_acknowledgement,
+        offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
-    use super::{Config, ServiceError, run_until_cancelled_with_dependencies};
+    use super::{
+        Config, ServiceError, Shutdown, ShutdownFuture, Sleeper,
+        run_until_cancelled_with_dependencies,
+    };
     use crate::runner::credential::test_credential;
+    use crate::runner::telemetry::{TestCapture, test_recorder};
 
     #[test]
     fn reports_connection_failure_cause() {
@@ -194,6 +359,89 @@ mod tests {
             error.to_string(),
             "runner service stopped unexpectedly: runner gateway connection failed: runner sequence overflow"
         );
+    }
+
+    struct ControlledShutdown {
+        notification: Arc<Notify>,
+    }
+
+    impl Shutdown for ControlledShutdown {
+        fn wait(&mut self) -> ShutdownFuture<'_> {
+            Box::pin(self.notification.notified())
+        }
+    }
+
+    fn controlled_shutdown() -> (Box<dyn Shutdown>, Arc<Notify>) {
+        let notification = Arc::new(Notify::new());
+        (
+            Box::new(ControlledShutdown {
+                notification: Arc::clone(&notification),
+            }),
+            notification,
+        )
+    }
+
+    fn spawn_fixture_service(
+        endpoint: &str,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        TestCapture,
+        Arc<Notify>,
+    ) {
+        let config = Config::new(endpoint, test_credential(), true).expect("configure gateway");
+        let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
+        let (shutdown, shutdown_trigger) = controlled_shutdown();
+        let service = tokio::spawn(run_until_cancelled_with_dependencies(
+            config,
+            deterministic_frame_source(),
+            sleeper,
+            recorder,
+            shutdown,
+        ));
+        (service, capture, shutdown_trigger)
+    }
+
+    async fn backoff_request(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+    ) -> (Duration, SleepRelease) {
+        loop {
+            let (delay, release) = with_watchdog(requests.recv())
+                .await
+                .expect("runner did not request backoff")
+                .expect("controlled sleeper closed");
+            if delay < Duration::from_secs(1) {
+                return (delay, release);
+            }
+            drop(release);
+        }
+    }
+
+    async fn abort_service(service: tokio::task::JoinHandle<Result<(), ServiceError>>) {
+        service.abort();
+        assert!(
+            service
+                .await
+                .expect_err("service task should be aborted")
+                .is_cancelled()
+        );
+    }
+
+    fn assert_attempt_event_pair(
+        capture: &TestCapture,
+        effect_outcome: &str,
+        effect_error_type: Option<&str>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        assert_eq!(capture.events().len(), 2);
+        let effect = capture.event("runner.effect_acknowledgement");
+        assert_eq!(effect["scherzo.outcome"], effect_outcome);
+        assert_eq!(
+            effect.get("error.type").and_then(serde_json::Value::as_str),
+            effect_error_type,
+        );
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+        capture.event("runner.gateway_connection")
     }
 
     #[tokio::test]
@@ -205,19 +453,24 @@ mod tests {
             socket
                 .send(Message::Close(Some(CloseFrame {
                     code: CloseCode::Policy,
-                    reason: "invalid runner observation".into(),
+                    reason: "PEER-CLOSE-REASON-MUST-NOT-LEAK".into(),
                 })))
                 .await
                 .expect("send policy close");
             while let Some(Ok(_)) = socket.next().await {}
         });
 
+        let endpoint = format!("{endpoint}?secret=URL-QUERY-MUST-NOT-LEAK");
         let config = Config::new(&endpoint, test_credential(), true).expect("configure gateway");
         let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
+        let (shutdown, _shutdown_trigger) = controlled_shutdown();
         let error = with_watchdog(run_until_cancelled_with_dependencies(
             config,
             deterministic_frame_source(),
             sleeper,
+            recorder,
+            shutdown,
         ))
         .await
         .expect("runner retried a terminal policy close")
@@ -228,6 +481,27 @@ mod tests {
              gateway closed connection with policy violation"
         );
         server.await.expect("fixture server failed");
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["event.name"], "runner.gateway_connection");
+        assert_eq!(event["scherzo.connection.attempt"], 1);
+        assert_eq!(event["scherzo.connection.failure_kind"], "terminal");
+        assert_eq!(event["error.type"], "gateway_policy_violation");
+        assert_eq!(event["scherzo.outcome"], "failure");
+        assert_eq!(event["scherzo.cloud.text_frames_received"], 0);
+        assert_eq!(event["scherzo.runner.text_frames_sent"], 1);
+        assert!(event.get("scherzo.connection.backoff_ms").is_none());
+        let encoded = serde_json::to_string(event).expect("encode terminal connection event");
+        for sentinel in [
+            "URL-QUERY-MUST-NOT-LEAK",
+            "PEER-CLOSE-REASON-MUST-NOT-LEAK",
+            "abcdefghijklmnopqrstuvwxyzABCDEFG-012345678",
+        ] {
+            assert!(!encoded.contains(sentinel));
+        }
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
     }
 
     #[tokio::test]
@@ -289,38 +563,219 @@ mod tests {
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
         });
 
-        let config = Config::new(&endpoint, test_credential(), true).expect("configure gateway");
         let (sleeper, mut sleep_requests) = controlled_sleeper();
-        let service = tokio::spawn(run_until_cancelled_with_dependencies(
-            config,
-            deterministic_frame_source(),
-            sleeper,
-        ));
+        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
         with_watchdog(failure_received)
             .await
             .expect("first connection did not reach its failure")
             .expect("fixture server dropped failure signal");
-        let release_sleep = loop {
-            let (delay, release_sleep) = with_watchdog(sleep_requests.recv())
-                .await
-                .expect("runner did not request a timer")
-                .expect("controlled sleeper closed");
-            if delay < Duration::from_secs(1) {
-                break release_sleep;
-            }
-            release_sleep.release();
-        };
+        let (backoff_delay, release_sleep) = backoff_request(&mut sleep_requests).await;
+        let events = capture.events();
+        let connection_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["event.name"] == "runner.gateway_connection")
+            .collect();
+        assert_eq!(connection_events.len(), 1);
+        let event = connection_events[0];
+        assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
+        assert_eq!(event["error.type"], "undecodable_gateway_frame");
+        assert_eq!(event["scherzo.outcome"], "disconnected");
+        assert_eq!(
+            event["scherzo.connection.backoff_ms"],
+            i64::try_from(backoff_delay.as_millis()).expect("fixture backoff fits i64")
+        );
+        assert_eq!(event["scherzo.runner.opening_acknowledged"], true);
+        assert_eq!(event["scherzo.runner.handshake_completed"], true);
+        assert_eq!(event["scherzo.cloud.text_frames_received"], 3);
+        assert_eq!(event["scherzo.runner.text_frames_sent"], 2);
+        assert_eq!(event["scherzo.runner.effects_received"], 1);
+        assert_eq!(event["scherzo.runner.effect_acknowledgements_confirmed"], 0);
+        assert!(
+            !serde_json::to_string(event)
+                .expect("encode retryable connection event")
+                .contains("not valid JSON")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event.name"] == "runner.effect_acknowledgement")
+                .count(),
+            1
+        );
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
         release_sleep.release();
         let server_result = with_watchdog(server).await;
-        service.abort();
-        assert!(
-            service
-                .await
-                .expect_err("service task should be aborted")
-                .is_cancelled()
-        );
+        abort_service(service).await;
         server_result
             .expect("runner did not reconnect")
             .expect("fixture server failed");
+    }
+
+    #[tokio::test]
+    async fn records_a_normal_gateway_close_once_before_backoff() {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut socket).await;
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "normal fixture close".into(),
+                })))
+                .await
+                .expect("send normal close");
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+        let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event.name"], "runner.gateway_connection");
+        assert_eq!(events[0]["error.type"], "gateway_closed_connection");
+        assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
+        assert_eq!(events[0]["scherzo.outcome"], "disconnected");
+        assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+
+        abort_service(service).await;
+        drop(release_backoff);
+        with_watchdog(server)
+            .await
+            .expect("fixture server did not close")
+            .expect("fixture server failed");
+    }
+
+    #[tokio::test]
+    async fn records_a_connection_timeout_once_with_backoff() {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept fixture connection");
+            std::future::pending::<()>().await;
+        });
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+
+        sleep_request(&mut sleep_requests, Duration::from_secs(10))
+            .await
+            .release();
+        let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event.name"], "runner.gateway_connection");
+        assert_eq!(events[0]["error.type"], "connect_timeout");
+        assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
+        assert_eq!(events[0]["scherzo.outcome"], "timeout");
+        assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+
+        abort_service(service).await;
+        drop(release_backoff);
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("fixture server should be aborted")
+                .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_pending_effect_event_timeout() {
+        let (listener, endpoint) = fixture_listener().await;
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_opened_fixture_socket(&listener).await;
+
+            let welcome_timer = sleep_request(&mut sleep_requests, Duration::from_secs(5)).await;
+            socket.send(welcome()).await.expect("send welcome");
+            let first_liveness_timer =
+                sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
+            drop(welcome_timer);
+            socket
+                .send(observation_acknowledgement(
+                    "rmsg_00000000000000000000000002",
+                    1,
+                ))
+                .await
+                .expect("send opening acknowledgement");
+            let second_liveness_timer =
+                sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
+            drop(first_liveness_timer);
+            socket
+                .send(assignment_offer())
+                .await
+                .expect("send assignment offer");
+            let _acknowledgement = effect_acknowledgement(&mut socket).await;
+            let pending_liveness_timer =
+                sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
+            drop(second_liveness_timer);
+            pending_liveness_timer.release();
+
+            let close = expect_close_frame(&mut socket).await;
+            assert_eq!(close.code, CloseCode::Away);
+            backoff_request(&mut sleep_requests).await.1
+        });
+
+        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+        let release_backoff = with_watchdog(server)
+            .await
+            .expect("runner did not time out the pending acknowledgement")
+            .expect("fixture server failed");
+
+        let connection =
+            assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"));
+        assert_eq!(connection["scherzo.outcome"], "timeout");
+        assert_eq!(connection["error.type"], "gateway_liveness_timeout");
+
+        abort_service(service).await;
+        drop(release_backoff);
+    }
+
+    #[tokio::test]
+    async fn classifies_pending_effect_event_cancellation() {
+        let (listener, endpoint) = fixture_listener().await;
+        let (pending_sent, pending_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_opened_fixture_socket(&listener).await;
+            let _acknowledgement =
+                offer_assignment_after_handshake(&mut socket, "rmsg_00000000000000000000000002", 1)
+                    .await;
+            pending_sent
+                .send(())
+                .expect("report pending effect acknowledgement");
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (service, capture, shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+        with_watchdog(pending_received)
+            .await
+            .expect("effect acknowledgement did not become pending")
+            .expect("fixture server dropped pending signal");
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service)
+            .await
+            .expect("runner service ignored termination")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        with_watchdog(server)
+            .await
+            .expect("fixture server did not observe shutdown")
+            .expect("fixture server failed");
+
+        let connection = assert_attempt_event_pair(&capture, "cancelled", None);
+        assert_eq!(connection["scherzo.outcome"], "cancelled");
+        assert_eq!(connection["scherzo.runner.opening_acknowledged"], true);
+        assert_eq!(connection["scherzo.runner.handshake_completed"], true);
+        assert!(connection.get("error.type").is_none());
+        assert!(connection.get("scherzo.connection.failure_kind").is_none());
+        assert!(connection.get("scherzo.connection.backoff_ms").is_none());
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
     }
 }

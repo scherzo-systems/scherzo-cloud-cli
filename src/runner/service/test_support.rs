@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::{Sink, Stream, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
@@ -408,10 +408,36 @@ pub(crate) async fn effect_acknowledgement(socket: &mut FixtureSocket) -> Value 
     serde_json::from_str(&message).expect("decode effect acknowledgement")
 }
 
+pub(crate) async fn offer_assignment_after_handshake(
+    socket: &mut FixtureSocket,
+    opening_message_id: &str,
+    opening_sequence: u64,
+) -> Value {
+    socket.send(welcome()).await.expect("send welcome");
+    socket
+        .send(observation_acknowledgement(
+            opening_message_id,
+            opening_sequence,
+        ))
+        .await
+        .expect("send opening acknowledgement");
+    socket
+        .send(assignment_offer())
+        .await
+        .expect("send assignment offer");
+    effect_acknowledgement(socket).await
+}
+
 pub(crate) async fn expect_opening_hello(socket: &mut FixtureSocket) {
     let Some(Ok(Message::Text(_))) = socket.next().await else {
         panic!("fixture did not receive opening hello");
     };
+}
+
+pub(crate) async fn accept_opened_fixture_socket(listener: &TcpListener) -> FixtureSocket {
+    let mut socket = accept_fixture_socket(listener).await;
+    expect_opening_hello(&mut socket).await;
+    socket
 }
 
 pub(crate) async fn expect_close_frame(socket: &mut FixtureSocket) -> CloseFrame {

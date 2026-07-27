@@ -13,8 +13,8 @@ The current release supports help, version inspection, OAuth Device Authorizatio
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, runner diagnostics, and a development-only outbound runner
 transport. `runner serve` connects to an explicitly configured runner gateway, receives
-and transport-acknowledges assignment offers, and reports that execution is not yet
-implemented.
+and transport-acknowledges assignment offers, and emits structured service events
+without claiming that execution occurred.
 
 Apart from creating the signed-in human's account and receiving a development assignment,
 the CLI cannot currently create cloud resources, configure a repository, submit
@@ -127,8 +127,26 @@ WebSocket Ping controls, and uses at-least-once transport acknowledgement. Termi
 failures — a gateway transport-integrity rejection (WebSocket close status 1008) or a
 rejected credential or configuration at upgrade — exit nonzero instead of retrying;
 restarting the process begins a fresh boot and re-reads the credential file. It
-receives at most one assignment effect at a time. Receiving an offer is not assignment acceptance or execution; repository
-checkout, workflow execution, and production runner enrollment remain unimplemented.
+receives at most one assignment effect at a time. Receiving an offer is not assignment
+acceptance or execution; repository checkout, workflow execution, and production runner
+enrollment remain unimplemented.
+
+While the service runs, standard error contains newline-delimited JSON. Each outbound
+attempt completes one `runner.gateway_connection` event with safe runner and boot IDs,
+server host and port, protocol progress and counts, retry classification, selected
+backoff when applicable, and a closed outcome and error type. Each offered effect
+completes one `runner.effect_acknowledgement` event after transport confirmation or an
+earlier safe ending. Its `success` outcome means only that the gateway confirmed the
+runner's transport acknowledgement; the runner does not emit `runner.run` yet. The same
+unit of work is also recorded as a local OpenTelemetry span, but this release configures
+no exporter and makes no telemetry network request. Completed JSON records enter a
+bounded non-blocking queue, so a stalled standard-error consumer cannot delay runner
+protocol work; saturation or output failure drops and counts a record.
+
+Service events never contain the machine credential, endpoint path or query, raw
+protocol frames, WebSocket close reasons, or arbitrary network errors. Human and JSON
+output contracts for help, version, authentication, account, and `runner doctor` remain
+unchanged and do not initialize runner telemetry.
 
 ## Release series
 

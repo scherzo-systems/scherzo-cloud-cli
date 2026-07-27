@@ -48,6 +48,31 @@ compiled-in checks through the same registry without adding a central check-name
 but it must keep those boundaries intact.
 
 
+## Runner service observability
+
+Long-running runner machine behavior owns a local recorder beneath `src/runner/`. One
+recorder projects each completed unit of work to a newline-delimited JSON object on
+standard error and to an OpenTelemetry span through a process-local SDK provider. JSON
+records enter a bounded queue without waiting; a dedicated local thread owns standard
+error, preserves record framing after partial writes, and counts records dropped by
+queue saturation or output failure. The provider has no span processor or exporter, so
+instrumentation performs no telemetry network requests. Recorder initialization is
+scoped to `runner serve`; interactive and offline commands retain their existing stdout
+and stderr contracts.
+
+`runner.gateway_connection` bounds one outbound connection attempt, including live
+handshake progress, attempt-local frame and effect counts, a closed connection cause,
+and retry backoff selected by the service. `runner.effect_acknowledgement` bounds one
+offer from receipt through gateway confirmation of the transport acknowledgement. It
+includes safe effect, assignment, run, runner, boot, sequence, and lease context, but it
+does not represent assignment acceptance or execution. The name `runner.run` remains
+reserved until the execution component exists.
+
+Telemetry call sites accept only reviewed scalar attributes and closed classifications.
+They do not copy credentials, complete endpoints, protocol frames, peer close reasons,
+or arbitrary errors into either projection. Queue saturation and JSON write failures are counted and do not change connection,
+acknowledgement, retry, or shutdown behavior.
+
 These are component boundaries before they are separate packages or executables. A
 second runner binary should be introduced only if platform dependencies, privilege
 isolation, artifact size, or independent release cadence creates a demonstrated need.

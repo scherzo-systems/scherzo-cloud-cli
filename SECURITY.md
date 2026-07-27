@@ -42,6 +42,28 @@ disable general retries, and reject response bodies larger than 1 MiB. A `401` r
 removes the rejected credential without deleting a token that another process replaced
 while the request was in flight.
 
+## Runner service telemetry
+
+`runner serve` writes one newline-delimited JSON event for each gateway connection
+attempt and effect transport acknowledgement. The same reviewed attributes are attached
+to a local OpenTelemetry span, but the runner configures no exporter and sends no
+telemetry over the network.
+
+The allowlist contains opaque public runner, boot, effect, assignment, and run IDs;
+closed outcomes and error types; the gateway host and port; protocol sequence, progress,
+and bounded counters; and durations. It excludes the machine credential, authorization
+header, credential path, endpoint path and query, raw protocol frames, peer close
+reasons, and arbitrary network, TLS, HTTP, WebSocket, filesystem, or child-process error
+text. A successful effect event means only that the gateway confirmed transport receipt;
+it is not evidence of assignment acceptance or execution.
+
+Telemetry is subordinate to runner work. Completed records enter a bounded queue without
+waiting, and a dedicated local thread owns standard error and repairs the line boundary
+after a partial write. Queue saturation or a failed local write drops and counts a
+record rather than changing protocol handling, retry classification, or process
+shutdown. Help, version, authentication, account, and `runner doctor` commands do not
+initialize this recorder or change their output contracts.
+
 ## Runner doctor
 
 `runner doctor` is offline. It does not load human deployment configuration, read the

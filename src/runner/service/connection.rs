@@ -1,7 +1,9 @@
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use opentelemetry::KeyValue;
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
@@ -12,6 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use crate::runner::service::Sleeper;
 use crate::runner::service::config::Config;
+use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use crate::runner_protocol::{
     CloudFrame, RunnerEnvelope, RunnerFrame, decode_cloud_frame, encode_runner_frame,
 };
@@ -47,7 +50,7 @@ impl FrameSource for SystemFrameSource {
             .map_err(|_| {
                 ConnectionError::terminal(
                     ConnectionProgress::unacknowledged(),
-                    "format current timestamp",
+                    ConnectionCause::FormatCurrentTimestamp,
                 )
             })
     }
@@ -65,6 +68,10 @@ pub(crate) struct OpeningHello<'a> {
 pub(crate) struct ConnectionProgress {
     pub(crate) opening_acknowledged: bool,
     pub(crate) handshake_completed: bool,
+    pub(crate) cloud_text_frames_received: u64,
+    pub(crate) runner_text_frames_sent: u64,
+    pub(crate) effects_received: u64,
+    pub(crate) effect_acknowledgements_confirmed: u64,
 }
 
 impl ConnectionProgress {
@@ -72,7 +79,17 @@ impl ConnectionProgress {
         Self {
             opening_acknowledged: false,
             handshake_completed: false,
+            cloud_text_frames_received: 0,
+            runner_text_frames_sent: 0,
+            effects_received: 0,
+            effect_acknowledgements_confirmed: 0,
         }
+    }
+
+    fn incremented(self, value: u64) -> Result<u64, ConnectionError> {
+        value.checked_add(1).ok_or_else(|| {
+            ConnectionError::terminal(self, ConnectionCause::ConnectionCounterOverflow)
+        })
     }
 }
 
@@ -85,15 +102,164 @@ pub(crate) enum FailureKind {
     Terminal,
 }
 
+impl FailureKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ConnectionCause {
+    FormatCurrentTimestamp,
+    GatewayPolicyViolation,
+    GatewayUnsupportedFrames,
+    GatewayOversizedFrames,
+    BuildGatewayRequest,
+    BuildAuthorizationHeader,
+    CredentialRejected,
+    ConnectionRequestRejected,
+    GatewayHttpError,
+    ConnectGateway,
+    ConnectTimeout,
+    RequiredSubprotocolNotSelected,
+    EncodeOpeningHelloUtf8,
+    SendOpeningHello,
+    GatewayLivenessTimeout,
+    GatewayWelcomeTimeout,
+    OversizedGatewayFrame,
+    ReadGatewayFrame,
+    UndecodableGatewayFrame,
+    UnexpectedObservationAcknowledgement,
+    MismatchedEffectAcknowledgement,
+    ObservationSequenceOverflow,
+    FormatEffectAcknowledgementTimestamp,
+    CalculateLeaseRemaining,
+    EncodeEffectAcknowledgement,
+    EncodeEffectAcknowledgementUtf8,
+    SendEffectAcknowledgement,
+    UnexpectedGatewayFrame,
+    FlushRunnerPong,
+    BinaryGatewayFrame,
+    UnexpectedRawGatewayFrame,
+    FormatOpeningHelloTimestamp,
+    EncodeOpeningHello,
+    RunnerSequenceOverflow,
+    GatewayClosedConnection,
+    ConnectionCounterOverflow,
+    EffectAcknowledgementUnconfirmed,
+}
+
+impl ConnectionCause {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::FormatCurrentTimestamp => "format current timestamp",
+            Self::GatewayPolicyViolation => "gateway closed connection with policy violation",
+            Self::GatewayUnsupportedFrames => {
+                "gateway attributed unsupported frames to this runner"
+            }
+            Self::GatewayOversizedFrames => "gateway attributed oversized frames to this runner",
+            Self::BuildGatewayRequest => "build gateway request",
+            Self::BuildAuthorizationHeader => "build authorization header",
+            Self::CredentialRejected => "runner gateway rejected the credential",
+            Self::ConnectionRequestRejected => "runner gateway rejected the connection request",
+            Self::GatewayHttpError => "runner gateway returned an HTTP error",
+            Self::ConnectGateway => "connect to runner gateway",
+            Self::ConnectTimeout => "runner gateway connect timeout",
+            Self::RequiredSubprotocolNotSelected => {
+                "runner gateway did not select the required subprotocol"
+            }
+            Self::EncodeOpeningHelloUtf8 => "encode opening hello as UTF-8",
+            Self::SendOpeningHello => "send opening hello",
+            Self::GatewayLivenessTimeout => "gateway liveness timeout",
+            Self::GatewayWelcomeTimeout => "gateway welcome timeout",
+            Self::OversizedGatewayFrame => "oversized gateway frame",
+            Self::ReadGatewayFrame => "read gateway frame",
+            Self::UndecodableGatewayFrame => "undecodable gateway frame",
+            Self::UnexpectedObservationAcknowledgement => "unexpected observation acknowledgement",
+            Self::MismatchedEffectAcknowledgement => "mismatched effect acknowledgement",
+            Self::ObservationSequenceOverflow => "runner observation sequence overflow",
+            Self::FormatEffectAcknowledgementTimestamp => "format effect acknowledgement timestamp",
+            Self::CalculateLeaseRemaining => "calculate effect lease remaining",
+            Self::EncodeEffectAcknowledgement => "encode effect acknowledgement",
+            Self::EncodeEffectAcknowledgementUtf8 => "encode effect acknowledgement as UTF-8",
+            Self::SendEffectAcknowledgement => "send effect acknowledgement",
+            Self::UnexpectedGatewayFrame => "unexpected gateway frame",
+            Self::FlushRunnerPong => "flush runner pong",
+            Self::BinaryGatewayFrame => "binary gateway frame",
+            Self::UnexpectedRawGatewayFrame => "unexpected raw gateway frame",
+            Self::FormatOpeningHelloTimestamp => "format opening hello timestamp",
+            Self::EncodeOpeningHello => "encode opening hello",
+            Self::RunnerSequenceOverflow => "runner sequence overflow",
+            Self::GatewayClosedConnection => "gateway closed connection",
+            Self::ConnectionCounterOverflow => "runner connection counter overflow",
+            Self::EffectAcknowledgementUnconfirmed => {
+                "effect acknowledgement confirmation not received"
+            }
+        }
+    }
+
+    pub(crate) const fn error_type(self) -> &'static str {
+        match self {
+            Self::FormatCurrentTimestamp => "format_current_timestamp",
+            Self::GatewayPolicyViolation => "gateway_policy_violation",
+            Self::GatewayUnsupportedFrames => "gateway_unsupported_frames",
+            Self::GatewayOversizedFrames => "gateway_oversized_frames",
+            Self::BuildGatewayRequest => "build_gateway_request",
+            Self::BuildAuthorizationHeader => "build_authorization_header",
+            Self::CredentialRejected => "credential_rejected",
+            Self::ConnectionRequestRejected => "connection_request_rejected",
+            Self::GatewayHttpError => "gateway_http_error",
+            Self::ConnectGateway => "connect_gateway",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::RequiredSubprotocolNotSelected => "required_subprotocol_not_selected",
+            Self::EncodeOpeningHelloUtf8 => "encode_opening_hello_utf8",
+            Self::SendOpeningHello => "send_opening_hello",
+            Self::GatewayLivenessTimeout => "gateway_liveness_timeout",
+            Self::GatewayWelcomeTimeout => "gateway_welcome_timeout",
+            Self::OversizedGatewayFrame => "oversized_gateway_frame",
+            Self::ReadGatewayFrame => "read_gateway_frame",
+            Self::UndecodableGatewayFrame => "undecodable_gateway_frame",
+            Self::UnexpectedObservationAcknowledgement => "unexpected_observation_acknowledgement",
+            Self::MismatchedEffectAcknowledgement => "mismatched_effect_acknowledgement",
+            Self::ObservationSequenceOverflow => "observation_sequence_overflow",
+            Self::FormatEffectAcknowledgementTimestamp => "format_effect_acknowledgement_timestamp",
+            Self::CalculateLeaseRemaining => "calculate_lease_remaining",
+            Self::EncodeEffectAcknowledgement => "encode_effect_acknowledgement",
+            Self::EncodeEffectAcknowledgementUtf8 => "encode_effect_acknowledgement_utf8",
+            Self::SendEffectAcknowledgement => "send_effect_acknowledgement",
+            Self::UnexpectedGatewayFrame => "unexpected_gateway_frame",
+            Self::FlushRunnerPong => "flush_runner_pong",
+            Self::BinaryGatewayFrame => "binary_gateway_frame",
+            Self::UnexpectedRawGatewayFrame => "unexpected_raw_gateway_frame",
+            Self::FormatOpeningHelloTimestamp => "format_opening_hello_timestamp",
+            Self::EncodeOpeningHello => "encode_opening_hello",
+            Self::RunnerSequenceOverflow => "runner_sequence_overflow",
+            Self::GatewayClosedConnection => "gateway_closed_connection",
+            Self::ConnectionCounterOverflow => "connection_counter_overflow",
+            Self::EffectAcknowledgementUnconfirmed => "effect_acknowledgement_unconfirmed",
+        }
+    }
+
+    pub(crate) const fn is_timeout(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectTimeout | Self::GatewayWelcomeTimeout | Self::GatewayLivenessTimeout
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ConnectionError {
     pub(crate) progress: ConnectionProgress,
     kind: FailureKind,
-    cause: &'static str,
+    cause: ConnectionCause,
 }
 
 impl ConnectionError {
-    pub(crate) const fn terminal(progress: ConnectionProgress, cause: &'static str) -> Self {
+    pub(crate) const fn terminal(progress: ConnectionProgress, cause: ConnectionCause) -> Self {
         Self {
             progress,
             kind: FailureKind::Terminal,
@@ -101,7 +267,7 @@ impl ConnectionError {
         }
     }
 
-    const fn retryable(progress: ConnectionProgress, cause: &'static str) -> Self {
+    const fn retryable(progress: ConnectionProgress, cause: ConnectionCause) -> Self {
         Self {
             progress,
             kind: FailureKind::Retryable,
@@ -113,8 +279,17 @@ impl ConnectionError {
         matches!(self.kind, FailureKind::Terminal)
     }
 
-    pub(crate) const fn cause(&self) -> &'static str {
+    pub(crate) const fn kind(&self) -> FailureKind {
+        self.kind
+    }
+
+    pub(crate) const fn connection_cause(&self) -> ConnectionCause {
         self.cause
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn cause(&self) -> &'static str {
+        self.cause.message()
     }
 }
 
@@ -123,7 +298,7 @@ impl fmt::Display for ConnectionError {
         write!(
             formatter,
             "runner gateway connection failed: {}",
-            self.cause
+            self.cause.message()
         )
     }
 }
@@ -139,15 +314,15 @@ fn close_outcome(
     match close.map(|close| close.code) {
         Some(CloseCode::Policy) => Err(ConnectionError::terminal(
             progress,
-            "gateway closed connection with policy violation",
+            ConnectionCause::GatewayPolicyViolation,
         )),
         Some(CloseCode::Unsupported) => Err(ConnectionError::terminal(
             progress,
-            "gateway attributed unsupported frames to this runner",
+            ConnectionCause::GatewayUnsupportedFrames,
         )),
         Some(CloseCode::Size) => Err(ConnectionError::terminal(
             progress,
-            "gateway attributed oversized frames to this runner",
+            ConnectionCause::GatewayOversizedFrames,
         )),
         _ => Ok(progress),
     }
@@ -180,32 +355,38 @@ async fn protocol_violation<W>(
     writer: &mut W,
     sleeper: &dyn Sleeper,
     progress: ConnectionProgress,
-    cause: &'static str,
+    cause: ConnectionCause,
 ) -> ConnectionError
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    close_locally(writer, sleeper, CloseCode::Protocol, cause).await;
+    close_locally(writer, sleeper, CloseCode::Protocol, cause.message()).await;
     ConnectionError::retryable(progress, cause)
 }
 
 pub(crate) async fn run(
-    config: &Config,
-    frame_source: &dyn FrameSource,
-    sleeper: &dyn Sleeper,
+    dependencies: ConnectionDependencies<'_>,
     opening: OpeningHello<'_>,
     next_sequence: &mut u64,
 ) -> Result<ConnectionProgress, ConnectionError> {
+    let config = dependencies.config;
+    let sleeper = dependencies.sleeper;
+    let active_effect_event = dependencies.active_effect_event;
     crate::tls::install_provider();
     let unacknowledged = ConnectionProgress::unacknowledged();
     let mut request = config
         .endpoint()
         .as_str()
         .into_client_request()
-        .map_err(|_| ConnectionError::terminal(unacknowledged, "build gateway request"))?;
+        .map_err(|_| {
+            ConnectionError::terminal(unacknowledged, ConnectionCause::BuildGatewayRequest)
+        })?;
     let authorization =
-        HeaderValue::from_str(&format!("Bearer {}", config.credential().bearer_value()))
-            .map_err(|_| ConnectionError::terminal(unacknowledged, "build authorization header"))?;
+        HeaderValue::from_str(&format!("Bearer {}", config.credential().bearer_value())).map_err(
+            |_| {
+                ConnectionError::terminal(unacknowledged, ConnectionCause::BuildAuthorizationHeader)
+            },
+        )?;
     request
         .headers_mut()
         .insert(header::AUTHORIZATION, authorization);
@@ -227,30 +408,26 @@ pub(crate) async fn run(
         Some(Ok(established)) => established,
         Some(Err(WebSocketError::Http(response))) => {
             return Err(match response.status() {
-                StatusCode::UNAUTHORIZED => ConnectionError::terminal(
-                    unacknowledged,
-                    "runner gateway rejected the credential",
-                ),
+                StatusCode::UNAUTHORIZED => {
+                    ConnectionError::terminal(unacknowledged, ConnectionCause::CredentialRejected)
+                }
                 StatusCode::BAD_REQUEST => ConnectionError::terminal(
                     unacknowledged,
-                    "runner gateway rejected the connection request",
+                    ConnectionCause::ConnectionRequestRejected,
                 ),
-                _ => ConnectionError::retryable(
-                    unacknowledged,
-                    "runner gateway returned an HTTP error",
-                ),
+                _ => ConnectionError::retryable(unacknowledged, ConnectionCause::GatewayHttpError),
             });
         }
         Some(Err(_)) => {
             return Err(ConnectionError::retryable(
                 unacknowledged,
-                "connect to runner gateway",
+                ConnectionCause::ConnectGateway,
             ));
         }
         None => {
             return Err(ConnectionError::retryable(
                 unacknowledged,
-                "runner gateway connect timeout",
+                ConnectionCause::ConnectTimeout,
             ));
         }
     };
@@ -262,26 +439,154 @@ pub(crate) async fn run(
     {
         return Err(ConnectionError::terminal(
             unacknowledged,
-            "runner gateway did not select the required subprotocol",
+            ConnectionCause::RequiredSubprotocolNotSelected,
         ));
     }
     let (writer, reader) = socket.split();
-    run_established(
-        config,
-        frame_source,
-        sleeper,
-        opening,
-        next_sequence,
-        reader,
-        writer,
-    )
-    .await
+    let result = run_established(dependencies, opening, next_sequence, reader, writer).await;
+    active_effect_event.finish_connection_end(&result);
+    result
 }
 
-pub(crate) async fn run_established<R, W>(
-    config: &Config,
-    frame_source: &dyn FrameSource,
-    sleeper: &dyn Sleeper,
+struct PendingEffectAcknowledgement {
+    message_id: String,
+    sequence: u64,
+}
+
+pub(super) struct ActiveEffectEvent {
+    event: Mutex<Option<Event>>,
+}
+
+impl ActiveEffectEvent {
+    pub(super) fn new() -> Self {
+        Self {
+            event: Mutex::new(None),
+        }
+    }
+
+    fn start(&self, event: Event) {
+        let previous = self
+            .event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(event);
+        if let Some(previous) = previous {
+            previous.set(KeyValue::new(
+                telemetry::attribute::ERROR_TYPE,
+                ConnectionCause::EffectAcknowledgementUnconfirmed.error_type(),
+            ));
+            previous.finish(Outcome::Disconnected);
+        }
+    }
+
+    pub(super) fn finish(&self, outcome: Outcome, cause: Option<ConnectionCause>) {
+        let event = self
+            .event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(event) = event {
+            if let Some(cause) = cause {
+                event.set(KeyValue::new(
+                    telemetry::attribute::ERROR_TYPE,
+                    cause.error_type(),
+                ));
+            }
+            event.finish(outcome);
+        }
+    }
+
+    fn finish_connection_end(&self, result: &Result<ConnectionProgress, ConnectionError>) {
+        match result {
+            Err(error) if error.connection_cause().is_timeout() => {
+                self.finish(Outcome::Timeout, Some(error.connection_cause()))
+            }
+            _ => self.finish(
+                Outcome::Disconnected,
+                Some(ConnectionCause::EffectAcknowledgementUnconfirmed),
+            ),
+        }
+    }
+}
+
+fn finish_effect_failure(event: &Event, cause: ConnectionCause) {
+    event.set(KeyValue::new(
+        telemetry::attribute::ERROR_TYPE,
+        cause.error_type(),
+    ));
+    event.finish(Outcome::Failure);
+}
+
+pub(super) fn record_progress(event: &Event, progress: ConnectionProgress) {
+    for attribute in [
+        KeyValue::new(
+            telemetry::attribute::OPENING_ACKNOWLEDGED,
+            progress.opening_acknowledged,
+        ),
+        KeyValue::new(
+            telemetry::attribute::HANDSHAKE_COMPLETED,
+            progress.handshake_completed,
+        ),
+        KeyValue::new(
+            telemetry::attribute::CLOUD_TEXT_FRAMES_RECEIVED,
+            telemetry::integer(progress.cloud_text_frames_received),
+        ),
+        KeyValue::new(
+            telemetry::attribute::RUNNER_TEXT_FRAMES_SENT,
+            telemetry::integer(progress.runner_text_frames_sent),
+        ),
+        KeyValue::new(
+            telemetry::attribute::EFFECTS_RECEIVED,
+            telemetry::integer(progress.effects_received),
+        ),
+        KeyValue::new(
+            telemetry::attribute::EFFECT_ACKNOWLEDGEMENTS_CONFIRMED,
+            telemetry::integer(progress.effect_acknowledgements_confirmed),
+        ),
+    ] {
+        event.set(attribute);
+    }
+}
+
+fn lease_remaining_ms(lease_expires_at: &str, now: &str) -> Option<i64> {
+    let format = &time::format_description::well_known::Rfc3339;
+    let lease = time::OffsetDateTime::parse(lease_expires_at, format).ok()?;
+    let now = time::OffsetDateTime::parse(now, format).ok()?;
+    i64::try_from((lease - now).whole_milliseconds().max(0)).ok()
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConnectionDependencies<'a> {
+    config: &'a Config,
+    frame_source: &'a dyn FrameSource,
+    sleeper: &'a dyn Sleeper,
+    recorder: &'a Recorder,
+    connection_event: &'a Event,
+    active_effect_event: &'a ActiveEffectEvent,
+}
+
+impl<'a> ConnectionDependencies<'a> {
+    pub(super) fn new(
+        config: &'a Config,
+        frame_source: &'a dyn FrameSource,
+        sleeper: &'a dyn Sleeper,
+        recorder: &'a Recorder,
+        connection_event: &'a Event,
+        active_effect_event: &'a ActiveEffectEvent,
+    ) -> Self {
+        Self {
+            config,
+            frame_source,
+            sleeper,
+            recorder,
+            connection_event,
+            active_effect_event,
+        }
+    }
+}
+
+pub(super) async fn run_established<R, W>(
+    dependencies: ConnectionDependencies<'_>,
     opening: OpeningHello<'_>,
     next_sequence: &mut u64,
     mut reader: R,
@@ -291,18 +596,31 @@ where
     R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
+    let ConnectionDependencies {
+        config,
+        frame_source,
+        sleeper,
+        recorder,
+        connection_event,
+        active_effect_event,
+    } = dependencies;
     let unacknowledged = ConnectionProgress::unacknowledged();
-    let opening_hello = std::str::from_utf8(opening.encoded)
-        .map_err(|_| ConnectionError::terminal(unacknowledged, "encode opening hello as UTF-8"))?;
+    let opening_hello = std::str::from_utf8(opening.encoded).map_err(|_| {
+        ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
+    })?;
     writer
         .send(Message::Text(opening_hello.into()))
         .await
-        .map_err(|_| ConnectionError::retryable(unacknowledged, "send opening hello"))?;
+        .map_err(|_| {
+            ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
+        })?;
 
     let mut welcome_timer = sleeper.sleep(WELCOME_TIMEOUT);
     let mut inbound_silence_timeout = None;
     let mut progress = ConnectionProgress::unacknowledged();
-    let mut pending_effect_acknowledgement: Option<(String, String, u64)> = None;
+    progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
+    record_progress(connection_event, progress);
+    let mut pending_effect_acknowledgement: Option<PendingEffectAcknowledgement> = None;
 
     loop {
         let message = if let Some(timeout) = inbound_silence_timeout {
@@ -314,11 +632,11 @@ where
                         &mut writer,
                         sleeper,
                         CloseCode::Away,
-                        "gateway liveness timeout",
+                        ConnectionCause::GatewayLivenessTimeout.message(),
                     ).await;
                     return Err(ConnectionError::retryable(
                         progress,
-                        "gateway liveness timeout",
+                        ConnectionCause::GatewayLivenessTimeout,
                     ));
                 }
             }
@@ -329,7 +647,7 @@ where
                 _ = &mut welcome_timer => {
                     return Err(ConnectionError::retryable(
                         progress,
-                        "gateway welcome timeout",
+                        ConnectionCause::GatewayWelcomeTimeout,
                     ));
                 }
             }
@@ -344,12 +662,15 @@ where
                     &mut writer,
                     sleeper,
                     progress,
-                    "oversized gateway frame",
+                    ConnectionCause::OversizedGatewayFrame,
                 )
                 .await);
             }
             Err(_) => {
-                return Err(ConnectionError::retryable(progress, "read gateway frame"));
+                return Err(ConnectionError::retryable(
+                    progress,
+                    ConnectionCause::ReadGatewayFrame,
+                ));
             }
         };
         match message {
@@ -359,10 +680,13 @@ where
                         &mut writer,
                         sleeper,
                         progress,
-                        "undecodable gateway frame",
+                        ConnectionCause::UndecodableGatewayFrame,
                     )
                     .await);
                 };
+                progress.cloud_text_frames_received =
+                    progress.incremented(progress.cloud_text_frames_received)?;
+                record_progress(connection_event, progress);
                 match frame {
                     CloudFrame::Welcome {
                         ping_interval_seconds,
@@ -380,102 +704,209 @@ where
                         && acknowledged_sequence == opening.sequence =>
                     {
                         progress.opening_acknowledged = true;
+                        record_progress(connection_event, progress);
                     }
                     CloudFrame::ObservationAck {
                         acknowledged_message_id,
                         acknowledged_sequence,
                         ..
                     } => {
-                        let Some((effect_id, message_id, sequence)) =
-                            pending_effect_acknowledgement.clone()
-                        else {
+                        let Some(pending) = pending_effect_acknowledgement.as_ref() else {
                             return Err(protocol_violation(
                                 &mut writer,
                                 sleeper,
                                 progress,
-                                "unexpected observation acknowledgement",
+                                ConnectionCause::UnexpectedObservationAcknowledgement,
                             )
                             .await);
                         };
-                        if acknowledged_message_id != message_id
-                            || acknowledged_sequence != sequence
+                        if acknowledged_message_id != pending.message_id
+                            || acknowledged_sequence != pending.sequence
                         {
                             return Err(protocol_violation(
                                 &mut writer,
                                 sleeper,
                                 progress,
-                                "mismatched effect acknowledgement",
+                                ConnectionCause::MismatchedEffectAcknowledgement,
                             )
                             .await);
                         }
-                        pending_effect_acknowledgement = None;
-                        eprintln!(
-                            "runner effect received: {effect_id} (execution not implemented)"
-                        );
+                        progress.effect_acknowledgements_confirmed = match progress
+                            .incremented(progress.effect_acknowledgements_confirmed)
+                        {
+                            Ok(count) => count,
+                            Err(error) => {
+                                if pending_effect_acknowledgement.take().is_some() {
+                                    active_effect_event.finish(
+                                        Outcome::Failure,
+                                        Some(ConnectionCause::ConnectionCounterOverflow),
+                                    );
+                                }
+                                return Err(error);
+                            }
+                        };
+                        record_progress(connection_event, progress);
+                        if pending_effect_acknowledgement.take().is_some() {
+                            active_effect_event.finish(Outcome::Success, None);
+                        }
                     }
-                    CloudFrame::AssignmentOffer { effect_id, .. }
-                        if progress.handshake_completed
-                            && pending_effect_acknowledgement.is_none() =>
+                    CloudFrame::AssignmentOffer {
+                        effect_id,
+                        assignment_id,
+                        run_id,
+                        lease_expires_at,
+                        ..
+                    } if progress.handshake_completed
+                        && pending_effect_acknowledgement.is_none() =>
                     {
                         let sequence = *next_sequence;
-                        *next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
-                            ConnectionError::terminal(
+                        let event = recorder.start(
+                            "runner.effect_acknowledgement",
+                            [
+                                KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                                KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id),
+                                KeyValue::new(telemetry::attribute::RUN_ID, run_id),
+                                KeyValue::new(
+                                    telemetry::attribute::RUNNER_ID,
+                                    config.credential().runner_id().to_owned(),
+                                ),
+                                KeyValue::new(
+                                    telemetry::attribute::RUNNER_BOOT_ID,
+                                    opening.boot_id.to_owned(),
+                                ),
+                                KeyValue::new(
+                                    telemetry::attribute::RUNNER_SEQUENCE,
+                                    telemetry::integer(sequence),
+                                ),
+                            ],
+                        );
+                        active_effect_event.start(event.clone());
+                        progress.effects_received =
+                            match progress.incremented(progress.effects_received) {
+                                Ok(count) => count,
+                                Err(error) => {
+                                    finish_effect_failure(
+                                        &event,
+                                        ConnectionCause::ConnectionCounterOverflow,
+                                    );
+                                    return Err(error);
+                                }
+                            };
+                        record_progress(connection_event, progress);
+                        let Some(incremented_sequence) = next_sequence.checked_add(1) else {
+                            finish_effect_failure(
+                                &event,
+                                ConnectionCause::ObservationSequenceOverflow,
+                            );
+                            return Err(ConnectionError::terminal(
                                 progress,
-                                "runner observation sequence overflow",
-                            )
-                        })?;
+                                ConnectionCause::ObservationSequenceOverflow,
+                            ));
+                        };
+                        *next_sequence = incremented_sequence;
                         let message_id = frame_source.public_id("rmsg_");
+                        let sent_at = match frame_source.utc_timestamp() {
+                            Ok(timestamp) => timestamp,
+                            Err(_) => {
+                                finish_effect_failure(
+                                    &event,
+                                    ConnectionCause::FormatEffectAcknowledgementTimestamp,
+                                );
+                                return Err(ConnectionError::terminal(
+                                    progress,
+                                    ConnectionCause::FormatEffectAcknowledgementTimestamp,
+                                ));
+                            }
+                        };
+                        let Some(lease_remaining_ms) =
+                            lease_remaining_ms(&lease_expires_at, &sent_at)
+                        else {
+                            finish_effect_failure(&event, ConnectionCause::CalculateLeaseRemaining);
+                            return Err(ConnectionError::terminal(
+                                progress,
+                                ConnectionCause::CalculateLeaseRemaining,
+                            ));
+                        };
+                        event.set(KeyValue::new(
+                            telemetry::attribute::LEASE_REMAINING_MS,
+                            lease_remaining_ms,
+                        ));
                         let frame = RunnerFrame::EffectAcknowledged {
                             envelope: RunnerEnvelope {
                                 message_id: message_id.clone(),
                                 runner_id: config.credential().runner_id().to_owned(),
                                 boot_id: opening.boot_id.to_owned(),
                                 sequence,
-                                sent_at: frame_source.utc_timestamp().map_err(|_| {
-                                    ConnectionError::terminal(
-                                        progress,
-                                        "format effect acknowledgement timestamp",
-                                    )
-                                })?,
+                                sent_at,
                             },
-                            effect_id: effect_id.clone(),
+                            effect_id,
                         };
-                        let encoded = encode_runner_frame(&frame).map_err(|_| {
-                            ConnectionError::terminal(progress, "encode effect acknowledgement")
-                        })?;
-                        let encoded = std::str::from_utf8(&encoded).map_err(|_| {
-                            ConnectionError::terminal(
+                        let encoded = match encode_runner_frame(&frame) {
+                            Ok(encoded) => encoded,
+                            Err(_) => {
+                                finish_effect_failure(
+                                    &event,
+                                    ConnectionCause::EncodeEffectAcknowledgement,
+                                );
+                                return Err(ConnectionError::terminal(
+                                    progress,
+                                    ConnectionCause::EncodeEffectAcknowledgement,
+                                ));
+                            }
+                        };
+                        let encoded = match std::str::from_utf8(&encoded) {
+                            Ok(encoded) => encoded,
+                            Err(_) => {
+                                finish_effect_failure(
+                                    &event,
+                                    ConnectionCause::EncodeEffectAcknowledgementUtf8,
+                                );
+                                return Err(ConnectionError::terminal(
+                                    progress,
+                                    ConnectionCause::EncodeEffectAcknowledgementUtf8,
+                                ));
+                            }
+                        };
+                        if writer.send(Message::Text(encoded.into())).await.is_err() {
+                            finish_effect_failure(
+                                &event,
+                                ConnectionCause::SendEffectAcknowledgement,
+                            );
+                            return Err(ConnectionError::retryable(
                                 progress,
-                                "encode effect acknowledgement as UTF-8",
-                            )
-                        })?;
-                        writer
-                            .send(Message::Text(encoded.into()))
-                            .await
-                            .map_err(|_| {
-                                ConnectionError::retryable(progress, "send effect acknowledgement")
-                            })?;
-                        pending_effect_acknowledgement = Some((effect_id, message_id, sequence));
+                                ConnectionCause::SendEffectAcknowledgement,
+                            ));
+                        }
+                        progress.runner_text_frames_sent =
+                            progress.incremented(progress.runner_text_frames_sent)?;
+                        record_progress(connection_event, progress);
+                        pending_effect_acknowledgement = Some(PendingEffectAcknowledgement {
+                            message_id,
+                            sequence,
+                        });
                     }
                     _ => {
                         return Err(protocol_violation(
                             &mut writer,
                             sleeper,
                             progress,
-                            "unexpected gateway frame",
+                            ConnectionCause::UnexpectedGatewayFrame,
                         )
                         .await);
                     }
                 }
-                if inbound_silence_timeout.is_some() && progress.opening_acknowledged {
+                if inbound_silence_timeout.is_some()
+                    && progress.opening_acknowledged
+                    && !progress.handshake_completed
+                {
                     progress.handshake_completed = true;
+                    record_progress(connection_event, progress);
                 }
             }
             Message::Ping(_) => {
-                writer
-                    .flush()
-                    .await
-                    .map_err(|_| ConnectionError::retryable(progress, "flush runner pong"))?;
+                writer.flush().await.map_err(|_| {
+                    ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
+                })?;
             }
             Message::Pong(_) => {}
             Message::Close(close) => return close_outcome(progress, close),
@@ -484,7 +915,7 @@ where
                     &mut writer,
                     sleeper,
                     progress,
-                    "binary gateway frame",
+                    ConnectionCause::BinaryGatewayFrame,
                 )
                 .await);
             }
@@ -493,7 +924,7 @@ where
                     &mut writer,
                     sleeper,
                     progress,
-                    "unexpected raw gateway frame",
+                    ConnectionCause::UnexpectedRawGatewayFrame,
                 )
                 .await);
             }
@@ -512,7 +943,7 @@ pub(crate) fn opening_hello(
     let sent_at = frame_source.utc_timestamp().map_err(|_| {
         ConnectionError::terminal(
             ConnectionProgress::unacknowledged(),
-            "format opening hello timestamp",
+            ConnectionCause::FormatOpeningHelloTimestamp,
         )
     })?;
     encode_runner_frame(&RunnerFrame::Hello {
@@ -527,7 +958,10 @@ pub(crate) fn opening_hello(
         max_concurrent_runs: 1,
     })
     .map_err(|_| {
-        ConnectionError::terminal(ConnectionProgress::unacknowledged(), "encode opening hello")
+        ConnectionError::terminal(
+            ConnectionProgress::unacknowledged(),
+            ConnectionCause::EncodeOpeningHello,
+        )
     })
 }
 
@@ -535,13 +969,18 @@ pub(crate) fn opening_hello(
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::{Sink, SinkExt, StreamExt};
     use serde_json::json;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
     use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::Error as WebSocketError;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
@@ -549,22 +988,284 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     use super::{
-        ConnectionError, ConnectionProgress, FrameSource, OpeningHello, close_outcome,
-        opening_hello, run,
+        ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
+        ConnectionProgress, FrameSource, OpeningHello, close_outcome, opening_hello, run,
+        run_established,
     };
     use crate::runner::credential::{Credential, test_credential};
     use crate::runner::service::Sleeper;
     use crate::runner::service::config::Config;
     use crate::runner::service::test_support::{
-        accept_fixture_socket, assignment_offer, controlled_sleeper, deterministic_frame_source,
-        effect_acknowledgement, expect_close_frame, expect_opening_hello, fixture_listener,
-        observation_acknowledgement, sleep_request, welcome,
+        accept_fixture_socket, accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
+        deterministic_frame_source, effect_acknowledgement, expect_close_frame,
+        expect_opening_hello, fixture_listener, observation_acknowledgement,
+        offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
+    use crate::runner::telemetry::{Outcome, TestCapture, test_recorder};
 
     const CREDENTIAL: &str =
         "rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678";
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+    struct BackpressuredEffectWriter {
+        sent: usize,
+        blocked: Arc<Notify>,
+    }
+
+    impl Sink<Message> for BackpressuredEffectWriter {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.sent == 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                self.blocked.notify_one();
+                Poll::Pending
+            }
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _message: Message) -> Result<(), Self::Error> {
+            self.sent += 1;
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn connection_causes_have_stable_unique_safe_slugs() {
+        let causes = [
+            (
+                ConnectionCause::FormatCurrentTimestamp,
+                "format current timestamp",
+                "format_current_timestamp",
+            ),
+            (
+                ConnectionCause::GatewayPolicyViolation,
+                "gateway closed connection with policy violation",
+                "gateway_policy_violation",
+            ),
+            (
+                ConnectionCause::GatewayUnsupportedFrames,
+                "gateway attributed unsupported frames to this runner",
+                "gateway_unsupported_frames",
+            ),
+            (
+                ConnectionCause::GatewayOversizedFrames,
+                "gateway attributed oversized frames to this runner",
+                "gateway_oversized_frames",
+            ),
+            (
+                ConnectionCause::BuildGatewayRequest,
+                "build gateway request",
+                "build_gateway_request",
+            ),
+            (
+                ConnectionCause::BuildAuthorizationHeader,
+                "build authorization header",
+                "build_authorization_header",
+            ),
+            (
+                ConnectionCause::CredentialRejected,
+                "runner gateway rejected the credential",
+                "credential_rejected",
+            ),
+            (
+                ConnectionCause::ConnectionRequestRejected,
+                "runner gateway rejected the connection request",
+                "connection_request_rejected",
+            ),
+            (
+                ConnectionCause::GatewayHttpError,
+                "runner gateway returned an HTTP error",
+                "gateway_http_error",
+            ),
+            (
+                ConnectionCause::ConnectGateway,
+                "connect to runner gateway",
+                "connect_gateway",
+            ),
+            (
+                ConnectionCause::ConnectTimeout,
+                "runner gateway connect timeout",
+                "connect_timeout",
+            ),
+            (
+                ConnectionCause::RequiredSubprotocolNotSelected,
+                "runner gateway did not select the required subprotocol",
+                "required_subprotocol_not_selected",
+            ),
+            (
+                ConnectionCause::EncodeOpeningHelloUtf8,
+                "encode opening hello as UTF-8",
+                "encode_opening_hello_utf8",
+            ),
+            (
+                ConnectionCause::SendOpeningHello,
+                "send opening hello",
+                "send_opening_hello",
+            ),
+            (
+                ConnectionCause::GatewayLivenessTimeout,
+                "gateway liveness timeout",
+                "gateway_liveness_timeout",
+            ),
+            (
+                ConnectionCause::GatewayWelcomeTimeout,
+                "gateway welcome timeout",
+                "gateway_welcome_timeout",
+            ),
+            (
+                ConnectionCause::OversizedGatewayFrame,
+                "oversized gateway frame",
+                "oversized_gateway_frame",
+            ),
+            (
+                ConnectionCause::ReadGatewayFrame,
+                "read gateway frame",
+                "read_gateway_frame",
+            ),
+            (
+                ConnectionCause::UndecodableGatewayFrame,
+                "undecodable gateway frame",
+                "undecodable_gateway_frame",
+            ),
+            (
+                ConnectionCause::UnexpectedObservationAcknowledgement,
+                "unexpected observation acknowledgement",
+                "unexpected_observation_acknowledgement",
+            ),
+            (
+                ConnectionCause::MismatchedEffectAcknowledgement,
+                "mismatched effect acknowledgement",
+                "mismatched_effect_acknowledgement",
+            ),
+            (
+                ConnectionCause::ObservationSequenceOverflow,
+                "runner observation sequence overflow",
+                "observation_sequence_overflow",
+            ),
+            (
+                ConnectionCause::FormatEffectAcknowledgementTimestamp,
+                "format effect acknowledgement timestamp",
+                "format_effect_acknowledgement_timestamp",
+            ),
+            (
+                ConnectionCause::CalculateLeaseRemaining,
+                "calculate effect lease remaining",
+                "calculate_lease_remaining",
+            ),
+            (
+                ConnectionCause::EncodeEffectAcknowledgement,
+                "encode effect acknowledgement",
+                "encode_effect_acknowledgement",
+            ),
+            (
+                ConnectionCause::EncodeEffectAcknowledgementUtf8,
+                "encode effect acknowledgement as UTF-8",
+                "encode_effect_acknowledgement_utf8",
+            ),
+            (
+                ConnectionCause::SendEffectAcknowledgement,
+                "send effect acknowledgement",
+                "send_effect_acknowledgement",
+            ),
+            (
+                ConnectionCause::UnexpectedGatewayFrame,
+                "unexpected gateway frame",
+                "unexpected_gateway_frame",
+            ),
+            (
+                ConnectionCause::FlushRunnerPong,
+                "flush runner pong",
+                "flush_runner_pong",
+            ),
+            (
+                ConnectionCause::BinaryGatewayFrame,
+                "binary gateway frame",
+                "binary_gateway_frame",
+            ),
+            (
+                ConnectionCause::UnexpectedRawGatewayFrame,
+                "unexpected raw gateway frame",
+                "unexpected_raw_gateway_frame",
+            ),
+            (
+                ConnectionCause::FormatOpeningHelloTimestamp,
+                "format opening hello timestamp",
+                "format_opening_hello_timestamp",
+            ),
+            (
+                ConnectionCause::EncodeOpeningHello,
+                "encode opening hello",
+                "encode_opening_hello",
+            ),
+            (
+                ConnectionCause::RunnerSequenceOverflow,
+                "runner sequence overflow",
+                "runner_sequence_overflow",
+            ),
+            (
+                ConnectionCause::GatewayClosedConnection,
+                "gateway closed connection",
+                "gateway_closed_connection",
+            ),
+            (
+                ConnectionCause::ConnectionCounterOverflow,
+                "runner connection counter overflow",
+                "connection_counter_overflow",
+            ),
+            (
+                ConnectionCause::EffectAcknowledgementUnconfirmed,
+                "effect acknowledgement confirmation not received",
+                "effect_acknowledgement_unconfirmed",
+            ),
+        ];
+        let mut slugs = std::collections::HashSet::new();
+        for (cause, message, slug) in causes {
+            assert_eq!(cause.message(), message);
+            assert_eq!(cause.error_type(), slug);
+            assert!(
+                slug.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            );
+            assert!(slugs.insert(slug), "duplicate cause slug {slug}");
+        }
+    }
+
+    #[test]
+    fn connection_counter_overflow_is_terminal_and_classified() {
+        let progress = ConnectionProgress {
+            cloud_text_frames_received: u64::MAX,
+            ..ConnectionProgress::unacknowledged()
+        };
+        let error = progress
+            .incremented(progress.cloud_text_frames_received)
+            .expect_err("overflowed connection counter");
+
+        assert!(error.is_terminal());
+        assert_eq!(error.cause(), "runner connection counter overflow");
+        assert_eq!(
+            error.connection_cause().error_type(),
+            "connection_counter_overflow"
+        );
+    }
 
     #[allow(
         clippy::result_large_err,
@@ -660,23 +1361,140 @@ mod tests {
             true,
         )
         .expect("configure loopback gateway");
-        let frame_source = deterministic_frame_source();
-        let (sleeper, _sleep_requests) = controlled_sleeper();
-        let opening = test_opening(&config, frame_source.as_ref());
-        let mut next_sequence = 2;
-        let outcome = run_test_connection(
-            &config,
-            frame_source.as_ref(),
-            sleeper.as_ref(),
-            &opening,
-            &mut next_sequence,
-        )
-        .await
-        .expect("run fixture connection");
+        let (outcome, capture, next_sequence) =
+            run_configured_fixture_connection_with_capture(&config).await;
+        let outcome = outcome.expect("run fixture connection");
         assert!(outcome.opening_acknowledged);
         assert!(outcome.handshake_completed);
+        assert_eq!(outcome.cloud_text_frames_received, 4);
+        assert_eq!(outcome.runner_text_frames_sent, 2);
+        assert_eq!(outcome.effects_received, 1);
+        assert_eq!(outcome.effect_acknowledgements_confirmed, 1);
         assert_eq!(next_sequence, 3);
         server.await.expect("join fixture server");
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["event.name"], "runner.effect_acknowledgement");
+        assert_eq!(event["scherzo.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abg");
+        assert_eq!(
+            event["scherzo.assignment.id"],
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abh"
+        );
+        assert_eq!(event["scherzo.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abj");
+        assert_eq!(event["scherzo.runner.boot_id"], BOOT_ID);
+        assert_eq!(event["scherzo.runner.sequence"], 2);
+        assert_eq!(event["scherzo.delivery.lease_remaining_ms"], 3_600_000);
+        assert_eq!(event["scherzo.outcome"], "success");
+        let encoded = serde_json::to_string(event).expect("encode effect event");
+        assert!(!encoded.contains("runner.run"));
+        assert!(!encoded.contains("accepted"));
+        assert!(!encoded.contains("executed"));
+        assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnects_an_effect_event_before_transport_confirmation() {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut socket).await;
+            let _acknowledgement =
+                offer_assignment_after_handshake(&mut socket, OPENING_MESSAGE_ID, 1).await;
+            socket
+                .close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "PEER-CLOSE-REASON-MUST-NOT-LEAK".into(),
+                }))
+                .await
+                .expect("close fixture socket");
+        });
+
+        let config = test_config(&endpoint);
+        let (outcome, capture, _next_sequence) =
+            run_configured_fixture_connection_with_capture(&config).await;
+        let outcome = outcome.expect("close established fixture connection");
+        assert_eq!(outcome.effects_received, 1);
+        assert_eq!(outcome.effect_acknowledgements_confirmed, 0);
+        server.await.expect("join fixture server");
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event.name"], "runner.effect_acknowledgement");
+        assert_eq!(events[0]["scherzo.outcome"], "disconnected");
+        assert_eq!(
+            events[0]["error.type"],
+            "effect_acknowledgement_unconfirmed"
+        );
+        assert!(
+            !serde_json::to_string(&events[0])
+                .expect("encode disconnected effect event")
+                .contains("PEER-CLOSE-REASON-MUST-NOT-LEAK")
+        );
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_effect_event_across_cancellation_while_send_is_pending() {
+        let config = test_config("wss://gateway.example.test/v1/connect");
+        let frame_source = deterministic_frame_source();
+        let opening = test_opening(&config, frame_source.as_ref());
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (recorder, capture) = test_recorder(BOOT_ID);
+        let connection_event = recorder.start("runner.gateway_connection", []);
+        let active_effect_event = ActiveEffectEvent::new();
+        let blocked = Arc::new(Notify::new());
+        let reader = futures_util::stream::iter([
+            Ok(welcome()),
+            Ok(observation_acknowledgement(OPENING_MESSAGE_ID, 1)),
+            Ok(assignment_offer()),
+        ]);
+        let writer = BackpressuredEffectWriter {
+            sent: 0,
+            blocked: Arc::clone(&blocked),
+        };
+        let mut next_sequence = 2;
+        let mut connection = Box::pin(run_established(
+            ConnectionDependencies::new(
+                &config,
+                frame_source.as_ref(),
+                sleeper.as_ref(),
+                &recorder,
+                &connection_event,
+                &active_effect_event,
+            ),
+            OpeningHello {
+                boot_id: BOOT_ID,
+                encoded: &opening,
+                message_id: OPENING_MESSAGE_ID,
+                sequence: 1,
+            },
+            &mut next_sequence,
+            reader,
+            writer,
+        ));
+
+        with_watchdog(async {
+            tokio::select! {
+                result = &mut connection => panic!("pending send completed unexpectedly: {result:?}"),
+                _ = blocked.notified() => {}
+            }
+        })
+        .await
+        .expect("effect acknowledgement send was not attempted");
+        drop(connection);
+        active_effect_event.finish(Outcome::Cancelled, None);
+        connection_event.finish(Outcome::Cancelled);
+
+        let events = capture.events();
+        assert_eq!(events.len(), 2);
+        let effect = capture.event("runner.effect_acknowledgement");
+        assert_eq!(effect["scherzo.outcome"], "cancelled");
+        assert!(effect.get("error.type").is_none());
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
     }
 
     #[tokio::test]
@@ -684,8 +1502,7 @@ mod tests {
         let (listener, endpoint) = fixture_listener().await;
         let (sleeper, mut sleep_requests) = controlled_sleeper();
         let server = tokio::spawn(async move {
-            let mut socket = accept_fixture_socket(&listener).await;
-            expect_opening_hello(&mut socket).await;
+            let _socket = accept_opened_fixture_socket(&listener).await;
             let release = sleep_request(&mut sleep_requests, Duration::from_secs(5)).await;
             release.release();
             std::future::pending::<()>().await;
@@ -921,6 +1738,28 @@ mod tests {
         (error, next_sequence)
     }
 
+    async fn run_configured_fixture_connection_with_capture(
+        config: &Config,
+    ) -> (
+        Result<ConnectionProgress, ConnectionError>,
+        TestCapture,
+        u64,
+    ) {
+        let frame_source = deterministic_frame_source();
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let opening = test_opening(config, frame_source.as_ref());
+        let mut next_sequence = 2;
+        let (result, capture) = run_test_connection_with_capture(
+            config,
+            frame_source.as_ref(),
+            sleeper.as_ref(),
+            &opening,
+            &mut next_sequence,
+        )
+        .await;
+        (result, capture, next_sequence)
+    }
+
     async fn run_test_connection(
         config: &Config,
         frame_source: &dyn FrameSource,
@@ -928,10 +1767,30 @@ mod tests {
         opening: &[u8],
         next_sequence: &mut u64,
     ) -> Result<ConnectionProgress, ConnectionError> {
-        run(
-            config,
-            frame_source,
-            sleeper,
+        run_test_connection_with_capture(config, frame_source, sleeper, opening, next_sequence)
+            .await
+            .0
+    }
+
+    async fn run_test_connection_with_capture(
+        config: &Config,
+        frame_source: &dyn FrameSource,
+        sleeper: &dyn Sleeper,
+        opening: &[u8],
+        next_sequence: &mut u64,
+    ) -> (Result<ConnectionProgress, ConnectionError>, TestCapture) {
+        let (recorder, capture) = test_recorder(BOOT_ID);
+        let connection_event = recorder.start("runner.fixture_connection", []);
+        let active_effect_event = ActiveEffectEvent::new();
+        let result = run(
+            ConnectionDependencies::new(
+                config,
+                frame_source,
+                sleeper,
+                &recorder,
+                &connection_event,
+                &active_effect_event,
+            ),
             OpeningHello {
                 boot_id: BOOT_ID,
                 encoded: opening,
@@ -940,7 +1799,8 @@ mod tests {
             },
             next_sequence,
         )
-        .await
+        .await;
+        (result, capture)
     }
 
     async fn abort_fixture_server(server: tokio::task::JoinHandle<()>) {

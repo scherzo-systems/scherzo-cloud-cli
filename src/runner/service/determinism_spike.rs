@@ -7,13 +7,16 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::Config;
-use super::connection::{OpeningHello, opening_hello, run_established};
+use super::connection::{
+    ActiveEffectEvent, ConnectionDependencies, OpeningHello, opening_hello, run_established,
+};
 use super::test_support::{
     DeterminismTranscript, assignment_offer, controlled_sleeper_with_transcript,
     deterministic_frame_source, observation_acknowledgement, scripted_duplex, sleep_request,
     welcome, with_watchdog,
 };
 use crate::runner::credential::test_credential;
+use crate::runner::telemetry::test_recorder;
 
 const REPETITIONS: usize = 1_000;
 const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
@@ -56,11 +59,19 @@ async fn run_scenario() -> Vec<String> {
     let (sleeper, mut sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
     let (inbound, reader, writer, mut outbound) = scripted_duplex(transcript.clone());
     let mut next_sequence = 2;
+    let (recorder, _capture) = test_recorder(BOOT_ID);
+    let connection_event = recorder.start("runner.fixture_connection", []);
+    let active_effect_event = ActiveEffectEvent::new();
 
     let connection = run_established(
-        &config,
-        frame_source.as_ref(),
-        sleeper.as_ref(),
+        ConnectionDependencies::new(
+            &config,
+            frame_source.as_ref(),
+            sleeper.as_ref(),
+            &recorder,
+            &connection_event,
+            &active_effect_event,
+        ),
         OpeningHello {
             boot_id: BOOT_ID,
             encoded: &opening,
