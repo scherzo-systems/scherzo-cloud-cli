@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scherzo.dev/contracts/workflow-v1.schema.json",
+  "title": "Scherzo workflow format version 1",
+  "description": "Structural contract for a Scherzo workflow YAML document.",
+  "$ref": "#/$defs/Workflow",
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "SourceRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "^\\\\" },
+          { "pattern": "^~[/\\\\]" },
+          { "pattern": "^[A-Za-z]:[/\\\\]" },
+          { "pattern": "[\\n\\r\\t]" }
+        ]
+      },
+      "description": "A path resolved from the workflow YAML file. The resolver must reject normalized or symlink-resolved paths outside the explicitly supplied workflow source root."
+    },
+    "RuntimeRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "^\\\\" },
+          { "pattern": "^~[/\\\\]" },
+          { "pattern": "^[A-Za-z]:[/\\\\]" },
+          { "pattern": "(^|[/\\\\])\\.\\.([/\\\\]|$)" },
+          { "pattern": "[\\n\\r\\t]" }
+        ]
+      },
+      "description": "A static path below the execution root."
+    },
+    "MediaType": {
+      "type": "string",
+      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(\\s*;\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=[^\\r\\n\\t;]+)*$"
+    },
+    "ImportOrOutputReferenceString": {
+      "type": "string",
+      "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+    },
+    "InputReferenceString": {
+      "type": "string",
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$"
+    },
+    "OutputReferenceString": {
+      "type": "string",
+      "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+    },
+    "ImportOrOutputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/ImportOrOutputReferenceString" }
+      },
+      "required": ["ref"]
+    },
+    "InputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/InputReferenceString" }
+      },
+      "required": ["ref"]
+    },
+    "OutputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/OutputReferenceString" }
+      },
+      "required": ["ref"]
+    },
+    "FileSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file": { "$ref": "#/$defs/SourceRelativePath" }
+      },
+      "required": ["file"]
+    },
+    "TextSource": {
+      "oneOf": [
+        { "$ref": "#/$defs/FileSource" },
+        { "$ref": "#/$defs/InputReference" }
+      ]
+    },
+    "AttachmentSource": {
+      "oneOf": [
+        { "$ref": "#/$defs/FileSource" },
+        { "$ref": "#/$defs/InputReference" }
+      ]
+    },
+    "InputBindings": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/ImportOrOutputReference" }
+    },
+    "Dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/Identifier" }
+    },
+    "Command": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            { "type": "string", "minLength": 1 }
+          ],
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["argv"]
+    },
+    "PiConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "thinking": {
+          "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
+      },
+      "required": ["model", "thinking"]
+    },
+    "PiHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "const": "pi" },
+        "config": { "$ref": "#/$defs/PiConfig" }
+      },
+      "required": ["id", "config"]
+    },
+    "AgentMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/TextSource" }
+        },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AttachmentSource" }
+        }
+      },
+      "required": ["text"]
+    },
+    "Agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "systemPrompt": { "$ref": "#/$defs/SourceRelativePath" },
+        "message": { "$ref": "#/$defs/AgentMessage" },
+        "harness": { "$ref": "#/$defs/PiHarness" }
+      },
+      "required": ["systemPrompt", "message", "harness"]
+    },
+    "AgentResponseOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "agent_response" }
+      },
+      "required": ["kind"]
+    },
+    "AgentResultOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "agent_result" },
+        "schema": { "$ref": "#/$defs/SourceRelativePath" }
+      },
+      "required": ["kind", "schema"]
+    },
+    "FileOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "file" },
+        "path": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "mediaType": { "$ref": "#/$defs/MediaType" }
+      },
+      "required": ["kind", "path", "mediaType"]
+    },
+    "CommandOutputs": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/FileOutput" }
+    },
+    "AgentOutputs": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/$defs/AgentResponseOutput" },
+          { "$ref": "#/$defs/AgentResultOutput" },
+          { "$ref": "#/$defs/FileOutput" }
+        ]
+      }
+    },
+    "CommandStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "cmd" },
+        "dependsOn": { "$ref": "#/$defs/Dependencies" },
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "inputs": { "$ref": "#/$defs/InputBindings" },
+        "outputs": { "$ref": "#/$defs/CommandOutputs" },
+        "command": { "$ref": "#/$defs/Command" }
+      },
+      "required": ["kind", "command"]
+    },
+    "AgentStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "agent" },
+        "dependsOn": { "$ref": "#/$defs/Dependencies" },
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "inputs": { "$ref": "#/$defs/InputBindings" },
+        "outputs": { "$ref": "#/$defs/AgentOutputs" },
+        "agent": { "$ref": "#/$defs/Agent" }
+      },
+      "required": ["kind", "agent"]
+    },
+    "Step": {
+      "oneOf": [
+        { "$ref": "#/$defs/CommandStep" },
+        { "$ref": "#/$defs/AgentStep" }
+      ]
+    },
+    "Exports": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/OutputReference" }
+    },
+    "Workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "description": { "type": "string" },
+        "steps": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/Identifier" },
+          "additionalProperties": { "$ref": "#/$defs/Step" }
+        },
+        "exports": { "$ref": "#/$defs/Exports" }
+      },
+      "required": ["schemaVersion", "steps"]
+    }
+  }
+}

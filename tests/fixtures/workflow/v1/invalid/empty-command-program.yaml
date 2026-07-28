@@ -1,0 +1,6 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["", "--unit"]

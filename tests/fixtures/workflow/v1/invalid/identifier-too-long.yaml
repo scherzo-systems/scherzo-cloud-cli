@@ -1,0 +1,6 @@
+schemaVersion: 1
+steps:
+  thisIdentifierIsDeliberatelyLongEnoughToExceedTheSixtyFourCharacterLimit:
+    kind: cmd
+    command:
+      argv: ["true"]

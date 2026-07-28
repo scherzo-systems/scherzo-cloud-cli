@@ -15,6 +15,11 @@
 mod api;
 mod build_info;
 mod cli;
+#[allow(
+    dead_code,
+    reason = "workflow decoding is an internal execution boundary with no CLI surface yet"
+)]
+mod execution;
 mod human_auth;
 mod runner;
 mod runner_protocol;

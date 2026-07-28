@@ -1,0 +1,7 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    timeout: 10m
+    command:
+      argv: ["./scripts/prepare-workspace.sh"]

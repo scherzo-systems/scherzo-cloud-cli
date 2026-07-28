@@ -1,0 +1,10 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["./scripts/prepare-workspace.sh"]
+    outputs:
+      summary:
+        kind: agent_result
+        schema: schemas/summary.schema.json

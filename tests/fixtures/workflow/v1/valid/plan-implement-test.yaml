@@ -1,0 +1,81 @@
+schemaVersion: 1
+description: Plan, implement, test, and export a requested change.
+
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["./scripts/prepare-workspace.sh"]
+
+  plan:
+    kind: agent
+    dependsOn: [prepare]
+    inputs:
+      prompt:
+        ref: imports.prompt
+      attachments:
+        ref: imports.attachments
+    agent:
+      systemPrompt: prompts/plan-system.md
+      message:
+        text:
+          - ref: inputs.prompt
+        attachments:
+          - ref: inputs.attachments
+      harness:
+        id: pi
+        config:
+          model: openai/gpt-5
+          thinking: high
+    outputs:
+      plan:
+        kind: agent_result
+        schema: schemas/change-plan.schema.json
+
+  implement:
+    kind: agent
+    dependsOn: [plan]
+    inputs:
+      prompt:
+        ref: imports.prompt
+      plan:
+        ref: outputs.plan.plan
+    agent:
+      systemPrompt: prompts/implement-system.md
+      message:
+        text:
+          - file: prompts/implement-message.md
+          - ref: inputs.prompt
+        attachments:
+          - ref: inputs.plan
+      harness:
+        id: pi
+        config:
+          model: openai/gpt-5
+          thinking: high
+    outputs:
+      response:
+        kind: agent_response
+      changeSummary:
+        kind: agent_result
+        schema: schemas/change-summary.schema.json
+
+  test:
+    kind: cmd
+    dependsOn: [implement]
+    cwd: packages/api
+    command:
+      argv: ["./scripts/test.sh"]
+    outputs:
+      report:
+        kind: file
+        path: packages/api/artifacts/test-report.xml
+        mediaType: application/junit+xml
+
+exports:
+  response:
+    ref: outputs.implement.response
+  changeSummary:
+    ref: outputs.implement.changeSummary
+  testReport:
+    ref: outputs.test.report

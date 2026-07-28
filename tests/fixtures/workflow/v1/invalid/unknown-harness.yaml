@@ -1,0 +1,14 @@
+schemaVersion: 1
+steps:
+  implement:
+    kind: agent
+    agent:
+      systemPrompt: prompts/implement-system.md
+      message:
+        text:
+          - file: prompts/implement-message.md
+      harness:
+        id: codex
+        config:
+          model: gpt-5
+          thinking: high
