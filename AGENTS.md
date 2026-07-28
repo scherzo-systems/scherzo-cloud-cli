@@ -39,6 +39,20 @@ synthetic `main` push. Preserve read-only permissions for checks and builds, gra
 only to the final release job, pin every action by commit, and keep pull requests and
 manual dispatch incapable of publication.
 
+## Release-note fragments
+
+Follow [`changes/README.md`](changes/README.md) whenever CLI work needs release intent.
+Choose `added`, `changed`, `fixed`, or `breaking` by primary user impact; use the exact
+`internal` marker only for truly user-invisible work. Generate filenames with the
+README's `/dev/urandom`, `od`, and `tr` command and verify exactly 32 lowercase
+hexadecimal characters rather than using `uuidgen` or a pull request number.
+
+Describe user behavior, not implementation. Never publish credentials, private URLs,
+customer or incident details, or unsafe vulnerability details, and never use `internal`
+to disguise a user-visible security correction. A rejected, unreleased fragment may be
+edited, replaced, or removed. A fragment present in a stable public tag is immutable;
+correct it with a new fragment. Run `./scripts/check-change-fragments` after authoring.
+
 ## Generated source
 
 Generated API clients and protocol codecs needed for a normal build must be committed.

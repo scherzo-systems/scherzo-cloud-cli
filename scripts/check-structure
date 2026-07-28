@@ -10,6 +10,7 @@ required_files=(
   CONTRIBUTING.md
   SECURITY.md
   LICENSE
+  changes/README.md
   release.toml
   .github/workflows/check.yml
   Cargo.toml
@@ -19,9 +20,11 @@ required_files=(
   devenv.yaml
   devenv.lock
   scripts/check
+  scripts/check-change-fragments
   scripts/check-lint-policy
   scripts/check-msrv
   scripts/check-structure
+  scripts/test-change-fragments
   tests/fixtures/lint-policy/main.rs
 )
 
@@ -49,6 +52,8 @@ done < <(find "$public_root/scripts" -type f -print0)
 "$public_root/scripts/test-fixture-git"
 "$public_root/scripts/test-git-isolation-check"
 "$public_root/scripts/check-test-git-isolation"
+"$public_root/scripts/test-change-fragments"
+"$public_root/scripts/check-change-fragments"
 "$public_root/scripts/test-release"
 "$public_root/scripts/test-release-planner"
 "$public_root/scripts/check-release"

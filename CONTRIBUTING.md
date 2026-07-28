@@ -38,6 +38,38 @@ regressing, skipped, or malformed release intent. `./scripts/plan-release` inspe
 synthetic public Git history and must remain the sole source of tag discovery,
 releaseable-path classification, and next-version planning for workflow automation.
 
+### Change fragments
+
+Record release intent under `changes/` (`cli/changes/` in the canonical monorepo).
+Choose the category by primary user impact: `added` for a new capability, `changed` for
+an observable compatible change, `fixed` for a corrected user-visible symptom, and
+`breaking` when users or integrations must adapt. A breaking note includes the migration
+in the same sentence. Use `internal` only when the change has no user-visible effect; its
+file must contain exactly `No user-visible changes.` and one newline.
+
+Generate the filename from the canonical monorepo root with the exact command in
+[`changes/README.md`](changes/README.md):
+
+```bash
+set -euo pipefail
+category=fixed
+fragment_id=$(LC_ALL=C od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')
+[[ $fragment_id =~ ^[0-9a-f]{32}$ ]]
+mkdir -p "cli/changes/$category"
+printf '%s\n' 'Fix run monitoring occasionally stopping before completion.' \
+  >"cli/changes/$category/$fragment_id.md"
+```
+
+Public notes describe present-tense user behavior rather than implementation details.
+Do not include credentials, private URLs, customer or incident details, or premature
+vulnerability details. Do not use `internal` to conceal a user-visible security fix.
+Run `./scripts/check-change-fragments` in the standalone checkout to validate the full
+byte grammar and tree.
+
+Human review may require editing, replacing, or removing a fragment before release.
+Once a stable public tag contains that fragment, it is immutable; correct released text
+with a new fragment instead.
+
 ## Security reports
 
 Do not report vulnerabilities, credentials, or other sensitive details in a public

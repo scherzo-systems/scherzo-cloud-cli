@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-change-fragments" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+fixture=$test_root/fixture
+changes_dir=$fixture/changes
+valid_name=0123456789abcdef0123456789abcdef.md
+second_name=fedcba9876543210fedcba9876543210.md
+code_delimiter='`'
+mkdir -p "$fixture/scripts"
+cp "$script_dir/check-change-fragments" "$fixture/scripts/check-change-fragments"
+chmod +x "$fixture/scripts/check-change-fragments"
+validator=$fixture/scripts/check-change-fragments
+
+reset_fixture() {
+  rm -rf "$changes_dir"
+  mkdir -p "$changes_dir"
+  printf '# Change fragment fixture\n' >"$changes_dir/README.md"
+}
+
+public_fragment_path() {
+  printf '%s/fixed/%s\n' "$changes_dir" "$valid_name"
+}
+
+prepare_public_fragment() {
+  reset_fixture
+  mkdir -p "$changes_dir/fixed"
+}
+
+write_public() {
+  prepare_public_fragment
+  printf '%s\n' "$1" >"$(public_fragment_path)"
+}
+
+expect_success() {
+  local output
+  if ! output=$("$validator" 2>&1); then
+    fail "Expected fragment validation success, got: $output"
+  fi
+  if [[ $output != "CLI change fragments are valid." ]]; then
+    fail "Unexpected fragment validation output: $output"
+  fi
+}
+
+expect_failure() {
+  local expected=$1
+  local output
+  if output=$("$validator" 2>&1); then
+    fail "Expected fragment validation failure containing '$expected', got success: $output"
+  fi
+  if [[ $output != *"$expected"* ]]; then
+    fail "Expected fragment validation failure containing '$expected', got: $output"
+  fi
+}
+
+# The checked-in generator must produce the exact filename identifier shape.
+fragment_id=$(LC_ALL=C od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')
+[[ $fragment_id =~ ^[0-9a-f]{32}$ ]] \
+  || fail "The documented fragment generator did not produce 32 lowercase hexadecimal characters."
+
+# The README retains the tree; every category directory is optional.
+reset_fixture
+expect_success
+mkdir -p "$changes_dir/added" "$changes_dir/fixed"
+printf '%s\n' 'Add account lookup.' >"$changes_dir/added/$valid_name"
+printf '%s\n' 'Fix account lookup.' >"$changes_dir/fixed/$second_name"
+expect_success
+
+# All public categories and the exact internal marker may coexist historically.
+reset_fixture
+for category in added changed fixed breaking; do
+  mkdir -p "$changes_dir/$category"
+  printf '%s\n' 'Describe user-visible behavior.' \
+    >"$changes_dir/$category/$valid_name"
+done
+mkdir -p "$changes_dir/internal"
+printf '%s\n' 'No user-visible changes.' \
+  >"$changes_dir/internal/$valid_name"
+expect_success
+
+reset_fixture
+rm "$changes_dir/README.md"
+expect_failure "changes/README.md is missing"
+
+reset_fixture
+printf 'unexpected\n' >"$changes_dir/notes.txt"
+expect_failure "unexpected entry in the fragment tree"
+
+reset_fixture
+mkdir "$changes_dir/security"
+expect_failure "unexpected entry in the fragment tree"
+
+reset_fixture
+mkdir -p "$changes_dir/fixed/nested"
+expect_failure "category entries must be regular fragment files"
+
+# Traversal failures must not let an uninspected category pass validation.
+reset_fixture
+mkdir -p "$changes_dir/fixed"
+printf '%s\n' 'Invalid hidden fragment.' >"$changes_dir/fixed/not-valid.md"
+(
+  trap 'chmod 700 "$changes_dir/fixed"' EXIT
+  chmod 000 "$changes_dir/fixed"
+  if output=$("$validator" 2>&1); then
+    fail "Expected an unreadable category to fail validation, got success: $output"
+  fi
+)
+
+for invalid_name in \
+  0123456789abcdef0123456789abcde.md \
+  0123456789abcdef0123456789abcdef0.md \
+  0123456789ABCDEF0123456789ABCDEF.md \
+  01234567-89ab-cdef-0123-456789abcdef.md \
+  0123456789abcdef0123456789abcdef.txt \
+  .gitkeep; do
+  reset_fixture
+  mkdir -p "$changes_dir/fixed"
+  printf '%s\n' 'Fix a visible problem.' >"$changes_dir/fixed/$invalid_name"
+  expect_failure "fragment names must match"
+done
+
+reset_fixture
+mkdir -p "$changes_dir/fixed"
+printf '%s\n' 'Fix a visible problem.' >"$changes_dir/fixed/$valid_name"
+ln -s "$valid_name" "$changes_dir/fixed/$second_name"
+expect_failure "symbolic links are not permitted in the fragment tree"
+
+# Internal fragments have one and only one accepted byte sequence.
+reset_fixture
+mkdir -p "$changes_dir/internal"
+printf '%s\n' 'No user-visible changes.' >"$changes_dir/internal/$valid_name"
+expect_success
+
+printf '%s\n' 'Refactor account storage.' >"$changes_dir/internal/$valid_name"
+expect_failure "internal fragments must contain exactly"
+printf '%s' 'No user-visible changes.' >"$changes_dir/internal/$valid_name"
+expect_failure "internal fragments must contain exactly"
+printf '%s\n\n' 'No user-visible changes.' >"$changes_dir/internal/$valid_name"
+expect_failure "internal fragments must contain exactly"
+printf '%s\n' 'No user-visible changes. ' >"$changes_dir/internal/$valid_name"
+expect_failure "internal fragments must contain exactly"
+
+# The inclusive content-size boundaries are one and 200 bytes.
+write_public '.'
+expect_success
+printf -v long_prefix '%199s' ''
+long_content=${long_prefix// /a}.
+write_public "$long_content"
+expect_success
+printf -v long_prefix '%200s' ''
+long_content=${long_prefix// /a}.
+write_public "$long_content"
+expect_failure "public content must be 1-200 bytes"
+
+prepare_public_fragment
+: >"$(public_fragment_path)"
+expect_failure "public content must be 1-200 bytes"
+printf '\n' >"$(public_fragment_path)"
+expect_failure "public content must be 1-200 bytes"
+printf '%s' 'Missing final newline.' >"$(public_fragment_path)"
+expect_failure "must end with exactly one newline"
+printf '%s\n\n' 'Extra final newline.' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf 'Windows newline.\r\n' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf '%s\n' ' Leading space.' >"$(public_fragment_path)"
+expect_failure "must not start or end with whitespace"
+printf '%s\n' 'Trailing space. ' >"$(public_fragment_path)"
+expect_failure "must not start or end with whitespace"
+printf 'Embedded\ttab.\n' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf 'Embedded\000null.\n' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf 'Embedded\177delete.\n' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf 'Embedded\200control.\n' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+printf '%s\n' 'Fix café display.' >"$(public_fragment_path)"
+expect_failure "only printable ASCII"
+
+# Printable Markdown syntax is accepted only inside nonempty single-backtick spans.
+write_public "Use ${code_delimiter}--flag=value?! #*_[x] <tag> \\ path${code_delimiter} safely."
+expect_success
+write_public "Use ${code_delimiter}one?${code_delimiter} and ${code_delimiter}two!${code_delimiter} safely."
+expect_success
+
+for markdown_content in \
+  'Reject # markup.' \
+  'Reject * markup.' \
+  'Reject _ markup.' \
+  'Reject [ markup.' \
+  'Reject ] markup.' \
+  'Reject < markup.' \
+  'Reject > markup.' \
+  'Reject \ markup.'; do
+  write_public "$markdown_content"
+  expect_failure "unsupported Markdown"
+done
+
+for prefix_content in \
+  '- list item.' \
+  '+ list item.' \
+  '1. list item.' \
+  '12) list item.' \
+  '> quote item.'; do
+  write_public "$prefix_content"
+  expect_failure "Markdown list and quote prefixes"
+done
+
+for restricted_content in \
+  'Notify @maintainer.' \
+  'Open HTTP://example.invalid.' \
+  'Open https://example.invalid.' \
+  'Open WWW.example.invalid.' \
+  "Use ${code_delimiter}@maintainer${code_delimiter} carefully." \
+  "Use ${code_delimiter}https://example.invalid${code_delimiter} carefully."; do
+  write_public "$restricted_content"
+  if [[ $restricted_content == *'@'* ]]; then
+    expect_failure "mentions are not permitted"
+  else
+    expect_failure "URLs are not permitted"
+  fi
+done
+
+write_public "Use ${code_delimiter}${code_delimiter} now."
+expect_failure "adjacent or multi-backtick"
+write_public "Use ${code_delimiter}flag."
+expect_failure "balanced and nonempty"
+write_public "Use ${code_delimiter}one${code_delimiter}${code_delimiter}two${code_delimiter} safely."
+expect_failure "adjacent or multi-backtick"
+
+write_public 'This has no terminator'
+expect_failure "exactly one sentence terminator"
+write_public 'This has two. Really.'
+expect_failure "exactly one sentence terminator"
+write_public 'This terminator. is not final'
+expect_failure "terminator must be the final content byte"
+
+printf 'CLI change fragment checks passed.\n'

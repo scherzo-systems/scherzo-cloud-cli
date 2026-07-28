@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+fail() {
+  echo "Change fragment validation failed: $1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/check-change-fragments" >&2
+  exit 2
+fi
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+changes_dir=$public_root/changes
+filename_pattern='^[0-9a-f]{32}[.]md$'
+list_prefix_pattern='^(- |\+ |> |[0-9]+([.]|\)) )'
+
+show_path() {
+  local relative=${1#"$public_root"/}
+  printf '%q' "$relative"
+}
+
+fail_path() {
+  local path=$1
+  local reason=$2
+  local display
+  display=$(show_path "$path")
+  fail "$display: $reason"
+}
+
+scan_dir=$(mktemp -d) || fail "could not create a temporary scan directory"
+trap 'rm -rf "$scan_dir"' EXIT
+
+collect_find_entries() {
+  local output=$1
+  local path=$2
+  local reason=$3
+  shift 3
+
+  if ! find "$@" -print0 >"$output" 2>/dev/null; then
+    fail_path "$path" "$reason"
+  fi
+}
+
+validate_internal_fragment() {
+  local fragment=$1
+
+  if ! cmp -s "$fragment" <(printf '%s\n' 'No user-visible changes.'); then
+    fail_path \
+      "$fragment" \
+      "internal fragments must contain exactly 'No user-visible changes.' followed by one newline"
+  fi
+}
+
+validate_public_fragment() {
+  local fragment=$1
+  local -a bytes=()
+  local -a line_bytes=()
+  local byte_count content_length index byte last_byte
+  local content lower_content character last_character
+  local backslash=$'\\'
+  local in_code=0
+  local code_length=0
+  local previous_backtick=0
+  local terminator_count=0
+
+  while read -r -a line_bytes; do
+    bytes+=("${line_bytes[@]}")
+  done < <(od -An -v -tu1 -- "$fragment")
+
+  byte_count=${#bytes[@]}
+  if ((byte_count < 2 || byte_count > 201)); then
+    fail_path \
+      "$fragment" \
+      "public content must be 1-200 bytes followed by one newline"
+  fi
+
+  last_byte=${bytes[byte_count - 1]}
+  if [[ $last_byte -ne 10 ]]; then
+    fail_path "$fragment" "public content must end with exactly one newline"
+  fi
+
+  content_length=$((byte_count - 1))
+  for ((index = 0; index < content_length; index += 1)); do
+    byte=${bytes[index]}
+    if ((byte < 32 || byte > 126)); then
+      fail_path \
+        "$fragment" \
+        "public content must contain only printable ASCII before its final newline"
+    fi
+  done
+
+  if [[ ${bytes[0]} -eq 32 || ${bytes[content_length - 1]} -eq 32 ]]; then
+    fail_path "$fragment" "public content must not start or end with whitespace"
+  fi
+
+  content=
+  IFS= read -r content <"$fragment" || true
+  lower_content=${content,,}
+
+  if [[ $content == *@* ]]; then
+    fail_path "$fragment" "mentions are not permitted"
+  fi
+  if [[ $lower_content == *http://* \
+    || $lower_content == *https://* \
+    || $lower_content == *www.* ]]; then
+    fail_path "$fragment" "URLs are not permitted"
+  fi
+  if [[ $content =~ $list_prefix_pattern ]]; then
+    fail_path "$fragment" "Markdown list and quote prefixes are not permitted"
+  fi
+
+  for ((index = 0; index < content_length; index += 1)); do
+    character=${content:index:1}
+
+    if [[ $character == '`' ]]; then
+      if [[ $previous_backtick -eq 1 ]]; then
+        fail_path "$fragment" "adjacent or multi-backtick code spans are not permitted"
+      fi
+      previous_backtick=1
+
+      if [[ $in_code -eq 0 ]]; then
+        in_code=1
+        code_length=0
+      else
+        if [[ $code_length -eq 0 ]]; then
+          fail_path "$fragment" "inline code spans must not be empty"
+        fi
+        in_code=0
+      fi
+      continue
+    fi
+
+    previous_backtick=0
+    if [[ $in_code -eq 1 ]]; then
+      ((code_length += 1))
+      continue
+    fi
+
+    case "$character" in
+      '#'|'*'|'_'|'['|']'|'<'|'>')
+        fail_path "$fragment" "unsupported Markdown is not permitted outside code spans"
+        ;;
+      '.'|'!'|'?')
+        ((terminator_count += 1))
+        ;;
+    esac
+    if [[ $character == "$backslash" ]]; then
+      fail_path "$fragment" "unsupported Markdown is not permitted outside code spans"
+    fi
+  done
+
+  if [[ $in_code -ne 0 ]]; then
+    fail_path "$fragment" "inline code spans must be balanced and nonempty"
+  fi
+  if [[ $terminator_count -ne 1 ]]; then
+    fail_path \
+      "$fragment" \
+      "public content must contain exactly one sentence terminator outside code spans"
+  fi
+
+  last_character=${content:content_length - 1:1}
+  case "$last_character" in
+    '.'|'!'|'?')
+      ;;
+    *)
+      fail_path \
+        "$fragment" \
+        "the outside-code sentence terminator must be the final content byte"
+      ;;
+  esac
+}
+
+validate_category() {
+  local category_dir=$1
+  local category=${category_dir##*/}
+  local entry name
+  local entry_list=$scan_dir/category-$category
+
+  collect_find_entries \
+    "$entry_list" \
+    "$category_dir" \
+    "could not inspect category entries" \
+    "$category_dir" -mindepth 1 -maxdepth 1
+
+  while IFS= read -r -d '' entry; do
+    if [[ ! -f $entry ]]; then
+      fail_path "$entry" "category entries must be regular fragment files"
+    fi
+
+    name=${entry##*/}
+    if [[ ! $name =~ $filename_pattern ]]; then
+      fail_path "$entry" "fragment names must match ^[0-9a-f]{32}\\.md$"
+    fi
+
+    if [[ $category == internal ]]; then
+      validate_internal_fragment "$entry"
+    else
+      validate_public_fragment "$entry"
+    fi
+  done <"$entry_list"
+}
+
+if [[ -L $changes_dir ]]; then
+  fail_path "$changes_dir" "symbolic links are not permitted in the fragment tree"
+fi
+if [[ ! -d $changes_dir ]]; then
+  fail "the changes directory is missing"
+fi
+
+symbolic_link_entries=$scan_dir/symbolic-links
+collect_find_entries \
+  "$symbolic_link_entries" \
+  "$changes_dir" \
+  "could not inspect fragment tree" \
+  "$changes_dir" -type l
+symbolic_link=
+while IFS= read -r -d '' symbolic_link; do
+  break
+done <"$symbolic_link_entries"
+if [[ -n $symbolic_link ]]; then
+  fail_path "$symbolic_link" "symbolic links are not permitted in the fragment tree"
+fi
+
+root_entries=$scan_dir/root-entries
+collect_find_entries \
+  "$root_entries" \
+  "$changes_dir" \
+  "could not inspect fragment tree" \
+  "$changes_dir" -mindepth 1 -maxdepth 1
+readme_found=0
+while IFS= read -r -d '' entry; do
+  name=${entry##*/}
+  case "$name" in
+    README.md)
+      if [[ ! -f $entry ]]; then
+        fail_path "$entry" "the fragment README must be a regular file"
+      fi
+      readme_found=1
+      ;;
+    added|changed|fixed|breaking|internal)
+      if [[ ! -d $entry ]]; then
+        fail_path "$entry" "fragment categories must be directories"
+      fi
+      validate_category "$entry"
+      ;;
+    *)
+      fail_path "$entry" "unexpected entry in the fragment tree"
+      ;;
+  esac
+done <"$root_entries"
+
+if [[ $readme_found -ne 1 ]]; then
+  fail "changes/README.md is missing"
+fi
+
+printf 'CLI change fragments are valid.\n'
