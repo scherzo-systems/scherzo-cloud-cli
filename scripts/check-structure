@@ -25,9 +25,13 @@ required_files=(
   scripts/check-msrv
   scripts/check-structure
   scripts/classify-release-path
+  scripts/render-release-notes
   scripts/test-change-fragments
+  scripts/test-release-notes
   scripts/test-release-path-classifier
   tests/fixtures/lint-policy/main.rs
+  tests/fixtures/release-notes/v1/README.md
+  tests/fixtures/release-notes/v1/contract-version
 )
 
 for required_file in "${required_files[@]}"; do
@@ -56,6 +60,7 @@ done < <(find "$public_root/scripts" -type f -print0)
 "$public_root/scripts/check-test-git-isolation"
 "$public_root/scripts/test-change-fragments"
 "$public_root/scripts/check-change-fragments"
+"$public_root/scripts/test-release-notes"
 "$public_root/scripts/test-release"
 "$public_root/scripts/test-release-path-classifier"
 "$public_root/scripts/test-release-planner"

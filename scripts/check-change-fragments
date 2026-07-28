@@ -8,10 +8,26 @@ fail() {
   exit 1
 }
 
-if [[ $# -ne 0 ]]; then
-  echo "Usage: scripts/check-change-fragments" >&2
-  exit 2
-fi
+mode=tree
+fragment_category=
+fragment_path=
+case $# in
+  0)
+    ;;
+  3)
+    if [[ $1 != --fragment ]]; then
+      echo "Usage: scripts/check-change-fragments [--fragment CATEGORY FILE]" >&2
+      exit 2
+    fi
+    mode=fragment
+    fragment_category=$2
+    fragment_path=$3
+    ;;
+  *)
+    echo "Usage: scripts/check-change-fragments [--fragment CATEGORY FILE]" >&2
+    exit 2
+    ;;
+esac
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 changes_dir=$public_root/changes
@@ -203,6 +219,28 @@ validate_category() {
     fi
   done <"$entry_list"
 }
+
+if [[ $mode == fragment ]]; then
+  if [[ ! -f $fragment_path || -L $fragment_path ]]; then
+    fail_path "$fragment_path" "the selected fragment must be a regular file"
+  fi
+  fragment_name=${fragment_path##*/}
+  if [[ ! $fragment_name =~ $filename_pattern ]]; then
+    fail_path "$fragment_path" "fragment names must match ^[0-9a-f]{32}\\.md$"
+  fi
+  case "$fragment_category" in
+    added|changed|fixed|breaking)
+      validate_public_fragment "$fragment_path"
+      ;;
+    internal)
+      validate_internal_fragment "$fragment_path"
+      ;;
+    *)
+      fail "unknown fragment category: $fragment_category"
+      ;;
+  esac
+  exit 0
+fi
 
 if [[ -L $changes_dir ]]; then
   fail_path "$changes_dir" "symbolic links are not permitted in the fragment tree"

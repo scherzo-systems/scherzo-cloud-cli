@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-release-notes" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+public_root=$(cd "$script_dir/.." && pwd -P)
+fixture_git=$script_dir/fixture-git
+corpus=$public_root/tests/fixtures/release-notes/v1
+workflow=$public_root/.github/workflows/check.yml
+[[ $(cat "$corpus/contract-version") == 1 ]] \
+  || fail "The release-note fixture contract version must be 1."
+
+test_root=$($fixture_git new-root)
+trap 'rm -rf "$test_root"' EXIT
+workflow_step_yaml=$test_root/write-release-notes.yml
+workflow_command=$test_root/write-release-notes.sh
+
+awk '
+  $0 == "      - name: Write release notes" {
+    in_step = 1
+  }
+  in_step && $0 ~ /^      - name: / && $0 != "      - name: Write release notes" {
+    exit
+  }
+  in_step {
+    print
+  }
+' "$workflow" >"$workflow_step_yaml"
+[[ -s $workflow_step_yaml ]] || fail "Could not find the Write release notes workflow step."
+
+# GitHub expressions are fixture text here, not shell expansions.
+# shellcheck disable=SC2016
+for expected_mapping in \
+  '          LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}' \
+  '          VERSION: ${{ needs.plan_release.outputs.version }}' \
+  '          SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}'; do
+  mapping_count=$(grep -Fxc "$expected_mapping" "$workflow_step_yaml" || true)
+  [[ $mapping_count -eq 1 ]] \
+    || fail "Write release notes must contain exactly one mapping: $expected_mapping"
+done
+
+awk '
+  $0 == "        run: |" {
+    in_run = 1
+    next
+  }
+  in_run {
+    sub(/^          /, "")
+    print
+  }
+' "$workflow_step_yaml" >"$workflow_command"
+[[ -s $workflow_command ]] || fail "Could not extract the Write release notes command."
+
+actual_permissions=$(
+  awk '
+    $0 == "  publish_release:" {
+      in_job = 1
+      next
+    }
+    in_job && /^  [A-Za-z0-9_]+:/ {
+      exit
+    }
+    in_job && $0 == "    permissions:" {
+      in_permissions = 1
+      next
+    }
+    in_permissions && /^      [A-Za-z0-9-]+: [A-Za-z]+$/ {
+      sub(/^      /, "")
+      print
+      next
+    }
+    in_permissions && $0 !~ /^[[:space:]]*$/ {
+      exit
+    }
+  ' "$workflow" | sort
+)
+expected_permissions=$(cat <<'EOF'
+attestations: write
+contents: write
+id-token: write
+EOF
+)
+[[ $actual_permissions == "$expected_permissions" ]] || {
+  printf 'Expected publish_release permissions:\n%s\nActual:\n%s\n' \
+    "$expected_permissions" "$actual_permissions" >&2
+  fail "publish_release permissions changed."
+}
+
+fixture_repository_git() {
+  "$fixture_git" worktree "$test_root" "$fixture" "$@"
+}
+
+compare_file() {
+  local description=$1
+  local expected=$2
+  local actual=$3
+  if ! cmp -s "$expected" "$actual"; then
+    printf '%s differs. Expected and actual bytes:\n' "$description" >&2
+    od -An -v -tx1 -- "$expected" >&2
+    printf '%s\n' '---' >&2
+    od -An -v -tx1 -- "$actual" >&2
+    fail "$description did not match its byte-for-byte fixture."
+  fi
+}
+
+for required_case in no-prior-tag tag-boundary all-categories internal-only; do
+  [[ -d $corpus/cases/$required_case ]] \
+    || fail "Required release-note fixture case is missing: $required_case"
+done
+
+case_count=0
+body_case_count=0
+while IFS= read -r -d '' case_dir; do
+  ((case_count += 1))
+  case_name=${case_dir##*/}
+  fixture=$test_root/repository-$case_name
+  runner_temp=$test_root/runner-$case_name
+  actual_release=$test_root/$case_name-release.md
+  actual_preview=$test_root/$case_name-preview.md
+  mkdir -p "$fixture/scripts" "$fixture/changes" "$runner_temp"
+  cp "$script_dir/render-release-notes" "$fixture/scripts/render-release-notes"
+  cp "$script_dir/check-change-fragments" "$fixture/scripts/check-change-fragments"
+  cp "$public_root/changes/README.md" "$fixture/changes/README.md"
+  chmod +x \
+    "$fixture/scripts/render-release-notes" \
+    "$fixture/scripts/check-change-fragments"
+
+  if [[ -d $case_dir/base ]]; then
+    cp -R "$case_dir/base/." "$fixture/"
+  fi
+
+  "$fixture_git" init-worktree "$test_root" "$fixture"
+  fixture_repository_git config user.name "Release Note Fixture"
+  fixture_repository_git config user.email "release-note-fixture@scherzo.invalid"
+  fixture_repository_git add --all
+  fixture_repository_git commit --quiet --message="Fixture release boundary"
+
+  latest_tag=
+  if [[ -f $case_dir/latest-tag ]]; then
+    IFS= read -r latest_tag <"$case_dir/latest-tag"
+    [[ $latest_tag =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] \
+      || fail "$case_name has an invalid latest-tag fixture."
+    fixture_repository_git update-ref "refs/tags/$latest_tag" HEAD
+  fi
+
+  cp -R "$case_dir/proposed/." "$fixture/"
+  fixture_repository_git add --all
+  fixture_repository_git commit --quiet --message="Fixture candidate"
+
+  release_args=(--candidate HEAD)
+  if [[ -n $latest_tag ]]; then
+    release_args+=(--latest-tag "$latest_tag")
+  fi
+  (
+    cd "$fixture"
+    GIT_DIR="$test_root/redirected.git" \
+    GIT_WORK_TREE="$test_root/redirected-worktree" \
+      ./scripts/render-release-notes "${release_args[@]}"
+  ) >"$actual_release"
+  compare_file "$case_name release rendering" "$case_dir/expected.md" "$actual_release"
+
+  preview_paths=()
+  while IFS= read -r -d '' proposed_fragment; do
+    preview_paths+=("${proposed_fragment#"$case_dir/proposed/"}")
+  done < <(find "$case_dir/proposed/changes" -type f -print0 | sort -z)
+  (
+    cd "$fixture"
+    ./scripts/render-release-notes --preview "${preview_paths[@]}"
+  ) >"$actual_preview"
+  compare_file "$case_name preview rendering" "$case_dir/expected.md" "$actual_preview"
+  compare_file "$case_name shared-mode rendering" "$actual_release" "$actual_preview"
+
+  if [[ -f $case_dir/release-body.md ]]; then
+    ((body_case_count += 1))
+    (
+      cd "$fixture"
+      GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+      LATEST_TAG="$latest_tag" \
+      RUNNER_TEMP="$runner_temp" \
+      SOURCE_REVISION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      VERSION=0.1.1 \
+        bash "$workflow_command"
+    )
+    compare_file \
+      "$case_name release body" \
+      "$case_dir/release-body.md" \
+      "$runner_temp/release-notes.md"
+  fi
+
+  if [[ $case_name == tag-boundary ]]; then
+    released_fragment=changes/fixed/ffffffffffffffffffffffffffffffff.md
+    renamed_fragment=changes/fixed/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.md
+    [[ -f $fixture/$released_fragment ]] \
+      || fail "The tag-boundary fixture must contain its released fragment."
+    immutable_candidate=$(fixture_repository_git rev-parse HEAD)
+
+    for mutation in modified deleted renamed; do
+      fixture_repository_git reset --hard --quiet "$immutable_candidate"
+      case "$mutation" in
+        modified)
+          printf '%s\n' 'Fix a rewritten released problem.' \
+            >"$fixture/$released_fragment"
+          ;;
+        deleted)
+          rm -- "$fixture/$released_fragment"
+          ;;
+        renamed)
+          mv -- "$fixture/$released_fragment" "$fixture/$renamed_fragment"
+          ;;
+      esac
+      fixture_repository_git add --all
+      fixture_repository_git commit \
+        --quiet \
+        --message="Fixture released fragment $mutation"
+
+      mutation_output=$test_root/tag-boundary-$mutation-output
+      mutation_error=$test_root/tag-boundary-$mutation-error
+      if (
+        cd "$fixture"
+        ./scripts/render-release-notes \
+          --candidate HEAD \
+          --latest-tag "$latest_tag"
+      ) >"$mutation_output" 2>"$mutation_error"; then
+        fail "Release rendering accepted a $mutation released fragment."
+      fi
+    done
+  fi
+done < <(find "$corpus/cases" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+[[ $case_count -ge 4 ]] || fail "Expected at least four release-note rendering fixture cases."
+[[ $body_case_count -ge 3 ]] || fail "Expected at least three exact release-body fixture cases."
+printf 'CLI release-note rendering checks passed.\n'

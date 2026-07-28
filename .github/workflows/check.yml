@@ -299,17 +299,30 @@ jobs:
         if: steps.recheck.outputs.publish == 'true'
         shell: bash
         env:
+          LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}
           VERSION: ${{ needs.plan_release.outputs.version }}
           SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
         run: |
-          cat >"$RUNNER_TEMP/release-notes.md" <<EOF
-          Scherzo Cloud CLI v$VERSION
+          set -euo pipefail
+          rendered_notes=$RUNNER_TEMP/rendered-release-notes.md
+          release_notes=$RUNNER_TEMP/release-notes.md
+          render_args=(--candidate HEAD)
+          if [[ -n "$LATEST_TAG" ]]; then
+            render_args+=(--latest-tag "$LATEST_TAG")
+          fi
+          ./scripts/render-release-notes "${render_args[@]}" >"$rendered_notes"
 
-          Mirror commit: \`$GITHUB_SHA\`
-          Source revision: \`$SOURCE_REVISION\`
-
-          This release contains unsigned binaries, SHA-256 checksums, and GitHub build-provenance attestations.
-          EOF
+          {
+            printf 'Scherzo Cloud CLI v%s\n\n' "$VERSION"
+            if [[ -s "$rendered_notes" ]]; then
+              cat "$rendered_notes"
+              printf '\n'
+            fi
+            printf "Mirror commit: \`%s\`\\n" "$GITHUB_SHA"
+            printf "Source revision: \`%s\`\\n\\n" "$SOURCE_REVISION"
+            printf '%s\n' \
+              'This release contains unsigned binaries, SHA-256 checksums, and GitHub build-provenance attestations.'
+          } >"$release_notes"
       - name: Publish GitHub Release
         if: steps.recheck.outputs.publish == 'true'
         shell: bash
