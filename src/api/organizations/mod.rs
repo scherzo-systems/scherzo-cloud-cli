@@ -167,6 +167,13 @@ impl Operation {
             Self::ListMemberships => "membership-list",
         }
     }
+
+    fn can_retry_interrupted_response(self, status: StatusCode) -> bool {
+        matches!(
+            (self, status),
+            (Self::Create, StatusCode::CREATED) | (Self::Update, StatusCode::OK)
+        )
+    }
 }
 
 struct RequestSpec {
@@ -471,10 +478,19 @@ fn execute_request(
             }
         };
         let status = response.status();
+        if spec.operation.can_retry_interrupted_response(status) {
+            require_replayable_success_headers(spec, &response)?;
+        }
         let remaining = timeout.saturating_sub(started.elapsed());
         match client.run(remaining, receive_response(spec.operation, response)) {
             Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
+            Ok(Err(AttemptError::Transport(category)))
+                if spec.operation.can_retry_interrupted_response(status) =>
+            {
+                last_failure = category;
+                continue;
+            }
             Ok(Err(AttemptError::Transport(category))) => {
                 return Ok(RequestExecution::Unreachable(if status.is_server_error() {
                     UnreachableCategory::Server
@@ -489,6 +505,10 @@ fn execute_request(
                     true,
                 ));
             }
+            Err(_) if spec.operation.can_retry_interrupted_response(status) => {
+                last_failure = UnreachableCategory::Timeout;
+                continue;
+            }
             Err(_) => {
                 return Ok(RequestExecution::Unreachable(if status.is_server_error() {
                     UnreachableCategory::Server
@@ -500,6 +520,55 @@ fn execute_request(
     }
 
     Ok(RequestExecution::Unreachable(last_failure))
+}
+
+fn require_replayable_success_headers(
+    spec: &RequestSpec,
+    response: &Response,
+) -> Result<(), OrganizationError> {
+    if response.headers().get("Idempotency-Key") != spec.idempotency_key.as_ref() {
+        return Err(OrganizationError::protocol(
+            spec.operation,
+            "the successful response has a missing or mismatched Idempotency-Key header",
+            false,
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(http_util::media_type)
+        .transpose()
+        .map_err(|()| {
+            OrganizationError::protocol(
+                spec.operation,
+                "the Content-Type header is not valid text",
+                false,
+            )
+        })?;
+    if content_type.as_deref() != Some(JSON_MEDIA_TYPE) {
+        return Err(OrganizationError::protocol(
+            spec.operation,
+            "the response Content-Type is not valid for its HTTP status",
+            false,
+        ));
+    }
+
+    if matches!(spec.operation, Operation::Create)
+        && response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .is_none()
+    {
+        return Err(OrganizationError::protocol(
+            Operation::Create,
+            "the successful response has a missing or mismatched Location header",
+            false,
+        ));
+    }
+
+    Ok(())
 }
 
 async fn send_request(

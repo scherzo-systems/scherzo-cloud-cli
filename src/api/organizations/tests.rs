@@ -61,6 +61,12 @@ fn success(status: &str) -> Vec<u8> {
     )
 }
 
+fn interrupted_success(status: &str) -> Vec<u8> {
+    let mut response = success(status);
+    response.pop();
+    response
+}
+
 fn problem_response(
     status_text: &str,
     status: u16,
@@ -96,38 +102,54 @@ fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
         .expect("request should contain expected header")
 }
 
+fn send_fixture_shutdown(api_url: &str) {
+    let address = api_url
+        .strip_prefix("http://")
+        .unwrap()
+        .trim_end_matches("/api/");
+    if let Ok(mut stream) = std::net::TcpStream::connect(address) {
+        let _ = std::io::Write::write_all(
+            &mut stream,
+            b"GET /fixture-shutdown HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n",
+        );
+    }
+}
+
 #[test]
-fn create_serializes_once_and_retries_with_identical_request_identity() {
-    let server = ScriptedHttpServer::respond_in_sequence(vec![Vec::new(), success("201 Created")]);
+fn create_retries_failures_before_and_during_a_created_response() {
+    for first_response in [Vec::new(), interrupted_success("201 Created")] {
+        let server =
+            ScriptedHttpServer::respond_in_sequence(vec![first_response, success("201 Created")]);
 
-    let outcome = create_organization(
-        &http_client(),
-        &server.api_url,
-        TOKEN,
-        KEY,
-        "\u{2003}Acme Research\u{2003}",
-        Some("acme-research"),
-    )
-    .expect("create should succeed after one ambiguous failure");
+        let outcome = create_organization(
+            &http_client(),
+            &server.api_url,
+            TOKEN,
+            KEY,
+            "\u{2003}Acme Research\u{2003}",
+            Some("acme-research"),
+        )
+        .expect("create should succeed after one ambiguous failure");
 
-    assert!(matches!(outcome, CreateOrganizationOutcome::Created(_)));
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-    assert!(requests[0].starts_with("POST /api/v1/organizations HTTP/1.1\r\n"));
-    assert_eq!(
-        header_value(&requests[0], "authorization"),
-        format!("Bearer {TOKEN}")
-    );
-    assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
-    assert_eq!(header_value(&requests[0], "content-type"), JSON_MEDIA_TYPE);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
-        serde_json::json!({
-            "displayName": "\u{2003}Acme Research\u{2003}",
-            "slug": "acme-research"
-        })
-    );
+        assert!(matches!(outcome, CreateOrganizationOutcome::Created(_)));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with("POST /api/v1/organizations HTTP/1.1\r\n"));
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+        assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
+        assert_eq!(header_value(&requests[0], "content-type"), JSON_MEDIA_TYPE);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
+            serde_json::json!({
+                "displayName": "\u{2003}Acme Research\u{2003}",
+                "slug": "acme-research"
+            })
+        );
+    }
 }
 
 #[test]
@@ -301,31 +323,70 @@ fn show_preserves_private_failure_classification() {
 }
 
 #[test]
-fn update_omits_unsupplied_fields_and_retries_identically() {
-    let server = ScriptedHttpServer::respond_in_sequence(vec![Vec::new(), success("200 OK")]);
+fn update_retries_failures_before_and_during_an_updated_response() {
+    for first_response in [Vec::new(), interrupted_success("200 OK")] {
+        let server =
+            ScriptedHttpServer::respond_in_sequence(vec![first_response, success("200 OK")]);
 
-    let outcome = update_organization(
-        &http_client(),
-        &server.api_url,
-        TOKEN,
-        "acme/research",
-        KEY,
-        Some("Acme Labs"),
-        None,
-    )
-    .expect("update should succeed after retry");
+        let outcome = update_organization(
+            &http_client(),
+            &server.api_url,
+            TOKEN,
+            "acme/research",
+            KEY,
+            Some("Acme Labs"),
+            None,
+        )
+        .expect("update should succeed after one ambiguous failure");
 
-    assert!(matches!(outcome, UpdateOrganizationOutcome::Updated(_)));
-    let requests = server.finish();
-    assert_eq!(requests[0], requests[1]);
-    assert!(requests[0].starts_with("PATCH /api/v1/organizations/acme%2Fresearch HTTP/1.1\r\n"));
+        assert!(matches!(outcome, UpdateOrganizationOutcome::Updated(_)));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(
+            requests[0].starts_with("PATCH /api/v1/organizations/acme%2Fresearch HTTP/1.1\r\n")
+        );
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+        assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
+        assert_eq!(
+            header_value(&requests[0], "content-type"),
+            MERGE_PATCH_MEDIA_TYPE
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
+            serde_json::json!({"displayName": "Acme Labs"})
+        );
+    }
+}
+
+#[test]
+fn mutation_attempt_budget_includes_interrupted_success_responses() {
+    let interrupted = interrupted_success("201 Created");
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        interrupted.clone(),
+        interrupted,
+        success("201 Created"),
+    ]);
+
+    let outcome = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None)
+        .expect("an exhausted request budget should be an expected outcome");
+
     assert_eq!(
-        header_value(&requests[0], "content-type"),
-        MERGE_PATCH_MEDIA_TYPE
+        outcome,
+        CreateOrganizationOutcome::Common(CommonOrganizationFailure::Unreachable(
+            UnreachableCategory::Connection
+        ))
     );
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
-        serde_json::json!({"displayName": "Acme Labs"})
+    send_fixture_shutdown(&server.api_url);
+    let requests = server.finish();
+    assert_eq!(requests.len(), MUTATION_ATTEMPTS + 1);
+    assert_eq!(requests[0], requests[1]);
+    assert!(
+        requests[2].starts_with("GET /fixture-shutdown HTTP/1.1\r\n"),
+        "the mutation exceeded its two-attempt budget"
     );
 }
 
@@ -679,6 +740,32 @@ fn mutation_successes_require_their_response_identity_headers() {
 }
 
 #[test]
+fn interrupted_success_with_mismatched_identity_is_not_retried() {
+    let mut interrupted = response(
+        "201 Created",
+        Some(JSON_MEDIA_TYPE),
+        &[
+            ("Idempotency-Key", "different-key"),
+            ("Location", "/v1/organizations/org_fixture"),
+        ],
+        &organization_body(),
+    );
+    interrupted.pop();
+    let server = ScriptedHttpServer::respond_in_sequence(vec![interrupted, success("201 Created")]);
+
+    let result = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None);
+
+    send_fixture_shutdown(&server.api_url);
+    let requests = server.finish();
+    assert!(
+        requests[1].starts_with("GET /fixture-shutdown HTTP/1.1\r\n"),
+        "the mutation retried after the successful response echoed another request identity"
+    );
+    let error = result.expect_err("a mismatched response identity is a protocol failure");
+    assert!(error.to_string().contains("Idempotency-Key"));
+}
+
+#[test]
 fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
     let redirect = ScriptedHttpServer::respond(response(
         "302 Found",
@@ -706,8 +793,15 @@ fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
     let interrupted = ScriptedHttpServer::respond(
         b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Type: application/problem+json\r\nContent-Length: 100\r\n\r\n{".to_vec(),
     );
-    let error = get_organization(&http_client(), &interrupted.api_url, TOKEN, "acme")
-        .expect_err("interrupted unauthorized response should fail");
+    let error = create_organization(
+        &http_client(),
+        &interrupted.api_url,
+        TOKEN,
+        KEY,
+        "Acme",
+        None,
+    )
+    .expect_err("interrupted unauthorized mutation response should fail");
     assert!(error.credential_rejected());
     assert!(error.to_string().contains("could not be read"));
     assert!(!error.to_string().contains(TOKEN));
@@ -772,12 +866,6 @@ fn explicit_server_status_with_interrupted_body_is_not_retried() {
         b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 1\r\n\r\n"
             .to_vec();
     let server = ScriptedHttpServer::respond_in_sequence(vec![interrupted, success("200 OK")]);
-    let shutdown_address = server
-        .api_url
-        .strip_prefix("http://")
-        .unwrap()
-        .trim_end_matches("/api/")
-        .to_owned();
 
     let outcome = update_organization(
         &http_client(),
@@ -790,12 +878,7 @@ fn explicit_server_status_with_interrupted_body_is_not_retried() {
     )
     .expect("the explicit server response should be classified");
 
-    if let Ok(mut stream) = std::net::TcpStream::connect(shutdown_address) {
-        let _ = std::io::Write::write_all(
-            &mut stream,
-            b"GET /fixture-shutdown HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n",
-        );
-    }
+    send_fixture_shutdown(&server.api_url);
     let requests = server.finish();
 
     assert!(
