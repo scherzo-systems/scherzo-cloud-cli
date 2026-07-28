@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: scripts/classify-release-path PATH" >&2
+  exit 2
+fi
+
+path=$1
+if [[ -z "$path" ]]; then
+  fail "CLI release path must not be empty."
+fi
+if [[ "$path" == /* ]]; then
+  fail "CLI release path must be relative to the public root: $path"
+fi
+case "/$path/" in
+  *//*)
+    fail "CLI release path must not contain empty segments: $path"
+    ;;
+  */./* | */../*)
+    fail "CLI release path must not contain '.' or '..' segments: $path"
+    ;;
+esac
+
+case "$path" in
+  *.md | .github/* | scripts/* | tests/* | devenv.nix | devenv.yaml | devenv.lock)
+    printf 'non-releaseable\n'
+    ;;
+  *)
+    printf 'releaseable\n'
+    ;;
+esac

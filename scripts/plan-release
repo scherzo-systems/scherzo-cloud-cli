@@ -31,6 +31,7 @@ fi
 cd "$public_root"
 
 checker=$script_dir/check-release
+classifier=$script_dir/classify-release-path
 "$checker" >/dev/null
 
 mirror_commit=$(git rev-parse --verify 'HEAD^{commit}')
@@ -95,11 +96,15 @@ elif [[ -z "$latest_tag" ]]; then
 else
   releaseable_change=0
   while IFS= read -r -d '' changed_path; do
-    case "$changed_path" in
-      *.md | .github/* | scripts/* | tests/* | devenv.nix | devenv.yaml | devenv.lock)
+    classification=$("$classifier" "$changed_path")
+    case "$classification" in
+      releaseable)
+        releaseable_change=1
+        ;;
+      non-releaseable)
         ;;
       *)
-        releaseable_change=1
+        fail "CLI release path classifier returned an invalid result."
         ;;
     esac
   done < <(git diff --name-only -z "${latest_tag}^{commit}" HEAD)

@@ -12,6 +12,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+classifier=$script_dir/classify-release-path
 fixture_git=$script_dir/fixture-git
 test_root=$($fixture_git new-root)
 trap 'rm -rf "$test_root"' EXIT
@@ -96,9 +97,13 @@ expect_failure() {
 }
 
 mkdir -p "$fixture/scripts" "$fixture/src"
+cp "$classifier" "$fixture/scripts/classify-release-path"
 cp "$script_dir/check-release" "$fixture/scripts/check-release"
 cp "$script_dir/plan-release" "$fixture/scripts/plan-release"
-chmod +x "$fixture/scripts/check-release" "$fixture/scripts/plan-release"
+chmod +x \
+  "$fixture/scripts/classify-release-path" \
+  "$fixture/scripts/check-release" \
+  "$fixture/scripts/plan-release"
 write_release 0.1
 printf 'fn main() {}\n' >"$fixture/src/main.rs"
 printf '# Fixture\n' >"$fixture/README.md"
@@ -122,8 +127,28 @@ expect_plan true releaseable-changes 0.1.1 v0.1.1 v0.1.0 "$source_three"
 
 fixture_repository_git update-ref refs/tags/v0.1.1 HEAD
 write_release 0.2
+printf 'fn series_changed() {}\n' >>"$fixture/src/main.rs"
 commit_mirror "$source_four"
 expect_plan true releaseable-changes 0.2.0 v0.2.0 v0.1.1 "$source_four"
+
+classification_log=$test_root/classifications
+IFS= read -r classifier_shebang <"$classifier"
+{
+  printf '%s\n' "$classifier_shebang"
+  cat <<EOF
+printf '%s\n' "\$1" >>"$classification_log"
+printf 'non-releaseable\n'
+EOF
+} >"$fixture/scripts/classify-release-path"
+chmod +x "$fixture/scripts/classify-release-path"
+expect_plan false no-releaseable-changes 0.2.0 v0.2.0 v0.1.1 "$source_four"
+expected_classifications=$'Cargo.toml\nrelease.toml\nsrc/main.rs'
+actual_classifications=$(LC_ALL=C sort "$classification_log")
+if [[ "$actual_classifications" != "$expected_classifications" ]]; then
+  fail "CLI release planner did not classify every changed path."
+fi
+cp "$classifier" "$fixture/scripts/classify-release-path"
+chmod +x "$fixture/scripts/classify-release-path"
 
 fixture_repository_git update-ref refs/tags/v01.0.0 HEAD
 expect_failure \

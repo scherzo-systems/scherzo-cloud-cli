@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-release-path-classifier" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+classifier=$script_dir/classify-release-path
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+actual=$test_root/actual
+expected_output=$test_root/expected
+standard_error=$test_root/stderr
+
+expect_classification() {
+  local expected=$1
+  local path=$2
+  local error
+
+  if ! "$classifier" "$path" >"$actual" 2>"$standard_error"; then
+    error=$(<"$standard_error")
+    fail "Expected '$path' to be $expected, got failure: $error"
+  fi
+  printf '%s\n' "$expected" >"$expected_output"
+  if ! cmp -s "$expected_output" "$actual"; then
+    fail "Expected '$path' to print exactly '$expected'."
+  fi
+}
+
+expect_rejected() {
+  local path=$1
+
+  if "$classifier" "$path" >"$actual" 2>"$standard_error"; then
+    fail "Expected invalid path '$path' to be rejected."
+  fi
+  [[ ! -s "$actual" ]] \
+    || fail "Invalid path '$path' printed a classification."
+  [[ -s "$standard_error" ]] \
+    || fail "Invalid path '$path' was rejected without a diagnostic."
+}
+
+expect_argument_rejection() {
+  if "$classifier" "$@" >"$actual" 2>"$standard_error"; then
+    fail "Expected invalid classifier argument count to be rejected."
+  fi
+  [[ ! -s "$actual" ]] \
+    || fail "Invalid classifier invocation printed a classification."
+}
+
+expect_classification non-releaseable README.md
+expect_classification non-releaseable docs/release-notes.md
+expect_classification non-releaseable .github/workflows/check.yml
+expect_classification non-releaseable scripts/check
+expect_classification non-releaseable tests/cli.rs
+expect_classification non-releaseable devenv.nix
+expect_classification non-releaseable devenv.yaml
+expect_classification non-releaseable devenv.lock
+
+expect_classification releaseable Cargo.toml
+expect_classification releaseable src/main.rs
+expect_classification releaseable changes/future.txt
+expect_classification releaseable nested/.github/workflows/check.yml
+expect_classification releaseable nested/scripts/check
+expect_classification releaseable nested/tests/cli.rs
+expect_classification releaseable config/devenv.nix
+expect_classification releaseable README.MD
+expect_classification releaseable .github
+expect_classification releaseable scripts
+expect_classification releaseable 'future policy/setting'
+
+expect_rejected ''
+expect_rejected /src/main.rs
+expect_rejected src//main.rs
+expect_rejected src/
+expect_rejected .
+expect_rejected ./src/main.rs
+expect_rejected src/./main.rs
+expect_rejected src/.
+expect_rejected ..
+expect_rejected ../src/main.rs
+expect_rejected src/../main.rs
+expect_rejected src/..
+
+expect_argument_rejection
+expect_argument_rejection src/main.rs tests/cli.rs
+
+printf 'CLI release path classifier checks passed.\n'

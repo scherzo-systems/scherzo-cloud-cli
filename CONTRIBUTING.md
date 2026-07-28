@@ -34,9 +34,10 @@ one and reset minor to zero.
 
 When changing the series, update the package fallback in `Cargo.toml` and `Cargo.lock` to
 `MAJOR.MINOR.0` in the same change. `./scripts/check-release` rejects inconsistent,
-regressing, skipped, or malformed release intent. `./scripts/plan-release` inspects a
-synthetic public Git history and must remain the sole source of tag discovery,
-releaseable-path classification, and next-version planning for workflow automation.
+regressing, skipped, or malformed release intent. `./scripts/classify-release-path` is
+the sole releaseable-path policy, while `./scripts/plan-release` inspects synthetic
+public Git history and remains the sole source of tag discovery and next-version
+planning for workflow automation.
 
 ### Change fragments
 
