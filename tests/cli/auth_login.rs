@@ -25,6 +25,11 @@ fn json_lines(output: &[u8]) -> Vec<serde_json::Value> {
 
 #[test]
 fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
+    let actions = serde_json::json!([{
+        "id": "organization.create",
+        "kind": "playbook",
+        "guide": "https://docs.scherzo.dev/agent/actions/organization.create.md"
+    }]);
     let server = ScriptedServer::respond(vec![
         json_http_response(
             "200 OK",
@@ -53,10 +58,13 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
         json_http_response(
             "200 OK",
             serde_json::json!({
-                "id": "prn_fixture",
-                "type": "human",
-                "state": "active",
-                "displayName": "Ada Lovelace"
+                "principal": {
+                    "id": "prn_fixture",
+                    "type": "human",
+                    "state": "active",
+                    "displayName": "Ada Lovelace"
+                },
+                "actions": actions.clone()
             }),
         ),
     ]);
@@ -117,7 +125,8 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
                     "type": "human",
                     "state": "active",
                     "displayName": "Ada Lovelace"
-                }
+                },
+                "actions": actions
             }
         })
     );
@@ -165,9 +174,11 @@ fn existing_authenticated_credential_short_circuits_device_authorization() {
     let server = ScriptedServer::respond(vec![json_http_response(
         "200 OK",
         serde_json::json!({
-            "id": "prn_existing",
-            "type": "human",
-            "state": "active"
+            "principal": {
+                "id": "prn_existing",
+                "type": "human",
+                "state": "active"
+            }
         }),
     )]);
     let credential_directory = private_credential_directory();
@@ -315,10 +326,12 @@ fn human_login_names_an_existing_authenticated_principal() {
     let server = ScriptedServer::respond(vec![json_http_response(
         "200 OK",
         serde_json::json!({
-            "id": "prn_ada",
-            "type": "human",
-            "state": "active",
-            "displayName": "Ada Lovelace"
+            "principal": {
+                "id": "prn_ada",
+                "type": "human",
+                "state": "active",
+                "displayName": "Ada Lovelace"
+            }
         }),
     )]);
     let credential_directory = private_credential_directory();
@@ -816,10 +829,12 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
         json_http_response(
             "200 OK",
             serde_json::json!({
-                "id": "prn_committed",
-                "type": "human",
-                "state": "active",
-                "displayName": "Committed Login"
+                "principal": {
+                    "id": "prn_committed",
+                    "type": "human",
+                    "state": "active",
+                    "displayName": "Committed Login"
+                }
             }),
         ),
     ]);

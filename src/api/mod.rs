@@ -11,8 +11,8 @@ mod signup;
 pub(crate) mod test_support;
 
 pub(crate) use current_principal::{
-    CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory, classify_reqwest_error,
-    get_current_principal,
+    AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
+    classify_reqwest_error, get_current_principal,
 };
 pub(crate) use http_client::{HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
@@ -64,6 +64,32 @@ mod tests {
         let problem: generated::models::Problem =
             serde_json::from_value(input.clone()).expect("problem should decode");
         let actions = problem.actions.expect("actions should be present");
+
+        assert_eq!(actions, input["actions"].as_array().unwrap().to_owned());
+    }
+
+    #[test]
+    fn generated_current_principal_response_preserves_opaque_actions() {
+        let input = serde_json::json!({
+            "principal": {
+                "id": "prn_fixture",
+                "type": "human",
+                "state": "active"
+            },
+            "actions": [
+                {
+                    "id": "future.action",
+                    "kind": "future-representation",
+                    "guide": "https://guarded.invalid/future-action",
+                    "additionalField": { "preserved": true }
+                },
+                "unknown-action-shape"
+            ]
+        });
+
+        let response: generated::models::CurrentPrincipalResponse =
+            serde_json::from_value(input.clone()).expect("current principal should decode");
+        let actions = response.actions.expect("actions should be present");
 
         assert_eq!(actions, input["actions"].as_array().unwrap().to_owned());
     }

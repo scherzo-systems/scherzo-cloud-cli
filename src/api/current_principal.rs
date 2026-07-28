@@ -18,8 +18,14 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPrincipal {
+    pub(crate) principal: HumanPrincipal,
+    pub(crate) actions: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CurrentPrincipalOutcome {
-    Authenticated(HumanPrincipal),
+    Authenticated(AuthenticatedPrincipal),
     SignupRequired {
         actions: Option<Vec<serde_json::Value>>,
     },
@@ -217,7 +223,7 @@ async fn decode_response(
     match status {
         StatusCode::OK => {
             require_media_type(content_type.as_deref(), JSON_MEDIA_TYPE, false)?;
-            decode_principal(&body).map(CurrentPrincipalOutcome::Authenticated)
+            decode_authenticated(&body)
         }
         StatusCode::UNAUTHORIZED => {
             require_media_type(content_type.as_deref(), PROBLEM_MEDIA_TYPE, true)?;
@@ -270,8 +276,22 @@ fn require_media_type(
     }
 }
 
-fn decode_principal(body: &[u8]) -> Result<HumanPrincipal, CurrentPrincipalError> {
-    human_principal::decode(body).map_err(|reason| CurrentPrincipalError::protocol(reason, false))
+fn decode_authenticated(body: &[u8]) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
+    let response: super::generated::models::CurrentPrincipalResponse = serde_json::from_slice(body)
+        .map_err(|_| {
+            CurrentPrincipalError::protocol(
+                "the current-principal response fields are invalid",
+                false,
+            )
+        })?;
+    let principal = human_principal::from_api(*response.principal)
+        .map_err(|reason| CurrentPrincipalError::protocol(reason, false))?;
+    Ok(CurrentPrincipalOutcome::Authenticated(
+        AuthenticatedPrincipal {
+            principal,
+            actions: response.actions,
+        },
+    ))
 }
 
 fn decode_problem(

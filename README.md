@@ -50,8 +50,10 @@ without checking an existing credential with the API.
 
 Use `scherzo-cloud auth status` to ask the selected deployment whether the current
 identity is authenticated, requires signup, is unauthenticated, or is unreachable. Add
-`--json` for the schema-version-1 structured result. Status always contacts the public
-API, including when no local credential exists.
+`--json` for the schema-version-1 structured result. Authenticated and signup-required
+results preserve any server actions as complete opaque JSON values. The CLI does not
+validate action IDs or guide origins, fetch guides, infer commands, or execute actions.
+Status always contacts the public API, including when no local credential exists.
 
 Use `scherzo-cloud auth logout` to remove the human credential for the active deployment
 without making a network request. Normal operation stores short-lived human access
@@ -109,8 +111,9 @@ request. If both attempts are ambiguous, it reports `unreachable` because the mu
 result cannot be confirmed. It does not persist the key or retry a contracted HTTP
 response. Do not issue a new mutation merely because an earlier result was unconfirmed.
 
-These commands are a direct human management surface. This release does not advertise,
-interpret, or execute server actions for agent-guided organization creation.
+These commands are a direct human management surface. Authentication status may carry a
+server-advertised `organization.create` action, but the CLI only transports that value;
+a trusted external guide owns action selection, explanation, and approval.
 
 ## Runner doctor
 

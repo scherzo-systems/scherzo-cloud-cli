@@ -15,16 +15,22 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// InvitationCapabilityRequest : A closed request carrying bearer material only for an email invitation.
+/// CurrentPrincipalResponse : The current principal and contextual actions available to the caller.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct InvitationCapabilityRequest {
-    #[serde(rename = "capability", skip_serializing_if = "Option::is_none")]
-    pub capability: Option<String>,
+pub struct CurrentPrincipalResponse {
+    #[serde(rename = "principal")]
+    pub principal: Box<models::Principal>,
+    /// Trusted playbook actions relevant to the represented caller and state.
+    #[serde(rename = "actions", skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<serde_json::Value>>,
 }
 
-impl InvitationCapabilityRequest {
-    /// A closed request carrying bearer material only for an email invitation.
-    pub fn new() -> InvitationCapabilityRequest {
-        InvitationCapabilityRequest { capability: None }
+impl CurrentPrincipalResponse {
+    /// The current principal and contextual actions available to the caller.
+    pub fn new(principal: models::Principal) -> CurrentPrincipalResponse {
+        CurrentPrincipalResponse {
+            principal: Box::new(principal),
+            actions: None,
+        }
     }
 }

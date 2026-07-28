@@ -640,10 +640,28 @@ fn status_does_not_apply_transport_policy_to_the_unused_issuer() {
 }
 
 #[test]
-fn structured_status_reports_an_authenticated_principal() {
-    let body =
-        br#"{"id":"prn_fixture","type":"human","state":"active","displayName":"Ada Lovelace"}"#;
-    let server = OneShotServer::respond("200 OK", Some("application/json"), body);
+fn structured_status_preserves_authenticated_actions_without_interpreting_them() {
+    let actions = serde_json::json!([
+        {
+            "id": "future.action",
+            "kind": "unknown-kind",
+            "guide": "http://127.0.0.1:1/guarded-guide",
+            "command": "do-not-execute",
+            "additional": { "preserved": true }
+        },
+        "unknown-action-shape"
+    ]);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "principal": {
+            "id": "prn_fixture",
+            "type": "human",
+            "state": "active",
+            "displayName": "Ada Lovelace"
+        },
+        "actions": actions
+    }))
+    .unwrap();
+    let server = OneShotServer::respond("200 OK", Some("application/json"), &body);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     write_credential_fixture(
@@ -672,7 +690,8 @@ fn structured_status_reports_an_authenticated_principal() {
                 "type": "human",
                 "state": "active",
                 "displayName": "Ada Lovelace"
-            }
+            },
+            "actions": actions
         })
     );
     assert!(output.stdout.ends_with(b"\n"));
@@ -683,6 +702,50 @@ fn structured_status_reports_an_authenticated_principal() {
     let request = server.finish();
     assert!(request.starts_with("GET /api/v1/me HTTP/1.1\r\n"));
     assert!(request.contains("authorization: Bearer unique-authenticated-synthetic-token\r\n"));
+}
+
+#[test]
+fn human_authenticated_status_reproduces_opaque_actions() {
+    let actions = serde_json::json!([
+        {
+            "id": "future.action",
+            "kind": "unknown-kind",
+            "guide": "http://127.0.0.1:1/guarded-guide",
+            "command": "do-not-execute"
+        },
+        "unknown-action-shape"
+    ]);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "principal": {
+            "id": "prn_fixture",
+            "type": "human",
+            "state": "active",
+            "displayName": "Ada Lovelace"
+        },
+        "actions": actions.clone()
+    }))
+    .unwrap();
+    let server = OneShotServer::respond("200 OK", Some("application/json"), &body);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = deployment_environment(&server.api_url, credential_path_string);
+
+    let output = run_with_env(&["auth", "status", "--allow-insecure-http"], &environment);
+
+    assert!(output.status.success());
+    let lines: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines[0], "✓ Signed in as Ada Lovelace.");
+    let reproduced: Vec<serde_json::Value> = lines[1..]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(reproduced, actions.as_array().unwrap().to_owned());
+    assert!(output.stderr.is_empty());
+    server.finish();
 }
 
 #[test]
@@ -739,7 +802,7 @@ fn structured_status_omits_absent_optional_fields() {
         (
             "200 OK",
             "application/json",
-            br#"{"id":"prn_fixture","type":"human","state":"active"}"#.as_slice(),
+            br#"{"principal":{"id":"prn_fixture","type":"human","state":"active"}}"#.as_slice(),
             "principal",
             "displayName",
         ),

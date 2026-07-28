@@ -63,6 +63,8 @@ enum StatusBody<'a> {
     Authenticated {
         deployment: &'a str,
         principal: PrincipalResult<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actions: Option<&'a [serde_json::Value]>,
     },
     SignupRequired {
         deployment: &'a str,
@@ -81,9 +83,10 @@ enum StatusBody<'a> {
 impl<'a> StatusResult<'a> {
     pub(super) fn from_status(status: &'a AuthenticationStatus) -> Self {
         let body = match status.state() {
-            AuthenticationState::Authenticated(principal) => StatusBody::Authenticated {
+            AuthenticationState::Authenticated(authenticated) => StatusBody::Authenticated {
                 deployment: status.deployment(),
-                principal: PrincipalResult::from_principal(principal),
+                principal: PrincipalResult::from_principal(&authenticated.principal),
+                actions: authenticated.actions.as_deref(),
             },
             AuthenticationState::SignupRequired { actions } => StatusBody::SignupRequired {
                 deployment: status.deployment(),
@@ -116,9 +119,14 @@ pub(super) fn write_human_status(status: &AuthenticationStatus) -> Result<(), Hu
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     match status.state() {
-        AuthenticationState::Authenticated(principal) => {
-            let account = principal.display_name.as_ref().unwrap_or(&principal.id);
-            writeln!(stdout, "✓ Signed in as {account}.").map_err(HumanStatusError::Output)
+        AuthenticationState::Authenticated(authenticated) => {
+            let account = authenticated
+                .principal
+                .display_name
+                .as_ref()
+                .unwrap_or(&authenticated.principal.id);
+            writeln!(stdout, "✓ Signed in as {account}.").map_err(HumanStatusError::Output)?;
+            write_human_actions(&mut stdout, authenticated.actions.as_deref())
         }
         AuthenticationState::SignupRequired { actions } => {
             writeln!(stdout, "✓ Signed in to Scherzo Cloud.").map_err(HumanStatusError::Output)?;
@@ -127,13 +135,7 @@ pub(super) fn write_human_status(status: &AuthenticationStatus) -> Result<(), Hu
                 "! Your Scherzo Cloud account still needs to be set up."
             )
             .map_err(HumanStatusError::Output)?;
-            if let Some(actions) = actions {
-                for action in actions {
-                    serde_json::to_writer(&mut stdout, action).map_err(HumanStatusError::Json)?;
-                    writeln!(stdout).map_err(HumanStatusError::Output)?;
-                }
-            }
-            Ok(())
+            write_human_actions(&mut stdout, actions.as_deref())
         }
         AuthenticationState::Unauthenticated => {
             writeln!(stdout, "! You're not signed in to Scherzo Cloud.")
@@ -146,6 +148,19 @@ pub(super) fn write_human_status(status: &AuthenticationStatus) -> Result<(), Hu
         )
         .map_err(HumanStatusError::Output),
     }
+}
+
+fn write_human_actions(
+    output: &mut impl Write,
+    actions: Option<&[serde_json::Value]>,
+) -> Result<(), HumanStatusError> {
+    if let Some(actions) = actions {
+        for action in actions {
+            serde_json::to_writer(&mut *output, action).map_err(HumanStatusError::Json)?;
+            writeln!(output).map_err(HumanStatusError::Output)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) enum HumanStatusError {

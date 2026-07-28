@@ -13,9 +13,13 @@ pub(super) fn decode(body: &[u8]) -> Result<HumanPrincipal, &'static str> {
         return Err("the principal response body is not a JSON object");
     }
 
-    let principal: models::CurrentPrincipal =
+    let principal: models::Principal =
         serde_json::from_value(value).map_err(|_| "the principal fields are invalid")?;
-    if principal.r#type != models::current_principal::Type::Human {
+    from_api(principal)
+}
+
+pub(super) fn from_api(principal: models::Principal) -> Result<HumanPrincipal, &'static str> {
+    if principal.r#type != models::principal::Type::Human {
         return Err("the principal type is not human");
     }
     if principal.id.is_empty() {

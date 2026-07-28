@@ -3,7 +3,7 @@ use std::fmt;
 use time::OffsetDateTime;
 
 use crate::api::{
-    self, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient, HumanPrincipal,
+    self, AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
     UnreachableCategory,
 };
 
@@ -18,7 +18,7 @@ pub(crate) struct AuthenticationStatus {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum AuthenticationState {
-    Authenticated(HumanPrincipal),
+    Authenticated(AuthenticatedPrincipal),
     SignupRequired {
         actions: Option<Vec<serde_json::Value>>,
     },
@@ -63,8 +63,8 @@ pub(crate) fn check(
     }
 
     let state = match outcome.map_err(StatusError::PublicApi)? {
-        CurrentPrincipalOutcome::Authenticated(principal) => {
-            AuthenticationState::Authenticated(principal)
+        CurrentPrincipalOutcome::Authenticated(authenticated) => {
+            AuthenticationState::Authenticated(authenticated)
         }
         CurrentPrincipalOutcome::SignupRequired { actions } => {
             AuthenticationState::SignupRequired { actions }

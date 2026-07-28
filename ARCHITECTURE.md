@@ -114,9 +114,12 @@ when directed, stops at the transaction deadline, and remains interruptible whil
 waiting.
 
 After OAuth login, the CLI asks the public API whether the identity is linked to a
-principal. It persists the short-lived access token before that confirmation so a
-temporary API failure does not require another browser flow. Login alone never creates a
-principal. An onboarding agent may invoke the separate
+principal. The successful response is an envelope containing the base principal and
+optional actions. Authentication status preserves complete action values as opaque JSON
+without validating their IDs, kinds, origins, fields, or command-shaped content. It
+never retrieves a guide or executes an action. The CLI persists the short-lived access
+token before confirmation so a temporary API failure does not require another browser
+flow. Login alone never creates a principal. An onboarding agent may invoke the separate
 signup command only after reporting that signup is required and obtaining explicit human
 approval. `scherzo-cloud account signup` uses the existing human credential, creates
 one opaque idempotency key per invocation, and retries an ambiguous transport failure
@@ -130,7 +133,8 @@ rejected by HTTP 401. Create and update serialize their request once and retry a
 one ambiguous transport failure under one in-memory idempotency key. Reads make one
 attempt, and member listing returns one server page without following its opaque
 continuation cursor. Private not-found responses remain one indistinguishable CLI
-outcome. These commands do not interpret or advertise onboarding actions.
+outcome. These commands do not interpret status actions; action selection and approval
+remain responsibilities of the governing agent guide.
 
 The runner uses a machine credential file supplied explicitly to `runner serve`. The
 current development-only format embeds a runner ID and a 43-character base64url secret;
@@ -208,12 +212,13 @@ regenerates the client and checks it for drift before the public source is mirro
 
 The generated module remains private to the handwritten API boundary so generated DTOs
 do not become command or workflow domain types. Generation overlays the public contract's
-typed playbook action with raw `serde_json::Value` objects in problem responses; this
-preserves opaque server actions without teaching the CLI their vocabulary. Handwritten
-transport construction remains responsible for redirect, timeout, retry,
-response-size, and secret-handling policy. The authentication-status path translates
-generated principal and problem DTOs into handwritten domain states before the CLI
-renders human or structured output.
+typed playbook action with raw `serde_json::Value` objects in problem and successful
+current-principal responses; this preserves opaque server actions without teaching the
+CLI their vocabulary. Handwritten transport construction remains responsible for
+redirect, timeout, retry, response-size, and secret-handling policy. The
+authentication-status path translates the generated current-principal envelope and
+problem DTOs into handwritten domain states before the CLI renders human or structured
+output.
 
 Organization request and response DTOs follow the same boundary. The handwritten
 `src/api/organizations/` module uses generated DTOs only to serialize merge patches and

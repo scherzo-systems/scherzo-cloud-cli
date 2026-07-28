@@ -39,12 +39,33 @@ fn problem(status: u16, problem_type: &str, actions: Option<serde_json::Value>) 
 }
 
 #[test]
-fn authenticated_response_ignores_additive_principal_fields() {
-    let body = br#"{"id":"prn_fixture","type":"human","state":"active","displayName":"Ada","future":{"nested":true}}"#;
+fn authenticated_response_preserves_opaque_actions_and_ignores_additive_fields() {
+    let actions = serde_json::json!([
+        {
+            "id": "future.action",
+            "kind": "future-kind",
+            "guide": "https://guarded.invalid/guide",
+            "command": "do-not-execute",
+            "unknown": { "nested": true }
+        },
+        "an-action-shape-the-cli-does-not-know"
+    ]);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "principal": {
+            "id": "prn_fixture",
+            "type": "human",
+            "state": "active",
+            "displayName": "Ada",
+            "future": { "nested": true }
+        },
+        "actions": actions,
+        "futureEnvelope": true
+    }))
+    .unwrap();
     let server = TestServer::respond(response(
         "200 OK",
         Some("application/json; charset=utf-8"),
-        body,
+        &body,
     ));
 
     let outcome = get_current_principal(
@@ -56,9 +77,12 @@ fn authenticated_response_ignores_additive_principal_fields() {
 
     assert_eq!(
         outcome,
-        CurrentPrincipalOutcome::Authenticated(HumanPrincipal {
-            id: "prn_fixture".to_owned(),
-            display_name: Some("Ada".to_owned()),
+        CurrentPrincipalOutcome::Authenticated(AuthenticatedPrincipal {
+            principal: HumanPrincipal {
+                id: "prn_fixture".to_owned(),
+                display_name: Some("Ada".to_owned()),
+            },
+            actions: Some(actions.as_array().unwrap().to_owned()),
         })
     );
     let request = server.finish_one();
@@ -69,7 +93,7 @@ fn authenticated_response_ignores_additive_principal_fields() {
 
 #[test]
 fn service_principal_response_is_not_accepted_as_a_human_credential() {
-    let body = br#"{"id":"prn_service","type":"service","state":"active"}"#;
+    let body = br#"{"principal":{"id":"prn_service","type":"service","state":"active"}}"#;
     let server = TestServer::respond(response("200 OK", Some("application/json"), body));
 
     let error = get_current_principal(
