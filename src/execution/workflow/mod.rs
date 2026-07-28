@@ -1,6 +1,8 @@
 pub(crate) mod document;
 mod schema;
 mod strict_yaml;
+pub(crate) mod validated;
+pub(crate) mod validation;
 
 use std::fmt;
 use std::sync::OnceLock;
