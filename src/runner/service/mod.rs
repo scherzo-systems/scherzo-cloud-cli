@@ -261,6 +261,7 @@ where
                     &recorder,
                     &connection_event,
                     &active_effect_event,
+                    attempt,
                 ),
                 opening: OpeningHello {
                     boot_id: &boot_id,

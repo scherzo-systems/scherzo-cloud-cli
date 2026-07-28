@@ -38,6 +38,28 @@ pub(crate) mod attribute {
     pub(crate) const SERVER_ADDRESS: &str = "server.address";
     pub(crate) const SERVER_PORT: &str = "server.port";
     pub(crate) const ASSIGNMENT_ID: &str = "scherzo.assignment.id";
+    pub(crate) const PROTOCOL_ACKNOWLEDGED_MESSAGE_ID: &str =
+        "scherzo.protocol.acknowledged_message_id";
+    pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str =
+        "scherzo.protocol.acknowledged_sequence";
+    pub(crate) const PROTOCOL_CLOSE_CODE: &str = "scherzo.protocol.close_code";
+    pub(crate) const PROTOCOL_CLOSE_INITIATOR: &str = "scherzo.protocol.close_initiator";
+    pub(crate) const PROTOCOL_DIRECTION: &str = "scherzo.protocol.direction";
+    pub(crate) const PROTOCOL_EVENT: &str = "scherzo.protocol.event";
+    pub(crate) const PROTOCOL_FRAME_KIND: &str = "scherzo.protocol.frame_kind";
+    pub(crate) const PROTOCOL_FRAME_TYPE: &str = "scherzo.protocol.frame_type";
+    pub(crate) const PROTOCOL_LEASE_EXPIRES_AT: &str = "scherzo.protocol.lease_expires_at";
+    pub(crate) const PROTOCOL_MESSAGE_ID: &str = "scherzo.protocol.message_id";
+    pub(crate) const PROTOCOL_ORDER: &str = "scherzo.protocol.order";
+    pub(crate) const PROTOCOL_PAYLOAD_VERSION: &str = "scherzo.protocol.payload_version";
+    pub(crate) const PROTOCOL_PING_INTERVAL_SECONDS: &str =
+        "scherzo.protocol.ping_interval_seconds";
+    pub(crate) const PROTOCOL_PONG_TIMEOUT_SECONDS: &str = "scherzo.protocol.pong_timeout_seconds";
+    pub(crate) const PROTOCOL_SENT_AT: &str = "scherzo.protocol.sent_at";
+    pub(crate) const PROTOCOL_TIMER: &str = "scherzo.protocol.timer";
+    pub(crate) const PROTOCOL_VERSION: &str = "scherzo.protocol.version";
+    pub(crate) const RUNNER_MAX_CONCURRENT_RUNS: &str = "scherzo.runner.max_concurrent_runs";
+    pub(crate) const RUNNER_SESSION_ID: &str = "scherzo.runner.session_id";
 }
 
 const EVENT_NAME: &str = "event.name";
@@ -277,6 +299,16 @@ impl Recorder {
         }
     }
 
+    fn common_attributes(&self, main: bool) -> [KeyValue; 5] {
+        [
+            KeyValue::new(MAIN, main),
+            KeyValue::new(SCHEMA_VERSION, 1_i64),
+            KeyValue::new(SERVICE_NAME, "scherzo-runner"),
+            KeyValue::new(SERVICE_VERSION, Arc::clone(&self.service_version)),
+            KeyValue::new(SERVICE_INSTANCE_ID, Arc::clone(&self.service_instance_id)),
+        ]
+    }
+
     pub(crate) fn start(
         &self,
         name: &'static str,
@@ -284,16 +316,7 @@ impl Recorder {
     ) -> Event {
         let mut fields = BTreeMap::new();
         let mut span_attributes = Vec::new();
-        for attribute in [
-            KeyValue::new(MAIN, true),
-            KeyValue::new(SCHEMA_VERSION, 1_i64),
-            KeyValue::new(SERVICE_NAME, "scherzo-runner"),
-            KeyValue::new(SERVICE_VERSION, Arc::clone(&self.service_version)),
-            KeyValue::new(SERVICE_INSTANCE_ID, Arc::clone(&self.service_instance_id)),
-        ]
-        .into_iter()
-        .chain(attributes)
-        {
+        for attribute in self.common_attributes(true).into_iter().chain(attributes) {
             if let Some(value) = json_value(&attribute.value) {
                 fields.insert(attribute.key.as_str().to_owned(), value);
                 span_attributes.push(attribute);
@@ -319,6 +342,26 @@ impl Recorder {
                 }),
                 name,
             }),
+        }
+    }
+
+    // record writes one instantaneous, reviewed diagnostic without creating a
+    // main event or span. Protocol call sites pass decoded fields only; this
+    // interface must never receive credentials, raw frames, or peer reasons.
+    pub(crate) fn record(
+        &self,
+        name: &'static str,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) {
+        let mut fields = Map::new();
+        for attribute in self.common_attributes(false).into_iter().chain(attributes) {
+            if let Some(value) = json_value(&attribute.value) {
+                fields.insert(attribute.key.as_str().to_owned(), value);
+            }
+        }
+        fields.insert(EVENT_NAME.to_owned(), Value::String(name.to_owned()));
+        if self.writer.write(&fields).is_err() {
+            self.dropped_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -473,11 +516,18 @@ pub(crate) struct TestCapture {
 
 #[cfg(test)]
 impl TestCapture {
-    pub(crate) fn events(&self) -> Vec<Map<String, Value>> {
+    pub(crate) fn records(&self) -> Vec<Map<String, Value>> {
         self.events
             .lock()
             .expect("event capture mutex poisoned")
             .clone()
+    }
+
+    pub(crate) fn events(&self) -> Vec<Map<String, Value>> {
+        self.records()
+            .into_iter()
+            .filter(|event| event.get(MAIN).and_then(Value::as_bool) == Some(true))
+            .collect()
     }
 
     pub(crate) fn spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
@@ -488,13 +538,10 @@ impl TestCapture {
     }
 
     pub(crate) fn event(&self, name: &str) -> Map<String, Value> {
-        self.events
-            .lock()
-            .expect("event capture mutex poisoned")
-            .iter()
+        self.events()
+            .into_iter()
             .find(|event| event[EVENT_NAME] == name)
             .expect("captured event should exist")
-            .clone()
     }
 
     pub(crate) fn span_count(&self, name: &str) -> usize {

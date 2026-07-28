@@ -27,6 +27,7 @@ const MAX_INBOUND_MESSAGE_BYTES: usize = 65_536;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const RUNNER_PROTOCOL_EVENT_NAME: &str = "runner.gateway_protocol";
 
 struct WebSocketTraceContextInjector<'a>(&'a mut HeaderMap);
 
@@ -82,6 +83,268 @@ pub(crate) struct OpeningHello<'a> {
     pub(crate) encoded: &'a [u8],
     pub(crate) message_id: &'a str,
     pub(crate) sequence: u64,
+}
+
+struct ProtocolLog<'a> {
+    recorder: &'a Recorder,
+    runner_id: &'a str,
+    boot_id: &'a str,
+    connection_attempt: u64,
+    session_id: Option<String>,
+    order: u64,
+}
+
+impl<'a> ProtocolLog<'a> {
+    fn new(
+        recorder: &'a Recorder,
+        runner_id: &'a str,
+        boot_id: &'a str,
+        connection_attempt: u64,
+    ) -> Self {
+        Self {
+            recorder,
+            runner_id,
+            boot_id,
+            connection_attempt,
+            session_id: None,
+            order: 0,
+        }
+    }
+
+    fn opening_hello(&mut self, opening: OpeningHello<'_>) {
+        // The opening was encoded and schema-validated by this process. Keep
+        // only its reviewed timestamp, never the raw frame or decode prose.
+        let sent_at = serde_json::from_slice::<serde_json::Value>(opening.encoded)
+            .ok()
+            .and_then(|frame| frame.get("sentAt")?.as_str().map(str::to_owned));
+        let mut attributes = protocol_text_attributes(
+            "runner_to_cloud",
+            "hello",
+            opening.message_id,
+            sent_at.as_deref(),
+        );
+        attributes.extend([
+            KeyValue::new(
+                telemetry::attribute::RUNNER_SEQUENCE,
+                telemetry::integer(opening.sequence),
+            ),
+            KeyValue::new(
+                telemetry::attribute::RUNNER_VERSION,
+                env!("CARGO_PKG_VERSION"),
+            ),
+            KeyValue::new(telemetry::attribute::RUNNER_MAX_CONCURRENT_RUNS, 1_i64),
+        ]);
+        self.emit(attributes);
+    }
+
+    fn runner_text(&mut self, frame: &RunnerFrame) {
+        let RunnerFrame::EffectAcknowledged {
+            envelope,
+            effect_id,
+        } = frame
+        else {
+            return;
+        };
+        let mut attributes = protocol_text_attributes(
+            "runner_to_cloud",
+            "effect_acknowledged",
+            &envelope.message_id,
+            Some(&envelope.sent_at),
+        );
+        attributes.extend([
+            KeyValue::new(
+                telemetry::attribute::RUNNER_SEQUENCE,
+                telemetry::integer(envelope.sequence),
+            ),
+            KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+        ]);
+        self.emit(attributes);
+    }
+
+    fn cloud_text(&mut self, frame: &CloudFrame) {
+        let (envelope, frame_type, details) = match frame {
+            CloudFrame::Welcome {
+                envelope,
+                session_id,
+                ping_interval_seconds,
+                pong_timeout_seconds,
+            } => {
+                self.session_id = Some(session_id.clone());
+                (
+                    envelope,
+                    "welcome",
+                    vec![
+                        KeyValue::new(
+                            telemetry::attribute::PROTOCOL_PING_INTERVAL_SECONDS,
+                            telemetry::integer(*ping_interval_seconds),
+                        ),
+                        KeyValue::new(
+                            telemetry::attribute::PROTOCOL_PONG_TIMEOUT_SECONDS,
+                            telemetry::integer(*pong_timeout_seconds),
+                        ),
+                    ],
+                )
+            }
+            CloudFrame::ObservationAck {
+                envelope,
+                acknowledged_message_id,
+                acknowledged_sequence,
+            } => (
+                envelope,
+                "observation_ack",
+                vec![
+                    KeyValue::new(
+                        telemetry::attribute::PROTOCOL_ACKNOWLEDGED_MESSAGE_ID,
+                        acknowledged_message_id.clone(),
+                    ),
+                    KeyValue::new(
+                        telemetry::attribute::PROTOCOL_ACKNOWLEDGED_SEQUENCE,
+                        telemetry::integer(*acknowledged_sequence),
+                    ),
+                ],
+            ),
+            CloudFrame::AssignmentOffer {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                lease_expires_at,
+            } => (
+                envelope,
+                "assignment_offer",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                    KeyValue::new(
+                        telemetry::attribute::PROTOCOL_LEASE_EXPIRES_AT,
+                        lease_expires_at.clone(),
+                    ),
+                ],
+            ),
+        };
+        let mut attributes = protocol_text_attributes(
+            "cloud_to_runner",
+            frame_type,
+            &envelope.message_id,
+            Some(&envelope.sent_at),
+        );
+        attributes.extend(details);
+        self.emit(attributes);
+    }
+
+    fn control(&mut self, direction: &'static str, kind: &'static str) {
+        self.emit([
+            KeyValue::new(telemetry::attribute::PROTOCOL_EVENT, "frame"),
+            KeyValue::new(telemetry::attribute::PROTOCOL_DIRECTION, direction),
+            KeyValue::new(telemetry::attribute::PROTOCOL_FRAME_KIND, kind),
+        ]);
+    }
+
+    fn timer_expired(&mut self, timer: &'static str) {
+        self.emit([
+            KeyValue::new(telemetry::attribute::PROTOCOL_EVENT, "timer_expired"),
+            KeyValue::new(telemetry::attribute::PROTOCOL_TIMER, timer),
+        ]);
+    }
+
+    fn transport_ended(&mut self) {
+        self.emit([KeyValue::new(
+            telemetry::attribute::PROTOCOL_EVENT,
+            "transport_ended",
+        )]);
+    }
+
+    fn read_failed(&mut self) {
+        self.emit([KeyValue::new(
+            telemetry::attribute::PROTOCOL_EVENT,
+            "read_failed",
+        )]);
+    }
+
+    fn close(&mut self, direction: &'static str, initiator: &'static str, code: Option<u16>) {
+        self.close_record("frame", direction, initiator, code);
+    }
+
+    fn close_write_failed(&mut self, direction: &'static str, initiator: &'static str, code: u16) {
+        self.close_record("write_failed", direction, initiator, Some(code));
+    }
+
+    fn close_record(
+        &mut self,
+        event: &'static str,
+        direction: &'static str,
+        initiator: &'static str,
+        code: Option<u16>,
+    ) {
+        let mut attributes = vec![
+            KeyValue::new(telemetry::attribute::PROTOCOL_EVENT, event),
+            KeyValue::new(telemetry::attribute::PROTOCOL_DIRECTION, direction),
+            KeyValue::new(telemetry::attribute::PROTOCOL_FRAME_KIND, "close"),
+            KeyValue::new(telemetry::attribute::PROTOCOL_CLOSE_INITIATOR, initiator),
+        ];
+        if let Some(code) = code {
+            attributes.push(KeyValue::new(
+                telemetry::attribute::PROTOCOL_CLOSE_CODE,
+                i64::from(code),
+            ));
+        }
+        self.emit(attributes);
+    }
+
+    fn emit(&mut self, attributes: impl IntoIterator<Item = KeyValue>) {
+        self.order = self.order.saturating_add(1);
+        let mut common = vec![
+            KeyValue::new(telemetry::attribute::RUNNER_ID, self.runner_id.to_owned()),
+            KeyValue::new(
+                telemetry::attribute::RUNNER_BOOT_ID,
+                self.boot_id.to_owned(),
+            ),
+            KeyValue::new(
+                telemetry::attribute::CONNECTION_ATTEMPT,
+                telemetry::integer(self.connection_attempt),
+            ),
+            KeyValue::new(
+                telemetry::attribute::PROTOCOL_ORDER,
+                telemetry::integer(self.order),
+            ),
+        ];
+        if let Some(session_id) = &self.session_id {
+            common.push(KeyValue::new(
+                telemetry::attribute::RUNNER_SESSION_ID,
+                session_id.clone(),
+            ));
+        }
+        common.extend(attributes);
+        self.recorder.record(RUNNER_PROTOCOL_EVENT_NAME, common);
+    }
+}
+
+fn protocol_text_attributes(
+    direction: &'static str,
+    frame_type: &'static str,
+    message_id: &str,
+    sent_at: Option<&str>,
+) -> Vec<KeyValue> {
+    let mut attributes = vec![
+        KeyValue::new(telemetry::attribute::PROTOCOL_EVENT, "frame"),
+        KeyValue::new(telemetry::attribute::PROTOCOL_DIRECTION, direction),
+        KeyValue::new(telemetry::attribute::PROTOCOL_FRAME_KIND, "text"),
+        KeyValue::new(telemetry::attribute::PROTOCOL_FRAME_TYPE, frame_type),
+        KeyValue::new(telemetry::attribute::PROTOCOL_VERSION, 1_i64),
+        KeyValue::new(telemetry::attribute::PROTOCOL_PAYLOAD_VERSION, 1_i64),
+        KeyValue::new(
+            telemetry::attribute::PROTOCOL_MESSAGE_ID,
+            message_id.to_owned(),
+        ),
+    ];
+    if let Some(sent_at) = sent_at {
+        attributes.push(KeyValue::new(
+            telemetry::attribute::PROTOCOL_SENT_AT,
+            sent_at.to_owned(),
+        ));
+    }
+    attributes
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,6 +616,7 @@ fn close_outcome(
 async fn close_locally<W>(
     writer: &mut W,
     sleeper: &dyn Sleeper,
+    protocol: &mut ProtocolLog<'_>,
     code: CloseCode,
     reason: &'static str,
 ) where
@@ -362,10 +626,17 @@ async fn close_locally<W>(
         code,
         reason: reason.into(),
     }));
-    tokio::select! {
+    let send_result = tokio::select! {
         biased;
-        _ = writer.send(close) => {}
-        _ = sleeper.sleep(CLOSE_TIMEOUT) => {}
+        result = writer.send(close) => Some(result),
+        _ = sleeper.sleep(CLOSE_TIMEOUT) => None,
+    };
+    match send_result {
+        Some(Ok(())) => protocol.close("runner_to_cloud", "runner", Some(u16::from(code))),
+        Some(Err(_)) => {
+            protocol.close_write_failed("runner_to_cloud", "runner", u16::from(code));
+        }
+        None => protocol.timer_expired("close"),
     }
 }
 
@@ -374,13 +645,21 @@ async fn close_locally<W>(
 async fn protocol_violation<W>(
     writer: &mut W,
     sleeper: &dyn Sleeper,
+    protocol: &mut ProtocolLog<'_>,
     progress: ConnectionProgress,
     cause: ConnectionCause,
 ) -> ConnectionError
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    close_locally(writer, sleeper, CloseCode::Protocol, cause.message()).await;
+    close_locally(
+        writer,
+        sleeper,
+        protocol,
+        CloseCode::Protocol,
+        cause.message(),
+    )
+    .await;
     ConnectionError::retryable(progress, cause)
 }
 
@@ -586,6 +865,7 @@ pub(super) struct ConnectionDependencies<'a> {
     recorder: &'a Recorder,
     connection_event: &'a Event,
     active_effect_event: &'a ActiveEffectEvent,
+    connection_attempt: u64,
 }
 
 impl<'a> ConnectionDependencies<'a> {
@@ -596,6 +876,7 @@ impl<'a> ConnectionDependencies<'a> {
         recorder: &'a Recorder,
         connection_event: &'a Event,
         active_effect_event: &'a ActiveEffectEvent,
+        connection_attempt: u64,
     ) -> Self {
         Self {
             config,
@@ -604,6 +885,7 @@ impl<'a> ConnectionDependencies<'a> {
             recorder,
             connection_event,
             active_effect_event,
+            connection_attempt,
         }
     }
 }
@@ -626,7 +908,14 @@ where
         recorder,
         connection_event,
         active_effect_event,
+        connection_attempt,
     } = dependencies;
+    let mut protocol = ProtocolLog::new(
+        recorder,
+        config.credential().runner_id(),
+        opening.boot_id,
+        connection_attempt,
+    );
     let unacknowledged = ConnectionProgress::unacknowledged();
     let opening_hello = std::str::from_utf8(opening.encoded).map_err(|_| {
         ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
@@ -637,6 +926,7 @@ where
         .map_err(|_| {
             ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
         })?;
+    protocol.opening_hello(opening);
 
     let mut welcome_timer = sleeper.sleep(WELCOME_TIMEOUT);
     let mut inbound_silence_timeout = None;
@@ -651,9 +941,11 @@ where
                 biased;
                 message = reader.next() => message,
                 _ = sleeper.sleep(timeout) => {
+                    protocol.timer_expired("inbound_silence");
                     close_locally(
                         &mut writer,
                         sleeper,
+                        &mut protocol,
                         CloseCode::Away,
                         ConnectionCause::GatewayLivenessTimeout.message(),
                     ).await;
@@ -668,6 +960,7 @@ where
                 biased;
                 message = reader.next() => message,
                 _ = &mut welcome_timer => {
+                    protocol.timer_expired("welcome");
                     return Err(ConnectionError::retryable(
                         progress,
                         ConnectionCause::GatewayWelcomeTimeout,
@@ -676,6 +969,7 @@ where
             }
         };
         let Some(message) = message else {
+            protocol.transport_ended();
             return Ok(progress);
         };
         let message = match message {
@@ -684,12 +978,14 @@ where
                 return Err(protocol_violation(
                     &mut writer,
                     sleeper,
+                    &mut protocol,
                     progress,
                     ConnectionCause::OversizedGatewayFrame,
                 )
                 .await);
             }
             Err(_) => {
+                protocol.read_failed();
                 return Err(ConnectionError::retryable(
                     progress,
                     ConnectionCause::ReadGatewayFrame,
@@ -702,11 +998,13 @@ where
                     return Err(protocol_violation(
                         &mut writer,
                         sleeper,
+                        &mut protocol,
                         progress,
                         ConnectionCause::UndecodableGatewayFrame,
                     )
                     .await);
                 };
+                protocol.cloud_text(&frame);
                 progress.cloud_text_frames_received =
                     progress.incremented(progress.cloud_text_frames_received)?;
                 record_progress(connection_event, progress);
@@ -738,6 +1036,7 @@ where
                             return Err(protocol_violation(
                                 &mut writer,
                                 sleeper,
+                                &mut protocol,
                                 progress,
                                 ConnectionCause::UnexpectedObservationAcknowledgement,
                             )
@@ -749,6 +1048,7 @@ where
                             return Err(protocol_violation(
                                 &mut writer,
                                 sleeper,
+                                &mut protocol,
                                 progress,
                                 ConnectionCause::MismatchedEffectAcknowledgement,
                             )
@@ -900,6 +1200,7 @@ where
                                 ConnectionCause::SendEffectAcknowledgement,
                             ));
                         }
+                        protocol.runner_text(&frame);
                         progress.runner_text_frames_sent =
                             progress.incremented(progress.runner_text_frames_sent)?;
                         record_progress(connection_event, progress);
@@ -912,6 +1213,7 @@ where
                         return Err(protocol_violation(
                             &mut writer,
                             sleeper,
+                            &mut protocol,
                             progress,
                             ConnectionCause::UnexpectedGatewayFrame,
                         )
@@ -927,16 +1229,26 @@ where
                 }
             }
             Message::Ping(_) => {
+                protocol.control("cloud_to_runner", "ping");
                 writer.flush().await.map_err(|_| {
                     ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
                 })?;
+                protocol.control("runner_to_cloud", "pong");
             }
-            Message::Pong(_) => {}
-            Message::Close(close) => return close_outcome(progress, close),
+            Message::Pong(_) => protocol.control("cloud_to_runner", "pong"),
+            Message::Close(close) => {
+                protocol.close(
+                    "cloud_to_runner",
+                    "gateway",
+                    close.as_ref().map(|frame| u16::from(frame.code)),
+                );
+                return close_outcome(progress, close);
+            }
             Message::Binary(_) => {
                 return Err(protocol_violation(
                     &mut writer,
                     sleeper,
+                    &mut protocol,
                     progress,
                     ConnectionCause::BinaryGatewayFrame,
                 )
@@ -946,6 +1258,7 @@ where
                 return Err(protocol_violation(
                     &mut writer,
                     sleeper,
+                    &mut protocol,
                     progress,
                     ConnectionCause::UnexpectedRawGatewayFrame,
                 )
@@ -1012,8 +1325,8 @@ mod tests {
 
     use super::{
         ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
-        ConnectionProgress, FrameSource, OpeningHello, close_outcome, opening_hello, run,
-        run_established,
+        ConnectionProgress, FrameSource, OpeningHello, ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME,
+        close_locally, close_outcome, opening_hello, run, run_established,
     };
     use crate::runner::credential::{Credential, test_credential};
     use crate::runner::service::Sleeper;
@@ -1024,12 +1337,65 @@ mod tests {
         expect_opening_hello, fixture_listener, observation_acknowledgement,
         offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
-    use crate::runner::telemetry::{Outcome, TestCapture, test_recorder};
+    use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
 
     const CREDENTIAL: &str =
         "rnr_01k0z6r1w8f4jy2m7q9v3x5abd.abcdefghijklmnopqrstuvwxyzABCDEFG-012345678";
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+    struct EstablishedTestContext {
+        config: Config,
+        frame_source: Arc<dyn FrameSource>,
+        sleeper: Arc<dyn Sleeper>,
+        recorder: Arc<Recorder>,
+        capture: TestCapture,
+        connection_event: Event,
+        active_effect_event: ActiveEffectEvent,
+        opening: Vec<u8>,
+    }
+
+    impl EstablishedTestContext {
+        fn new() -> Self {
+            let config = test_config("wss://gateway.example.test/v1/connect");
+            let frame_source = deterministic_frame_source();
+            let opening = test_opening(&config, frame_source.as_ref());
+            let (sleeper, _sleep_requests) = controlled_sleeper();
+            let (recorder, capture) = test_recorder(BOOT_ID);
+            let connection_event = recorder.start("runner.gateway_connection", []);
+            Self {
+                config,
+                frame_source,
+                sleeper,
+                recorder,
+                capture,
+                connection_event,
+                active_effect_event: ActiveEffectEvent::new(),
+                opening,
+            }
+        }
+
+        fn dependencies(&self) -> ConnectionDependencies<'_> {
+            ConnectionDependencies::new(
+                &self.config,
+                self.frame_source.as_ref(),
+                self.sleeper.as_ref(),
+                self.recorder.as_ref(),
+                &self.connection_event,
+                &self.active_effect_event,
+                1,
+            )
+        }
+
+        fn opening(&self) -> OpeningHello<'_> {
+            OpeningHello {
+                boot_id: BOOT_ID,
+                encoded: &self.opening,
+                message_id: OPENING_MESSAGE_ID,
+                sequence: 1,
+            }
+        }
+    }
 
     struct BackpressuredEffectWriter {
         sent: usize,
@@ -1069,6 +1435,86 @@ mod tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn failed_close_send_is_not_logged_as_a_frame() {
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (recorder, capture) = test_recorder(BOOT_ID);
+        let mut protocol =
+            ProtocolLog::new(&recorder, "rnr_01k0z6r1w8f4jy2m7q9v3x5abd", BOOT_ID, 1);
+        let mut writer = futures_util::sink::unfold((), |(), _: Message| {
+            std::future::ready(Err(WebSocketError::ConnectionClosed))
+        });
+
+        close_locally(
+            &mut writer,
+            sleeper.as_ref(),
+            &mut protocol,
+            CloseCode::Protocol,
+            "safe close reason",
+        )
+        .await;
+
+        let frames: Vec<_> = capture
+            .records()
+            .into_iter()
+            .filter(|record| record["scherzo.protocol.event"] == "frame")
+            .collect();
+        assert!(
+            frames.is_empty(),
+            "failed close send was logged as a frame: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_read_failure_is_not_logged_as_a_close_frame() {
+        let context = EstablishedTestContext::new();
+        let reader = futures_util::stream::iter([Err(WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "transport reset sentinel",
+        )))]);
+        let writer = BackpressuredEffectWriter {
+            sent: 0,
+            blocked: Arc::new(Notify::new()),
+        };
+        let mut next_sequence = 2;
+
+        run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            reader,
+            writer,
+        )
+        .await
+        .expect_err("transport read failure unexpectedly succeeded");
+
+        let protocol: Vec<_> = context
+            .capture
+            .records()
+            .into_iter()
+            .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
+            .collect();
+        assert_eq!(protocol.len(), 2);
+        assert_eq!(protocol[1]["scherzo.protocol.order"], 2);
+        assert_eq!(protocol[1]["scherzo.protocol.event"], "read_failed");
+        for frame_field in [
+            "scherzo.protocol.direction",
+            "scherzo.protocol.frame_kind",
+            "scherzo.protocol.close_initiator",
+        ] {
+            assert!(
+                protocol[1].get(frame_field).is_none(),
+                "transport read failure was logged with frame metadata: {:?}",
+                protocol[1]
+            );
+        }
+        assert!(
+            !serde_json::to_string(&protocol)
+                .expect("encode protocol records")
+                .contains("transport reset sentinel")
+        );
     }
 
     #[test]
@@ -1416,6 +1862,55 @@ mod tests {
         assert!(!encoded.contains("executed"));
         assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
         assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+
+        let protocol: Vec<_> = capture
+            .records()
+            .into_iter()
+            .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
+            .collect();
+        let expected = [
+            ("text", Some("hello")),
+            ("text", Some("welcome")),
+            ("text", Some("observation_ack")),
+            ("ping", None),
+            ("pong", None),
+            ("text", Some("assignment_offer")),
+            ("text", Some("effect_acknowledged")),
+            ("text", Some("observation_ack")),
+            ("close", None),
+        ];
+        assert_eq!(protocol.len(), expected.len());
+        for (index, (record, (kind, frame_type))) in protocol.iter().zip(expected).enumerate() {
+            assert_eq!(record["scherzo.main"], false);
+            assert_eq!(record["scherzo.protocol.order"], index + 1);
+            assert_eq!(record["scherzo.protocol.frame_kind"], kind);
+            assert_eq!(
+                record
+                    .get("scherzo.protocol.frame_type")
+                    .and_then(serde_json::Value::as_str),
+                frame_type,
+            );
+            assert_eq!(record["scherzo.connection.attempt"], 1);
+            assert_eq!(record["scherzo.runner.id"], config.credential().runner_id());
+            assert_eq!(record["scherzo.runner.boot_id"], BOOT_ID);
+        }
+        assert_eq!(
+            protocol[1]["scherzo.runner.session_id"],
+            "rsn_01k0z6r1w8f4jy2m7q9v3x5abc"
+        );
+        assert_eq!(
+            protocol[5]["scherzo.effect.id"],
+            "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+        );
+        assert_eq!(protocol[6]["scherzo.runner.sequence"], 2);
+        let protocol_json = serde_json::to_string(&protocol).expect("encode protocol records");
+        for forbidden in [
+            "abcdefghijklmnopqrstuvwxyzABCDEFG-012345678",
+            "Authorization",
+            "PEER-CLOSE-REASON-MUST-NOT-LEAK",
+        ] {
+            assert!(!protocol_json.contains(forbidden));
+        }
     }
 
     #[tokio::test]
@@ -1461,13 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_effect_event_across_cancellation_while_send_is_pending() {
-        let config = test_config("wss://gateway.example.test/v1/connect");
-        let frame_source = deterministic_frame_source();
-        let opening = test_opening(&config, frame_source.as_ref());
-        let (sleeper, _sleep_requests) = controlled_sleeper();
-        let (recorder, capture) = test_recorder(BOOT_ID);
-        let connection_event = recorder.start("runner.gateway_connection", []);
-        let active_effect_event = ActiveEffectEvent::new();
+        let context = EstablishedTestContext::new();
         let blocked = Arc::new(Notify::new());
         let reader = futures_util::stream::iter([
             Ok(welcome()),
@@ -1480,20 +1969,8 @@ mod tests {
         };
         let mut next_sequence = 2;
         let mut connection = Box::pin(run_established(
-            ConnectionDependencies::new(
-                &config,
-                frame_source.as_ref(),
-                sleeper.as_ref(),
-                &recorder,
-                &connection_event,
-                &active_effect_event,
-            ),
-            OpeningHello {
-                boot_id: BOOT_ID,
-                encoded: &opening,
-                message_id: OPENING_MESSAGE_ID,
-                sequence: 1,
-            },
+            context.dependencies(),
+            context.opening(),
             &mut next_sequence,
             reader,
             writer,
@@ -1508,16 +1985,19 @@ mod tests {
         .await
         .expect("effect acknowledgement send was not attempted");
         drop(connection);
-        active_effect_event.finish(Outcome::Cancelled, None);
-        connection_event.finish(Outcome::Cancelled);
+        context.active_effect_event.finish(Outcome::Cancelled, None);
+        context.connection_event.finish(Outcome::Cancelled);
 
-        let events = capture.events();
+        let events = context.capture.events();
         assert_eq!(events.len(), 2);
-        let effect = capture.event("runner.effect_acknowledgement");
+        let effect = context.capture.event("runner.effect_acknowledgement");
         assert_eq!(effect["scherzo.outcome"], "cancelled");
         assert!(effect.get("error.type").is_none());
-        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
-        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+        assert_eq!(
+            context.capture.span_count("runner.effect_acknowledgement"),
+            1
+        );
+        assert_eq!(context.capture.span_count("runner.gateway_connection"), 1);
     }
 
     #[tokio::test]
@@ -1530,13 +2010,22 @@ mod tests {
             release.release();
             std::future::pending::<()>().await;
         });
-        let (error, next_sequence) =
+        let (error, next_sequence, capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
         assert_eq!(error.cause(), "gateway welcome timeout");
         assert!(!error.is_terminal());
         assert!(!error.progress.opening_acknowledged);
         assert!(!error.progress.handshake_completed);
         assert_eq!(next_sequence, 2);
+        let protocol: Vec<_> = capture
+            .records()
+            .into_iter()
+            .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
+            .collect();
+        assert_eq!(protocol.len(), 2);
+        assert_eq!(protocol[0]["scherzo.protocol.frame_type"], "hello");
+        assert_eq!(protocol[1]["scherzo.protocol.event"], "timer_expired");
+        assert_eq!(protocol[1]["scherzo.protocol.timer"], "welcome");
 
         abort_fixture_server(server).await;
     }
@@ -1564,12 +2053,18 @@ mod tests {
             release_silence.release();
             std::future::pending::<()>().await;
         });
-        let (error, next_sequence) =
+        let (error, next_sequence, capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
         assert_eq!(error.cause(), "gateway liveness timeout");
         assert!(error.progress.opening_acknowledged);
         assert!(error.progress.handshake_completed);
         assert_eq!(next_sequence, 2);
+        let timer = capture
+            .records()
+            .into_iter()
+            .find(|record| record.get("scherzo.protocol.event") == Some(&json!("timer_expired")))
+            .expect("runner liveness timer record");
+        assert_eq!(timer["scherzo.protocol.timer"], "inbound_silence");
 
         abort_fixture_server(server).await;
     }
@@ -1585,7 +2080,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let (error, next_sequence) =
+        let (error, next_sequence, _capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
         assert_eq!(error.cause(), "runner gateway connect timeout");
         assert!(!error.is_terminal());
@@ -1651,7 +2146,8 @@ mod tests {
             assert_eq!(&*close.reason, "gateway liveness timeout");
         });
 
-        let (error, _) = run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
+        let (error, _, _capture) =
+            run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
         assert!(!error.is_terminal());
         assert_eq!(error.cause(), "gateway liveness timeout");
         server.await.expect("join fixture server");
@@ -1744,21 +2240,21 @@ mod tests {
     async fn run_failing_fixture_connection(
         endpoint: &str,
         sleeper: &dyn Sleeper,
-    ) -> (ConnectionError, u64) {
+    ) -> (ConnectionError, u64, TestCapture) {
         let config = test_config(endpoint);
         let frame_source = deterministic_frame_source();
         let opening = test_opening(&config, frame_source.as_ref());
         let mut next_sequence = 2;
-        let error = run_test_connection(
+        let (result, capture) = run_test_connection_with_capture(
             &config,
             frame_source.as_ref(),
             sleeper,
             &opening,
             &mut next_sequence,
         )
-        .await
-        .expect_err("fixture connection unexpectedly succeeded");
-        (error, next_sequence)
+        .await;
+        let error = result.expect_err("fixture connection unexpectedly succeeded");
+        (error, next_sequence, capture)
     }
 
     async fn run_configured_fixture_connection_with_capture(
@@ -1813,6 +2309,7 @@ mod tests {
                 &recorder,
                 &connection_event,
                 &active_effect_event,
+                1,
             ),
             OpeningHello {
                 boot_id: BOOT_ID,

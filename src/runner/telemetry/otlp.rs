@@ -1013,7 +1013,7 @@ mod tests {
                 .head
                 .contains("x-owned-secret: UNIQUE-HEADER-SENTINEL\r\n")
         );
-        let local_output = serde_json::to_string(&capture.events()).expect("encode local output");
+        let local_output = serde_json::to_string(&capture.records()).expect("encode local output");
         assert!(local_output.contains("request_failed"));
         for sentinel in [
             "UNIQUE-HEADER-SENTINEL",
@@ -1047,9 +1047,9 @@ mod tests {
         }
         drop(recorder);
 
-        let events = capture.events();
+        let records = capture.records();
         assert_eq!(
-            events
+            records
                 .iter()
                 .filter(|event| {
                     event.get(DIAGNOSTIC_CLASSIFICATION_FIELD)
@@ -1058,14 +1058,8 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.get("event.name").is_some())
-                .count(),
-            3
-        );
-        let diagnostics = events
+        assert_eq!(capture.events().len(), 3);
+        let diagnostics = records
             .iter()
             .filter(|event| event.get(DIAGNOSTIC_NAME_FIELD).is_some())
             .collect::<Vec<_>>();
@@ -1135,7 +1129,7 @@ mod tests {
         let before = Instant::now();
         drop(recorder);
         assert!(before.elapsed() < Duration::from_secs(1));
-        assert!(capture.events().iter().any(|event| {
+        assert!(capture.records().iter().any(|event| {
             event.get(DIAGNOSTIC_CLASSIFICATION_FIELD)
                 == Some(&serde_json::json!("shutdown_timeout"))
         }));
@@ -1160,7 +1154,7 @@ mod tests {
             .start("runner.effect_acknowledgement", [])
             .finish(Outcome::Success);
         assert!(before.elapsed() < Duration::from_secs(1));
-        assert!(capture.events().iter().any(|event| {
+        assert!(capture.records().iter().any(|event| {
             event.get(DIAGNOSTIC_CLASSIFICATION_FIELD)
                 == Some(&serde_json::json!("queue_saturated"))
         }));

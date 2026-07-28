@@ -21,6 +21,7 @@ use crate::runner::telemetry::test_recorder;
 
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
 const REPLAY_TIMESTAMP: &str = "2026-07-23T00:00:00Z";
+const REPLAY_OVERRIDE: &str = "SCHERZO_RUNNER_CONVERSATION_FIXTURE";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -58,6 +59,7 @@ enum ConversationKind {
 
 struct ReplayFrameSource {
     message_ids: Mutex<VecDeque<String>>,
+    timestamps: Mutex<VecDeque<String>>,
 }
 
 impl FrameSource for ReplayFrameSource {
@@ -74,7 +76,12 @@ impl FrameSource for ReplayFrameSource {
     }
 
     fn utc_timestamp(&self) -> Result<String, ConnectionError> {
-        Ok(REPLAY_TIMESTAMP.to_owned())
+        Ok(self
+            .timestamps
+            .lock()
+            .expect("conversation timestamp mutex poisoned")
+            .pop_front()
+            .expect("conversation omitted a timestamp for a runner frame"))
     }
 }
 
@@ -181,12 +188,14 @@ impl Sleeper for LogicalSleeper {
 #[tokio::test]
 async fn replays_gateway_conversations_against_established_runner() {
     let conversations = load_conversations();
-    let names: Vec<_> = conversations
-        .iter()
-        .map(|conversation| conversation.name.as_str())
-        .collect();
-    assert!(names.contains(&"gateway.handshake-one-effect"));
-    assert!(names.contains(&"gateway.redelivery-after-reset"));
+    if std::env::var_os(REPLAY_OVERRIDE).is_none() {
+        let names: Vec<_> = conversations
+            .iter()
+            .map(|conversation| conversation.name.as_str())
+            .collect();
+        assert!(names.contains(&"gateway.handshake-one-effect"));
+        assert!(names.contains(&"gateway.redelivery-after-reset"));
+    }
 
     for conversation in conversations {
         let name = conversation.name.clone();
@@ -197,16 +206,20 @@ async fn replays_gateway_conversations_against_established_runner() {
 }
 
 fn load_conversations() -> Vec<Conversation> {
-    let directory =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner-conversations/v1");
-    let mut paths: Vec<_> = fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("read conversation fixture directory: {error}"))
-        .map(|entry| entry.expect("read conversation fixture entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect();
+    let mut paths: Vec<_> = if let Some(path) = std::env::var_os(REPLAY_OVERRIDE) {
+        vec![Path::new(&path).to_path_buf()]
+    } else {
+        let directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner-conversations/v1");
+        fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("read conversation fixture directory: {error}"))
+            .map(|entry| entry.expect("read conversation fixture entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect()
+    };
     paths.sort();
     assert!(!paths.is_empty(), "no runner conversation fixtures found");
     paths
@@ -249,8 +262,10 @@ fn validate_entries(conversation: &Conversation) {
 async fn replay_conversation(conversation: Conversation) {
     let opening = opening_metadata(&conversation);
     let effect_message_ids = runner_effect_message_ids(&conversation);
+    let timestamps = runner_timestamps(&conversation);
     let frame_source = ReplayFrameSource {
         message_ids: Mutex::new(effect_message_ids),
+        timestamps: Mutex::new(timestamps),
     };
     let config = Config::new("ws://127.0.0.1:1/v1/connect", test_credential(), true)
         .expect("configure conversation replay gateway");
@@ -282,6 +297,7 @@ async fn replay_conversation(conversation: Conversation) {
             &recorder,
             &connection_event,
             &active_effect_event,
+            1,
         ),
         OpeningHello {
             boot_id: REPLAY_BOOT_ID,
@@ -352,6 +368,15 @@ async fn replay_conversation(conversation: Conversation) {
         "conversation {} did not generate every expected runner frame",
         conversation.name
     );
+    assert!(
+        frame_source
+            .timestamps
+            .lock()
+            .expect("conversation timestamp mutex poisoned")
+            .is_empty(),
+        "conversation {} did not generate every expected timestamp",
+        conversation.name
+    );
 }
 
 struct OpeningMetadata {
@@ -391,6 +416,32 @@ fn runner_effect_message_ids(conversation: &Conversation) -> VecDeque<String> {
                 .and_then(Value::as_u64)
                 .expect("effect acknowledgement sequence");
             acknowledged_message_id(conversation, sequence)
+        })
+        .collect()
+}
+
+fn runner_timestamps(conversation: &Conversation) -> VecDeque<String> {
+    let mut concrete = HashMap::new();
+    conversation
+        .entries
+        .iter()
+        .filter(|entry| entry.from == ConversationPeer::Runner)
+        .filter_map(|entry| entry.payload.as_ref())
+        .map(|payload| {
+            let placeholder = payload["sentAt"]
+                .as_str()
+                .expect("runner frame timestamp placeholder");
+            let next = concrete.len();
+            concrete
+                .entry(placeholder.to_owned())
+                .or_insert_with(|| {
+                    if next == 0 {
+                        REPLAY_TIMESTAMP.to_owned()
+                    } else {
+                        format!("2026-07-23T00:00:00.{next}Z")
+                    }
+                })
+                .clone()
         })
         .collect()
 }

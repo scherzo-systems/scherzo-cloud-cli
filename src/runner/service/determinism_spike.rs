@@ -481,6 +481,7 @@ impl EstablishedRuntime {
                 &recorder,
                 &connection_event,
                 &active_effect_event,
+                1,
             ),
             opening_frame(&self.opening),
             next_sequence,
