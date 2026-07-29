@@ -4,6 +4,7 @@ mod organization;
 mod principal;
 mod runner;
 mod version;
+mod workflow;
 
 use std::ffi::OsString;
 use std::io;
@@ -56,6 +57,8 @@ enum Command {
     Version(version::Command),
     #[command(about = runner::ABOUT)]
     Runner(runner::Command),
+    #[command(about = workflow::ABOUT)]
+    Workflow(workflow::Command),
 }
 
 pub(crate) fn parse<I, S>(args: I) -> Result<Cli, clap::Error>
@@ -75,6 +78,7 @@ impl Cli {
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
+            Some(Command::Workflow(command)) => command.execute(),
         }
     }
 }
@@ -158,6 +162,7 @@ mod tests {
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
         assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
+        assert!(help.contains("workflow      Inspect local Workflow V1 definitions"));
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -212,5 +217,18 @@ mod tests {
 
         assert!(help.contains("doctor  Inspect local runner prerequisites"));
         assert!(help.contains("serve   Connect to Scherzo Cloud and serve run assignments"));
+    }
+
+    #[test]
+    fn workflow_help_is_composed_from_leaf_metadata() {
+        let help = command_help(&["workflow"]);
+        let validate = command_help(&["workflow", "validate"]);
+
+        assert!(
+            help.contains("validate  Validate a local Workflow V1 bundle without executing it")
+        );
+        assert!(validate.contains("--source-root <ROOT>"));
+        assert!(validate.contains("<WORKFLOW_PATH>"));
+        assert!(validate.contains("--json"));
     }
 }

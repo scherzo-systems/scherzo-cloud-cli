@@ -55,6 +55,7 @@ pub(crate) enum ResolutionLocation {
 pub(crate) struct ResolutionFailure {
     kind: ResolutionFailureKind,
     location: ResolutionLocation,
+    workflow_path: Option<String>,
 }
 
 impl ResolutionFailure {
@@ -66,8 +67,21 @@ impl ResolutionFailure {
         &self.location
     }
 
+    pub(crate) fn workflow_path(&self) -> Option<&str> {
+        self.workflow_path.as_deref()
+    }
+
     fn new(kind: ResolutionFailureKind, location: ResolutionLocation) -> Self {
-        Self { kind, location }
+        Self {
+            kind,
+            location,
+            workflow_path: None,
+        }
+    }
+
+    fn with_workflow_path(mut self, workflow_path: String) -> Self {
+        self.workflow_path = Some(workflow_path);
+        self
     }
 }
 
@@ -133,6 +147,15 @@ pub(crate) fn resolve(
     let selected_candidate = sources.path_from_root(selected_workflow);
     let workflow_source = sources.load(&selected_candidate, ResolutionLocation::Workflow)?;
 
+    let workflow_path = workflow_source.canonical_path.clone();
+    resolve_loaded_workflow(sources, workflow_source)
+        .map_err(|failure| failure.with_workflow_path(workflow_path))
+}
+
+fn resolve_loaded_workflow(
+    mut sources: SourceResolver,
+    workflow_source: LoadedSource,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let document = decode(&workflow_source.bytes).map_err(|failure| {
         ResolutionFailure::new(
             ResolutionFailureKind::InvalidWorkflowDocument(failure.kind()),

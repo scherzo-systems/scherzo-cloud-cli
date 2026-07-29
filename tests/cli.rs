@@ -28,6 +28,8 @@ mod account_signup;
 mod auth_login;
 #[path = "cli/organization.rs"]
 mod organization;
+#[path = "cli/workflow_validate.rs"]
+mod workflow_validate;
 
 const BUILD_VERSION: &str = match option_env!("SCHERZO_CLOUD_VERSION") {
     Some(version) => version,
@@ -432,6 +434,7 @@ fn no_arguments_print_composed_root_help() {
     assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
     assert!(stdout.contains("version       Print version information"));
     assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
+    assert!(stdout.contains("workflow      Inspect local Workflow V1 definitions"));
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }
@@ -465,12 +468,24 @@ fn runner_without_a_subcommand_prints_composed_help() {
 }
 
 #[test]
+fn workflow_without_a_subcommand_prints_composed_help() {
+    let output = run(&["workflow"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: scherzo-cloud workflow [COMMAND]"));
+    assert!(stdout.contains("validate  Validate a local Workflow V1 bundle without executing it"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn nested_help_flags_use_the_composed_command_tree() {
     let auth = run(&["auth", "--help"]);
     let login = run(&["auth", "login", "--help"]);
     let runner = run(&["runner", "--help"]);
     let doctor = run(&["runner", "doctor", "--help"]);
     let serve = run(&["runner", "serve", "--help"]);
+    let workflow_validate = run(&["workflow", "validate", "--help"]);
 
     assert!(auth.status.success());
     assert!(
@@ -504,6 +519,16 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(serve.status.success());
     assert!(String::from_utf8_lossy(&serve.stdout).contains("Usage: scherzo-cloud runner serve"));
     assert!(serve.stderr.is_empty());
+
+    assert!(workflow_validate.status.success());
+    let workflow_validate_stdout = String::from_utf8_lossy(&workflow_validate.stdout);
+    assert!(workflow_validate_stdout.contains(
+        "Usage: scherzo-cloud workflow validate [OPTIONS] --source-root <ROOT> <WORKFLOW_PATH>"
+    ));
+    assert!(workflow_validate_stdout.contains("--source-root <ROOT>"));
+    assert!(workflow_validate_stdout.contains("--json"));
+    assert!(workflow_validate_stdout.contains("without executing it"));
+    assert!(workflow_validate.stderr.is_empty());
 }
 
 #[test]

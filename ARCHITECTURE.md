@@ -6,8 +6,9 @@ This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
 authentication status, explicit human-principal signup, local logout, organization
-profile management, one-page active member-directory reads, and an outbound,
-development-only runner transport. `scherzo-cloud runner serve` opens a versioned
+profile management, one-page active member-directory reads, local Workflow V1
+definition validation, and an outbound, development-only runner transport.
+`scherzo-cloud runner serve` opens a versioned
 WebSocket connection, durably acknowledges received assignment offers, and never claims
 to execute them. `scherzo-cloud runner doctor` currently performs one local Git
 prerequisite check and does not claim that the runner is ready to execute assignments.
@@ -30,6 +31,20 @@ entrypoint will dispatch to components with distinct responsibilities:
 The long-running runner starts only through an explicit command such as
 `scherzo-cloud runner serve`. Bare `scherzo-cloud runner` will not implicitly start a
 service.
+
+## Local workflow validation
+
+`src/cli/workflow/validate.rs` is an offline typed Clap adapter around the shared
+resolver in `src/execution/workflow/resolution.rs`. It requires both an explicit source
+root and a selected workflow path, then renders only normalized provenance, digest,
+step-count, required-import, and closed diagnostic fields. It does not parse or
+validate workflow definitions independently.
+
+Validation stops at definition resolution. The adapter does not construct run
+admission or runtime state, execute command or agent steps, inspect harness
+availability, load either credential type, make a network request, or enter Runner
+Serve connectivity. Bare `scherzo-cloud workflow` prints composed help rather than
+selecting a workflow or inferring a source boundary.
 
 ## Runner diagnostics
 

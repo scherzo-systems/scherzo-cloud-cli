@@ -12,8 +12,9 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, organization profile management and one-page member-directory
-reads, runner diagnostics, and a development-only outbound runner transport. `runner
-serve` connects to an explicitly configured runner gateway, receives and
+reads, local Workflow V1 definition validation, runner diagnostics, and a
+development-only outbound runner transport. `runner serve` connects to an explicitly
+configured runner gateway, receives and
 transport-acknowledges assignment offers, and emits structured service events without
 claiming that execution occurred.
 
@@ -21,6 +22,34 @@ The CLI can create an organization, read or update its initial profile, and list
 page of active members. It cannot configure repositories, invite or change members,
 submit workflows, or execute runner assignments. Agent-guided organization creation
 and the rest of Cloud onboarding are not implemented yet.
+
+## Local workflow validation
+
+Use `scherzo-cloud workflow validate` to resolve a checked-out Workflow V1 bundle
+without running it:
+
+```sh
+scherzo-cloud workflow validate \
+  --source-root ./my-repository \
+  .scherzo/workflows/check.yaml
+```
+
+`--source-root` is required and defines the complete directory boundary for the
+selected workflow YAML and all static prompts, message files, attachments, and result
+schemas. The selected workflow path is interpreted within that explicit root. The CLI
+does not infer the boundary from the current directory, an enclosing repository, or
+the YAML file's directory.
+
+A successful human result reports the normalized source-root-relative workflow path,
+the SHA-256 digest of the resolved source closure, step count, and required optional
+imports. It never prints static file contents. Add `--json` for one schema-version-1
+result with `valid` or `invalid` as its closed `outcome`; invalid results contain one
+bounded CLI-owned diagnostic rather than parser or schema-library error text.
+
+This command performs definition resolution only. It does not admit or start a run,
+execute command or agent steps, check harness or model availability, read human or
+runner credentials, or contact Scherzo Cloud. A zero exit status means only that the
+local definition resolved successfully.
 
 ## Version inspection
 

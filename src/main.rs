@@ -18,7 +18,7 @@ mod build_info;
 mod cli;
 #[allow(
     dead_code,
-    reason = "workflow decoding is an internal execution boundary with no CLI surface yet"
+    reason = "validation resolves execution fields that later runtime components will consume"
 )]
 mod execution;
 mod human_auth;
