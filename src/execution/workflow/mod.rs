@@ -1,6 +1,9 @@
+#![deny(clippy::disallowed_methods)]
+
 pub(crate) mod admission;
 pub(crate) mod document;
 pub(crate) mod resolution;
+pub(crate) mod runtime;
 mod schema;
 mod strict_yaml;
 pub(crate) mod validated;
