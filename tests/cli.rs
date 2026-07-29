@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_macros,
+    reason = "integration tests use Cargo-provided build and executable paths"
+)]
+#![allow(
     clippy::disallowed_methods,
     reason = "runner service timing raises this restriction within its own module"
 )]
@@ -503,7 +507,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
 }
 
 #[test]
-fn version_command_and_flag_report_the_build_version() {
+fn version_command_and_flag_report_the_resolved_build_version() {
     let expected = format!("scherzo-cloud {BUILD_VERSION}\n");
 
     for args in [["version"].as_slice(), ["--version"].as_slice()] {
@@ -516,7 +520,7 @@ fn version_command_and_flag_report_the_build_version() {
 }
 
 #[test]
-fn structured_version_reports_the_version_one_contract() {
+fn structured_version_reports_the_resolved_build_version_contract() {
     let output = run(&["version", "--json"]);
     let expected_executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_scherzo-cloud"))
         .expect("scherzo-cloud executable path should resolve");

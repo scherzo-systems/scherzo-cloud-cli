@@ -130,7 +130,7 @@ impl<'a> ProtocolLog<'a> {
             ),
             KeyValue::new(
                 telemetry::attribute::RUNNER_VERSION,
-                env!("CARGO_PKG_VERSION"),
+                crate::build_info::VERSION,
             ),
             KeyValue::new(telemetry::attribute::RUNNER_MAX_CONCURRENT_RUNS, 1_i64),
         ]);
@@ -1903,6 +1903,10 @@ mod tests {
             "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
         );
         assert_eq!(protocol[6]["scherzo.runner.sequence"], 2);
+        assert_eq!(
+            protocol[0]["scherzo.runner.version"],
+            crate::build_info::VERSION
+        );
         let protocol_json = serde_json::to_string(&protocol).expect("encode protocol records");
         for forbidden in [
             "abcdefghijklmnopqrstuvwxyzABCDEFG-012345678",
@@ -2344,7 +2348,7 @@ mod tests {
             BOOT_ID,
             OPENING_MESSAGE_ID.to_owned(),
             1,
-            "0.2.0",
+            crate::build_info::VERSION,
         )
         .expect("encode opening hello")
     }

@@ -1,3 +1,11 @@
+# Compile-time environment reads must remain behind an explicit boundary so
+# packaged build metadata cannot be bypassed accidentally. Production code
+# reads the resolved version through build_info::VERSION; narrow exceptions
+# document the canonical fallback and Cargo-provided test fixtures.
+disallowed-macros = [
+  { path = "std::env", reason = "use the explicit compile-time environment boundary" },
+]
+
 # Runner service timing must pass through FrameSource or Sleeper so tests can
 # control it. The service module enables this restriction lint; narrow system
 # adapter and test-watchdog exceptions live next to their direct calls.

@@ -608,7 +608,7 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
-    use crate::runner::telemetry::{Outcome, Recorder, TestCapture};
+    use crate::runner::telemetry::{Outcome, Recorder, TestCapture, runner_resource};
 
     fn outcome(values: &[(&str, &str)]) -> SettingsOutcome {
         let values = values
@@ -833,13 +833,7 @@ mod tests {
     }
 
     fn resource() -> Resource {
-        Resource::builder_empty()
-            .with_attributes([
-                KeyValue::new("service.name", "scherzo-runner"),
-                KeyValue::new("service.version", "0.2.0-test"),
-                KeyValue::new("service.instance.id", "rbt_fixture"),
-            ])
-            .build()
+        runner_resource(crate::build_info::VERSION, "rbt_fixture")
     }
 
     fn recorder_with_exporter(
@@ -855,7 +849,12 @@ mod tests {
             .with_span_processor(processor)
             .with_resource(resource())
             .build();
-        Arc::new(Recorder::new(provider, writer, "0.2.0-test", "rbt_fixture"))
+        Arc::new(Recorder::new(
+            provider,
+            writer,
+            crate::build_info::VERSION,
+            "rbt_fixture",
+        ))
     }
 
     fn proto_value(value: &opentelemetry_proto::tonic::common::v1::AnyValue) -> serde_json::Value {
@@ -875,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_canonical_events_with_exact_resource_and_local_identifiers() {
+    fn exports_resolved_build_version_in_resource_and_local_events() {
         let receiver = OtlpReceiver::start("200 OK");
         let settings = enabled(&[
             (TRACES_ENDPOINT, &receiver.endpoint),
@@ -949,7 +948,7 @@ mod tests {
                 ),
                 (
                     "service.version".to_owned(),
-                    serde_json::json!("0.2.0-test")
+                    serde_json::json!(crate::build_info::VERSION)
                 ),
                 (
                     "service.instance.id".to_owned(),

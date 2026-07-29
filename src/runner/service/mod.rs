@@ -161,7 +161,7 @@ async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
     let frame_source: Arc<dyn FrameSource> = Arc::new(SystemFrameSource);
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
-    let recorder = Recorder::stderr(env!("CARGO_PKG_VERSION"), &boot_id);
+    let recorder = Recorder::stderr(&boot_id);
     let mut shutdown = ProcessShutdown::new()?;
     run_service_loop(
         config,
@@ -237,7 +237,7 @@ where
         &boot_id,
         opening_message_id.clone(),
         opening_sequence,
-        env!("CARGO_PKG_VERSION"),
+        crate::build_info::VERSION,
     )
     .map_err(ServiceError::Connection)?;
     sequence = sequence
@@ -316,7 +316,7 @@ where
                         &boot_id,
                         opening_message_id.clone(),
                         opening_sequence,
-                        env!("CARGO_PKG_VERSION"),
+                        crate::build_info::VERSION,
                     ).map_err(ServiceError::Connection)?;
                     sequence = sequence
                         .checked_add(1)
@@ -341,7 +341,7 @@ fn connection_event(recorder: &Recorder, config: &Config, boot_id: &str, attempt
         KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
         KeyValue::new(
             telemetry::attribute::RUNNER_VERSION,
-            env!("CARGO_PKG_VERSION"),
+            crate::build_info::VERSION,
         ),
         KeyValue::new(
             telemetry::attribute::CONNECTION_ATTEMPT,
@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replaces_an_acknowledged_opening_after_a_connection_error() {
+    async fn projects_resolved_build_version_across_initial_and_reconnect_telemetry() {
         let (listener, endpoint) = fixture_listener().await;
         let (failure_sent, failure_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -621,6 +621,10 @@ mod tests {
             assert_eq!(first_message_id, "rmsg_00000000000000000000000002");
             assert_eq!(first_hello["bootId"], "rbt_00000000000000000000000001");
             assert_eq!(first_hello["sentAt"], "2026-07-23T00:00:00Z");
+            assert_eq!(
+                first_hello["payload"]["runnerVersion"],
+                crate::build_info::VERSION
+            );
             let first_sequence = first_hello["sequence"]
                 .as_u64()
                 .expect("first opening sequence");
@@ -660,6 +664,10 @@ mod tests {
             assert_ne!(second_hello["messageId"], first_message_id);
             assert_eq!(second_hello["sequence"], 3);
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
+            assert_eq!(
+                second_hello["payload"]["runnerVersion"],
+                crate::build_info::VERSION
+            );
         });
 
         let (sleeper, mut sleep_requests) = controlled_sleeper();
@@ -669,6 +677,13 @@ mod tests {
             .expect("first connection did not reach its failure")
             .expect("fixture server dropped failure signal");
         let (backoff_delay, release_sleep) = backoff_request(&mut sleep_requests).await;
+        let records = capture.records();
+        assert!(records.iter().all(|record| {
+            record["service.version"] == crate::build_info::VERSION
+                && record
+                    .get("scherzo.runner.version")
+                    .is_none_or(|version| version == crate::build_info::VERSION)
+        }));
         let events = capture.events();
         let connection_events: Vec<_> = events
             .iter()
@@ -677,6 +692,7 @@ mod tests {
         assert_eq!(connection_events.len(), 1);
         let event = connection_events[0];
         assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
+        assert_eq!(event["scherzo.runner.version"], crate::build_info::VERSION);
         assert_eq!(event["error.type"], "undecodable_gateway_frame");
         assert_eq!(event["scherzo.outcome"], "disconnected");
         assert_eq!(

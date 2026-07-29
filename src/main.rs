@@ -1,10 +1,11 @@
 #![cfg_attr(
     test,
     allow(
+        clippy::disallowed_macros,
         clippy::expect_used,
         clippy::panic,
         clippy::unwrap_used,
-        reason = "unit tests use panic shortcuts to express assertion failures"
+        reason = "unit tests use Cargo-provided fixture paths and panic shortcuts"
     )
 )]
 #![allow(

@@ -44,6 +44,7 @@ for expected_code in \
   dead_code \
   clippy::allow_attributes_without_reason \
   clippy::cast_possible_truncation \
+  clippy::disallowed_macros \
   clippy::unwrap_used; do
   if ! grep --fixed-strings --line-regexp --quiet "$expected_code" <<<"$error_codes"; then
     echo "Clippy did not reject the representative $expected_code violation." >&2
@@ -56,4 +57,4 @@ for expected_code in \
   fi
 done
 
-printf 'Checked-in Rust lint policy rejects representative production violations.\n'
+printf 'Checked-in Rust lint policy enforces the build version boundary and rejects representative production violations.\n'

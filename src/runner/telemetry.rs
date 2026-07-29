@@ -240,7 +240,8 @@ impl fmt::Debug for Recorder {
 }
 
 impl Recorder {
-    pub(crate) fn stderr(service_version: &str, service_instance_id: &str) -> Arc<Self> {
+    pub(crate) fn stderr(service_instance_id: &str) -> Arc<Self> {
+        let service_version = crate::build_info::VERSION;
         let dropped_count = Arc::new(AtomicU64::new(0));
         let writer: Arc<dyn EventWriter> =
             Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
@@ -248,13 +249,7 @@ impl Recorder {
         if let Some(processor) = otlp::configured_processor(Arc::clone(&writer)) {
             provider = provider.with_span_processor(processor);
         }
-        let resource = Resource::builder_empty()
-            .with_attributes([
-                KeyValue::new(SERVICE_NAME, "scherzo-runner"),
-                KeyValue::new(SERVICE_VERSION, service_version.to_owned()),
-                KeyValue::new(SERVICE_INSTANCE_ID, service_instance_id.to_owned()),
-            ])
-            .build();
+        let resource = runner_resource(service_version, service_instance_id);
         let provider = provider.with_resource(resource).build();
         Arc::new(Self::with_dropped_count(
             provider,
@@ -364,6 +359,16 @@ impl Recorder {
             self.dropped_count.fetch_add(1, Ordering::AcqRel);
         }
     }
+}
+
+fn runner_resource(service_version: &str, service_instance_id: &str) -> Resource {
+    Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new(SERVICE_NAME, "scherzo-runner"),
+            KeyValue::new(SERVICE_VERSION, service_version.to_owned()),
+            KeyValue::new(SERVICE_INSTANCE_ID, service_instance_id.to_owned()),
+        ])
+        .build()
 }
 
 #[derive(Clone)]
@@ -588,7 +593,7 @@ pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCa
     let recorder = Recorder::new(
         provider,
         Arc::new(capture.clone()),
-        "0.2.0-test",
+        crate::build_info::VERSION,
         service_instance_id,
     );
     (Arc::new(recorder), capture)

@@ -12,6 +12,8 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
 cargo test --locked --workspace --all-targets --all-features
+SCHERZO_CLOUD_VERSION=0.2.7 \
+  cargo test --locked --workspace --all-targets --all-features resolved_build_version
 cargo build --locked --workspace --all-features --release
 
 printf 'Public CLI source checks passed.\n'
