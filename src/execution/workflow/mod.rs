@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 pub(crate) mod document;
 pub(crate) mod resolution;
 mod schema;
@@ -17,6 +18,7 @@ const STRUCTURAL_SCHEMA: &str = include_str!("workflow-v1.schema.json");
 pub(crate) const MAX_DECODE_DIAGNOSTIC_BYTES: usize = 96;
 
 static STRUCTURAL_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();
+static MEDIA_TYPE_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodeFailureKind {
@@ -91,6 +93,17 @@ fn structural_validator() -> Option<&'static Validator> {
         })
         .as_ref()
         .ok()
+}
+
+fn is_valid_media_type(value: &str) -> bool {
+    MEDIA_TYPE_VALIDATOR
+        .get_or_init(|| {
+            let schema = serde_json::from_str::<Value>(STRUCTURAL_SCHEMA).map_err(|_| ())?;
+            let media_type_schema = schema.pointer("/$defs/MediaType").ok_or(())?;
+            jsonschema::draft202012::new(media_type_schema).map_err(|_| ())
+        })
+        .as_ref()
+        .is_ok_and(|validator| validator.is_valid(&Value::String(value.to_owned())))
 }
 
 #[cfg(test)]
