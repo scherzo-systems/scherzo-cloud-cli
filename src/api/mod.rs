@@ -45,7 +45,7 @@ mod generated;
 
 #[cfg(test)]
 mod tests {
-    use super::generated;
+    use super::{generated, test_support::ScriptedHttpServer};
 
     #[test]
     fn generated_problem_preserves_opaque_actions() {
@@ -66,6 +66,43 @@ mod tests {
         let actions = problem.actions.expect("actions should be present");
 
         assert_eq!(actions, input["actions"].as_array().unwrap().to_owned());
+    }
+
+    #[test]
+    fn membership_patch_client_uses_contract_media_type() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = r#"{"id":"mem_01k0z6r1w8f4jy2m7q9v3x5abc","organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc","principalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc","principalType":"human","role":"owner","state":"active","createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:00:00Z"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let server = ScriptedHttpServer::respond(response);
+        let mut configuration = generated::apis::configuration::Configuration::new();
+        configuration.base_path = server.api_url.trim_end_matches('/').to_owned();
+        configuration.bearer_access_token = Some("fixture-token".to_owned());
+        let patch = generated::models::UpdateOrganizationMembershipPatch {
+            role: Some(
+                generated::models::update_organization_membership_patch::Role::MembershipPatchRoleOwner,
+            ),
+            state: None,
+        };
+
+        let result = generated::apis::organizations_api::update_organization_membership(
+            &configuration,
+            "acme",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "fixture-key",
+            patch,
+        );
+
+        assert!(result.is_ok());
+        let request = server.finish_one();
+        assert!(
+            request
+                .lines()
+                .any(|line| line == "content-type: application/merge-patch+json")
+        );
     }
 
     #[test]

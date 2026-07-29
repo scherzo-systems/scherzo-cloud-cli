@@ -15,40 +15,57 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// OrganizationMembershipDirectoryEntry : One active membership held by an active principal.
+/// OrganizationMembershipHistoryEntry : One owner-visible membership history row without identity provenance.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrganizationMembershipDirectoryEntry {
-    /// The membership's opaque, stable, globally unique identifier.
+pub struct OrganizationMembershipHistoryEntry {
     #[serde(rename = "id")]
     pub id: String,
-    /// The member principal's opaque identifier.
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
     #[serde(rename = "principalId")]
     pub principal_id: String,
     /// The member principal's immutable type.
     #[serde(rename = "principalType")]
     pub principal_type: PrincipalType,
-    /// The principal's optional mutable display name.
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// The membership's organization role.
     #[serde(rename = "role")]
     pub role: Role,
+    /// The membership's current or terminal lifecycle state.
+    #[serde(rename = "state")]
+    pub state: State,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(rename = "terminalAt", skip_serializing_if = "Option::is_none")]
+    pub terminal_at: Option<String>,
 }
 
-impl OrganizationMembershipDirectoryEntry {
-    /// One active membership held by an active principal.
+impl OrganizationMembershipHistoryEntry {
+    /// One owner-visible membership history row without identity provenance.
     pub fn new(
         id: String,
+        organization_id: String,
         principal_id: String,
         principal_type: PrincipalType,
         role: Role,
-    ) -> OrganizationMembershipDirectoryEntry {
-        OrganizationMembershipDirectoryEntry {
+        state: State,
+        created_at: String,
+        updated_at: String,
+    ) -> OrganizationMembershipHistoryEntry {
+        OrganizationMembershipHistoryEntry {
             id,
+            organization_id,
             principal_id,
             principal_type,
             display_name: None,
             role,
+            state,
+            created_at,
+            updated_at,
+            terminal_at: None,
         }
     }
 }
@@ -78,5 +95,21 @@ pub enum Role {
 impl Default for Role {
     fn default() -> Role {
         Self::Owner
+    }
+}
+/// The membership's current or terminal lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum State {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "suspended")]
+    Suspended,
+    #[serde(rename = "ended")]
+    Ended,
+}
+
+impl Default for State {
+    fn default() -> State {
+        Self::Active
     }
 }

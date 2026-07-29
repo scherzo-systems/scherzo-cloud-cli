@@ -15,57 +15,51 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// Principal : An active human or service principal.
+/// UpdateOrganizationMembershipPatch : A closed merge patch containing exactly one membership transition.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Principal {
-    /// An opaque, stable, globally unique principal identifier.
-    #[serde(rename = "id")]
-    pub id: String,
-    /// The immutable principal type.
-    #[serde(rename = "type")]
-    pub r#type: Type,
-    /// The principal lifecycle state available to this operation.
-    #[serde(rename = "state")]
-    pub state: State,
-    /// The principal's mutable, non-unique display name, when one has been established.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
+pub struct UpdateOrganizationMembershipPatch {
+    /// The requested initial organization role.
+    #[serde(rename = "role", skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    /// The requested nonterminal membership lifecycle state.
+    #[serde(rename = "state", skip_serializing_if = "Option::is_none")]
+    pub state: Option<State>,
 }
 
-impl Principal {
-    /// An active human or service principal.
-    pub fn new(id: String, r#type: Type, state: State) -> Principal {
-        Principal {
-            id,
-            r#type,
-            state,
-            display_name: None,
+impl UpdateOrganizationMembershipPatch {
+    /// A closed merge patch containing exactly one membership transition.
+    pub fn new() -> UpdateOrganizationMembershipPatch {
+        UpdateOrganizationMembershipPatch {
+            role: None,
+            state: None,
         }
     }
 }
-/// The immutable principal type.
+/// The requested initial organization role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Type {
-    #[serde(rename = "human")]
-    PrincipalTypeHuman,
-    #[serde(rename = "service")]
-    PrincipalTypeService,
+pub enum Role {
+    #[serde(rename = "owner")]
+    MembershipPatchRoleOwner,
+    #[serde(rename = "member")]
+    MembershipPatchRoleMember,
 }
 
-impl Default for Type {
-    fn default() -> Type {
-        Self::PrincipalTypeHuman
+impl Default for Role {
+    fn default() -> Role {
+        Self::MembershipPatchRoleOwner
     }
 }
-/// The principal lifecycle state available to this operation.
+/// The requested nonterminal membership lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
     #[serde(rename = "active")]
-    Active,
+    MembershipPatchStateActive,
+    #[serde(rename = "suspended")]
+    MembershipPatchStateSuspended,
 }
 
 impl Default for State {
     fn default() -> State {
-        Self::Active
+        Self::MembershipPatchStateActive
     }
 }

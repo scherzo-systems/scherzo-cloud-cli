@@ -15,16 +15,21 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// InvitationCapabilityRequest : A closed request carrying bearer material only for an email invitation.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct InvitationCapabilityRequest {
-    #[serde(rename = "capability", skip_serializing_if = "Option::is_none")]
-    pub capability: Option<String>,
+pub struct CurrentPrincipalMembershipList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::CurrentPrincipalMembershipEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
-impl InvitationCapabilityRequest {
-    /// A closed request carrying bearer material only for an email invitation.
-    pub fn new() -> InvitationCapabilityRequest {
-        InvitationCapabilityRequest { capability: None }
+impl CurrentPrincipalMembershipList {
+    pub fn new(
+        items: Vec<models::CurrentPrincipalMembershipEntry>,
+    ) -> CurrentPrincipalMembershipList {
+        CurrentPrincipalMembershipList {
+            items,
+            next_cursor: None,
+        }
     }
 }

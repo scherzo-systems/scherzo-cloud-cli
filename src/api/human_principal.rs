@@ -19,7 +19,7 @@ pub(super) fn decode(body: &[u8]) -> Result<HumanPrincipal, &'static str> {
 }
 
 pub(super) fn from_api(principal: models::Principal) -> Result<HumanPrincipal, &'static str> {
-    if principal.r#type != models::principal::Type::Human {
+    if principal.r#type != models::principal::Type::PrincipalTypeHuman {
         return Err("the principal type is not human");
     }
     if principal.id.is_empty() {

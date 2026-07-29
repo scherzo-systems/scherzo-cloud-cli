@@ -15,48 +15,82 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// CurrentPrincipalMembershipEntry : One current-principal relationship with profile fields only while effective.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AcceptedInvitationMembership {
+pub struct CurrentPrincipalMembershipEntry {
     #[serde(rename = "id")]
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
-    #[serde(rename = "principalId")]
-    pub principal_id: String,
-    /// Existing active memberships retain their role; newly created memberships are member.
+    /// The organization's current lifecycle state.
+    #[serde(rename = "organizationState")]
+    pub organization_state: OrganizationState,
+    #[serde(
+        rename = "organizationDisplayName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub organization_display_name: Option<String>,
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "organizationSlug", skip_serializing_if = "Option::is_none")]
+    pub organization_slug: Option<String>,
+    /// The caller's role in this relationship.
     #[serde(rename = "role")]
     pub role: Role,
-    /// The active membership state returned by successful acceptance.
+    /// The caller's membership lifecycle state.
     #[serde(rename = "state")]
     pub state: State,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+    #[serde(rename = "terminalAt", skip_serializing_if = "Option::is_none")]
+    pub terminal_at: Option<String>,
 }
 
-impl AcceptedInvitationMembership {
+impl CurrentPrincipalMembershipEntry {
+    /// One current-principal relationship with profile fields only while effective.
     pub fn new(
         id: String,
         organization_id: String,
-        principal_id: String,
+        organization_state: OrganizationState,
         role: Role,
         state: State,
         created_at: String,
         updated_at: String,
-    ) -> AcceptedInvitationMembership {
-        AcceptedInvitationMembership {
+    ) -> CurrentPrincipalMembershipEntry {
+        CurrentPrincipalMembershipEntry {
             id,
             organization_id,
-            principal_id,
+            organization_state,
+            organization_display_name: None,
+            organization_slug: None,
             role,
             state,
             created_at,
             updated_at,
+            terminal_at: None,
         }
     }
 }
-/// Existing active memberships retain their role; newly created memberships are member.
+/// The organization's current lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum OrganizationState {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "suspended")]
+    Suspended,
+    #[serde(rename = "deletion_pending")]
+    DeletionPending,
+    #[serde(rename = "deleted")]
+    Deleted,
+}
+
+impl Default for OrganizationState {
+    fn default() -> OrganizationState {
+        Self::Active
+    }
+}
+/// The caller's role in this relationship.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Role {
     #[serde(rename = "owner")]
@@ -70,11 +104,15 @@ impl Default for Role {
         Self::Owner
     }
 }
-/// The active membership state returned by successful acceptance.
+/// The caller's membership lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
     #[serde(rename = "active")]
     Active,
+    #[serde(rename = "suspended")]
+    Suspended,
+    #[serde(rename = "ended")]
+    Ended,
 }
 
 impl Default for State {
