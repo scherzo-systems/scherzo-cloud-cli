@@ -1,4 +1,5 @@
 pub(crate) mod document;
+pub(crate) mod resolution;
 mod schema;
 mod strict_yaml;
 pub(crate) mod validated;

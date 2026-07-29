@@ -1651,6 +1651,7 @@ dependencies = [
  "prost",
  "regress",
  "reqwest",
+ "ring",
  "rustix",
  "rustls",
  "serde",
