@@ -3,8 +3,9 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+use tokio::sync::watch;
 
 use super::resolution::ResolvedWorkflow;
 use super::validated::ValidatedStep;
@@ -17,47 +18,37 @@ pub(crate) enum CancellationReason {
     RunnerShutdown,
 }
 
-impl CancellationReason {
-    fn code(self) -> u8 {
-        match self {
-            Self::UserRequest => 1,
-            Self::RunnerShutdown => 2,
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::UserRequest),
-            2 => Some(Self::RunnerShutdown),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CancellationSource {
-    reason: Arc<AtomicU8>,
+    reason: watch::Sender<Option<CancellationReason>>,
 }
 
 impl CancellationSource {
     pub(crate) fn new() -> Self {
-        Self {
-            reason: Arc::new(AtomicU8::new(0)),
-        }
+        let (reason, _) = watch::channel(None);
+        Self { reason }
     }
 
     pub(crate) fn request_cancellation(&self, reason: CancellationReason) -> bool {
-        self.reason
-            .compare_exchange(0, reason.code(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.reason.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reason);
+            true
+        })
     }
 
     pub(crate) fn cancellation_reason(&self) -> Option<CancellationReason> {
-        CancellationReason::from_code(self.reason.load(Ordering::SeqCst))
+        *self.reason.borrow()
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation_reason().is_some()
+    }
+
+    pub(super) fn subscribe(&self) -> watch::Receiver<Option<CancellationReason>> {
+        self.reason.subscribe()
     }
 }
 

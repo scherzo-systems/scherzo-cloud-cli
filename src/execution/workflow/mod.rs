@@ -1,6 +1,7 @@
 #![deny(clippy::disallowed_methods)]
 
 pub(crate) mod admission;
+pub(crate) mod coordinator;
 pub(crate) mod document;
 mod pi;
 pub(crate) mod resolution;

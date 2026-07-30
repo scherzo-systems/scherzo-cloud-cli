@@ -119,6 +119,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
     fs::remove_dir_all(&fixture.source_root).unwrap();
     let cancellation = CancellationSource::new();
     let caller_cancellation = cancellation.clone();
+    let mut cancellation_notifications = cancellation.subscribe();
     let imports = ResolvedImports::new(
         Some(Arc::<str>::from("Run the checks.")),
         Arc::<[ResolvedAttachment]>::from(vec![ResolvedAttachment::new(
@@ -156,7 +157,13 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
     );
     assert!(!admitted.execution().cancellation().source().is_cancelled());
     assert!(caller_cancellation.request_cancellation(CancellationReason::UserRequest));
+    assert!(cancellation_notifications.has_changed().unwrap());
+    assert_eq!(
+        *cancellation_notifications.borrow_and_update(),
+        Some(CancellationReason::UserRequest)
+    );
     assert!(!caller_cancellation.request_cancellation(CancellationReason::RunnerShutdown));
+    assert!(!cancellation_notifications.has_changed().unwrap());
     assert_eq!(
         admitted
             .execution()
