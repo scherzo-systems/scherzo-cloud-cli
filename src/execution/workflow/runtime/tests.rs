@@ -4,10 +4,23 @@ use std::time::Duration;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationSource, ExecutionContext, ExecutionRootLifecycle,
-    ResolvedImports, admit_command_workflow,
+    CancellationPolicy, CancellationReason, CancellationSource, ExecutionContext,
+    ExecutionRootLifecycle, ResolvedImports, admit_command_workflow,
 };
 use crate::execution::workflow::resolution;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestDeadline {
+    arbiter_tick: u64,
+}
+
+type TestAction = RequestedAction<String, String, String, TestDeadline>;
+type TestOccurrence = Occurrence<String, String, String, TestDeadline>;
+type TestReduction = Reduction<String, String, String, TestDeadline>;
+
+fn deadline(arbiter_tick: u64) -> TestDeadline {
+    TestDeadline { arbiter_tick }
+}
 
 fn sequence(value: u64) -> TransitionSequence {
     TransitionSequence(value)
@@ -58,6 +71,13 @@ fn definition(
     }
 }
 
+fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
+    initialize_definition(ExecutionStart {
+        definition,
+        initial_cancellation: None,
+    })
+}
+
 fn step_event(
     value: u64,
     step: &str,
@@ -102,7 +122,29 @@ fn failure(step: &str, phase: FailurePhase, cause: &str) -> StepFailure<String> 
     }
 }
 
-fn start_action(value: u64, step: &str) -> RequestedAction<String, String, String> {
+fn cancellation(
+    reason: CancellationReason,
+    arbiter_tick: u64,
+) -> CancellationRequest<TestDeadline> {
+    CancellationRequest {
+        reason,
+        deadline: deadline(arbiter_tick),
+    }
+}
+
+fn cancelling_workflow(
+    reason: CancellationReason,
+    prior_failure: Option<StepFailure<String>>,
+) -> WorkflowState<String> {
+    WorkflowState::Executing {
+        gate: SchedulingGate::Cancelling {
+            reason,
+            prior_failure,
+        },
+    }
+}
+
+fn start_action(value: u64, step: &str) -> TestAction {
     RequestedAction {
         id: action_id(value),
         action: Action::StartStep {
@@ -111,11 +153,7 @@ fn start_action(value: u64, step: &str) -> RequestedAction<String, String, Strin
     }
 }
 
-fn capture_action(
-    value: u64,
-    step: &str,
-    provisional: &str,
-) -> RequestedAction<String, String, String> {
+fn capture_action(value: u64, step: &str, provisional: &str) -> TestAction {
     RequestedAction {
         id: action_id(value),
         action: Action::CaptureOutputs {
@@ -125,10 +163,7 @@ fn capture_action(
     }
 }
 
-fn finish_action(
-    value: u64,
-    exports: ExportSet<String>,
-) -> RequestedAction<String, String, String> {
+fn finish_action(value: u64, exports: ExportSet<String>) -> TestAction {
     RequestedAction {
         id: action_id(value),
         action: Action::FinishRun {
@@ -138,15 +173,57 @@ fn finish_action(
     }
 }
 
+fn cancel_action(
+    value: u64,
+    step: &str,
+    reason: CancellationReason,
+    arbiter_tick: u64,
+) -> TestAction {
+    RequestedAction {
+        id: action_id(value),
+        action: Action::CancelStep {
+            step: step.to_owned(),
+            reason,
+            deadline: deadline(arbiter_tick),
+        },
+    }
+}
+
 fn finish_failed_action(
     value: u64,
     primary_failure: StepFailure<String>,
     exports: ExportSet<String>,
-) -> RequestedAction<String, String, String> {
+) -> TestAction {
+    finish_failed_after_cancellation_action(value, primary_failure, None, exports)
+}
+
+fn finish_failed_after_cancellation_action(
+    value: u64,
+    primary_failure: StepFailure<String>,
+    later_cancellation: Option<CancellationReason>,
+    exports: ExportSet<String>,
+) -> TestAction {
     RequestedAction {
         id: action_id(value),
         action: Action::FinishRun {
-            outcome: RunOutcome::Failed { primary_failure },
+            outcome: RunOutcome::Failed {
+                primary_failure,
+                later_cancellation,
+            },
+            exports,
+        },
+    }
+}
+
+fn finish_cancelled_action(
+    value: u64,
+    reason: CancellationReason,
+    exports: ExportSet<String>,
+) -> TestAction {
+    RequestedAction {
+        id: action_id(value),
+        action: Action::FinishRun {
+            outcome: RunOutcome::Cancelled { reason },
             exports,
         },
     }
@@ -177,10 +254,7 @@ fn assert_step(state: &RuntimeState<String, String>, step: &str, expected: StepS
     assert_eq!(state.steps[step].state.kind(), expected);
 }
 
-fn assert_noop(
-    before: &RuntimeState<String, String>,
-    reduction: &Reduction<String, String, String>,
-) {
+fn assert_noop(before: &RuntimeState<String, String>, reduction: &TestReduction) {
     assert_eq!(&reduction.state, before);
     assert!(reduction.events.is_empty());
     assert!(reduction.actions.is_empty());
@@ -188,9 +262,31 @@ fn assert_noop(
 
 fn reduce_and_advance(
     state: &mut RuntimeState<String, String>,
-    occurrence: Occurrence<String, String, String>,
-) -> Reduction<String, String, String> {
+    occurrence: TestOccurrence,
+) -> TestReduction {
     let reduction = reduce(state, occurrence);
+    *state = reduction.state.clone();
+    reduction
+}
+
+fn reduce_ordered(
+    state: &RuntimeState<String, String>,
+    last_ordinal: &mut u64,
+    ordinal: u64,
+    occurrence: TestOccurrence,
+) -> TestReduction {
+    assert!(ordinal > *last_ordinal);
+    *last_ordinal = ordinal;
+    reduce(state, occurrence)
+}
+
+fn reduce_ordered_and_advance(
+    state: &mut RuntimeState<String, String>,
+    last_ordinal: &mut u64,
+    ordinal: u64,
+    occurrence: TestOccurrence,
+) -> TestReduction {
+    let reduction = reduce_ordered(state, last_ordinal, ordinal, occurrence);
     *state = reduction.state.clone();
     reduction
 }
@@ -199,11 +295,11 @@ fn prepare_failure_phase(
     phase: FailurePhase,
 ) -> (
     RuntimeState<String, String>,
-    Occurrence<String, String, String>,
+    TestOccurrence,
     StepStateKind,
     u64,
 ) {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[
             ("aFail", &[], &["result"]),
             ("bStopped", &[], &["result"]),
@@ -296,7 +392,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     )
     .unwrap();
 
-    let initialization = initialize::<String, String, String>(&admitted);
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
 
     assert_eq!(initialization.actions, [start_action(1, "alpha")]);
     assert_step(&initialization.state, "alpha", StepStateKind::Starting);
@@ -305,8 +401,343 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
 }
 
 #[test]
+fn initial_cancellation_finishes_without_authorizing_a_start() {
+    let reason = CancellationReason::UserRequest;
+    let expected_exports = BTreeMap::from([
+        (
+            "childExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+        (
+            "rootExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+    ]);
+    let reduction = initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
+        definition: definition(
+            &[
+                ("aRoot", &[], &["result"]),
+                ("bChild", &["aRoot"], &["result"]),
+            ],
+            &[
+                ("childExport", "bChild", "result"),
+                ("rootExport", "aRoot", "result"),
+            ],
+            1,
+        ),
+        initial_cancellation: Some(cancellation(reason, 5_000)),
+    });
+    let cancelling = cancelling_workflow(reason, None);
+
+    assert_eq!(
+        reduction.events,
+        [
+            workflow_event(
+                1,
+                WorkflowState::Executing {
+                    gate: SchedulingGate::Open,
+                },
+                cancelling.clone(),
+            ),
+            step_event(2, "aRoot", StepStateKind::Pending, StepStateKind::Cancelled,),
+            step_event(
+                3,
+                "bChild",
+                StepStateKind::Pending,
+                StepStateKind::Cancelled,
+            ),
+            workflow_event(4, cancelling, WorkflowState::Cancelled { reason },),
+        ]
+    );
+    assert_eq!(
+        reduction.state.steps["aRoot"].state,
+        StepState::Cancelled { reason }
+    );
+    assert_eq!(
+        reduction.state.steps["bChild"].state,
+        StepState::Cancelled { reason }
+    );
+    assert_eq!(
+        reduction.state.workflow,
+        WorkflowState::Cancelled { reason }
+    );
+    assert_eq!(reduction.state.exports, Some(expected_exports.clone()));
+    assert_eq!(
+        reduction.actions,
+        [finish_cancelled_action(4, reason, expected_exports)]
+    );
+    assert!(
+        reduction
+            .actions
+            .iter()
+            .all(|action| !matches!(action.action, Action::StartStep { .. }))
+    );
+}
+
+#[test]
+fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
+    let initialization = initialize_test(definition(
+        &[
+            ("aStarting", &[], &[]),
+            ("bRunning", &[], &[]),
+            ("cCapturing", &[], &["result"]),
+            ("zWaiting", &["cCapturing"], &["result"]),
+        ],
+        &[
+            ("capturingExport", "cCapturing", "result"),
+            ("waitingExport", "zWaiting", "result"),
+        ],
+        3,
+    ));
+    assert_eq!(
+        initialization.actions,
+        [
+            start_action(1, "aStarting"),
+            start_action(2, "bRunning"),
+            start_action(3, "cCapturing"),
+        ]
+    );
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "bRunning".to_owned(),
+            action: action_id(2),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "cCapturing".to_owned(),
+            action: action_id(3),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "cCapturing".to_owned(),
+            action: action_id(3),
+            provisional: "uncommitted".to_owned(),
+        },
+    );
+
+    let reason = CancellationReason::RunnerShutdown;
+    let mut ordinal = 0;
+    let cancelled = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        10,
+        Occurrence::CancellationRequested {
+            reason,
+            deadline: deadline(7_777),
+        },
+    );
+    let cancelling = cancelling_workflow(reason, None);
+    assert_eq!(
+        cancelled.events,
+        [
+            workflow_event(
+                7,
+                WorkflowState::Executing {
+                    gate: SchedulingGate::Open,
+                },
+                cancelling.clone(),
+            ),
+            step_event(
+                8,
+                "aStarting",
+                StepStateKind::Starting,
+                StepStateKind::Cancelling,
+            ),
+            step_event(
+                9,
+                "bRunning",
+                StepStateKind::Running,
+                StepStateKind::Cancelling,
+            ),
+            step_event(
+                10,
+                "cCapturing",
+                StepStateKind::CapturingOutputs,
+                StepStateKind::Cancelling,
+            ),
+            step_event(
+                11,
+                "zWaiting",
+                StepStateKind::Pending,
+                StepStateKind::Cancelled,
+            ),
+        ]
+    );
+    assert_eq!(
+        cancelled.actions,
+        [
+            cancel_action(8, "aStarting", reason, 7_777),
+            cancel_action(9, "bRunning", reason, 7_777),
+            cancel_action(10, "cCapturing", reason, 7_777),
+        ]
+    );
+    assert_eq!(state.workflow, cancelling);
+    assert!(state.exports.is_none());
+
+    let duplicate_cancellation = reduce_ordered(
+        &state,
+        &mut ordinal,
+        11,
+        Occurrence::CancellationRequested {
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(9_999),
+        },
+    );
+    assert_noop(&state, &duplicate_cancellation);
+
+    let first_quiesced = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        12,
+        Occurrence::StepQuiesced {
+            step: "aStarting".to_owned(),
+            action: action_id(8),
+        },
+    );
+    assert_eq!(
+        first_quiesced.events,
+        [step_event(
+            12,
+            "aStarting",
+            StepStateKind::Cancelling,
+            StepStateKind::Cancelled,
+        )]
+    );
+    assert!(first_quiesced.actions.is_empty());
+    assert_eq!(state.workflow, cancelling_workflow(reason, None));
+
+    for (next_ordinal, occurrence) in [
+        (
+            13,
+            Occurrence::StepQuiesced {
+                step: "aStarting".to_owned(),
+                action: action_id(8),
+            },
+        ),
+        (
+            14,
+            Occurrence::StepExecutionCompleted {
+                step: "bRunning".to_owned(),
+                action: action_id(2),
+                provisional: "late completion".to_owned(),
+            },
+        ),
+        (
+            15,
+            Occurrence::OutputsCaptured {
+                step: "cCapturing".to_owned(),
+                action: action_id(6),
+                outputs: output_set(&[("result", "late output")]),
+            },
+        ),
+    ] {
+        let stale = reduce_ordered(&state, &mut ordinal, next_ordinal, occurrence);
+        assert_noop(&state, &stale);
+    }
+
+    let second_quiesced = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        16,
+        Occurrence::StepQuiesced {
+            step: "bRunning".to_owned(),
+            action: action_id(9),
+        },
+    );
+    assert_eq!(
+        second_quiesced.events,
+        [step_event(
+            13,
+            "bRunning",
+            StepStateKind::Cancelling,
+            StepStateKind::Cancelled,
+        )]
+    );
+    assert!(second_quiesced.actions.is_empty());
+    assert_eq!(state.workflow, cancelling_workflow(reason, None));
+
+    let final_quiesced = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        17,
+        Occurrence::StepQuiesced {
+            step: "cCapturing".to_owned(),
+            action: action_id(10),
+        },
+    );
+    let expected_exports = BTreeMap::from([
+        (
+            "capturingExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+        (
+            "waitingExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+    ]);
+    assert_eq!(
+        final_quiesced.events,
+        [
+            step_event(
+                14,
+                "cCapturing",
+                StepStateKind::Cancelling,
+                StepStateKind::Cancelled,
+            ),
+            workflow_event(
+                15,
+                cancelling_workflow(reason, None),
+                WorkflowState::Cancelled { reason },
+            ),
+        ]
+    );
+    assert_eq!(
+        final_quiesced.actions,
+        [finish_cancelled_action(
+            15,
+            reason,
+            expected_exports.clone()
+        )]
+    );
+    assert_eq!(state.exports, Some(expected_exports));
+
+    for occurrence in [
+        Occurrence::StepQuiesced {
+            step: "cCapturing".to_owned(),
+            action: action_id(10),
+        },
+        Occurrence::CancellationRequested {
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(12_345),
+        },
+        Occurrence::StepExecutionFailed {
+            step: "bRunning".to_owned(),
+            action: action_id(2),
+            cause: "terminal replay".to_owned(),
+        },
+    ] {
+        let replay = reduce(&state, occurrence);
+        assert_noop(&state, &replay);
+    }
+}
+
+#[test]
 fn empty_dag_finishes_during_initialization() {
-    let reduction = initialize_definition::<String, String, String>(definition(&[], &[], 1));
+    let reduction = initialize_test(definition(&[], &[], 1));
 
     assert_eq!(reduction.state.workflow, WorkflowState::Succeeded);
     assert!(reduction.state.steps.is_empty());
@@ -318,11 +749,8 @@ fn empty_dag_finishes_during_initialization() {
 
 #[test]
 fn serial_steps_follow_every_success_state_and_identifier() {
-    let initialization = initialize_definition::<String, String, String>(definition(
-        &[("a", &[], &[]), ("b", &["a"], &[])],
-        &[],
-        2,
-    ));
+    let initialization =
+        initialize_test(definition(&[("a", &[], &[]), ("b", &["a"], &[])], &[], 2));
     assert_eq!(
         initialization.events,
         [step_event(
@@ -440,7 +868,7 @@ fn serial_steps_follow_every_success_state_and_identifier() {
 
 #[test]
 fn branching_dependents_wait_for_the_producers_committed_outputs() {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[
             ("root", &[], &["artifact"]),
             ("zeta", &["root"], &[]),
@@ -552,7 +980,7 @@ fn branching_dependents_wait_for_the_producers_committed_outputs() {
 
 #[test]
 fn ready_selection_is_lexical_and_respects_parallelism() {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[
             ("zeta", &[], &[]),
             ("alpha", &[], &[]),
@@ -605,7 +1033,7 @@ fn ready_selection_is_lexical_and_respects_parallelism() {
 
 #[test]
 fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[("producer", &[], &["result"])],
         &[("publicResult", "producer", "result")],
         1,
@@ -654,15 +1082,23 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     );
 
     assert_eq!(state.last_transition_sequence, sequence(5));
+
+    let mut last_ordinal = 3;
+    let late_cancellation = reduce_ordered(
+        &state,
+        &mut last_ordinal,
+        4,
+        Occurrence::CancellationRequested {
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(4_444),
+        },
+    );
+    assert_noop(&state, &late_cancellation);
 }
 
 #[test]
 fn duplicate_and_stale_success_occurrences_are_noops() {
-    let initialization = initialize_definition::<String, String, String>(definition(
-        &[("producer", &[], &["result"])],
-        &[],
-        1,
-    ));
+    let initialization = initialize_test(definition(&[("producer", &[], &["result"])], &[], 1));
     let mut state = initialization.state;
 
     let stale_start = reduce(
@@ -765,6 +1201,388 @@ fn duplicate_and_stale_success_occurrences_are_noops() {
 }
 
 #[test]
+fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
+    let initialization = initialize_test(definition(
+        &[
+            ("aCommitted", &[], &["result"]),
+            ("bFail", &[], &["result"]),
+            ("cActive", &[], &["result"]),
+        ],
+        &[
+            ("activeExport", "cActive", "result"),
+            ("committedExport", "aCommitted", "result"),
+            ("failedExport", "bFail", "result"),
+        ],
+        3,
+    ));
+    let mut state = initialization.state;
+    let mut ordinal = 0;
+    for (next_ordinal, occurrence) in [
+        (
+            1,
+            Occurrence::StepStarted {
+                step: "aCommitted".to_owned(),
+                action: action_id(1),
+            },
+        ),
+        (
+            2,
+            Occurrence::StepExecutionCompleted {
+                step: "aCommitted".to_owned(),
+                action: action_id(1),
+                provisional: "provisional".to_owned(),
+            },
+        ),
+        (
+            3,
+            Occurrence::OutputsCaptured {
+                step: "aCommitted".to_owned(),
+                action: action_id(5),
+                outputs: output_set(&[("result", "committed")]),
+            },
+        ),
+        (
+            4,
+            Occurrence::StepStarted {
+                step: "bFail".to_owned(),
+                action: action_id(2),
+            },
+        ),
+        (
+            5,
+            Occurrence::StepStarted {
+                step: "cActive".to_owned(),
+                action: action_id(3),
+            },
+        ),
+    ] {
+        reduce_ordered_and_advance(&mut state, &mut ordinal, next_ordinal, occurrence);
+    }
+
+    let failed = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        6,
+        Occurrence::StepExecutionFailed {
+            step: "bFail".to_owned(),
+            action: action_id(2),
+            cause: "primary".to_owned(),
+        },
+    );
+    let primary_failure = failure("bFail", FailurePhase::Execution, "primary");
+    let failure_stopped = WorkflowState::Executing {
+        gate: SchedulingGate::FailureStopped {
+            primary_failure: primary_failure.clone(),
+        },
+    };
+    assert_eq!(
+        failed.events,
+        [
+            step_event(9, "bFail", StepStateKind::Running, StepStateKind::Failed,),
+            workflow_event(
+                10,
+                WorkflowState::Executing {
+                    gate: SchedulingGate::Open,
+                },
+                failure_stopped.clone(),
+            ),
+        ]
+    );
+    assert!(failed.actions.is_empty());
+
+    let reason = CancellationReason::RunnerShutdown;
+    let cancellation = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        7,
+        Occurrence::CancellationRequested {
+            reason,
+            deadline: deadline(8_888),
+        },
+    );
+    let cancelling = cancelling_workflow(reason, Some(primary_failure.clone()));
+    assert_eq!(
+        cancellation.events,
+        [
+            workflow_event(11, failure_stopped, cancelling.clone()),
+            step_event(
+                12,
+                "cActive",
+                StepStateKind::Running,
+                StepStateKind::Cancelling,
+            ),
+        ]
+    );
+    assert_eq!(
+        cancellation.actions,
+        [cancel_action(12, "cActive", reason, 8_888)]
+    );
+
+    let finished = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        8,
+        Occurrence::StepQuiesced {
+            step: "cActive".to_owned(),
+            action: action_id(12),
+        },
+    );
+    let expected_exports = BTreeMap::from([
+        (
+            "activeExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+        (
+            "committedExport".to_owned(),
+            ExportValue::Available {
+                output: "committed".to_owned(),
+            },
+        ),
+        (
+            "failedExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Failed,
+            },
+        ),
+    ]);
+    let terminal = WorkflowState::Failed {
+        primary_failure: primary_failure.clone(),
+        later_cancellation: Some(reason),
+    };
+    assert_eq!(
+        finished.events,
+        [
+            step_event(
+                13,
+                "cActive",
+                StepStateKind::Cancelling,
+                StepStateKind::Cancelled,
+            ),
+            workflow_event(14, cancelling, terminal.clone()),
+        ]
+    );
+    assert_eq!(
+        finished.actions,
+        [finish_failed_after_cancellation_action(
+            14,
+            primary_failure,
+            Some(reason),
+            expected_exports.clone(),
+        )]
+    );
+    assert_eq!(state.workflow, terminal);
+    assert_eq!(state.exports, Some(expected_exports));
+    assert_eq!(
+        state.steps["aCommitted"].state,
+        StepState::Succeeded {
+            outputs: output_set(&[("result", "committed")]),
+        }
+    );
+}
+
+#[test]
+fn cancellation_first_makes_a_later_failure_stale() {
+    let initialization = initialize_test(definition(
+        &[("aFail", &[], &[]), ("bActive", &[], &[])],
+        &[],
+        2,
+    ));
+    let mut state = initialization.state;
+    let mut ordinal = 0;
+    for (next_ordinal, step, action) in [(1, "aFail", 1), (2, "bActive", 2)] {
+        reduce_ordered_and_advance(
+            &mut state,
+            &mut ordinal,
+            next_ordinal,
+            Occurrence::StepStarted {
+                step: step.to_owned(),
+                action: action_id(action),
+            },
+        );
+    }
+
+    let reason = CancellationReason::UserRequest;
+    let cancelled = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        3,
+        Occurrence::CancellationRequested {
+            reason,
+            deadline: deadline(9_001),
+        },
+    );
+    assert_eq!(
+        cancelled.actions,
+        [
+            cancel_action(6, "aFail", reason, 9_001),
+            cancel_action(7, "bActive", reason, 9_001),
+        ]
+    );
+
+    let late_failure = reduce_ordered(
+        &state,
+        &mut ordinal,
+        4,
+        Occurrence::StepExecutionFailed {
+            step: "aFail".to_owned(),
+            action: action_id(1),
+            cause: "too late".to_owned(),
+        },
+    );
+    assert_noop(&state, &late_failure);
+
+    let first_quiesced = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        5,
+        Occurrence::StepQuiesced {
+            step: "aFail".to_owned(),
+            action: action_id(6),
+        },
+    );
+    assert!(first_quiesced.actions.is_empty());
+    assert_eq!(state.workflow, cancelling_workflow(reason, None));
+
+    let finished = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        6,
+        Occurrence::StepQuiesced {
+            step: "bActive".to_owned(),
+            action: action_id(7),
+        },
+    );
+    assert_eq!(
+        finished.events,
+        [
+            step_event(
+                9,
+                "bActive",
+                StepStateKind::Cancelling,
+                StepStateKind::Cancelled,
+            ),
+            workflow_event(
+                10,
+                cancelling_workflow(reason, None),
+                WorkflowState::Cancelled { reason },
+            ),
+        ]
+    );
+    assert_eq!(
+        finished.actions,
+        [finish_cancelled_action(10, reason, ExportSet::new())]
+    );
+    assert_eq!(state.workflow, WorkflowState::Cancelled { reason });
+}
+
+#[test]
+fn committed_success_survives_later_cancellation() {
+    let initialization = initialize_test(definition(
+        &[
+            ("aCommitted", &[], &["result"]),
+            ("bActive", &[], &["result"]),
+        ],
+        &[
+            ("activeExport", "bActive", "result"),
+            ("committedExport", "aCommitted", "result"),
+        ],
+        2,
+    ));
+    let mut state = initialization.state;
+    let mut ordinal = 0;
+    for (next_ordinal, occurrence) in [
+        (
+            1,
+            Occurrence::StepStarted {
+                step: "aCommitted".to_owned(),
+                action: action_id(1),
+            },
+        ),
+        (
+            2,
+            Occurrence::StepExecutionCompleted {
+                step: "aCommitted".to_owned(),
+                action: action_id(1),
+                provisional: "provisional".to_owned(),
+            },
+        ),
+        (
+            3,
+            Occurrence::OutputsCaptured {
+                step: "aCommitted".to_owned(),
+                action: action_id(4),
+                outputs: output_set(&[("result", "committed")]),
+            },
+        ),
+    ] {
+        reduce_ordered_and_advance(&mut state, &mut ordinal, next_ordinal, occurrence);
+    }
+
+    let reason = CancellationReason::UserRequest;
+    let cancellation = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        4,
+        Occurrence::CancellationRequested {
+            reason,
+            deadline: deadline(22_222),
+        },
+    );
+    assert_eq!(
+        cancellation.actions,
+        [cancel_action(7, "bActive", reason, 22_222)]
+    );
+    assert_eq!(
+        state.steps["aCommitted"].state,
+        StepState::Succeeded {
+            outputs: output_set(&[("result", "committed")]),
+        }
+    );
+
+    let stale_start = reduce_ordered(
+        &state,
+        &mut ordinal,
+        5,
+        Occurrence::StepStarted {
+            step: "bActive".to_owned(),
+            action: action_id(2),
+        },
+    );
+    assert_noop(&state, &stale_start);
+
+    let finished = reduce_ordered_and_advance(
+        &mut state,
+        &mut ordinal,
+        6,
+        Occurrence::StepQuiesced {
+            step: "bActive".to_owned(),
+            action: action_id(7),
+        },
+    );
+    let expected_exports = BTreeMap::from([
+        (
+            "activeExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Cancelled,
+            },
+        ),
+        (
+            "committedExport".to_owned(),
+            ExportValue::Available {
+                output: "committed".to_owned(),
+            },
+        ),
+    ]);
+    assert_eq!(
+        finished.actions,
+        [finish_cancelled_action(9, reason, expected_exports.clone())]
+    );
+    assert_eq!(state.exports, Some(expected_exports));
+}
+
+#[test]
 fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
     for phase in [
         FailurePhase::Start,
@@ -782,6 +1600,7 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
         };
         let terminal = WorkflowState::Failed {
             primary_failure: primary_failure.clone(),
+            later_cancellation: None,
         };
 
         assert_eq!(
@@ -869,7 +1688,7 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
 
 #[test]
 fn later_active_failure_does_not_replace_the_primary_failure() {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[("alpha", &[], &["result"]), ("zeta", &[], &["result"])],
         &[],
         2,
@@ -941,6 +1760,7 @@ fn later_active_failure_does_not_replace_the_primary_failure() {
     );
     let terminal = WorkflowState::Failed {
         primary_failure: primary_failure.clone(),
+        later_cancellation: None,
     };
     assert_eq!(
         later.events,
@@ -970,7 +1790,7 @@ fn later_active_failure_does_not_replace_the_primary_failure() {
 
 #[test]
 fn successful_sibling_outputs_and_export_reasons_survive_failure() {
-    let initialization = initialize_definition::<String, String, String>(definition(
+    let initialization = initialize_test(definition(
         &[
             ("aFail", &[], &["result"]),
             ("aFailChild", &["aFail"], &["result"]),
@@ -1088,6 +1908,7 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
         state.workflow,
         WorkflowState::Failed {
             primary_failure: primary_failure.clone(),
+            later_cancellation: None,
         }
     );
     assert_eq!(state.exports, Some(expected_exports.clone()));
@@ -1109,11 +1930,7 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
 
 #[test]
 fn duplicate_and_stale_failure_occurrences_are_noops() {
-    let initialization = initialize_definition::<String, String, String>(definition(
-        &[("producer", &[], &["result"])],
-        &[],
-        1,
-    ));
+    let initialization = initialize_test(definition(&[("producer", &[], &["result"])], &[], 1));
     let mut state = initialization.state;
 
     let stale_start_failure = reduce(
@@ -1238,7 +2055,7 @@ fn replaying_the_same_ordered_transcript_is_structurally_identical() {
     };
     let evaluate = || {
         let mut reductions = Vec::new();
-        let initialization = initialize_definition::<String, String, String>(definition(
+        let initialization = initialize_test(definition(
             &[
                 ("a", &[], &["artifact"]),
                 ("b", &["a"], &[]),

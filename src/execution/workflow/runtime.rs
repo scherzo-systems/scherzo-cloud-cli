@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::admission::AdmittedCommandWorkflow;
+use super::admission::{AdmittedCommandWorkflow, CancellationReason};
 use super::validated::{ValidatedCommonStep, ValidatedStep, ValidatedWorkflow};
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -51,14 +51,28 @@ pub(crate) struct StepFailure<Cause> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchedulingGate<Cause> {
     Open,
-    FailureStopped { primary_failure: StepFailure<Cause> },
+    FailureStopped {
+        primary_failure: StepFailure<Cause>,
+    },
+    Cancelling {
+        reason: CancellationReason,
+        prior_failure: Option<StepFailure<Cause>>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WorkflowState<Cause> {
-    Executing { gate: SchedulingGate<Cause> },
+    Executing {
+        gate: SchedulingGate<Cause>,
+    },
     Succeeded,
-    Failed { primary_failure: StepFailure<Cause> },
+    Failed {
+        primary_failure: StepFailure<Cause>,
+        later_cancellation: Option<CancellationReason>,
+    },
+    Cancelled {
+        reason: CancellationReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,10 +86,12 @@ pub(crate) enum StepState<Cause, Output> {
     Starting,
     Running,
     CapturingOutputs,
+    Cancelling { reason: CancellationReason },
     Succeeded { outputs: OutputSet<Output> },
     Failed { phase: FailurePhase, cause: Cause },
     Blocked { dependency: String },
     NotRun { reason: NotRunReason },
+    Cancelled { reason: CancellationReason },
 }
 
 impl<Cause, Output> StepState<Cause, Output> {
@@ -85,17 +101,19 @@ impl<Cause, Output> StepState<Cause, Output> {
             Self::Starting => StepStateKind::Starting,
             Self::Running => StepStateKind::Running,
             Self::CapturingOutputs => StepStateKind::CapturingOutputs,
+            Self::Cancelling { .. } => StepStateKind::Cancelling,
             Self::Succeeded { .. } => StepStateKind::Succeeded,
             Self::Failed { .. } => StepStateKind::Failed,
             Self::Blocked { .. } => StepStateKind::Blocked,
             Self::NotRun { .. } => StepStateKind::NotRun,
+            Self::Cancelled { .. } => StepStateKind::Cancelled,
         }
     }
 
     fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Running | Self::CapturingOutputs
+            Self::Starting | Self::Running | Self::CapturingOutputs | Self::Cancelling { .. }
         )
     }
 
@@ -106,13 +124,17 @@ impl<Cause, Output> StepState<Cause, Output> {
                 | Self::Failed { .. }
                 | Self::Blocked { .. }
                 | Self::NotRun { .. }
+                | Self::Cancelled { .. }
         )
     }
 
     fn is_terminal_without_success(&self) -> bool {
         matches!(
             self,
-            Self::Failed { .. } | Self::Blocked { .. } | Self::NotRun { .. }
+            Self::Failed { .. }
+                | Self::Blocked { .. }
+                | Self::NotRun { .. }
+                | Self::Cancelled { .. }
         )
     }
 }
@@ -123,10 +145,12 @@ pub(crate) enum StepStateKind {
     Starting,
     Running,
     CapturingOutputs,
+    Cancelling,
     Succeeded,
     Failed,
     Blocked,
     NotRun,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,6 +234,7 @@ pub(crate) enum ExportUnavailableReason {
     Failed,
     Blocked,
     NotRun,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,7 +253,13 @@ pub(crate) struct RuntimeState<Cause, Output> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Occurrence<Provisional, Cause, Output> {
+pub(crate) struct CancellationRequest<Deadline> {
+    pub(crate) reason: CancellationReason,
+    pub(crate) deadline: Deadline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
     StepStarted {
         step: String,
         action: ActionId,
@@ -258,22 +289,41 @@ pub(crate) enum Occurrence<Provisional, Cause, Output> {
         action: ActionId,
         cause: Cause,
     },
+    CancellationRequested {
+        reason: CancellationReason,
+        deadline: Deadline,
+    },
+    StepQuiesced {
+        step: String,
+        action: ActionId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RunOutcome<Cause> {
     Succeeded,
-    Failed { primary_failure: StepFailure<Cause> },
+    Failed {
+        primary_failure: StepFailure<Cause>,
+        later_cancellation: Option<CancellationReason>,
+    },
+    Cancelled {
+        reason: CancellationReason,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Action<Provisional, Cause, Output> {
+pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
     StartStep {
         step: String,
     },
     CaptureOutputs {
         step: String,
         provisional: Provisional,
+    },
+    CancelStep {
+        step: String,
+        reason: CancellationReason,
+        deadline: Deadline,
     },
     FinishRun {
         outcome: RunOutcome<Cause>,
@@ -282,9 +332,9 @@ pub(crate) enum Action<Provisional, Cause, Output> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RequestedAction<Provisional, Cause, Output> {
+pub(crate) struct RequestedAction<Provisional, Cause, Output, Deadline> {
     pub(crate) id: ActionId,
-    pub(crate) action: Action<Provisional, Cause, Output>,
+    pub(crate) action: Action<Provisional, Cause, Output, Deadline>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,29 +353,44 @@ pub(crate) enum TransitionEvent<Cause> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Reduction<Provisional, Cause, Output> {
+pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) state: RuntimeState<Cause, Output>,
     pub(crate) events: Vec<TransitionEvent<Cause>>,
-    pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output>>,
+    pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output, Deadline>>,
 }
 
-pub(crate) fn initialize<Provisional, Cause, Output>(
+pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
     admitted: &AdmittedCommandWorkflow,
-) -> Reduction<Provisional, Cause, Output>
+    initial_cancellation: Option<CancellationRequest<Deadline>>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
     Output: Clone,
+    Deadline: Clone,
 {
-    initialize_definition(RuntimeDefinition::from_admitted(admitted))
+    initialize_definition(ExecutionStart {
+        definition: RuntimeDefinition::from_admitted(admitted),
+        initial_cancellation,
+    })
 }
 
-fn initialize_definition<Provisional, Cause, Output>(
+struct ExecutionStart<Deadline> {
     definition: RuntimeDefinition,
-) -> Reduction<Provisional, Cause, Output>
+    initial_cancellation: Option<CancellationRequest<Deadline>>,
+}
+
+fn initialize_definition<Provisional, Cause, Output, Deadline>(
+    start: ExecutionStart<Deadline>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
     Output: Clone,
+    Deadline: Clone,
 {
+    let ExecutionStart {
+        definition,
+        initial_cancellation,
+    } = start;
     let steps = definition
         .steps
         .keys()
@@ -352,17 +417,21 @@ where
         events: Vec::new(),
         actions: Vec::new(),
     };
+    if let Some(cancellation) = initial_cancellation {
+        apply_cancellation(&mut reduction, cancellation);
+    }
     stabilize(&mut reduction);
     reduction
 }
 
-pub(crate) fn reduce<Provisional, Cause, Output>(
+pub(crate) fn reduce<Provisional, Cause, Output, Deadline>(
     current: &RuntimeState<Cause, Output>,
-    occurrence: Occurrence<Provisional, Cause, Output>,
-) -> Reduction<Provisional, Cause, Output>
+    occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
     Output: Clone,
+    Deadline: Clone,
 {
     let mut reduction = Reduction {
         state: current.clone(),
@@ -379,13 +448,14 @@ where
     reduction
 }
 
-fn apply_occurrence<Provisional, Cause, Output>(
-    reduction: &mut Reduction<Provisional, Cause, Output>,
-    occurrence: Occurrence<Provisional, Cause, Output>,
+fn apply_occurrence<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
 ) -> bool
 where
     Cause: Clone,
     Output: Clone,
+    Deadline: Clone,
 {
     match occurrence {
         Occurrence::StepStarted { step, action } => {
@@ -498,12 +568,126 @@ where
                 cause,
             );
         }
+        Occurrence::CancellationRequested { reason, deadline } => {
+            return apply_cancellation(reduction, CancellationRequest { reason, deadline });
+        }
+        Occurrence::StepQuiesced { step, action } => {
+            let Some(reason) = cancelling_step_reason(&reduction.state, &step, action) else {
+                return false;
+            };
+            transition_step(
+                &mut reduction.state,
+                &mut reduction.events,
+                &step,
+                StepState::Cancelled { reason },
+                None,
+            );
+        }
     }
     true
 }
 
-fn apply_step_failure<Provisional, Cause, Output>(
-    reduction: &mut Reduction<Provisional, Cause, Output>,
+fn apply_cancellation<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    cancellation: CancellationRequest<Deadline>,
+) -> bool
+where
+    Cause: Clone,
+    Deadline: Clone,
+{
+    let prior_failure = match &reduction.state.workflow {
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        } => None,
+        WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped { primary_failure },
+        } => Some(primary_failure.clone()),
+        WorkflowState::Executing {
+            gate: SchedulingGate::Cancelling { .. },
+        }
+        | WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => return false,
+    };
+
+    let from = reduction.state.workflow.clone();
+    let to = WorkflowState::Executing {
+        gate: SchedulingGate::Cancelling {
+            reason: cancellation.reason,
+            prior_failure,
+        },
+    };
+    let sequence = next_sequence(&mut reduction.state);
+    reduction.state.workflow = to.clone();
+    reduction
+        .events
+        .push(TransitionEvent::Workflow { sequence, from, to });
+
+    let steps = reduction
+        .state
+        .steps
+        .iter()
+        .map(|(step, runtime)| (step.clone(), runtime.state.kind()))
+        .collect::<Vec<_>>();
+    for (step, state) in steps {
+        match state {
+            StepStateKind::Pending => {
+                transition_step(
+                    &mut reduction.state,
+                    &mut reduction.events,
+                    &step,
+                    StepState::Cancelled {
+                        reason: cancellation.reason,
+                    },
+                    None,
+                );
+            }
+            StepStateKind::Starting | StepStateKind::Running | StepStateKind::CapturingOutputs => {
+                let sequence = transition_step(
+                    &mut reduction.state,
+                    &mut reduction.events,
+                    &step,
+                    StepState::Cancelling {
+                        reason: cancellation.reason,
+                    },
+                    None,
+                );
+                let action = ActionId::for_transition(sequence);
+                set_current_action(&mut reduction.state, &step, action);
+                reduction.actions.push(RequestedAction {
+                    id: action,
+                    action: Action::CancelStep {
+                        step,
+                        reason: cancellation.reason,
+                        deadline: cancellation.deadline.clone(),
+                    },
+                });
+            }
+            StepStateKind::Cancelling
+            | StepStateKind::Succeeded
+            | StepStateKind::Failed
+            | StepStateKind::Blocked
+            | StepStateKind::NotRun
+            | StepStateKind::Cancelled => {}
+        }
+    }
+    true
+}
+
+fn cancelling_step_reason<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
+    step: &str,
+    action: ActionId,
+) -> Option<CancellationReason> {
+    let runtime = state.steps.get(step)?;
+    match &runtime.state {
+        StepState::Cancelling { reason } if runtime.current_action == Some(action) => Some(*reason),
+        _ => None,
+    }
+}
+
+fn apply_step_failure<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: String,
     action: ActionId,
     expected_state: StepStateKind,
@@ -558,8 +742,9 @@ fn close_gate_for_failure<Cause, Output>(
     events.push(TransitionEvent::Workflow { sequence, from, to });
 }
 
-fn stabilize<Provisional, Cause, Output>(reduction: &mut Reduction<Provisional, Cause, Output>)
-where
+fn stabilize<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+) where
     Cause: Clone,
     Output: Clone,
 {
@@ -574,8 +759,8 @@ enum PendingDisposition {
     NotRun,
 }
 
-fn propagate_failure_stop<Provisional, Cause, Output>(
-    reduction: &mut Reduction<Provisional, Cause, Output>,
+fn propagate_failure_stop<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) {
     if !matches!(
         &reduction.state.workflow,
@@ -648,8 +833,8 @@ fn next_pending_disposition<Cause, Output>(
         })
 }
 
-fn select_ready_steps<Provisional, Cause, Output>(
-    reduction: &mut Reduction<Provisional, Cause, Output>,
+fn select_ready_steps<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) {
     if !matches!(
         &reduction.state.workflow,
@@ -716,8 +901,8 @@ fn step_is_ready<Cause, Output>(
         })
 }
 
-fn finish_if_terminal<Provisional, Cause, Output>(
-    reduction: &mut Reduction<Provisional, Cause, Output>,
+fn finish_if_terminal<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) where
     Cause: Clone,
     Output: Clone,
@@ -744,12 +929,42 @@ fn finish_if_terminal<Provisional, Cause, Output>(
         } => (
             WorkflowState::Failed {
                 primary_failure: primary_failure.clone(),
+                later_cancellation: None,
             },
             RunOutcome::Failed {
                 primary_failure: primary_failure.clone(),
+                later_cancellation: None,
             },
         ),
-        WorkflowState::Succeeded | WorkflowState::Failed { .. } => return,
+        WorkflowState::Executing {
+            gate:
+                SchedulingGate::Cancelling {
+                    reason,
+                    prior_failure: Some(primary_failure),
+                },
+        } => (
+            WorkflowState::Failed {
+                primary_failure: primary_failure.clone(),
+                later_cancellation: Some(*reason),
+            },
+            RunOutcome::Failed {
+                primary_failure: primary_failure.clone(),
+                later_cancellation: Some(*reason),
+            },
+        ),
+        WorkflowState::Executing {
+            gate:
+                SchedulingGate::Cancelling {
+                    reason,
+                    prior_failure: None,
+                },
+        } => (
+            WorkflowState::Cancelled { reason: *reason },
+            RunOutcome::Cancelled { reason: *reason },
+        ),
+        WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => return,
     };
     let from = reduction.state.workflow.clone();
     let sequence = next_sequence(&mut reduction.state);
@@ -787,10 +1002,14 @@ where
                 StepState::NotRun { .. } => ExportValue::Unavailable {
                     reason: ExportUnavailableReason::NotRun,
                 },
+                StepState::Cancelled { .. } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::Cancelled,
+                },
                 StepState::Pending
                 | StepState::Starting
                 | StepState::Running
-                | StepState::CapturingOutputs => return None,
+                | StepState::CapturingOutputs
+                | StepState::Cancelling { .. } => return None,
             };
             Some((name.clone(), value))
         })
