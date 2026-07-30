@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use super::document::{Harness, Output};
+use super::document::Output;
+use super::pi::PiConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkflowValueType {
@@ -84,9 +85,15 @@ pub(crate) struct ValidatedOutput {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedAgent {
+    pub(crate) profile: String,
     pub(crate) system_prompt: String,
     pub(crate) message: ValidatedAgentMessage,
-    pub(crate) harness: Harness,
+    pub(crate) harness: ValidatedHarness,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ValidatedHarness {
+    Pi(PiConfig),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

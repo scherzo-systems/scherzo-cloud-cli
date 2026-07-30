@@ -8,13 +8,23 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::*;
-use crate::execution::workflow::validated::{ValidatedMessageSource, ValidatedStep};
+use crate::execution::workflow::pi::{PiConfig, Thinking};
+use crate::execution::workflow::validated::{
+    ValidatedHarness, ValidatedMessageSource, ValidatedStep,
+};
 
 const WORKFLOW_PATH: &str = "workflows/complete.yaml";
 const RESULT_SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false}
 "#;
 const WORKFLOW: &str = r#"schemaVersion: 1
 description: Complete resolution fixture.
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
 steps:
   agent:
     kind: agent
@@ -23,6 +33,7 @@ steps:
       prompt:
         ref: imports.prompt
     agent:
+      profile: coding
       systemPrompt: ../prompts/system.md
       message:
         text:
@@ -31,11 +42,6 @@ steps:
           - file: ../prompts/message.md
         attachments:
           - file: ../attachments/data.bin
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: xhigh
     outputs:
       result:
         kind: agent_result
@@ -127,6 +133,14 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
     let ValidatedStep::Agent(agent) = &resolved.definition.steps["agent"] else {
         panic!("agent fixture step must remain an agent step");
     };
+    assert_eq!(agent.agent.profile, "coding");
+    assert_eq!(
+        agent.agent.harness,
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::XHigh,
+        })
+    );
     assert_eq!(agent.agent.system_prompt, "prompts/system.md");
     assert_eq!(
         agent.agent.message.text[0],
@@ -220,6 +234,42 @@ fn digest_has_a_normative_known_answer_and_is_sensitive_to_paths() {
     let content = closure.remove("a/\u{e9}.bin").unwrap();
     closure.insert("a/renamed.bin".to_owned(), content);
     assert_ne!(digest_source_closure(&closure).unwrap(), digest);
+}
+
+#[test]
+fn profile_declarations_and_references_are_pinned_by_resolution() {
+    let renamed = FixtureBundle::new();
+    fs::write(
+        renamed.workflow_path(),
+        WORKFLOW
+            .replace("  coding:\n", "  renamed:\n")
+            .replace("profile: coding", "profile: renamed"),
+    )
+    .unwrap();
+    let renamed = renamed.resolve().unwrap();
+
+    let changed_config = FixtureBundle::new();
+    fs::write(
+        changed_config.workflow_path(),
+        WORKFLOW.replace("model: openai/gpt-5", "model: openai/gpt-4.1"),
+    )
+    .unwrap();
+    let changed_config = changed_config.resolve().unwrap();
+
+    let original = FixtureBundle::new().resolve().unwrap();
+    assert_ne!(renamed.content_digest, original.content_digest);
+    assert_ne!(changed_config.content_digest, original.content_digest);
+
+    let ValidatedStep::Agent(agent) = &changed_config.definition.steps["agent"] else {
+        panic!("agent fixture step must remain an agent step");
+    };
+    assert_eq!(
+        agent.agent.harness,
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-4.1".to_owned(),
+            thinking: Thinking::XHigh,
+        })
+    );
 }
 
 #[test]

@@ -43,6 +43,13 @@ impl WorkflowBundle {
         let workflow = format!(
             r#"schemaVersion: 1
 description: {WORKFLOW_SENTINEL}
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   prepare:
     kind: cmd
@@ -55,6 +62,7 @@ steps:
       prompt:
         ref: imports.prompt
     agent:
+      profile: coding
       systemPrompt: ../prompts/system.md
       message:
         text:
@@ -62,11 +70,6 @@ steps:
           - ref: inputs.prompt
         attachments:
           - file: ../attachments/data.txt
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       result:
         kind: agent_result

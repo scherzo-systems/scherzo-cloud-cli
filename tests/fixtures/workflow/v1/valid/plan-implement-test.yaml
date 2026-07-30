@@ -1,6 +1,14 @@
 schemaVersion: 1
 description: Plan, implement, test, and export a requested change.
 
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+
 steps:
   prepare:
     kind: cmd
@@ -16,17 +24,13 @@ steps:
       attachments:
         ref: imports.attachments
     agent:
+      profile: coding
       systemPrompt: prompts/plan-system.md
       message:
         text:
           - ref: inputs.prompt
         attachments:
           - ref: inputs.attachments
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       plan:
         kind: agent_result
@@ -41,6 +45,7 @@ steps:
       plan:
         ref: outputs.plan.plan
     agent:
+      profile: coding
       systemPrompt: prompts/implement-system.md
       message:
         text:
@@ -48,11 +53,6 @@ steps:
           - ref: inputs.prompt
         attachments:
           - ref: inputs.plan
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       response:
         kind: agent_response

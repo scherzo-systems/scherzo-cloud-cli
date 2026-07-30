@@ -6,7 +6,7 @@ use super::admission::AdmittedCommandWorkflow;
 use super::validated::{ValidatedCommonStep, ValidatedStep, ValidatedWorkflow};
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
-pub(crate) type ExportSet<Output> = BTreeMap<String, Output>;
+pub(crate) type ExportSet<Output> = BTreeMap<String, ExportValue<Output>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TransitionSequence(u64);
@@ -35,26 +35,50 @@ impl ActionId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchedulingGate {
-    Open,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkflowState {
-    Executing { gate: SchedulingGate },
-    Succeeded,
+pub(crate) enum FailurePhase {
+    Start,
+    Execution,
+    OutputCapture,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StepState<Output> {
+pub(crate) struct StepFailure<Cause> {
+    pub(crate) step: String,
+    pub(crate) phase: FailurePhase,
+    pub(crate) cause: Cause,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulingGate<Cause> {
+    Open,
+    FailureStopped { primary_failure: StepFailure<Cause> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowState<Cause> {
+    Executing { gate: SchedulingGate<Cause> },
+    Succeeded,
+    Failed { primary_failure: StepFailure<Cause> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotRunReason {
+    FailureStop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StepState<Cause, Output> {
     Pending,
     Starting,
     Running,
     CapturingOutputs,
     Succeeded { outputs: OutputSet<Output> },
+    Failed { phase: FailurePhase, cause: Cause },
+    Blocked { dependency: String },
+    NotRun { reason: NotRunReason },
 }
 
-impl<Output> StepState<Output> {
+impl<Cause, Output> StepState<Cause, Output> {
     fn kind(&self) -> StepStateKind {
         match self {
             Self::Pending => StepStateKind::Pending,
@@ -62,6 +86,9 @@ impl<Output> StepState<Output> {
             Self::Running => StepStateKind::Running,
             Self::CapturingOutputs => StepStateKind::CapturingOutputs,
             Self::Succeeded { .. } => StepStateKind::Succeeded,
+            Self::Failed { .. } => StepStateKind::Failed,
+            Self::Blocked { .. } => StepStateKind::Blocked,
+            Self::NotRun { .. } => StepStateKind::NotRun,
         }
     }
 
@@ -69,6 +96,23 @@ impl<Output> StepState<Output> {
         matches!(
             self,
             Self::Starting | Self::Running | Self::CapturingOutputs
+        )
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded { .. }
+                | Self::Failed { .. }
+                | Self::Blocked { .. }
+                | Self::NotRun { .. }
+        )
+    }
+
+    fn is_terminal_without_success(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed { .. } | Self::Blocked { .. } | Self::NotRun { .. }
         )
     }
 }
@@ -80,11 +124,14 @@ pub(crate) enum StepStateKind {
     Running,
     CapturingOutputs,
     Succeeded,
+    Failed,
+    Blocked,
+    NotRun,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StepRuntimeState<Output> {
-    pub(crate) state: StepState<Output>,
+pub(crate) struct StepRuntimeState<Cause, Output> {
+    pub(crate) state: StepState<Cause, Output>,
     pub(crate) current_action: Option<ActionId>,
 }
 
@@ -158,40 +205,69 @@ fn common_step(step: &ValidatedStep) -> &ValidatedCommonStep {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportUnavailableReason {
+    Failed,
+    Blocked,
+    NotRun,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeState<Output> {
+pub(crate) enum ExportValue<Output> {
+    Available { output: Output },
+    Unavailable { reason: ExportUnavailableReason },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeState<Cause, Output> {
     definition: Arc<RuntimeDefinition>,
-    pub(crate) workflow: WorkflowState,
-    pub(crate) steps: BTreeMap<String, StepRuntimeState<Output>>,
+    pub(crate) workflow: WorkflowState<Cause>,
+    pub(crate) steps: BTreeMap<String, StepRuntimeState<Cause, Output>>,
     pub(crate) exports: Option<ExportSet<Output>>,
     pub(crate) last_transition_sequence: TransitionSequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Occurrence<Provisional, Output> {
+pub(crate) enum Occurrence<Provisional, Cause, Output> {
     StepStarted {
         step: String,
         action: ActionId,
+    },
+    StepStartFailed {
+        step: String,
+        action: ActionId,
+        cause: Cause,
     },
     StepExecutionCompleted {
         step: String,
         action: ActionId,
         provisional: Provisional,
     },
+    StepExecutionFailed {
+        step: String,
+        action: ActionId,
+        cause: Cause,
+    },
     OutputsCaptured {
         step: String,
         action: ActionId,
         outputs: OutputSet<Output>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunOutcome {
-    Succeeded,
+    OutputCaptureFailed {
+        step: String,
+        action: ActionId,
+        cause: Cause,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Action<Provisional, Output> {
+pub(crate) enum RunOutcome<Cause> {
+    Succeeded,
+    Failed { primary_failure: StepFailure<Cause> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Action<Provisional, Cause, Output> {
     StartStep {
         step: String,
     },
@@ -200,19 +276,19 @@ pub(crate) enum Action<Provisional, Output> {
         provisional: Provisional,
     },
     FinishRun {
-        outcome: RunOutcome,
+        outcome: RunOutcome<Cause>,
         exports: ExportSet<Output>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RequestedAction<Provisional, Output> {
+pub(crate) struct RequestedAction<Provisional, Cause, Output> {
     pub(crate) id: ActionId,
-    pub(crate) action: Action<Provisional, Output>,
+    pub(crate) action: Action<Provisional, Cause, Output>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TransitionEvent {
+pub(crate) enum TransitionEvent<Cause> {
     Step {
         sequence: TransitionSequence,
         step: String,
@@ -221,31 +297,33 @@ pub(crate) enum TransitionEvent {
     },
     Workflow {
         sequence: TransitionSequence,
-        from: WorkflowState,
-        to: WorkflowState,
+        from: WorkflowState<Cause>,
+        to: WorkflowState<Cause>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Reduction<Provisional, Output> {
-    pub(crate) state: RuntimeState<Output>,
-    pub(crate) events: Vec<TransitionEvent>,
-    pub(crate) actions: Vec<RequestedAction<Provisional, Output>>,
+pub(crate) struct Reduction<Provisional, Cause, Output> {
+    pub(crate) state: RuntimeState<Cause, Output>,
+    pub(crate) events: Vec<TransitionEvent<Cause>>,
+    pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output>>,
 }
 
-pub(crate) fn initialize<Provisional, Output>(
+pub(crate) fn initialize<Provisional, Cause, Output>(
     admitted: &AdmittedCommandWorkflow,
-) -> Reduction<Provisional, Output>
+) -> Reduction<Provisional, Cause, Output>
 where
+    Cause: Clone,
     Output: Clone,
 {
     initialize_definition(RuntimeDefinition::from_admitted(admitted))
 }
 
-fn initialize_definition<Provisional, Output>(
+fn initialize_definition<Provisional, Cause, Output>(
     definition: RuntimeDefinition,
-) -> Reduction<Provisional, Output>
+) -> Reduction<Provisional, Cause, Output>
 where
+    Cause: Clone,
     Output: Clone,
 {
     let steps = definition
@@ -278,11 +356,12 @@ where
     reduction
 }
 
-pub(crate) fn reduce<Provisional, Output>(
-    current: &RuntimeState<Output>,
-    occurrence: Occurrence<Provisional, Output>,
-) -> Reduction<Provisional, Output>
+pub(crate) fn reduce<Provisional, Cause, Output>(
+    current: &RuntimeState<Cause, Output>,
+    occurrence: Occurrence<Provisional, Cause, Output>,
+) -> Reduction<Provisional, Cause, Output>
 where
+    Cause: Clone,
     Output: Clone,
 {
     let mut reduction = Reduction {
@@ -290,7 +369,7 @@ where
         events: Vec::new(),
         actions: Vec::new(),
     };
-    if !matches!(reduction.state.workflow, WorkflowState::Executing { .. })
+    if !matches!(&reduction.state.workflow, WorkflowState::Executing { .. })
         || !apply_occurrence(&mut reduction, occurrence)
     {
         return reduction;
@@ -300,11 +379,12 @@ where
     reduction
 }
 
-fn apply_occurrence<Provisional, Output>(
-    reduction: &mut Reduction<Provisional, Output>,
-    occurrence: Occurrence<Provisional, Output>,
+fn apply_occurrence<Provisional, Cause, Output>(
+    reduction: &mut Reduction<Provisional, Cause, Output>,
+    occurrence: Occurrence<Provisional, Cause, Output>,
 ) -> bool
 where
+    Cause: Clone,
     Output: Clone,
 {
     match occurrence {
@@ -318,6 +398,20 @@ where
                 &step,
                 StepState::Running,
                 Some(action),
+            );
+        }
+        Occurrence::StepStartFailed {
+            step,
+            action,
+            cause,
+        } => {
+            return apply_step_failure(
+                reduction,
+                step,
+                action,
+                StepStateKind::Starting,
+                FailurePhase::Start,
+                cause,
             );
         }
         Occurrence::StepExecutionCompleted {
@@ -354,6 +448,20 @@ where
                 );
             }
         }
+        Occurrence::StepExecutionFailed {
+            step,
+            action,
+            cause,
+        } => {
+            return apply_step_failure(
+                reduction,
+                step,
+                action,
+                StepStateKind::Running,
+                FailurePhase::Execution,
+                cause,
+            );
+        }
         Occurrence::OutputsCaptured {
             step,
             action,
@@ -376,21 +484,175 @@ where
                 None,
             );
         }
+        Occurrence::OutputCaptureFailed {
+            step,
+            action,
+            cause,
+        } => {
+            return apply_step_failure(
+                reduction,
+                step,
+                action,
+                StepStateKind::CapturingOutputs,
+                FailurePhase::OutputCapture,
+                cause,
+            );
+        }
     }
     true
 }
 
-fn stabilize<Provisional, Output>(reduction: &mut Reduction<Provisional, Output>)
+fn apply_step_failure<Provisional, Cause, Output>(
+    reduction: &mut Reduction<Provisional, Cause, Output>,
+    step: String,
+    action: ActionId,
+    expected_state: StepStateKind,
+    phase: FailurePhase,
+    cause: Cause,
+) -> bool
 where
+    Cause: Clone,
+{
+    if !step_accepts(&reduction.state, &step, expected_state, action) {
+        return false;
+    }
+
+    let primary_failure = StepFailure {
+        step: step.clone(),
+        phase,
+        cause: cause.clone(),
+    };
+    transition_step(
+        &mut reduction.state,
+        &mut reduction.events,
+        &step,
+        StepState::Failed { phase, cause },
+        None,
+    );
+    close_gate_for_failure(&mut reduction.state, &mut reduction.events, primary_failure);
+    true
+}
+
+fn close_gate_for_failure<Cause, Output>(
+    state: &mut RuntimeState<Cause, Output>,
+    events: &mut Vec<TransitionEvent<Cause>>,
+    primary_failure: StepFailure<Cause>,
+) where
+    Cause: Clone,
+{
+    if !matches!(
+        &state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ) {
+        return;
+    }
+
+    let from = state.workflow.clone();
+    let to = WorkflowState::Executing {
+        gate: SchedulingGate::FailureStopped { primary_failure },
+    };
+    let sequence = next_sequence(state);
+    state.workflow = to.clone();
+    events.push(TransitionEvent::Workflow { sequence, from, to });
+}
+
+fn stabilize<Provisional, Cause, Output>(reduction: &mut Reduction<Provisional, Cause, Output>)
+where
+    Cause: Clone,
     Output: Clone,
 {
+    propagate_failure_stop(reduction);
     select_ready_steps(reduction);
     finish_if_terminal(reduction);
 }
 
-fn select_ready_steps<Provisional, Output>(reduction: &mut Reduction<Provisional, Output>) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingDisposition {
+    Blocked { dependency: String },
+    NotRun,
+}
+
+fn propagate_failure_stop<Provisional, Cause, Output>(
+    reduction: &mut Reduction<Provisional, Cause, Output>,
+) {
     if !matches!(
-        reduction.state.workflow,
+        &reduction.state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped { .. }
+        }
+    ) {
+        return;
+    }
+
+    while let Some((step, disposition)) = next_pending_disposition(&reduction.state) {
+        let state = match disposition {
+            PendingDisposition::Blocked { dependency } => StepState::Blocked { dependency },
+            PendingDisposition::NotRun => StepState::NotRun {
+                reason: NotRunReason::FailureStop,
+            },
+        };
+        transition_step(
+            &mut reduction.state,
+            &mut reduction.events,
+            &step,
+            state,
+            None,
+        );
+    }
+}
+
+fn next_pending_disposition<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
+) -> Option<(String, PendingDisposition)> {
+    state
+        .definition
+        .steps
+        .iter()
+        .find_map(|(step_id, definition)| {
+            let runtime = state.steps.get(step_id)?;
+            if !matches!(runtime.state, StepState::Pending) {
+                return None;
+            }
+
+            if let Some(dependency) = definition
+                .dependencies
+                .iter()
+                .filter(|dependency| {
+                    state
+                        .steps
+                        .get(*dependency)
+                        .is_some_and(|step| step.state.is_terminal_without_success())
+                })
+                .min()
+            {
+                return Some((
+                    step_id.clone(),
+                    PendingDisposition::Blocked {
+                        dependency: dependency.clone(),
+                    },
+                ));
+            }
+
+            definition
+                .dependencies
+                .iter()
+                .all(|dependency| {
+                    state
+                        .steps
+                        .get(dependency)
+                        .is_some_and(|step| matches!(step.state, StepState::Succeeded { .. }))
+                })
+                .then(|| (step_id.clone(), PendingDisposition::NotRun))
+        })
+}
+
+fn select_ready_steps<Provisional, Cause, Output>(
+    reduction: &mut Reduction<Provisional, Cause, Output>,
+) {
+    if !matches!(
+        &reduction.state.workflow,
         WorkflowState::Executing {
             gate: SchedulingGate::Open
         }
@@ -437,8 +699,8 @@ fn select_ready_steps<Provisional, Output>(reduction: &mut Reduction<Provisional
     }
 }
 
-fn step_is_ready<Output>(
-    state: &RuntimeState<Output>,
+fn step_is_ready<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
     step_id: &str,
     definition: &RuntimeStep,
 ) -> bool {
@@ -454,16 +716,18 @@ fn step_is_ready<Output>(
         })
 }
 
-fn finish_if_terminal<Provisional, Output>(reduction: &mut Reduction<Provisional, Output>)
-where
+fn finish_if_terminal<Provisional, Cause, Output>(
+    reduction: &mut Reduction<Provisional, Cause, Output>,
+) where
+    Cause: Clone,
     Output: Clone,
 {
-    if !matches!(reduction.state.workflow, WorkflowState::Executing { .. })
+    if !matches!(&reduction.state.workflow, WorkflowState::Executing { .. })
         || !reduction
             .state
             .steps
             .values()
-            .all(|step| matches!(step.state, StepState::Succeeded { .. }))
+            .all(|step| step.state.is_terminal())
     {
         return;
     }
@@ -471,24 +735,36 @@ where
     let Some(exports) = derive_exports(&reduction.state) else {
         return;
     };
-    let from = reduction.state.workflow;
-    let to = WorkflowState::Succeeded;
+    let (to, outcome) = match &reduction.state.workflow {
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        } => (WorkflowState::Succeeded, RunOutcome::Succeeded),
+        WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped { primary_failure },
+        } => (
+            WorkflowState::Failed {
+                primary_failure: primary_failure.clone(),
+            },
+            RunOutcome::Failed {
+                primary_failure: primary_failure.clone(),
+            },
+        ),
+        WorkflowState::Succeeded | WorkflowState::Failed { .. } => return,
+    };
+    let from = reduction.state.workflow.clone();
     let sequence = next_sequence(&mut reduction.state);
-    reduction.state.workflow = to;
+    reduction.state.workflow = to.clone();
     reduction.state.exports = Some(exports.clone());
     reduction
         .events
         .push(TransitionEvent::Workflow { sequence, from, to });
     reduction.actions.push(RequestedAction {
         id: ActionId::for_transition(sequence),
-        action: Action::FinishRun {
-            outcome: RunOutcome::Succeeded,
-            exports,
-        },
+        action: Action::FinishRun { outcome, exports },
     });
 }
 
-fn derive_exports<Output>(state: &RuntimeState<Output>) -> Option<ExportSet<Output>>
+fn derive_exports<Cause, Output>(state: &RuntimeState<Cause, Output>) -> Option<ExportSet<Output>>
 where
     Output: Clone,
 {
@@ -498,16 +774,31 @@ where
         .iter()
         .map(|(name, source)| {
             let step = state.steps.get(&source.step)?;
-            let StepState::Succeeded { outputs } = &step.state else {
-                return None;
+            let value = match &step.state {
+                StepState::Succeeded { outputs } => ExportValue::Available {
+                    output: outputs.get(&source.output)?.clone(),
+                },
+                StepState::Failed { .. } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::Failed,
+                },
+                StepState::Blocked { .. } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::Blocked,
+                },
+                StepState::NotRun { .. } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::NotRun,
+                },
+                StepState::Pending
+                | StepState::Starting
+                | StepState::Running
+                | StepState::CapturingOutputs => return None,
             };
-            Some((name.clone(), outputs.get(&source.output)?.clone()))
+            Some((name.clone(), value))
         })
         .collect()
 }
 
-fn step_accepts<Output>(
-    state: &RuntimeState<Output>,
+fn step_accepts<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
     step: &str,
     expected_state: StepStateKind,
     action: ActionId,
@@ -517,7 +808,7 @@ fn step_accepts<Output>(
     })
 }
 
-fn step_declares_outputs<Output>(state: &RuntimeState<Output>, step: &str) -> bool {
+fn step_declares_outputs<Cause, Output>(state: &RuntimeState<Cause, Output>, step: &str) -> bool {
     state
         .definition
         .steps
@@ -525,8 +816,8 @@ fn step_declares_outputs<Output>(state: &RuntimeState<Output>, step: &str) -> bo
         .is_some_and(|definition| !definition.declared_outputs.is_empty())
 }
 
-fn outputs_match_declaration<Output>(
-    state: &RuntimeState<Output>,
+fn outputs_match_declaration<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
     step: &str,
     outputs: &OutputSet<Output>,
 ) -> bool {
@@ -537,17 +828,21 @@ fn outputs_match_declaration<Output>(
         .is_some_and(|definition| outputs.keys().eq(definition.declared_outputs.iter()))
 }
 
-fn set_current_action<Output>(state: &mut RuntimeState<Output>, step: &str, action: ActionId) {
+fn set_current_action<Cause, Output>(
+    state: &mut RuntimeState<Cause, Output>,
+    step: &str,
+    action: ActionId,
+) {
     if let Some(runtime) = state.steps.get_mut(step) {
         runtime.current_action = Some(action);
     }
 }
 
-fn transition_step<Output>(
-    state: &mut RuntimeState<Output>,
-    events: &mut Vec<TransitionEvent>,
+fn transition_step<Cause, Output>(
+    state: &mut RuntimeState<Cause, Output>,
+    events: &mut Vec<TransitionEvent<Cause>>,
     step: &str,
-    to: StepState<Output>,
+    to: StepState<Cause, Output>,
     current_action: Option<ActionId>,
 ) -> TransitionSequence {
     let sequence = next_sequence(state);
@@ -566,7 +861,7 @@ fn transition_step<Output>(
     sequence
 }
 
-fn next_sequence<Output>(state: &mut RuntimeState<Output>) -> TransitionSequence {
+fn next_sequence<Cause, Output>(state: &mut RuntimeState<Cause, Output>) -> TransitionSequence {
     let sequence = state.last_transition_sequence.next();
     state.last_transition_sequence = sequence;
     sequence

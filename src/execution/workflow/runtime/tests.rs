@@ -58,7 +58,12 @@ fn definition(
     }
 }
 
-fn step_event(value: u64, step: &str, from: StepStateKind, to: StepStateKind) -> TransitionEvent {
+fn step_event(
+    value: u64,
+    step: &str,
+    from: StepStateKind,
+    to: StepStateKind,
+) -> TransitionEvent<String> {
     TransitionEvent::Step {
         sequence: sequence(value),
         step: step.to_owned(),
@@ -67,17 +72,37 @@ fn step_event(value: u64, step: &str, from: StepStateKind, to: StepStateKind) ->
     }
 }
 
-fn workflow_succeeded_event(value: u64) -> TransitionEvent {
+fn workflow_event(
+    value: u64,
+    from: WorkflowState<String>,
+    to: WorkflowState<String>,
+) -> TransitionEvent<String> {
     TransitionEvent::Workflow {
         sequence: sequence(value),
-        from: WorkflowState::Executing {
-            gate: SchedulingGate::Open,
-        },
-        to: WorkflowState::Succeeded,
+        from,
+        to,
     }
 }
 
-fn start_action(value: u64, step: &str) -> RequestedAction<String, String> {
+fn workflow_succeeded_event(value: u64) -> TransitionEvent<String> {
+    workflow_event(
+        value,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        },
+        WorkflowState::Succeeded,
+    )
+}
+
+fn failure(step: &str, phase: FailurePhase, cause: &str) -> StepFailure<String> {
+    StepFailure {
+        step: step.to_owned(),
+        phase,
+        cause: cause.to_owned(),
+    }
+}
+
+fn start_action(value: u64, step: &str) -> RequestedAction<String, String, String> {
     RequestedAction {
         id: action_id(value),
         action: Action::StartStep {
@@ -86,7 +111,11 @@ fn start_action(value: u64, step: &str) -> RequestedAction<String, String> {
     }
 }
 
-fn capture_action(value: u64, step: &str, provisional: &str) -> RequestedAction<String, String> {
+fn capture_action(
+    value: u64,
+    step: &str,
+    provisional: &str,
+) -> RequestedAction<String, String, String> {
     RequestedAction {
         id: action_id(value),
         action: Action::CaptureOutputs {
@@ -96,11 +125,28 @@ fn capture_action(value: u64, step: &str, provisional: &str) -> RequestedAction<
     }
 }
 
-fn finish_action(value: u64, exports: ExportSet<String>) -> RequestedAction<String, String> {
+fn finish_action(
+    value: u64,
+    exports: ExportSet<String>,
+) -> RequestedAction<String, String, String> {
     RequestedAction {
         id: action_id(value),
         action: Action::FinishRun {
             outcome: RunOutcome::Succeeded,
+            exports,
+        },
+    }
+}
+
+fn finish_failed_action(
+    value: u64,
+    primary_failure: StepFailure<String>,
+    exports: ExportSet<String>,
+) -> RequestedAction<String, String, String> {
+    RequestedAction {
+        id: action_id(value),
+        action: Action::FinishRun {
+            outcome: RunOutcome::Failed { primary_failure },
             exports,
         },
     }
@@ -113,23 +159,117 @@ fn output_set(entries: &[(&str, &str)]) -> OutputSet<String> {
         .collect()
 }
 
-fn assert_step(state: &RuntimeState<String>, step: &str, expected: StepStateKind) {
+fn available_exports(entries: &[(&str, &str)]) -> ExportSet<String> {
+    entries
+        .iter()
+        .map(|(name, output)| {
+            (
+                (*name).to_owned(),
+                ExportValue::Available {
+                    output: (*output).to_owned(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn assert_step(state: &RuntimeState<String, String>, step: &str, expected: StepStateKind) {
     assert_eq!(state.steps[step].state.kind(), expected);
 }
 
-fn assert_noop(before: &RuntimeState<String>, reduction: &Reduction<String, String>) {
+fn assert_noop(
+    before: &RuntimeState<String, String>,
+    reduction: &Reduction<String, String, String>,
+) {
     assert_eq!(&reduction.state, before);
     assert!(reduction.events.is_empty());
     assert!(reduction.actions.is_empty());
 }
 
 fn reduce_and_advance(
-    state: &mut RuntimeState<String>,
-    occurrence: Occurrence<String, String>,
-) -> Reduction<String, String> {
+    state: &mut RuntimeState<String, String>,
+    occurrence: Occurrence<String, String, String>,
+) -> Reduction<String, String, String> {
     let reduction = reduce(state, occurrence);
     *state = reduction.state.clone();
     reduction
+}
+
+fn prepare_failure_phase(
+    phase: FailurePhase,
+) -> (
+    RuntimeState<String, String>,
+    Occurrence<String, String, String>,
+    StepStateKind,
+    u64,
+) {
+    let initialization = initialize_definition::<String, String, String>(definition(
+        &[
+            ("aFail", &[], &["result"]),
+            ("bStopped", &[], &["result"]),
+            ("zJoin", &["bStopped", "aFail"], &["result"]),
+            ("zzDescendant", &["zJoin"], &["result"]),
+        ],
+        &[],
+        1,
+    ));
+    let mut state = initialization.state;
+    let (occurrence, source_state, direct_sequence) = match phase {
+        FailurePhase::Start => (
+            Occurrence::StepStartFailed {
+                step: "aFail".to_owned(),
+                action: action_id(1),
+                cause: "reported cause".to_owned(),
+            },
+            StepStateKind::Starting,
+            2,
+        ),
+        FailurePhase::Execution => {
+            reduce_and_advance(
+                &mut state,
+                Occurrence::StepStarted {
+                    step: "aFail".to_owned(),
+                    action: action_id(1),
+                },
+            );
+            (
+                Occurrence::StepExecutionFailed {
+                    step: "aFail".to_owned(),
+                    action: action_id(1),
+                    cause: "reported cause".to_owned(),
+                },
+                StepStateKind::Running,
+                3,
+            )
+        }
+        FailurePhase::OutputCapture => {
+            reduce_and_advance(
+                &mut state,
+                Occurrence::StepStarted {
+                    step: "aFail".to_owned(),
+                    action: action_id(1),
+                },
+            );
+            reduce_and_advance(
+                &mut state,
+                Occurrence::StepExecutionCompleted {
+                    step: "aFail".to_owned(),
+                    action: action_id(1),
+                    provisional: "provisional".to_owned(),
+                },
+            );
+            (
+                Occurrence::OutputCaptureFailed {
+                    step: "aFail".to_owned(),
+                    action: action_id(3),
+                    cause: "reported cause".to_owned(),
+                },
+                StepStateKind::CapturingOutputs,
+                4,
+            )
+        }
+    };
+    (state, occurrence, source_state, direct_sequence)
 }
 
 #[test]
@@ -156,7 +296,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     )
     .unwrap();
 
-    let initialization = initialize::<String, String>(&admitted);
+    let initialization = initialize::<String, String, String>(&admitted);
 
     assert_eq!(initialization.actions, [start_action(1, "alpha")]);
     assert_step(&initialization.state, "alpha", StepStateKind::Starting);
@@ -166,7 +306,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
 
 #[test]
 fn empty_dag_finishes_during_initialization() {
-    let reduction = initialize_definition::<String, String>(definition(&[], &[], 1));
+    let reduction = initialize_definition::<String, String, String>(definition(&[], &[], 1));
 
     assert_eq!(reduction.state.workflow, WorkflowState::Succeeded);
     assert!(reduction.state.steps.is_empty());
@@ -178,7 +318,7 @@ fn empty_dag_finishes_during_initialization() {
 
 #[test]
 fn serial_steps_follow_every_success_state_and_identifier() {
-    let initialization = initialize_definition::<String, String>(definition(
+    let initialization = initialize_definition::<String, String, String>(definition(
         &[("a", &[], &[]), ("b", &["a"], &[])],
         &[],
         2,
@@ -295,12 +435,12 @@ fn serial_steps_follow_every_success_state_and_identifier() {
     assert_eq!(state.workflow, WorkflowState::Succeeded);
     assert_eq!(state.last_transition_sequence, sequence(9));
 
-    assert_eq!(state.exports, Some(BTreeMap::<String, String>::new()));
+    assert_eq!(state.exports, Some(ExportSet::new()));
 }
 
 #[test]
 fn branching_dependents_wait_for_the_producers_committed_outputs() {
-    let initialization = initialize_definition::<String, String>(definition(
+    let initialization = initialize_definition::<String, String, String>(definition(
         &[
             ("root", &[], &["artifact"]),
             ("zeta", &["root"], &[]),
@@ -412,7 +552,7 @@ fn branching_dependents_wait_for_the_producers_committed_outputs() {
 
 #[test]
 fn ready_selection_is_lexical_and_respects_parallelism() {
-    let initialization = initialize_definition::<String, String>(definition(
+    let initialization = initialize_definition::<String, String, String>(definition(
         &[
             ("zeta", &[], &[]),
             ("alpha", &[], &[]),
@@ -465,7 +605,7 @@ fn ready_selection_is_lexical_and_respects_parallelism() {
 
 #[test]
 fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
-    let initialization = initialize_definition::<String, String>(definition(
+    let initialization = initialize_definition::<String, String, String>(definition(
         &[("producer", &[], &["result"])],
         &[("publicResult", "producer", "result")],
         1,
@@ -500,7 +640,7 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     );
     actions.extend(captured.actions.clone());
 
-    let expected_exports = output_set(&[("publicResult", "committed-result")]);
+    let expected_exports = available_exports(&[("publicResult", "committed-result")]);
     assert_eq!(state.workflow, WorkflowState::Succeeded);
     assert_eq!(state.exports, Some(expected_exports.clone()));
     assert_eq!(captured.events.last(), Some(&workflow_succeeded_event(5)));
@@ -518,7 +658,7 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
 
 #[test]
 fn duplicate_and_stale_success_occurrences_are_noops() {
-    let initialization = initialize_definition::<String, String>(definition(
+    let initialization = initialize_definition::<String, String, String>(definition(
         &[("producer", &[], &["result"])],
         &[],
         1,
@@ -625,6 +765,426 @@ fn duplicate_and_stale_success_occurrences_are_noops() {
 }
 
 #[test]
+fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
+    for phase in [
+        FailurePhase::Start,
+        FailurePhase::Execution,
+        FailurePhase::OutputCapture,
+    ] {
+        let (state, occurrence, source_state, direct_sequence) = prepare_failure_phase(phase);
+        let duplicate = occurrence.clone();
+        let reduction = reduce(&state, occurrence);
+        let primary_failure = failure("aFail", phase, "reported cause");
+        let failure_stopped = WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped {
+                primary_failure: primary_failure.clone(),
+            },
+        };
+        let terminal = WorkflowState::Failed {
+            primary_failure: primary_failure.clone(),
+        };
+
+        assert_eq!(
+            reduction.events,
+            [
+                step_event(
+                    direct_sequence,
+                    "aFail",
+                    source_state,
+                    StepStateKind::Failed,
+                ),
+                workflow_event(
+                    direct_sequence + 1,
+                    WorkflowState::Executing {
+                        gate: SchedulingGate::Open,
+                    },
+                    failure_stopped.clone(),
+                ),
+                step_event(
+                    direct_sequence + 2,
+                    "bStopped",
+                    StepStateKind::Pending,
+                    StepStateKind::NotRun,
+                ),
+                step_event(
+                    direct_sequence + 3,
+                    "zJoin",
+                    StepStateKind::Pending,
+                    StepStateKind::Blocked,
+                ),
+                step_event(
+                    direct_sequence + 4,
+                    "zzDescendant",
+                    StepStateKind::Pending,
+                    StepStateKind::Blocked,
+                ),
+                workflow_event(direct_sequence + 5, failure_stopped, terminal.clone(),),
+            ]
+        );
+        assert_eq!(
+            reduction.state.steps["aFail"].state,
+            StepState::Failed {
+                phase,
+                cause: "reported cause".to_owned(),
+            }
+        );
+        assert_eq!(
+            reduction.state.steps["bStopped"].state,
+            StepState::NotRun {
+                reason: NotRunReason::FailureStop,
+            }
+        );
+        assert_eq!(
+            reduction.state.steps["zJoin"].state,
+            StepState::Blocked {
+                dependency: "aFail".to_owned(),
+            }
+        );
+        assert_eq!(
+            reduction.state.steps["zzDescendant"].state,
+            StepState::Blocked {
+                dependency: "zJoin".to_owned(),
+            }
+        );
+        assert_eq!(reduction.state.workflow, terminal);
+        assert_eq!(
+            reduction.actions,
+            [finish_failed_action(
+                direct_sequence + 5,
+                primary_failure,
+                ExportSet::new(),
+            )]
+        );
+        assert!(
+            reduction
+                .actions
+                .iter()
+                .all(|action| !matches!(action.action, Action::StartStep { .. }))
+        );
+
+        let duplicate_reduction = reduce(&reduction.state, duplicate);
+        assert_noop(&reduction.state, &duplicate_reduction);
+    }
+}
+
+#[test]
+fn later_active_failure_does_not_replace_the_primary_failure() {
+    let initialization = initialize_definition::<String, String, String>(definition(
+        &[("alpha", &[], &["result"]), ("zeta", &[], &["result"])],
+        &[],
+        2,
+    ));
+    assert_eq!(
+        initialization.actions,
+        [start_action(1, "alpha"), start_action(2, "zeta")]
+    );
+    let mut state = initialization.state;
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "alpha".to_owned(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "alpha".to_owned(),
+            action: action_id(1),
+            provisional: "alpha provisional".to_owned(),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "zeta".to_owned(),
+            action: action_id(2),
+        },
+    );
+
+    let first = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "zeta".to_owned(),
+            action: action_id(2),
+            cause: "first failure".to_owned(),
+        },
+    );
+    let primary_failure = failure("zeta", FailurePhase::Execution, "first failure");
+    let failure_stopped = WorkflowState::Executing {
+        gate: SchedulingGate::FailureStopped {
+            primary_failure: primary_failure.clone(),
+        },
+    };
+    assert_eq!(state.workflow, failure_stopped);
+    assert!(first.actions.is_empty());
+    assert_step(&state, "alpha", StepStateKind::CapturingOutputs);
+
+    let duplicate = reduce(
+        &state,
+        Occurrence::StepExecutionFailed {
+            step: "zeta".to_owned(),
+            action: action_id(2),
+            cause: "duplicate failure".to_owned(),
+        },
+    );
+    assert_noop(&state, &duplicate);
+
+    let later = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputCaptureFailed {
+            step: "alpha".to_owned(),
+            action: action_id(4),
+            cause: "later failure".to_owned(),
+        },
+    );
+    let terminal = WorkflowState::Failed {
+        primary_failure: primary_failure.clone(),
+    };
+    assert_eq!(
+        later.events,
+        [
+            step_event(
+                8,
+                "alpha",
+                StepStateKind::CapturingOutputs,
+                StepStateKind::Failed,
+            ),
+            workflow_event(9, failure_stopped, terminal.clone()),
+        ]
+    );
+    assert_eq!(
+        state.steps["alpha"].state,
+        StepState::Failed {
+            phase: FailurePhase::OutputCapture,
+            cause: "later failure".to_owned(),
+        }
+    );
+    assert_eq!(state.workflow, terminal);
+    assert_eq!(
+        later.actions,
+        [finish_failed_action(9, primary_failure, ExportSet::new())]
+    );
+}
+
+#[test]
+fn successful_sibling_outputs_and_export_reasons_survive_failure() {
+    let initialization = initialize_definition::<String, String, String>(definition(
+        &[
+            ("aFail", &[], &["result"]),
+            ("aFailChild", &["aFail"], &["result"]),
+            ("bSibling", &[], &["result"]),
+            ("bSiblingChild", &["bSibling"], &["result"]),
+            ("zQueued", &[], &["result"]),
+        ],
+        &[
+            ("blockedExport", "aFailChild", "result"),
+            ("failedExport", "aFail", "result"),
+            ("notRunExport", "zQueued", "result"),
+            ("siblingChildExport", "bSiblingChild", "result"),
+            ("siblingExport", "bSibling", "result"),
+        ],
+        2,
+    ));
+    assert_eq!(
+        initialization.actions,
+        [start_action(1, "aFail"), start_action(2, "bSibling")]
+    );
+    let mut state = initialization.state;
+    for (step, action) in [("aFail", 1), ("bSibling", 2)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.to_owned(),
+                action: action_id(action),
+            },
+        );
+    }
+
+    let failed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "aFail".to_owned(),
+            action: action_id(1),
+            cause: "branch failed".to_owned(),
+        },
+    );
+    assert!(failed.actions.is_empty());
+    assert_step(&state, "aFailChild", StepStateKind::Blocked);
+    assert_step(&state, "bSibling", StepStateKind::Running);
+    assert_step(&state, "bSiblingChild", StepStateKind::Pending);
+    assert_step(&state, "zQueued", StepStateKind::NotRun);
+
+    let completed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "bSibling".to_owned(),
+            action: action_id(2),
+            provisional: "sibling provisional".to_owned(),
+        },
+    );
+    assert_eq!(
+        completed.actions,
+        [capture_action(9, "bSibling", "sibling provisional")]
+    );
+    assert_step(&state, "bSiblingChild", StepStateKind::Pending);
+
+    let captured = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputsCaptured {
+            step: "bSibling".to_owned(),
+            action: action_id(9),
+            outputs: output_set(&[("result", "sibling committed")]),
+        },
+    );
+    let primary_failure = failure("aFail", FailurePhase::Execution, "branch failed");
+    let expected_exports = BTreeMap::from([
+        (
+            "blockedExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Blocked,
+            },
+        ),
+        (
+            "failedExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Failed,
+            },
+        ),
+        (
+            "notRunExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::NotRun,
+            },
+        ),
+        (
+            "siblingChildExport".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::NotRun,
+            },
+        ),
+        (
+            "siblingExport".to_owned(),
+            ExportValue::Available {
+                output: "sibling committed".to_owned(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        state.steps["bSibling"].state,
+        StepState::Succeeded {
+            outputs: output_set(&[("result", "sibling committed")]),
+        }
+    );
+    assert_eq!(
+        state.steps["bSiblingChild"].state,
+        StepState::NotRun {
+            reason: NotRunReason::FailureStop,
+        }
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_failure: primary_failure.clone(),
+        }
+    );
+    assert_eq!(state.exports, Some(expected_exports.clone()));
+    assert_eq!(
+        captured.actions,
+        [finish_failed_action(12, primary_failure, expected_exports,)]
+    );
+    assert_eq!(
+        failed
+            .actions
+            .iter()
+            .chain(&completed.actions)
+            .chain(&captured.actions)
+            .filter(|action| matches!(action.action, Action::FinishRun { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn duplicate_and_stale_failure_occurrences_are_noops() {
+    let initialization = initialize_definition::<String, String, String>(definition(
+        &[("producer", &[], &["result"])],
+        &[],
+        1,
+    ));
+    let mut state = initialization.state;
+
+    let stale_start_failure = reduce(
+        &state,
+        Occurrence::StepStartFailed {
+            step: "producer".to_owned(),
+            action: action_id(999),
+            cause: "stale".to_owned(),
+        },
+    );
+    assert_noop(&state, &stale_start_failure);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "producer".to_owned(),
+            action: action_id(1),
+        },
+    );
+    for occurrence in [
+        Occurrence::StepStartFailed {
+            step: "producer".to_owned(),
+            action: action_id(1),
+            cause: "wrong phase".to_owned(),
+        },
+        Occurrence::StepExecutionFailed {
+            step: "producer".to_owned(),
+            action: action_id(999),
+            cause: "wrong action".to_owned(),
+        },
+    ] {
+        let stale = reduce(&state, occurrence);
+        assert_noop(&state, &stale);
+    }
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "producer".to_owned(),
+            action: action_id(1),
+            provisional: "provisional".to_owned(),
+        },
+    );
+    for occurrence in [
+        Occurrence::StepExecutionFailed {
+            step: "producer".to_owned(),
+            action: action_id(1),
+            cause: "superseded action".to_owned(),
+        },
+        Occurrence::OutputCaptureFailed {
+            step: "producer".to_owned(),
+            action: action_id(999),
+            cause: "wrong action".to_owned(),
+        },
+    ] {
+        let stale = reduce(&state, occurrence);
+        assert_noop(&state, &stale);
+    }
+
+    let accepted = Occurrence::OutputCaptureFailed {
+        step: "producer".to_owned(),
+        action: action_id(3),
+        cause: "capture failed".to_owned(),
+    };
+    reduce_and_advance(&mut state, accepted.clone());
+    let terminal = state.clone();
+    let duplicate = reduce(&state, accepted);
+    assert_noop(&terminal, &duplicate);
+}
+
+#[test]
 fn replaying_the_same_ordered_transcript_is_structurally_identical() {
     let transcript = || {
         vec![
@@ -678,7 +1238,7 @@ fn replaying_the_same_ordered_transcript_is_structurally_identical() {
     };
     let evaluate = || {
         let mut reductions = Vec::new();
-        let initialization = initialize_definition::<String, String>(definition(
+        let initialization = initialize_definition::<String, String, String>(definition(
             &[
                 ("a", &[], &["artifact"]),
                 ("b", &["a"], &[]),
@@ -706,6 +1266,6 @@ fn replaying_the_same_ordered_transcript_is_structurally_identical() {
     assert_eq!(terminal.last_transition_sequence, sequence(17));
     assert_eq!(
         terminal.exports,
-        Some(output_set(&[("finalReport", "d-committed")]))
+        Some(available_exports(&[("finalReport", "d-committed")]))
     );
 }

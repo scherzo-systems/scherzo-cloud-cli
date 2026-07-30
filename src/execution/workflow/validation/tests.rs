@@ -1,8 +1,9 @@
 use super::super::decode;
-use super::super::document::{InputReference, Output, Step};
+use super::super::document::{HarnessDefinition, InputReference, Output, Step};
+use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
-    ResolvedValueSource, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowImport,
-    WorkflowValueType,
+    ResolvedValueSource, ValidatedHarness, ValidatedMessageSource, ValidatedStep,
+    ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 use super::{ValidationFailureKind, ValidationLocation};
 
@@ -123,6 +124,74 @@ fn branching_and_disconnected_dag_retains_every_edge_and_step() {
         assert!(dependency_position < dependent_position);
     }
     assert!(workflow.topological_order.contains(&"isolated".to_owned()));
+}
+
+#[test]
+fn agent_profiles_resolve_to_pinned_configs_and_missing_references_fail() {
+    let source = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+  unused:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-4.1
+        thinking: low
+steps:
+  agent:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+";
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
+        panic!("agent must be an agent step");
+    };
+    assert_eq!(agent.agent.profile, "coding");
+    assert_eq!(
+        agent.agent.harness,
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::XHigh,
+        })
+    );
+
+    assert_failure(
+        &source.replace("profile: coding", "profile: missing"),
+        ValidationFailureKind::UnknownAgentProfile,
+        ValidationLocation::AgentProfileReference {
+            step: "agent".to_owned(),
+        },
+    );
+
+    let mut invalid_unused = decode(source.as_bytes()).unwrap();
+    let unused = invalid_unused.agent_profiles.get_mut("unused").unwrap();
+    unused.harness = HarnessDefinition::Pi {
+        config: serde_json::json!({
+            "model": "",
+            "thinking": "low",
+        }),
+    };
+    let failure = super::validate(invalid_unused).unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        ValidationFailureKind::InvalidAgentProfileConfig
+    );
+    assert_eq!(
+        failure.location(),
+        &ValidationLocation::AgentProfile {
+            profile: "unused".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -247,19 +316,22 @@ fn typed_message_workflow(reference: &str, destination: &str) -> String {
     };
     format!(
         "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   producer:
     kind: agent
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - file: prompts/message.md
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       response:
         kind: agent_response
@@ -277,14 +349,10 @@ steps:
       value:
         ref: {reference}
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
-{message}      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
-"
+{message}"
     )
 }
 
@@ -324,19 +392,22 @@ fn message_type_table_rejects_every_inverse_destination_without_conversion() {
 fn validated_definition_preserves_typed_bindings_outputs_exports_and_imports() {
     let source = "schemaVersion: 1
 description: Typed workflow.
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   producer:
     kind: agent
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - file: prompts/message.md
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       response:
         kind: agent_response
@@ -362,6 +433,7 @@ steps:
       file:
         ref: outputs.producer.file
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
@@ -371,11 +443,6 @@ steps:
           - ref: inputs.attachments
           - ref: inputs.result
           - ref: inputs.file
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
 exports:
   response:
     ref: outputs.producer.response
@@ -453,19 +520,22 @@ exports:
 #[test]
 fn agent_messages_reject_missing_and_unused_inputs() {
     let missing = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   agent:
     kind: agent
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - ref: inputs.missing
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
 ";
     assert_failure(
         missing,
@@ -477,6 +547,13 @@ steps:
     );
 
     let unused = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   agent:
     kind: agent
@@ -484,15 +561,11 @@ steps:
       prompt:
         ref: imports.prompt
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - file: prompts/message.md
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
 ";
     assert_failure(
         unused,
@@ -527,19 +600,22 @@ fn output_kind_and_agent_cardinality_rules_are_enforced() {
     );
 
     let two_responses = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   agent:
     kind: agent
     agent:
+      profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - file: prompts/message.md
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
     outputs:
       first:
         kind: agent_response

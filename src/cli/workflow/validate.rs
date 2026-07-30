@@ -225,6 +225,8 @@ struct DiagnosticLocation<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     export: Option<&'a str>,
 }
 
@@ -236,6 +238,7 @@ impl<'a> DiagnosticLocation<'a> {
             index: None,
             input: None,
             output: None,
+            profile: None,
             export: None,
         }
     }
@@ -272,6 +275,13 @@ impl<'a> DiagnosticLocation<'a> {
     fn from_validation(location: &'a ValidationLocation) -> Self {
         match location {
             ValidationLocation::WorkflowGraph => Self::simple("workflow_graph"),
+            ValidationLocation::AgentProfile { profile } => Self {
+                profile: Some(profile),
+                ..Self::simple("agent_profile")
+            },
+            ValidationLocation::AgentProfileReference { step } => {
+                Self::for_step("agent_profile_reference", step)
+            }
             ValidationLocation::StepDependency { step, index } => Self {
                 index: Some(*index),
                 ..Self::for_step("step_dependency", step)
@@ -315,6 +325,8 @@ impl fmt::Display for DiagnosticLocation<'_> {
                 write!(formatter, ", output {output}")?;
             }
             formatter.write_str(")")?;
+        } else if let Some(profile) = self.profile {
+            write!(formatter, " ({profile})")?;
         } else if let Some(name) = self.export {
             write!(formatter, " ({name})")?;
         }
@@ -418,6 +430,14 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
         ValidationFailureKind::DependencyCycle => (
             "dependency_cycle",
             "Remove dependency edges until the workflow step graph is acyclic.",
+        ),
+        ValidationFailureKind::InvalidAgentProfileConfig => (
+            "invalid_agent_profile_config",
+            "Correct the agent profile's Pi configuration.",
+        ),
+        ValidationFailureKind::UnknownAgentProfile => (
+            "unknown_agent_profile",
+            "Reference an agent profile declared by this workflow.",
         ),
         ValidationFailureKind::UnknownImport => (
             "unknown_import",

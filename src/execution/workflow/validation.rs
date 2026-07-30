@@ -2,14 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::document::{
-    Agent, CommonStep, InputReference, MessageSource, Output, OutputReference, Step,
-    WorkflowDocument,
+    Agent, CommonStep, HarnessDefinition, InputReference, MessageSource, Output, OutputReference,
+    Step, WorkflowDocument,
 };
+use super::pi;
 use super::validated::{
     RequiredImports, ResolvedOutputSource, ResolvedValueSource, ValidatedAgent,
     ValidatedAgentMessage, ValidatedAgentStep, ValidatedCommandStep, ValidatedCommonStep,
-    ValidatedInput, ValidatedMessageSource, ValidatedOutput, ValidatedStep, ValidatedWorkflow,
-    WorkflowImport, WorkflowValueType,
+    ValidatedHarness, ValidatedInput, ValidatedMessageSource, ValidatedOutput, ValidatedStep,
+    ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +19,8 @@ pub(crate) enum ValidationFailureKind {
     SelfDependency,
     DuplicateDependency,
     DependencyCycle,
+    InvalidAgentProfileConfig,
+    UnknownAgentProfile,
     UnknownImport,
     UnknownOutputStep,
     UnknownOutput,
@@ -34,6 +37,8 @@ pub(crate) enum ValidationFailureKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationLocation {
     WorkflowGraph,
+    AgentProfile { profile: String },
+    AgentProfileReference { step: String },
     StepDependency { step: String, index: usize },
     StepInput { step: String, input: String },
     MessageText { step: String, index: usize },
@@ -76,6 +81,7 @@ struct ValidatedGraph {
 }
 
 pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, ValidationFailure> {
+    let agent_profiles = validate_agent_profiles(&document)?;
     let graph = validate_graph(&document)?;
     validate_output_rules(&document)?;
 
@@ -101,7 +107,9 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
                     &graph.ancestors,
                     &mut required_imports,
                 )?;
-                let validated_agent = validate_agent(step_name, &agent.agent, &common.inputs)?;
+                let harness = resolve_agent_profile(step_name, &agent.agent, &agent_profiles)?;
+                let validated_agent =
+                    validate_agent(step_name, &agent.agent, &common.inputs, harness)?;
                 ValidatedStep::Agent(ValidatedAgentStep {
                     common,
                     agent: validated_agent,
@@ -382,10 +390,50 @@ fn resolve_input(
     }
 }
 
+fn validate_agent_profiles(
+    document: &WorkflowDocument,
+) -> Result<BTreeMap<String, ValidatedHarness>, ValidationFailure> {
+    document
+        .agent_profiles
+        .iter()
+        .map(|(name, profile)| {
+            let harness = match &profile.harness {
+                HarnessDefinition::Pi { config } => pi::resolve_config(config)
+                    .map(ValidatedHarness::Pi)
+                    .ok_or_else(|| {
+                        ValidationFailure::new(
+                            ValidationFailureKind::InvalidAgentProfileConfig,
+                            ValidationLocation::AgentProfile {
+                                profile: name.clone(),
+                            },
+                        )
+                    })?,
+            };
+            Ok((name.clone(), harness))
+        })
+        .collect()
+}
+
+fn resolve_agent_profile(
+    step_name: &str,
+    agent: &Agent,
+    profiles: &BTreeMap<String, ValidatedHarness>,
+) -> Result<ValidatedHarness, ValidationFailure> {
+    profiles.get(&agent.profile).cloned().ok_or_else(|| {
+        ValidationFailure::new(
+            ValidationFailureKind::UnknownAgentProfile,
+            ValidationLocation::AgentProfileReference {
+                step: step_name.to_owned(),
+            },
+        )
+    })
+}
+
 fn validate_agent(
     step_name: &str,
     agent: &Agent,
     inputs: &BTreeMap<String, ValidatedInput>,
+    harness: ValidatedHarness,
 ) -> Result<ValidatedAgent, ValidationFailure> {
     let mut used_inputs = BTreeSet::new();
     let text = agent
@@ -435,9 +483,10 @@ fn validate_agent(
     }
 
     Ok(ValidatedAgent {
+        profile: agent.profile.clone(),
         system_prompt: agent.system_prompt.clone(),
         message: ValidatedAgentMessage { text, attachments },
-        harness: agent.harness.clone(),
+        harness,
     })
 }
 

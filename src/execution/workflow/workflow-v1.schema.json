@@ -139,10 +139,24 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "id": { "const": "pi" },
+        "kind": { "const": "pi" },
         "config": { "$ref": "#/$defs/PiConfig" }
       },
-      "required": ["id", "config"]
+      "required": ["kind", "config"]
+    },
+    "AgentProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness": { "$ref": "#/$defs/PiHarness" }
+      },
+      "required": ["harness"],
+      "description": "Immutable workflow-local harness configuration. A profile grants no execution authority."
+    },
+    "AgentProfiles": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/AgentProfile" }
     },
     "AgentMessage": {
       "type": "object",
@@ -164,11 +178,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "profile": { "$ref": "#/$defs/Identifier" },
         "systemPrompt": { "$ref": "#/$defs/SourceRelativePath" },
-        "message": { "$ref": "#/$defs/AgentMessage" },
-        "harness": { "$ref": "#/$defs/PiHarness" }
+        "message": { "$ref": "#/$defs/AgentMessage" }
       },
-      "required": ["systemPrompt", "message", "harness"]
+      "required": ["profile", "systemPrompt", "message"]
     },
     "AgentResponseOutput": {
       "type": "object",
@@ -256,6 +270,7 @@
       "properties": {
         "schemaVersion": { "const": 1 },
         "description": { "type": "string" },
+        "agentProfiles": { "$ref": "#/$defs/AgentProfiles" },
         "steps": {
           "type": "object",
           "minProperties": 1,

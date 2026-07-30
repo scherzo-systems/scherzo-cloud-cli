@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::document::{
-    Harness, InputReference, MessageSource, Output, OutputReference, PiConfig, Step, Thinking,
+    HarnessDefinition, InputReference, MessageSource, Output, OutputReference, Step,
 };
 use super::*;
 
@@ -23,8 +23,18 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         workflow.description.as_deref(),
         Some("Plan, implement, test, and export a requested change.")
     );
+    assert_eq!(workflow.agent_profiles.len(), 1);
     assert_eq!(workflow.steps.len(), 4);
     assert_eq!(workflow.exports.len(), 3);
+    assert_eq!(
+        workflow.agent_profiles["coding"].harness,
+        HarnessDefinition::Pi {
+            config: serde_json::json!({
+                "model": "openai/gpt-5",
+                "thinking": "high",
+            }),
+        }
+    );
 
     let Step::Command(prepare) = &workflow.steps["prepare"] else {
         panic!("prepare must be a command step");
@@ -50,6 +60,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             name: "attachments".to_owned()
         }
     );
+    assert_eq!(plan.agent.profile, "coding");
     assert_eq!(plan.agent.system_prompt, "prompts/plan-system.md");
     assert_eq!(
         plan.agent.message.text,
@@ -62,13 +73,6 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         [MessageSource::Input {
             name: "attachments".to_owned()
         }]
-    );
-    assert_eq!(
-        plan.agent.harness,
-        Harness::Pi(PiConfig {
-            model: "openai/gpt-5".to_owned(),
-            thinking: Thinking::High,
-        })
     );
     assert_eq!(
         plan.common.outputs["plan"],
@@ -94,14 +98,8 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             output: "plan".to_owned(),
         })
     );
+    assert_eq!(implement.agent.profile, "coding");
     assert_eq!(implement.agent.system_prompt, "prompts/implement-system.md");
-    assert_eq!(
-        implement.agent.harness,
-        Harness::Pi(PiConfig {
-            model: "openai/gpt-5".to_owned(),
-            thinking: Thinking::High,
-        })
-    );
     assert_eq!(
         implement.agent.message.text,
         [
@@ -183,6 +181,29 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
             path.display()
         );
     }
+}
+
+#[test]
+fn unused_agent_profiles_still_use_the_pi_config_contract() {
+    let source = b"schemaVersion: 1
+agentProfiles:
+  unused:
+    harness:
+      kind: pi
+      config:
+        model: ''
+        thinking: high
+steps:
+  command:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+";
+
+    assert_eq!(
+        decode(source).unwrap_err().kind(),
+        DecodeFailureKind::StructuralContract
+    );
 }
 
 #[test]

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentStep, CommandStep, CommonStep, Harness, InputReference,
-    MessageSource, Output, OutputReference, PiConfig, Step, Thinking, WorkflowDocument,
+    Agent, AgentMessage, AgentProfile, AgentStep, CommandStep, CommonStep, HarnessDefinition,
+    InputReference, MessageSource, Output, OutputReference, Step, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -13,6 +14,8 @@ pub(super) struct WorkflowDto {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,
     description: Option<String>,
+    #[serde(rename = "agentProfiles", default)]
+    agent_profiles: BTreeMap<String, AgentProfileDto>,
     steps: BTreeMap<String, StepDto>,
     #[serde(default)]
     exports: BTreeMap<String, ReferenceDto>,
@@ -54,11 +57,17 @@ struct CommandDto {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AgentProfileDto {
+    harness: HarnessDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentDto {
+    profile: String,
     #[serde(rename = "systemPrompt")]
     system_prompt: String,
     message: AgentMessageDto,
-    harness: HarnessDto,
 }
 
 #[derive(Deserialize)]
@@ -82,35 +91,10 @@ enum MessageSourceDto {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HarnessDto {
-    id: String,
-    config: PiConfigDto,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PiConfigDto {
-    model: String,
-    thinking: ThinkingDto,
-}
-
-#[derive(Deserialize)]
-enum ThinkingDto {
-    #[serde(rename = "off")]
-    Off,
-    #[serde(rename = "minimal")]
-    Minimal,
-    #[serde(rename = "low")]
-    Low,
-    #[serde(rename = "medium")]
-    Medium,
-    #[serde(rename = "high")]
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
-    #[serde(rename = "max")]
-    Max,
+#[serde(tag = "kind")]
+enum HarnessDto {
+    #[serde(rename = "pi")]
+    Pi { config: Value },
 }
 
 #[derive(Deserialize)]
@@ -137,6 +121,11 @@ struct ReferenceDto {
 
 impl WorkflowDto {
     pub(super) fn into_document(self) -> Option<WorkflowDocument> {
+        let agent_profiles = self
+            .agent_profiles
+            .into_iter()
+            .map(|(name, profile)| (name, profile.into_agent_profile()))
+            .collect();
         let steps = self
             .steps
             .into_iter()
@@ -153,6 +142,7 @@ impl WorkflowDto {
         Some(WorkflowDocument {
             schema_version: self.schema_version,
             description: self.description,
+            agent_profiles,
             steps,
             exports,
         })
@@ -198,22 +188,31 @@ impl CommonStepDto {
     }
 }
 
+impl AgentProfileDto {
+    fn into_agent_profile(self) -> AgentProfile {
+        AgentProfile {
+            harness: self.harness.into_harness(),
+        }
+    }
+}
+
+impl HarnessDto {
+    fn into_harness(self) -> HarnessDefinition {
+        match self {
+            Self::Pi { config } => HarnessDefinition::Pi { config },
+        }
+    }
+}
+
 impl AgentDto {
     fn into_agent(self) -> Option<Agent> {
-        if self.harness.id != "pi" {
-            return None;
-        }
-
         Some(Agent {
+            profile: self.profile,
             system_prompt: self.system_prompt,
             message: AgentMessage {
                 text: message_sources(self.message.text)?,
                 attachments: message_sources(self.message.attachments)?,
             },
-            harness: Harness::Pi(PiConfig {
-                model: self.harness.config.model,
-                thinking: self.harness.config.thinking.into(),
-            }),
         })
     }
 }
@@ -240,20 +239,6 @@ impl OutputDto {
             Self::AgentResponse => Output::AgentResponse,
             Self::AgentResult { schema } => Output::AgentResult { schema },
             Self::File { path, media_type } => Output::File { path, media_type },
-        }
-    }
-}
-
-impl From<ThinkingDto> for Thinking {
-    fn from(value: ThinkingDto) -> Self {
-        match value {
-            ThinkingDto::Off => Self::Off,
-            ThinkingDto::Minimal => Self::Minimal,
-            ThinkingDto::Low => Self::Low,
-            ThinkingDto::Medium => Self::Medium,
-            ThinkingDto::High => Self::High,
-            ThinkingDto::XHigh => Self::XHigh,
-            ThinkingDto::Max => Self::Max,
         }
     }
 }

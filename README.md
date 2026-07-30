@@ -60,7 +60,7 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 {
   "schemaVersion": 1,
   "command": "scherzo-cloud",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "executablePath": "/resolved/path/to/scherzo-cloud",
   "buildIdentity": "unknown"
 }
@@ -277,18 +277,18 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the manually selected `MAJOR.MINOR` release series. The current
-series is `0.2`. Automatic release planning derives patches from immutable public tags,
-so the first release in this series is `0.2.0` and later compatible releases increment
+series is `0.3`. Automatic release planning derives patches from immutable public tags,
+so the first release in this series is `0.3.0` and later compatible releases increment
 the patch.
 
 Run `./scripts/check-release` to validate the declaration and its Cargo fallback. To
 preview version planning from an explicit latest tag, run:
 
 ```sh
-./scripts/check-release --next-version v0.2.7
+./scripts/check-release --next-version v0.3.7
 ```
 
-This prints `0.2.8`.
+This prints `0.3.8`.
 
 After every releaseable mirror update passes the public check, GitHub Actions builds and
 runs native archives for x86-64 and ARM64 Linux and for Intel and Apple Silicon macOS.

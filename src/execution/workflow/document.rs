@@ -1,11 +1,19 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowDocument {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
+    pub(crate) agent_profiles: BTreeMap<String, AgentProfile>,
     pub(crate) steps: BTreeMap<String, Step>,
     pub(crate) exports: BTreeMap<String, OutputReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentProfile {
+    pub(crate) harness: HarnessDefinition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,9 +63,9 @@ pub(crate) enum Output {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Agent {
+    pub(crate) profile: String,
     pub(crate) system_prompt: String,
     pub(crate) message: AgentMessage,
-    pub(crate) harness: Harness,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,23 +81,6 @@ pub(crate) enum MessageSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Harness {
-    Pi(PiConfig),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PiConfig {
-    pub(crate) model: String,
-    pub(crate) thinking: Thinking,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Thinking {
-    Off,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
+pub(crate) enum HarnessDefinition {
+    Pi { config: Value },
 }

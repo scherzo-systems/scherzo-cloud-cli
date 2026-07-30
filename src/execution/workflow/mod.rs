@@ -2,6 +2,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod document;
+mod pi;
 pub(crate) mod resolution;
 pub(crate) mod runtime;
 mod schema;

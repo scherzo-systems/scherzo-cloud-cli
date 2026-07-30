@@ -317,6 +317,8 @@ jobs:
             if [[ -s "$rendered_notes" ]]; then
               cat "$rendered_notes"
               printf '\n'
+            else
+              printf '%s\n\n' 'Internal changes only; no user-visible changes.'
             fi
             printf "Mirror commit: \`%s\`\\n" "$GITHUB_SHA"
             printf "Source revision: \`%s\`\\n\\n" "$SOURCE_REVISION"

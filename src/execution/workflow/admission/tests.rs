@@ -30,19 +30,22 @@ steps:
 "#;
 
 const AGENT_WORKFLOW: &str = r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
 steps:
   agent:
     kind: agent
     agent:
+      profile: coding
       systemPrompt: system.md
       message:
         text:
           - file: message.md
-      harness:
-        id: pi
-        config:
-          model: openai/gpt-5
-          thinking: high
 "#;
 
 struct WorkflowFixture {
