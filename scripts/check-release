@@ -7,7 +7,7 @@ fail() {
 }
 
 usage() {
-  echo "Usage: scripts/check-release [--next-version [LATEST_TAG] | --validate-tag TAG]" >&2
+  echo "Usage: scripts/check-release [--series | --validate-tag TAG]" >&2
 }
 
 mode=check
@@ -16,27 +16,19 @@ case $# in
   0)
     ;;
   1)
-    if [[ "$1" != "--next-version" ]]; then
+    if [[ "$1" != "--series" ]]; then
       usage
       exit 2
     fi
-    mode=next-version
+    mode=series
     ;;
   2)
-    case "$1" in
-      --next-version)
-        mode=next-version
-        latest_tag=$2
-        ;;
-      --validate-tag)
-        mode=validate-tag
-        latest_tag=$2
-        ;;
-      *)
-        usage
-        exit 2
-        ;;
-    esac
+    if [[ "$1" != "--validate-tag" ]]; then
+      usage
+      exit 2
+    fi
+    mode=validate-tag
+    latest_tag=$2
     ;;
   *)
     usage
@@ -151,18 +143,24 @@ if [[ "$package_version" != "$expected_package_version" ]]; then
   fail "Cargo package version must match the release-series fallback $expected_package_version; found $package_version."
 fi
 
-if [[ "$mode" == "check" ]]; then
-  printf 'CLI release configuration is valid for series %s.\n' "$series"
-  exit 0
-fi
-
-if [[ -z "$latest_tag" ]]; then
-  printf '%s.0\n' "$series"
-  exit 0
-fi
+case "$mode" in
+  check)
+    printf 'CLI release configuration is valid for series %s.\n' "$series"
+    exit 0
+    ;;
+  series)
+    printf '%s\n' "$series"
+    exit 0
+    ;;
+  validate-tag)
+    ;;
+  *)
+    fail "Unsupported release-check mode: $mode"
+    ;;
+esac
 
 if [[ ! "$latest_tag" =~ $tag_pattern ]]; then
-  fail "Latest CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $latest_tag"
+  fail "CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $latest_tag"
 fi
 latest_major=${BASH_REMATCH[1]}
 latest_minor=${BASH_REMATCH[2]}
@@ -170,41 +168,7 @@ latest_patch=${BASH_REMATCH[3]}
 if ((latest_major > maximum_component \
   || latest_minor > maximum_component \
   || latest_patch > maximum_component)); then
-  fail "Latest CLI release tag components must not exceed $maximum_component: $latest_tag"
+  fail "CLI release tag components must not exceed $maximum_component: $latest_tag"
 fi
 
-if [[ "$mode" == "validate-tag" ]]; then
-  printf 'CLI release tag is valid: %s.\n' "$latest_tag"
-  exit 0
-fi
-
-if ((series_major < latest_major \
-  || (series_major == latest_major && series_minor < latest_minor))); then
-  fail "CLI release series $series regresses from latest tag $latest_tag."
-fi
-
-if ((series_major == latest_major && series_minor == latest_minor)); then
-  if ((latest_patch == maximum_component)); then
-    fail "CLI release patch cannot advance beyond $maximum_component for series $series."
-  fi
-  printf '%s.%d\n' "$series" "$((latest_patch + 1))"
-  exit 0
-fi
-
-if ((series_major == latest_major)); then
-  if ((series_minor == latest_minor + 1)); then
-    printf '%s.0\n' "$series"
-    exit 0
-  fi
-  fail "CLI release series $series skips a minor release after $latest_tag."
-fi
-
-if ((series_major == latest_major + 1)); then
-  if ((series_minor != 0)); then
-    fail "CLI major release series $series must reset the minor component to zero after $latest_tag."
-  fi
-  printf '%s.0\n' "$series"
-  exit 0
-fi
-
-fail "CLI release series $series skips a major release after $latest_tag."
+printf 'CLI release tag is valid: %s.\n' "$latest_tag"

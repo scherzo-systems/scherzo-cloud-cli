@@ -12,6 +12,14 @@ category that best describes the primary user impact:
 - `internal`: the change has no user-visible effect and produces no public release-note
   bullet.
 
+The category is also the release-impact recommendation. `internal`, `fixed`, and
+compatible `changed` select a patch; `added` selects the adjacent minor series;
+`breaking` selects the adjacent minor before `1.0` and the adjacent major from `1.0`
+onward. Planning takes the highest impact across all fragments since the latest stable
+tag. Update `release.toml`, the Cargo package fallback, and `Cargo.lock` in the same
+candidate whenever that cumulative impact selects a different `MAJOR.MINOR` series; do
+not advance an already-selected unreleased minor or major series a second time.
+
 The category directories are optional. Create one only when adding its first fragment;
 do not add `.gitkeep` files or other placeholders. `README.md` is the only file allowed
 at the root of this directory.

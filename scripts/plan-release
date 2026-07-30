@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export LC_ALL=C
+
 # Resolve the public checkout from this script's location, never from an
 # enclosing Git or Jujutsu process context.
 while IFS= read -r variable; do
@@ -24,7 +26,7 @@ public_root=$(cd "$script_dir/.." && pwd -P)
 if ! repository_root=$(git -C "$public_root" rev-parse --show-toplevel 2>/dev/null); then
   fail "CLI release planning requires a Git checkout."
 fi
-repository_root=$(cd "$repository_root" && pwd)
+repository_root=$(cd "$repository_root" && pwd -P)
 if [[ "$repository_root" != "$public_root" ]]; then
   fail "CLI release planning must run from the public repository root."
 fi
@@ -32,93 +34,207 @@ cd "$public_root"
 
 checker=$script_dir/check-release
 classifier=$script_dir/classify-release-path
+impact_planner=$script_dir/release-impact
+renderer=$script_dir/render-release-notes
 "$checker" >/dev/null
+series=$("$checker" --series)
 
 mirror_commit=$(git rev-parse --verify 'HEAD^{commit}')
 source_revision=$(
   git log -1 --format='%(trailers:key=Source-Revision,valueonly)' HEAD \
     | tr -d '[:space:]'
 )
-if [[ ! "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
+if [[ ! $source_revision =~ ^[0-9a-f]{40}$ ]]; then
   fail "Current mirror commit must contain one canonical Source-Revision trailer."
+fi
+approved_digest=$(
+  git log -1 --format='%(trailers:key=Release-Plan-Digest,valueonly)' HEAD \
+    | tr -d '[:space:]'
+)
+if [[ -z $approved_digest ]]; then
+  # Legacy mirroring remains authoritative until the managed publication
+  # cutover. Managed mirror commits always carry the approved plan digest.
+  approved_digest=none
+elif [[ ! $approved_digest =~ ^[0-9a-f]{64}$ ]]; then
+  fail "Current mirror commit contains an invalid Release-Plan-Digest trailer."
 fi
 
 latest_tag=
 latest_major=-1
 latest_minor=-1
 latest_patch=-1
+current_stable_tag=
+current_stable_major=-1
+current_stable_minor=-1
+current_stable_patch=-1
 head_tag=
 while IFS= read -r release_tag; do
-  [[ -n "$release_tag" ]] || continue
+  [[ -n $release_tag ]] || continue
   "$checker" --validate-tag "$release_tag" >/dev/null
 
   tag_version=${release_tag#v}
   IFS=. read -r tag_major tag_minor tag_patch <<<"$tag_version"
+  tag_major=$((10#$tag_major))
+  tag_minor=$((10#$tag_minor))
+  tag_patch=$((10#$tag_patch))
 
   if ! git merge-base --is-ancestor "${release_tag}^{commit}" HEAD; then
     fail "CLI release tag is not an ancestor of the current mirror commit: $release_tag"
   fi
 
   tag_commit=$(git rev-parse --verify "${release_tag}^{commit}")
-  if [[ "$tag_commit" == "$mirror_commit" ]]; then
-    if [[ -n "$head_tag" ]]; then
+  if [[ $tag_commit == "$mirror_commit" ]]; then
+    if [[ -n $head_tag ]]; then
       fail "Current mirror commit has more than one CLI release tag: $head_tag, $release_tag"
     fi
     head_tag=$release_tag
-  fi
-
-  if ((tag_major > latest_major \
+  elif ((tag_major > latest_major \
     || (tag_major == latest_major && tag_minor > latest_minor) \
     || (tag_major == latest_major && tag_minor == latest_minor && tag_patch > latest_patch))); then
+    # A tag on HEAD is the release being verified. Semantic planning uses the
+    # preceding stable release as its baseline.
     latest_tag=$release_tag
     latest_major=$tag_major
     latest_minor=$tag_minor
     latest_patch=$tag_patch
   fi
+
+  if ((tag_major > current_stable_major \
+    || (tag_major == current_stable_major && tag_minor > current_stable_minor) \
+    || (tag_major == current_stable_major && tag_minor == current_stable_minor \
+      && tag_patch > current_stable_patch))); then
+    current_stable_tag=$release_tag
+    current_stable_major=$tag_major
+    current_stable_minor=$tag_minor
+    current_stable_patch=$tag_patch
+  fi
 done < <(git tag --list 'v*')
 
-if [[ -n "$latest_tag" ]]; then
-  version=$("$checker" --next-version "$latest_tag")
-else
-  version=$("$checker" --next-version)
+if [[ -n $head_tag && $head_tag != "$current_stable_tag" ]]; then
+  fail "Current mirror commit is tagged with $head_tag but latest stable tag is $current_stable_tag."
 fi
-tag=v$version
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+selected_paths=$scratch/selected-paths
+changed_paths=$scratch/changed-paths
+rendered_notes=$scratch/rendered-notes.md
+plan_file=$scratch/release-plan.txt
+: >"$selected_paths"
 
 release=false
 reason=no-releaseable-changes
-if [[ -n "$head_tag" ]]; then
-  reason=already-released
-  version=${head_tag#v}
-  tag=$head_tag
-elif [[ -z "$latest_tag" ]]; then
-  release=true
-  reason=initial-release
+if [[ -n $latest_tag ]]; then
+  git diff \
+    --no-color --no-ext-diff --no-textconv --no-renames \
+    --name-only --diff-filter=A -z \
+    "${latest_tag}^{commit}" HEAD -- changes >"$selected_paths"
+  git diff \
+    --no-color --no-ext-diff --no-textconv --no-renames \
+    --name-only -z "${latest_tag}^{commit}" HEAD >"$changed_paths"
 else
-  releaseable_change=0
-  while IFS= read -r -d '' changed_path; do
-    classification=$("$classifier" "$changed_path")
-    case "$classification" in
-      releaseable)
-        releaseable_change=1
-        ;;
-      non-releaseable)
-        ;;
-      *)
-        fail "CLI release path classifier returned an invalid result."
-        ;;
-    esac
-  done < <(git diff --name-only -z "${latest_tag}^{commit}" HEAD)
+  git ls-tree -r --name-only -z HEAD -- changes >"$selected_paths"
+  empty_tree=$(git hash-object -t tree --stdin </dev/null)
+  git diff \
+    --no-color --no-ext-diff --no-textconv --no-renames \
+    --name-only -z "$empty_tree" HEAD >"$changed_paths"
+fi
 
-  if ((releaseable_change == 1)); then
-    release=true
+while IFS= read -r -d '' changed_path; do
+  case $changed_path in
+    changes/*)
+      ;;
+    *)
+      classification=$("$classifier" "$changed_path")
+      case "$classification" in
+        releaseable)
+          release=true
+          ;;
+        non-releaseable)
+          ;;
+        *)
+          fail "CLI release path classifier returned an invalid result."
+          ;;
+      esac
+      ;;
+  esac
+done <"$changed_paths"
+
+if [[ $release == true ]]; then
+  if [[ -n $latest_tag ]]; then
     reason=releaseable-changes
+  else
+    reason=initial-release
   fi
 fi
 
-printf 'release=%s\n' "$release"
-printf 'reason=%s\n' "$reason"
-printf 'version=%s\n' "$version"
-printf 'tag=%s\n' "$tag"
-printf 'latest_tag=%s\n' "$latest_tag"
+render_args=(--candidate HEAD)
+if [[ -n $latest_tag ]]; then
+  render_args+=(--latest-tag "$latest_tag")
+fi
+"$renderer" "${render_args[@]}" >"$rendered_notes"
+changelog_sha256=$(sha256sum "$rendered_notes" | cut -d' ' -f1)
+
+categories=()
+while IFS= read -r -d '' path; do
+  if [[ $path =~ ^changes/(breaking|added|changed|fixed|internal)/[0-9a-f]{32}[.]md$ ]]; then
+    categories+=("${BASH_REMATCH[1]}")
+  fi
+done <"$selected_paths"
+
+impact_args=(
+  plan
+  --series "$series"
+  --release "$release"
+  --reason "$reason"
+  --source-revision "$source_revision"
+  --changelog-sha256 "$changelog_sha256"
+)
+if [[ -n $latest_tag ]]; then
+  impact_args+=(--latest-tag "$latest_tag")
+fi
+"$impact_planner" "${impact_args[@]}" -- "${categories[@]}" >"$plan_file"
+plan_digest=$(sha256sum "$plan_file" | cut -d' ' -f1)
+if [[ $approved_digest != none && $approved_digest != "$plan_digest" ]]; then
+  fail "Approved release-plan digest does not match the recomputed plan."
+fi
+
+plan_field() {
+  local name=$1
+  awk -F= -v name="$name" '$1 == name { print $2 }' "$plan_file"
+}
+
+if [[ -n $head_tag ]]; then
+  planned_release=$(plan_field release)
+  planned_tag=$(plan_field tag)
+  [[ $planned_release == true && $planned_tag == "$head_tag" ]] \
+    || fail "Current mirror commit tag $head_tag does not match its semantic release plan."
+  printf 'release=false\n'
+  printf 'reason=already-released\n'
+  printf 'impact=%s\n' "$(plan_field impact)"
+  printf 'series=%s\n' "$(plan_field series)"
+  printf 'version=%s\n' "$(plan_field version)"
+  printf 'tag=%s\n' "$planned_tag"
+  printf 'latest_tag=%s\n' "$head_tag"
+  printf 'latest_stable_version=%s\n' "${head_tag#v}"
+  printf 'mirror_commit=%s\n' "$mirror_commit"
+  printf 'source_revision=%s\n' "$(plan_field source_revision)"
+  printf 'changelog_sha256=%s\n' "$(plan_field changelog_sha256)"
+  printf 'plan_digest=%s\n' "$plan_digest"
+  printf 'approved_digest=%s\n' "$approved_digest"
+  exit 0
+fi
+
+printf 'release=%s\n' "$(plan_field release)"
+printf 'reason=%s\n' "$(plan_field reason)"
+printf 'impact=%s\n' "$(plan_field impact)"
+printf 'series=%s\n' "$(plan_field series)"
+printf 'version=%s\n' "$(plan_field version)"
+printf 'tag=%s\n' "$(plan_field tag)"
+printf 'latest_tag=%s\n' "$(plan_field latest_stable_tag)"
+printf 'latest_stable_version=%s\n' "$(plan_field latest_stable_version)"
 printf 'mirror_commit=%s\n' "$mirror_commit"
-printf 'source_revision=%s\n' "$source_revision"
+printf 'source_revision=%s\n' "$(plan_field source_revision)"
+printf 'changelog_sha256=%s\n' "$(plan_field changelog_sha256)"
+printf 'plan_digest=%s\n' "$plan_digest"
+printf 'approved_digest=%s\n' "$approved_digest"

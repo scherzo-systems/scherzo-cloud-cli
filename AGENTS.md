@@ -30,14 +30,18 @@ release build.
 
 Keep `release.toml` as the authoritative `MAJOR.MINOR` release series. Keep the Cargo
 package fallback at the matching `MAJOR.MINOR.0`; packaged builds inject their complete
-version. Run both release fixture suites when changing release logic. Do not duplicate
-version-transition, tag-selection, or releaseable-path rules in workflow YAML or Nix.
+version. Select release intent with the fragment category in the same candidate:
+`internal`, `fixed`, and compatible `changed` mean patch; `added` means minor; and
+`breaking` means minor before `1.0` or major afterward. Use the highest impact since the
+latest stable tag, and do not advance an already-selected unreleased series again. Update
+`release.toml`, `Cargo.toml`, and `Cargo.lock` together when that impact changes the
+series. Run the release fixture suites when changing release logic. Do not duplicate
+impact, tag-selection, or releaseable-path rules in workflow YAML, Nix, or prompts.
 
-Before `1.0`, breaking behavior requires an adjacent minor-series bump. Major-series
-bumps must be adjacent and reset minor to zero. Automatic releases run only for a checked
-synthetic `main` push. Preserve read-only permissions for checks and builds, grant write
-only to the final release job, pin every action by commit, and keep pull requests and
-manual dispatch incapable of publication.
+Minor and major transitions must be adjacent, and a major bump resets minor to zero.
+Automatic releases run only for a checked synthetic `main` push. Preserve read-only
+permissions for checks and builds, grant write only to the final release job, pin every
+action by commit, and keep pull requests and manual dispatch incapable of publication.
 
 ## Release-note fragments
 

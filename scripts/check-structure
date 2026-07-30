@@ -25,8 +25,10 @@ required_files=(
   scripts/check-msrv
   scripts/check-structure
   scripts/classify-release-path
+  scripts/release-impact
   scripts/render-release-notes
   scripts/test-change-fragments
+  scripts/test-release-impact
   scripts/test-release-notes
   scripts/test-release-path-classifier
   tests/fixtures/lint-policy/main.rs
@@ -62,6 +64,7 @@ done < <(find "$public_root/scripts" -type f -print0)
 "$public_root/scripts/check-change-fragments"
 "$public_root/scripts/test-release-notes"
 "$public_root/scripts/test-release"
+"$public_root/scripts/test-release-impact"
 "$public_root/scripts/test-release-path-classifier"
 "$public_root/scripts/test-release-planner"
 "$public_root/scripts/check-release"

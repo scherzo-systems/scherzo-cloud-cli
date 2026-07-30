@@ -42,11 +42,17 @@ jobs:
     outputs:
       release: ${{ steps.plan.outputs.release }}
       reason: ${{ steps.plan.outputs.reason }}
+      impact: ${{ steps.plan.outputs.impact }}
+      series: ${{ steps.plan.outputs.series }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       latest_tag: ${{ steps.plan.outputs.latest_tag }}
+      latest_stable_version: ${{ steps.plan.outputs.latest_stable_version }}
       mirror_commit: ${{ steps.plan.outputs.mirror_commit }}
       source_revision: ${{ steps.plan.outputs.source_revision }}
+      changelog_sha256: ${{ steps.plan.outputs.changelog_sha256 }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
+      approved_digest: ${{ steps.plan.outputs.approved_digest }}
     steps:
       - name: Check out release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,11 +71,17 @@ jobs:
             {
               echo "release=false"
               echo "reason=mirror-advanced"
-              echo "version="
-              echo "tag="
-              echo "latest_tag="
+              echo "impact=none"
+              echo "series=none"
+              echo "version=none"
+              echo "tag=none"
+              echo "latest_tag=none"
+              echo "latest_stable_version=none"
               echo "mirror_commit=$GITHUB_SHA"
-              echo "source_revision="
+              echo "source_revision=none"
+              echo "changelog_sha256=none"
+              echo "plan_digest=none"
+              echo "approved_digest=none"
             } >>"$GITHUB_OUTPUT"
             echo "Public main advanced to $remote_main; this workflow will not release $GITHUB_SHA."
             exit 0
@@ -205,9 +217,14 @@ jobs:
         id: recheck
         shell: bash
         env:
+          EXPECTED_IMPACT: ${{ needs.plan_release.outputs.impact }}
           EXPECTED_VERSION: ${{ needs.plan_release.outputs.version }}
           EXPECTED_TAG: ${{ needs.plan_release.outputs.tag }}
+          EXPECTED_LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}
           EXPECTED_SOURCE_REVISION: ${{ needs.plan_release.outputs.source_revision }}
+          EXPECTED_CHANGELOG_SHA256: ${{ needs.plan_release.outputs.changelog_sha256 }}
+          EXPECTED_PLAN_DIGEST: ${{ needs.plan_release.outputs.plan_digest }}
+          EXPECTED_APPROVED_DIGEST: ${{ needs.plan_release.outputs.approved_digest }}
         run: |
           set -euo pipefail
           git fetch --force --tags origin
@@ -225,9 +242,14 @@ jobs:
           ./scripts/plan-release >"$plan_file"
           planned_release=$(awk -F= '$1 == "release" { print $2 }' "$plan_file")
           planned_reason=$(awk -F= '$1 == "reason" { print $2 }' "$plan_file")
+          planned_impact=$(awk -F= '$1 == "impact" { print $2 }' "$plan_file")
           planned_version=$(awk -F= '$1 == "version" { print $2 }' "$plan_file")
           planned_tag=$(awk -F= '$1 == "tag" { print $2 }' "$plan_file")
+          planned_latest_tag=$(awk -F= '$1 == "latest_tag" { print $2 }' "$plan_file")
           planned_source=$(awk -F= '$1 == "source_revision" { print $2 }' "$plan_file")
+          planned_changelog=$(awk -F= '$1 == "changelog_sha256" { print $2 }' "$plan_file")
+          planned_digest=$(awk -F= '$1 == "plan_digest" { print $2 }' "$plan_file")
+          planned_approved=$(awk -F= '$1 == "approved_digest" { print $2 }' "$plan_file")
 
           if [[ "$planned_release" == "false" && "$planned_reason" == "already-released" ]]; then
             echo "publish=false" >>"$GITHUB_OUTPUT"
@@ -236,15 +258,20 @@ jobs:
             exit 0
           fi
           if [[ "$planned_release" != "true" \
+            || "$planned_impact" != "$EXPECTED_IMPACT" \
             || "$planned_version" != "$EXPECTED_VERSION" \
             || "$planned_tag" != "$EXPECTED_TAG" \
-            || "$planned_source" != "$EXPECTED_SOURCE_REVISION" ]]; then
+            || "$planned_latest_tag" != "$EXPECTED_LATEST_TAG" \
+            || "$planned_source" != "$EXPECTED_SOURCE_REVISION" \
+            || "$planned_changelog" != "$EXPECTED_CHANGELOG_SHA256" \
+            || "$planned_digest" != "$EXPECTED_PLAN_DIGEST" \
+            || "$planned_approved" != "$EXPECTED_APPROVED_DIGEST" ]]; then
             echo "Release plan changed between build and publication." >&2
             cat "$plan_file" >&2
             exit 1
           fi
           echo "publish=true" >>"$GITHUB_OUTPUT"
-          echo "reason=releaseable-changes" >>"$GITHUB_OUTPUT"
+          echo "reason=$planned_reason" >>"$GITHUB_OUTPUT"
       - name: Validate archives and create checksums
         if: steps.recheck.outputs.publish == 'true'
         shell: bash
@@ -307,7 +334,7 @@ jobs:
           rendered_notes=$RUNNER_TEMP/rendered-release-notes.md
           release_notes=$RUNNER_TEMP/release-notes.md
           render_args=(--candidate HEAD)
-          if [[ -n "$LATEST_TAG" ]]; then
+          if [[ "$LATEST_TAG" != "none" ]]; then
             render_args+=(--latest-tag "$LATEST_TAG")
           fi
           ./scripts/render-release-notes "${render_args[@]}" >"$rendered_notes"

@@ -15,23 +15,18 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// UpdateOrganizationPatch : A merge patch containing at least one mutable organization profile field.
+/// ProposeDelegationRequest : A closed proposal naming one exact service principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateOrganizationPatch {
-    /// The new required organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+pub struct ProposeDelegationRequest {
+    #[serde(rename = "servicePrincipalId")]
+    pub service_principal_id: String,
 }
 
-impl UpdateOrganizationPatch {
-    /// A merge patch containing at least one mutable organization profile field.
-    pub fn new() -> UpdateOrganizationPatch {
-        UpdateOrganizationPatch {
-            display_name: None,
-            slug: None,
+impl ProposeDelegationRequest {
+    /// A closed proposal naming one exact service principal.
+    pub fn new(service_principal_id: String) -> ProposeDelegationRequest {
+        ProposeDelegationRequest {
+            service_principal_id,
         }
     }
 }

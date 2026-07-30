@@ -75,8 +75,7 @@ reset_fixture
 expect_output \
   "CLI release configuration is valid for series 0.1." \
   "$validator"
-expect_output "0.1.0" "$validator" --next-version
-expect_output "0.1.8" "$validator" --next-version v0.1.7
+expect_output "0.1" "$validator" --series
 expect_output \
   "CLI release tag is valid: v99.42.7." \
   "$validator" --validate-tag v99.42.7
@@ -90,12 +89,6 @@ EOF
 expect_output \
   "CLI release configuration is valid for series 0.1." \
   "$validator"
-
-reset_fixture 0.2
-expect_output "0.2.0" "$validator" --next-version v0.1.7
-
-reset_fixture 1.0
-expect_output "1.0.0" "$validator" --next-version v0.7.2
 
 reset_fixture
 rm "$fixture/release.toml"
@@ -204,38 +197,13 @@ expect_failure \
 reset_fixture
 for malformed_tag in 0.1.7 v0.1 v0.1.7-beta.1 v01.1.7; do
   expect_failure \
-    "Latest CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $malformed_tag" \
-    "$validator" --next-version "$malformed_tag"
+    "CLI release tag must use canonical vMAJOR.MINOR.PATCH syntax: $malformed_tag" \
+    "$validator" --validate-tag "$malformed_tag"
 done
-
-reset_fixture 0.1
-expect_failure \
-  "CLI release series 0.1 regresses from latest tag v0.2.0." \
-  "$validator" --next-version v0.2.0
-
-reset_fixture 0.3
-expect_failure \
-  "CLI release series 0.3 skips a minor release after v0.1.7." \
-  "$validator" --next-version v0.1.7
-
-reset_fixture 2.0
-expect_failure \
-  "CLI release series 2.0 skips a major release after v0.7.2." \
-  "$validator" --next-version v0.7.2
-
-reset_fixture 1.1
-expect_failure \
-  "CLI major release series 1.1 must reset the minor component to zero after v0.7.2." \
-  "$validator" --next-version v0.7.2
-
-reset_fixture 0.1
-expect_failure \
-  "CLI release patch cannot advance beyond 999999 for series 0.1." \
-  "$validator" --next-version v0.1.999999
 
 reset_fixture
 expect_failure \
-  "Latest CLI release tag components must not exceed 999999: v0.1.1000000" \
-  "$validator" --next-version v0.1.1000000
+  "CLI release tag components must not exceed 999999: v0.1.1000000" \
+  "$validator" --validate-tag v0.1.1000000
 
 printf 'CLI release checks passed.\n'

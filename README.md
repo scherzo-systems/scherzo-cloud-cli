@@ -276,19 +276,18 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 
 ## Release series
 
-`release.toml` declares the manually selected `MAJOR.MINOR` release series. The current
-series is `0.3`. Automatic release planning derives patches from immutable public tags,
-so the first release in this series is `0.3.0` and later compatible releases increment
-the patch.
+`release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
+`0.3`. Planning takes the highest fragment impact since the latest stable tag:
+`internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
+and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
+fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact
+planned version.
 
-Run `./scripts/check-release` to validate the declaration and its Cargo fallback. To
-preview version planning from an explicit latest tag, run:
-
-```sh
-./scripts/check-release --next-version v0.3.7
-```
-
-This prints `0.3.8`.
+Run `./scripts/check-release` to validate the declaration and Cargo fallback. Running
+`./scripts/plan-release` in a synthetic public mirror checkout binds the stable release,
+impact, exact proposed version and tag, source revision, and rendered-changelog digest
+into one deterministic plan. A series already advanced for an accumulated unreleased
+minor or major remains on that adjacent series.
 
 After every releaseable mirror update passes the public check, GitHub Actions builds and
 runs native archives for x86-64 and ARM64 Linux and for Intel and Apple Silicon macOS.

@@ -15,23 +15,19 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// UpdateOrganizationPatch : A merge patch containing at least one mutable organization profile field.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateOrganizationPatch {
-    /// The new required organization display name. Surrounding Unicode whitespace is removed before validation and storage.
-    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// The exact lowercase URL-safe organization slug.
-    #[serde(rename = "slug", skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
+pub struct DelegationList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::Delegation>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
-impl UpdateOrganizationPatch {
-    /// A merge patch containing at least one mutable organization profile field.
-    pub fn new() -> UpdateOrganizationPatch {
-        UpdateOrganizationPatch {
-            display_name: None,
-            slug: None,
+impl DelegationList {
+    pub fn new(items: Vec<models::Delegation>) -> DelegationList {
+        DelegationList {
+            items,
+            next_cursor: None,
         }
     }
 }

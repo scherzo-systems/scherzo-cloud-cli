@@ -50,6 +50,25 @@ for expected_mapping in \
     || fail "Write release notes must contain exactly one mapping: $expected_mapping"
 done
 
+# The write-enabled job must bind publication to the exact semantic plan
+# produced before native builds, not only to the candidate source revision.
+# GitHub expressions and extracted shell variables are fixture literals here.
+# shellcheck disable=SC1003,SC2016
+for expected_recheck in \
+  '          EXPECTED_IMPACT: ${{ needs.plan_release.outputs.impact }}' \
+  '          EXPECTED_LATEST_TAG: ${{ needs.plan_release.outputs.latest_tag }}' \
+  '          EXPECTED_CHANGELOG_SHA256: ${{ needs.plan_release.outputs.changelog_sha256 }}' \
+  '          EXPECTED_PLAN_DIGEST: ${{ needs.plan_release.outputs.plan_digest }}' \
+  '          EXPECTED_APPROVED_DIGEST: ${{ needs.plan_release.outputs.approved_digest }}' \
+  '            || "$planned_impact" != "$EXPECTED_IMPACT" \' \
+  '            || "$planned_latest_tag" != "$EXPECTED_LATEST_TAG" \' \
+  '            || "$planned_changelog" != "$EXPECTED_CHANGELOG_SHA256" \' \
+  '            || "$planned_digest" != "$EXPECTED_PLAN_DIGEST" \' \
+  '            || "$planned_approved" != "$EXPECTED_APPROVED_DIGEST" ]]; then'; do
+  [[ $(grep -Fxc "$expected_recheck" "$workflow" || true) -eq 1 ]] \
+    || fail "Public release recheck is missing exact semantic-plan binding: $expected_recheck"
+done
+
 awk '
   $0 == "        run: |" {
     in_run = 1
@@ -186,7 +205,7 @@ while IFS= read -r -d '' case_dir; do
     (
       cd "$fixture"
       GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-      LATEST_TAG="$latest_tag" \
+      LATEST_TAG="${latest_tag:-none}" \
       RUNNER_TEMP="$runner_temp" \
       SOURCE_REVISION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
       VERSION=0.1.1 \

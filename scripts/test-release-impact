@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-release-impact" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+planner=$script_dir/release-impact
+source_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+changelog_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+field() {
+  local name=$1
+  awk -F= -v name="$name" '$1 == name { print $2 }'
+}
+
+expect_transition() {
+  local latest_tag=$1
+  local category=$2
+  local series=$3
+  local expected_impact=$4
+  local expected_version=$5
+  local output actual
+  output=$(
+    "$planner" plan \
+      --series "$series" \
+      --latest-tag "$latest_tag" \
+      --release true \
+      --reason releaseable-changes \
+      --source-revision "$source_revision" \
+      --changelog-sha256 "$changelog_sha" \
+      "$category"
+  ) || fail "Expected $latest_tag / $category planning to succeed."
+  for expectation in \
+    "impact=$expected_impact" \
+    "version=$expected_version" \
+    "tag=v$expected_version"; do
+    name=${expectation%%=*}
+    expected=${expectation#*=}
+    actual=$(field "$name" <<<"$output")
+    [[ $actual == "$expected" ]] \
+      || fail "Expected $name=$expected for $latest_tag / $category; found $actual."
+  done
+}
+
+expect_failure() {
+  local description=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    fail "$description: expected failure."
+  fi
+}
+
+expect_transition v0.2.7 fixed 0.2 patch 0.2.8
+expect_transition v0.2.7 internal 0.2 patch 0.2.8
+expect_transition v0.2.7 changed 0.2 patch 0.2.8
+expect_transition v0.2.7 added 0.3 minor 0.3.0
+expect_transition v0.2.7 breaking 0.3 minor 0.3.0
+expect_transition v1.4.7 added 1.5 minor 1.5.0
+expect_transition v1.4.7 breaking 2.0 major 2.0.0
+
+accumulated=$(
+  "$planner" validate \
+    --series 0.3 \
+    --latest-tag v0.2.7 \
+    added fixed added
+)
+[[ $(field impact <<<"$accumulated") == minor \
+  && $(field version <<<"$accumulated") == 0.3.0 ]] \
+  || fail "Accumulated additions did not remain in the adjacent minor series."
+
+no_release=$(
+  "$planner" plan \
+    --series 0.2 \
+    --latest-tag v0.2.7 \
+    --release false \
+    --reason no-releaseable-changes \
+    --source-revision "$source_revision" \
+    --changelog-sha256 "$changelog_sha"
+)
+[[ $(field impact <<<"$no_release") == none \
+  && $(field version <<<"$no_release") == none \
+  && $(field tag <<<"$no_release") == none ]] \
+  || fail "A documentation-only range did not remain no-release."
+
+expect_failure \
+  "addition without adjacent minor intent" \
+  "$planner" validate --series 0.2 --latest-tag v0.2.7 added
+expect_failure \
+  "patch with skipped intent" \
+  "$planner" validate --series 0.3 --latest-tag v0.2.7 fixed
+expect_failure \
+  "post-1.0 breaking minor intent" \
+  "$planner" validate --series 1.5 --latest-tag v1.4.7 breaking
+expect_failure \
+  "pre-1.0 breaking major intent" \
+  "$planner" validate --series 1.0 --latest-tag v0.2.7 breaking
+expect_failure \
+  "regressing intent" \
+  "$planner" validate --series 0.1 --latest-tag v0.2.7 fixed
+expect_failure \
+  "malformed stable tag" \
+  "$planner" validate --series 0.2 --latest-tag v0.02.7 fixed
+
+printf 'CLI release-impact checks passed.\n'

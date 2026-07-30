@@ -27,26 +27,32 @@ source-boundary, and release build checks used by CI.
 ## Release intent
 
 `release.toml` is the visible source of truth for the CLI's `MAJOR.MINOR` release series.
-Compatible releaseable work remains in the configured series and receives automatic
-patch versions after public checks pass. Before `1.0`, a breaking command or output
-change must advance the minor series by exactly one. A major bump must advance by exactly
-one and reset minor to zero.
+Choose its value together with the fragment category: `internal`, `fixed`, and compatible
+`changed` work stays in the stable series for a patch; `added` selects the adjacent minor
+series; and `breaking` selects the adjacent minor before `1.0` or the adjacent major,
+with minor reset to zero, from `1.0` onward. The highest impact across every fragment
+since the latest stable tag controls one cumulative plan, so a second addition behind an
+unreleased minor does not advance the series again.
 
 When changing the series, update the package fallback in `Cargo.toml` and `Cargo.lock` to
-`MAJOR.MINOR.0` in the same change. `./scripts/check-release` rejects inconsistent,
-regressing, skipped, or malformed release intent. `./scripts/classify-release-path` is
-the sole releaseable-path policy, while `./scripts/plan-release` inspects synthetic
-public Git history and remains the sole source of tag discovery and next-version
-planning for workflow automation.
+`MAJOR.MINOR.0` in the same change. `./scripts/check-release` validates the declaration
+and fallback, and `./scripts/release-impact` rejects missing, regressing, skipped, or
+impact-inconsistent intent. `./scripts/classify-release-path` is the sole releaseable-path
+policy, while `./scripts/plan-release` inspects synthetic public Git history and remains
+the source of exact tag discovery and deterministic semantic planning for workflow
+automation.
 
 ### Change fragments
 
 Record release intent under `changes/` (`cli/changes/` in the canonical monorepo).
-Choose the category by primary user impact: `added` for a new capability, `changed` for
-an observable compatible change, `fixed` for a corrected user-visible symptom, and
-`breaking` when users or integrations must adapt. A breaking note includes the migration
-in the same sentence. Use `internal` only when the change has no user-visible effect; its
-file must contain exactly `No user-visible changes.` and one newline.
+Choose the category by primary user impact: `added` for a new capability and an adjacent
+minor series, `changed` for an observable compatible patch, `fixed` for a corrected
+user-visible patch, and `breaking` when users or integrations must adapt. A breaking note
+includes the migration in the same sentence and selects an adjacent minor before `1.0`
+or an adjacent major afterward. Use `internal` only when the change has no user-visible
+effect; it selects a patch and its file must contain exactly
+`No user-visible changes.` and one newline. Make the fragment, `release.toml`, Cargo
+fallback, and lockfile update one coherent candidate change.
 
 Generate the filename from the canonical monorepo root with the exact command in
 [`changes/README.md`](changes/README.md):

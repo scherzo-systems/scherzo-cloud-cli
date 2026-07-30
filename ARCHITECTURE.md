@@ -261,26 +261,35 @@ calls. `output.rs` exhaustively maps the four route-specific outcomes to human t
 schema-version-1 JSON, and process status. The command modules never expose generated
 DTOs or map raw HTTP statuses independently.
 
-`release.toml` is the public release-intent contract. It selects only the manually
-managed `MAJOR.MINOR` series; immutable public release tags provide patch history. The
-Cargo package version remains the matching `MAJOR.MINOR.0` fallback so source builds are
-coherent without pretending to know an automatically assigned patch.
+`release.toml` is the public release-intent contract. It selects the reviewed
+`MAJOR.MINOR` series, immutable public tags provide stable history, and fragment
+categories supply semantic impact. Patch categories retain the stable series, additions
+select the adjacent minor, and breaking changes select an adjacent minor before `1.0` or
+an adjacent major afterward. The highest unreleased impact is evaluated from the stable
+tag, so accumulated work shares one target series. The Cargo package version remains the
+matching `MAJOR.MINOR.0` fallback so source builds are coherent without pretending to
+know an automatically assigned patch.
 
 Local builds report the package version from `Cargo.toml`. Reproducible release builds
 inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at compile time, and
 both `scherzo-cloud version` and `scherzo-cloud --version` read the same version.
 Structured version output also reports the resolved executable path and separately
 injected build identity. Packaging must verify the installed executable reports these
-exact values. `scripts/check-release` validates release-series syntax, Cargo fallback
-consistency, and candidate transitions before packaging. `scripts/plan-release`
-validates synthetic public history, selects the latest tag numerically, suppresses stale
-or non-releaseable work, and emits the only version plan consumed by GitHub Actions. The
-version schema does not infer or advertise a release channel.
+exact values. `scripts/check-release` validates release-series syntax and Cargo fallback
+consistency, while `scripts/release-impact` is the shared semantic policy used by
+candidate validation and deterministic evidence. `scripts/plan-release` validates
+synthetic public history, selects the latest tag numerically, derives the cumulative
+impact, suppresses stale or non-releaseable work, and emits the digest-bound version plan
+consumed and independently rechecked by GitHub Actions. The version schema does not infer
+or advertise a release channel.
 
 Public GitHub Actions builds each supported target on its native architecture and grants
-write permission only to the final job after checks and builds pass. Release tags point
-directly to exact synthetic mirror commits; automation never writes generated version
-commits to `main`. Archives contain the executable, public README, and license, and ship
+write permission only to the final job after checks and builds pass. Managed mirror
+commits carry the approved deterministic plan digest alongside `Source-Revision`; the
+public planner independently reproduces it, while legacy commits without that trailer
+remain valid until mirror-authority cutover. Release tags point directly to exact
+synthetic mirror commits; automation never writes generated version commits to `main`.
+Archives contain the executable, public README, and license, and ship
 with aggregate checksums and GitHub provenance attestations. Signing, notarization,
 installers, package-manager metadata, and update channels remain separate decisions.
 
