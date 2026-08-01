@@ -127,13 +127,18 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             Arc::<[u8]>::from([0, 0xff, b'\n']),
         )]),
     );
-    let admitted = admit_command_workflow(
+    let admitted = admit_workflow(
         resolved,
         imports,
         ExecutionContext::new(
             fixture.execution_root.join("."),
             ExecutionRootLifecycle::CallerOwnedRetained,
             3,
+            2 * 1024 * 1024,
+            EnvironmentSnapshot::new([
+                ("PATH", "/admitted/bin"),
+                ("SCHERZO_INHERITED", "must be removed"),
+            ]),
             CancellationPolicy::new(cancellation, Duration::from_secs(15)),
         ),
     )
@@ -150,6 +155,28 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
     assert_eq!(
         admitted.execution().limits().maximum_parallel_steps().get(),
         3
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_file_output_bytes()
+            .get(),
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .environment()
+            .variable(std::ffi::OsStr::new("PATH")),
+        Some(std::ffi::OsStr::new("/admitted/bin"))
+    );
+    assert!(
+        admitted
+            .execution()
+            .environment()
+            .variable(std::ffi::OsStr::new("SCHERZO_INHERITED"))
+            .is_none()
     );
     assert_eq!(
         admitted.execution().cancellation().grace(),
@@ -198,7 +225,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
     let missing = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     let missing_root = missing.execution_root.join("missing");
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             missing.resolve(),
             ResolvedImports::default(),
             execution_context(
@@ -216,7 +243,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
     let file_root = file.execution_root.join("not-a-directory");
     fs::write(&file_root, b"file\n").unwrap();
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             file.resolve(),
             ResolvedImports::default(),
             execution_context(
@@ -235,7 +262,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
 fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy() {
     let zero_parallelism = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             zero_parallelism.resolve(),
             ResolvedImports::default(),
             zero_parallelism.context(
@@ -248,9 +275,27 @@ fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy()
         AdmissionLocation::MaximumParallelSteps,
     );
 
+    let zero_file_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    assert_failure(
+        admit_workflow(
+            zero_file_limit.resolve(),
+            ResolvedImports::default(),
+            ExecutionContext::new(
+                zero_file_limit.execution_root.clone(),
+                ExecutionRootLifecycle::EngineOwnedRetained,
+                1,
+                0,
+                EnvironmentSnapshot::default(),
+                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+            ),
+        ),
+        AdmissionFailureKind::NonPositiveFileOutputBytes,
+        AdmissionLocation::MaximumFileOutputBytes,
+    );
+
     let zero_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             zero_grace.resolve(),
             ResolvedImports::default(),
             zero_grace.context(
@@ -265,7 +310,7 @@ fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy()
 
     let excessive_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             excessive_grace.resolve(),
             ResolvedImports::default(),
             excessive_grace.context(
@@ -283,7 +328,7 @@ fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy()
 fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations() {
     let missing_prompt = WorkflowFixture::new(COMMAND_WORKFLOW);
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             missing_prompt.resolve(),
             ResolvedImports::default(),
             missing_prompt.context(
@@ -298,7 +343,7 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
 
     let agent = WorkflowFixture::new(AGENT_WORKFLOW);
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             agent.resolve(),
             ResolvedImports::default(),
             agent.context(
@@ -329,7 +374,7 @@ fn admission_rejects_invalid_attachment_media_type() {
     );
 
     assert_failure(
-        admit_command_workflow(
+        admit_workflow(
             fixture.resolve(),
             imports,
             fixture.context(
@@ -351,7 +396,7 @@ fn admitted_root_lifecycle_preserves_each_closed_ownership_variant() {
         ExecutionRootLifecycle::EngineOwnedEphemeral,
     ] {
         let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
-        let admitted = admit_command_workflow(
+        let admitted = admit_workflow(
             fixture.resolve(),
             ResolvedImports::default(),
             fixture.context(lifecycle, 1, MAX_CANCELLATION_GRACE),
@@ -371,6 +416,8 @@ fn execution_context(
         root,
         lifecycle,
         maximum_parallel_steps,
+        1024 * 1024,
+        EnvironmentSnapshot::default(),
         CancellationPolicy::new(CancellationSource::new(), grace),
     )
 }
@@ -391,7 +438,7 @@ fn root_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 fn assert_failure(
-    result: Result<AdmittedCommandWorkflow, AdmissionFailure>,
+    result: Result<AdmittedWorkflow, AdmissionFailure>,
     kind: AdmissionFailureKind,
     location: AdmissionLocation,
 ) {

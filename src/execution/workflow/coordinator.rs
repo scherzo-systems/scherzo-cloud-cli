@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use super::admission::AdmittedCommandWorkflow;
+use super::admission::AdmittedWorkflow;
 use super::runtime::{
     self, ActionId, CancellationRequest, Occurrence, OutputSet, Reduction, RequestedAction,
     RuntimeState, TransitionEvent, WorkflowState,
@@ -89,7 +89,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         Self(Occurrence::StepQuiesced { step, action })
     }
 
-    fn into_runtime<Deadline>(self) -> Occurrence<Provisional, Cause, Output, Deadline> {
+    pub(crate) fn into_runtime<Deadline>(self) -> Occurrence<Provisional, Cause, Output, Deadline> {
         match self.0 {
             Occurrence::StepStarted { step, action } => Occurrence::StepStarted { step, action },
             Occurrence::StepStartFailed {
@@ -164,6 +164,17 @@ pub(crate) struct OccurrenceReceiver<Provisional, Cause, Output> {
     receiver: mpsc::Receiver<DriverOccurrence<Provisional, Cause, Output>>,
 }
 
+impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> {
+    pub(crate) async fn recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
+        self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
+        self.receiver.try_recv().ok()
+    }
+}
+
 pub(crate) fn occurrence_channel<Provisional, Cause, Output>(
     capacity: NonZeroUsize,
 ) -> (
@@ -174,10 +185,12 @@ pub(crate) fn occurrence_channel<Provisional, Cause, Output>(
     (OccurrenceSender { sender }, OccurrenceReceiver { receiver })
 }
 
-pub(crate) trait CoordinatorClock {
-    type Instant: Add<Duration, Output = Self::Instant> + Clone;
+pub(crate) trait CoordinatorClock: Clone + Send + Sync + 'static {
+    type Instant: Add<Duration, Output = Self::Instant> + Clone + Send + 'static;
 
     fn now(&mut self) -> Self::Instant;
+
+    fn wait_until(&self, deadline: Self::Instant) -> impl Future<Output = ()> + Send;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +210,7 @@ pub(crate) trait ActionPort<Action> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoordinationError {
+    ArtifactStagingMismatch,
     OccurrenceChannelClosed,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
@@ -212,7 +226,7 @@ pub(crate) struct Coordinator<Provisional, Cause, Output, Clock, Commits, Action
 where
     Clock: CoordinatorClock,
 {
-    admitted: AdmittedCommandWorkflow,
+    admitted: AdmittedWorkflow,
     occurrences: OccurrenceReceiver<Provisional, Cause, Output>,
     clock: Clock,
     commits: Commits,
@@ -230,7 +244,7 @@ where
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
 {
     pub(crate) fn new(
-        admitted: AdmittedCommandWorkflow,
+        admitted: AdmittedWorkflow,
         occurrences: OccurrenceReceiver<Provisional, Cause, Output>,
         clock: Clock,
         commits: Commits,

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::admission::{AdmittedCommandWorkflow, CancellationReason};
+use super::admission::{AdmittedWorkflow, CancellationReason};
 use super::validated::{ValidatedCommonStep, ValidatedStep, ValidatedWorkflow};
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -179,7 +179,7 @@ struct RuntimeDefinition {
 }
 
 impl RuntimeDefinition {
-    fn from_admitted(admitted: &AdmittedCommandWorkflow) -> Self {
+    fn from_admitted(admitted: &AdmittedWorkflow) -> Self {
         Self::from_workflow(
             &admitted.workflow().definition,
             admitted.execution().limits().maximum_parallel_steps(),
@@ -360,7 +360,7 @@ pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
 }
 
 pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
-    admitted: &AdmittedCommandWorkflow,
+    admitted: &AdmittedWorkflow,
     initial_cancellation: Option<CancellationRequest<Deadline>>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where

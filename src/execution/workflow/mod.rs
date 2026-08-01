@@ -1,12 +1,14 @@
 #![deny(clippy::disallowed_methods)]
 
 pub(crate) mod admission;
+pub(crate) mod artifact;
 pub(crate) mod coordinator;
 pub(crate) mod document;
 mod pi;
 pub(crate) mod resolution;
 pub(crate) mod runtime;
 mod schema;
+pub(crate) mod step_runtime;
 mod strict_yaml;
 pub(crate) mod validated;
 pub(crate) mod validation;

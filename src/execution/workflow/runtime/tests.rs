@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, ExecutionContext,
-    ExecutionRootLifecycle, ResolvedImports, admit_command_workflow,
+    CancellationPolicy, CancellationReason, CancellationSource, EnvironmentSnapshot,
+    ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -380,13 +380,15 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
         "schemaVersion: 1\nsteps:\n  zeta:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  alpha:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        path: report.txt\n        mediaType: text/plain\n",
     )
     .unwrap();
-    let admitted = admit_command_workflow(
+    let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
+            1024 * 1024,
+            EnvironmentSnapshot::default(),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),
     )

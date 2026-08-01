@@ -43,6 +43,16 @@ for required_file in "${required_files[@]}"; do
   fi
 done
 
+for timing_policy_module in \
+  src/runner/service/mod.rs \
+  src/execution/workflow/mod.rs; do
+  IFS= read -r first_line <"$public_root/$timing_policy_module"
+  if [[ "$first_line" != '#![deny(clippy::disallowed_methods)]' ]]; then
+    echo "Timing-sensitive module must deny the checked-in disallowed methods: $timing_policy_module" >&2
+    exit 1
+  fi
+done
+
 symbolic_link=$(
   find "$public_root" \
     \( -name '.devenv*' -o -name .direnv -o -name target \) -prune -o \

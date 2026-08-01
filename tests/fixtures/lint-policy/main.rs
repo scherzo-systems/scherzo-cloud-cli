@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_methods)]
+
 #[allow(dead_code)]
 fn reasonless_suppression() {}
 
@@ -13,6 +15,15 @@ fn lossy_cast(value: u64) -> u8 {
 
 fn direct_compile_time_environment_read() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+fn timing_dependent_thread_synchronization() {
+    std::thread::yield_now();
+    std::thread::park_timeout(std::time::Duration::from_millis(1));
+}
+
+async fn timing_dependent_task_synchronization() {
+    tokio::task::yield_now().await;
 }
 
 fn main() {

@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, ExecutionContext,
-    ExecutionRootLifecycle, ResolvedImports, admit_command_workflow,
+    CancellationPolicy, CancellationReason, CancellationSource, EnvironmentSnapshot,
+    ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{Action, StepState};
@@ -36,6 +36,7 @@ impl Add<Duration> for TestInstant {
     }
 }
 
+#[derive(Clone)]
 struct TestClock {
     instant: TestInstant,
     reads: Arc<AtomicUsize>,
@@ -47,6 +48,10 @@ impl CoordinatorClock for TestClock {
     fn now(&mut self) -> Self::Instant {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.instant
+    }
+
+    async fn wait_until(&self, _deadline: Self::Instant) {
+        std::future::pending().await
     }
 }
 
@@ -104,7 +109,7 @@ impl ActionPort<TestAction> for ControlledActionPort {
 
 struct AdmittedFixture {
     _temporary: tempfile::TempDir,
-    admitted: AdmittedCommandWorkflow,
+    admitted: AdmittedWorkflow,
 }
 
 fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixture {
@@ -114,13 +119,15 @@ fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixt
     fs::create_dir(&source_root).unwrap();
     fs::create_dir(&execution_root).unwrap();
     fs::write(source_root.join("workflow.yaml"), WORKFLOW).unwrap();
-    let admitted = admit_command_workflow(
+    let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
+            1024 * 1024,
+            EnvironmentSnapshot::default(),
             CancellationPolicy::new(source, grace),
         ),
     )

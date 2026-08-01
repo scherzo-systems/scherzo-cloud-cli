@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,11 +124,60 @@ impl CancellationPolicy {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EnvironmentSnapshot {
+    variables: Arc<BTreeMap<OsString, OsString>>,
+}
+
+impl EnvironmentSnapshot {
+    pub(crate) fn new<I, Name, Value>(variables: I) -> Self
+    where
+        I: IntoIterator<Item = (Name, Value)>,
+        Name: Into<OsString>,
+        Value: Into<OsString>,
+    {
+        Self {
+            variables: Arc::new(
+                variables
+                    .into_iter()
+                    .map(|(name, value)| (name.into(), value.into()))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn variables(&self) -> &BTreeMap<OsString, OsString> {
+        &self.variables
+    }
+
+    pub(crate) fn variable(&self, name: &OsStr) -> Option<&OsStr> {
+        self.variables.get(name).map(OsString::as_os_str)
+    }
+
+    fn without_reserved_variables(self) -> Self {
+        Self {
+            variables: Arc::new(
+                self.variables
+                    .iter()
+                    .filter(|(name, _)| !is_reserved_environment_name(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn is_reserved_environment_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"SCHERZO_")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
     root_lifecycle: ExecutionRootLifecycle,
     maximum_parallel_steps: usize,
+    maximum_file_output_bytes: u64,
+    environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
 }
 
@@ -135,12 +186,16 @@ impl ExecutionContext {
         root: PathBuf,
         root_lifecycle: ExecutionRootLifecycle,
         maximum_parallel_steps: usize,
+        maximum_file_output_bytes: u64,
+        environment: EnvironmentSnapshot,
         cancellation: CancellationPolicy,
     ) -> Self {
         Self {
             root,
             root_lifecycle,
             maximum_parallel_steps,
+            maximum_file_output_bytes,
+            environment,
             cancellation,
         }
     }
@@ -149,11 +204,16 @@ impl ExecutionContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionLimits {
     maximum_parallel_steps: NonZeroUsize,
+    maximum_file_output_bytes: NonZeroU64,
 }
 
 impl ExecutionLimits {
     pub(crate) fn maximum_parallel_steps(self) -> NonZeroUsize {
         self.maximum_parallel_steps
+    }
+
+    pub(crate) fn maximum_file_output_bytes(self) -> NonZeroU64 {
+        self.maximum_file_output_bytes
     }
 }
 
@@ -162,6 +222,7 @@ pub(crate) struct AdmittedExecutionContext {
     root: PathBuf,
     root_lifecycle: ExecutionRootLifecycle,
     limits: ExecutionLimits,
+    environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
 }
 
@@ -178,19 +239,23 @@ impl AdmittedExecutionContext {
         self.limits
     }
 
+    pub(crate) fn environment(&self) -> &EnvironmentSnapshot {
+        &self.environment
+    }
+
     pub(crate) fn cancellation(&self) -> &CancellationPolicy {
         &self.cancellation
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AdmittedCommandWorkflow {
+pub(crate) struct AdmittedWorkflow {
     workflow: Arc<ResolvedWorkflow>,
     imports: ResolvedImports,
     execution: AdmittedExecutionContext,
 }
 
-impl AdmittedCommandWorkflow {
+impl AdmittedWorkflow {
     pub(crate) fn workflow(&self) -> &ResolvedWorkflow {
         &self.workflow
     }
@@ -212,6 +277,7 @@ pub(crate) enum AdmissionFailureKind {
     ExecutionRootUnavailable,
     ExecutionRootNotDirectory,
     NonPositiveParallelism,
+    NonPositiveFileOutputBytes,
     NonPositiveCancellationGrace,
     CancellationGraceTooLong,
 }
@@ -223,6 +289,7 @@ pub(crate) enum AdmissionLocation {
     Step { step: String },
     ExecutionRoot,
     MaximumParallelSteps,
+    MaximumFileOutputBytes,
     CancellationPolicy,
 }
 
@@ -258,11 +325,11 @@ impl fmt::Display for AdmissionFailure {
 
 impl std::error::Error for AdmissionFailure {}
 
-pub(crate) fn admit_command_workflow(
+pub(crate) fn admit_workflow(
     workflow: ResolvedWorkflow,
     imports: ResolvedImports,
     context: ExecutionContext,
-) -> Result<AdmittedCommandWorkflow, AdmissionFailure> {
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
     if workflow.required_imports().prompt && imports.prompt().is_none() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::MissingRequiredPrompt,
@@ -301,6 +368,13 @@ pub(crate) fn admit_command_workflow(
                 AdmissionLocation::MaximumParallelSteps,
             )
         })?;
+    let maximum_file_output_bytes =
+        NonZeroU64::new(context.maximum_file_output_bytes).ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveFileOutputBytes,
+                AdmissionLocation::MaximumFileOutputBytes,
+            )
+        })?;
     if context.cancellation.grace().is_zero() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::NonPositiveCancellationGrace,
@@ -315,7 +389,7 @@ pub(crate) fn admit_command_workflow(
     }
 
     let root = canonical_execution_root(&context.root)?;
-    Ok(AdmittedCommandWorkflow {
+    Ok(AdmittedWorkflow {
         workflow: Arc::new(workflow),
         imports,
         execution: AdmittedExecutionContext {
@@ -323,7 +397,9 @@ pub(crate) fn admit_command_workflow(
             root_lifecycle: context.root_lifecycle,
             limits: ExecutionLimits {
                 maximum_parallel_steps,
+                maximum_file_output_bytes,
             },
+            environment: context.environment.without_reserved_variables(),
             cancellation: context.cancellation,
         },
     })
