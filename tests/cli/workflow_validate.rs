@@ -58,16 +58,13 @@ steps:
   agent:
     kind: agent
     dependsOn: [prepare]
-    inputs:
-      prompt:
-        ref: imports.prompt
     agent:
       profile: coding
       systemPrompt: ../prompts/system.md
       message:
         text:
           - file: ../prompts/message.md
-          - ref: inputs.prompt
+          - ref: imports.prompt
         attachments:
           - file: ../attachments/data.txt
     outputs:
@@ -253,12 +250,23 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
     )
     .expect("invalid result schema should be written");
 
-    for (bundle, expected_code) in [
-        (malformed, "malformed_yaml"),
-        (semantic, "missing_dependency"),
-        (missing, "source_unavailable"),
-        (escaping, "source_path_escape"),
-        (invalid_schema, "invalid_result_schema"),
+    let missing_message_output = WorkflowBundle::valid();
+    let source = fs::read_to_string(missing_message_output.workflow_path())
+        .expect("workflow should be readable");
+    missing_message_output
+        .replace_workflow(&source.replace("ref: imports.prompt", "ref: outputs.missing.response"));
+
+    for (bundle, expected_code, expected_location) in [
+        (malformed, "malformed_yaml", "workflow"),
+        (semantic, "missing_dependency", "step_dependency"),
+        (missing, "source_unavailable", "system_prompt"),
+        (escaping, "source_path_escape", "system_prompt"),
+        (invalid_schema, "invalid_result_schema", "result_schema"),
+        (
+            missing_message_output,
+            "unknown_output_step",
+            "message_text",
+        ),
     ] {
         let human = validate(&bundle, false);
         assert_eq!(human.status.code(), Some(1));
@@ -284,7 +292,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0]["code"], expected_code);
         assert!(diagnostics[0]["message"].as_str().unwrap().len() <= 128);
-        assert!(diagnostics[0]["location"]["kind"].is_string());
+        assert_eq!(diagnostics[0]["location"]["kind"], expected_location);
         assert!(report.get("digest").is_none());
         assert!(report.get("stepCount").is_none());
         assert!(report.get("requiredImports").is_none());

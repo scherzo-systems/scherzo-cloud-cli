@@ -41,6 +41,7 @@ pub(crate) enum ValidatedStep {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedCommandStep {
     pub(crate) common: ValidatedCommonStep,
+    pub(crate) inputs: BTreeMap<String, ResolvedValueReference>,
     pub(crate) argv: Vec<String>,
 }
 
@@ -54,12 +55,11 @@ pub(crate) struct ValidatedAgentStep {
 pub(crate) struct ValidatedCommonStep {
     pub(crate) dependencies: Vec<String>,
     pub(crate) cwd: Option<String>,
-    pub(crate) inputs: BTreeMap<String, ValidatedInput>,
     pub(crate) outputs: BTreeMap<String, ValidatedOutput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedInput {
+pub(crate) struct ResolvedValueReference {
     pub(crate) source: ResolvedValueSource,
     pub(crate) value_type: WorkflowValueType,
 }
@@ -107,8 +107,8 @@ pub(crate) enum ValidatedMessageSource {
     File {
         path: String,
     },
-    Input {
-        name: String,
+    Reference {
+        source: ResolvedValueSource,
         value_type: WorkflowValueType,
     },
 }

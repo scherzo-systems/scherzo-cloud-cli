@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::document::{
     Agent, AgentMessage, AgentProfile, AgentStep, CommandStep, CommonStep, HarnessDefinition,
-    InputReference, MessageSource, Output, OutputReference, Step, WorkflowDocument,
+    MessageSource, Output, OutputReference, Step, ValueReference, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -28,6 +28,8 @@ enum StepDto {
     Command {
         #[serde(flatten)]
         common: CommonStepDto,
+        #[serde(default)]
+        inputs: BTreeMap<String, ReferenceDto>,
         command: CommandDto,
     },
     #[serde(rename = "agent")]
@@ -43,8 +45,6 @@ struct CommonStepDto {
     #[serde(rename = "dependsOn", default)]
     dependencies: Vec<String>,
     cwd: Option<String>,
-    #[serde(default)]
-    inputs: BTreeMap<String, ReferenceDto>,
     #[serde(default)]
     outputs: BTreeMap<String, OutputDto>,
 }
@@ -152,12 +152,17 @@ impl WorkflowDto {
 impl StepDto {
     fn into_step(self) -> Option<Step> {
         match self {
-            Self::Command { common, command } => Some(Step::Command(CommandStep {
-                common: common.into_common_step()?,
+            Self::Command {
+                common,
+                inputs,
+                command,
+            } => Some(Step::Command(CommandStep {
+                common: common.into_common_step(),
+                inputs: parse_references(inputs)?,
                 argv: command.argv,
             })),
             Self::Agent { common, agent } => Some(Step::Agent(AgentStep {
-                common: common.into_common_step()?,
+                common: common.into_common_step(),
                 agent: agent.into_agent()?,
             })),
         }
@@ -165,27 +170,30 @@ impl StepDto {
 }
 
 impl CommonStepDto {
-    fn into_common_step(self) -> Option<CommonStep> {
-        let inputs = self
-            .inputs
-            .into_iter()
-            .map(|(name, reference)| {
-                parse_input_reference(&reference.reference).map(|reference| (name, reference))
-            })
-            .collect::<Option<_>>()?;
+    fn into_common_step(self) -> CommonStep {
         let outputs = self
             .outputs
             .into_iter()
             .map(|(name, output)| (name, output.into_output()))
             .collect();
 
-        Some(CommonStep {
+        CommonStep {
             dependencies: self.dependencies,
             cwd: self.cwd,
-            inputs,
             outputs,
-        })
+        }
     }
+}
+
+fn parse_references(
+    references: BTreeMap<String, ReferenceDto>,
+) -> Option<BTreeMap<String, ValueReference>> {
+    references
+        .into_iter()
+        .map(|(name, reference)| {
+            parse_value_reference(&reference.reference).map(|reference| (name, reference))
+        })
+        .collect()
 }
 
 impl AgentProfileDto {
@@ -223,11 +231,7 @@ fn message_sources(sources: Vec<MessageSourceDto>) -> Option<Vec<MessageSource>>
         .map(|source| match source {
             MessageSourceDto::File { file } => Some(MessageSource::File { path: file }),
             MessageSourceDto::Reference { reference } => {
-                reference
-                    .strip_prefix("inputs.")
-                    .map(|name| MessageSource::Input {
-                        name: name.to_owned(),
-                    })
+                parse_value_reference(&reference).map(MessageSource::Reference)
             }
         })
         .collect()
@@ -243,14 +247,14 @@ impl OutputDto {
     }
 }
 
-fn parse_input_reference(reference: &str) -> Option<InputReference> {
+fn parse_value_reference(reference: &str) -> Option<ValueReference> {
     if let Some(name) = reference.strip_prefix("imports.") {
-        return Some(InputReference::Import {
+        return Some(ValueReference::Import {
             name: name.to_owned(),
         });
     }
 
-    parse_output_reference(reference).map(InputReference::Output)
+    parse_output_reference(reference).map(ValueReference::Output)
 }
 
 fn parse_output_reference(reference: &str) -> Option<OutputReference> {

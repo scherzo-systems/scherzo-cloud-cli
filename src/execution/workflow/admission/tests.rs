@@ -46,6 +46,7 @@ steps:
       message:
         text:
           - file: message.md
+          - ref: imports.prompt
 "#;
 
 struct WorkflowFixture {
@@ -346,6 +347,19 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
         admit_workflow(
             agent.resolve(),
             ResolvedImports::default(),
+            agent.context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            ),
+        ),
+        AdmissionFailureKind::MissingRequiredPrompt,
+        AdmissionLocation::PromptImport,
+    );
+    assert_failure(
+        admit_workflow(
+            agent.resolve(),
+            ResolvedImports::new(Some(Arc::<str>::from("Prompt.")), Arc::from([])),
             agent.context(
                 ExecutionRootLifecycle::EngineOwnedEphemeral,
                 1,

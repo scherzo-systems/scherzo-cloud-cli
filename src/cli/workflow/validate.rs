@@ -441,7 +441,7 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
         ),
         ValidationFailureKind::UnknownImport => (
             "unknown_import",
-            "Use a Workflow V1 import name or correct the input reference.",
+            "Use a Workflow V1 import name or correct the value reference.",
         ),
         ValidationFailureKind::UnknownOutputStep => (
             "unknown_output_step",
@@ -455,17 +455,9 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
             "output_producer_not_dependency",
             "Make the output producer a transitive dependency of the consuming step.",
         ),
-        ValidationFailureKind::UnknownMessageInput => (
-            "unknown_message_input",
-            "Bind the referenced message input in the agent step's inputs.",
-        ),
         ValidationFailureKind::MessageTypeMismatch => (
             "message_type_mismatch",
-            "Use an input type accepted by this message destination.",
-        ),
-        ValidationFailureKind::UnusedAgentInput => (
-            "unused_agent_input",
-            "Reference every agent input from message text or attachments.",
+            "Reference a value type accepted by this message destination.",
         ),
         ValidationFailureKind::IllegalCommandOutput => (
             "illegal_command_output",

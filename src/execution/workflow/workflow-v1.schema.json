@@ -47,10 +47,6 @@
       "type": "string",
       "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
-    "InputReferenceString": {
-      "type": "string",
-      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$"
-    },
     "OutputReferenceString": {
       "type": "string",
       "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
@@ -60,14 +56,6 @@
       "additionalProperties": false,
       "properties": {
         "ref": { "$ref": "#/$defs/ImportOrOutputReferenceString" }
-      },
-      "required": ["ref"]
-    },
-    "InputReference": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "ref": { "$ref": "#/$defs/InputReferenceString" }
       },
       "required": ["ref"]
     },
@@ -90,13 +78,13 @@
     "TextSource": {
       "oneOf": [
         { "$ref": "#/$defs/FileSource" },
-        { "$ref": "#/$defs/InputReference" }
+        { "$ref": "#/$defs/ImportOrOutputReference" }
       ]
     },
     "AttachmentSource": {
       "oneOf": [
         { "$ref": "#/$defs/FileSource" },
-        { "$ref": "#/$defs/InputReference" }
+        { "$ref": "#/$defs/ImportOrOutputReference" }
       ]
     },
     "InputBindings": {
@@ -247,7 +235,6 @@
         "kind": { "const": "agent" },
         "dependsOn": { "$ref": "#/$defs/Dependencies" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
-        "inputs": { "$ref": "#/$defs/InputBindings" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },
         "agent": { "$ref": "#/$defs/Agent" }
       },

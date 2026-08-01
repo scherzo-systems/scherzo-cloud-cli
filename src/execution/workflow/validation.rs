@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::document::{
-    Agent, CommonStep, HarnessDefinition, InputReference, MessageSource, Output, OutputReference,
-    Step, WorkflowDocument,
+    Agent, CommonStep, HarnessDefinition, MessageSource, Output, OutputReference, Step,
+    ValueReference, WorkflowDocument,
 };
 use super::pi;
 use super::validated::{
-    RequiredImports, ResolvedOutputSource, ResolvedValueSource, ValidatedAgent,
-    ValidatedAgentMessage, ValidatedAgentStep, ValidatedCommandStep, ValidatedCommonStep,
-    ValidatedHarness, ValidatedInput, ValidatedMessageSource, ValidatedOutput, ValidatedStep,
+    RequiredImports, ResolvedOutputSource, ResolvedValueReference, ResolvedValueSource,
+    ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep, ValidatedCommandStep,
+    ValidatedCommonStep, ValidatedHarness, ValidatedMessageSource, ValidatedOutput, ValidatedStep,
     ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 
@@ -25,9 +25,7 @@ pub(crate) enum ValidationFailureKind {
     UnknownOutputStep,
     UnknownOutput,
     OutputProducerNotDependency,
-    UnknownMessageInput,
     MessageTypeMismatch,
-    UnusedAgentInput,
     IllegalCommandOutput,
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
@@ -90,9 +88,10 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
     for (step_name, step) in &document.steps {
         let validated = match step {
             Step::Command(command) => ValidatedStep::Command(ValidatedCommandStep {
-                common: validate_common(
+                common: validate_common(&command.common),
+                inputs: validate_command_inputs(
                     step_name,
-                    &command.common,
+                    &command.inputs,
                     &document,
                     &graph.ancestors,
                     &mut required_imports,
@@ -100,16 +99,16 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
                 argv: command.argv.clone(),
             }),
             Step::Agent(agent) => {
-                let common = validate_common(
+                let common = validate_common(&agent.common);
+                let harness = resolve_agent_profile(step_name, &agent.agent, &agent_profiles)?;
+                let validated_agent = validate_agent(
                     step_name,
-                    &agent.common,
+                    &agent.agent,
                     &document,
                     &graph.ancestors,
                     &mut required_imports,
+                    harness,
                 )?;
-                let harness = resolve_agent_profile(step_name, &agent.agent, &agent_profiles)?;
-                let validated_agent =
-                    validate_agent(step_name, &agent.agent, &common.inputs, harness)?;
                 ValidatedStep::Agent(ValidatedAgentStep {
                     common,
                     agent: validated_agent,
@@ -274,28 +273,7 @@ fn output_failure(kind: ValidationFailureKind, step: &str, output: &str) -> Vali
     )
 }
 
-fn validate_common(
-    step_name: &str,
-    common: &CommonStep,
-    document: &WorkflowDocument,
-    ancestors: &BTreeMap<String, BTreeSet<String>>,
-    required_imports: &mut RequiredImports,
-) -> Result<ValidatedCommonStep, ValidationFailure> {
-    let inputs = common
-        .inputs
-        .iter()
-        .map(|(input_name, reference)| {
-            resolve_input(
-                step_name,
-                input_name,
-                reference,
-                document,
-                ancestors,
-                required_imports,
-            )
-            .map(|input| (input_name.clone(), input))
-        })
-        .collect::<Result<_, _>>()?;
+fn validate_common(common: &CommonStep) -> ValidatedCommonStep {
     let outputs = common
         .outputs
         .iter()
@@ -310,29 +288,49 @@ fn validate_common(
         })
         .collect();
 
-    Ok(ValidatedCommonStep {
+    ValidatedCommonStep {
         dependencies: common.dependencies.clone(),
         cwd: common.cwd.clone(),
-        inputs,
         outputs,
-    })
+    }
 }
 
-fn resolve_input(
+fn validate_command_inputs(
     step_name: &str,
-    input_name: &str,
-    reference: &InputReference,
+    inputs: &BTreeMap<String, ValueReference>,
     document: &WorkflowDocument,
     ancestors: &BTreeMap<String, BTreeSet<String>>,
     required_imports: &mut RequiredImports,
-) -> Result<ValidatedInput, ValidationFailure> {
-    let location = || ValidationLocation::StepInput {
-        step: step_name.to_owned(),
-        input: input_name.to_owned(),
-    };
+) -> Result<BTreeMap<String, ResolvedValueReference>, ValidationFailure> {
+    inputs
+        .iter()
+        .map(|(input_name, reference)| {
+            resolve_value_reference(
+                step_name,
+                reference,
+                document,
+                ancestors,
+                required_imports,
+                ValidationLocation::StepInput {
+                    step: step_name.to_owned(),
+                    input: input_name.clone(),
+                },
+            )
+            .map(|input| (input_name.clone(), input))
+        })
+        .collect()
+}
 
+fn resolve_value_reference(
+    step_name: &str,
+    reference: &ValueReference,
+    document: &WorkflowDocument,
+    ancestors: &BTreeMap<String, BTreeSet<String>>,
+    required_imports: &mut RequiredImports,
+    location: ValidationLocation,
+) -> Result<ResolvedValueReference, ValidationFailure> {
     match reference {
-        InputReference::Import { name } => {
+        ValueReference::Import { name } => {
             let (source, value_type) = match name.as_str() {
                 "prompt" => {
                     required_imports.prompt = true;
@@ -345,26 +343,26 @@ fn resolve_input(
                 _ => {
                     return Err(ValidationFailure::new(
                         ValidationFailureKind::UnknownImport,
-                        location(),
+                        location,
                     ));
                 }
             };
-            Ok(ValidatedInput {
+            Ok(ResolvedValueReference {
                 source: ResolvedValueSource::Import(source),
                 value_type,
             })
         }
-        InputReference::Output(reference) => {
+        ValueReference::Output(reference) => {
             let Some(producer) = document.steps.get(&reference.step) else {
                 return Err(ValidationFailure::new(
                     ValidationFailureKind::UnknownOutputStep,
-                    location(),
+                    location,
                 ));
             };
             let Some(output) = common_step(producer).outputs.get(&reference.output) else {
                 return Err(ValidationFailure::new(
                     ValidationFailureKind::UnknownOutput,
-                    location(),
+                    location,
                 ));
             };
             let producer_is_ancestor = ancestors
@@ -373,12 +371,12 @@ fn resolve_input(
             if !producer_is_ancestor {
                 return Err(ValidationFailure::new(
                     ValidationFailureKind::OutputProducerNotDependency,
-                    location(),
+                    location,
                 ));
             }
 
             let value_type = output_value_type(output);
-            Ok(ValidatedInput {
+            Ok(ResolvedValueReference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
                     step: reference.step.clone(),
                     output: reference.output.clone(),
@@ -432,10 +430,11 @@ fn resolve_agent_profile(
 fn validate_agent(
     step_name: &str,
     agent: &Agent,
-    inputs: &BTreeMap<String, ValidatedInput>,
+    document: &WorkflowDocument,
+    ancestors: &BTreeMap<String, BTreeSet<String>>,
+    required_imports: &mut RequiredImports,
     harness: ValidatedHarness,
 ) -> Result<ValidatedAgent, ValidationFailure> {
-    let mut used_inputs = BTreeSet::new();
     let text = agent
         .message
         .text
@@ -446,9 +445,10 @@ fn validate_agent(
                 step_name,
                 index,
                 source,
-                inputs,
+                document,
+                ancestors,
+                required_imports,
                 MessageDestination::Text,
-                &mut used_inputs,
             )
         })
         .collect::<Result<_, _>>()?;
@@ -462,25 +462,13 @@ fn validate_agent(
                 step_name,
                 index,
                 source,
-                inputs,
+                document,
+                ancestors,
+                required_imports,
                 MessageDestination::Attachment,
-                &mut used_inputs,
             )
         })
         .collect::<Result<_, _>>()?;
-
-    if let Some((unused, _)) = inputs
-        .iter()
-        .find(|(name, _)| !used_inputs.contains(name.as_str()))
-    {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::UnusedAgentInput,
-            ValidationLocation::StepInput {
-                step: step_name.to_owned(),
-                input: unused.clone(),
-            },
-        ));
-    }
 
     Ok(ValidatedAgent {
         profile: agent.profile.clone(),
@@ -500,11 +488,12 @@ fn validate_message_source(
     step_name: &str,
     index: usize,
     source: &MessageSource,
-    inputs: &BTreeMap<String, ValidatedInput>,
+    document: &WorkflowDocument,
+    ancestors: &BTreeMap<String, BTreeSet<String>>,
+    required_imports: &mut RequiredImports,
     destination: MessageDestination,
-    used_inputs: &mut BTreeSet<String>,
 ) -> Result<ValidatedMessageSource, ValidationFailure> {
-    let location = || match destination {
+    let location = match destination {
         MessageDestination::Text => ValidationLocation::MessageText {
             step: step_name.to_owned(),
             index,
@@ -515,22 +504,24 @@ fn validate_message_source(
         },
     };
 
-    let name = match source {
+    let reference = match source {
         MessageSource::File { path } => {
             return Ok(ValidatedMessageSource::File { path: path.clone() });
         }
-        MessageSource::Input { name } => name,
+        MessageSource::Reference(reference) => reference,
     };
-    let Some(input) = inputs.get(name) else {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::UnknownMessageInput,
-            location(),
-        ));
-    };
+    let value = resolve_value_reference(
+        step_name,
+        reference,
+        document,
+        ancestors,
+        required_imports,
+        location.clone(),
+    )?;
     let compatible = match destination {
-        MessageDestination::Text => input.value_type == WorkflowValueType::Text,
+        MessageDestination::Text => value.value_type == WorkflowValueType::Text,
         MessageDestination::Attachment => matches!(
-            input.value_type,
+            value.value_type,
             WorkflowValueType::AttachmentCollection
                 | WorkflowValueType::Json
                 | WorkflowValueType::File
@@ -539,14 +530,13 @@ fn validate_message_source(
     if !compatible {
         return Err(ValidationFailure::new(
             ValidationFailureKind::MessageTypeMismatch,
-            location(),
+            location,
         ));
     }
 
-    used_inputs.insert(name.clone());
-    Ok(ValidatedMessageSource::Input {
-        name: name.clone(),
-        value_type: input.value_type,
+    Ok(ValidatedMessageSource::Reference {
+        source: value.source,
+        value_type: value.value_type,
     })
 }
 

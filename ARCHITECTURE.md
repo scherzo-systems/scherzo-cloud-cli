@@ -179,14 +179,14 @@ configuration, and runtime layout are not compatibility targets.
 
 ## Workflow execution model
 
-A run invocation resolves one workflow and supplies its declared inputs. Workflow
+A run invocation resolves one workflow and supplies its resolved imports. Workflow
 resolution is a closed union: a local invocation may select an explicit file path,
 while a Cloud invocation selects a registered workflow identity that the control plane
 resolves to an immutable revision and digest. Both paths produce the same internal
 resolved workflow before execution begins.
 
-A workflow contains a schema version, input declarations, one dependency graph of
-command and agent steps, and output declarations. It has no mandatory checkout,
+A workflow contains a schema version, one dependency graph of command and agent steps,
+explicit data references, and output declarations. It has no mandatory checkout,
 preparation, or execution phases. Cloning a repository, using an existing working tree,
 creating a Git worktree or Jujutsu workspace, installing dependencies, and other setup
 are ordinary workflow-authorized steps.

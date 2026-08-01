@@ -25,6 +25,7 @@ pub(crate) enum Step {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommandStep {
     pub(crate) common: CommonStep,
+    pub(crate) inputs: BTreeMap<String, ValueReference>,
     pub(crate) argv: Vec<String>,
 }
 
@@ -38,12 +39,11 @@ pub(crate) struct AgentStep {
 pub(crate) struct CommonStep {
     pub(crate) dependencies: Vec<String>,
     pub(crate) cwd: Option<String>,
-    pub(crate) inputs: BTreeMap<String, InputReference>,
     pub(crate) outputs: BTreeMap<String, Output>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InputReference {
+pub(crate) enum ValueReference {
     Import { name: String },
     Output(OutputReference),
 }
@@ -77,7 +77,7 @@ pub(crate) struct AgentMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageSource {
     File { path: String },
-    Input { name: String },
+    Reference(ValueReference),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,9 +1,9 @@
 use super::super::decode;
-use super::super::document::{HarnessDefinition, InputReference, Output, Step};
+use super::super::document::{HarnessDefinition, Output, Step, ValueReference};
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
-    ResolvedValueSource, ValidatedHarness, ValidatedMessageSource, ValidatedStep,
-    ValidatedWorkflow, WorkflowImport, WorkflowValueType,
+    ResolvedOutputSource, ResolvedValueSource, ValidatedHarness, ValidatedMessageSource,
+    ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowValueType,
 };
 use super::{ValidationFailureKind, ValidationLocation};
 
@@ -153,6 +153,7 @@ steps:
           - file: prompts/message.md
 ";
     let workflow = validate_yaml(source).unwrap();
+    assert!(!workflow.required_imports.prompt);
     let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
         panic!("agent must be an agent step");
     };
@@ -280,10 +281,7 @@ steps:
     let ValidatedStep::Command(consumer) = &workflow.steps["consumer"] else {
         panic!("consumer must be a command step");
     };
-    assert_eq!(
-        consumer.common.inputs["value"].value_type,
-        WorkflowValueType::File
-    );
+    assert_eq!(consumer.inputs["value"].value_type, WorkflowValueType::File);
 }
 
 #[test]
@@ -310,8 +308,10 @@ steps:
 
 fn typed_message_workflow(reference: &str, destination: &str) -> String {
     let message = match destination {
-        "text" => "        text:\n          - ref: inputs.value\n".to_owned(),
-        "attachment" => "        text:\n          - file: prompts/message.md\n        attachments:\n          - ref: inputs.value\n".to_owned(),
+        "text" => format!("        text:\n          - ref: {reference}\n"),
+        "attachment" => format!(
+            "        text:\n          - file: prompts/message.md\n        attachments:\n          - ref: {reference}\n"
+        ),
         _ => panic!("unknown test destination"),
     };
     format!(
@@ -345,9 +345,6 @@ steps:
   consumer:
     kind: agent
     dependsOn: [producer]
-    inputs:
-      value:
-        ref: {reference}
     agent:
       profile: coding
       systemPrompt: prompts/system.md
@@ -389,7 +386,7 @@ fn message_type_table_rejects_every_inverse_destination_without_conversion() {
 }
 
 #[test]
-fn validated_definition_preserves_typed_bindings_outputs_exports_and_imports() {
+fn validated_definition_preserves_only_explicit_direct_message_references() {
     let source = "schemaVersion: 1
 description: Typed workflow.
 agentProfiles:
@@ -418,31 +415,24 @@ steps:
         kind: file
         path: artifact.bin
         mediaType: application/octet-stream
+      ignored:
+        kind: file
+        path: ignored.bin
+        mediaType: application/octet-stream
   consumer:
     kind: agent
     dependsOn: [producer]
-    inputs:
-      prompt:
-        ref: imports.prompt
-      attachments:
-        ref: imports.attachments
-      response:
-        ref: outputs.producer.response
-      result:
-        ref: outputs.producer.result
-      file:
-        ref: outputs.producer.file
     agent:
       profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
-          - ref: inputs.prompt
-          - ref: inputs.response
+          - ref: imports.prompt
+          - ref: outputs.producer.response
         attachments:
-          - ref: inputs.attachments
-          - ref: inputs.result
-          - ref: inputs.file
+          - ref: imports.attachments
+          - ref: outputs.producer.result
+          - ref: outputs.producer.file
 exports:
   response:
     ref: outputs.producer.response
@@ -460,35 +450,46 @@ exports:
     };
     assert_eq!(consumer.common.dependencies, ["producer"]);
     assert_eq!(
-        consumer.common.inputs["prompt"].source,
-        ResolvedValueSource::Import(WorkflowImport::Prompt)
+        consumer.agent.message.text,
+        [
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Import(WorkflowImport::Prompt),
+                value_type: WorkflowValueType::Text,
+            },
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Output(ResolvedOutputSource {
+                    step: "producer".to_owned(),
+                    output: "response".to_owned(),
+                    value_type: WorkflowValueType::Text,
+                }),
+                value_type: WorkflowValueType::Text,
+            },
+        ]
     );
     assert_eq!(
-        consumer.common.inputs["attachments"].source,
-        ResolvedValueSource::Import(WorkflowImport::Attachments)
-    );
-    for (name, expected_type) in [
-        ("prompt", WorkflowValueType::Text),
-        ("attachments", WorkflowValueType::AttachmentCollection),
-        ("response", WorkflowValueType::Text),
-        ("result", WorkflowValueType::Json),
-        ("file", WorkflowValueType::File),
-    ] {
-        assert_eq!(consumer.common.inputs[name].value_type, expected_type);
-    }
-    assert_eq!(
-        consumer.agent.message.text[1],
-        ValidatedMessageSource::Input {
-            name: "response".to_owned(),
-            value_type: WorkflowValueType::Text,
-        }
-    );
-    assert_eq!(
-        consumer.agent.message.attachments[0],
-        ValidatedMessageSource::Input {
-            name: "attachments".to_owned(),
-            value_type: WorkflowValueType::AttachmentCollection,
-        }
+        consumer.agent.message.attachments,
+        [
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Import(WorkflowImport::Attachments),
+                value_type: WorkflowValueType::AttachmentCollection,
+            },
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Output(ResolvedOutputSource {
+                    step: "producer".to_owned(),
+                    output: "result".to_owned(),
+                    value_type: WorkflowValueType::Json,
+                }),
+                value_type: WorkflowValueType::Json,
+            },
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Output(ResolvedOutputSource {
+                    step: "producer".to_owned(),
+                    output: "file".to_owned(),
+                    value_type: WorkflowValueType::File,
+                }),
+                value_type: WorkflowValueType::File,
+            },
+        ]
     );
 
     let ValidatedStep::Agent(producer) = &workflow.steps["producer"] else {
@@ -506,6 +507,10 @@ exports:
         producer.common.outputs["file"].value_type,
         WorkflowValueType::File
     );
+    assert_eq!(
+        producer.common.outputs["ignored"].value_type,
+        WorkflowValueType::File
+    );
     for (name, expected_type) in [
         ("response", WorkflowValueType::Text),
         ("result", WorkflowValueType::Json),
@@ -518,61 +523,37 @@ exports:
 }
 
 #[test]
-fn agent_messages_reject_missing_and_unused_inputs() {
-    let missing = "schemaVersion: 1
-agentProfiles:
-  coding:
-    harness:
-      kind: pi
-      config:
-        model: openai/gpt-5
-        thinking: high
-steps:
-  agent:
-    kind: agent
-    agent:
-      profile: coding
-      systemPrompt: prompts/system.md
-      message:
-        text:
-          - ref: inputs.missing
-";
-    assert_failure(
-        missing,
-        ValidationFailureKind::UnknownMessageInput,
-        ValidationLocation::MessageText {
-            step: "agent".to_owned(),
-            index: 0,
-        },
-    );
+fn direct_message_reference_failures_are_reported_at_the_message_location() {
+    for (reference, kind) in [
+        ("imports.unknown", ValidationFailureKind::UnknownImport),
+        (
+            "outputs.missing.value",
+            ValidationFailureKind::UnknownOutputStep,
+        ),
+        (
+            "outputs.producer.missing",
+            ValidationFailureKind::UnknownOutput,
+        ),
+    ] {
+        let failure = validate_yaml(&typed_message_workflow(reference, "text")).unwrap_err();
+        assert_eq!(failure.kind(), kind);
+        assert_eq!(
+            failure.location(),
+            &ValidationLocation::MessageText {
+                step: "consumer".to_owned(),
+                index: 0,
+            }
+        );
+    }
 
-    let unused = "schemaVersion: 1
-agentProfiles:
-  coding:
-    harness:
-      kind: pi
-      config:
-        model: openai/gpt-5
-        thinking: high
-steps:
-  agent:
-    kind: agent
-    inputs:
-      prompt:
-        ref: imports.prompt
-    agent:
-      profile: coding
-      systemPrompt: prompts/system.md
-      message:
-        text:
-          - file: prompts/message.md
-";
+    let unreachable = typed_message_workflow("outputs.producer.response", "text")
+        .replace("    dependsOn: [producer]\n", "");
     assert_failure(
-        unused,
-        ValidationFailureKind::UnusedAgentInput,
-        ValidationLocation::StepInput {
-            step: "agent".to_owned(),
-            input: "prompt".to_owned(),
+        &unreachable,
+        ValidationFailureKind::OutputProducerNotDependency,
+        ValidationLocation::MessageText {
+            step: "consumer".to_owned(),
+            index: 0,
         },
     );
 }
@@ -681,9 +662,9 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     let Step::Command(command) = document.steps.get_mut("command").unwrap() else {
         panic!("command must be a command step");
     };
-    command.common.inputs.insert(
+    command.inputs.insert(
         "prompt".to_owned(),
-        InputReference::Import {
+        ValueReference::Import {
             name: "prompt".to_owned(),
         },
     );
@@ -693,7 +674,7 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
         panic!("command must be a command step");
     };
     assert_eq!(
-        command.common.inputs["prompt"].source,
+        command.inputs["prompt"].source,
         ResolvedValueSource::Import(WorkflowImport::Prompt)
     );
 }

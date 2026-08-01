@@ -29,16 +29,13 @@ steps:
   agent:
     kind: agent
     cwd: runtime/does-not-exist
-    inputs:
-      prompt:
-        ref: imports.prompt
     agent:
       profile: coding
       systemPrompt: ../prompts/system.md
       message:
         text:
           - file: ../prompts/message.md
-          - ref: inputs.prompt
+          - ref: imports.prompt
           - file: ../prompts/message.md
         attachments:
           - file: ../attachments/data.bin

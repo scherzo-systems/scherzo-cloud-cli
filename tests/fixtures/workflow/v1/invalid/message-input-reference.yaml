@@ -1,0 +1,17 @@
+schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  implement:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/implement-system.md
+      message:
+        text:
+          - ref: inputs.prompt

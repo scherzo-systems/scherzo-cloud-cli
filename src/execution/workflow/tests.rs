@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::document::{
-    HarnessDefinition, InputReference, MessageSource, Output, OutputReference, Step,
+    HarnessDefinition, MessageSource, Output, OutputReference, Step, ValueReference,
 };
 use super::*;
 
@@ -41,43 +41,39 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     };
     assert_eq!(prepare.argv, ["./scripts/prepare-workspace.sh"]);
     assert!(prepare.common.dependencies.is_empty());
-    assert!(prepare.common.inputs.is_empty());
+    assert!(prepare.inputs.is_empty());
     assert!(prepare.common.outputs.is_empty());
 
     let Step::Agent(plan) = &workflow.steps["plan"] else {
         panic!("plan must be an agent step");
     };
     assert_eq!(plan.common.dependencies, ["prepare"]);
-    assert_eq!(
-        plan.common.inputs["prompt"],
-        InputReference::Import {
-            name: "prompt".to_owned()
-        }
-    );
-    assert_eq!(
-        plan.common.inputs["attachments"],
-        InputReference::Import {
-            name: "attachments".to_owned()
-        }
-    );
     assert_eq!(plan.agent.profile, "coding");
     assert_eq!(plan.agent.system_prompt, "prompts/plan-system.md");
     assert_eq!(
         plan.agent.message.text,
-        [MessageSource::Input {
+        [MessageSource::Reference(ValueReference::Import {
             name: "prompt".to_owned()
-        }]
+        })]
     );
     assert_eq!(
         plan.agent.message.attachments,
-        [MessageSource::Input {
+        [MessageSource::Reference(ValueReference::Import {
             name: "attachments".to_owned()
-        }]
+        })]
     );
+    assert_eq!(plan.common.outputs["response"], Output::AgentResponse);
     assert_eq!(
         plan.common.outputs["plan"],
         Output::AgentResult {
             schema: "schemas/change-plan.schema.json".to_owned()
+        }
+    );
+    assert_eq!(
+        plan.common.outputs["artifact"],
+        Output::File {
+            path: "artifacts/plan.txt".to_owned(),
+            media_type: "text/plain".to_owned(),
         }
     );
 
@@ -85,19 +81,6 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         panic!("implement must be an agent step");
     };
     assert_eq!(implement.common.dependencies, ["plan"]);
-    assert_eq!(
-        implement.common.inputs["prompt"],
-        InputReference::Import {
-            name: "prompt".to_owned()
-        }
-    );
-    assert_eq!(
-        implement.common.inputs["plan"],
-        InputReference::Output(OutputReference {
-            step: "plan".to_owned(),
-            output: "plan".to_owned(),
-        })
-    );
     assert_eq!(implement.agent.profile, "coding");
     assert_eq!(implement.agent.system_prompt, "prompts/implement-system.md");
     assert_eq!(
@@ -106,16 +89,30 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             MessageSource::File {
                 path: "prompts/implement-message.md".to_owned()
             },
-            MessageSource::Input {
+            MessageSource::Reference(ValueReference::Import {
                 name: "prompt".to_owned()
-            }
+            }),
+            MessageSource::Reference(ValueReference::Output(OutputReference {
+                step: "plan".to_owned(),
+                output: "response".to_owned(),
+            }))
         ]
     );
     assert_eq!(
         implement.agent.message.attachments,
-        [MessageSource::Input {
-            name: "plan".to_owned()
-        }]
+        [
+            MessageSource::Reference(ValueReference::Import {
+                name: "attachments".to_owned()
+            }),
+            MessageSource::Reference(ValueReference::Output(OutputReference {
+                step: "plan".to_owned(),
+                output: "plan".to_owned(),
+            })),
+            MessageSource::Reference(ValueReference::Output(OutputReference {
+                step: "plan".to_owned(),
+                output: "artifact".to_owned(),
+            }))
+        ]
     );
     assert_eq!(implement.common.outputs["response"], Output::AgentResponse);
     assert_eq!(
@@ -131,6 +128,19 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     assert_eq!(test.common.dependencies, ["implement"]);
     assert_eq!(test.common.cwd.as_deref(), Some("packages/api"));
     assert_eq!(test.argv, ["./scripts/test.sh"]);
+    assert_eq!(
+        test.inputs["prompt"],
+        ValueReference::Import {
+            name: "prompt".to_owned(),
+        }
+    );
+    assert_eq!(
+        test.inputs["changeSummary"],
+        ValueReference::Output(OutputReference {
+            step: "implement".to_owned(),
+            output: "changeSummary".to_owned(),
+        })
+    );
     assert_eq!(
         test.common.outputs["report"],
         Output::File {

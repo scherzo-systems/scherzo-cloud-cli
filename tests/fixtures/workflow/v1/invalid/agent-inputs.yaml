@@ -9,6 +9,9 @@ agentProfiles:
 steps:
   implement:
     kind: agent
+    inputs:
+      prompt:
+        ref: imports.prompt
     agent:
       profile: coding
       systemPrompt: prompts/implement-system.md

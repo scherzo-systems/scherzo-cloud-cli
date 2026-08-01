@@ -363,10 +363,10 @@ where
             .get(step)
             .ok_or(StepStartFailure::StepUnavailable)?;
         let body = StepBody::from(definition);
-        let common = body.common();
-        if !common.inputs.is_empty() {
+        if body.has_inputs() {
             return Err(StepStartFailure::InputsUnsupported);
         }
+        let common = body.common();
         if common
             .outputs
             .values()
@@ -809,6 +809,13 @@ impl<'a> From<&'a ValidatedStep> for StepBody<'a> {
 }
 
 impl StepBody<'_> {
+    fn has_inputs(&self) -> bool {
+        match self {
+            Self::Command(command) => !command.inputs.is_empty(),
+            Self::Agent(_) => false,
+        }
+    }
+
     fn common(&self) -> &ValidatedCommonStep {
         match self {
             Self::Command(command) => &command.common,

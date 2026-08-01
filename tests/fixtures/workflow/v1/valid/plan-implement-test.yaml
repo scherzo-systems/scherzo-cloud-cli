@@ -18,41 +18,40 @@ steps:
   plan:
     kind: agent
     dependsOn: [prepare]
-    inputs:
-      prompt:
-        ref: imports.prompt
-      attachments:
-        ref: imports.attachments
     agent:
       profile: coding
       systemPrompt: prompts/plan-system.md
       message:
         text:
-          - ref: inputs.prompt
+          - ref: imports.prompt
         attachments:
-          - ref: inputs.attachments
+          - ref: imports.attachments
     outputs:
+      response:
+        kind: agent_response
       plan:
         kind: agent_result
         schema: schemas/change-plan.schema.json
+      artifact:
+        kind: file
+        path: artifacts/plan.txt
+        mediaType: text/plain
 
   implement:
     kind: agent
     dependsOn: [plan]
-    inputs:
-      prompt:
-        ref: imports.prompt
-      plan:
-        ref: outputs.plan.plan
     agent:
       profile: coding
       systemPrompt: prompts/implement-system.md
       message:
         text:
           - file: prompts/implement-message.md
-          - ref: inputs.prompt
+          - ref: imports.prompt
+          - ref: outputs.plan.response
         attachments:
-          - ref: inputs.plan
+          - ref: imports.attachments
+          - ref: outputs.plan.plan
+          - ref: outputs.plan.artifact
     outputs:
       response:
         kind: agent_response
@@ -64,6 +63,11 @@ steps:
     kind: cmd
     dependsOn: [implement]
     cwd: packages/api
+    inputs:
+      prompt:
+        ref: imports.prompt
+      changeSummary:
+        ref: outputs.implement.changeSummary
     command:
       argv: ["./scripts/test.sh"]
     outputs:
