@@ -191,10 +191,10 @@ impl ScriptedServer {
                     String::from_utf8(read_request(&mut stream)).expect("request should be text");
                 let response = response_for_request(response, &request);
                 sender.send(request).unwrap();
-                if index + 1 == remaining_requests {
-                    if let Some(receiver) = release_receiver.take() {
-                        receiver.recv().expect("paused response should be released");
-                    }
+                if index + 1 == remaining_requests
+                    && let Some(receiver) = release_receiver.take()
+                {
+                    receiver.recv().expect("paused response should be released");
                 }
                 let _ = stream.write_all(&response);
             }

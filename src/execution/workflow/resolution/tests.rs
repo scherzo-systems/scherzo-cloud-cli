@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -414,8 +414,7 @@ fn an_absolute_selected_path_cannot_hide_a_symbolic_link_escape_with_parent_trav
 
 #[cfg(unix)]
 #[test]
-fn symbolic_link_escapes_and_non_utf8_canonical_components_are_rejected() {
-    use std::os::unix::ffi::OsStringExt;
+fn symbolic_link_escapes_are_rejected() {
     use std::os::unix::fs::symlink;
 
     let static_escape = FixtureBundle::new();
@@ -441,6 +440,14 @@ fn symbolic_link_escapes_and_non_utf8_canonical_components_are_rejected() {
         ResolutionFailureKind::SymbolicLinkEscape,
         ResolutionLocation::Workflow,
     );
+}
+
+// Darwin filesystems reject non-UTF-8 names before the resolver can inspect them.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn non_utf8_canonical_components_are_rejected() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
 
     let invalid_utf8 = FixtureBundle::new();
     let invalid_component = OsString::from_vec(vec![b'n', b'o', b'n', 0xff, b'u', b't', b'f']);

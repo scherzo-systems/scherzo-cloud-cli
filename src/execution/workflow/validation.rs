@@ -29,6 +29,7 @@ pub(crate) enum ValidationFailureKind {
     IllegalCommandOutput,
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
+    ConflictingAgentValueOutputs,
     InvalidExportTarget,
 }
 
@@ -243,13 +244,21 @@ fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFa
                     let failure_kind = match output {
                         Output::AgentResponse => {
                             response_count += 1;
-                            (response_count > 1)
-                                .then_some(ValidationFailureKind::ExcessAgentResponseOutput)
+                            if response_count > 1 {
+                                Some(ValidationFailureKind::ExcessAgentResponseOutput)
+                            } else {
+                                (result_count > 0)
+                                    .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
+                            }
                         }
                         Output::AgentResult { .. } => {
                             result_count += 1;
-                            (result_count > 1)
-                                .then_some(ValidationFailureKind::ExcessAgentResultOutput)
+                            if result_count > 1 {
+                                Some(ValidationFailureKind::ExcessAgentResultOutput)
+                            } else {
+                                (response_count > 0)
+                                    .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
+                            }
                         }
                         Output::File { .. } => None,
                     };

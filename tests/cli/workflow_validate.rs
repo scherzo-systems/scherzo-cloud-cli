@@ -235,6 +235,14 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         "schemaVersion: 1\nsteps:\n  consumer:\n    kind: cmd\n    dependsOn: [missing]\n    command:\n      argv: [\"true\"]\n",
     );
 
+    let conflicting_agent_values = WorkflowBundle::valid();
+    let source = fs::read_to_string(conflicting_agent_values.workflow_path())
+        .expect("workflow should be readable");
+    conflicting_agent_values.replace_workflow(&source.replace(
+        "    outputs:\n      result:",
+        "    outputs:\n      response:\n        kind: agent_response\n      result:",
+    ));
+
     let missing = WorkflowBundle::valid();
     fs::remove_file(missing.root.join("prompts/system.md"))
         .expect("system prompt should be removed");
@@ -259,6 +267,11 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
     for (bundle, expected_code, expected_location) in [
         (malformed, "malformed_yaml", "workflow"),
         (semantic, "missing_dependency", "step_dependency"),
+        (
+            conflicting_agent_values,
+            "conflicting_agent_value_outputs",
+            "step_output",
+        ),
         (missing, "source_unavailable", "system_prompt"),
         (escaping, "source_path_escape", "system_prompt"),
         (invalid_schema, "invalid_result_schema", "result_schema"),

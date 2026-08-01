@@ -479,10 +479,8 @@ impl ArtifactStagingInner {
             Ok(()) | Err(Errno::NOENT) => true,
             Err(_) => false,
         };
-        if removed {
-            if let Ok(mut artifacts) = self.artifacts.lock() {
-                artifacts.remove(artifact_identity);
-            }
+        if removed && let Ok(mut artifacts) = self.artifacts.lock() {
+            artifacts.remove(artifact_identity);
         }
     }
 

@@ -54,12 +54,10 @@ pub(crate) fn check(
         || outcome
             .as_ref()
             .is_err_and(|error| error.credential_rejected());
-    if credential_rejected {
-        if let Some(access_token) = access_token {
-            store
-                .remove_if_access_token_matches(deployment.fingerprint(), access_token)
-                .map_err(StatusError::CredentialStore)?;
-        }
+    if credential_rejected && let Some(access_token) = access_token {
+        store
+            .remove_if_access_token_matches(deployment.fingerprint(), access_token)
+            .map_err(StatusError::CredentialStore)?;
     }
 
     let state = match outcome.map_err(StatusError::PublicApi)? {

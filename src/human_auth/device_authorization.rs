@@ -166,21 +166,21 @@ pub(crate) fn poll_token(
         return Err(AuthorizationError::Unreachable(UnreachableCategory::Server));
     }
     if response.status.is_client_error() {
-        if response.content_type.as_deref() == Some(JSON_MEDIA_TYPE) {
-            if let Ok(error) = serde_json::from_slice::<OAuthErrorResponse>(&response.body) {
-                return match error.error.as_str() {
-                    "authorization_pending" => Ok(TokenPoll::Pending),
-                    "slow_down" => Ok(TokenPoll::SlowDown),
-                    "access_denied" => Ok(TokenPoll::Denied),
-                    "expired_token" => Ok(TokenPoll::Expired),
-                    _ if response.status == StatusCode::TOO_MANY_REQUESTS => Err(
-                        AuthorizationError::Unreachable(UnreachableCategory::RateLimited),
-                    ),
-                    _ => Err(AuthorizationError::Protocol {
-                        reason: "the token endpoint returned an unknown OAuth error",
-                    }),
-                };
-            }
+        if response.content_type.as_deref() == Some(JSON_MEDIA_TYPE)
+            && let Ok(error) = serde_json::from_slice::<OAuthErrorResponse>(&response.body)
+        {
+            return match error.error.as_str() {
+                "authorization_pending" => Ok(TokenPoll::Pending),
+                "slow_down" => Ok(TokenPoll::SlowDown),
+                "access_denied" => Ok(TokenPoll::Denied),
+                "expired_token" => Ok(TokenPoll::Expired),
+                _ if response.status == StatusCode::TOO_MANY_REQUESTS => Err(
+                    AuthorizationError::Unreachable(UnreachableCategory::RateLimited),
+                ),
+                _ => Err(AuthorizationError::Protocol {
+                    reason: "the token endpoint returned an unknown OAuth error",
+                }),
+            };
         }
         if response.status == StatusCode::TOO_MANY_REQUESTS {
             return Err(AuthorizationError::Unreachable(

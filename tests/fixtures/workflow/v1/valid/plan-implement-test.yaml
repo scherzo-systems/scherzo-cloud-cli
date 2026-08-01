@@ -55,9 +55,6 @@ steps:
     outputs:
       response:
         kind: agent_response
-      changeSummary:
-        kind: agent_result
-        schema: schemas/change-summary.schema.json
 
   test:
     kind: cmd
@@ -79,7 +76,5 @@ steps:
 exports:
   response:
     ref: outputs.implement.response
-  changeSummary:
-    ref: outputs.implement.changeSummary
   testReport:
     ref: outputs.test.report

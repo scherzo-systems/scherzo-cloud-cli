@@ -324,7 +324,7 @@ agentProfiles:
         model: openai/gpt-5
         thinking: high
 steps:
-  producer:
+  responseProducer:
     kind: agent
     agent:
       profile: coding
@@ -335,16 +335,25 @@ steps:
     outputs:
       response:
         kind: agent_response
-      result:
-        kind: agent_result
-        schema: schemas/result.json
       file:
         kind: file
         path: artifact.bin
         mediaType: application/octet-stream
+  resultProducer:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: schemas/result.json
   consumer:
     kind: agent
-    dependsOn: [producer]
+    dependsOn: [responseProducer, resultProducer]
     agent:
       profile: coding
       systemPrompt: prompts/system.md
@@ -358,9 +367,9 @@ fn message_type_table_rejects_every_inverse_destination_without_conversion() {
     let cases = [
         ("imports.prompt", "attachment"),
         ("imports.attachments", "text"),
-        ("outputs.producer.response", "attachment"),
-        ("outputs.producer.result", "text"),
-        ("outputs.producer.file", "text"),
+        ("outputs.responseProducer.response", "attachment"),
+        ("outputs.resultProducer.result", "text"),
+        ("outputs.responseProducer.file", "text"),
     ];
 
     for (reference, destination) in cases {
@@ -397,7 +406,7 @@ agentProfiles:
         model: openai/gpt-5
         thinking: high
 steps:
-  producer:
+  responseProducer:
     kind: agent
     agent:
       profile: coding
@@ -408,9 +417,6 @@ steps:
     outputs:
       response:
         kind: agent_response
-      result:
-        kind: agent_result
-        schema: schemas/result.json
       file:
         kind: file
         path: artifact.bin
@@ -419,36 +425,63 @@ steps:
         kind: file
         path: ignored.bin
         mediaType: application/octet-stream
+  resultProducer:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: schemas/result.json
   consumer:
     kind: agent
-    dependsOn: [producer]
+    dependsOn: [responseProducer, resultProducer]
     agent:
       profile: coding
       systemPrompt: prompts/system.md
       message:
         text:
           - ref: imports.prompt
-          - ref: outputs.producer.response
+          - ref: outputs.responseProducer.response
         attachments:
           - ref: imports.attachments
-          - ref: outputs.producer.result
-          - ref: outputs.producer.file
+          - ref: outputs.resultProducer.result
+          - ref: outputs.responseProducer.file
 exports:
   response:
-    ref: outputs.producer.response
+    ref: outputs.responseProducer.response
   result:
-    ref: outputs.producer.result
+    ref: outputs.resultProducer.result
   file:
-    ref: outputs.producer.file
+    ref: outputs.responseProducer.file
 ";
     let workflow = validate_yaml(source).unwrap();
 
     assert!(workflow.required_imports.prompt);
-    assert_eq!(workflow.topological_order, ["producer", "consumer"]);
+    let consumer_position = workflow
+        .topological_order
+        .iter()
+        .position(|step| step == "consumer")
+        .unwrap();
+    for producer in ["responseProducer", "resultProducer"] {
+        let producer_position = workflow
+            .topological_order
+            .iter()
+            .position(|step| step == producer)
+            .unwrap();
+        assert!(producer_position < consumer_position);
+    }
     let ValidatedStep::Agent(consumer) = &workflow.steps["consumer"] else {
         panic!("consumer must be an agent step");
     };
-    assert_eq!(consumer.common.dependencies, ["producer"]);
+    assert_eq!(
+        consumer.common.dependencies,
+        ["responseProducer", "resultProducer"]
+    );
     assert_eq!(
         consumer.agent.message.text,
         [
@@ -458,7 +491,7 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "producer".to_owned(),
+                    step: "responseProducer".to_owned(),
                     output: "response".to_owned(),
                     value_type: WorkflowValueType::Text,
                 }),
@@ -475,7 +508,7 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "producer".to_owned(),
+                    step: "resultProducer".to_owned(),
                     output: "result".to_owned(),
                     value_type: WorkflowValueType::Json,
                 }),
@@ -483,7 +516,7 @@ exports:
             },
             ValidatedMessageSource::Reference {
                 source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    step: "producer".to_owned(),
+                    step: "responseProducer".to_owned(),
                     output: "file".to_owned(),
                     value_type: WorkflowValueType::File,
                 }),
@@ -492,31 +525,34 @@ exports:
         ]
     );
 
-    let ValidatedStep::Agent(producer) = &workflow.steps["producer"] else {
-        panic!("producer must be an agent step");
+    let ValidatedStep::Agent(response_producer) = &workflow.steps["responseProducer"] else {
+        panic!("response producer must be an agent step");
     };
     assert_eq!(
-        producer.common.outputs["response"].value_type,
+        response_producer.common.outputs["response"].value_type,
         WorkflowValueType::Text
     );
     assert_eq!(
-        producer.common.outputs["result"].value_type,
+        response_producer.common.outputs["file"].value_type,
+        WorkflowValueType::File
+    );
+    let ValidatedStep::Agent(result_producer) = &workflow.steps["resultProducer"] else {
+        panic!("result producer must be an agent step");
+    };
+    assert_eq!(
+        result_producer.common.outputs["result"].value_type,
         WorkflowValueType::Json
     );
     assert_eq!(
-        producer.common.outputs["file"].value_type,
+        response_producer.common.outputs["ignored"].value_type,
         WorkflowValueType::File
     );
-    assert_eq!(
-        producer.common.outputs["ignored"].value_type,
-        WorkflowValueType::File
-    );
-    for (name, expected_type) in [
-        ("response", WorkflowValueType::Text),
-        ("result", WorkflowValueType::Json),
-        ("file", WorkflowValueType::File),
+    for (name, step, expected_type) in [
+        ("response", "responseProducer", WorkflowValueType::Text),
+        ("result", "resultProducer", WorkflowValueType::Json),
+        ("file", "responseProducer", WorkflowValueType::File),
     ] {
-        assert_eq!(workflow.exports[name].step, "producer");
+        assert_eq!(workflow.exports[name].step, step);
         assert_eq!(workflow.exports[name].output, name);
         assert_eq!(workflow.exports[name].value_type, expected_type);
     }
@@ -531,7 +567,7 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
             ValidationFailureKind::UnknownOutputStep,
         ),
         (
-            "outputs.producer.missing",
+            "outputs.responseProducer.missing",
             ValidationFailureKind::UnknownOutput,
         ),
     ] {
@@ -546,8 +582,8 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
         );
     }
 
-    let unreachable = typed_message_workflow("outputs.producer.response", "text")
-        .replace("    dependsOn: [producer]\n", "");
+    let unreachable = typed_message_workflow("outputs.responseProducer.response", "text")
+        .replace("    dependsOn: [responseProducer, resultProducer]\n", "");
     assert_failure(
         &unreachable,
         ValidationFailureKind::OutputProducerNotDependency,
@@ -619,6 +655,20 @@ steps:
     assert_failure(
         &two_results,
         ValidationFailureKind::ExcessAgentResultOutput,
+        ValidationLocation::StepOutput {
+            step: "agent".to_owned(),
+            output: "second".to_owned(),
+        },
+    );
+
+    let conflicting_values = two_responses.replacen(
+        "kind: agent_response",
+        "kind: agent_result\n        schema: schemas/result.json",
+        1,
+    );
+    assert_failure(
+        &conflicting_values,
+        ValidationFailureKind::ConflictingAgentValueOutputs,
         ValidationLocation::StepOutput {
             step: "agent".to_owned(),
             output: "second".to_owned(),

@@ -471,6 +471,10 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
             "excess_agent_result_output",
             "Declare at most one agent result output on a step.",
         ),
+        ValidationFailureKind::ConflictingAgentValueOutputs => (
+            "conflicting_agent_value_outputs",
+            "Declare either one agent response output or one agent result output, not both.",
+        ),
         ValidationFailureKind::InvalidExportTarget => (
             "invalid_export_target",
             "Reference a declared step output from the workflow export.",

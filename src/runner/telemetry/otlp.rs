@@ -793,6 +793,9 @@ mod tests {
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("make accepted OTLP connection blocking");
                             let request = crate::api::test_support::read_request(&mut stream);
                             let body_start = request
                                 .windows(4)

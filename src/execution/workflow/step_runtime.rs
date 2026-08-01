@@ -221,12 +221,12 @@ where
             _ = &mut cancellation => None,
             result = launched.wait() => Some(result),
         };
-        if waited.is_none() {
-            if let Some(cancellation) = self.cancellation_for(action) {
-                return self
-                    .cancel_launched(action, &mut launched, cancellation)
-                    .await;
-            }
+        if waited.is_none()
+            && let Some(cancellation) = self.cancellation_for(action)
+        {
+            return self
+                .cancel_launched(action, &mut launched, cancellation)
+                .await;
         }
 
         self.settle_launched(step, action, &mut launched, waited)

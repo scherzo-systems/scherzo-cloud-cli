@@ -24,6 +24,25 @@ The project uses its standalone devenv environment to provide the minimum Rust t
 declared in `Cargo.toml`. Run `devenv test` for the same formatting, linting, testing,
 source-boundary, and release build checks used by CI.
 
+## Rust baseline upgrades
+
+`package.rust-version` in `Cargo.toml` is the single Rust baseline declaration. Express
+it as the selected stable `MAJOR.MINOR` release line. The development and MSRV
+toolchains, production Nix package, and GitHub release builds derive their compiler from
+that value; do not add a `rust-toolchain` file, a second version constant, or an older
+compatibility build.
+
+Advance the baseline directly when the project intentionally adopts a newer compiler or
+dependency requirement. Before a bump, confirm that the release line is available from
+the pinned Rust overlay and from rustup on every native release runner. Update
+`Cargo.lock` only when the new baseline changes dependency resolution or when the same
+change deliberately refreshes dependencies. Because the CLI is pre-release, replace the
+old baseline rather than retaining parallel support.
+
+Treat a higher source-build requirement as a breaking change fragment. Validate a bump
+with `./scripts/check`, the monorepo dependency-state check, and `nix flake check`; CI
+then builds every supported native release target with the declared release line.
+
 ## Release intent
 
 `release.toml` is the visible source of truth for the CLI's `MAJOR.MINOR` release series.

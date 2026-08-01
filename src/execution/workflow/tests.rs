@@ -25,7 +25,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
     assert_eq!(workflow.agent_profiles.len(), 1);
     assert_eq!(workflow.steps.len(), 4);
-    assert_eq!(workflow.exports.len(), 3);
+    assert_eq!(workflow.exports.len(), 2);
     assert_eq!(
         workflow.agent_profiles["coding"].harness,
         HarnessDefinition::Pi {
@@ -115,12 +115,6 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         ]
     );
     assert_eq!(implement.common.outputs["response"], Output::AgentResponse);
-    assert_eq!(
-        implement.common.outputs["changeSummary"],
-        Output::AgentResult {
-            schema: "schemas/change-summary.schema.json".to_owned()
-        }
-    );
 
     let Step::Command(test) = &workflow.steps["test"] else {
         panic!("test must be a command step");
@@ -154,13 +148,6 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         OutputReference {
             step: "implement".to_owned(),
             output: "response".to_owned(),
-        }
-    );
-    assert_eq!(
-        workflow.exports["changeSummary"],
-        OutputReference {
-            step: "implement".to_owned(),
-            output: "changeSummary".to_owned(),
         }
     );
     assert_eq!(

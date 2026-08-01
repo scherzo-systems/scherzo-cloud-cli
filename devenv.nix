@@ -12,7 +12,11 @@ let
   msrvToolchain = rustPackages.rust-bin.stable.${rustVersion}.minimal;
 in
 {
-  languages.rust.enable = true;
+  languages.rust = {
+    enable = true;
+    channel = "stable";
+    version = rustVersion;
+  };
   env.SCHERZO_MSRV_CARGO = "${msrvToolchain}/bin/cargo";
   env.SCHERZO_MSRV_RUSTC = "${msrvToolchain}/bin/rustc";
 

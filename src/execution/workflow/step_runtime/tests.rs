@@ -160,10 +160,10 @@ fn command_fixture_process() {
         control.read_exact(&mut release).unwrap();
         assert_eq!(release, [1]);
     }
-    if mode.as_deref() != Some(FIXTURE_MODE_PARENT_EXITS) {
-        if let Some(descendant) = descendant.as_mut() {
-            assert!(descendant.wait().unwrap().success());
-        }
+    if mode.as_deref() != Some(FIXTURE_MODE_PARENT_EXITS)
+        && let Some(descendant) = descendant.as_mut()
+    {
+        assert!(descendant.wait().unwrap().success());
     }
     if exit_code != 0 {
         process::exit(exit_code);
@@ -326,7 +326,7 @@ impl CommitPort<WorkflowCommit> for RecordingCommitPort {
 }
 
 #[tokio::test]
-async fn command_uses_contained_cwd_literal_argv_and_only_the_admitted_environment() {
+async fn command_uses_contained_cwd_literal_argv_and_isolates_parent_environment() {
     with_watchdog(async {
         for form in [
             ProgramForm::Bare,
@@ -335,9 +335,16 @@ async fn command_uses_contained_cwd_literal_argv_and_only_the_admitted_environme
         ] {
             let run = run_fixture_command(form, 0).await;
             assert_eq!(run.report.arguments, fixture_arguments());
+            let expected_environment =
+                ["EXPLICIT_VALUE", "PATH", FIXTURE_EXIT_CODE, FIXTURE_SOCKET]
+                    .into_iter()
+                    // Foundation adds this process-local setting after macOS starts the
+                    // otherwise environment-cleared child.
+                    .chain(cfg!(target_os = "macos").then_some("__CF_USER_TEXT_ENCODING"))
+                    .collect::<Vec<_>>();
             assert_eq!(
                 run.report.environment.keys().cloned().collect::<Vec<_>>(),
-                ["EXPLICIT_VALUE", "PATH", FIXTURE_EXIT_CODE, FIXTURE_SOCKET,]
+                expected_environment
             );
             assert_eq!(
                 run.report.environment.get("EXPLICIT_VALUE"),
