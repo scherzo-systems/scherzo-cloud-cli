@@ -136,6 +136,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             ExecutionRootLifecycle::CallerOwnedRetained,
             3,
             2 * 1024 * 1024,
+            64 * 1024,
             EnvironmentSnapshot::new([
                 ("PATH", "/admitted/bin"),
                 ("SCHERZO_INHERITED", "must be removed"),
@@ -164,6 +165,10 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             .maximum_file_output_bytes()
             .get(),
         2 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted.execution().limits().maximum_step_log_bytes().get(),
+        64 * 1024
     );
     assert_eq!(
         admitted
@@ -260,7 +265,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
 }
 
 #[test]
-fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy() {
+fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_policy() {
     let zero_parallelism = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
         admit_workflow(
@@ -286,12 +291,32 @@ fn admission_rejects_nonpositive_parallelism_and_unbounded_cancellation_policy()
                 ExecutionRootLifecycle::EngineOwnedRetained,
                 1,
                 0,
+                1024 * 1024,
                 EnvironmentSnapshot::default(),
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
             ),
         ),
         AdmissionFailureKind::NonPositiveFileOutputBytes,
         AdmissionLocation::MaximumFileOutputBytes,
+    );
+
+    let zero_log_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    assert_failure(
+        admit_workflow(
+            zero_log_limit.resolve(),
+            ResolvedImports::default(),
+            ExecutionContext::new(
+                zero_log_limit.execution_root.clone(),
+                ExecutionRootLifecycle::EngineOwnedRetained,
+                1,
+                1024 * 1024,
+                0,
+                EnvironmentSnapshot::default(),
+                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+            ),
+        ),
+        AdmissionFailureKind::NonPositiveStepLogBytes,
+        AdmissionLocation::MaximumStepLogBytes,
     );
 
     let zero_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
@@ -430,6 +455,7 @@ fn execution_context(
         root,
         lifecycle,
         maximum_parallel_steps,
+        1024 * 1024,
         1024 * 1024,
         EnvironmentSnapshot::default(),
         CancellationPolicy::new(CancellationSource::new(), grace),

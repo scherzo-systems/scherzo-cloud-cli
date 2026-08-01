@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::ops::Add;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::admission::AdmittedWorkflow;
 use super::runtime::{
@@ -143,9 +143,59 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
     }
 }
 
+enum ClaimResolution {
+    Publish,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DriverOccurrenceClaimError {
+    ReceiverClosed,
+}
+
+// The receiver acknowledges a claim before the driver waits for adapter quiescence.
+// Resolving this token then either publishes the lifecycle occurrence or discards it.
+pub(crate) struct DriverOccurrenceClaim {
+    resolution: oneshot::Sender<ClaimResolution>,
+}
+
+impl DriverOccurrenceClaim {
+    pub(crate) fn publish(self) -> Result<(), DriverOccurrenceClaimError> {
+        self.resolution
+            .send(ClaimResolution::Publish)
+            .map_err(|_| DriverOccurrenceClaimError::ReceiverClosed)
+    }
+
+    pub(crate) fn discard(self) {}
+}
+
+enum DriverOccurrenceDelivery<Provisional, Cause, Output> {
+    Ready(DriverOccurrence<Provisional, Cause, Output>),
+    Claimed {
+        occurrence: DriverOccurrence<Provisional, Cause, Output>,
+        observed: oneshot::Sender<()>,
+        resolution: oneshot::Receiver<ClaimResolution>,
+    },
+}
+
+impl<Provisional, Cause, Output> DriverOccurrenceDelivery<Provisional, Cause, Output> {
+    async fn resolve(self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
+        match self {
+            Self::Ready(occurrence) => Some(occurrence),
+            Self::Claimed {
+                occurrence,
+                observed,
+                resolution,
+            } => {
+                observed.send(()).ok()?;
+                matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(occurrence)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OccurrenceSender<Provisional, Cause, Output> {
-    sender: mpsc::Sender<DriverOccurrence<Provisional, Cause, Output>>,
+    sender: mpsc::Sender<DriverOccurrenceDelivery<Provisional, Cause, Output>>,
 }
 
 impl<Provisional, Cause, Output> OccurrenceSender<Provisional, Cause, Output> {
@@ -154,24 +204,71 @@ impl<Provisional, Cause, Output> OccurrenceSender<Provisional, Cause, Output> {
         occurrence: DriverOccurrence<Provisional, Cause, Output>,
     ) -> Result<(), DriverOccurrence<Provisional, Cause, Output>> {
         self.sender
-            .send(occurrence)
+            .send(DriverOccurrenceDelivery::Ready(occurrence))
             .await
-            .map_err(|failure| failure.0)
+            .map_err(|failure| match failure.0 {
+                DriverOccurrenceDelivery::Ready(occurrence)
+                | DriverOccurrenceDelivery::Claimed { occurrence, .. } => occurrence,
+            })
+    }
+
+    pub(crate) async fn claim(
+        &self,
+        occurrence: DriverOccurrence<Provisional, Cause, Output>,
+    ) -> Result<DriverOccurrenceClaim, DriverOccurrenceClaimError> {
+        let (observed, observation) = oneshot::channel();
+        let (resolution, resolved) = oneshot::channel();
+        self.sender
+            .send(DriverOccurrenceDelivery::Claimed {
+                occurrence,
+                observed,
+                resolution: resolved,
+            })
+            .await
+            .map_err(|_| DriverOccurrenceClaimError::ReceiverClosed)?;
+        observation
+            .await
+            .map_err(|_| DriverOccurrenceClaimError::ReceiverClosed)?;
+        Ok(DriverOccurrenceClaim { resolution })
     }
 }
 
 pub(crate) struct OccurrenceReceiver<Provisional, Cause, Output> {
-    receiver: mpsc::Receiver<DriverOccurrence<Provisional, Cause, Output>>,
+    receiver: mpsc::Receiver<DriverOccurrenceDelivery<Provisional, Cause, Output>>,
+    pending: Option<DriverOccurrenceDelivery<Provisional, Cause, Output>>,
 }
 
 impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> {
     pub(crate) async fn recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
-        self.receiver.recv().await
+        loop {
+            let delivery = self.recv_delivery().await?;
+            if let Some(occurrence) = delivery.resolve().await {
+                return Some(occurrence);
+            }
+        }
+    }
+
+    async fn recv_delivery(
+        &mut self,
+    ) -> Option<DriverOccurrenceDelivery<Provisional, Cause, Output>> {
+        match self.pending.take() {
+            Some(delivery) => Some(delivery),
+            None => self.receiver.recv().await,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
-        self.receiver.try_recv().ok()
+        if self.pending.is_some() {
+            return None;
+        }
+        match self.receiver.try_recv().ok()? {
+            DriverOccurrenceDelivery::Ready(occurrence) => Some(occurrence),
+            claimed @ DriverOccurrenceDelivery::Claimed { .. } => {
+                self.pending = Some(claimed);
+                None
+            }
+        }
     }
 }
 
@@ -182,7 +279,13 @@ pub(crate) fn occurrence_channel<Provisional, Cause, Output>(
     OccurrenceReceiver<Provisional, Cause, Output>,
 ) {
     let (sender, receiver) = mpsc::channel(capacity.get());
-    (OccurrenceSender { sender }, OccurrenceReceiver { receiver })
+    (
+        OccurrenceSender { sender },
+        OccurrenceReceiver {
+            receiver,
+            pending: None,
+        },
+    )
 }
 
 pub(crate) trait CoordinatorClock: Clone + Send + Sync + 'static {
@@ -220,6 +323,11 @@ pub(crate) enum CoordinationError {
 pub(crate) struct CoordinationResult<Cause, Output> {
     pub(crate) state: RuntimeState<Cause, Output>,
     pub(crate) last_occurrence_ordinal: OccurrenceOrdinal,
+}
+
+enum CoordinatorInput<Provisional, Cause, Output, Deadline> {
+    Cancellation(Occurrence<Provisional, Cause, Output, Deadline>),
+    Driver(DriverOccurrenceDelivery<Provisional, Cause, Output>),
 }
 
 pub(crate) struct Coordinator<Provisional, Cause, Output, Clock, Commits, Actions>
@@ -288,26 +396,39 @@ where
         }
 
         loop {
-            let occurrence = tokio::select! {
-                biased;
-                changed = cancellation.changed(), if !cancellation_admitted => {
-                    if changed.is_err() {
-                        return Err(CoordinationError::OccurrenceChannelClosed);
+            let occurrence = loop {
+                let input = tokio::select! {
+                    biased;
+                    changed = cancellation.changed(), if !cancellation_admitted => {
+                        if changed.is_err() {
+                            return Err(CoordinationError::OccurrenceChannelClosed);
+                        }
+                        let Some(reason) = *cancellation.borrow_and_update() else {
+                            continue;
+                        };
+                        cancellation_admitted = true;
+                        CoordinatorInput::Cancellation(Occurrence::CancellationRequested {
+                            reason,
+                            deadline: self.clock.now() + grace,
+                        })
                     }
-                    let Some(reason) = *cancellation.borrow_and_update() else {
-                        continue;
-                    };
-                    cancellation_admitted = true;
-                    Occurrence::CancellationRequested {
-                        reason,
-                        deadline: self.clock.now() + grace,
+                    driver_occurrence = self.occurrences.recv_delivery() => {
+                        let Some(driver_occurrence) = driver_occurrence else {
+                            return Err(CoordinationError::OccurrenceChannelClosed);
+                        };
+                        CoordinatorInput::Driver(driver_occurrence)
                     }
-                }
-                driver_occurrence = self.occurrences.receiver.recv() => {
-                    let Some(driver_occurrence) = driver_occurrence else {
-                        return Err(CoordinationError::OccurrenceChannelClosed);
-                    };
-                    driver_occurrence.into_runtime()
+                };
+                match input {
+                    CoordinatorInput::Cancellation(occurrence) => break occurrence,
+                    CoordinatorInput::Driver(delivery) => {
+                        // A selected claim owns arbitration until its adapter settles, so a
+                        // later cancellation cannot gain priority from diagnostic drain timing.
+                        let Some(occurrence) = delivery.resolve().await else {
+                            continue;
+                        };
+                        break occurrence.into_runtime();
+                    }
                 }
             };
             ordinal = ordinal

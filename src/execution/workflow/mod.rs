@@ -3,6 +3,7 @@
 pub(crate) mod admission;
 pub(crate) mod artifact;
 pub(crate) mod coordinator;
+pub(crate) mod diagnostic;
 pub(crate) mod document;
 mod pi;
 pub(crate) mod resolution;

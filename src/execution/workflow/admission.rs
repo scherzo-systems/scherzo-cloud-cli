@@ -177,6 +177,7 @@ pub(crate) struct ExecutionContext {
     root_lifecycle: ExecutionRootLifecycle,
     maximum_parallel_steps: usize,
     maximum_file_output_bytes: u64,
+    maximum_step_log_bytes: u64,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
 }
@@ -187,6 +188,7 @@ impl ExecutionContext {
         root_lifecycle: ExecutionRootLifecycle,
         maximum_parallel_steps: usize,
         maximum_file_output_bytes: u64,
+        maximum_step_log_bytes: u64,
         environment: EnvironmentSnapshot,
         cancellation: CancellationPolicy,
     ) -> Self {
@@ -195,6 +197,7 @@ impl ExecutionContext {
             root_lifecycle,
             maximum_parallel_steps,
             maximum_file_output_bytes,
+            maximum_step_log_bytes,
             environment,
             cancellation,
         }
@@ -205,6 +208,7 @@ impl ExecutionContext {
 pub(crate) struct ExecutionLimits {
     maximum_parallel_steps: NonZeroUsize,
     maximum_file_output_bytes: NonZeroU64,
+    maximum_step_log_bytes: NonZeroU64,
 }
 
 impl ExecutionLimits {
@@ -214,6 +218,10 @@ impl ExecutionLimits {
 
     pub(crate) fn maximum_file_output_bytes(self) -> NonZeroU64 {
         self.maximum_file_output_bytes
+    }
+
+    pub(crate) fn maximum_step_log_bytes(self) -> NonZeroU64 {
+        self.maximum_step_log_bytes
     }
 }
 
@@ -278,6 +286,7 @@ pub(crate) enum AdmissionFailureKind {
     ExecutionRootNotDirectory,
     NonPositiveParallelism,
     NonPositiveFileOutputBytes,
+    NonPositiveStepLogBytes,
     NonPositiveCancellationGrace,
     CancellationGraceTooLong,
 }
@@ -290,6 +299,7 @@ pub(crate) enum AdmissionLocation {
     ExecutionRoot,
     MaximumParallelSteps,
     MaximumFileOutputBytes,
+    MaximumStepLogBytes,
     CancellationPolicy,
 }
 
@@ -375,6 +385,13 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumFileOutputBytes,
             )
         })?;
+    let maximum_step_log_bytes =
+        NonZeroU64::new(context.maximum_step_log_bytes).ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveStepLogBytes,
+                AdmissionLocation::MaximumStepLogBytes,
+            )
+        })?;
     if context.cancellation.grace().is_zero() {
         return Err(AdmissionFailure::new(
             AdmissionFailureKind::NonPositiveCancellationGrace,
@@ -398,6 +415,7 @@ pub(crate) fn admit_workflow(
             limits: ExecutionLimits {
                 maximum_parallel_steps,
                 maximum_file_output_bytes,
+                maximum_step_log_bytes,
             },
             environment: context.environment.without_reserved_variables(),
             cancellation: context.cancellation,

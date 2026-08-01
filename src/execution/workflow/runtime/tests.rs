@@ -388,6 +388,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
             1024 * 1024,
+            1024 * 1024,
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),

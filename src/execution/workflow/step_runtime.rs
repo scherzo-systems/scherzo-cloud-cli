@@ -4,9 +4,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rustix::fs::{Access, AtFlags, CWD, accessat};
@@ -18,8 +19,10 @@ use super::admission::{AdmittedWorkflow, EnvironmentSnapshot};
 use super::artifact::{ArtifactStaging, CaptureFailure, CapturedArtifact};
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
-    CoordinatorClock, DriverOccurrence, OccurrenceSender, occurrence_channel,
+    CoordinatorClock, DriverOccurrence, DriverOccurrenceClaim, OccurrenceSender,
+    occurrence_channel,
 };
+use super::diagnostic::{PendingStepDiagnostic, StepDiagnosticLog};
 use super::document::Output;
 use super::runtime::{Action, ActionId, OutputSet, RequestedAction};
 use super::validated::{ValidatedCommonStep, ValidatedStep};
@@ -102,6 +105,7 @@ where
 {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
+    diagnostics: StepDiagnosticLog,
     occurrences: OccurrenceSender<(), StepFailureCause, CapturedArtifact>,
     clock: Clock,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
@@ -111,15 +115,33 @@ impl<Clock> StepRuntime<Clock>
 where
     Clock: CoordinatorClock,
 {
-    pub(crate) fn new(
+    #[cfg(test)]
+    fn new(
         admitted: AdmittedWorkflow,
         artifacts: ArtifactStaging,
+        occurrences: OccurrenceSender<(), StepFailureCause, CapturedArtifact>,
+        clock: Clock,
+    ) -> Self {
+        Self::with_diagnostics(
+            admitted,
+            artifacts,
+            StepDiagnosticLog::default(),
+            occurrences,
+            clock,
+        )
+    }
+
+    fn with_diagnostics(
+        admitted: AdmittedWorkflow,
+        artifacts: ArtifactStaging,
+        diagnostics: StepDiagnosticLog,
         occurrences: OccurrenceSender<(), StepFailureCause, CapturedArtifact>,
         clock: Clock,
     ) -> Self {
         Self {
             admitted,
             artifacts,
+            diagnostics,
             occurrences,
             clock,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
@@ -157,12 +179,17 @@ where
             BeginLaunch::Gone => return Ok(()),
         }
 
-        let mut launched = match prepared.body.launch() {
+        let mut launched = match prepared.body.launch(
+            step.clone(),
+            &self.diagnostics,
+            self.admitted.execution().limits().maximum_step_log_bytes(),
+        ) {
             Ok(launched) => launched,
             Err(failure) => return self.settle_start_failure(step, action, failure).await,
         };
         let Some(process_group) = launched.process_group() else {
             launched.force_stop().await;
+            launched.finish_diagnostics().await;
             return self
                 .settle_start_failure(
                     step,
@@ -187,6 +214,7 @@ where
             }
             RecordLaunch::Gone => {
                 launched.force_stop().await;
+                launched.finish_diagnostics().await;
                 return Ok(());
             }
         }
@@ -210,6 +238,7 @@ where
             }
             Some(Err(failure)) => {
                 launched.force_stop().await;
+                launched.finish_diagnostics().await;
                 self.with_work(|work| work.abandon(action));
                 return Err(failure);
             }
@@ -275,35 +304,58 @@ where
             launched.force_stop().await;
         }
         launched.force_process_group();
-
-        match self.with_work(|work| work.claim_completion(action)) {
-            CompletionClaim::Lifecycle => {
-                let occurrence = match waited {
-                    Ok(status) if status.success() => {
-                        DriverOccurrence::step_execution_completed(step, action, ())
-                    }
-                    Ok(status) => DriverOccurrence::step_execution_failed(
-                        step,
-                        action,
-                        StepFailureCause::Execution(StepExecutionFailure::Command(
-                            unsuccessful_exit(status),
-                        )),
-                    ),
-                    Err(()) => DriverOccurrence::step_execution_failed(
-                        step,
-                        action,
-                        StepFailureCause::Execution(StepExecutionFailure::Command(
-                            CommandExecutionFailure::Wait,
-                        )),
-                    ),
-                };
-                self.send(occurrence).await
+        let occurrence = match waited {
+            Ok(status) if status.success() => {
+                DriverOccurrence::step_execution_completed(step, action, ())
             }
+            Ok(status) => DriverOccurrence::step_execution_failed(
+                step,
+                action,
+                StepFailureCause::Execution(StepExecutionFailure::Command(unsuccessful_exit(
+                    status,
+                ))),
+            ),
+            Err(()) => DriverOccurrence::step_execution_failed(
+                step,
+                action,
+                StepFailureCause::Execution(StepExecutionFailure::Command(
+                    CommandExecutionFailure::Wait,
+                )),
+            ),
+        };
+        match self.with_work(|work| work.begin_completion(action)) {
+            CompletionClaim::Lifecycle => {}
             CompletionClaim::Cancelled(cancellation) => {
-                launched.force_process_group();
+                launched.finish_diagnostics().await;
+                return self.finish_cancellation(action, cancellation).await;
+            }
+            CompletionClaim::Gone => {
+                launched.finish_diagnostics().await;
+                return Ok(());
+            }
+        }
+        let claim = match self.claim(occurrence).await {
+            Ok(claim) => claim,
+            Err(failure) => {
+                launched.finish_diagnostics().await;
+                self.with_work(|work| work.abandon(action));
+                return Err(failure);
+            }
+        };
+        launched.finish_diagnostics().await;
+
+        match self.with_work(|work| work.finish_completion(action)) {
+            CompletionClaim::Lifecycle => claim
+                .publish()
+                .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed),
+            CompletionClaim::Cancelled(cancellation) => {
+                claim.discard();
                 self.finish_cancellation(action, cancellation).await
             }
-            CompletionClaim::Gone => Ok(()),
+            CompletionClaim::Gone => {
+                claim.discard();
+                Ok(())
+            }
         }
     }
 
@@ -330,6 +382,7 @@ where
                 }
             }
         }
+        launched.finish_diagnostics().await;
         self.finish_cancellation(action, cancellation).await
     }
 
@@ -498,6 +551,16 @@ where
             .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed)
     }
 
+    async fn claim(
+        &self,
+        occurrence: DriverOccurrence<(), StepFailureCause, CapturedArtifact>,
+    ) -> Result<DriverOccurrenceClaim, StepRuntimeError> {
+        self.occurrences
+            .claim(occurrence)
+            .await
+            .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed)
+    }
+
     #[cfg(test)]
     fn active_work_count(&self) -> usize {
         self.with_work(|work| work.active.len())
@@ -516,6 +579,7 @@ enum WorkPhase {
     Prelaunch,
     Launching,
     Running,
+    Completing,
 }
 
 struct CommandWork<Deadline> {
@@ -652,14 +716,36 @@ where
     }
 
     fn claim_completion(&mut self, action: ActionId) -> CompletionClaim<Deadline> {
+        let claim = self.completion_status(action);
+        if matches!(claim, CompletionClaim::Lifecycle) {
+            self.remove_active(action);
+        }
+        claim
+    }
+
+    fn begin_completion(&mut self, action: ActionId) -> CompletionClaim<Deadline> {
+        let claim = self.completion_status(action);
+        if matches!(claim, CompletionClaim::Lifecycle) {
+            let Some(work) = self.active.get_mut(&action) else {
+                return CompletionClaim::Gone;
+            };
+            work.phase = WorkPhase::Completing;
+        }
+        claim
+    }
+
+    fn finish_completion(&mut self, action: ActionId) -> CompletionClaim<Deadline> {
+        self.claim_completion(action)
+    }
+
+    fn completion_status(&self, action: ActionId) -> CompletionClaim<Deadline> {
         let Some(work) = self.active.get(&action) else {
             return CompletionClaim::Gone;
         };
-        if let Some(cancellation) = work.cancellation.clone() {
-            return CompletionClaim::Cancelled(cancellation);
+        match work.cancellation.clone() {
+            Some(cancellation) => CompletionClaim::Cancelled(cancellation),
+            None => CompletionClaim::Lifecycle,
         }
-        self.remove_active(action);
-        CompletionClaim::Lifecycle
     }
 
     fn finish_cancellation(&mut self, action: ActionId) {
@@ -776,6 +862,7 @@ where
 pub(crate) async fn execute_workflow<Clock, Commits>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
+    diagnostics: &StepDiagnosticLog,
     clock: Clock,
     commits: Commits,
 ) -> Result<CoordinationResult<StepFailureCause, CapturedArtifact>, CoordinationError>
@@ -788,7 +875,13 @@ where
     }
     let channel_capacity = admitted.execution().limits().maximum_parallel_steps();
     let (sender, receiver) = occurrence_channel(channel_capacity);
-    let actions = StepRuntime::new(admitted.clone(), artifacts.clone(), sender, clock.clone());
+    let actions = StepRuntime::with_diagnostics(
+        admitted.clone(),
+        artifacts.clone(),
+        diagnostics.clone(),
+        sender,
+        clock.clone(),
+    );
     Coordinator::new(admitted, receiver, clock, commits, actions)
         .run()
         .await
@@ -834,9 +927,14 @@ enum PreparedStepBody {
 }
 
 impl PreparedStepBody {
-    fn launch(self) -> Result<LaunchedStepBody, StepStartFailure> {
+    fn launch(
+        self,
+        step: String,
+        diagnostic_log: &StepDiagnosticLog,
+        maximum_stream_bytes: NonZeroU64,
+    ) -> Result<LaunchedStepBody, StepStartFailure> {
         match self {
-            Self::Command(command) => command.launch().map(LaunchedStepBody::command),
+            Self::Command(command) => command.launch(step, diagnostic_log, maximum_stream_bytes),
             Self::Agent => Err(StepStartFailure::UnsupportedBody(StepBodyKind::Agent)),
         }
     }
@@ -850,17 +948,25 @@ struct PreparedCommand {
 }
 
 impl PreparedCommand {
-    fn launch(self) -> Result<Child, StepStartFailure> {
+    fn launch(
+        self,
+        step: String,
+        diagnostic_log: &StepDiagnosticLog,
+        maximum_stream_bytes: NonZeroU64,
+    ) -> Result<LaunchedStepBody, StepStartFailure> {
         let mut command = Command::new(self.program);
         command
             .args(self.arguments)
             .current_dir(self.cwd)
             .env_clear()
-            .envs(self.environment.variables());
+            .envs(self.environment.variables())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         command.as_std_mut().process_group(0);
-        command
-            .spawn()
-            .map_err(|failure| StepStartFailure::CommandLaunch(classify_launch_failure(&failure)))
+        let child = command.spawn().map_err(|failure| {
+            StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
+        })?;
+        LaunchedStepBody::command(child, step, diagnostic_log, maximum_stream_bytes)
     }
 }
 
@@ -868,19 +974,41 @@ enum LaunchedStepBody {
     Command {
         child: Child,
         process_group: Option<Pid>,
+        diagnostic: Option<PendingStepDiagnostic>,
     },
 }
 
 impl LaunchedStepBody {
-    fn command(child: Child) -> Self {
+    fn command(
+        mut child: Child,
+        step: String,
+        diagnostic_log: &StepDiagnosticLog,
+        maximum_stream_bytes: NonZeroU64,
+    ) -> Result<Self, StepStartFailure> {
         let process_group = child
             .id()
             .and_then(|process_id| i32::try_from(process_id).ok())
             .and_then(Pid::from_raw);
-        Self::Command {
+        let (Some(standard_output), Some(standard_error)) =
+            (child.stdout.take(), child.stderr.take())
+        else {
+            if let Some(process_group) = process_group {
+                terminate_process_group(process_group);
+            }
+            let _ = child.start_kill();
+            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+        };
+        let diagnostic = diagnostic_log.start_capture(
+            step,
+            maximum_stream_bytes,
+            standard_output,
+            standard_error,
+        );
+        Ok(Self::Command {
             child,
             process_group,
-        }
+            diagnostic: Some(diagnostic),
+        })
     }
 
     fn process_group(&self) -> Option<Pid> {
@@ -908,6 +1036,15 @@ impl LaunchedStepBody {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             }
+        }
+    }
+
+    async fn finish_diagnostics(&mut self) {
+        let diagnostic = match self {
+            Self::Command { diagnostic, .. } => diagnostic.take(),
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish().await;
         }
     }
 }

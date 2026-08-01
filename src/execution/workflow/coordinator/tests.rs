@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::{Future, ready};
 use std::num::NonZeroUsize;
@@ -126,6 +127,7 @@ fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixt
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
+            1024 * 1024,
             1024 * 1024,
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(source, grace),
@@ -299,6 +301,80 @@ async fn cancellation_priority_commit_order_and_terminal_shutdown_are_determinis
     assert!(matches!(first.actions[0].action, Action::StartStep { .. }));
     assert!(matches!(first.actions[1].action, Action::CancelStep { .. }));
     assert!(matches!(first.actions[2].action, Action::FinishRun { .. }));
+}
+
+#[tokio::test]
+async fn acknowledged_completion_claim_precedes_later_cancellation() {
+    let cancellation = CancellationSource::new();
+    let fixture = admitted_fixture(cancellation.clone(), Duration::from_secs(7));
+    let clock_reads = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::from_secs(100)),
+            reads: Arc::clone(&clock_reads),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        assert_eq!(commits.recv().await.unwrap().occurrence_ordinal.get(), 1);
+        let start = actions.recv().await.unwrap();
+        let Action::StartStep { step } = &start.action.action else {
+            panic!("workflow did not request its command start");
+        };
+        let step = step.clone();
+        let start_id = start.action.id;
+        start.resume.send(()).unwrap();
+
+        sender
+            .send(DriverOccurrence::step_started(step.clone(), start_id))
+            .await
+            .unwrap();
+        let running = commits.recv().await.unwrap();
+        assert_eq!(running.occurrence_ordinal.get(), 2);
+        assert_eq!(running.state.steps[&step].state, StepState::Running);
+
+        let claim = sender
+            .claim(DriverOccurrence::step_execution_completed(
+                step.clone(),
+                start_id,
+                "completed".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        claim.publish().unwrap();
+
+        let terminal = commits.recv().await.unwrap();
+        assert_eq!(terminal.occurrence_ordinal.get(), 3);
+        assert_eq!(terminal.state.workflow, WorkflowState::Succeeded);
+        assert_eq!(
+            terminal.state.steps[&step].state,
+            StepState::Succeeded {
+                outputs: BTreeMap::new(),
+            }
+        );
+        let finish = actions.recv().await.unwrap();
+        assert!(matches!(finish.action.action, Action::FinishRun { .. }));
+        finish.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result.unwrap().state.workflow, WorkflowState::Succeeded);
+    assert_eq!(clock_reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

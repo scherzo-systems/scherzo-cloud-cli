@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ use crate::execution::workflow::coordinator::{
     CommitPort, CommittedReduction, CoordinationError, CoordinatorClock, OccurrenceReceiver,
     occurrence_channel,
 };
+use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
     self, Action, Occurrence, RequestedAction, StepState, WorkflowState,
@@ -36,6 +38,7 @@ const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::comma
 const FIXTURE_SOCKET: &str = "WORKFLOW_FIXTURE_SOCKET";
 const FIXTURE_EXIT_CODE: &str = "WORKFLOW_FIXTURE_EXIT_CODE";
 const FIXTURE_MODE: &str = "WORKFLOW_FIXTURE_MODE";
+const FIXTURE_OUTPUT_BYTES: &str = "WORKFLOW_FIXTURE_OUTPUT_BYTES";
 const FIXTURE_ROLE: &str = "WORKFLOW_FIXTURE_ROLE";
 const FIXTURE_MODE_INTERRUPTIBLE: &str = "interruptible-group";
 const FIXTURE_MODE_STUBBORN: &str = "stubborn-group";
@@ -135,6 +138,22 @@ fn command_fixture_process() {
     control.write_all(b"\n").unwrap();
     control.flush().unwrap();
 
+    if let Ok(output_bytes) = std::env::var(FIXTURE_OUTPUT_BYTES) {
+        let output_bytes = output_bytes.parse::<usize>().unwrap();
+        let mut standard_output = std::io::stdout().lock();
+        standard_output
+            .write_all(&vec![b'o'; output_bytes])
+            .unwrap();
+        standard_output.flush().unwrap();
+        let mut standard_error = std::io::stderr().lock();
+        standard_error.write_all(&vec![b'e'; output_bytes]).unwrap();
+        standard_error.flush().unwrap();
+        control
+            .write_all(b"{\"event\":\"output-written\"}\n")
+            .unwrap();
+        control.flush().unwrap();
+    }
+
     if let Some((released_command, command)) = commands {
         let mut released = control.try_clone().unwrap();
         drop(std::thread::spawn(move || {
@@ -181,6 +200,7 @@ struct FixtureRun {
     report: FixtureReport,
     action: ActionId,
     terminal: TestOccurrence,
+    diagnostic: StepDiagnostic,
 }
 
 struct PreparedFixtureCommand {
@@ -375,9 +395,11 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
         } = prepare_fixture_command(ProgramForm::Absolute, 0).await;
         let (commit_sender, mut commit_receiver) = mpsc::unbounded_channel();
         let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
         let execution = execute_workflow(
             admitted,
             &artifacts.staging,
+            &diagnostics,
             TestClock,
             RecordingCommitPort {
                 commits: commit_sender,
@@ -393,6 +415,9 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
         let result = result.unwrap();
         assert_eq!(result.state.workflow, WorkflowState::Succeeded);
         assert_eq!(result.last_occurrence_ordinal.get(), 3);
+        let diagnostic = diagnostics.get("task").unwrap();
+        assert!(diagnostic.standard_output().fully_drained());
+        assert!(diagnostic.standard_error().fully_drained());
 
         let mut commits = Vec::new();
         while let Ok(commit) = commit_receiver.try_recv() {
@@ -513,11 +538,13 @@ async fn workflow_execution_rejects_staging_bound_to_another_execution() {
         1,
     );
     let artifacts = test_artifacts(&other_admitted);
+    let diagnostics = StepDiagnosticLog::default();
     let (commit_sender, mut commits) = mpsc::unbounded_channel();
 
     let result = execute_workflow(
         admitted,
         &artifacts.staging,
+        &diagnostics,
         TestClock,
         RecordingCommitPort {
             commits: commit_sender,
@@ -540,10 +567,12 @@ async fn workflow_execution_captures_declared_outputs_before_success() {
         } = prepare_fixture_command_with_output(ProgramForm::Absolute, 0).await;
         fs::write(cwd.join("report.txt"), b"committed report").unwrap();
         let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
         let (commit_sender, _commits) = mpsc::unbounded_channel();
         let execution = execute_workflow(
             admitted,
             &artifacts.staging,
+            &diagnostics,
             TestClock,
             RecordingCommitPort {
                 commits: commit_sender,
@@ -702,6 +731,157 @@ async fn nonzero_exit_is_a_typed_execution_occurrence_with_the_start_action() {
                 )),
             }
         );
+        assert!(run.diagnostic.standard_output().fully_drained());
+        assert!(run.diagnostic.standard_error().fully_drained());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn output_beyond_each_log_limit_is_drained_before_success() {
+    with_watchdog(async {
+        let PreparedFixtureCommand {
+            _temporary,
+            listener,
+            admitted,
+            ..
+        } = prepare_fixture_command_with_log_output(256 * 1024, 37).await;
+        let action = start_actions(&admitted)["task"];
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let runtime = StepRuntime::with_diagnostics(
+            admitted,
+            artifacts.staging.clone(),
+            diagnostics.clone(),
+            sender,
+            TestClock,
+        );
+        let execution =
+            tokio::spawn(async move { runtime.execute_step("task".to_owned(), action).await });
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action,
+            }
+        );
+        let (control, _) = accept_report(&listener).await;
+        assert_eq!(next_fixture_event(&control).await.event, "output-written");
+        release(control).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepExecutionCompleted {
+                step: "task".to_owned(),
+                action,
+                provisional: (),
+            }
+        );
+        assert_eq!(execution.await.unwrap(), Ok(()));
+
+        let diagnostic = diagnostics.get("task").unwrap();
+        for stream in [diagnostic.standard_output(), diagnostic.standard_error()] {
+            assert_eq!(stream.bytes().len(), 37);
+            assert!(stream.truncation().is_some());
+            assert!(stream.fully_drained());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_during_diagnostic_join_waits_for_readers() {
+    with_watchdog(async {
+        let PreparedFixtureCommand {
+            _temporary,
+            admitted,
+            ..
+        } = prepare_fixture_command(ProgramForm::Absolute, 0).await;
+        let deadline = TestInstant(Duration::from_secs(17));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let cancel_action = cancel.id;
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let mut runtime = StepRuntime::with_diagnostics(
+            admitted,
+            artifacts.staging.clone(),
+            diagnostics.clone(),
+            sender,
+            TestClock,
+        );
+        let cancellation = runtime.register_start("task".to_owned(), start.id).unwrap();
+        drop(cancellation);
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "__diagnostic_join_child__"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let status = child.wait().await.unwrap();
+
+        let (standard_output, standard_output_writer) = tokio::io::duplex(1);
+        let (standard_error, standard_error_writer) = tokio::io::duplex(1);
+        let pending = diagnostics.start_capture(
+            "task".to_owned(),
+            NonZeroU64::new(1).unwrap(),
+            standard_output,
+            standard_error,
+        );
+        let mut launched = LaunchedStepBody::Command {
+            child,
+            process_group: None,
+            diagnostic: Some(pending),
+        };
+        let settlement_runtime = runtime.clone();
+        let settlement = settlement_runtime.settle_launched(
+            "task".to_owned(),
+            start.id,
+            &mut launched,
+            Some(Ok(status)),
+        );
+        tokio::pin!(settlement);
+        std::future::poll_fn(|context| {
+            assert!(settlement.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let occurrence = receiver.recv();
+        tokio::pin!(occurrence);
+        std::future::poll_fn(|context| {
+            assert!(occurrence.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        runtime.release(cancel).await;
+        std::future::poll_fn(|context| {
+            assert!(settlement.as_mut().poll(context).is_pending());
+            assert!(occurrence.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            diagnostics.get("task").is_none(),
+            "diagnostics completed while both writers remained open"
+        );
+
+        drop(standard_output_writer);
+        drop(standard_error_writer);
+        assert_eq!(settlement.await, Ok(()));
+        assert_eq!(
+            occurrence.await.unwrap().into_runtime::<()>(),
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+            }
+        );
+        let diagnostic = diagnostics.get("task").unwrap();
+        assert!(diagnostic.standard_output().fully_drained());
+        assert!(diagnostic.standard_error().fully_drained());
     })
     .await;
 }
@@ -724,7 +904,7 @@ async fn concurrent_commands_receive_distinct_process_groups() {
             ("alpha", None, argv.as_slice()),
             ("beta", None, argv.as_slice()),
         ]);
-        let environment = fixture_environment(&control_address, 0, execution_root.as_path());
+        let environment = fixture_environment(&control_address, 0, execution_root.as_path(), None);
         let admitted = admit_fixture(temporary.path(), &execution_root, &source, environment, 2);
         let actions = start_actions(&admitted);
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
@@ -833,7 +1013,14 @@ async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once
         let (clock, mut control) = ControlledClock::new(TestInstant(Duration::ZERO));
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let mut runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, clock);
+        let diagnostics = StepDiagnosticLog::default();
+        let mut runtime = StepRuntime::with_diagnostics(
+            admitted,
+            artifacts.staging.clone(),
+            diagnostics.clone(),
+            sender,
+            clock,
+        );
 
         runtime.release(start).await;
         assert_eq!(
@@ -858,6 +1045,9 @@ async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once
         );
 
         assert_group_closed(&mut processes).await;
+        let diagnostic = diagnostics.get("task").unwrap();
+        assert!(diagnostic.standard_output().fully_drained());
+        assert!(diagnostic.standard_error().fully_drained());
         assert_eq!(runtime.active_work_count(), 0);
         assert_eq!(control.active_waiters(), 0);
         assert!(receiver.try_recv().is_none());
@@ -1040,7 +1230,14 @@ async fn run_fixture_command(form: ProgramForm, exit_code: i32) -> FixtureRun {
     let action = start_actions(&admitted)["task"];
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
     let artifacts = test_artifacts(&admitted);
-    let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+    let diagnostics = StepDiagnosticLog::default();
+    let runtime = StepRuntime::with_diagnostics(
+        admitted,
+        artifacts.staging.clone(),
+        diagnostics.clone(),
+        sender,
+        TestClock,
+    );
     let execution =
         tokio::spawn(async move { runtime.execute_step("task".to_owned(), action).await });
 
@@ -1060,24 +1257,41 @@ async fn run_fixture_command(form: ProgramForm, exit_code: i32) -> FixtureRun {
         report,
         action,
         terminal,
+        diagnostic: diagnostics.get("task").unwrap(),
     }
 }
 
 async fn prepare_fixture_command(form: ProgramForm, exit_code: i32) -> PreparedFixtureCommand {
-    prepare_fixture_command_with_declared_output(form, exit_code, false).await
+    prepare_fixture_command_with_options(form, exit_code, false, None, 1024 * 1024).await
 }
 
 async fn prepare_fixture_command_with_output(
     form: ProgramForm,
     exit_code: i32,
 ) -> PreparedFixtureCommand {
-    prepare_fixture_command_with_declared_output(form, exit_code, true).await
+    prepare_fixture_command_with_options(form, exit_code, true, None, 1024 * 1024).await
 }
 
-async fn prepare_fixture_command_with_declared_output(
+async fn prepare_fixture_command_with_log_output(
+    output_bytes: usize,
+    maximum_log_bytes: u64,
+) -> PreparedFixtureCommand {
+    prepare_fixture_command_with_options(
+        ProgramForm::Absolute,
+        0,
+        false,
+        Some(output_bytes),
+        maximum_log_bytes,
+    )
+    .await
+}
+
+async fn prepare_fixture_command_with_options(
     form: ProgramForm,
     exit_code: i32,
     declare_output: bool,
+    output_bytes: Option<usize>,
+    maximum_log_bytes: u64,
 ) -> PreparedFixtureCommand {
     let temporary = tempfile::tempdir().unwrap();
     let execution_root = temporary.path().join("execution");
@@ -1117,8 +1331,16 @@ async fn prepare_fixture_command_with_declared_output(
             "    outputs:\n      report:\n        kind: file\n        path: work/report.txt\n        mediaType: text/plain\n",
         );
     }
-    let environment = fixture_environment(&control_address, exit_code, &path_directory);
-    let admitted = admit_fixture(temporary.path(), &execution_root, &source, environment, 1);
+    let environment =
+        fixture_environment(&control_address, exit_code, &path_directory, output_bytes);
+    let admitted = admit_fixture_with_log_limit(
+        temporary.path(),
+        &execution_root,
+        &source,
+        environment,
+        1,
+        maximum_log_bytes,
+    );
     PreparedFixtureCommand {
         _temporary: temporary,
         cwd,
@@ -1247,8 +1469,9 @@ fn fixture_environment(
     control_address: &str,
     exit_code: i32,
     path_directory: &Path,
+    output_bytes: Option<usize>,
 ) -> EnvironmentSnapshot {
-    EnvironmentSnapshot::new([
+    let mut variables = vec![
         (
             OsString::from(FIXTURE_SOCKET),
             OsString::from(control_address),
@@ -1269,7 +1492,14 @@ fn fixture_environment(
             OsString::from("SCHERZO_INHERITED"),
             OsString::from("must-not-reach-command"),
         ),
-    ])
+    ];
+    if let Some(output_bytes) = output_bytes {
+        variables.push((
+            OsString::from(FIXTURE_OUTPUT_BYTES),
+            OsString::from(output_bytes.to_string()),
+        ));
+    }
+    EnvironmentSnapshot::new(variables)
 }
 
 fn install_fixture(source: &Path, destination: &Path) {
@@ -1301,6 +1531,24 @@ fn admit_fixture(
     environment: EnvironmentSnapshot,
     maximum_parallel_steps: usize,
 ) -> AdmittedWorkflow {
+    admit_fixture_with_log_limit(
+        temporary_root,
+        execution_root,
+        source,
+        environment,
+        maximum_parallel_steps,
+        1024 * 1024,
+    )
+}
+
+fn admit_fixture_with_log_limit(
+    temporary_root: &Path,
+    execution_root: &Path,
+    source: &str,
+    environment: EnvironmentSnapshot,
+    maximum_parallel_steps: usize,
+    maximum_log_bytes: u64,
+) -> AdmittedWorkflow {
     let source_root = temporary_root.join(format!(
         "source-{}",
         temporary_root.read_dir().unwrap().count()
@@ -1315,6 +1563,7 @@ fn admit_fixture(
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             maximum_parallel_steps,
             1024 * 1024,
+            maximum_log_bytes,
             environment,
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),
