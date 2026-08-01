@@ -810,32 +810,12 @@ fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
 
 #[test]
 fn unauthorized_status_survives_the_body_deadline() {
-    let headers = concat!(
-        "HTTP/1.1 401 Unauthorized\r\n",
-        "Connection: close\r\n",
-        "Content-Type: application/problem+json\r\n",
-        "Content-Length: 2\r\n\r\n"
-    )
-    .as_bytes()
-    .to_vec();
-    let server = ScriptedHttpServer::respond_with_delayed_suffix(
-        headers,
-        Duration::from_millis(150),
-        b"{}".to_vec(),
-    );
-
-    let error = get_organization_with_timeout(
-        &http_client(),
-        &server.api_url,
-        TOKEN,
-        "acme",
-        Duration::from_millis(25),
-    )
-    .expect_err("a timed-out unauthorized body is a protocol failure");
+    let Err(error) = classify_response_deadline(Operation::Get, StatusCode::UNAUTHORIZED) else {
+        panic!("a timed-out unauthorized body is a protocol failure");
+    };
 
     assert!(error.credential_rejected());
     assert!(!error.to_string().contains(TOKEN));
-    server.finish_one();
 }
 
 #[test]

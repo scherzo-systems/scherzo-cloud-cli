@@ -40,6 +40,18 @@ schemas. The selected workflow path is interpreted within that explicit root. Th
 does not infer the boundary from the current directory, an enclosing repository, or
 the YAML file's directory.
 
+The source distribution publishes the self-contained Workflow V1 JSON Schema at
+[`schemas/workflow-v1.schema.json`](schemas/workflow-v1.schema.json). Configure a JSON
+Schema-aware YAML editor or validation tool to use that checked-out file for Workflow
+V1 documents; every schema reference resolves within the file, so normal use does not
+need the private monorepo contract tree. Do not add a `$schema` property to the workflow
+document.
+
+The schema checks document structure. `workflow validate` additionally checks the step
+graph, references, path containment, static files, types, and policy. Passing a schema
+check alone therefore does not establish that the CLI will accept the complete workflow
+bundle.
+
 A successful human result reports the normalized source-root-relative workflow path,
 the SHA-256 digest of the resolved source closure, step count, and required optional
 imports. It never prints static file contents. Add `--json` for one schema-version-1
@@ -60,7 +72,7 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 {
   "schemaVersion": 1,
   "command": "scherzo-cloud",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "executablePath": "/resolved/path/to/scherzo-cloud",
   "buildIdentity": "unknown"
 }
@@ -277,7 +289,7 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.3`. Planning takes the highest fragment impact since the latest stable tag:
+`0.6`. Planning takes the highest fragment impact since the latest stable tag:
 `internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
 and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
 fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact

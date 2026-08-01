@@ -161,7 +161,7 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeStep {
-    dependencies: Arc<[String]>,
+    prerequisites: Arc<[String]>,
     declared_outputs: BTreeSet<String>,
 }
 
@@ -195,7 +195,7 @@ impl RuntimeDefinition {
                 (
                     step_id.clone(),
                     RuntimeStep {
-                        dependencies: Arc::from(common.dependencies.clone()),
+                        prerequisites: Arc::from(common.prerequisites.clone()),
                         declared_outputs: common.outputs.keys().cloned().collect(),
                     },
                 )
@@ -802,7 +802,7 @@ fn next_pending_disposition<Cause, Output>(
             }
 
             if let Some(dependency) = definition
-                .dependencies
+                .prerequisites
                 .iter()
                 .filter(|dependency| {
                     state
@@ -821,7 +821,7 @@ fn next_pending_disposition<Cause, Output>(
             }
 
             definition
-                .dependencies
+                .prerequisites
                 .iter()
                 .all(|dependency| {
                     state
@@ -893,7 +893,7 @@ fn step_is_ready<Cause, Output>(
         .steps
         .get(step_id)
         .is_some_and(|step| matches!(step.state, StepState::Pending))
-        && definition.dependencies.iter().all(|dependency| {
+        && definition.prerequisites.iter().all(|dependency| {
             state
                 .steps
                 .get(dependency)

@@ -1,3 +1,5 @@
+# Deliberately self-contained: this file and its lock are exported with the CLI
+# and must not import the private repository's shared Devenv input baseline.
 # yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
 inputs:
   nixpkgs:

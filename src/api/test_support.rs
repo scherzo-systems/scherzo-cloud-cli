@@ -21,20 +21,7 @@ impl ScriptedHttpServer {
     pub(crate) fn respond_after(delay: Duration, response: Vec<u8>) -> Self {
         Self::start(vec![ScriptedResponse {
             initial_delay: delay,
-            first: response,
-            continuation: None,
-        }])
-    }
-
-    pub(crate) fn respond_with_delayed_suffix(
-        first: Vec<u8>,
-        delay: Duration,
-        suffix: Vec<u8>,
-    ) -> Self {
-        Self::start(vec![ScriptedResponse {
-            initial_delay: Duration::ZERO,
-            first,
-            continuation: Some((delay, suffix)),
+            response,
         }])
     }
 
@@ -44,8 +31,7 @@ impl ScriptedHttpServer {
                 .into_iter()
                 .map(|response| ScriptedResponse {
                     initial_delay: Duration::ZERO,
-                    first: response,
-                    continuation: None,
+                    response,
                 })
                 .collect(),
         )
@@ -64,11 +50,7 @@ impl ScriptedHttpServer {
                     .send(String::from_utf8(request).expect("request should be text"))
                     .expect("fixture request receiver should remain available");
                 thread::sleep(response.initial_delay);
-                let _ = stream.write_all(&response.first);
-                if let Some((delay, suffix)) = response.continuation {
-                    thread::sleep(delay);
-                    let _ = stream.write_all(&suffix);
-                }
+                let _ = stream.write_all(&response.response);
             }
         });
 
@@ -101,8 +83,7 @@ impl ScriptedHttpServer {
 
 struct ScriptedResponse {
     initial_delay: Duration,
-    first: Vec<u8>,
-    continuation: Option<(Duration, Vec<u8>)>,
+    response: Vec<u8>,
 }
 
 pub(crate) fn read_request(stream: &mut TcpStream) -> Vec<u8> {

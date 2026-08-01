@@ -12,6 +12,7 @@ required_files=(
   LICENSE
   changes/README.md
   release.toml
+  schemas/workflow-v1.schema.json
   .github/workflows/check.yml
   Cargo.toml
   Cargo.lock
@@ -42,6 +43,12 @@ for required_file in "${required_files[@]}"; do
     exit 1
   fi
 done
+
+obsolete_workflow_schema=src/execution/workflow/workflow-v1.schema.json
+if [[ -e "$public_root/$obsolete_workflow_schema" ]]; then
+  echo "Obsolete internal Workflow V1 schema is present: $obsolete_workflow_schema" >&2
+  exit 1
+fi
 
 for timing_policy_module in \
   src/runner/service/mod.rs \

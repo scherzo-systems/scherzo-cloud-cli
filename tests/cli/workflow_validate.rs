@@ -55,9 +55,13 @@ steps:
     kind: cmd
     command:
       argv: ["{}"]
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.txt
+        mediaType: text/plain
   agent:
     kind: agent
-    dependsOn: [prepare]
     agent:
       profile: coding
       systemPrompt: ../prompts/system.md
@@ -67,10 +71,18 @@ steps:
           - ref: imports.prompt
         attachments:
           - file: ../attachments/data.txt
+          - ref: outputs.prepare.artifact
     outputs:
       result:
         kind: agent_result
         schema: ../schemas/result.schema.json
+  consume:
+    kind: cmd
+    inputs:
+      result:
+        ref: outputs.agent.result
+    command:
+      argv: ["true"]
 exports:
   result:
     ref: outputs.agent.result
@@ -193,7 +205,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
-    assert!(stdout.contains("Steps: 2"));
+    assert!(stdout.contains("Steps: 3"));
     assert!(stdout.contains("Required optional imports: prompt"));
     assert!(stdout.contains("No workflow steps were executed."));
     assert!(human.stderr.is_empty());
@@ -217,7 +229,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
-    assert_eq!(report["stepCount"], 2);
+    assert_eq!(report["stepCount"], 3);
     assert_eq!(report["requiredImports"], serde_json::json!(["prompt"]));
     assert!(report.get("diagnostics").is_none());
     assert!(json.stdout.ends_with(b"\n"));

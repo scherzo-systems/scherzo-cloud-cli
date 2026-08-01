@@ -20,10 +20,10 @@ use tokio::sync::{mpsc, watch};
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, EnvironmentSnapshot,
+    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
 };
-use crate::execution::workflow::artifact::{ArtifactStaging, CapturedArtifact};
+use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind, CapturedArtifact};
 use crate::execution::workflow::coordinator::{
     CommitPort, CommittedReduction, CoordinationError, CoordinatorClock, OccurrenceReceiver,
     occurrence_channel,
@@ -31,7 +31,7 @@ use crate::execution::workflow::coordinator::{
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
-    self, Action, Occurrence, RequestedAction, StepState, WorkflowState,
+    self, Action, ExportValue, Occurrence, RequestedAction, StepState, WorkflowState,
 };
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
@@ -603,6 +603,511 @@ async fn workflow_execution_captures_declared_outputs_before_success() {
         assert_eq!(bytes, b"committed report");
     })
     .await;
+}
+
+#[tokio::test]
+async fn multi_file_capture_emits_one_complete_typed_set_and_complete_exports() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(execution_root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(execution_root.join("beta.json"), br#"{"beta":true}"#).unwrap();
+    let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      alpha:
+        kind: file
+        path: alpha.txt
+        mediaType: text/plain
+      beta:
+        kind: file
+        path: beta.json
+        mediaType: application/json
+exports:
+  alphaExport:
+    ref: outputs.task.alpha
+  betaExport:
+    ref: outputs.task.beta
+"#;
+    let admitted = admit_fixture(
+        temporary.path(),
+        &execution_root,
+        source,
+        EnvironmentSnapshot::default(),
+        1,
+    );
+    let initialized =
+        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+    let start = initialized.actions[0].id;
+    let running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &initialized.state,
+        Occurrence::StepStarted {
+            step: "task".to_owned(),
+            action: start,
+        },
+    );
+    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &running.state,
+        Occurrence::StepExecutionCompleted {
+            step: "task".to_owned(),
+            action: start,
+            provisional: (),
+        },
+    );
+    let capture = capture_requested
+        .actions
+        .iter()
+        .find(|requested| matches!(requested.action, Action::CaptureOutputs { .. }))
+        .unwrap();
+    let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+    let artifacts = test_artifacts(&admitted);
+    let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+
+    runtime
+        .capture_outputs("task".to_owned(), capture.id)
+        .await
+        .unwrap();
+
+    let occurrence = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let Occurrence::OutputsCaptured {
+        step,
+        action,
+        outputs,
+    } = &occurrence
+    else {
+        panic!("complete capture did not produce outputsCaptured");
+    };
+    assert_eq!(step, "task");
+    assert_eq!(*action, capture.id);
+    assert_eq!(
+        outputs.keys().cloned().collect::<Vec<_>>(),
+        ["alpha", "beta"]
+    );
+    assert_eq!(outputs["alpha"].media_type(), "text/plain");
+    assert_eq!(outputs["beta"].media_type(), "application/json");
+    assert_eq!(artifacts.staging.budget_usage(), (2, 18));
+    assert!(receiver.try_recv().is_none());
+
+    let committed = runtime::reduce(&capture_requested.state, occurrence);
+    assert_eq!(committed.state.workflow, WorkflowState::Succeeded);
+    let finish = committed
+        .actions
+        .iter()
+        .find(|requested| matches!(requested.action, Action::FinishRun { .. }))
+        .unwrap();
+    let Action::FinishRun { exports, .. } = &finish.action else {
+        unreachable!();
+    };
+    let ExportValue::Available { output: alpha } = &exports["alphaExport"] else {
+        panic!("alpha export was unavailable");
+    };
+    let ExportValue::Available { output: beta } = &exports["betaExport"] else {
+        panic!("beta export was unavailable");
+    };
+    assert_eq!(alpha.media_type(), "text/plain");
+    assert_eq!(beta.media_type(), "application/json");
+}
+
+#[tokio::test]
+async fn capture_action_release_completes_when_occurrence_channel_is_full() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(execution_root.join("report.txt"), b"report").unwrap();
+    let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      report:
+        kind: file
+        path: report.txt
+        mediaType: text/plain
+"#;
+    let admitted = admit_fixture(
+        temporary.path(),
+        &execution_root,
+        source,
+        EnvironmentSnapshot::default(),
+        1,
+    );
+    let initialized =
+        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+    let start = initialized.actions[0].id;
+    let running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &initialized.state,
+        Occurrence::StepStarted {
+            step: "task".to_owned(),
+            action: start,
+        },
+    );
+    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &running.state,
+        Occurrence::StepExecutionCompleted {
+            step: "task".to_owned(),
+            action: start,
+            provisional: (),
+        },
+    );
+    let capture = capture_requested.actions[0].clone();
+    let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    sender
+        .send(DriverOccurrence::step_started("queued".to_owned(), start))
+        .await
+        .unwrap();
+    let artifacts = test_artifacts(&admitted);
+    let mut driver = StepRuntime::new(admitted, artifacts.staging, sender, TestClock);
+
+    with_watchdog(driver.release(capture)).await;
+
+    assert!(matches!(
+        receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
+        Occurrence::StepStarted { step, .. } if step == "queued"
+    ));
+    assert!(matches!(
+        receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
+        Occurrence::OutputsCaptured { step, .. } if step == "task"
+    ));
+}
+
+#[tokio::test]
+async fn failed_set_rolls_back_without_removing_a_prior_steps_export() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(execution_root.join("prior.bin"), b"12").unwrap();
+    fs::write(execution_root.join("candidate.bin"), b"34").unwrap();
+    let source = r#"schemaVersion: 1
+steps:
+  prior:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      report:
+        kind: file
+        path: prior.bin
+        mediaType: application/prior
+  failing:
+    kind: cmd
+    dependsOn: [prior]
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      candidate:
+        kind: file
+        path: candidate.bin
+        mediaType: application/candidate
+      missing:
+        kind: file
+        path: missing.bin
+        mediaType: application/missing
+exports:
+  priorExport:
+    ref: outputs.prior.report
+  failedExport:
+    ref: outputs.failing.candidate
+"#;
+    let admitted = admit_fixture_with_capture_limits(
+        temporary.path(),
+        &execution_root,
+        source,
+        EnvironmentSnapshot::default(),
+        1,
+        CaptureLimits::new(3, 4, 6),
+    );
+    let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+    let artifacts = test_artifacts(&admitted);
+    let runtime = StepRuntime::new(
+        admitted.clone(),
+        artifacts.staging.clone(),
+        sender,
+        TestClock,
+    );
+    let initialized =
+        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+    let prior_start = initialized.actions[0].id;
+    let prior_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &initialized.state,
+        Occurrence::StepStarted {
+            step: "prior".to_owned(),
+            action: prior_start,
+        },
+    );
+    let prior_capture_requested =
+        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+            &prior_running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "prior".to_owned(),
+                action: prior_start,
+                provisional: (),
+            },
+        );
+    let prior_capture = prior_capture_requested.actions[0].id;
+    runtime
+        .capture_outputs("prior".to_owned(), prior_capture)
+        .await
+        .unwrap();
+    let prior_committed = runtime::reduce(
+        &prior_capture_requested.state,
+        receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
+    );
+    let failing_start = prior_committed
+        .actions
+        .iter()
+        .find(|requested| matches!(&requested.action, Action::StartStep { step } if step == "failing"))
+        .unwrap()
+        .id;
+    let failing_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &prior_committed.state,
+        Occurrence::StepStarted {
+            step: "failing".to_owned(),
+            action: failing_start,
+        },
+    );
+    let failing_capture_requested =
+        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+            &failing_running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "failing".to_owned(),
+                action: failing_start,
+                provisional: (),
+            },
+        );
+    let failing_capture = failing_capture_requested.actions[0].id;
+
+    runtime
+        .capture_outputs("failing".to_owned(), failing_capture)
+        .await
+        .unwrap();
+
+    let failure_occurrence = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let Occurrence::OutputCaptureFailed { cause, .. } = &failure_occurrence else {
+        panic!("failed set did not report outputCaptureFailed");
+    };
+    let StepFailureCause::OutputCapture(OutputCaptureFailure::Capture(capture_failure)) = cause
+    else {
+        panic!("failed set did not retain its typed capture cause");
+    };
+    assert_eq!(capture_failure.output_identity(), "missing");
+    assert_eq!(artifacts.staging.staged_artifact_count(), 1);
+    assert_eq!(artifacts.staging.budget_usage(), (1, 2));
+
+    let terminal = runtime::reduce(&failing_capture_requested.state, failure_occurrence);
+    assert!(matches!(
+        terminal.state.workflow,
+        WorkflowState::Failed { .. }
+    ));
+    let StepState::Succeeded { outputs } = &terminal.state.steps["prior"].state else {
+        panic!("prior step lost its committed output");
+    };
+    let prior = &outputs["report"];
+    let mut prior_bytes = Vec::new();
+    artifacts
+        .staging
+        .copy_to(prior.handle(), &mut prior_bytes)
+        .unwrap();
+    assert_eq!(prior_bytes, b"12");
+    let Action::FinishRun { exports, .. } = &terminal.actions.last().unwrap().action else {
+        panic!("terminal failure did not finish the run");
+    };
+    assert!(matches!(
+        exports["priorExport"],
+        ExportValue::Available { .. }
+    ));
+    assert!(matches!(
+        exports["failedExport"],
+        ExportValue::Unavailable { .. }
+    ));
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CaptureBudgetTranscript {
+    winner: String,
+    winner_action_sequence: u64,
+    winner_output: (String, u64, String, bool),
+    loser: String,
+    loser_action_sequence: u64,
+    loser_failure: CaptureFailureKind,
+    budget: (usize, u64),
+    staged_artifacts: usize,
+}
+
+async fn run_contended_capture_transcript() -> CaptureBudgetTranscript {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    // Make the later action's source available first; source readiness does not
+    // participate in budget allocation.
+    fs::write(execution_root.join("beta.bin"), b"bbb").unwrap();
+    fs::write(execution_root.join("alpha.bin"), b"aaa").unwrap();
+    let source = r#"schemaVersion: 1
+steps:
+  alpha:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      artifact:
+        kind: file
+        path: alpha.bin
+        mediaType: application/alpha
+  beta:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      artifact:
+        kind: file
+        path: beta.bin
+        mediaType: application/beta
+"#;
+    let admitted = admit_fixture_with_capture_limits(
+        temporary.path(),
+        &execution_root,
+        source,
+        EnvironmentSnapshot::default(),
+        2,
+        CaptureLimits::new(2, 3, 3),
+    );
+    let initialized =
+        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+    let starts = initialized
+        .actions
+        .iter()
+        .map(|requested| match &requested.action {
+            Action::StartStep { step } => (step.clone(), requested.id),
+            _ => unreachable!(),
+        })
+        .collect::<BTreeMap<_, _>>();
+    let alpha_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &initialized.state,
+        Occurrence::StepStarted {
+            step: "alpha".to_owned(),
+            action: starts["alpha"],
+        },
+    );
+    let both_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        &alpha_running.state,
+        Occurrence::StepStarted {
+            step: "beta".to_owned(),
+            action: starts["beta"],
+        },
+    );
+    let alpha_capture_requested =
+        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+            &both_running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "alpha".to_owned(),
+                action: starts["alpha"],
+                provisional: (),
+            },
+        );
+    let alpha_capture = alpha_capture_requested.actions[0].clone();
+    let beta_capture_requested =
+        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+            &alpha_capture_requested.state,
+            Occurrence::StepExecutionCompleted {
+                step: "beta".to_owned(),
+                action: starts["beta"],
+                provisional: (),
+            },
+        );
+    let beta_capture = beta_capture_requested.actions[0].clone();
+    assert!(alpha_capture.id < beta_capture.id);
+
+    let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    sender
+        .send(DriverOccurrence::step_started(
+            "queued".to_owned(),
+            starts["alpha"],
+        ))
+        .await
+        .unwrap();
+    let artifacts = test_artifacts(&admitted);
+    let mut driver = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+
+    // Hold both result deliveries behind a full channel. Each release must still finish
+    // its budget allocation before the coordinator can release the next action.
+    driver.release(alpha_capture).await;
+    assert_eq!(artifacts.staging.budget_usage(), (1, 3));
+    driver.release(beta_capture).await;
+    assert_eq!(artifacts.staging.budget_usage(), (1, 3));
+    assert!(matches!(
+        receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
+        Occurrence::StepStarted { step, .. } if step == "queued"
+    ));
+
+    let winner = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let loser = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let Occurrence::OutputsCaptured {
+        step,
+        action,
+        outputs,
+    } = winner
+    else {
+        panic!("earlier capture action did not win the budget");
+    };
+    let output = &outputs["artifact"];
+    let winner_output = (
+        output.output_identity().to_owned(),
+        output.size(),
+        output.media_type().to_owned(),
+        output.handle().opaque_id().starts_with("art_"),
+    );
+    let Occurrence::OutputCaptureFailed {
+        step: loser_step,
+        action: loser_action,
+        cause,
+    } = loser
+    else {
+        panic!("later capture action did not report budget failure");
+    };
+    let StepFailureCause::OutputCapture(OutputCaptureFailure::Capture(failure)) = cause else {
+        panic!("later capture action lost its typed budget failure");
+    };
+    CaptureBudgetTranscript {
+        winner: step,
+        winner_action_sequence: action.transition_sequence.get(),
+        winner_output,
+        loser: loser_step,
+        loser_action_sequence: loser_action.transition_sequence.get(),
+        loser_failure: failure.kind(),
+        budget: artifacts.staging.budget_usage(),
+        staged_artifacts: artifacts.staging.staged_artifact_count(),
+    }
+}
+
+#[tokio::test]
+async fn reducer_action_order_deterministically_allocates_contended_capture_budget() {
+    let first = run_contended_capture_transcript().await;
+    let second = run_contended_capture_transcript().await;
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first,
+        CaptureBudgetTranscript {
+            winner: "alpha".to_owned(),
+            winner_action_sequence: 5,
+            winner_output: (
+                "artifact".to_owned(),
+                3,
+                "application/alpha".to_owned(),
+                true
+            ),
+            loser: "beta".to_owned(),
+            loser_action_sequence: 6,
+            loser_failure: CaptureFailureKind::TotalSizeLimitExceeded,
+            budget: (1, 3),
+            staged_artifacts: 1,
+        }
+    );
 }
 
 #[tokio::test]
@@ -1531,12 +2036,32 @@ fn admit_fixture(
     environment: EnvironmentSnapshot,
     maximum_parallel_steps: usize,
 ) -> AdmittedWorkflow {
-    admit_fixture_with_log_limit(
+    admit_fixture_with_limits(
         temporary_root,
         execution_root,
         source,
         environment,
         maximum_parallel_steps,
+        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+        1024 * 1024,
+    )
+}
+
+fn admit_fixture_with_capture_limits(
+    temporary_root: &Path,
+    execution_root: &Path,
+    source: &str,
+    environment: EnvironmentSnapshot,
+    maximum_parallel_steps: usize,
+    capture_limits: CaptureLimits,
+) -> AdmittedWorkflow {
+    admit_fixture_with_limits(
+        temporary_root,
+        execution_root,
+        source,
+        environment,
+        maximum_parallel_steps,
+        capture_limits,
         1024 * 1024,
     )
 }
@@ -1547,6 +2072,26 @@ fn admit_fixture_with_log_limit(
     source: &str,
     environment: EnvironmentSnapshot,
     maximum_parallel_steps: usize,
+    maximum_log_bytes: u64,
+) -> AdmittedWorkflow {
+    admit_fixture_with_limits(
+        temporary_root,
+        execution_root,
+        source,
+        environment,
+        maximum_parallel_steps,
+        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+        maximum_log_bytes,
+    )
+}
+
+fn admit_fixture_with_limits(
+    temporary_root: &Path,
+    execution_root: &Path,
+    source: &str,
+    environment: EnvironmentSnapshot,
+    maximum_parallel_steps: usize,
+    capture_limits: CaptureLimits,
     maximum_log_bytes: u64,
 ) -> AdmittedWorkflow {
     let source_root = temporary_root.join(format!(
@@ -1562,7 +2107,7 @@ fn admit_fixture_with_log_limit(
             execution_root.to_owned(),
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             maximum_parallel_steps,
-            1024 * 1024,
+            capture_limits,
             maximum_log_bytes,
             environment,
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
@@ -1712,11 +2257,11 @@ async fn send_fixture_control(stream: &TcpStream, control: u8) -> bool {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "real time is allowed only to keep a broken process handshake from hanging"
+    reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
 )]
 async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
     match tokio::time::timeout(TEST_WATCHDOG, future).await {
         Ok(output) => output,
-        Err(_) => panic!("workflow command fixture watchdog expired"),
+        Err(_) => panic!("workflow test watchdog expired"),
     }
 }

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, EnvironmentSnapshot,
+    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
@@ -127,7 +127,7 @@ fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixt
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
-            1024 * 1024,
+            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
             1024 * 1024,
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(source, grace),

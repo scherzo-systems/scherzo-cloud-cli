@@ -37,7 +37,7 @@ pub(crate) struct AgentStep {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommonStep {
-    pub(crate) dependencies: Vec<String>,
+    pub(crate) control_dependencies: Vec<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, Output>,
 }

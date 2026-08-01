@@ -2,6 +2,11 @@
 set -euo pipefail
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Keep Unix-domain socket fixtures below the platform path-length limit even when
+# the source checkout or inherited temporary directory has a long path.
+check_tmp=$(TMPDIR=/tmp mktemp -d)
+trap 'rm -rf "$check_tmp"' EXIT
+export TMPDIR=$check_tmp
 
 "$public_root/scripts/check-structure"
 

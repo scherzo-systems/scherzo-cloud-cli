@@ -43,7 +43,7 @@ enum StepDto {
 #[derive(Deserialize)]
 struct CommonStepDto {
     #[serde(rename = "dependsOn", default)]
-    dependencies: Vec<String>,
+    control_dependencies: Vec<String>,
     cwd: Option<String>,
     #[serde(default)]
     outputs: BTreeMap<String, OutputDto>,
@@ -178,7 +178,7 @@ impl CommonStepDto {
             .collect();
 
         CommonStep {
-            dependencies: self.dependencies,
+            control_dependencies: self.control_dependencies,
             cwd: self.cwd,
             outputs,
         }

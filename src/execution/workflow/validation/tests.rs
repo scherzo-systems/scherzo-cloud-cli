@@ -61,7 +61,10 @@ fn dependency_graph_failures_are_classified_at_owned_locations() {
     let Step::Command(consumer) = duplicate.steps.get_mut("consumer").unwrap() else {
         panic!("consumer must be a command step");
     };
-    consumer.common.dependencies.push("producer".to_owned());
+    consumer
+        .common
+        .control_dependencies
+        .push("producer".to_owned());
     let duplicate_failure = super::validate(duplicate).unwrap_err();
     assert_eq!(
         duplicate_failure.kind(),
@@ -86,6 +89,49 @@ fn dependency_graph_failures_are_classified_at_owned_locations() {
         ValidationFailureKind::DependencyCycle,
         ValidationLocation::WorkflowGraph,
     );
+
+    let data_cycle = "schemaVersion: 1
+steps:
+  one:
+    kind: cmd
+    inputs:
+      value:
+        ref: outputs.two.value
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: one.txt
+        mediaType: text/plain
+  two:
+    kind: cmd
+    inputs:
+      value:
+        ref: outputs.one.value
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: two.txt
+        mediaType: text/plain
+";
+    assert_failure(
+        data_cycle,
+        ValidationFailureKind::DependencyCycle,
+        ValidationLocation::WorkflowGraph,
+    );
+
+    let mixed_cycle = data_cycle.replace(
+        "    inputs:\n      value:\n        ref: outputs.two.value\n",
+        "    dependsOn: [two]\n",
+    );
+    assert_failure(
+        &mixed_cycle,
+        ValidationFailureKind::DependencyCycle,
+        ValidationLocation::WorkflowGraph,
+    );
 }
 
 #[test]
@@ -104,7 +150,7 @@ fn branching_and_disconnected_dag_retains_every_edge_and_step() {
     let ValidatedStep::Command(join) = &workflow.steps["join"] else {
         panic!("join must be a command step");
     };
-    assert_eq!(join.common.dependencies, ["left", "right"]);
+    assert_eq!(join.common.prerequisites, ["left", "right"]);
     for (dependency, dependent) in [
         ("root", "left"),
         ("root", "right"),
@@ -196,7 +242,7 @@ steps:
 }
 
 #[test]
-fn output_bindings_require_existing_reachable_producers() {
+fn output_bindings_require_declared_non_self_outputs() {
     let missing_step = "schemaVersion: 1
 steps:
   consumer:
@@ -224,7 +270,6 @@ steps:
       argv: [\"true\"]
   consumer:
     kind: cmd
-    dependsOn: [producer]
     inputs:
       value:
         ref: outputs.producer.missing
@@ -240,7 +285,93 @@ steps:
         },
     );
 
-    let unreachable = "schemaVersion: 1
+    let self_reference = "schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    inputs:
+      value:
+        ref: outputs.consumer.value
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: value.txt
+        mediaType: text/plain
+";
+    assert_failure(
+        self_reference,
+        ValidationFailureKind::SelfDependency,
+        ValidationLocation::StepInput {
+            step: "consumer".to_owned(),
+            input: "value".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn command_output_references_form_normalized_direct_prerequisites() {
+    let source = "schemaVersion: 1
+steps:
+  alpha:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: alpha.txt
+        mediaType: text/plain
+  beta:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: beta.txt
+        mediaType: text/plain
+  middle:
+    kind: cmd
+    dependsOn: [alpha]
+    command:
+      argv: [\"true\"]
+  zeta:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+  consumer:
+    kind: cmd
+    dependsOn: [zeta, middle, alpha]
+    inputs:
+      second:
+        ref: outputs.beta.value
+      first:
+        ref: outputs.alpha.value
+    command:
+      argv: [\"true\"]
+";
+
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Command(consumer) = &workflow.steps["consumer"] else {
+        panic!("consumer must be a command step");
+    };
+    assert_eq!(
+        consumer.common.prerequisites,
+        ["alpha", "beta", "middle", "zeta"]
+    );
+    assert_eq!(consumer.inputs.len(), 2);
+    assert_eq!(consumer.inputs["first"].value_type, WorkflowValueType::File);
+    assert_eq!(
+        workflow.topological_order,
+        ["alpha", "beta", "middle", "zeta", "consumer"]
+    );
+}
+
+#[test]
+fn transitive_output_reference_remains_a_direct_prerequisite() {
+    let source = "schemaVersion: 1
 steps:
   producer:
     kind: cmd
@@ -251,37 +382,64 @@ steps:
         kind: file
         path: value.txt
         mediaType: text/plain
-  other:
+  middle:
     kind: cmd
     dependsOn: [producer]
     command:
       argv: [\"true\"]
   consumer:
     kind: cmd
+    dependsOn: [middle]
     inputs:
       value:
         ref: outputs.producer.value
     command:
       argv: [\"true\"]
 ";
-    assert_failure(
-        unreachable,
-        ValidationFailureKind::OutputProducerNotDependency,
-        ValidationLocation::StepInput {
-            step: "consumer".to_owned(),
-            input: "value".to_owned(),
-        },
-    );
 
-    let transitive = unreachable.replace(
-        "  consumer:\n    kind: cmd\n    inputs:",
-        "  consumer:\n    kind: cmd\n    dependsOn: [other]\n    inputs:",
-    );
-    let workflow = validate_yaml(&transitive).unwrap();
+    let workflow = validate_yaml(source).unwrap();
     let ValidatedStep::Command(consumer) = &workflow.steps["consumer"] else {
         panic!("consumer must be a command step");
     };
-    assert_eq!(consumer.inputs["value"].value_type, WorkflowValueType::File);
+    assert_eq!(consumer.common.prerequisites, ["middle", "producer"]);
+    assert_eq!(
+        workflow.topological_order,
+        ["producer", "middle", "consumer"]
+    );
+}
+
+#[test]
+fn imports_and_exports_do_not_create_step_prerequisites() {
+    let source = "schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    inputs:
+      prompt:
+        ref: imports.prompt
+    command:
+      argv: [\"true\"]
+  producer:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: file
+        path: value.txt
+        mediaType: text/plain
+exports:
+  value:
+    ref: outputs.producer.value
+";
+
+    let workflow = validate_yaml(source).unwrap();
+    let ValidatedStep::Command(consumer) = &workflow.steps["consumer"] else {
+        panic!("consumer must be a command step");
+    };
+    assert!(consumer.common.prerequisites.is_empty());
+    assert!(workflow.required_imports.prompt);
+    assert_eq!(workflow.topological_order, ["consumer", "producer"]);
 }
 
 #[test]
@@ -395,7 +553,7 @@ fn message_type_table_rejects_every_inverse_destination_without_conversion() {
 }
 
 #[test]
-fn validated_definition_preserves_only_explicit_direct_message_references() {
+fn validated_definition_preserves_explicit_consumption_and_effective_prerequisites() {
     let source = "schemaVersion: 1
 description: Typed workflow.
 agentProfiles:
@@ -479,7 +637,7 @@ exports:
         panic!("consumer must be an agent step");
     };
     assert_eq!(
-        consumer.common.dependencies,
+        consumer.common.prerequisites,
         ["responseProducer", "resultProducer"]
     );
     assert_eq!(
@@ -582,16 +740,13 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
         );
     }
 
-    let unreachable = typed_message_workflow("outputs.responseProducer.response", "text")
+    let data_only = typed_message_workflow("outputs.responseProducer.response", "text")
         .replace("    dependsOn: [responseProducer, resultProducer]\n", "");
-    assert_failure(
-        &unreachable,
-        ValidationFailureKind::OutputProducerNotDependency,
-        ValidationLocation::MessageText {
-            step: "consumer".to_owned(),
-            index: 0,
-        },
-    );
+    let workflow = validate_yaml(&data_only).unwrap();
+    let ValidatedStep::Agent(consumer) = &workflow.steps["consumer"] else {
+        panic!("consumer must be an agent step");
+    };
+    assert_eq!(consumer.common.prerequisites, ["responseProducer"]);
 }
 
 #[test]

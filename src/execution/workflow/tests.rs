@@ -40,14 +40,14 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         panic!("prepare must be a command step");
     };
     assert_eq!(prepare.argv, ["./scripts/prepare-workspace.sh"]);
-    assert!(prepare.common.dependencies.is_empty());
+    assert!(prepare.common.control_dependencies.is_empty());
     assert!(prepare.inputs.is_empty());
     assert!(prepare.common.outputs.is_empty());
 
     let Step::Agent(plan) = &workflow.steps["plan"] else {
         panic!("plan must be an agent step");
     };
-    assert_eq!(plan.common.dependencies, ["prepare"]);
+    assert_eq!(plan.common.control_dependencies, ["prepare"]);
     assert_eq!(plan.agent.profile, "coding");
     assert_eq!(plan.agent.system_prompt, "prompts/plan-system.md");
     assert_eq!(
@@ -62,7 +62,6 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             name: "attachments".to_owned()
         })]
     );
-    assert_eq!(plan.common.outputs["response"], Output::AgentResponse);
     assert_eq!(
         plan.common.outputs["plan"],
         Output::AgentResult {
@@ -80,7 +79,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     let Step::Agent(implement) = &workflow.steps["implement"] else {
         panic!("implement must be an agent step");
     };
-    assert_eq!(implement.common.dependencies, ["plan"]);
+    assert!(implement.common.control_dependencies.is_empty());
     assert_eq!(implement.agent.profile, "coding");
     assert_eq!(implement.agent.system_prompt, "prompts/implement-system.md");
     assert_eq!(
@@ -91,11 +90,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             },
             MessageSource::Reference(ValueReference::Import {
                 name: "prompt".to_owned()
-            }),
-            MessageSource::Reference(ValueReference::Output(OutputReference {
-                step: "plan".to_owned(),
-                output: "response".to_owned(),
-            }))
+            })
         ]
     );
     assert_eq!(
@@ -119,7 +114,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     let Step::Command(test) = &workflow.steps["test"] else {
         panic!("test must be a command step");
     };
-    assert_eq!(test.common.dependencies, ["implement"]);
+    assert!(test.common.control_dependencies.is_empty());
     assert_eq!(test.common.cwd.as_deref(), Some("packages/api"));
     assert_eq!(test.argv, ["./scripts/test.sh"]);
     assert_eq!(
@@ -132,7 +127,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
         test.inputs["changeSummary"],
         ValueReference::Output(OutputReference {
             step: "implement".to_owned(),
-            output: "changeSummary".to_owned(),
+            output: "response".to_owned(),
         })
     );
     assert_eq!(

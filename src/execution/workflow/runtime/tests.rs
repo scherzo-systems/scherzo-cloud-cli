@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, EnvironmentSnapshot,
+    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
@@ -42,7 +42,7 @@ fn definition(
                 (
                     (*step).to_owned(),
                     RuntimeStep {
-                        dependencies: dependencies
+                        prerequisites: dependencies
                             .iter()
                             .map(|dependency| (*dependency).to_owned())
                             .collect::<Vec<_>>()
@@ -387,7 +387,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             1,
-            1024 * 1024,
+            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
             1024 * 1024,
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
@@ -401,6 +401,83 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     assert_step(&initialization.state, "alpha", StepStateKind::Starting);
     assert_step(&initialization.state, "zeta", StepStateKind::Pending);
     assert!(initialization.state.exports.is_none());
+}
+
+#[test]
+fn inferred_data_edges_drive_runtime_scheduling_and_blocking() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        "schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    inputs:
+      artifact:
+        ref: outputs.producer.artifact
+    command:
+      argv: [\"true\"]
+  producer:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.txt
+        mediaType: text/plain
+",
+    )
+    .unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedImports::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            2,
+            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+            1024 * 1024,
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_eq!(initialization.actions, [start_action(1, "producer")]);
+    assert_step(&initialization.state, "consumer", StepStateKind::Pending);
+
+    let reduction = reduce(
+        &initialization.state,
+        Occurrence::StepStartFailed {
+            step: "producer".to_owned(),
+            action: action_id(1),
+            cause: "failed to start".to_owned(),
+        },
+    );
+    let primary_failure = failure("producer", FailurePhase::Start, "failed to start");
+    assert_eq!(
+        reduction.state.steps["consumer"].state,
+        StepState::Blocked {
+            dependency: "producer".to_owned(),
+        }
+    );
+    assert_eq!(
+        reduction.state.workflow,
+        WorkflowState::Failed {
+            primary_failure: primary_failure.clone(),
+            later_cancellation: None,
+        }
+    );
+    assert_eq!(
+        reduction.actions,
+        [finish_failed_action(5, primary_failure, ExportSet::new())]
+    );
 }
 
 #[test]

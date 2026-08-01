@@ -35,10 +35,11 @@ service.
 ## Local workflow validation
 
 `src/cli/workflow/validate.rs` is an offline typed Clap adapter around the shared
-resolver in `src/execution/workflow/resolution.rs`. It requires both an explicit source
-root and a selected workflow path, then renders only normalized provenance, digest,
-step-count, required-import, and closed diagnostic fields. It does not parse or
-validate workflow definitions independently.
+resolver in `src/execution/workflow/resolution.rs`. Structural validation embeds the
+public `schemas/workflow-v1.schema.json` artifact; no implementation-local schema copy
+exists. The adapter requires both an explicit source root and a selected workflow path,
+then renders only normalized provenance, digest, step-count, required-import, and closed
+diagnostic fields. It does not parse or validate workflow definitions independently.
 
 Validation stops at definition resolution. The adapter does not construct run
 admission or runtime state, execute command or agent steps, inspect harness

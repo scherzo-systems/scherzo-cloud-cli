@@ -24,7 +24,6 @@ pub(crate) enum ValidationFailureKind {
     UnknownImport,
     UnknownOutputStep,
     UnknownOutput,
-    OutputProducerNotDependency,
     MessageTypeMismatch,
     IllegalCommandOutput,
     ExcessAgentResponseOutput,
@@ -75,6 +74,7 @@ impl fmt::Display for ValidationFailure {
 impl std::error::Error for ValidationFailure {}
 
 struct ValidatedGraph {
+    direct_prerequisites: BTreeMap<String, Vec<String>>,
     topological_order: Vec<String>,
     ancestors: BTreeMap<String, BTreeSet<String>>,
 }
@@ -89,7 +89,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
     for (step_name, step) in &document.steps {
         let validated = match step {
             Step::Command(command) => ValidatedStep::Command(ValidatedCommandStep {
-                common: validate_common(&command.common),
+                common: validate_common(&command.common, &graph.direct_prerequisites[step_name]),
                 inputs: validate_command_inputs(
                     step_name,
                     &command.inputs,
@@ -100,7 +100,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
                 argv: command.argv.clone(),
             }),
             Step::Agent(agent) => {
-                let common = validate_common(&agent.common);
+                let common = validate_common(&agent.common, &graph.direct_prerequisites[step_name]);
                 let harness = resolve_agent_profile(step_name, &agent.agent, &agent_profiles)?;
                 let validated_agent = validate_agent(
                     step_name,
@@ -138,44 +138,21 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
 }
 
 fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, ValidationFailure> {
+    let direct_prerequisites = resolve_direct_prerequisites(document)?;
     let mut dependents = BTreeMap::<String, Vec<String>>::new();
-    let mut remaining_dependencies = BTreeMap::<String, usize>::new();
+    let mut remaining_prerequisites = BTreeMap::<String, usize>::new();
 
-    for (step_name, step) in &document.steps {
-        let common = common_step(step);
-        let mut direct_dependencies = BTreeSet::new();
-        for (index, dependency) in common.dependencies.iter().enumerate() {
-            let location = || ValidationLocation::StepDependency {
-                step: step_name.clone(),
-                index,
-            };
-            if dependency == step_name {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::SelfDependency,
-                    location(),
-                ));
-            }
-            if !direct_dependencies.insert(dependency) {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::DuplicateDependency,
-                    location(),
-                ));
-            }
-            if !document.steps.contains_key(dependency) {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::MissingDependency,
-                    location(),
-                ));
-            }
+    for (step_name, prerequisites) in &direct_prerequisites {
+        for prerequisite in prerequisites {
             dependents
-                .entry(dependency.clone())
+                .entry(prerequisite.clone())
                 .or_default()
                 .push(step_name.clone());
         }
-        remaining_dependencies.insert(step_name.clone(), common.dependencies.len());
+        remaining_prerequisites.insert(step_name.clone(), prerequisites.len());
     }
 
-    let mut ready = remaining_dependencies
+    let mut ready = remaining_prerequisites
         .iter()
         .filter(|(_, count)| **count == 0)
         .map(|(name, _)| name.clone())
@@ -186,7 +163,7 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
         topological_order.push(step_name.clone());
         if let Some(step_dependents) = dependents.get(&step_name) {
             for dependent in step_dependents {
-                if let Some(count) = remaining_dependencies.get_mut(dependent) {
+                if let Some(count) = remaining_prerequisites.get_mut(dependent) {
                     *count -= 1;
                     if *count == 0 {
                         ready.insert(dependent.clone());
@@ -206,21 +183,143 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
     let mut ancestors = BTreeMap::<String, BTreeSet<String>>::new();
     for step_name in &topological_order {
         let mut step_ancestors = BTreeSet::new();
-        if let Some(step) = document.steps.get(step_name) {
-            for dependency in &common_step(step).dependencies {
-                step_ancestors.insert(dependency.clone());
-                if let Some(dependency_ancestors) = ancestors.get(dependency) {
-                    step_ancestors.extend(dependency_ancestors.iter().cloned());
-                }
+        for prerequisite in &direct_prerequisites[step_name] {
+            step_ancestors.insert(prerequisite.clone());
+            if let Some(prerequisite_ancestors) = ancestors.get(prerequisite) {
+                step_ancestors.extend(prerequisite_ancestors.iter().cloned());
             }
         }
         ancestors.insert(step_name.clone(), step_ancestors);
     }
 
     Ok(ValidatedGraph {
+        direct_prerequisites,
         topological_order,
         ancestors,
     })
+}
+
+fn resolve_direct_prerequisites(
+    document: &WorkflowDocument,
+) -> Result<BTreeMap<String, Vec<String>>, ValidationFailure> {
+    document
+        .steps
+        .iter()
+        .map(|(step_name, step)| {
+            let mut prerequisites = BTreeSet::new();
+            for (index, dependency) in common_step(step).control_dependencies.iter().enumerate() {
+                let location = || ValidationLocation::StepDependency {
+                    step: step_name.clone(),
+                    index,
+                };
+                if dependency == step_name {
+                    return Err(ValidationFailure::new(
+                        ValidationFailureKind::SelfDependency,
+                        location(),
+                    ));
+                }
+                if !prerequisites.insert(dependency.clone()) {
+                    return Err(ValidationFailure::new(
+                        ValidationFailureKind::DuplicateDependency,
+                        location(),
+                    ));
+                }
+                if !document.steps.contains_key(dependency) {
+                    return Err(ValidationFailure::new(
+                        ValidationFailureKind::MissingDependency,
+                        location(),
+                    ));
+                }
+            }
+            infer_data_prerequisites(step_name, step, document, &mut prerequisites)?;
+            Ok((step_name.clone(), prerequisites.into_iter().collect()))
+        })
+        .collect()
+}
+
+fn infer_data_prerequisites(
+    step_name: &str,
+    step: &Step,
+    document: &WorkflowDocument,
+    prerequisites: &mut BTreeSet<String>,
+) -> Result<(), ValidationFailure> {
+    match step {
+        Step::Command(command) => {
+            for (input, reference) in &command.inputs {
+                infer_reference_prerequisite(
+                    step_name,
+                    reference,
+                    document,
+                    prerequisites,
+                    ValidationLocation::StepInput {
+                        step: step_name.to_owned(),
+                        input: input.clone(),
+                    },
+                )?;
+            }
+        }
+        Step::Agent(agent) => {
+            for (index, source) in agent.agent.message.text.iter().enumerate() {
+                infer_message_prerequisite(
+                    step_name,
+                    source,
+                    document,
+                    prerequisites,
+                    ValidationLocation::MessageText {
+                        step: step_name.to_owned(),
+                        index,
+                    },
+                )?;
+            }
+            for (index, source) in agent.agent.message.attachments.iter().enumerate() {
+                infer_message_prerequisite(
+                    step_name,
+                    source,
+                    document,
+                    prerequisites,
+                    ValidationLocation::MessageAttachment {
+                        step: step_name.to_owned(),
+                        index,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn infer_message_prerequisite(
+    step_name: &str,
+    source: &MessageSource,
+    document: &WorkflowDocument,
+    prerequisites: &mut BTreeSet<String>,
+    location: ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    if let MessageSource::Reference(reference) = source {
+        infer_reference_prerequisite(step_name, reference, document, prerequisites, location)?;
+    }
+    Ok(())
+}
+
+fn infer_reference_prerequisite(
+    step_name: &str,
+    reference: &ValueReference,
+    document: &WorkflowDocument,
+    prerequisites: &mut BTreeSet<String>,
+    location: ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    let ValueReference::Output(reference) = reference else {
+        return Ok(());
+    };
+    declared_output(document, reference, location.clone())?;
+    if reference.step == step_name {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::SelfDependency,
+            location,
+        ));
+    }
+    prerequisites.insert(reference.step.clone());
+    Ok(())
 }
 
 fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFailure> {
@@ -282,7 +381,7 @@ fn output_failure(kind: ValidationFailureKind, step: &str, output: &str) -> Vali
     )
 }
 
-fn validate_common(common: &CommonStep) -> ValidatedCommonStep {
+fn validate_common(common: &CommonStep, prerequisites: &[String]) -> ValidatedCommonStep {
     let outputs = common
         .outputs
         .iter()
@@ -298,7 +397,7 @@ fn validate_common(common: &CommonStep) -> ValidatedCommonStep {
         .collect();
 
     ValidatedCommonStep {
-        dependencies: common.dependencies.clone(),
+        prerequisites: prerequisites.to_vec(),
         cwd: common.cwd.clone(),
         outputs,
     }
@@ -362,27 +461,13 @@ fn resolve_value_reference(
             })
         }
         ValueReference::Output(reference) => {
-            let Some(producer) = document.steps.get(&reference.step) else {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::UnknownOutputStep,
-                    location,
-                ));
-            };
-            let Some(output) = common_step(producer).outputs.get(&reference.output) else {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::UnknownOutput,
-                    location,
-                ));
-            };
-            let producer_is_ancestor = ancestors
-                .get(step_name)
-                .is_some_and(|step_ancestors| step_ancestors.contains(&reference.step));
-            if !producer_is_ancestor {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::OutputProducerNotDependency,
-                    location,
-                ));
-            }
+            let output = declared_output(document, reference, location)?;
+            debug_assert!(
+                ancestors
+                    .get(step_name)
+                    .is_some_and(|step_ancestors| step_ancestors.contains(&reference.step)),
+                "every output reference must contribute a graph edge"
+            );
 
             let value_type = output_value_type(output);
             Ok(ResolvedValueReference {
@@ -395,6 +480,23 @@ fn resolve_value_reference(
             })
         }
     }
+}
+
+fn declared_output<'a>(
+    document: &'a WorkflowDocument,
+    reference: &OutputReference,
+    location: ValidationLocation,
+) -> Result<&'a Output, ValidationFailure> {
+    let Some(producer) = document.steps.get(&reference.step) else {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::UnknownOutputStep,
+            location,
+        ));
+    };
+    common_step(producer)
+        .outputs
+        .get(&reference.output)
+        .ok_or_else(|| ValidationFailure::new(ValidationFailureKind::UnknownOutput, location))
 }
 
 fn validate_agent_profiles(

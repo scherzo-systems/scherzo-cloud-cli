@@ -171,12 +171,33 @@ fn is_reserved_environment_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"SCHERZO_")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CaptureLimits {
+    maximum_files: usize,
+    maximum_file_bytes: u64,
+    maximum_total_bytes: u64,
+}
+
+impl CaptureLimits {
+    pub(crate) fn new(
+        maximum_files: usize,
+        maximum_file_bytes: u64,
+        maximum_total_bytes: u64,
+    ) -> Self {
+        Self {
+            maximum_files,
+            maximum_file_bytes,
+            maximum_total_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
     root_lifecycle: ExecutionRootLifecycle,
     maximum_parallel_steps: usize,
-    maximum_file_output_bytes: u64,
+    capture_limits: CaptureLimits,
     maximum_step_log_bytes: u64,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
@@ -187,7 +208,7 @@ impl ExecutionContext {
         root: PathBuf,
         root_lifecycle: ExecutionRootLifecycle,
         maximum_parallel_steps: usize,
-        maximum_file_output_bytes: u64,
+        capture_limits: CaptureLimits,
         maximum_step_log_bytes: u64,
         environment: EnvironmentSnapshot,
         cancellation: CancellationPolicy,
@@ -196,7 +217,7 @@ impl ExecutionContext {
             root,
             root_lifecycle,
             maximum_parallel_steps,
-            maximum_file_output_bytes,
+            capture_limits,
             maximum_step_log_bytes,
             environment,
             cancellation,
@@ -207,7 +228,9 @@ impl ExecutionContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionLimits {
     maximum_parallel_steps: NonZeroUsize,
-    maximum_file_output_bytes: NonZeroU64,
+    maximum_captured_files: NonZeroUsize,
+    maximum_captured_file_bytes: NonZeroU64,
+    maximum_total_captured_bytes: NonZeroU64,
     maximum_step_log_bytes: NonZeroU64,
 }
 
@@ -216,8 +239,16 @@ impl ExecutionLimits {
         self.maximum_parallel_steps
     }
 
-    pub(crate) fn maximum_file_output_bytes(self) -> NonZeroU64 {
-        self.maximum_file_output_bytes
+    pub(crate) fn maximum_captured_files(self) -> NonZeroUsize {
+        self.maximum_captured_files
+    }
+
+    pub(crate) fn maximum_captured_file_bytes(self) -> NonZeroU64 {
+        self.maximum_captured_file_bytes
+    }
+
+    pub(crate) fn maximum_total_captured_bytes(self) -> NonZeroU64 {
+        self.maximum_total_captured_bytes
     }
 
     pub(crate) fn maximum_step_log_bytes(self) -> NonZeroU64 {
@@ -285,7 +316,9 @@ pub(crate) enum AdmissionFailureKind {
     ExecutionRootUnavailable,
     ExecutionRootNotDirectory,
     NonPositiveParallelism,
-    NonPositiveFileOutputBytes,
+    NonPositiveCapturedFiles,
+    NonPositiveCapturedFileBytes,
+    NonPositiveTotalCapturedBytes,
     NonPositiveStepLogBytes,
     NonPositiveCancellationGrace,
     CancellationGraceTooLong,
@@ -298,7 +331,9 @@ pub(crate) enum AdmissionLocation {
     Step { step: String },
     ExecutionRoot,
     MaximumParallelSteps,
-    MaximumFileOutputBytes,
+    MaximumCapturedFiles,
+    MaximumCapturedFileBytes,
+    MaximumTotalCapturedBytes,
     MaximumStepLogBytes,
     CancellationPolicy,
 }
@@ -378,11 +413,25 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumParallelSteps,
             )
         })?;
-    let maximum_file_output_bytes =
-        NonZeroU64::new(context.maximum_file_output_bytes).ok_or_else(|| {
+    let maximum_captured_files = NonZeroUsize::new(context.capture_limits.maximum_files)
+        .ok_or_else(|| {
             AdmissionFailure::new(
-                AdmissionFailureKind::NonPositiveFileOutputBytes,
-                AdmissionLocation::MaximumFileOutputBytes,
+                AdmissionFailureKind::NonPositiveCapturedFiles,
+                AdmissionLocation::MaximumCapturedFiles,
+            )
+        })?;
+    let maximum_captured_file_bytes = NonZeroU64::new(context.capture_limits.maximum_file_bytes)
+        .ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveCapturedFileBytes,
+                AdmissionLocation::MaximumCapturedFileBytes,
+            )
+        })?;
+    let maximum_total_captured_bytes = NonZeroU64::new(context.capture_limits.maximum_total_bytes)
+        .ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveTotalCapturedBytes,
+                AdmissionLocation::MaximumTotalCapturedBytes,
             )
         })?;
     let maximum_step_log_bytes =
@@ -414,7 +463,9 @@ pub(crate) fn admit_workflow(
             root_lifecycle: context.root_lifecycle,
             limits: ExecutionLimits {
                 maximum_parallel_steps,
-                maximum_file_output_bytes,
+                maximum_captured_files,
+                maximum_captured_file_bytes,
+                maximum_total_captured_bytes,
                 maximum_step_log_bytes,
             },
             environment: context.environment.without_reserved_variables(),

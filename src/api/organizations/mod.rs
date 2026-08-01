@@ -498,28 +498,41 @@ fn execute_request(
                     category
                 }));
             }
-            Err(_) if status == StatusCode::UNAUTHORIZED => {
-                return Err(OrganizationError::protocol(
-                    spec.operation,
-                    "the unauthorized response body exceeded the request deadline",
-                    true,
-                ));
-            }
-            Err(_) if spec.operation.can_retry_interrupted_response(status) => {
-                last_failure = UnreachableCategory::Timeout;
-                continue;
-            }
-            Err(_) => {
-                return Ok(RequestExecution::Unreachable(if status.is_server_error() {
-                    UnreachableCategory::Server
-                } else {
-                    UnreachableCategory::Timeout
-                }));
-            }
+            Err(_) => match classify_response_deadline(spec.operation, status)? {
+                Some(execution) => return Ok(execution),
+                None => {
+                    last_failure = UnreachableCategory::Timeout;
+                    continue;
+                }
+            },
         }
     }
 
     Ok(RequestExecution::Unreachable(last_failure))
+}
+
+fn classify_response_deadline(
+    operation: Operation,
+    status: StatusCode,
+) -> Result<Option<RequestExecution>, OrganizationError> {
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(OrganizationError::protocol(
+            operation,
+            "the unauthorized response body exceeded the request deadline",
+            true,
+        ));
+    }
+    if operation.can_retry_interrupted_response(status) {
+        return Ok(None);
+    }
+
+    Ok(Some(RequestExecution::Unreachable(
+        if status.is_server_error() {
+            UnreachableCategory::Server
+        } else {
+            UnreachableCategory::Timeout
+        },
+    )))
 }
 
 fn require_replayable_success_headers(

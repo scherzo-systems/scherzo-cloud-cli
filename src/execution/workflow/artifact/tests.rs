@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
@@ -15,6 +15,14 @@ struct CaptureFixture {
 
 impl CaptureFixture {
     fn new(maximum_file_bytes: u64) -> Self {
+        Self::with_limits(64, maximum_file_bytes, u64::MAX)
+    }
+
+    fn with_limits(
+        maximum_files: usize,
+        maximum_file_bytes: u64,
+        maximum_total_bytes: u64,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
         let staging_parent = temporary.path().join("staging");
@@ -23,7 +31,9 @@ impl CaptureFixture {
         let store = ArtifactStaging::create_for_execution(
             &execution_root,
             &staging_parent,
+            NonZeroUsize::new(maximum_files).unwrap(),
             NonZeroU64::new(maximum_file_bytes).unwrap(),
+            NonZeroU64::new(maximum_total_bytes).unwrap(),
         )
         .unwrap();
         Self {
@@ -34,8 +44,21 @@ impl CaptureFixture {
     }
 
     fn capture(&self, path: &str) -> Result<CapturedArtifact, CaptureFailure> {
-        self.store
-            .capture("report", Path::new(path), "application/octet-stream")
+        self.capture_set(&[("report", path)])
+            .map(|captured| captured.into_values().next().unwrap())
+    }
+
+    fn capture_set(
+        &self,
+        declarations: &[(&str, &str)],
+    ) -> Result<BTreeMap<String, CapturedArtifact>, CaptureFailure> {
+        let declarations = declarations
+            .iter()
+            .map(|(identity, path)| {
+                CaptureDeclaration::new(identity, Path::new(path), "application/octet-stream")
+            })
+            .collect::<Vec<_>>();
+        self.store.capture_files(&declarations)
     }
 
     fn read(&self, artifact: &CapturedArtifact) -> Vec<u8> {
@@ -59,7 +82,9 @@ fn staging_cannot_be_created_inside_the_execution_root() {
     let result = ArtifactStaging::create_for_execution(
         &execution_root,
         &exposed_parent,
+        NonZeroUsize::new(64).unwrap(),
         NonZeroU64::new(64).unwrap(),
+        NonZeroU64::new(4096).unwrap(),
     );
 
     assert!(matches!(
@@ -116,10 +141,9 @@ fn rejects_unsafe_paths_symlinks_and_nonregular_sources_with_typed_failures() {
     symlink("target.bin", fixture.execution_root.join("final-link")).unwrap();
     symlink("directory", fixture.execution_root.join("directory-link")).unwrap();
     let fifo_path = fixture.execution_root.join("fifo");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
+    nix::unistd::mkfifo(
         &fifo_path,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )
     .unwrap();
 
@@ -172,7 +196,7 @@ fn the_exact_limit_succeeds_and_overflow_removes_the_partial_destination() {
     fixture.store.discard(&exact);
     let failure = fixture.capture("large.bin").unwrap_err();
 
-    assert_eq!(failure.kind(), CaptureFailureKind::SizeLimitExceeded);
+    assert_eq!(failure.kind(), CaptureFailureKind::FileSizeLimitExceeded);
     assert!(
         fs::read_dir(fixture.staging_path())
             .unwrap()
@@ -197,6 +221,94 @@ impl StreamCopier for GatedCopier {
         self.resume_copy.wait();
         copy_bounded(source, destination, maximum_bytes)
     }
+}
+
+#[test]
+fn failed_sets_restore_file_reservations_and_preserve_prior_captures() {
+    let fixture = CaptureFixture::with_limits(3, 4, 6);
+    fs::write(fixture.execution_root.join("prior.bin"), b"12").unwrap();
+    fs::write(fixture.execution_root.join("candidate.bin"), b"34").unwrap();
+    fs::write(fixture.execution_root.join("replacement.bin"), b"56").unwrap();
+
+    let prior = fixture.capture("prior.bin").unwrap();
+    let failure = fixture
+        .capture_set(&[("candidate", "candidate.bin"), ("missing", "missing.bin")])
+        .unwrap_err();
+
+    assert_eq!(failure.output_identity(), "missing");
+    assert_eq!(failure.kind(), CaptureFailureKind::Missing);
+    assert_eq!(fixture.store.budget_usage(), (1, 2));
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    assert_eq!(fixture.read(&prior), b"12");
+
+    let replacement = fixture
+        .capture_set(&[
+            ("candidate", "candidate.bin"),
+            ("replacement", "replacement.bin"),
+        ])
+        .unwrap();
+    assert_eq!(fixture.store.budget_usage(), (3, 6));
+    let count_failure = fixture.capture("candidate.bin").unwrap_err();
+    assert_eq!(
+        count_failure.kind(),
+        CaptureFailureKind::FileCountLimitExceeded
+    );
+    assert_eq!(fixture.store.staged_artifact_count(), 3);
+
+    drop(replacement);
+    assert_eq!(fixture.store.budget_usage(), (1, 2));
+    assert_eq!(fixture.read(&prior), b"12");
+}
+
+#[test]
+fn failed_rollback_quarantines_the_store_and_release_retries_cleanup() {
+    let fixture = CaptureFixture::with_limits(2, 4, 8);
+    fs::write(fixture.execution_root.join("candidate.bin"), b"12").unwrap();
+    fixture.store.block_artifact_unlinks();
+
+    let failure = fixture
+        .capture_set(&[("candidate", "candidate.bin"), ("missing", "missing.bin")])
+        .unwrap_err();
+
+    assert_eq!(failure.output_identity(), "missing");
+    assert_eq!(failure.kind(), CaptureFailureKind::StagingUnavailable);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    assert_eq!(
+        fixture.capture("candidate.bin").unwrap_err().kind(),
+        CaptureFailureKind::StagingUnavailable
+    );
+
+    let staging_path = fixture.staging_path();
+    fixture.store.release().unwrap();
+    assert!(!staging_path.exists());
+}
+
+#[test]
+fn total_byte_overflow_rolls_back_the_set_and_the_exact_budget_is_reusable() {
+    let fixture = CaptureFixture::with_limits(3, 4, 5);
+    fs::write(fixture.execution_root.join("two.bin"), b"12").unwrap();
+    fs::write(fixture.execution_root.join("three.bin"), b"345").unwrap();
+    fs::write(fixture.execution_root.join("four.bin"), b"3456").unwrap();
+    fs::write(fixture.execution_root.join("one.bin"), b"7").unwrap();
+
+    let failure = fixture
+        .capture_set(&[("two", "two.bin"), ("four", "four.bin")])
+        .unwrap_err();
+
+    assert_eq!(failure.output_identity(), "four");
+    assert_eq!(failure.kind(), CaptureFailureKind::TotalSizeLimitExceeded);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+
+    let exact = fixture
+        .capture_set(&[("two", "two.bin"), ("three", "three.bin")])
+        .unwrap();
+    assert_eq!(fixture.store.budget_usage(), (2, 5));
+    let overflow = fixture.capture_set(&[("one", "one.bin")]).unwrap_err();
+    assert_eq!(overflow.kind(), CaptureFailureKind::TotalSizeLimitExceeded);
+    assert_eq!(fixture.store.staged_artifact_count(), 2);
+    assert_eq!(exact.keys().cloned().collect::<Vec<_>>(), ["three", "two"]);
 }
 
 #[test]
@@ -227,7 +339,7 @@ fn streaming_growth_is_bounded_and_its_partial_destination_is_removed() {
     resume_copy.wait();
     let failure = capture.join().unwrap().unwrap_err();
 
-    assert_eq!(failure.kind(), CaptureFailureKind::SizeLimitExceeded);
+    assert_eq!(failure.kind(), CaptureFailureKind::FileSizeLimitExceeded);
     assert!(
         fs::read_dir(fixture.staging_path())
             .unwrap()

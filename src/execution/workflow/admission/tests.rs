@@ -135,7 +135,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             fixture.execution_root.join("."),
             ExecutionRootLifecycle::CallerOwnedRetained,
             3,
-            2 * 1024 * 1024,
+            CaptureLimits::new(17, 2 * 1024 * 1024, 8 * 1024 * 1024),
             64 * 1024,
             EnvironmentSnapshot::new([
                 ("PATH", "/admitted/bin"),
@@ -159,16 +159,28 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         3
     );
     assert_eq!(
+        admitted.execution().limits().maximum_captured_files().get(),
+        17
+    );
+    assert_eq!(
         admitted
             .execution()
             .limits()
-            .maximum_file_output_bytes()
+            .maximum_captured_file_bytes()
             .get(),
         2 * 1024 * 1024
     );
     assert_eq!(
         admitted.execution().limits().maximum_step_log_bytes().get(),
         64 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_total_captured_bytes()
+            .get(),
+        8 * 1024 * 1024
     );
     assert_eq!(
         admitted
@@ -281,24 +293,48 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
         AdmissionLocation::MaximumParallelSteps,
     );
 
-    let zero_file_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
-    assert_failure(
-        admit_workflow(
-            zero_file_limit.resolve(),
-            ResolvedImports::default(),
-            ExecutionContext::new(
-                zero_file_limit.execution_root.clone(),
-                ExecutionRootLifecycle::EngineOwnedRetained,
-                1,
-                0,
-                1024 * 1024,
-                EnvironmentSnapshot::default(),
-                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
-            ),
+    for (captured_files, file_bytes, total_bytes, kind, location) in [
+        (
+            0,
+            1,
+            1,
+            AdmissionFailureKind::NonPositiveCapturedFiles,
+            AdmissionLocation::MaximumCapturedFiles,
         ),
-        AdmissionFailureKind::NonPositiveFileOutputBytes,
-        AdmissionLocation::MaximumFileOutputBytes,
-    );
+        (
+            1,
+            0,
+            1,
+            AdmissionFailureKind::NonPositiveCapturedFileBytes,
+            AdmissionLocation::MaximumCapturedFileBytes,
+        ),
+        (
+            1,
+            1,
+            0,
+            AdmissionFailureKind::NonPositiveTotalCapturedBytes,
+            AdmissionLocation::MaximumTotalCapturedBytes,
+        ),
+    ] {
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        assert_failure(
+            admit_workflow(
+                fixture.resolve(),
+                ResolvedImports::default(),
+                ExecutionContext::new(
+                    fixture.execution_root.clone(),
+                    ExecutionRootLifecycle::EngineOwnedRetained,
+                    1,
+                    CaptureLimits::new(captured_files, file_bytes, total_bytes),
+                    1024 * 1024,
+                    EnvironmentSnapshot::default(),
+                    CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+                ),
+            ),
+            kind,
+            location,
+        );
+    }
 
     let zero_log_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
     assert_failure(
@@ -309,7 +345,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                 zero_log_limit.execution_root.clone(),
                 ExecutionRootLifecycle::EngineOwnedRetained,
                 1,
-                1024 * 1024,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
                 0,
                 EnvironmentSnapshot::default(),
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
@@ -455,7 +491,7 @@ fn execution_context(
         root,
         lifecycle,
         maximum_parallel_steps,
-        1024 * 1024,
+        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
         1024 * 1024,
         EnvironmentSnapshot::default(),
         CancellationPolicy::new(CancellationSource::new(), grace),

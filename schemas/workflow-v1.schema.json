@@ -57,7 +57,8 @@
       "properties": {
         "ref": { "$ref": "#/$defs/ImportOrOutputReferenceString" }
       },
-      "required": ["ref"]
+      "required": ["ref"],
+      "description": "A step-local value reference. An outputs reference creates a direct data prerequisite on its producer; an imports reference creates no step prerequisite."
     },
     "OutputReference": {
       "type": "object",
@@ -65,7 +66,8 @@
       "properties": {
         "ref": { "$ref": "#/$defs/OutputReferenceString" }
       },
-      "required": ["ref"]
+      "required": ["ref"],
+      "description": "A workflow export reference. Exports select outputs but create no step prerequisite."
     },
     "FileSource": {
       "type": "object",
@@ -95,7 +97,8 @@
     "Dependencies": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/Identifier" }
+      "items": { "$ref": "#/$defs/Identifier" },
+      "description": "Explicit control prerequisites for ordering without declared data flow. Resolution normalizes these with direct prerequisites inferred from step-local output references."
     },
     "Command": {
       "type": "object",

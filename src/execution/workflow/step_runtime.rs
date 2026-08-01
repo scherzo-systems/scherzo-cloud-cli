@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rustix::fs::{Access, AtFlags, CWD, accessat};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::admission::{AdmittedWorkflow, EnvironmentSnapshot};
-use super::artifact::{ArtifactStaging, CaptureFailure, CapturedArtifact};
+use super::artifact::{ArtifactStaging, CaptureDeclaration, CaptureFailure, CapturedArtifact};
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
     CoordinatorClock, DriverOccurrence, DriverOccurrenceClaim, OccurrenceSender,
@@ -109,6 +109,20 @@ where
     occurrences: OccurrenceSender<(), StepFailureCause, CapturedArtifact>,
     clock: Clock,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
+    capture_deliveries: mpsc::UnboundedSender<CaptureDelivery>,
+}
+
+struct CaptureDelivery {
+    occurrence: DriverOccurrence<(), StepFailureCause, CapturedArtifact>,
+    unreachable: Vec<CapturedArtifact>,
+}
+
+impl CaptureDelivery {
+    fn discard(self, artifacts: &ArtifactStaging) {
+        for output in &self.unreachable {
+            artifacts.discard(output);
+        }
+    }
 }
 
 impl<Clock> StepRuntime<Clock>
@@ -138,6 +152,26 @@ where
         occurrences: OccurrenceSender<(), StepFailureCause, CapturedArtifact>,
         clock: Clock,
     ) -> Self {
+        let (capture_deliveries, mut pending_deliveries) = mpsc::unbounded_channel();
+        let delivery_artifacts = artifacts.clone();
+        let delivery_occurrences = occurrences.clone();
+        drop(tokio::spawn(async move {
+            while let Some(delivery) = pending_deliveries.recv().await {
+                let CaptureDelivery {
+                    occurrence,
+                    unreachable,
+                } = delivery;
+                if delivery_occurrences.send(occurrence).await.is_err() {
+                    for output in &unreachable {
+                        delivery_artifacts.discard(output);
+                    }
+                    while let Ok(pending) = pending_deliveries.try_recv() {
+                        pending.discard(&delivery_artifacts);
+                    }
+                    return;
+                }
+            }
+        }));
         Self {
             admitted,
             artifacts,
@@ -145,6 +179,7 @@ where
             occurrences,
             clock,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
+            capture_deliveries,
         }
     }
 
@@ -477,26 +512,24 @@ where
         })
         .await
         .unwrap_or(Err(OutputCaptureFailure::TaskUnavailable));
-        match captured {
-            Ok(outputs) => {
-                let unreachable = outputs.values().cloned().collect::<Vec<_>>();
-                let result = self
-                    .send(DriverOccurrence::outputs_captured(step, action, outputs))
-                    .await;
-                if result.is_err() {
-                    self.discard_outputs(&unreachable);
-                }
-                result
-            }
-            Err(failure) => {
-                self.send(DriverOccurrence::output_capture_failed(
+        let delivery = match captured {
+            Ok(outputs) => CaptureDelivery {
+                unreachable: outputs.values().cloned().collect(),
+                occurrence: DriverOccurrence::outputs_captured(step, action, outputs),
+            },
+            Err(failure) => CaptureDelivery {
+                occurrence: DriverOccurrence::output_capture_failed(
                     step,
                     action,
                     StepFailureCause::OutputCapture(failure),
-                ))
-                .await
-            }
-        }
+                ),
+                unreachable: Vec::new(),
+            },
+        };
+        self.capture_deliveries.send(delivery).map_err(|failure| {
+            failure.0.discard(&self.artifacts);
+            StepRuntimeError::OccurrenceReceiverClosed
+        })
     }
 
     fn capture_outputs_blocking(
@@ -512,33 +545,23 @@ where
             .ok_or(OutputCaptureFailure::StepUnavailable)?;
         let body = StepBody::from(definition);
         let common = body.common();
-        let mut captured = OutputSet::new();
-        for (output_identity, output) in &common.outputs {
-            let Output::File { path, media_type } = &output.definition else {
-                self.discard_outputs(captured.values());
-                return Err(OutputCaptureFailure::UnsupportedOutput);
-            };
-            match self.artifacts.capture(
-                output_identity.as_str(),
-                Path::new(path),
-                media_type.as_str(),
-            ) {
-                Ok(artifact) => {
-                    captured.insert(output_identity.clone(), artifact);
-                }
-                Err(failure) => {
-                    self.discard_outputs(captured.values());
-                    return Err(OutputCaptureFailure::Capture(failure));
-                }
-            }
-        }
-        Ok(captured)
-    }
-
-    fn discard_outputs<'a>(&self, outputs: impl IntoIterator<Item = &'a CapturedArtifact>) {
-        for output in outputs {
-            self.artifacts.discard(output);
-        }
+        let declarations = common
+            .outputs
+            .iter()
+            .map(|(output_identity, output)| {
+                let Output::File { path, media_type } = &output.definition else {
+                    return Err(OutputCaptureFailure::UnsupportedOutput);
+                };
+                Ok(CaptureDeclaration::new(
+                    output_identity,
+                    Path::new(path),
+                    media_type,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.artifacts
+            .capture_files(&declarations)
+            .map_err(OutputCaptureFailure::Capture)
     }
 
     async fn send(
@@ -849,9 +872,10 @@ where
                     }
                 }
                 Action::CaptureOutputs { step, .. } => {
-                    drop(tokio::spawn(async move {
-                        let _ = runtime.capture_outputs(step, requested.id).await;
-                    }));
+                    // The coordinator awaits each snapshot in reducer action-sequence order.
+                    // Only occurrence delivery is detached, so channel backpressure cannot
+                    // deadlock the coordinator or change the run-scoped budget winner.
+                    let _ = runtime.capture_outputs(step, requested.id).await;
                 }
                 Action::FinishRun { .. } => {}
             }

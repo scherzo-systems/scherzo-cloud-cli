@@ -12,6 +12,9 @@ let
   msrvToolchain = rustPackages.rust-bin.stable.${rustVersion}.minimal;
 in
 {
+  # This environment deliberately duplicates the private repository's Rust and
+  # structural-check tools because the exported CLI tree must validate without
+  # importing or reading its parent repository.
   languages.rust = {
     enable = true;
     channel = "stable";
@@ -23,6 +26,7 @@ in
   packages = [
     pkgs.actionlint
     pkgs.ast-grep
+    pkgs.git
     pkgs.jq
   ];
 

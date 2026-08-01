@@ -22,7 +22,10 @@ use serde_json::Value;
 
 use document::WorkflowDocument;
 
-const STRUCTURAL_SCHEMA: &str = include_str!("workflow-v1.schema.json");
+const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/workflow-v1.schema.json"
+));
 pub(crate) const MAX_DECODE_DIAGNOSTIC_BYTES: usize = 96;
 
 static STRUCTURAL_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();

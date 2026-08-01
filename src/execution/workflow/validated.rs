@@ -53,7 +53,7 @@ pub(crate) struct ValidatedAgentStep {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedCommonStep {
-    pub(crate) dependencies: Vec<String>,
+    pub(crate) prerequisites: Vec<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, ValidatedOutput>,
 }

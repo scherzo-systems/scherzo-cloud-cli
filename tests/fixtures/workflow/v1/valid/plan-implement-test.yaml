@@ -27,8 +27,6 @@ steps:
         attachments:
           - ref: imports.attachments
     outputs:
-      response:
-        kind: agent_response
       plan:
         kind: agent_result
         schema: schemas/change-plan.schema.json
@@ -39,7 +37,6 @@ steps:
 
   implement:
     kind: agent
-    dependsOn: [plan]
     agent:
       profile: coding
       systemPrompt: prompts/implement-system.md
@@ -47,7 +44,6 @@ steps:
         text:
           - file: prompts/implement-message.md
           - ref: imports.prompt
-          - ref: outputs.plan.response
         attachments:
           - ref: imports.attachments
           - ref: outputs.plan.plan
@@ -58,13 +54,12 @@ steps:
 
   test:
     kind: cmd
-    dependsOn: [implement]
     cwd: packages/api
     inputs:
       prompt:
         ref: imports.prompt
       changeSummary:
-        ref: outputs.implement.changeSummary
+        ref: outputs.implement.response
     command:
       argv: ["./scripts/test.sh"]
     outputs:

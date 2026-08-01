@@ -420,9 +420,10 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
             "missing_dependency",
             "Declare the referenced dependency step or correct its name.",
         ),
-        ValidationFailureKind::SelfDependency => {
-            ("self_dependency", "Remove the step's dependency on itself.")
-        }
+        ValidationFailureKind::SelfDependency => (
+            "self_dependency",
+            "Remove the step's dependency on or output reference to itself.",
+        ),
         ValidationFailureKind::DuplicateDependency => (
             "duplicate_dependency",
             "List each direct step dependency only once.",
@@ -450,10 +451,6 @@ fn validation_diagnostic(kind: ValidationFailureKind) -> (&'static str, &'static
         ValidationFailureKind::UnknownOutput => (
             "unknown_output",
             "Reference an output declared by the producing step.",
-        ),
-        ValidationFailureKind::OutputProducerNotDependency => (
-            "output_producer_not_dependency",
-            "Make the output producer a transitive dependency of the consuming step.",
         ),
         ValidationFailureKind::MessageTypeMismatch => (
             "message_type_mismatch",
