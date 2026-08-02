@@ -21,18 +21,24 @@ use tokio::sync::{mpsc, watch};
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
+    ResolvedAttachment, ResolvedImports, admit_workflow,
 };
-use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind, CapturedArtifact};
+use crate::execution::workflow::artifact::{
+    ArtifactStaging, CaptureBoundary, CaptureBoundaryKind, CaptureBoundaryObserver,
+    CaptureDeclaration, CaptureFailure, CaptureFailureKind,
+};
 use crate::execution::workflow::coordinator::{
-    CommitPort, CommittedReduction, CoordinationError, CoordinatorClock, OccurrenceReceiver,
-    occurrence_channel,
+    CommitPort, CommittedReduction, CoordinationError, CoordinatorClock,
+    DriverOccurrenceTestAcknowledgement, OccurrenceReceiver, occurrence_channel,
 };
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
+use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
     self, Action, ExportValue, Occurrence, RequestedAction, StepState, WorkflowState,
 };
+use crate::execution::workflow::value::CapturedValue;
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
 const FIXTURE_SOCKET: &str = "WORKFLOW_FIXTURE_SOCKET";
@@ -48,9 +54,10 @@ const FIXTURE_DESCENDANT: &str = "descendant";
 const LITERAL_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 
-type TestOccurrence = Occurrence<(), StepFailureCause, CapturedArtifact, ()>;
-type TestReceiver = OccurrenceReceiver<(), StepFailureCause, CapturedArtifact>;
-type TestRequestedAction = RequestedAction<(), StepFailureCause, CapturedArtifact, TestInstant>;
+type TestOccurrence = Occurrence<(), StepFailureCause, CapturedValue, ()>;
+type TestReceiver = OccurrenceReceiver<(), StepFailureCause, CapturedValue>;
+type TestRequestedAction = RequestedAction<(), StepFailureCause, CapturedValue, TestInstant>;
+type TestRuntimeState = runtime::RuntimeState<StepFailureCause, CapturedValue>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FixtureReport {
@@ -213,14 +220,59 @@ struct PreparedFixtureCommand {
 struct TestArtifacts {
     _temporary: tempfile::TempDir,
     staging: ArtifactStaging,
+    inputs: InputStaging,
+}
+
+struct CaptureBoundaryGate {
+    reached: mpsc::UnboundedSender<CaptureBoundary>,
+    permits: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CaptureBoundaryObserver for CaptureBoundaryGate {
+    fn reached(&self, boundary: CaptureBoundary) {
+        self.reached.send(boundary).unwrap();
+        self.permits.lock().unwrap().recv().unwrap();
+    }
+}
+
+struct CaptureBoundaryControl {
+    reached: mpsc::UnboundedReceiver<CaptureBoundary>,
+    permits: std::sync::mpsc::Sender<()>,
+}
+
+impl CaptureBoundaryControl {
+    async fn next(&mut self) -> CaptureBoundary {
+        self.reached.recv().await.unwrap()
+    }
+
+    fn release(&self) {
+        self.permits.send(()).unwrap();
+    }
+}
+
+fn capture_boundary_gate() -> (Arc<dyn CaptureBoundaryObserver>, CaptureBoundaryControl) {
+    let (reached, pending) = mpsc::unbounded_channel();
+    let (permits, permission) = std::sync::mpsc::channel();
+    (
+        Arc::new(CaptureBoundaryGate {
+            reached,
+            permits: Mutex::new(permission),
+        }),
+        CaptureBoundaryControl {
+            reached: pending,
+            permits,
+        },
+    )
 }
 
 fn test_artifacts(admitted: &AdmittedWorkflow) -> TestArtifacts {
     let temporary = tempfile::tempdir().unwrap();
     let staging = ArtifactStaging::create(admitted.execution(), temporary.path()).unwrap();
+    let inputs = InputStaging::create(admitted.execution(), temporary.path()).unwrap();
     TestArtifacts {
         _temporary: temporary,
         staging,
+        inputs,
     }
 }
 
@@ -332,7 +384,7 @@ impl DeadlineControl {
     }
 }
 
-type WorkflowCommit = CommittedReduction<StepFailureCause, CapturedArtifact>;
+type WorkflowCommit = CommittedReduction<StepFailureCause, CapturedValue>;
 
 struct RecordingCommitPort {
     commits: mpsc::UnboundedSender<WorkflowCommit>,
@@ -385,6 +437,206 @@ async fn command_uses_contained_cwd_literal_argv_and_isolates_parent_environment
 }
 
 #[tokio::test]
+async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let mut source = String::from("schemaVersion: 1\nsteps:\n");
+        for step in ["alpha", "beta"] {
+            source.push_str(&format!(
+                "  {step}:\n    kind: cmd\n    inputs:\n      attachments:\n        ref: imports.attachments\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: {}\n",
+                serde_json::to_string(&argv).unwrap()
+            ));
+        }
+        let environment =
+            fixture_environment(&control_address, 0, &execution_root, None);
+        let imports = ResolvedImports::new(
+            Some(Arc::from("shared prompt")),
+            Arc::from([ResolvedAttachment::new(
+                Arc::from("application/octet-stream"),
+                Arc::from([0_u8, 0xff, 7]),
+            )]),
+        );
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            environment,
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    2,
+                    CaptureLimits::new(16, 1024, 4096),
+                    InputLimits::new(8, 1024, 4096),
+                    1024,
+                ),
+                imports,
+            },
+        );
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let (commit_sender, _commits) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+        );
+        let commands = async {
+            let (first_control, first_report) = accept_report(&listener).await;
+            let (second_control, second_report) = accept_report(&listener).await;
+            let expected_environment = [
+                "EXPLICIT_VALUE",
+                "PATH",
+                "SCHERZO_STEP_INPUTS",
+                FIXTURE_EXIT_CODE,
+                FIXTURE_SOCKET,
+            ]
+            .into_iter()
+            .chain(cfg!(target_os = "macos").then_some("__CF_USER_TEXT_ENCODING"))
+            .collect::<Vec<_>>();
+            for report in [&first_report, &second_report] {
+                assert_eq!(
+                    report.environment.keys().cloned().collect::<Vec<_>>(),
+                    expected_environment
+                );
+                assert!(!report.environment.contains_key("SCHERZO_INHERITED"));
+            }
+            let first_path = PathBuf::from(&first_report.environment["SCHERZO_STEP_INPUTS"]);
+            let second_path = PathBuf::from(&second_report.environment["SCHERZO_STEP_INPUTS"]);
+            assert_ne!(first_path, second_path);
+            assert_eq!(artifacts.inputs.reservation_usage(), (2, 6, 32));
+            assert_eq!(
+                fs::read(first_path.join("values/prompt")).unwrap(),
+                b"shared prompt"
+            );
+            assert_eq!(
+                fs::read(second_path.join("values/prompt")).unwrap(),
+                b"shared prompt"
+            );
+            fs::set_permissions(
+                first_path.join("values/prompt"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            fs::write(first_path.join("values/prompt"), b"first changed").unwrap();
+            assert_eq!(
+                fs::read(second_path.join("values/prompt")).unwrap(),
+                b"shared prompt"
+            );
+            release(first_control).await;
+            release(second_control).await;
+            [first_path, second_path]
+        };
+
+        let (result, paths) = tokio::join!(execution, commands);
+        assert_eq!(result.unwrap().state.workflow, WorkflowState::Succeeded);
+        assert!(paths.into_iter().all(|path| !path.exists()));
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("report.bin"), b"captured file").unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let producer_argv = [
+            executable.to_str().unwrap(),
+            "--exact",
+            "__workflow_producer_noop__",
+        ];
+        let mut source = format!(
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      report:\n        kind: file\n        path: report.bin\n        mediaType: application/fixture\n",
+            serde_json::to_string(&producer_argv).unwrap()
+        );
+        for step in ["alpha", "beta"] {
+            source.push_str(&format!(
+                "  {step}:\n    kind: cmd\n    dependsOn: [produce]\n    inputs:\n      artifact:\n        ref: outputs.produce.report\n    command:\n      argv: {}\n",
+                serde_json::to_string(&argv).unwrap()
+            ));
+        }
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            &source,
+            fixture_environment(&control_address, 0, &execution_root, None),
+            2,
+        );
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let (commit_sender, _commits) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+        );
+        let commands = async {
+            let (first_control, first_report) = accept_report(&listener).await;
+            let (second_control, second_report) = accept_report(&listener).await;
+            let first_path = PathBuf::from(&first_report.environment["SCHERZO_STEP_INPUTS"]);
+            let second_path = PathBuf::from(&second_report.environment["SCHERZO_STEP_INPUTS"]);
+            assert_ne!(first_path, second_path);
+            assert_eq!(artifacts.inputs.reservation_usage(), (2, 2, 26));
+            let first_file = first_path.join("values/artifact");
+            let second_file = second_path.join("values/artifact");
+            assert_eq!(fs::read(&first_file).unwrap(), b"captured file");
+            assert_eq!(fs::read(&second_file).unwrap(), b"captured file");
+            fs::set_permissions(&first_file, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&first_file, b"first changed").unwrap();
+            assert_eq!(fs::read(&second_file).unwrap(), b"captured file");
+            release(first_control).await;
+            release(second_control).await;
+            [first_path, second_path]
+        };
+
+        let (result, paths) = tokio::join!(execution, commands);
+        let result = result.unwrap();
+        assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+        assert!(paths.into_iter().all(|path| !path.exists()));
+        let StepState::Succeeded { outputs } = &result.state.steps["produce"].state else {
+            panic!("producer did not commit its file");
+        };
+        let captured = outputs["report"].as_file().unwrap();
+        let mut captured_bytes = Vec::new();
+        artifacts
+            .staging
+            .copy_to(captured.handle(), &mut captured_bytes)
+            .unwrap();
+        assert_eq!(captured_bytes, b"captured file");
+        assert_eq!(fs::read(execution_root.join("report.bin")).unwrap(), b"captured file");
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
     with_watchdog(async {
         let PreparedFixtureCommand {
@@ -399,6 +651,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
         let execution = execute_workflow(
             admitted,
             &artifacts.staging,
+            &artifacts.inputs,
             &diagnostics,
             TestClock,
             RecordingCommitPort {
@@ -454,20 +707,20 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
     fs::write(cwd.join("report.txt"), b"uncommitted report").unwrap();
     let artifacts = test_artifacts(&admitted);
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
     let start = initialized
         .actions
         .iter()
-        .find(|requested| matches!(&requested.action, Action::StartStep { step } if step == "task"))
+        .find(|requested| matches!(&requested.action, Action::StartStep { step, .. } if step == "task"))
         .unwrap();
-    let running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "task".to_owned(),
             action: start.id,
         },
     );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &running.state,
         Occurrence::StepExecutionCompleted {
             step: "task".to_owned(),
@@ -482,7 +735,7 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
             matches!(&requested.action, Action::CaptureOutputs { step, .. } if step == "task")
         })
         .unwrap();
-    let cancelled = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &capture_requested.state,
         Occurrence::CancellationRequested {
             reason: CancellationReason::UserRequest,
@@ -496,19 +749,405 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
         }
     );
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
-    let step_runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+    let step_runtime = StepRuntime::new(
+        admitted,
+        artifacts.staging.clone(),
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
 
     step_runtime
         .capture_outputs("task".to_owned(), capture.id)
         .await
         .unwrap();
+    let (completion, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
     assert_eq!(artifacts.staging.staged_artifact_count(), 1);
-    let completion = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+    assert_eq!(artifacts.staging.reservation_usage(), (1, 18));
     let stale = runtime::reduce(&cancelled.state, completion);
+    acknowledgement.resolve(stale.occurrence_accepted).await;
 
     assert!(stale.events.is_empty());
     assert_eq!(stale.state, cancelled.state);
     assert_eq!(artifacts.staging.staged_artifact_count(), 0);
+    assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+    assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+}
+
+#[tokio::test]
+async fn queued_capture_cancellation_prevents_source_access_and_is_idempotent() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("alpha.bin"), b"alpha").unwrap();
+        fs::write(execution_root.join("beta.bin"), b"beta").unwrap();
+        let source = r#"schemaVersion: 1
+steps:
+  alpha:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      alphaOutput:
+        kind: file
+        path: alpha.bin
+        mediaType: application/octet-stream
+  beta:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      betaOutput:
+        kind: file
+        path: beta.bin
+        mediaType: application/octet-stream
+"#;
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            source,
+            EnvironmentSnapshot::default(),
+            2,
+        );
+        let (capturing, captures) = capturing_actions(&admitted);
+        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &capturing,
+            Occurrence::CancellationRequested {
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::from_secs(1)),
+            },
+        );
+        let cancellations = cancelled
+            .actions
+            .iter()
+            .filter_map(|requested| match &requested.action {
+                Action::CancelStep { step, .. } => Some((step.clone(), requested.clone())),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(8).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut driver = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        let (observer, mut boundaries) = capture_boundary_gate();
+        driver.set_capture_observer(observer);
+
+        driver.release(captures["alpha"].clone()).await;
+        let first_boundary = boundaries.next().await;
+        assert_eq!(first_boundary.output_identity.as_ref(), "alphaOutput");
+        assert_eq!(first_boundary.kind, CaptureBoundaryKind::BeforeSourceOpen);
+        driver.release(captures["beta"].clone()).await;
+        for cancellation in cancellations.values() {
+            driver.release(cancellation.clone()).await;
+            driver.release(cancellation.clone()).await;
+        }
+        fs::remove_file(execution_root.join("beta.bin")).unwrap();
+        assert!(receiver.try_recv().is_none());
+
+        boundaries.release();
+        let mut quiesced = BTreeMap::new();
+        for _ in 0..2 {
+            let Occurrence::StepQuiesced { step, action } = next_occurrence(&mut receiver).await
+            else {
+                panic!("cancelled capture reported a lifecycle completion");
+            };
+            quiesced.insert(step, action);
+        }
+        assert_eq!(quiesced["alpha"], cancellations["alpha"].id);
+        assert_eq!(quiesced["beta"], cancellations["beta"].id);
+        assert!(boundaries.reached.try_recv().is_err());
+        assert_eq!(artifacts.staging.staged_artifact_count(), 0);
+        assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+        assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+        assert_eq!(driver.active_work_count(), 0);
+        assert!(receiver.try_recv().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn active_capture_cancellation_stops_at_a_chunk_boundary_before_quiescence() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("report.bin"), b"one gated chunk").unwrap();
+        let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      report:
+        kind: file
+        path: report.bin
+        mediaType: application/octet-stream
+"#;
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            source,
+            EnvironmentSnapshot::default(),
+            1,
+        );
+        let (capturing, captures) = capturing_actions(&admitted);
+        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &capturing,
+            Occurrence::CancellationRequested {
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::from_secs(1)),
+            },
+        );
+        let cancellation = cancelled.actions[0].clone();
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut driver = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        let (observer, mut boundaries) = capture_boundary_gate();
+        driver.set_capture_observer(observer);
+        driver.release(captures["task"].clone()).await;
+
+        for expected in [
+            CaptureBoundaryKind::BeforeSourceOpen,
+            CaptureBoundaryKind::BeforeRead,
+            CaptureBoundaryKind::BeforeWrite,
+        ] {
+            let boundary = boundaries.next().await;
+            assert_eq!(boundary.output_identity.as_ref(), "report");
+            assert_eq!(boundary.kind, expected);
+            boundaries.release();
+        }
+        let after_first_write = boundaries.next().await;
+        assert_eq!(after_first_write.kind, CaptureBoundaryKind::AfterWrite);
+        assert_eq!(artifacts.staging.staged_artifact_count(), 1);
+
+        driver.release(cancellation.clone()).await;
+        driver.release(cancellation.clone()).await;
+        assert!(receiver.try_recv().is_none());
+        boundaries.release();
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancellation.id,
+            }
+        );
+        assert!(boundaries.reached.try_recv().is_err());
+        assert_eq!(artifacts.staging.staged_artifact_count(), 0);
+        assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+        assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+        assert_eq!(driver.active_work_count(), 0);
+        assert!(receiver.try_recv().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancel_first_rejects_a_ready_candidate_and_commit_first_retains_it() {
+    with_watchdog(async {
+        for cancel_first in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let execution_root = temporary.path().join("execution");
+            fs::create_dir(&execution_root).unwrap();
+            fs::write(execution_root.join("report.bin"), b"candidate").unwrap();
+            let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      report:
+        kind: file
+        path: report.bin
+        mediaType: application/octet-stream
+exports:
+  reportExport:
+    ref: outputs.task.report
+"#;
+            let admitted = admit_fixture(
+                temporary.path(),
+                &execution_root,
+                source,
+                EnvironmentSnapshot::default(),
+                1,
+            );
+            let (capturing, captures) = capturing_actions(&admitted);
+            let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+            let artifacts = test_artifacts(&admitted);
+            let mut driver = StepRuntime::new(
+                admitted,
+                artifacts.staging.clone(),
+                artifacts.inputs.clone(),
+                sender,
+                TestClock,
+            );
+            driver.release(captures["task"].clone()).await;
+            let (candidate, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+            assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+            assert_eq!(artifacts.staging.reservation_usage(), (1, 9));
+
+            if cancel_first {
+                let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+                    &capturing,
+                    Occurrence::CancellationRequested {
+                        reason: CancellationReason::UserRequest,
+                        deadline: TestInstant(Duration::from_secs(1)),
+                    },
+                );
+                let cancellation = cancelled.actions[0].clone();
+                driver.release(cancellation.clone()).await;
+                driver.release(cancellation.clone()).await;
+                let stale = runtime::reduce(&cancelled.state, candidate);
+                acknowledgement.resolve(stale.occurrence_accepted).await;
+                assert!(!stale.occurrence_accepted);
+                let quiesced = next_occurrence(&mut receiver).await;
+                let terminal = runtime::reduce(&cancelled.state, quiesced);
+                assert_eq!(
+                    terminal.state.workflow,
+                    WorkflowState::Cancelled {
+                        reason: CancellationReason::UserRequest,
+                    }
+                );
+                assert!(matches!(
+                    terminal.state.exports.as_ref().unwrap()["reportExport"],
+                    ExportValue::Unavailable { .. }
+                ));
+                assert_eq!(artifacts.staging.staged_artifact_count(), 0);
+                assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+                assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+                assert!(receiver.try_recv().is_none());
+            } else {
+                let committed = runtime::reduce(&capturing, candidate);
+                acknowledgement.resolve(committed.occurrence_accepted).await;
+                assert!(committed.occurrence_accepted);
+                assert_eq!(committed.state.workflow, WorkflowState::Succeeded);
+                let late_cancellation =
+                    runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+                        &committed.state,
+                        Occurrence::CancellationRequested {
+                            reason: CancellationReason::UserRequest,
+                            deadline: TestInstant(Duration::from_secs(1)),
+                        },
+                    );
+                assert!(!late_cancellation.occurrence_accepted);
+                assert!(late_cancellation.actions.is_empty());
+                assert_eq!(late_cancellation.state, committed.state);
+                assert_eq!(artifacts.staging.staged_artifact_count(), 1);
+                assert_eq!(artifacts.staging.budget_usage(), (1, 9));
+                assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+                let StepState::Succeeded { outputs } = &committed.state.steps["task"].state else {
+                    panic!("accepted output candidate did not commit");
+                };
+                let mut bytes = Vec::new();
+                artifacts
+                    .staging
+                    .copy_to(outputs["report"].as_file().unwrap().handle(), &mut bytes)
+                    .unwrap();
+                assert_eq!(bytes, b"candidate");
+            }
+            assert_eq!(driver.active_work_count(), 0);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejected_candidate_cleanup_failure_quarantines_staging_before_quiescence() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("report.bin"), b"candidate").unwrap();
+        let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/true"]
+    outputs:
+      report:
+        kind: file
+        path: report.bin
+        mediaType: application/octet-stream
+"#;
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            source,
+            EnvironmentSnapshot::default(),
+            1,
+        );
+        let (capturing, captures) = capturing_actions(&admitted);
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut driver = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        driver.release(captures["task"].clone()).await;
+        let (candidate, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+
+        let staging_root = fs::read_dir(artifacts._temporary.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some()))
+            .unwrap();
+        artifacts.staging.block_artifact_unlinks();
+        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &capturing,
+            Occurrence::CancellationRequested {
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::from_secs(1)),
+            },
+        );
+        let cancellation = cancelled.actions[0].clone();
+        driver.release(cancellation.clone()).await;
+        let stale = runtime::reduce(&cancelled.state, candidate);
+        acknowledgement.resolve(stale.occurrence_accepted).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancellation.id,
+            }
+        );
+
+        assert_eq!(artifacts.staging.staged_artifact_count(), 1);
+        assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
+        let retry = artifacts.staging.capture_files(&[CaptureDeclaration::new(
+            "retry",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )]);
+        assert_eq!(
+            retry.as_ref().err().map(CaptureFailure::kind),
+            Some(CaptureFailureKind::StagingUnavailable),
+            "capture quiesced without quarantining failed candidate cleanup"
+        );
+        drop(retry);
+
+        artifacts.staging.release().unwrap();
+        assert!(!staging_root.exists());
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -544,6 +1183,7 @@ async fn workflow_execution_rejects_staging_bound_to_another_execution() {
     let result = execute_workflow(
         admitted,
         &artifacts.staging,
+        &artifacts.inputs,
         &diagnostics,
         TestClock,
         RecordingCommitPort {
@@ -572,6 +1212,7 @@ async fn workflow_execution_captures_declared_outputs_before_success() {
         let execution = execute_workflow(
             admitted,
             &artifacts.staging,
+            &artifacts.inputs,
             &diagnostics,
             TestClock,
             RecordingCommitPort {
@@ -591,7 +1232,7 @@ async fn workflow_execution_captures_declared_outputs_before_success() {
         let StepState::Succeeded { outputs } = &result.state.steps["task"].state else {
             panic!("output-producing command did not succeed");
         };
-        let captured = &outputs["report"];
+        let captured = outputs["report"].as_file().unwrap();
         assert_eq!(captured.output_identity(), "report");
         assert_eq!(captured.media_type(), "text/plain");
         assert_eq!(captured.size(), 16);
@@ -641,16 +1282,16 @@ exports:
         1,
     );
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
     let start = initialized.actions[0].id;
-    let running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "task".to_owned(),
             action: start,
         },
     );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &running.state,
         Occurrence::StepExecutionCompleted {
             step: "task".to_owned(),
@@ -665,14 +1306,20 @@ exports:
         .unwrap();
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
     let artifacts = test_artifacts(&admitted);
-    let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+    let runtime = StepRuntime::new(
+        admitted,
+        artifacts.staging.clone(),
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
 
     runtime
         .capture_outputs("task".to_owned(), capture.id)
         .await
         .unwrap();
 
-    let occurrence = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let (occurrence, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
     let Occurrence::OutputsCaptured {
         step,
         action,
@@ -687,12 +1334,22 @@ exports:
         outputs.keys().cloned().collect::<Vec<_>>(),
         ["alpha", "beta"]
     );
-    assert_eq!(outputs["alpha"].media_type(), "text/plain");
-    assert_eq!(outputs["beta"].media_type(), "application/json");
-    assert_eq!(artifacts.staging.budget_usage(), (2, 18));
+    assert_eq!(
+        outputs["alpha"].as_file().unwrap().media_type(),
+        "text/plain"
+    );
+    assert_eq!(
+        outputs["beta"].as_file().unwrap().media_type(),
+        "application/json"
+    );
+    assert_eq!(artifacts.staging.budget_usage(), (0, 0));
+    assert_eq!(artifacts.staging.reservation_usage(), (2, 18));
     assert!(receiver.try_recv().is_none());
 
     let committed = runtime::reduce(&capture_requested.state, occurrence);
+    acknowledgement.resolve(committed.occurrence_accepted).await;
+    assert_eq!(artifacts.staging.budget_usage(), (2, 18));
+    assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
     assert_eq!(committed.state.workflow, WorkflowState::Succeeded);
     let finish = committed
         .actions
@@ -708,8 +1365,8 @@ exports:
     let ExportValue::Available { output: beta } = &exports["betaExport"] else {
         panic!("beta export was unavailable");
     };
-    assert_eq!(alpha.media_type(), "text/plain");
-    assert_eq!(beta.media_type(), "application/json");
+    assert_eq!(alpha.as_file().unwrap().media_type(), "text/plain");
+    assert_eq!(beta.as_file().unwrap().media_type(), "application/json");
 }
 
 #[tokio::test]
@@ -738,16 +1395,16 @@ steps:
         1,
     );
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
     let start = initialized.actions[0].id;
-    let running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "task".to_owned(),
             action: start,
         },
     );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &running.state,
         Occurrence::StepExecutionCompleted {
             step: "task".to_owned(),
@@ -762,7 +1419,13 @@ steps:
         .await
         .unwrap();
     let artifacts = test_artifacts(&admitted);
-    let mut driver = StepRuntime::new(admitted, artifacts.staging, sender, TestClock);
+    let mut driver = StepRuntime::new(
+        admitted,
+        artifacts.staging,
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
 
     with_watchdog(driver.release(capture)).await;
 
@@ -827,44 +1490,46 @@ exports:
     let runtime = StepRuntime::new(
         admitted.clone(),
         artifacts.staging.clone(),
+        artifacts.inputs.clone(),
         sender,
         TestClock,
     );
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
     let prior_start = initialized.actions[0].id;
-    let prior_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let prior_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "prior".to_owned(),
             action: prior_start,
         },
     );
-    let prior_capture_requested =
-        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
-            &prior_running.state,
-            Occurrence::StepExecutionCompleted {
-                step: "prior".to_owned(),
-                action: prior_start,
-                provisional: (),
-            },
-        );
+    let prior_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        &prior_running.state,
+        Occurrence::StepExecutionCompleted {
+            step: "prior".to_owned(),
+            action: prior_start,
+            provisional: (),
+        },
+    );
     let prior_capture = prior_capture_requested.actions[0].id;
     runtime
         .capture_outputs("prior".to_owned(), prior_capture)
         .await
         .unwrap();
-    let prior_committed = runtime::reduce(
-        &prior_capture_requested.state,
-        receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
-    );
+    let (prior_occurrence, prior_acknowledgement) =
+        next_acknowledged_occurrence(&mut receiver).await;
+    let prior_committed = runtime::reduce(&prior_capture_requested.state, prior_occurrence);
+    prior_acknowledgement
+        .resolve(prior_committed.occurrence_accepted)
+        .await;
     let failing_start = prior_committed
         .actions
         .iter()
-        .find(|requested| matches!(&requested.action, Action::StartStep { step } if step == "failing"))
+        .find(|requested| matches!(&requested.action, Action::StartStep { step, .. } if step == "failing"))
         .unwrap()
         .id;
-    let failing_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let failing_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &prior_committed.state,
         Occurrence::StepStarted {
             step: "failing".to_owned(),
@@ -872,7 +1537,7 @@ exports:
         },
     );
     let failing_capture_requested =
-        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+        runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
             &failing_running.state,
             Occurrence::StepExecutionCompleted {
                 step: "failing".to_owned(),
@@ -887,7 +1552,8 @@ exports:
         .await
         .unwrap();
 
-    let failure_occurrence = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let (failure_occurrence, failure_acknowledgement) =
+        next_acknowledged_occurrence(&mut receiver).await;
     let Occurrence::OutputCaptureFailed { cause, .. } = &failure_occurrence else {
         panic!("failed set did not report outputCaptureFailed");
     };
@@ -900,6 +1566,9 @@ exports:
     assert_eq!(artifacts.staging.budget_usage(), (1, 2));
 
     let terminal = runtime::reduce(&failing_capture_requested.state, failure_occurrence);
+    failure_acknowledgement
+        .resolve(terminal.occurrence_accepted)
+        .await;
     assert!(matches!(
         terminal.state.workflow,
         WorkflowState::Failed { .. }
@@ -907,7 +1576,7 @@ exports:
     let StepState::Succeeded { outputs } = &terminal.state.steps["prior"].state else {
         panic!("prior step lost its committed output");
     };
-    let prior = &outputs["report"];
+    let prior = outputs["report"].as_file().unwrap();
     let mut prior_bytes = Vec::new();
     artifacts
         .staging
@@ -936,6 +1605,7 @@ struct CaptureBudgetTranscript {
     loser_action_sequence: u64,
     loser_failure: CaptureFailureKind,
     budget: (usize, u64),
+    reservations: (usize, u64),
     staged_artifacts: usize,
 }
 
@@ -977,48 +1647,46 @@ steps:
         CaptureLimits::new(2, 3, 3),
     );
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(&admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
     let starts = initialized
         .actions
         .iter()
         .map(|requested| match &requested.action {
-            Action::StartStep { step } => (step.clone(), requested.id),
+            Action::StartStep { step, .. } => (step.clone(), requested.id),
             _ => unreachable!(),
         })
         .collect::<BTreeMap<_, _>>();
-    let alpha_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let alpha_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "alpha".to_owned(),
             action: starts["alpha"],
         },
     );
-    let both_running = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let both_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &alpha_running.state,
         Occurrence::StepStarted {
             step: "beta".to_owned(),
             action: starts["beta"],
         },
     );
-    let alpha_capture_requested =
-        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
-            &both_running.state,
-            Occurrence::StepExecutionCompleted {
-                step: "alpha".to_owned(),
-                action: starts["alpha"],
-                provisional: (),
-            },
-        );
+    let alpha_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        &both_running.state,
+        Occurrence::StepExecutionCompleted {
+            step: "alpha".to_owned(),
+            action: starts["alpha"],
+            provisional: (),
+        },
+    );
     let alpha_capture = alpha_capture_requested.actions[0].clone();
-    let beta_capture_requested =
-        runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
-            &alpha_capture_requested.state,
-            Occurrence::StepExecutionCompleted {
-                step: "beta".to_owned(),
-                action: starts["beta"],
-                provisional: (),
-            },
-        );
+    let beta_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        &alpha_capture_requested.state,
+        Occurrence::StepExecutionCompleted {
+            step: "beta".to_owned(),
+            action: starts["beta"],
+            provisional: (),
+        },
+    );
     let beta_capture = beta_capture_requested.actions[0].clone();
     assert!(alpha_capture.id < beta_capture.id);
 
@@ -1031,55 +1699,75 @@ steps:
         .await
         .unwrap();
     let artifacts = test_artifacts(&admitted);
-    let mut driver = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+    let mut driver = StepRuntime::new(
+        admitted,
+        artifacts.staging.clone(),
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
 
-    // Hold both result deliveries behind a full channel. Each release must still finish
-    // its budget allocation before the coordinator can release the next action.
+    // Hold both result deliveries behind a full channel. Action release only queues
+    // capture work, while the worker still stages and reserves in action order.
     driver.release(alpha_capture).await;
-    assert_eq!(artifacts.staging.budget_usage(), (1, 3));
     driver.release(beta_capture).await;
-    assert_eq!(artifacts.staging.budget_usage(), (1, 3));
     assert!(matches!(
         receiver.recv().await.unwrap().into_runtime::<TestInstant>(),
         Occurrence::StepStarted { step, .. } if step == "queued"
     ));
 
-    let winner = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
-    let loser = receiver.recv().await.unwrap().into_runtime::<TestInstant>();
+    let (winner, winner_acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+    assert_eq!(artifacts.staging.budget_usage(), (0, 0));
     let Occurrence::OutputsCaptured {
         step,
         action,
         outputs,
-    } = winner
+    } = &winner
     else {
         panic!("earlier capture action did not win the budget");
     };
-    let output = &outputs["artifact"];
+    let output = outputs["artifact"].as_file().unwrap();
     let winner_output = (
         output.output_identity().to_owned(),
         output.size(),
         output.media_type().to_owned(),
         output.handle().opaque_id().starts_with("art_"),
     );
+    let winner_step = step.clone();
+    let winner_action = *action;
+    let winner_reduction = runtime::reduce(&beta_capture_requested.state, winner);
+    winner_acknowledgement
+        .resolve(winner_reduction.occurrence_accepted)
+        .await;
+
+    let (loser, loser_acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
     let Occurrence::OutputCaptureFailed {
         step: loser_step,
         action: loser_action,
         cause,
-    } = loser
+    } = &loser
     else {
         panic!("later capture action did not report budget failure");
     };
     let StepFailureCause::OutputCapture(OutputCaptureFailure::Capture(failure)) = cause else {
         panic!("later capture action lost its typed budget failure");
     };
+    let loser_step = loser_step.clone();
+    let loser_action = *loser_action;
+    let loser_failure = failure.kind();
+    let loser_reduction = runtime::reduce(&winner_reduction.state, loser);
+    loser_acknowledgement
+        .resolve(loser_reduction.occurrence_accepted)
+        .await;
     CaptureBudgetTranscript {
-        winner: step,
-        winner_action_sequence: action.transition_sequence.get(),
+        winner: winner_step,
+        winner_action_sequence: winner_action.transition_sequence.get(),
         winner_output,
         loser: loser_step,
         loser_action_sequence: loser_action.transition_sequence.get(),
-        loser_failure: failure.kind(),
+        loser_failure,
         budget: artifacts.staging.budget_usage(),
+        reservations: artifacts.staging.reservation_usage(),
         staged_artifacts: artifacts.staging.staged_artifact_count(),
     }
 }
@@ -1105,6 +1793,7 @@ async fn reducer_action_order_deterministically_allocates_contended_capture_budg
             loser_action_sequence: 6,
             loser_failure: CaptureFailureKind::TotalSizeLimitExceeded,
             budget: (1, 3),
+            reservations: (0, 0),
             staged_artifacts: 1,
         }
     );
@@ -1147,7 +1836,13 @@ async fn bare_program_search_skips_a_candidate_inaccessible_to_the_caller() {
         let action = start_actions(&admitted)["task"];
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+        let runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
         let execution =
             tokio::spawn(async move { runtime.execute_step("task".to_owned(), action).await });
 
@@ -1243,6 +1938,447 @@ async fn nonzero_exit_is_a_typed_execution_occurrence_with_the_start_action() {
 }
 
 #[tokio::test]
+async fn input_views_cleanup_after_launch_and_execution_failures() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let source = input_command_source("task", argv.as_slice());
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            fixture_environment(&control_address, 23, &execution_root, None),
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(8, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096),
+                    1024,
+                ),
+                imports: ResolvedImports::new(Some(Arc::from("failure prompt")), Arc::from([])),
+            },
+        );
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let (commits, _) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort { commits },
+        );
+        let command = async {
+            let (control, report) = accept_report(&listener).await;
+            let path = PathBuf::from(&report.environment["SCHERZO_STEP_INPUTS"]);
+            release(control).await;
+            path
+        };
+        let (result, execution_failure_path) = tokio::join!(execution, command);
+        assert!(matches!(
+            result.unwrap().state.workflow,
+            WorkflowState::Failed { .. }
+        ));
+        assert!(!execution_failure_path.exists());
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+
+        let launch_source = input_command_source("launch", &["./missing-executable"]);
+        let launch_admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &launch_source,
+            EnvironmentSnapshot::new([("SCHERZO_STEP_INPUTS", "caller-value")]),
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(8, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096),
+                    1024,
+                ),
+                imports: ResolvedImports::new(Some(Arc::from("launch prompt")), Arc::from([])),
+            },
+        );
+        let launch_artifacts = test_artifacts(&launch_admitted);
+        let (commits, _) = mpsc::unbounded_channel();
+        let result = execute_workflow(
+            launch_admitted,
+            &launch_artifacts.staging,
+            &launch_artifacts.inputs,
+            &StepDiagnosticLog::default(),
+            TestClock,
+            RecordingCommitPort { commits },
+        )
+        .await
+        .unwrap();
+        let WorkflowState::Failed {
+            primary_failure, ..
+        } = result.state.workflow
+        else {
+            panic!("launch failure did not fail the workflow");
+        };
+        assert_eq!(
+            primary_failure.cause,
+            StepFailureCause::Start(StepStartFailure::CommandLaunch(
+                CommandLaunchFailure::NotFound
+            ))
+        );
+        assert_eq!(launch_artifacts.inputs.reservation_usage(), (0, 0, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn input_staging_cleanup_failure_is_reported_and_retryable() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let source = input_command_source("task", argv.as_slice());
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            fixture_environment(&control_address, 0, &execution_root, None),
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(8, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096),
+                    1024,
+                ),
+                imports: ResolvedImports::new(Some(Arc::from("retry prompt")), Arc::from([])),
+            },
+        );
+        let artifacts = test_artifacts(&admitted);
+        artifacts.inputs.block_cleanup();
+        let diagnostics = StepDiagnosticLog::default();
+        let (commits, _) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort { commits },
+        );
+        let command = async {
+            let (control, report) = accept_report(&listener).await;
+            let path = PathBuf::from(&report.environment["SCHERZO_STEP_INPUTS"]);
+            release(control).await;
+            path
+        };
+
+        let (result, input_path) = tokio::join!(execution, command);
+
+        assert_eq!(result, Err(CoordinationError::InputStagingCleanup));
+        assert!(input_path.exists());
+        assert_eq!(artifacts.inputs.reservation_usage(), (1, 1, 12));
+
+        artifacts.inputs.unblock_cleanup();
+        artifacts.inputs.release().unwrap();
+
+        assert!(!input_path.exists());
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+        artifacts.inputs.release().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn unavailable_captured_input_fails_preparation_without_launching_command() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("report.bin"), b"foreign artifact").unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let source = format!(
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"unused\"]\n    outputs:\n      report:\n        kind: file\n        path: report.bin\n        mediaType: application/fixture\n  consume:\n    kind: cmd\n    dependsOn: [produce]\n    inputs:\n      artifact:\n        ref: outputs.produce.report\n    command:\n      argv: {}\n",
+            serde_json::to_string(&argv).unwrap()
+        );
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            &source,
+            fixture_environment(&control_address, 0, &execution_root, None),
+            1,
+        );
+        let artifacts = test_artifacts(&admitted);
+        let foreign_parent = tempfile::tempdir().unwrap();
+        let foreign_store =
+            ArtifactStaging::create(admitted.execution(), foreign_parent.path()).unwrap();
+        let mut foreign_outputs = foreign_store
+            .capture_files(&[crate::execution::workflow::artifact::CaptureDeclaration::new(
+                "report",
+                Path::new("report.bin"),
+                "application/fixture",
+            )])
+            .unwrap();
+        let foreign_value = CapturedValue::file(foreign_outputs.remove("report").unwrap());
+
+        let initialized =
+            runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+        let producer_start = initialized.actions[0].id;
+        let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "produce".to_owned(),
+                action: producer_start,
+            },
+        );
+        let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "produce".to_owned(),
+                action: producer_start,
+                provisional: (),
+            },
+        );
+        let capture_action = capture_requested.actions[0].id;
+        let consumer_requested = runtime::reduce(
+            &capture_requested.state,
+            Occurrence::OutputsCaptured {
+                step: "produce".to_owned(),
+                action: capture_action,
+                outputs: BTreeMap::from([("report".to_owned(), foreign_value)]),
+            },
+        );
+        let consumer = consumer_requested
+            .actions
+            .into_iter()
+            .find(|requested| {
+                matches!(&requested.action, Action::StartStep { step, .. } if step == "consume")
+            })
+            .unwrap();
+        let consumer_action = consumer.id;
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+        let mut driver = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+
+        driver.release(consumer).await;
+
+        let Occurrence::StepStartFailed { action, cause, .. } =
+            next_occurrence(&mut receiver).await
+        else {
+            panic!("unavailable input did not fail command preparation");
+        };
+        assert_eq!(action, consumer_action);
+        let StepFailureCause::Start(StepStartFailure::InputPreparation(failure)) = cause else {
+            panic!("unavailable input lost its typed preparation cause");
+        };
+        assert_eq!(failure.input_identity(), Some("artifact"));
+        assert_eq!(
+            failure.kind(),
+            crate::execution::workflow::input::InputPreparationFailureKind::SourceUnavailable
+        );
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+        let listener = listener.into_std().unwrap();
+        assert!(matches!(
+            listener.accept(),
+            Err(failure) if failure.kind() == io::ErrorKind::WouldBlock
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let source = input_command_source("task", &["/bin/true"]);
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            EnvironmentSnapshot::default(),
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(8, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096),
+                    1024,
+                ),
+                imports: ResolvedImports::new(
+                    Some(Arc::from("cancel before launch")),
+                    Arc::from([]),
+                ),
+            },
+        );
+        let deadline = TestInstant(Duration::from_secs(41));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let Action::StartStep { step, inputs } = start.action else {
+            panic!("fixture did not produce a start action");
+        };
+        let Action::CancelStep {
+            step: cancel_step,
+            deadline,
+            ..
+        } = cancel.action
+        else {
+            panic!("fixture did not produce a cancellation action");
+        };
+        let (sender, _receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+        sender
+            .send(DriverOccurrence::step_started(
+                "channel-occupant".to_owned(),
+                start.id,
+            ))
+            .await
+            .unwrap();
+        let artifacts = test_artifacts(&admitted);
+        let runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        let cancellation = runtime.register_start(step.clone(), start.id).unwrap();
+        let CancellationRegistration::Active { wake, interrupt } =
+            runtime.request_cancellation(cancel_step, cancel.id, deadline)
+        else {
+            panic!("prelaunch cancellation was not registered");
+        };
+        assert!(interrupt.is_none());
+        wake.unwrap().send(()).unwrap();
+
+        let execution = runtime.execute_registered_step(step, start.id, inputs, cancellation);
+        tokio::pin!(execution);
+        std::future::poll_fn(|context| match execution.as_mut().poll(context) {
+            Poll::Ready(result) => panic!("quiescence bypassed channel backpressure: {result:?}"),
+            Poll::Pending if runtime.active_work_count() == 0 => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        })
+        .await;
+
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = std::iter::once(executable.to_str().unwrap())
+            .chain(arguments.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let source = input_command_source("task", argv.as_slice());
+        let environment = EnvironmentSnapshot::new([
+            (
+                OsString::from(FIXTURE_SOCKET),
+                OsString::from(control_address),
+            ),
+            (OsString::from(FIXTURE_EXIT_CODE), OsString::from("0")),
+            (
+                OsString::from(FIXTURE_MODE),
+                OsString::from(FIXTURE_MODE_INTERRUPTIBLE),
+            ),
+            (OsString::from(FIXTURE_ROLE), OsString::from(FIXTURE_PARENT)),
+            (
+                OsString::from("SCHERZO_INHERITED"),
+                OsString::from("must-not-reach-command"),
+            ),
+        ]);
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            environment,
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(8, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096),
+                    1024,
+                ),
+                imports: ResolvedImports::new(Some(Arc::from("cancel prompt")), Arc::from([])),
+            },
+        );
+        let deadline = TestInstant(Duration::from_secs(41));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let start_action = start.id;
+        let cancel_action = cancel.id;
+        let (clock, mut deadline_control) = ControlledClock::new(TestInstant(Duration::ZERO));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
+
+        runtime.release(start).await;
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start_action,
+            }
+        );
+        let mut processes = accept_group(&listener).await;
+        let parent_path =
+            PathBuf::from(&processes[FIXTURE_PARENT].1.environment["SCHERZO_STEP_INPUTS"]);
+        let descendant_path =
+            PathBuf::from(&processes[FIXTURE_DESCENDANT].1.environment["SCHERZO_STEP_INPUTS"]);
+        assert_eq!(parent_path, descendant_path);
+        assert_eq!(artifacts.inputs.reservation_usage(), (1, 1, 13));
+
+        runtime.release(cancel).await;
+        assert_group_interrupted(&processes).await;
+        assert_eq!(deadline_control.next_deadline().await, deadline);
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+            }
+        );
+        assert!(!parent_path.exists());
+        assert_eq!(artifacts.inputs.reservation_usage(), (0, 0, 0));
+        assert_group_closed(&mut processes).await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn output_beyond_each_log_limit_is_drained_before_success() {
     with_watchdog(async {
         let PreparedFixtureCommand {
@@ -1258,6 +2394,7 @@ async fn output_beyond_each_log_limit_is_drained_before_success() {
         let runtime = StepRuntime::with_diagnostics(
             admitted,
             artifacts.staging.clone(),
+            artifacts.inputs.clone(),
             diagnostics.clone(),
             sender,
             TestClock,
@@ -1312,6 +2449,7 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
         let mut runtime = StepRuntime::with_diagnostics(
             admitted,
             artifacts.staging.clone(),
+            artifacts.inputs.clone(),
             diagnostics.clone(),
             sender,
             TestClock,
@@ -1339,6 +2477,7 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
             child,
             process_group: None,
             diagnostic: Some(pending),
+            inputs: None,
         };
         let settlement_runtime = runtime.clone();
         let settlement = settlement_runtime.settle_launched(
@@ -1414,7 +2553,13 @@ async fn concurrent_commands_receive_distinct_process_groups() {
         let actions = start_actions(&admitted);
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+        let runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
         let alpha_runtime = runtime.clone();
         let alpha_action = actions["alpha"];
         let alpha = tokio::spawn(async move {
@@ -1478,7 +2623,13 @@ async fn cancellation_before_launch_revokes_the_action_and_duplicate_delivery_is
         let (clock, control) = ControlledClock::new(TestInstant(Duration::ZERO));
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let mut runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, clock);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
 
         runtime.release(start.clone()).await;
         runtime.release(cancel.clone()).await;
@@ -1522,6 +2673,7 @@ async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once
         let mut runtime = StepRuntime::with_diagnostics(
             admitted,
             artifacts.staging.clone(),
+            artifacts.inputs.clone(),
             diagnostics.clone(),
             sender,
             clock,
@@ -1575,7 +2727,13 @@ async fn admitted_deadline_forces_the_stubborn_process_group_without_wall_clock_
         let (clock, mut control) = ControlledClock::new(TestInstant(Duration::ZERO));
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let mut runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, clock);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
 
         runtime.release(start).await;
         assert_eq!(
@@ -1623,7 +2781,13 @@ async fn natural_exit_before_cancel_delivery_has_no_late_lifecycle_or_cleanup_wo
         let (clock, mut control) = ControlledClock::new(TestInstant(Duration::ZERO));
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let mut runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, clock);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
 
         runtime.release(start).await;
         assert_eq!(
@@ -1678,7 +2842,13 @@ async fn cancellation_after_the_owned_child_exits_still_terminates_its_descendan
         let (clock, control) = ControlledClock::new(TestInstant(Duration::ZERO));
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
-        let mut runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, clock);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        );
 
         runtime.release(start).await;
         assert_eq!(
@@ -1739,6 +2909,7 @@ async fn run_fixture_command(form: ProgramForm, exit_code: i32) -> FixtureRun {
     let runtime = StepRuntime::with_diagnostics(
         admitted,
         artifacts.staging.clone(),
+        artifacts.inputs.clone(),
         diagnostics.clone(),
         sender,
         TestClock,
@@ -1884,19 +3055,66 @@ async fn prepare_group_command(mode: &str) -> PreparedGroupCommand {
     }
 }
 
+fn capturing_actions(
+    admitted: &AdmittedWorkflow,
+) -> (TestRuntimeState, BTreeMap<String, TestRequestedAction>) {
+    let initialized =
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(admitted, None);
+    let starts = initialized
+        .actions
+        .iter()
+        .filter_map(|requested| match &requested.action {
+            Action::StartStep { step, .. } => Some((step.clone(), requested.id)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut state = initialized.state;
+    for (step, action) in &starts {
+        state = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &state,
+            Occurrence::StepStarted {
+                step: step.clone(),
+                action: *action,
+            },
+        )
+        .state;
+    }
+
+    let mut captures = BTreeMap::new();
+    for (step, action) in starts {
+        let reduction = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+            &state,
+            Occurrence::StepExecutionCompleted {
+                step: step.clone(),
+                action,
+                provisional: (),
+            },
+        );
+        let capture = reduction
+            .actions
+            .iter()
+            .find(|requested| matches!(requested.action, Action::CaptureOutputs { .. }))
+            .unwrap()
+            .clone();
+        captures.insert(step, capture);
+        state = reduction.state;
+    }
+    (state, captures)
+}
+
 fn running_cancellation_actions(
     admitted: &AdmittedWorkflow,
     deadline: TestInstant,
 ) -> (TestRequestedAction, TestRequestedAction) {
     let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedArtifact, TestInstant>(admitted, None);
+        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(admitted, None);
     let start = initialized
         .actions
         .iter()
         .find(|requested| matches!(requested.action, Action::StartStep { .. }))
         .unwrap()
         .clone();
-    let started = runtime::reduce::<(), StepFailureCause, CapturedArtifact, TestInstant>(
+    let started = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
         &initialized.state,
         Occurrence::StepStarted {
             step: "task".to_owned(),
@@ -2011,6 +3229,13 @@ fn install_fixture(source: &Path, destination: &Path) {
     symlink(source, destination).unwrap();
 }
 
+fn input_command_source(step: &str, argv: &[&str]) -> String {
+    format!(
+        "schemaVersion: 1\nsteps:\n  {step}:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: {}\n",
+        serde_json::to_string(argv).unwrap()
+    )
+}
+
 fn workflow_source(steps: &[(&str, Option<&str>, &[&str])]) -> String {
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
     for (step, cwd, argv) in steps {
@@ -2094,6 +3319,35 @@ fn admit_fixture_with_limits(
     capture_limits: CaptureLimits,
     maximum_log_bytes: u64,
 ) -> AdmittedWorkflow {
+    admit_fixture_with_inputs(
+        temporary_root,
+        execution_root,
+        source,
+        environment,
+        FixtureExecution {
+            limits: ExecutionPolicyLimits::new(
+                maximum_parallel_steps,
+                capture_limits,
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                maximum_log_bytes,
+            ),
+            imports: ResolvedImports::default(),
+        },
+    )
+}
+
+struct FixtureExecution {
+    limits: ExecutionPolicyLimits,
+    imports: ResolvedImports,
+}
+
+fn admit_fixture_with_inputs(
+    temporary_root: &Path,
+    execution_root: &Path,
+    source: &str,
+    environment: EnvironmentSnapshot,
+    execution: FixtureExecution,
+) -> AdmittedWorkflow {
     let source_root = temporary_root.join(format!(
         "source-{}",
         temporary_root.read_dir().unwrap().count()
@@ -2102,13 +3356,11 @@ fn admit_fixture_with_limits(
     fs::write(source_root.join("workflow.yaml"), source).unwrap();
     admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        execution.imports,
         ExecutionContext::new(
             execution_root.to_owned(),
             ExecutionRootLifecycle::EngineOwnedEphemeral,
-            maximum_parallel_steps,
-            capture_limits,
-            maximum_log_bytes,
+            execution.limits,
             environment,
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),
@@ -2117,11 +3369,11 @@ fn admit_fixture_with_limits(
 }
 
 fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
-    runtime::initialize::<(), StepFailureCause, CapturedArtifact, ()>(admitted, None)
+    runtime::initialize::<(), StepFailureCause, CapturedValue, ()>(admitted, None)
         .actions
         .into_iter()
         .filter_map(|requested| match requested.action {
-            Action::StartStep { step } => Some((step, requested.id)),
+            Action::StartStep { step, .. } => Some((step, requested.id)),
             Action::CaptureOutputs { .. }
             | Action::CancelStep { .. }
             | Action::FinishRun { .. } => None,
@@ -2133,7 +3385,13 @@ async fn assert_start_failure(admitted: AdmittedWorkflow, step: &str, expected: 
     let action = start_actions(&admitted)[step];
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
     let artifacts = test_artifacts(&admitted);
-    let runtime = StepRuntime::new(admitted, artifacts.staging.clone(), sender, TestClock);
+    let runtime = StepRuntime::new(
+        admitted,
+        artifacts.staging.clone(),
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
     assert_eq!(runtime.execute_step(step.to_owned(), action).await, Ok(()));
     assert_eq!(
         next_occurrence(&mut receiver).await,
@@ -2147,6 +3405,13 @@ async fn assert_start_failure(admitted: AdmittedWorkflow, step: &str, expected: 
 
 async fn next_occurrence(receiver: &mut TestReceiver) -> TestOccurrence {
     receiver.recv().await.unwrap().into_runtime()
+}
+
+async fn next_acknowledged_occurrence(
+    receiver: &mut TestReceiver,
+) -> (TestOccurrence, DriverOccurrenceTestAcknowledgement) {
+    let (occurrence, acknowledgement) = receiver.recv_with_acknowledgement().await.unwrap();
+    (occurrence.into_runtime(), acknowledgement)
 }
 
 async fn accept_report(listener: &TcpListener) -> (TcpStream, FixtureReport) {

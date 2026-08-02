@@ -405,10 +405,15 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
 fn oauth_request_deadline_bounds_the_complete_exchange() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    // Keep the peer pending so this isolated check observes only the production
+    // request deadline; release it deterministically after classification.
+    let (release_response, response_release) = mpsc::sync_channel(0);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
-        thread::sleep(Duration::from_millis(100));
+        response_release
+            .recv()
+            .expect("OAuth response should be released");
         let _ = stream.write_all(&json_response("200 OK", serde_json::json!({})));
     });
 
@@ -426,6 +431,9 @@ fn oauth_request_deadline_bounds_the_complete_exchange() {
         error,
         AuthorizationError::Unreachable(UnreachableCategory::Timeout)
     ));
+    release_response
+        .send(())
+        .expect("OAuth response should be released");
     server.join().unwrap();
 }
 

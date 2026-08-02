@@ -820,7 +820,7 @@ fn unauthorized_status_survives_the_body_deadline() {
 
 #[test]
 fn deadlines_cover_headers_and_reads_do_not_retry() {
-    let server = ScriptedHttpServer::respond_after(Duration::from_millis(150), success("200 OK"));
+    let mut server = ScriptedHttpServer::respond_when_released(success("200 OK"));
 
     let outcome = get_organization_with_timeout(
         &http_client(),
@@ -837,6 +837,7 @@ fn deadlines_cover_headers_and_reads_do_not_retry() {
             UnreachableCategory::Timeout
         ))
     );
+    server.release_response();
     server.finish_one();
 }
 

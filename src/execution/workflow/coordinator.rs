@@ -152,6 +152,40 @@ pub(crate) enum DriverOccurrenceClaimError {
     ReceiverClosed,
 }
 
+// Acknowledged deliveries settle in two phases: the coordinator reports the reducer
+// decision, then waits for the driver to finalize or release occurrence-owned resources.
+pub(crate) enum DriverOccurrenceAcceptance {
+    Accepted(DriverOccurrenceFinalization),
+    Rejected(DriverOccurrenceFinalization),
+}
+
+pub(crate) struct DriverOccurrenceFinalization {
+    finalized: oneshot::Sender<()>,
+}
+
+impl DriverOccurrenceFinalization {
+    pub(crate) fn finalize(self) {
+        let _ = self.finalized.send(());
+    }
+}
+
+struct DriverOccurrenceAcknowledgement {
+    decision: oneshot::Sender<DriverOccurrenceAcceptance>,
+}
+
+impl DriverOccurrenceAcknowledgement {
+    fn resolve(self, accepted: bool) -> Option<oneshot::Receiver<()>> {
+        let (finalized, finalization) = oneshot::channel();
+        let finalization_token = DriverOccurrenceFinalization { finalized };
+        let decision = if accepted {
+            DriverOccurrenceAcceptance::Accepted(finalization_token)
+        } else {
+            DriverOccurrenceAcceptance::Rejected(finalization_token)
+        };
+        self.decision.send(decision).ok().map(|()| finalization)
+    }
+}
+
 // The receiver acknowledges a claim before the driver waits for adapter quiescence.
 // Resolving this token then either publishes the lifecycle occurrence or discards it.
 pub(crate) struct DriverOccurrenceClaim {
@@ -175,20 +209,44 @@ enum DriverOccurrenceDelivery<Provisional, Cause, Output> {
         observed: oneshot::Sender<()>,
         resolution: oneshot::Receiver<ClaimResolution>,
     },
+    Acknowledged {
+        occurrence: DriverOccurrence<Provisional, Cause, Output>,
+        acknowledgement: DriverOccurrenceAcknowledgement,
+    },
+}
+
+struct ResolvedDriverOccurrence<Provisional, Cause, Output> {
+    occurrence: DriverOccurrence<Provisional, Cause, Output>,
+    acknowledgement: Option<DriverOccurrenceAcknowledgement>,
 }
 
 impl<Provisional, Cause, Output> DriverOccurrenceDelivery<Provisional, Cause, Output> {
-    async fn resolve(self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
+    async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
         match self {
-            Self::Ready(occurrence) => Some(occurrence),
+            Self::Ready(occurrence) => Some(ResolvedDriverOccurrence {
+                occurrence,
+                acknowledgement: None,
+            }),
             Self::Claimed {
                 occurrence,
                 observed,
                 resolution,
             } => {
                 observed.send(()).ok()?;
-                matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(occurrence)
+                matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(
+                    ResolvedDriverOccurrence {
+                        occurrence,
+                        acknowledgement: None,
+                    },
+                )
             }
+            Self::Acknowledged {
+                occurrence,
+                acknowledgement,
+            } => Some(ResolvedDriverOccurrence {
+                occurrence,
+                acknowledgement: Some(acknowledgement),
+            }),
         }
     }
 }
@@ -208,8 +266,26 @@ impl<Provisional, Cause, Output> OccurrenceSender<Provisional, Cause, Output> {
             .await
             .map_err(|failure| match failure.0 {
                 DriverOccurrenceDelivery::Ready(occurrence)
-                | DriverOccurrenceDelivery::Claimed { occurrence, .. } => occurrence,
+                | DriverOccurrenceDelivery::Claimed { occurrence, .. }
+                | DriverOccurrenceDelivery::Acknowledged { occurrence, .. } => occurrence,
             })
+    }
+
+    pub(crate) async fn send_acknowledged(
+        &self,
+        occurrence: DriverOccurrence<Provisional, Cause, Output>,
+    ) -> Result<DriverOccurrenceAcceptance, DriverOccurrenceClaimError> {
+        let (decision, acceptance) = oneshot::channel();
+        self.sender
+            .send(DriverOccurrenceDelivery::Acknowledged {
+                occurrence,
+                acknowledgement: DriverOccurrenceAcknowledgement { decision },
+            })
+            .await
+            .map_err(|_| DriverOccurrenceClaimError::ReceiverClosed)?;
+        acceptance
+            .await
+            .map_err(|_| DriverOccurrenceClaimError::ReceiverClosed)
     }
 
     pub(crate) async fn claim(
@@ -238,12 +314,32 @@ pub(crate) struct OccurrenceReceiver<Provisional, Cause, Output> {
     pending: Option<DriverOccurrenceDelivery<Provisional, Cause, Output>>,
 }
 
+#[cfg(test)]
+pub(crate) struct DriverOccurrenceTestAcknowledgement {
+    acknowledgement: Option<DriverOccurrenceAcknowledgement>,
+}
+
+#[cfg(test)]
+impl DriverOccurrenceTestAcknowledgement {
+    pub(crate) async fn resolve(self, accepted: bool) {
+        if let Some(finalization) = self
+            .acknowledgement
+            .and_then(|acknowledgement| acknowledgement.resolve(accepted))
+        {
+            let _ = finalization.await;
+        }
+    }
+}
+
 impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> {
     pub(crate) async fn recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
         loop {
             let delivery = self.recv_delivery().await?;
-            if let Some(occurrence) = delivery.resolve().await {
-                return Some(occurrence);
+            if let Some(resolved) = delivery.resolve().await {
+                if let Some(acknowledgement) = resolved.acknowledgement {
+                    acknowledgement.resolve(false);
+                }
+                return Some(resolved.occurrence);
             }
         }
     }
@@ -258,14 +354,35 @@ impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> 
     }
 
     #[cfg(test)]
+    pub(crate) async fn recv_with_acknowledgement(
+        &mut self,
+    ) -> Option<(
+        DriverOccurrence<Provisional, Cause, Output>,
+        DriverOccurrenceTestAcknowledgement,
+    )> {
+        loop {
+            let delivery = self.recv_delivery().await?;
+            if let Some(resolved) = delivery.resolve().await {
+                return Some((
+                    resolved.occurrence,
+                    DriverOccurrenceTestAcknowledgement {
+                        acknowledgement: resolved.acknowledgement,
+                    },
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
         if self.pending.is_some() {
             return None;
         }
         match self.receiver.try_recv().ok()? {
             DriverOccurrenceDelivery::Ready(occurrence) => Some(occurrence),
-            claimed @ DriverOccurrenceDelivery::Claimed { .. } => {
-                self.pending = Some(claimed);
+            pending @ (DriverOccurrenceDelivery::Claimed { .. }
+            | DriverOccurrenceDelivery::Acknowledged { .. }) => {
+                self.pending = Some(pending);
                 None
             }
         }
@@ -314,6 +431,8 @@ pub(crate) trait ActionPort<Action> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoordinationError {
     ArtifactStagingMismatch,
+    InputStagingMismatch,
+    InputStagingCleanup,
     OccurrenceChannelClosed,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
@@ -391,12 +510,12 @@ where
             &self.admitted,
             initial_cancellation,
         );
-        if self.commit(ordinal, initialization).await? {
+        if self.commit(ordinal, initialization, None).await? {
             return self.result(ordinal);
         }
 
         loop {
-            let occurrence = loop {
+            let (occurrence, acknowledgement) = loop {
                 let input = tokio::select! {
                     biased;
                     changed = cancellation.changed(), if !cancellation_admitted => {
@@ -420,14 +539,14 @@ where
                     }
                 };
                 match input {
-                    CoordinatorInput::Cancellation(occurrence) => break occurrence,
+                    CoordinatorInput::Cancellation(occurrence) => break (occurrence, None),
                     CoordinatorInput::Driver(delivery) => {
                         // A selected claim owns arbitration until its adapter settles, so a
                         // later cancellation cannot gain priority from diagnostic drain timing.
-                        let Some(occurrence) = delivery.resolve().await else {
+                        let Some(resolved) = delivery.resolve().await else {
                             continue;
                         };
-                        break occurrence.into_runtime();
+                        break (resolved.occurrence.into_runtime(), resolved.acknowledgement);
                     }
                 }
             };
@@ -438,7 +557,7 @@ where
                 return Err(CoordinationError::ReducerStateUnavailable);
             };
             let reduction = runtime::reduce(state, occurrence);
-            if self.commit(ordinal, reduction).await? {
+            if self.commit(ordinal, reduction, acknowledgement).await? {
                 return self.result(ordinal);
             }
         }
@@ -448,11 +567,13 @@ where
         &mut self,
         occurrence_ordinal: OccurrenceOrdinal,
         reduction: Reduction<Provisional, Cause, Output, Clock::Instant>,
+        acknowledgement: Option<DriverOccurrenceAcknowledgement>,
     ) -> Result<bool, CoordinationError> {
         let Reduction {
             state,
             events,
             actions,
+            occurrence_accepted,
         } = reduction;
         let terminal = !matches!(&state.workflow, WorkflowState::Executing { .. });
         self.state = Some(state);
@@ -466,6 +587,11 @@ where
                 events,
             })
             .await;
+        if let Some(finalization) =
+            acknowledgement.and_then(|acknowledgement| acknowledgement.resolve(occurrence_accepted))
+        {
+            let _ = finalization.await;
+        }
         if terminal {
             self.occurrences.receiver.close();
         }

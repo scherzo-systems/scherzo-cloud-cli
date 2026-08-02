@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods)]
-
 mod backoff;
 mod config;
 mod connection;

@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports,
+    admit_workflow,
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{Action, StepState};
@@ -126,9 +127,12 @@ fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixt
         ExecutionContext::new(
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
-            1,
-            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-            1024 * 1024,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(source, grace),
         ),
@@ -186,7 +190,7 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
             Action::StartStep { .. }
         ));
         let step = match &start_release.action.action {
-            Action::StartStep { step } => step.clone(),
+            Action::StartStep { step, .. } => step.clone(),
             _ => String::new(),
         };
         let start_id = start_release.action.id;
@@ -332,7 +336,7 @@ async fn acknowledged_completion_claim_precedes_later_cancellation() {
     let driver = async {
         assert_eq!(commits.recv().await.unwrap().occurrence_ordinal.get(), 1);
         let start = actions.recv().await.unwrap();
-        let Action::StartStep { step } = &start.action.action else {
+        let Action::StartStep { step, .. } = &start.action.action else {
             panic!("workflow did not request its command start");
         };
         let step = step.clone();

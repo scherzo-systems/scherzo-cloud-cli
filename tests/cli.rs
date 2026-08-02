@@ -3,10 +3,6 @@
     reason = "integration tests use Cargo-provided build and executable paths"
 )]
 #![allow(
-    clippy::disallowed_methods,
-    reason = "runner service timing raises this restriction within its own module"
-)]
-#![allow(
     clippy::expect_used,
     clippy::panic,
     clippy::unwrap_used,

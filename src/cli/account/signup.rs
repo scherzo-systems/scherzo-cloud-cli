@@ -1,10 +1,13 @@
+// Signup and status have independent output contracts, so their command-local
+// adapters stay separate rather than coupling unrelated command behavior.
+// jscpd:ignore-start
 use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Args;
 use serde::Serialize;
-use time::OffsetDateTime;
+// jscpd:ignore-end
 
 use crate::api::{
     HttpClient, HttpClientError, HumanPrincipal, SignupError, SignupOutcome,
@@ -46,7 +49,7 @@ impl Command {
         let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
         // jscpd:ignore-end
         let Some(credential) = store
-            .selected(deployment.fingerprint(), OffsetDateTime::now_utc())
+            .selected(deployment.fingerprint(), crate::timing::utc_now())
             .map_err(CommandError::CredentialStore)?
         else {
             return self.write_outcome(deployment, &SignupOutcome::Unauthenticated);

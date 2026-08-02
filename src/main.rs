@@ -8,11 +8,6 @@
         reason = "unit tests use Cargo-provided fixture paths and panic shortcuts"
     )
 )]
-#![allow(
-    clippy::disallowed_methods,
-    reason = "runner service timing raises this restriction within its own module"
-)]
-
 mod api;
 mod build_info;
 mod cli;
@@ -24,6 +19,7 @@ mod execution;
 mod human_auth;
 mod runner;
 mod runner_protocol;
+mod timing;
 mod tls;
 
 use std::env;

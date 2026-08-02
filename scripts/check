@@ -2,11 +2,15 @@
 set -euo pipefail
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# Keep Unix-domain socket fixtures below the platform path-length limit even when
-# the source checkout or inherited temporary directory has a long path.
-check_tmp=$(TMPDIR=/tmp mktemp -d)
-trap 'rm -rf "$check_tmp"' EXIT
-export TMPDIR=$check_tmp
+
+long_tmp_parent=$(mktemp -d)
+cleanup() {
+  rm -rf "$long_tmp_parent"
+}
+trap cleanup EXIT
+long_tmp="$long_tmp_parent/portable-workflow-test-temporary-directory/with-a-deliberately-long-path/to-detect-path-length-dependent-test-fixtures"
+mkdir -p "$long_tmp"
+chmod 700 "$long_tmp"
 
 "$public_root/scripts/check-structure"
 
@@ -16,8 +20,8 @@ cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
-cargo test --locked --workspace --all-targets --all-features
-SCHERZO_CLOUD_VERSION=0.2.7 \
+TMPDIR="$long_tmp" cargo test --locked --workspace --all-targets --all-features
+TMPDIR="$long_tmp" SCHERZO_CLOUD_VERSION=0.2.7 \
   cargo test --locked --workspace --all-targets --all-features resolved_build_version
 cargo build --locked --workspace --all-features --release
 

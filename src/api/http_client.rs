@@ -73,6 +73,10 @@ impl HttpClient {
     }
 
     #[expect(
+        clippy::disallowed_methods,
+        reason = "HttpClient is the production boundary for complete-request deadlines"
+    )]
+    #[expect(
         clippy::expect_used,
         reason = "HttpClient owns its runtime until Drop takes it after all borrows end"
     )]

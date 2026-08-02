@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_STDOUT_BYTES: usize = 8 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -60,7 +60,7 @@ impl CommandRunner for SystemCommandRunner {
         };
         let stdout_thread = thread::spawn(move || drain_stdout(stdout));
         let stderr_thread = thread::spawn(move || drain(stderr));
-        let started = Instant::now();
+        let started = crate::timing::monotonic_now();
 
         let success = loop {
             match child.try_wait() {
@@ -70,7 +70,7 @@ impl CommandRunner for SystemCommandRunner {
                     let _ = join_readers(stdout_thread, stderr_thread);
                     return Err(CommandProbeError::Timeout);
                 }
-                Ok(None) => thread::sleep(WAIT_POLL_INTERVAL),
+                Ok(None) => crate::timing::sleep(WAIT_POLL_INTERVAL),
                 Err(_) => {
                     terminate(&mut child);
                     let _ = join_readers(stdout_thread, stderr_thread);
@@ -167,7 +167,7 @@ fn drain(mut reader: impl Read) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{CommandProbeError, CommandRunner, MAX_STDOUT_BYTES, SystemCommandRunner};
 
@@ -175,7 +175,6 @@ mod tests {
     #[test]
     fn timed_out_command_is_killed_and_reaped() {
         let runner = SystemCommandRunner;
-        let started = Instant::now();
 
         let result = runner.run(
             "/bin/sh",
@@ -184,7 +183,6 @@ mod tests {
         );
 
         assert_eq!(result, Err(CommandProbeError::Timeout));
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]

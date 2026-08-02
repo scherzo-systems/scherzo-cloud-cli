@@ -330,7 +330,7 @@ impl Recorder {
                 context: Context::new().with_span(span),
                 writer: Arc::clone(&self.writer),
                 dropped_count: Arc::clone(&self.dropped_count),
-                started_at: Instant::now(),
+                started_at: crate::timing::monotonic_now(),
                 state: Mutex::new(EventState {
                     fields,
                     completed: false,

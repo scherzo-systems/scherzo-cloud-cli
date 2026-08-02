@@ -211,15 +211,16 @@ struct GatedCopier {
 }
 
 impl StreamCopier for GatedCopier {
-    fn copy(
-        &mut self,
-        source: &mut File,
-        destination: &mut File,
-        maximum_bytes: u64,
-    ) -> Result<u64, CaptureFailureKind> {
+    fn copy(&mut self, request: CopyRequest<'_>) -> Result<u64, CaptureAttemptFailure> {
         self.source_opened.wait();
         self.resume_copy.wait();
-        copy_bounded(source, destination, maximum_bytes)
+        copy_bounded(
+            request.source,
+            request.destination,
+            request.maximum_bytes,
+            request.output_identity,
+            request.cancellation,
+        )
     }
 }
 

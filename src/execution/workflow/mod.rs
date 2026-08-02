@@ -1,10 +1,9 @@
-#![deny(clippy::disallowed_methods)]
-
 pub(crate) mod admission;
 pub(crate) mod artifact;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
 pub(crate) mod document;
+pub(crate) mod input;
 mod pi;
 pub(crate) mod resolution;
 pub(crate) mod runtime;
@@ -13,6 +12,7 @@ pub(crate) mod step_runtime;
 mod strict_yaml;
 pub(crate) mod validated;
 pub(crate) mod validation;
+pub(crate) mod value;
 
 use std::fmt;
 use std::sync::OnceLock;

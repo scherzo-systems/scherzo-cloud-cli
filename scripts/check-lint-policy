@@ -4,6 +4,119 @@ set -euo pipefail
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$public_root"
 
+has_timing_allow() {
+  awk '
+    function inspect_attribute() {
+      if (attribute ~ /allow[[:space:]]*\(/ && attribute ~ /clippy::disallowed_methods/) {
+        found = 1
+      }
+    }
+    collecting {
+      attribute = attribute "\n" $0
+      if ($0 ~ /\]/) {
+        inspect_attribute()
+        collecting = 0
+      }
+      next
+    }
+    /^[[:space:]]*#(!)?\[/ {
+      collecting = 1
+      attribute = $0
+      if ($0 ~ /\]/) {
+        inspect_attribute()
+        collecting = 0
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
+has_broad_timing_expectation() {
+  awk '
+    function inspect_item(line, item) {
+      if (!awaiting_item) {
+        return
+      }
+
+      item = line
+      sub(/^[[:space:]]*/, "", item)
+      if (item == "" || item ~ /^\/\// || item ~ /^\/\*/ || item ~ /^\*/) {
+        return
+      }
+
+      if (item ~ /(^|[[:space:]])fn[[:space:]]+(r#)?[[:alpha:]_][[:alnum:]_]*/) {
+        awaiting_item = 0
+      } else {
+        found = 1
+      }
+    }
+    function inspect_attribute(line, trailing) {
+      if (attribute ~ /expect[[:space:]]*\(/ && attribute ~ /clippy::disallowed_methods/) {
+        if (attribute ~ /^[[:space:]]*#!\[/) {
+          found = 1
+        } else {
+          awaiting_item = 1
+        }
+      }
+
+      trailing = line
+      sub(/^.*\][[:space:]]*/, "", trailing)
+      inspect_item(trailing)
+    }
+    collecting {
+      attribute = attribute "\n" $0
+      if ($0 ~ /\]/) {
+        inspect_attribute($0)
+        collecting = 0
+      }
+      next
+    }
+    /^[[:space:]]*#(!)?\[/ {
+      collecting = 1
+      attribute = $0
+      if ($0 ~ /\]/) {
+        inspect_attribute($0)
+        collecting = 0
+      }
+      next
+    }
+    {
+      inspect_item($0)
+    }
+    END {
+      if (awaiting_item) {
+        found = 1
+      }
+      exit found ? 0 : 1
+    }
+  ' "$1"
+}
+
+while IFS= read -r -d '' rust_source; do
+  if has_timing_allow "$rust_source"; then
+    echo "Use item-scoped #[expect] for clippy::disallowed_methods exceptions; #[allow] is forbidden: $rust_source" >&2
+    exit 1
+  fi
+  if has_broad_timing_expectation "$rust_source"; then
+    echo "Attach clippy::disallowed_methods expectations directly to a function or method, never a crate or module: $rust_source" >&2
+    exit 1
+  fi
+done < <(
+  find src tests \
+    -path 'tests/fixtures/lint-policy' -prune -o \
+    -name '*.rs' -type f -print0
+)
+
+broad_suppression_fixture=tests/fixtures/lint-policy/main.rs
+if ! has_timing_allow "$broad_suppression_fixture"; then
+  echo "Lint-policy fixture did not exercise an outer module timing allow." >&2
+  exit 1
+fi
+if ! has_broad_timing_expectation "$broad_suppression_fixture"; then
+  echo "Lint-policy fixture did not exercise an outer module timing expectation." >&2
+  exit 1
+fi
+
 lint_fixture=$(mktemp -d)
 cleanup() {
   rm -rf "$lint_fixture"
@@ -12,7 +125,7 @@ trap cleanup EXIT
 
 cp Cargo.toml Cargo.lock clippy.toml "$lint_fixture/"
 mkdir -p "$lint_fixture/src"
-cp tests/fixtures/lint-policy/main.rs "$lint_fixture/src/main.rs"
+cp tests/fixtures/lint-policy/*.rs "$lint_fixture/src/"
 
 lint_output=$lint_fixture/clippy-output.json
 clippy_stderr=$lint_fixture/clippy-stderr
@@ -30,7 +143,7 @@ clippy_status=$?
 set -e
 
 if ((clippy_status == 0)); then
-  echo "Clippy accepted representative production policy violations." >&2
+  echo "Clippy accepted representative production and test policy violations." >&2
   exit 1
 fi
 
@@ -58,4 +171,25 @@ for expected_code in \
   fi
 done
 
-printf 'Checked-in Rust lint policy enforces the build version and deterministic synchronization boundaries.\n'
+method_violation_files=$(
+  jq -r '
+    select(
+      .reason == "compiler-message"
+      and .message.level == "error"
+      and .message.code.code == "clippy::disallowed_methods"
+    )
+    | .message.spans[]
+    | select(.is_primary)
+    | .file_name
+  ' "$lint_output"
+)
+for expected_source in ordinary_production.rs ordinary_test.rs; do
+  if ! grep --extended-regexp --quiet "(^|/)${expected_source//./\\.}$" \
+    <<<"$method_violation_files"; then
+    echo "Clippy did not reject the representative timing violation in $expected_source." >&2
+    cat "$clippy_stderr" >&2
+    exit 1
+  fi
+done
+
+printf 'Checked-in Rust lint policy rejects broad timing suppressions and production/test timing primitives by default.\n'

@@ -1,6 +1,6 @@
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -11,33 +11,38 @@ pub(crate) struct ScriptedHttpServer {
     requests: Receiver<String>,
     thread: JoinHandle<()>,
     response_count: usize,
+    response_release: Option<SyncSender<()>>,
 }
 
 impl ScriptedHttpServer {
     pub(crate) fn respond(response: Vec<u8>) -> Self {
-        Self::respond_after(Duration::ZERO, response)
+        Self::start(vec![ScriptedResponse::immediate(response)], None)
     }
 
-    pub(crate) fn respond_after(delay: Duration, response: Vec<u8>) -> Self {
-        Self::start(vec![ScriptedResponse {
-            initial_delay: delay,
-            response,
-        }])
+    // Deadline tests keep the response pending until the production timer has
+    // classified the request, then release the fixture through this channel.
+    pub(crate) fn respond_when_released(response: Vec<u8>) -> Self {
+        let (release, released) = mpsc::sync_channel(0);
+        Self::start(
+            vec![ScriptedResponse {
+                release: Some(released),
+                response,
+            }],
+            Some(release),
+        )
     }
 
     pub(crate) fn respond_in_sequence(responses: Vec<Vec<u8>>) -> Self {
         Self::start(
             responses
                 .into_iter()
-                .map(|response| ScriptedResponse {
-                    initial_delay: Duration::ZERO,
-                    response,
-                })
+                .map(ScriptedResponse::immediate)
                 .collect(),
+            None,
         )
     }
 
-    fn start(responses: Vec<ScriptedResponse>) -> Self {
+    fn start(responses: Vec<ScriptedResponse>, response_release: Option<SyncSender<()>>) -> Self {
         let response_count = responses.len();
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
         let address = listener.local_addr().expect("fixture address should exist");
@@ -49,7 +54,11 @@ impl ScriptedHttpServer {
                 sender
                     .send(String::from_utf8(request).expect("request should be text"))
                     .expect("fixture request receiver should remain available");
-                thread::sleep(response.initial_delay);
+                if let Some(release) = response.release {
+                    release
+                        .recv()
+                        .expect("controlled fixture response should be released");
+                }
                 let _ = stream.write_all(&response.response);
             }
         });
@@ -59,7 +68,16 @@ impl ScriptedHttpServer {
             requests,
             thread,
             response_count,
+            response_release,
         }
+    }
+
+    pub(crate) fn release_response(&mut self) {
+        self.response_release
+            .take()
+            .expect("fixture should have a controlled response")
+            .send(())
+            .expect("controlled fixture response should be released");
     }
 
     pub(crate) fn finish_one(self) -> String {
@@ -69,6 +87,10 @@ impl ScriptedHttpServer {
     }
 
     pub(crate) fn finish(self) -> Vec<String> {
+        assert!(
+            self.response_release.is_none(),
+            "controlled fixture response should be released before finishing"
+        );
         let requests = (0..self.response_count)
             .map(|_| {
                 self.requests
@@ -82,8 +104,17 @@ impl ScriptedHttpServer {
 }
 
 struct ScriptedResponse {
-    initial_delay: Duration,
+    release: Option<Receiver<()>>,
     response: Vec<u8>,
+}
+
+impl ScriptedResponse {
+    fn immediate(response: Vec<u8>) -> Self {
+        Self {
+            release: None,
+            response,
+        }
+    }
 }
 
 pub(crate) fn read_request(stream: &mut TcpStream) -> Vec<u8> {

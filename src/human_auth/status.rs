@@ -1,7 +1,5 @@
 use std::fmt;
 
-use time::OffsetDateTime;
-
 use crate::api::{
     self, AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
     UnreachableCategory,
@@ -42,7 +40,7 @@ pub(crate) fn check(
 ) -> Result<AuthenticationStatus, StatusError> {
     let store = CredentialStore::from_environment().map_err(StatusError::CredentialStore)?;
     let credential = store
-        .selected(deployment.fingerprint(), OffsetDateTime::now_utc())
+        .selected(deployment.fingerprint(), crate::timing::utc_now())
         .map_err(StatusError::CredentialStore)?;
     let access_token = credential
         .as_ref()

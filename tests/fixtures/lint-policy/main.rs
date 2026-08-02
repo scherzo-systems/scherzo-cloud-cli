@@ -1,4 +1,21 @@
-#![deny(clippy::disallowed_methods)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the policy checker must reject timing suppression on an ordinary module"
+)]
+mod broadly_suppressed;
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the policy checker must also reject timing expectations on ordinary modules"
+)]
+mod broadly_expected {
+    pub(super) fn timing_dependent_synchronization() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+mod ordinary_production;
+
+#[cfg(test)]
+mod ordinary_test;
 
 #[allow(dead_code)]
 fn reasonless_suppression() {}
@@ -17,16 +34,9 @@ fn direct_compile_time_environment_read() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn timing_dependent_thread_synchronization() {
-    std::thread::yield_now();
-    std::thread::park_timeout(std::time::Duration::from_millis(1));
-}
-
-async fn timing_dependent_task_synchronization() {
-    tokio::task::yield_now().await;
-}
-
 fn main() {
+    let _ = broadly_suppressed::timing_dependent_synchronization as fn();
+    let _ = broadly_expected::timing_dependent_synchronization as fn();
     let _ = panic_shortcut as fn(Option<u8>) -> u8;
     let _ = lossy_cast as fn(u64) -> u8;
     let _ = direct_compile_time_environment_read();

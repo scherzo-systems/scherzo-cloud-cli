@@ -60,7 +60,7 @@ impl Command {
             // Validate store access and prune an expired selected credential
             // before starting its replacement login.
             store
-                .selected(deployment.fingerprint(), OffsetDateTime::now_utc())
+                .selected(deployment.fingerprint(), crate::timing::utc_now())
                 .map_err(CommandError::CredentialStore)?;
         } else {
             let existing_status = status::check(&client, deployment);
@@ -122,7 +122,7 @@ impl Command {
             return Ok(Completion::Cancelled);
         }
         let Some(mut schedule) = PollSchedule::new(
-            Instant::now(),
+            crate::timing::monotonic_now(),
             authorization.interval(),
             authorization.expires_in(),
         ) else {
@@ -150,7 +150,7 @@ impl Command {
                 output.cancelled(deployment)?;
                 return Ok(Completion::Cancelled);
             }
-            let Some(wait) = schedule.next_wait(Instant::now()) else {
+            let Some(wait) = schedule.next_wait(crate::timing::monotonic_now()) else {
                 output.failed(
                     deployment,
                     FailureOutcome::Expired,
@@ -239,7 +239,7 @@ fn polling_interruption(
         output.cancelled(deployment)?;
         return Ok(Some(Completion::Cancelled));
     }
-    if schedule.expired(Instant::now()) {
+    if schedule.expired(crate::timing::monotonic_now()) {
         output.failed(
             deployment,
             FailureOutcome::Expired,
@@ -383,7 +383,7 @@ impl PollSchedule {
 
 fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    OffsetDateTime::now_utc().checked_add(time::Duration::seconds(seconds))
+    crate::timing::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[derive(Clone, Copy)]
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn poll_schedule_honors_interval_and_slow_down() {
-        let start = Instant::now();
+        let start = crate::timing::monotonic_now();
         let mut schedule =
             PollSchedule::new(start, Duration::from_secs(2), Duration::from_secs(30)).unwrap();
 

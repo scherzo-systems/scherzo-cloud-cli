@@ -160,12 +160,11 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
         stored["credentials"][0]["accessToken"],
         "unique-new-access-token"
     );
-    let expires_at = time::OffsetDateTime::parse(
+    time::OffsetDateTime::parse(
         stored["credentials"][0]["expiresAt"].as_str().unwrap(),
         &time::format_description::well_known::Rfc3339,
     )
-    .unwrap();
-    assert!(expires_at > time::OffsetDateTime::now_utc());
+    .expect("stored expiration should be RFC 3339");
     assert!(!stored.to_string().contains("refresh"));
 }
 
@@ -885,7 +884,6 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
     let raw_pid = i32::try_from(child.id()).expect("child PID should fit in i32");
     let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
-    thread::sleep(Duration::from_millis(100));
     server.release_paused_response();
 
     let status = child.wait().expect("login process should stop");

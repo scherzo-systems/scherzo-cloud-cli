@@ -1,7 +1,7 @@
 mod models;
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, Response, StatusCode, Url};
@@ -464,7 +464,7 @@ fn execute_request(
 ) -> Result<RequestExecution, OrganizationError> {
     let mut last_failure = UnreachableCategory::Connection;
     for _ in 0..spec.max_attempts {
-        let started = Instant::now();
+        let started = crate::timing::monotonic_now();
         let response = match client.run(timeout, send_request(client, spec, timeout)) {
             Ok(Ok(response)) => response,
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),

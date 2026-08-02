@@ -134,9 +134,12 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         ExecutionContext::new(
             fixture.execution_root.join("."),
             ExecutionRootLifecycle::CallerOwnedRetained,
-            3,
-            CaptureLimits::new(17, 2 * 1024 * 1024, 8 * 1024 * 1024),
-            64 * 1024,
+            ExecutionPolicyLimits::new(
+                3,
+                CaptureLimits::new(17, 2 * 1024 * 1024, 8 * 1024 * 1024),
+                InputLimits::new(31, 2 * 1024 * 1024, 8 * 1024 * 1024),
+                64 * 1024,
+            ),
             EnvironmentSnapshot::new([
                 ("PATH", "/admitted/bin"),
                 ("SCHERZO_INHERITED", "must be removed"),
@@ -179,6 +182,26 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             .execution()
             .limits()
             .maximum_total_captured_bytes()
+            .get(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted.execution().limits().maximum_input_values().get(),
+        31
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_input_value_bytes()
+            .get(),
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_total_input_bytes()
             .get(),
         8 * 1024 * 1024
     );
@@ -324,9 +347,58 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
                     ExecutionRootLifecycle::EngineOwnedRetained,
-                    1,
-                    CaptureLimits::new(captured_files, file_bytes, total_bytes),
-                    1024 * 1024,
+                    ExecutionPolicyLimits::new(
+                        1,
+                        CaptureLimits::new(captured_files, file_bytes, total_bytes),
+                        InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                        1024 * 1024,
+                    ),
+                    EnvironmentSnapshot::default(),
+                    CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+                ),
+            ),
+            kind,
+            location,
+        );
+    }
+
+    for (values, value_bytes, total_bytes, kind, location) in [
+        (
+            0,
+            1,
+            1,
+            AdmissionFailureKind::NonPositiveInputValues,
+            AdmissionLocation::MaximumInputValues,
+        ),
+        (
+            1,
+            0,
+            1,
+            AdmissionFailureKind::NonPositiveInputValueBytes,
+            AdmissionLocation::MaximumInputValueBytes,
+        ),
+        (
+            1,
+            1,
+            0,
+            AdmissionFailureKind::NonPositiveTotalInputBytes,
+            AdmissionLocation::MaximumTotalInputBytes,
+        ),
+    ] {
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        assert_failure(
+            admit_workflow(
+                fixture.resolve(),
+                ResolvedImports::default(),
+                ExecutionContext::new(
+                    fixture.execution_root.clone(),
+                    ExecutionRootLifecycle::EngineOwnedRetained,
+                    ExecutionPolicyLimits::new(
+                        1,
+                        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                        InputLimits::new(values, value_bytes, total_bytes),
+                        1024 * 1024,
+                    ),
                     EnvironmentSnapshot::default(),
                     CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
                 ),
@@ -344,9 +416,12 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
             ExecutionContext::new(
                 zero_log_limit.execution_root.clone(),
                 ExecutionRootLifecycle::EngineOwnedRetained,
-                1,
-                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                0,
+                ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                    InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                    0,
+                ),
                 EnvironmentSnapshot::default(),
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
             ),
@@ -490,9 +565,12 @@ fn execution_context(
     ExecutionContext::new(
         root,
         lifecycle,
-        maximum_parallel_steps,
-        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-        1024 * 1024,
+        ExecutionPolicyLimits::new(
+            maximum_parallel_steps,
+            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+            InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+            1024 * 1024,
+        ),
         EnvironmentSnapshot::default(),
         CancellationPolicy::new(CancellationSource::new(), grace),
     )

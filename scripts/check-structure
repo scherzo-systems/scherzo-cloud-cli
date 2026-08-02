@@ -32,7 +32,11 @@ required_files=(
   scripts/test-release-impact
   scripts/test-release-notes
   scripts/test-release-path-classifier
+  src/timing.rs
+  tests/fixtures/lint-policy/broadly_suppressed.rs
   tests/fixtures/lint-policy/main.rs
+  tests/fixtures/lint-policy/ordinary_production.rs
+  tests/fixtures/lint-policy/ordinary_test.rs
   tests/fixtures/release-notes/v1/README.md
   tests/fixtures/release-notes/v1/contract-version
 )
@@ -50,15 +54,11 @@ if [[ -e "$public_root/$obsolete_workflow_schema" ]]; then
   exit 1
 fi
 
-for timing_policy_module in \
-  src/runner/service/mod.rs \
-  src/execution/workflow/mod.rs; do
-  IFS= read -r first_line <"$public_root/$timing_policy_module"
-  if [[ "$first_line" != '#![deny(clippy::disallowed_methods)]' ]]; then
-    echo "Timing-sensitive module must deny the checked-in disallowed methods: $timing_policy_module" >&2
-    exit 1
-  fi
-done
+if ! grep --fixed-strings --line-regexp --quiet \
+  'disallowed_methods = "deny"' "$public_root/Cargo.toml"; then
+  echo "Cargo must deny the checked-in disallowed timing methods by default." >&2
+  exit 1
+fi
 
 symbolic_link=$(
   find "$public_root" \

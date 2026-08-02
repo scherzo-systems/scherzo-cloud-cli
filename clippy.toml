@@ -6,9 +6,9 @@ disallowed-macros = [
   { path = "std::env", reason = "use the explicit compile-time environment boundary" },
 ]
 
-# Runner service and workflow execution timing must pass through their explicit
-# boundaries so tests can control it. Those module roots enable this restriction
-# lint; narrow system-adapter and anti-hang watchdog exceptions live next to calls.
+# Timing primitives are denied by default across every CLI target. Production
+# clock and deadline operations pass through explicit system adapters; narrow
+# anti-hang watchdog exceptions remain documented next to their direct calls.
 disallowed-methods = [
   { path = "std::thread::park_timeout", reason = "use explicit synchronization rather than a park timeout" },
   { path = "std::thread::park_timeout_ms", reason = "use explicit synchronization rather than a park timeout", allow-invalid = true },

@@ -8,7 +8,6 @@ use std::fmt;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
-use time::OffsetDateTime;
 
 use crate::api::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
@@ -154,7 +153,7 @@ where
 {
     let store = CredentialStore::from_environment().map_err(CommandError::CredentialStore)?;
     let Some(credential) = store
-        .selected(deployment.fingerprint(), OffsetDateTime::now_utc())
+        .selected(deployment.fingerprint(), crate::timing::utc_now())
         .map_err(CommandError::CredentialStore)?
     else {
         return Ok(O::unauthenticated());

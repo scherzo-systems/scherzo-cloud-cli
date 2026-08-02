@@ -5,7 +5,8 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionRootLifecycle, ResolvedImports, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports,
+    admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -47,6 +48,7 @@ fn definition(
                             .map(|dependency| (*dependency).to_owned())
                             .collect::<Vec<_>>()
                             .into(),
+                        inputs: BTreeMap::new(),
                         declared_outputs: outputs
                             .iter()
                             .map(|output| (*output).to_owned())
@@ -149,6 +151,7 @@ fn start_action(value: u64, step: &str) -> TestAction {
         id: action_id(value),
         action: Action::StartStep {
             step: step.to_owned(),
+            inputs: BTreeMap::new(),
         },
     }
 }
@@ -386,9 +389,12 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
         ExecutionContext::new(
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
-            1,
-            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-            1024 * 1024,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),
@@ -439,9 +445,12 @@ steps:
         ExecutionContext::new(
             execution_root,
             ExecutionRootLifecycle::EngineOwnedEphemeral,
-            2,
-            CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-            1024 * 1024,
+            ExecutionPolicyLimits::new(
+                2,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
             EnvironmentSnapshot::default(),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),

@@ -154,6 +154,14 @@ impl EnvironmentSnapshot {
         self.variables.get(name).map(OsString::as_os_str)
     }
 
+    pub(super) fn with_variable(&self, name: OsString, value: OsString) -> Self {
+        let mut variables = self.variables.as_ref().clone();
+        variables.insert(name, value);
+        Self {
+            variables: Arc::new(variables),
+        }
+    }
+
     fn without_reserved_variables(self) -> Self {
         Self {
             variables: Arc::new(
@@ -192,13 +200,56 @@ impl CaptureLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InputLimits {
+    maximum_values: usize,
+    maximum_value_bytes: u64,
+    maximum_total_bytes: u64,
+}
+
+impl InputLimits {
+    pub(crate) fn new(
+        maximum_values: usize,
+        maximum_value_bytes: u64,
+        maximum_total_bytes: u64,
+    ) -> Self {
+        Self {
+            maximum_values,
+            maximum_value_bytes,
+            maximum_total_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionPolicyLimits {
+    maximum_parallel_steps: usize,
+    capture: CaptureLimits,
+    input: InputLimits,
+    maximum_step_log_bytes: u64,
+}
+
+impl ExecutionPolicyLimits {
+    pub(crate) fn new(
+        maximum_parallel_steps: usize,
+        capture: CaptureLimits,
+        input: InputLimits,
+        maximum_step_log_bytes: u64,
+    ) -> Self {
+        Self {
+            maximum_parallel_steps,
+            capture,
+            input,
+            maximum_step_log_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
     root_lifecycle: ExecutionRootLifecycle,
-    maximum_parallel_steps: usize,
-    capture_limits: CaptureLimits,
-    maximum_step_log_bytes: u64,
+    limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
 }
@@ -207,18 +258,14 @@ impl ExecutionContext {
     pub(crate) fn new(
         root: PathBuf,
         root_lifecycle: ExecutionRootLifecycle,
-        maximum_parallel_steps: usize,
-        capture_limits: CaptureLimits,
-        maximum_step_log_bytes: u64,
+        limits: ExecutionPolicyLimits,
         environment: EnvironmentSnapshot,
         cancellation: CancellationPolicy,
     ) -> Self {
         Self {
             root,
             root_lifecycle,
-            maximum_parallel_steps,
-            capture_limits,
-            maximum_step_log_bytes,
+            limits,
             environment,
             cancellation,
         }
@@ -231,6 +278,9 @@ pub(crate) struct ExecutionLimits {
     maximum_captured_files: NonZeroUsize,
     maximum_captured_file_bytes: NonZeroU64,
     maximum_total_captured_bytes: NonZeroU64,
+    maximum_input_values: NonZeroUsize,
+    maximum_input_value_bytes: NonZeroU64,
+    maximum_total_input_bytes: NonZeroU64,
     maximum_step_log_bytes: NonZeroU64,
 }
 
@@ -249,6 +299,18 @@ impl ExecutionLimits {
 
     pub(crate) fn maximum_total_captured_bytes(self) -> NonZeroU64 {
         self.maximum_total_captured_bytes
+    }
+
+    pub(crate) fn maximum_input_values(self) -> NonZeroUsize {
+        self.maximum_input_values
+    }
+
+    pub(crate) fn maximum_input_value_bytes(self) -> NonZeroU64 {
+        self.maximum_input_value_bytes
+    }
+
+    pub(crate) fn maximum_total_input_bytes(self) -> NonZeroU64 {
+        self.maximum_total_input_bytes
     }
 
     pub(crate) fn maximum_step_log_bytes(self) -> NonZeroU64 {
@@ -319,6 +381,9 @@ pub(crate) enum AdmissionFailureKind {
     NonPositiveCapturedFiles,
     NonPositiveCapturedFileBytes,
     NonPositiveTotalCapturedBytes,
+    NonPositiveInputValues,
+    NonPositiveInputValueBytes,
+    NonPositiveTotalInputBytes,
     NonPositiveStepLogBytes,
     NonPositiveCancellationGrace,
     CancellationGraceTooLong,
@@ -334,6 +399,9 @@ pub(crate) enum AdmissionLocation {
     MaximumCapturedFiles,
     MaximumCapturedFileBytes,
     MaximumTotalCapturedBytes,
+    MaximumInputValues,
+    MaximumInputValueBytes,
+    MaximumTotalInputBytes,
     MaximumStepLogBytes,
     CancellationPolicy,
 }
@@ -406,36 +474,57 @@ pub(crate) fn admit_workflow(
         ));
     }
 
-    let maximum_parallel_steps =
-        NonZeroUsize::new(context.maximum_parallel_steps).ok_or_else(|| {
+    let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
+        .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveParallelism,
                 AdmissionLocation::MaximumParallelSteps,
             )
         })?;
-    let maximum_captured_files = NonZeroUsize::new(context.capture_limits.maximum_files)
+    let maximum_captured_files = NonZeroUsize::new(context.limits.capture.maximum_files)
         .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveCapturedFiles,
                 AdmissionLocation::MaximumCapturedFiles,
             )
         })?;
-    let maximum_captured_file_bytes = NonZeroU64::new(context.capture_limits.maximum_file_bytes)
+    let maximum_captured_file_bytes = NonZeroU64::new(context.limits.capture.maximum_file_bytes)
         .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveCapturedFileBytes,
                 AdmissionLocation::MaximumCapturedFileBytes,
             )
         })?;
-    let maximum_total_captured_bytes = NonZeroU64::new(context.capture_limits.maximum_total_bytes)
+    let maximum_total_captured_bytes = NonZeroU64::new(context.limits.capture.maximum_total_bytes)
         .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveTotalCapturedBytes,
                 AdmissionLocation::MaximumTotalCapturedBytes,
             )
         })?;
-    let maximum_step_log_bytes =
-        NonZeroU64::new(context.maximum_step_log_bytes).ok_or_else(|| {
+    let maximum_input_values =
+        NonZeroUsize::new(context.limits.input.maximum_values).ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveInputValues,
+                AdmissionLocation::MaximumInputValues,
+            )
+        })?;
+    let maximum_input_value_bytes = NonZeroU64::new(context.limits.input.maximum_value_bytes)
+        .ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveInputValueBytes,
+                AdmissionLocation::MaximumInputValueBytes,
+            )
+        })?;
+    let maximum_total_input_bytes = NonZeroU64::new(context.limits.input.maximum_total_bytes)
+        .ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveTotalInputBytes,
+                AdmissionLocation::MaximumTotalInputBytes,
+            )
+        })?;
+    let maximum_step_log_bytes = NonZeroU64::new(context.limits.maximum_step_log_bytes)
+        .ok_or_else(|| {
             AdmissionFailure::new(
                 AdmissionFailureKind::NonPositiveStepLogBytes,
                 AdmissionLocation::MaximumStepLogBytes,
@@ -466,6 +555,9 @@ pub(crate) fn admit_workflow(
                 maximum_captured_files,
                 maximum_captured_file_bytes,
                 maximum_total_captured_bytes,
+                maximum_input_values,
+                maximum_input_value_bytes,
+                maximum_total_input_bytes,
                 maximum_step_log_bytes,
             },
             environment: context.environment.without_reserved_variables(),

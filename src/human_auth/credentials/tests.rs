@@ -328,18 +328,22 @@ fn credential_lock_symlink_is_rejected_without_touching_its_target() {
     assert_eq!(fs::read(target).unwrap(), b"lock target bytes");
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this isolated OS-lock integration check verifies the production wait boundary, not test synchronization"
+)]
 #[test]
 fn busy_lock_respects_the_configured_deadline() {
     let fixture = Fixture::new();
     ensure_private_directory(fixture.directory.path()).unwrap();
     let lock = open_or_create_private_file(&fixture.store.lock_path).unwrap();
     FileExt::lock(&lock).unwrap();
-    let start = Instant::now();
+    let started = std::time::Instant::now();
 
     let result = fixture.store.remove(&fingerprint("primary"));
 
     assert!(matches!(result, Err(CredentialError::LockTimeout)));
-    assert!(start.elapsed() >= fixture.store.lock_timeout);
+    assert!(started.elapsed() >= fixture.store.lock_timeout);
     FileExt::unlock(&lock).unwrap();
 }
 

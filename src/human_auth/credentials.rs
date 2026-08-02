@@ -8,8 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
@@ -221,7 +220,7 @@ impl CredentialStore {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
         let file = open_or_create_private_file(&self.lock_path)?;
-        let start = Instant::now();
+        let start = crate::timing::monotonic_now();
 
         loop {
             match FileExt::try_lock(&file) {
@@ -231,7 +230,7 @@ impl CredentialStore {
                     if elapsed >= self.lock_timeout {
                         return Err(CredentialError::LockTimeout);
                     }
-                    thread::sleep(
+                    crate::timing::sleep(
                         LOCK_RETRY_INTERVAL.min(self.lock_timeout.saturating_sub(elapsed)),
                     );
                 }

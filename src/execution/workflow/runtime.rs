@@ -3,7 +3,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::admission::{AdmittedWorkflow, CancellationReason};
-use super::validated::{ValidatedCommonStep, ValidatedStep, ValidatedWorkflow};
+use super::validated::{
+    ResolvedValueSource, ValidatedCommonStep, ValidatedStep, ValidatedWorkflow,
+};
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
 pub(crate) type ExportSet<Output> = BTreeMap<String, ExportValue<Output>>;
@@ -162,6 +164,7 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeStep {
     prerequisites: Arc<[String]>,
+    inputs: BTreeMap<String, ResolvedValueSource>,
     declared_outputs: BTreeSet<String>,
 }
 
@@ -196,6 +199,14 @@ impl RuntimeDefinition {
                     step_id.clone(),
                     RuntimeStep {
                         prerequisites: Arc::from(common.prerequisites.clone()),
+                        inputs: match step {
+                            ValidatedStep::Command(command) => command
+                                .inputs
+                                .iter()
+                                .map(|(name, reference)| (name.clone(), reference.source.clone()))
+                                .collect(),
+                            ValidatedStep::Agent(_) => BTreeMap::new(),
+                        },
                         declared_outputs: common.outputs.keys().cloned().collect(),
                     },
                 )
@@ -312,9 +323,17 @@ pub(crate) enum RunOutcome<Cause> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActionInput<Output> {
+    Import,
+    Output(Output),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
     StartStep {
         step: String,
+        inputs: BTreeMap<String, ActionInput<Output>>,
     },
     CaptureOutputs {
         step: String,
@@ -357,6 +376,9 @@ pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) state: RuntimeState<Cause, Output>,
     pub(crate) events: Vec<TransitionEvent<Cause>>,
     pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output, Deadline>>,
+    // Initialization is accepted by construction; reductions expose stale rejection to
+    // occurrence adapters that retain resources until the coordinator commits a decision.
+    pub(crate) occurrence_accepted: bool,
 }
 
 pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
@@ -416,6 +438,7 @@ where
         },
         events: Vec::new(),
         actions: Vec::new(),
+        occurrence_accepted: true,
     };
     if let Some(cancellation) = initial_cancellation {
         apply_cancellation(&mut reduction, cancellation);
@@ -437,6 +460,7 @@ where
         state: current.clone(),
         events: Vec::new(),
         actions: Vec::new(),
+        occurrence_accepted: false,
     };
     if !matches!(&reduction.state.workflow, WorkflowState::Executing { .. })
         || !apply_occurrence(&mut reduction, occurrence)
@@ -444,6 +468,7 @@ where
         return reduction;
     }
 
+    reduction.occurrence_accepted = true;
     stabilize(&mut reduction);
     reduction
 }
@@ -835,7 +860,9 @@ fn next_pending_disposition<Cause, Output>(
 
 fn select_ready_steps<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
-) {
+) where
+    Output: Clone,
+{
     if !matches!(
         &reduction.state.workflow,
         WorkflowState::Executing {
@@ -863,11 +890,16 @@ fn select_ready_steps<Provisional, Cause, Output, Deadline>(
         .steps
         .iter()
         .filter(|(step_id, definition)| step_is_ready(&reduction.state, step_id, definition))
+        .map(|(step_id, definition)| {
+            (
+                step_id.clone(),
+                resolved_action_inputs(&reduction.state, definition),
+            )
+        })
         .take(available_slots)
-        .map(|(step_id, _)| step_id.clone())
         .collect::<Vec<_>>();
 
-    for step in selected {
+    for (step, inputs) in selected {
         let sequence = transition_step(
             &mut reduction.state,
             &mut reduction.events,
@@ -879,9 +911,37 @@ fn select_ready_steps<Provisional, Cause, Output, Deadline>(
         set_current_action(&mut reduction.state, &step, action_id);
         reduction.actions.push(RequestedAction {
             id: action_id,
-            action: Action::StartStep { step },
+            action: Action::StartStep { step, inputs },
         });
     }
+}
+
+fn resolved_action_inputs<Cause, Output>(
+    state: &RuntimeState<Cause, Output>,
+    definition: &RuntimeStep,
+) -> BTreeMap<String, ActionInput<Output>>
+where
+    Output: Clone,
+{
+    definition
+        .inputs
+        .iter()
+        .map(|(input, source)| {
+            let value = match source {
+                ResolvedValueSource::Import(_) => ActionInput::Import,
+                ResolvedValueSource::Output(source) => state
+                    .steps
+                    .get(&source.step)
+                    .and_then(|producer| match &producer.state {
+                        StepState::Succeeded { outputs } => outputs.get(&source.output),
+                        _ => None,
+                    })
+                    .cloned()
+                    .map_or(ActionInput::Unavailable, ActionInput::Output),
+            };
+            (input.clone(), value)
+        })
+        .collect()
 }
 
 fn step_is_ready<Cause, Output>(

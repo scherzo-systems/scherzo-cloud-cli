@@ -257,10 +257,8 @@ fn response_body_is_bounded_before_any_status_is_reported() {
 #[test]
 fn request_deadline_maps_to_timeout() {
     let body = br#"{"id":"prn_fixture","type":"human","state":"active"}"#;
-    let server = TestServer::respond_after(
-        Duration::from_millis(150),
-        response("200 OK", Some(JSON_MEDIA_TYPE), body),
-    );
+    let mut server =
+        TestServer::respond_when_released(response("200 OK", Some(JSON_MEDIA_TYPE), body));
 
     let outcome = get_current_principal_with_timeout(
         &http_client(),
@@ -274,6 +272,7 @@ fn request_deadline_maps_to_timeout() {
         outcome,
         CurrentPrincipalOutcome::Unreachable(UnreachableCategory::Timeout)
     );
+    server.release_response();
     server.finish_one();
 }
 
@@ -281,6 +280,9 @@ fn request_deadline_maps_to_timeout() {
 fn request_deadline_bounds_the_complete_streaming_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    // The peer sends headers and then remains pending, isolating the production
+    // body deadline without using a sleep as test coordination.
+    let (release_response, response_release) = std::sync::mpsc::sync_channel(0);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
@@ -289,17 +291,12 @@ fn request_deadline_bounds_the_complete_streaming_response() {
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
             )
             .unwrap();
-        for _ in 0..8 {
-            if stream.write_all(b" ").is_err() {
-                break;
-            }
-            if stream.flush().is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        stream.flush().unwrap();
+        response_release
+            .recv()
+            .expect("streaming response should be released");
+        let _ = stream.write_all(b"{}");
     });
-    let started = std::time::Instant::now();
 
     let outcome = get_current_principal_with_timeout(
         &http_client(),
@@ -313,9 +310,9 @@ fn request_deadline_bounds_the_complete_streaming_response() {
         outcome,
         CurrentPrincipalOutcome::Unreachable(UnreachableCategory::Timeout)
     );
-    // The 60ms request deadline must still cut off the 160ms streaming body.
-    // Allow scheduling headroom for isolated Nix test builders.
-    assert!(started.elapsed() < Duration::from_millis(250));
+    release_response
+        .send(())
+        .expect("streaming response should be released");
     server.join().unwrap();
 }
 
