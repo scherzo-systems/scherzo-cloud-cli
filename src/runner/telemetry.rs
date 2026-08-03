@@ -439,7 +439,8 @@ impl Event {
                 OUTCOME.to_owned(),
                 Value::String(outcome.as_str().to_owned()),
             );
-            let duration_ms = integer_u128(self.inner.started_at.elapsed().as_millis());
+            let duration_ms =
+                integer_u128(crate::timing::elapsed(self.inner.started_at).as_millis());
             state
                 .fields
                 .insert(DURATION_MS.to_owned(), Value::Number(duration_ms.into()));

@@ -1,0 +1,18 @@
+{"type":"session","version":3,"id":"00000000-0000-4000-8000-000000000002","timestamp":"2026-07-30T12:00:00Z","cwd":"/execution/worktree"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":"prompt","timestamp":1}}
+{"type":"message_end","message":{"role":"user","content":"prompt","timestamp":1}}
+{"type":"message_start","message":{"role":"assistant","content":[],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","errorMessage":"provider unavailable","timestamp":2}}
+{"type":"message_end","message":{"role":"assistant","content":[],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","errorMessage":"provider unavailable","timestamp":2}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","errorMessage":"provider unavailable","timestamp":2},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"user","content":"prompt","timestamp":1},{"role":"assistant","content":[],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","errorMessage":"provider unavailable","timestamp":2}],"willRetry":true}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":1000,"errorMessage":"provider unavailable"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":3}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":3}}
+{"type":"auto_retry_end","success":true,"attempt":1}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":3},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"recovered"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":3}],"willRetry":false}
+{"type":"agent_settled"}

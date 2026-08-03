@@ -67,11 +67,15 @@ async fn nontruncated_streams_preserve_raw_bytes_independently() {
     let (stderr_reader, stderr_eof) = ChunkedReader::new(standard_error.clone(), [1]);
     let log = StepDiagnosticLog::default();
 
-    log.start_capture(
+    log.start_capture::<(), _, _, _>(
         "step".to_owned(),
+        ActionId {
+            transition_sequence: Default::default(),
+        },
         NonZeroU64::new(16).unwrap(),
         stdout_reader,
         stderr_reader,
+        crate::execution::workflow::observation::NoopExecutionObserver,
     )
     .finish()
     .await;
@@ -132,11 +136,15 @@ async fn capture_with_chunks(
     let (stdout, stdout_eof) = ChunkedReader::new(stdout, stdout_chunks);
     let (stderr, stderr_eof) = ChunkedReader::new(stderr, stderr_chunks);
     let log = StepDiagnosticLog::default();
-    log.start_capture(
+    log.start_capture::<(), _, _, _>(
         "step".to_owned(),
+        ActionId {
+            transition_sequence: Default::default(),
+        },
         NonZeroU64::new(5).unwrap(),
         stdout,
         stderr,
+        crate::execution::workflow::observation::NoopExecutionObserver,
     )
     .finish()
     .await;

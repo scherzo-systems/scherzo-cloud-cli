@@ -25,6 +25,10 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
     assert_eq!(workflow.agent_profiles.len(), 1);
     assert_eq!(workflow.steps.len(), 4);
+    assert_eq!(
+        workflow.step_order,
+        ["prepare", "plan", "implement", "test"]
+    );
     assert_eq!(workflow.exports.len(), 2);
     assert_eq!(
         workflow.agent_profiles["coding"].harness,

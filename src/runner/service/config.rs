@@ -2,11 +2,13 @@ use std::fmt;
 
 use url::Url;
 
+use crate::execution::pi::ValidatedPiInstallation;
 use crate::runner::credential::Credential;
 
 pub(crate) struct Config {
     endpoint: Url,
     credential: Credential,
+    pi_installation: Option<ValidatedPiInstallation>,
 }
 
 impl fmt::Debug for Config {
@@ -15,6 +17,7 @@ impl fmt::Debug for Config {
             .debug_struct("Config")
             .field("endpoint", &self.endpoint)
             .field("credential", &self.credential)
+            .field("agent_capable", &self.pi_installation.is_some())
             .finish()
     }
 }
@@ -60,6 +63,7 @@ impl Config {
         Ok(Self {
             endpoint,
             credential,
+            pi_installation: None,
         })
     }
 
@@ -69,6 +73,11 @@ impl Config {
 
     pub(crate) fn credential(&self) -> &Credential {
         &self.credential
+    }
+
+    pub(crate) fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
+        self.pi_installation = Some(installation);
+        self
     }
 }
 

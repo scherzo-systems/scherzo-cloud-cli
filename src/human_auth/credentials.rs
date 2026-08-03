@@ -226,7 +226,7 @@ impl CredentialStore {
             match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
-                    let elapsed = start.elapsed();
+                    let elapsed = crate::timing::elapsed(start);
                     if elapsed >= self.lock_timeout {
                         return Err(CredentialError::LockTimeout);
                     }

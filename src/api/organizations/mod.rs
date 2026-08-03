@@ -481,7 +481,7 @@ fn execute_request(
         if spec.operation.can_retry_interrupted_response(status) {
             require_replayable_success_headers(spec, &response)?;
         }
-        let remaining = timeout.saturating_sub(started.elapsed());
+        let remaining = timeout.saturating_sub(crate::timing::elapsed(started));
         match client.run(remaining, receive_response(spec.operation, response)) {
             Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),

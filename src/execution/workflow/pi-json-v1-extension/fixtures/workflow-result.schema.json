@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Change": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": ["summary"],
+      "additionalProperties": false
+    }
+  },
+  "$ref": "#/$defs/Change"
+}

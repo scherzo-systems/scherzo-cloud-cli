@@ -29,6 +29,22 @@ impl Fixture {
         maximum_value_bytes: u64,
         maximum_total_bytes: u64,
     ) -> Self {
+        Self::with_live_limit(
+            maximum_parallel_steps,
+            maximum_values,
+            maximum_value_bytes,
+            maximum_total_bytes,
+            maximum_total_bytes,
+        )
+    }
+
+    fn with_live_limit(
+        maximum_parallel_steps: usize,
+        maximum_values: usize,
+        maximum_value_bytes: u64,
+        maximum_total_bytes: u64,
+        maximum_live_bytes: u64,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -56,7 +72,12 @@ impl Fixture {
                 ExecutionPolicyLimits::new(
                     maximum_parallel_steps,
                     CaptureLimits::new(64, 1024 * 1024, 8 * 1024 * 1024),
-                    InputLimits::new(maximum_values, maximum_value_bytes, maximum_total_bytes),
+                    InputLimits::new(
+                        maximum_values,
+                        maximum_value_bytes,
+                        maximum_total_bytes,
+                        maximum_live_bytes,
+                    ),
                     1024 * 1024,
                 ),
                 EnvironmentSnapshot::default(),
@@ -259,6 +280,55 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
 }
 
 #[test]
+fn live_byte_reservations_are_run_wide_and_reusable_at_high_parallelism() {
+    const MAXIMUM_LIVE_BYTES: u64 = 256 * 1024 * 1024;
+    let fixture = Fixture::with_live_limit(
+        256,
+        1,
+        MAXIMUM_LIVE_BYTES,
+        MAXIMUM_LIVE_BYTES,
+        MAXIMUM_LIVE_BYTES,
+    );
+    let larger_half = MAXIMUM_LIVE_BYTES / 2 + 1;
+    let smaller_half = MAXIMUM_LIVE_BYTES / 2 - 1;
+
+    let first = reserve_view(&fixture.inputs, larger_half).unwrap();
+    let second = reserve_view(&fixture.inputs, smaller_half).unwrap();
+    assert_eq!(
+        fixture.inputs.reservation_usage(),
+        (2, 2, MAXIMUM_LIVE_BYTES)
+    );
+    assert!(fs::read_dir(first.path()).unwrap().next().is_none());
+    assert!(fs::read_dir(second.path()).unwrap().next().is_none());
+    let staging_root = first.path().parent().unwrap().to_owned();
+    assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 2);
+
+    assert_preparation_failure(
+        reserve_view(&fixture.inputs, larger_half),
+        InputPreparationFailureKind::LiveLimitExceeded,
+        None,
+        None,
+    );
+    assert_eq!(
+        fixture.inputs.reservation_usage(),
+        (2, 2, MAXIMUM_LIVE_BYTES)
+    );
+    assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 2);
+
+    drop(first);
+    assert_eq!(fixture.inputs.reservation_usage(), (1, 1, smaller_half));
+    let replacement = reserve_view(&fixture.inputs, larger_half).unwrap();
+    assert_eq!(
+        fixture.inputs.reservation_usage(),
+        (2, 2, MAXIMUM_LIVE_BYTES)
+    );
+
+    drop(second);
+    drop(replacement);
+    assert_eq!(fixture.inputs.reservation_usage(), (0, 0, 0));
+}
+
+#[test]
 fn dropping_a_view_cleans_it_after_the_staging_parent_moves() {
     let fixture = Fixture::new(1, 8, 8, 16);
     let view = fixture
@@ -403,6 +473,20 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     );
     drop(held);
     assert_eq!(live_fixture.inputs.reservation_usage(), (0, 0, 0));
+}
+
+fn reserve_view(staging: &InputStaging, bytes: u64) -> Result<InputView, InputPreparationFailure> {
+    let (identity, path) = staging.reserve(ReservationUsage {
+        views: 1,
+        values: 1,
+        bytes,
+    })?;
+    Ok(InputView {
+        inner: Arc::clone(&staging.inner),
+        identity,
+        path,
+        released: false,
+    })
 }
 
 fn assert_preparation_failure(

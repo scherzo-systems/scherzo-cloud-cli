@@ -17,6 +17,7 @@ mod cli;
 )]
 mod execution;
 mod human_auth;
+mod process;
 mod runner;
 mod runner_protocol;
 mod timing;

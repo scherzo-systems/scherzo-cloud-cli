@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rustix::fs::{Access, AtFlags, CWD, accessat};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::admission::{AdmittedWorkflow, EnvironmentSnapshot};
 #[cfg(test)]
@@ -30,6 +30,7 @@ use super::coordinator::{
 use super::diagnostic::{PendingStepDiagnostic, StepDiagnosticLog};
 use super::document::Output;
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
+use super::observation::{ExecutionObserver, NoopExecutionObserver};
 use super::runtime::{Action, ActionId, ActionInput, RequestedAction};
 use super::validated::{
     ResolvedValueSource, ValidatedCommandStep, ValidatedCommonStep, ValidatedStep, WorkflowImport,
@@ -110,9 +111,51 @@ pub(crate) enum StepRuntimeError {
 }
 
 #[derive(Clone)]
-pub(crate) struct StepRuntime<Clock>
+struct OwnedTasks {
+    active: watch::Sender<usize>,
+}
+
+struct OwnedTaskGuard(OwnedTasks);
+
+impl Drop for OwnedTaskGuard {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .send_modify(|active| *active = active.saturating_sub(1));
+    }
+}
+
+impl OwnedTasks {
+    fn new() -> Self {
+        let (active, _) = watch::channel(0);
+        Self { active }
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.active
+            .send_modify(|active| *active = active.saturating_add(1));
+        let guard = OwnedTaskGuard(self.clone());
+        drop(tokio::spawn(async move {
+            let _guard = guard;
+            future.await;
+        }));
+    }
+
+    async fn wait_until_idle(&self) {
+        let mut active = self.active.subscribe();
+        while *active.borrow_and_update() != 0 {
+            if active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StepRuntime<Clock, Observer = NoopExecutionObserver>
 where
     Clock: CoordinatorClock,
+    Observer: ExecutionObserver<Clock::Instant>,
 {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
@@ -120,14 +163,21 @@ where
     occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
     inputs: InputStaging,
     clock: Clock,
+    observer: Observer,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
     capture_work: Arc<Mutex<CaptureWorkRegistry>>,
-    capture_requests: mpsc::UnboundedSender<CaptureRequest>,
+    capture_requests: mpsc::UnboundedSender<CaptureWorkerMessage>,
+    tasks: OwnedTasks,
 }
 
 struct CaptureRequest {
     step: String,
     action: ActionId,
+}
+
+enum CaptureWorkerMessage {
+    Capture(CaptureRequest),
+    Shutdown(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -173,16 +223,52 @@ where
         occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
         clock: Clock,
     ) -> Self {
+        Self::with_observer(
+            admitted,
+            artifacts,
+            inputs,
+            diagnostics,
+            occurrences,
+            clock,
+            NoopExecutionObserver,
+        )
+    }
+}
+
+impl<Clock, Observer> StepRuntime<Clock, Observer>
+where
+    Clock: CoordinatorClock,
+    Observer: ExecutionObserver<Clock::Instant>,
+{
+    fn with_observer(
+        admitted: AdmittedWorkflow,
+        artifacts: ArtifactStaging,
+        inputs: InputStaging,
+        diagnostics: StepDiagnosticLog,
+        occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+        clock: Clock,
+        observer: Observer,
+    ) -> Self {
         let capture_work = Arc::new(Mutex::new(CaptureWorkRegistry::new()));
-        let (capture_requests, mut queued_captures) = mpsc::unbounded_channel::<CaptureRequest>();
+        let (capture_requests, mut queued_captures) =
+            mpsc::unbounded_channel::<CaptureWorkerMessage>();
         let capture_worker = CaptureWorker {
             admitted: admitted.clone(),
             artifacts: artifacts.clone(),
             occurrences: occurrences.clone(),
             work: Arc::clone(&capture_work),
         };
-        drop(tokio::spawn(async move {
-            while let Some(request) = queued_captures.recv().await {
+        let tasks = OwnedTasks::new();
+        let capture_tasks = tasks.clone();
+        tasks.spawn(async move {
+            while let Some(message) = queued_captures.recv().await {
+                let request = match message {
+                    CaptureWorkerMessage::Capture(request) => request,
+                    CaptureWorkerMessage::Shutdown(finished) => {
+                        let _ = finished.send(());
+                        return;
+                    }
+                };
                 let begin = capture_worker.with_work(|work| work.begin(request.action));
                 match begin {
                     BeginCapture::Capture(cancellation) => {
@@ -196,20 +282,26 @@ where
                             OutputCaptureFailure::TaskUnavailable,
                         )));
                         let settling_worker = capture_worker.clone();
-                        drop(tokio::spawn(async move {
-                            settling_worker.settle(request, result).await;
-                        }));
+                        let (started, settlement_started) = oneshot::channel();
+                        capture_tasks.spawn(async move {
+                            settling_worker.settle(request, result, started).await;
+                        });
+                        let _ = settlement_started.await;
                     }
                     BeginCapture::Cancelled => {
                         let settling_worker = capture_worker.clone();
-                        drop(tokio::spawn(async move {
-                            settling_worker.settle_cancelled(request.action).await;
-                        }));
+                        let (started, settlement_started) = oneshot::channel();
+                        capture_tasks.spawn(async move {
+                            settling_worker
+                                .settle_cancelled(request.action, started)
+                                .await;
+                        });
+                        let _ = settlement_started.await;
                     }
                     BeginCapture::Gone => {}
                 }
             }
-        }));
+        });
         Self {
             admitted,
             artifacts,
@@ -217,9 +309,11 @@ where
             occurrences,
             inputs,
             clock,
+            observer,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
             capture_work,
             capture_requests,
+            tasks,
         }
     }
 
@@ -266,11 +360,17 @@ where
             }
         }
 
-        let mut launched = match prepared.body.launch(
-            step.clone(),
-            &self.diagnostics,
-            self.admitted.execution().limits().maximum_step_log_bytes(),
-        ) {
+        let launched = match prepared.body {
+            PreparedStepBody::Command(command) => command.launch::<Clock::Instant, _>(
+                step.clone(),
+                action,
+                &self.diagnostics,
+                self.admitted.execution().limits().maximum_step_log_bytes(),
+                self.observer.clone(),
+            ),
+            PreparedStepBody::Agent => Err(StepStartFailure::UnsupportedBody(StepBodyKind::Agent)),
+        };
+        let mut launched = match launched {
             Ok(launched) => launched,
             Err(failure) => return self.settle_start_failure(step, action, failure).await,
         };
@@ -625,7 +725,10 @@ where
         }
         if self
             .capture_requests
-            .send(CaptureRequest { step, action })
+            .send(CaptureWorkerMessage::Capture(CaptureRequest {
+                step,
+                action,
+            }))
             .is_err()
         {
             self.with_capture_work(|work| work.finish(action));
@@ -645,6 +748,18 @@ where
         operation: impl FnOnce(&mut CaptureWorkRegistry) -> Output,
     ) -> Output {
         operation(&mut lock_registry(&self.capture_work))
+    }
+
+    async fn shutdown(&self) {
+        let (finished, completion) = oneshot::channel();
+        if self
+            .capture_requests
+            .send(CaptureWorkerMessage::Shutdown(finished))
+            .is_ok()
+        {
+            let _ = completion.await;
+        }
+        self.tasks.wait_until_idle().await;
     }
 
     #[cfg(test)]
@@ -736,22 +851,28 @@ impl CaptureWorker {
         &self,
         request: CaptureRequest,
         result: Result<CaptureCandidateSet, CaptureWorkerFailure>,
+        started: oneshot::Sender<()>,
     ) {
         match result {
-            Ok(candidates) => self.settle_candidates(request, candidates).await,
+            Ok(candidates) => self.settle_candidates(request, candidates, started).await,
             Err(CaptureWorkerFailure::Cancelled) => {
-                self.settle_cancelled(request.action).await;
+                self.settle_cancelled(request.action, started).await;
             }
             Err(CaptureWorkerFailure::Failed(failure)) => {
-                self.settle_failure(request, failure).await;
+                self.settle_failure(request, failure, started).await;
             }
         }
     }
 
-    async fn settle_candidates(&self, request: CaptureRequest, candidates: CaptureCandidateSet) {
+    async fn settle_candidates(
+        &self,
+        request: CaptureRequest,
+        candidates: CaptureCandidateSet,
+        started: oneshot::Sender<()>,
+    ) {
         if self.with_work(|work| work.is_cancelled(request.action)) {
             candidates.abort();
-            self.settle_cancelled(request.action).await;
+            self.settle_cancelled(request.action, started).await;
             return;
         }
         self.with_work(|work| work.begin_delivery(request.action));
@@ -761,6 +882,7 @@ impl CaptureWorker {
             .map(|(name, output)| (name.clone(), CapturedValue::file(output.clone())))
             .collect();
         let occurrence = DriverOccurrence::outputs_captured(request.step, request.action, outputs);
+        let _ = started.send(());
         match self.occurrences.send_acknowledged(occurrence).await {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
                 drop(candidates.commit());
@@ -782,9 +904,14 @@ impl CaptureWorker {
         }
     }
 
-    async fn settle_failure(&self, request: CaptureRequest, failure: OutputCaptureFailure) {
+    async fn settle_failure(
+        &self,
+        request: CaptureRequest,
+        failure: OutputCaptureFailure,
+        started: oneshot::Sender<()>,
+    ) {
         if self.with_work(|work| work.is_cancelled(request.action)) {
-            self.settle_cancelled(request.action).await;
+            self.settle_cancelled(request.action, started).await;
             return;
         }
         self.with_work(|work| work.begin_delivery(request.action));
@@ -793,6 +920,7 @@ impl CaptureWorker {
             request.action,
             StepFailureCause::OutputCapture(failure),
         );
+        let _ = started.send(());
         match self.occurrences.send_acknowledged(occurrence).await {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
                 self.with_work(|work| work.finish(request.action));
@@ -811,8 +939,9 @@ impl CaptureWorker {
         }
     }
 
-    async fn settle_cancelled(&self, action: ActionId) {
+    async fn settle_cancelled(&self, action: ActionId, started: oneshot::Sender<()>) {
         let cancellation = self.with_work(|work| work.finish(action));
+        let _ = started.send(());
         if let Some(cancellation) = cancellation {
             self.send_quiesced(cancellation).await;
         }
@@ -1198,10 +1327,12 @@ fn lock_registry<Registry>(registry: &Mutex<Registry>) -> MutexGuard<'_, Registr
     }
 }
 
-impl<Clock> ActionPort<RequestedAction<(), StepFailureCause, CapturedValue, Clock::Instant>>
-    for StepRuntime<Clock>
+impl<Clock, Observer>
+    ActionPort<RequestedAction<(), StepFailureCause, CapturedValue, Clock::Instant>>
+    for StepRuntime<Clock, Observer>
 where
     Clock: CoordinatorClock,
+    Observer: ExecutionObserver<Clock::Instant>,
 {
     fn release(
         &mut self,
@@ -1215,11 +1346,12 @@ where
                     else {
                         return;
                     };
-                    drop(tokio::spawn(async move {
+                    let tasks = runtime.tasks.clone();
+                    tasks.spawn(async move {
                         let _ = runtime
                             .execute_registered_step(step, requested.id, inputs, cancellation)
                             .await;
-                    }));
+                    });
                 }
                 Action::CancelStep { step, deadline, .. } => {
                     match runtime.request_capture_cancellation(&step, requested.id) {
@@ -1237,14 +1369,15 @@ where
                                     }
                                 }
                                 CancellationRegistration::Quiesced => {
-                                    drop(tokio::spawn(async move {
+                                    let tasks = runtime.tasks.clone();
+                                    tasks.spawn(async move {
                                         let _ = runtime
                                             .send(DriverOccurrence::step_quiesced(
                                                 step,
                                                 requested.id,
                                             ))
                                             .await;
-                                    }));
+                                    });
                                 }
                                 CancellationRegistration::Duplicate => {}
                             }
@@ -1272,7 +1405,33 @@ pub(crate) async fn execute_workflow<Clock, Commits>(
 ) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
 where
     Clock: CoordinatorClock,
-    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue>>,
+    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>,
+{
+    execute_workflow_observed(
+        admitted,
+        artifacts,
+        inputs,
+        diagnostics,
+        clock,
+        commits,
+        NoopExecutionObserver,
+    )
+    .await
+}
+
+pub(super) async fn execute_workflow_observed<Clock, Commits, Observer>(
+    admitted: AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    inputs: &InputStaging,
+    diagnostics: &StepDiagnosticLog,
+    clock: Clock,
+    commits: Commits,
+    observer: Observer,
+) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
+where
+    Clock: CoordinatorClock,
+    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>,
+    Observer: ExecutionObserver<Clock::Instant>,
 {
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);
@@ -1282,17 +1441,21 @@ where
     }
     let channel_capacity = admitted.execution().limits().maximum_parallel_steps();
     let (sender, receiver) = occurrence_channel(channel_capacity);
-    let actions = StepRuntime::with_diagnostics(
+    let actions = StepRuntime::with_observer(
         admitted.clone(),
         artifacts.clone(),
         inputs.clone(),
         diagnostics.clone(),
         sender,
         clock.clone(),
+        observer,
     );
+    let lifecycle = actions.clone();
     let result = Coordinator::new(admitted, receiver, clock, commits, actions)
         .run()
-        .await?;
+        .await;
+    lifecycle.shutdown().await;
+    let result = result?;
     inputs
         .release()
         .map_err(|_| CoordinationError::InputStagingCleanup)?;
@@ -1331,20 +1494,6 @@ enum PreparedStepBody {
     Agent,
 }
 
-impl PreparedStepBody {
-    fn launch(
-        self,
-        step: String,
-        diagnostic_log: &StepDiagnosticLog,
-        maximum_stream_bytes: NonZeroU64,
-    ) -> Result<LaunchedStepBody, StepStartFailure> {
-        match self {
-            Self::Command(command) => command.launch(step, diagnostic_log, maximum_stream_bytes),
-            Self::Agent => Err(StepStartFailure::UnsupportedBody(StepBodyKind::Agent)),
-        }
-    }
-}
-
 struct PreparedCommand {
     program: PathBuf,
     arguments: Vec<OsString>,
@@ -1354,12 +1503,18 @@ struct PreparedCommand {
 }
 
 impl PreparedCommand {
-    fn launch(
+    fn launch<Deadline, Observer>(
         self,
         step: String,
+        invocation: ActionId,
         diagnostic_log: &StepDiagnosticLog,
         maximum_stream_bytes: NonZeroU64,
-    ) -> Result<LaunchedStepBody, StepStartFailure> {
+        observer: Observer,
+    ) -> Result<LaunchedStepBody, StepStartFailure>
+    where
+        Deadline: Send + 'static,
+        Observer: ExecutionObserver<Deadline>,
+    {
         let Self {
             program,
             arguments,
@@ -1373,13 +1528,22 @@ impl PreparedCommand {
             .current_dir(cwd)
             .env_clear()
             .envs(environment.variables())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.as_std_mut().process_group(0);
         let child = command.spawn().map_err(|failure| {
             StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
         })?;
-        LaunchedStepBody::command(child, step, diagnostic_log, maximum_stream_bytes, inputs)
+        LaunchedStepBody::command(
+            child,
+            step,
+            invocation,
+            diagnostic_log,
+            maximum_stream_bytes,
+            inputs,
+            observer,
+        )
     }
 }
 
@@ -1393,13 +1557,19 @@ enum LaunchedStepBody {
 }
 
 impl LaunchedStepBody {
-    fn command(
+    fn command<Deadline, Observer>(
         mut child: Child,
         step: String,
+        invocation: ActionId,
         diagnostic_log: &StepDiagnosticLog,
         maximum_stream_bytes: NonZeroU64,
         inputs: Option<InputView>,
-    ) -> Result<Self, StepStartFailure> {
+        observer: Observer,
+    ) -> Result<Self, StepStartFailure>
+    where
+        Deadline: Send + 'static,
+        Observer: ExecutionObserver<Deadline>,
+    {
         let process_group = child
             .id()
             .and_then(|process_id| i32::try_from(process_id).ok())
@@ -1415,9 +1585,11 @@ impl LaunchedStepBody {
         };
         let diagnostic = diagnostic_log.start_capture(
             step,
+            invocation,
             maximum_stream_bytes,
             standard_output,
             standard_error,
+            observer,
         );
         Ok(Self::Command {
             child,

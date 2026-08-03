@@ -27,9 +27,10 @@ pub(crate) struct ValidatedWorkflow {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
     pub(crate) steps: BTreeMap<String, ValidatedStep>,
+    pub(crate) source_order: Vec<String>,
+    pub(crate) presentation_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, ResolvedOutputSource>,
     pub(crate) required_imports: RequiredImports,
-    pub(crate) topological_order: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

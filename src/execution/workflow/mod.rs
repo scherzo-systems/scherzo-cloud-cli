@@ -1,10 +1,17 @@
 pub(crate) mod admission;
+pub(crate) mod agent;
 pub(crate) mod artifact;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
 pub(crate) mod document;
+pub(crate) mod execution;
 pub(crate) mod input;
+pub(crate) mod observation;
 mod pi;
+pub(crate) mod pi_json_v1;
+pub(crate) mod presentation;
+pub(crate) mod publication;
+pub(crate) mod rejection;
 pub(crate) mod resolution;
 pub(crate) mod runtime;
 mod schema;
@@ -84,15 +91,15 @@ impl fmt::Display for DecodeFailure {
 impl std::error::Error for DecodeFailure {}
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowDocument, DecodeFailure> {
-    let value = strict_yaml::parse(bytes)?;
+    let parsed = strict_yaml::parse(bytes)?;
     let validator = structural_validator().ok_or_else(DecodeFailure::structural_contract)?;
-    if !validator.is_valid(&value) {
+    if !validator.is_valid(&parsed.value) {
         return Err(DecodeFailure::structural_contract());
     }
 
-    let dto = serde_json::from_value::<schema::WorkflowDto>(value)
+    let dto = serde_json::from_value::<schema::WorkflowDto>(parsed.value)
         .map_err(|_| DecodeFailure::structural_contract())?;
-    dto.into_document()
+    dto.into_document(parsed.step_order)
         .ok_or_else(DecodeFailure::structural_contract)
 }
 

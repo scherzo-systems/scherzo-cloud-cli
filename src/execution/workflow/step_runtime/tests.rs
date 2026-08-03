@@ -223,6 +223,11 @@ struct TestArtifacts {
     inputs: InputStaging,
 }
 
+enum StagingBindingMismatch {
+    Artifact,
+    Input,
+}
+
 struct CaptureBoundaryGate {
     reached: mpsc::UnboundedSender<CaptureBoundary>,
     permits: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -384,7 +389,7 @@ impl DeadlineControl {
     }
 }
 
-type WorkflowCommit = CommittedReduction<StepFailureCause, CapturedValue>;
+type WorkflowCommit = CommittedReduction<StepFailureCause, CapturedValue, TestInstant>;
 
 struct RecordingCommitPort {
     commits: mpsc::UnboundedSender<WorkflowCommit>,
@@ -474,7 +479,7 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
                 limits: ExecutionPolicyLimits::new(
                     2,
                     CaptureLimits::new(16, 1024, 4096),
-                    InputLimits::new(8, 1024, 4096),
+                    InputLimits::new(8, 1024, 4096, 4096),
                     1024,
                 ),
                 imports,
@@ -1151,17 +1156,33 @@ steps:
 }
 
 #[tokio::test]
-async fn workflow_execution_rejects_staging_bound_to_another_execution() {
+async fn workflow_execution_rejects_artifact_staging_bound_to_another_execution() {
+    assert_staging_binding_guard(StagingBindingMismatch::Artifact).await;
+}
+
+#[tokio::test]
+async fn workflow_execution_rejects_input_staging_bound_to_another_execution() {
+    assert_staging_binding_guard(StagingBindingMismatch::Input).await;
+}
+
+async fn assert_staging_binding_guard(mismatch: StagingBindingMismatch) {
     let temporary = tempfile::tempdir().unwrap();
     let admitted_root = temporary.path().join("admitted-execution");
     let other_root = temporary.path().join("other-execution");
     fs::create_dir(&admitted_root).unwrap();
     fs::create_dir(&other_root).unwrap();
-    fs::write(other_root.join("report.txt"), b"wrong execution").unwrap();
-    let mut source = workflow_source(&[("task", None, &["/bin/true"])]);
-    source.push_str(
-        "    outputs:\n      report:\n        kind: file\n        path: report.txt\n        mediaType: text/plain\n",
-    );
+    let command_marker = admitted_root.join("command-started");
+    let source = workflow_source(&[(
+        "task",
+        None,
+        &[
+            "/bin/sh",
+            "-c",
+            r#"printf started > "$1""#,
+            "staging-binding-guard",
+            command_marker.to_str().unwrap(),
+        ],
+    )]);
     let admitted = admit_fixture(
         temporary.path(),
         &admitted_root,
@@ -1176,14 +1197,27 @@ async fn workflow_execution_rejects_staging_bound_to_another_execution() {
         EnvironmentSnapshot::default(),
         1,
     );
-    let artifacts = test_artifacts(&other_admitted);
+    let matching = test_artifacts(&admitted);
+    let other = test_artifacts(&other_admitted);
+    let (artifacts, inputs, expected) = match mismatch {
+        StagingBindingMismatch::Artifact => (
+            &other.staging,
+            &matching.inputs,
+            CoordinationError::ArtifactStagingMismatch,
+        ),
+        StagingBindingMismatch::Input => (
+            &matching.staging,
+            &other.inputs,
+            CoordinationError::InputStagingMismatch,
+        ),
+    };
     let diagnostics = StepDiagnosticLog::default();
     let (commit_sender, mut commits) = mpsc::unbounded_channel();
 
     let result = execute_workflow(
         admitted,
-        &artifacts.staging,
-        &artifacts.inputs,
+        artifacts,
+        inputs,
         &diagnostics,
         TestClock,
         RecordingCommitPort {
@@ -1192,7 +1226,50 @@ async fn workflow_execution_rejects_staging_bound_to_another_execution() {
     )
     .await;
 
-    assert_eq!(result, Err(CoordinationError::ArtifactStagingMismatch));
+    assert_eq!(result, Err(expected));
+    assert!(commits.try_recv().is_err());
+    assert!(!command_marker.exists());
+}
+
+#[tokio::test]
+async fn workflow_execution_rejects_input_staging_with_a_different_live_limit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    let source = workflow_source(&[("task", None, &["/bin/true"])]);
+    let admitted = admit_fixture(
+        temporary.path(),
+        &execution_root,
+        &source,
+        EnvironmentSnapshot::default(),
+        1,
+    );
+    let mismatched_input_admission = admit_fixture_with_live_input_limit(
+        temporary.path(),
+        &execution_root,
+        &source,
+        EnvironmentSnapshot::default(),
+        1,
+        64 * 1024 * 1024 + 1,
+    );
+    let matching_staging = test_artifacts(&admitted);
+    let mismatched_staging = test_artifacts(&mismatched_input_admission);
+    let diagnostics = StepDiagnosticLog::default();
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+
+    let result = execute_workflow(
+        admitted,
+        &matching_staging.staging,
+        &mismatched_staging.inputs,
+        &diagnostics,
+        TestClock,
+        RecordingCommitPort {
+            commits: commit_sender,
+        },
+    )
+    .await;
+
+    assert_eq!(result, Err(CoordinationError::InputStagingMismatch));
     assert!(commits.try_recv().is_err());
 }
 
@@ -1960,7 +2037,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
                 limits: ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(8, 1024, 4096),
-                    InputLimits::new(4, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
                 imports: ResolvedImports::new(Some(Arc::from("failure prompt")), Arc::from([])),
@@ -2001,7 +2078,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
                 limits: ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(8, 1024, 4096),
-                    InputLimits::new(4, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
                 imports: ResolvedImports::new(Some(Arc::from("launch prompt")), Arc::from([])),
@@ -2059,7 +2136,7 @@ async fn input_staging_cleanup_failure_is_reported_and_retryable() {
                 limits: ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(8, 1024, 4096),
-                    InputLimits::new(4, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
                 imports: ResolvedImports::new(Some(Arc::from("retry prompt")), Arc::from([])),
@@ -2224,7 +2301,7 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
                 limits: ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(8, 1024, 4096),
-                    InputLimits::new(4, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
                 imports: ResolvedImports::new(
@@ -2324,7 +2401,7 @@ async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
                 limits: ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(8, 1024, 4096),
-                    InputLimits::new(4, 1024, 4096),
+                    InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
                 imports: ResolvedImports::new(Some(Arc::from("cancel prompt")), Arc::from([])),
@@ -2467,11 +2544,13 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
 
         let (standard_output, standard_output_writer) = tokio::io::duplex(1);
         let (standard_error, standard_error_writer) = tokio::io::duplex(1);
-        let pending = diagnostics.start_capture(
+        let pending = diagnostics.start_capture::<TestInstant, _, _, _>(
             "task".to_owned(),
+            start.id,
             NonZeroU64::new(1).unwrap(),
             standard_output,
             standard_error,
+            crate::execution::workflow::observation::NoopExecutionObserver,
         );
         let mut launched = LaunchedStepBody::Command {
             child,
@@ -3310,6 +3389,36 @@ fn admit_fixture_with_log_limit(
     )
 }
 
+fn admit_fixture_with_live_input_limit(
+    temporary_root: &Path,
+    execution_root: &Path,
+    source: &str,
+    environment: EnvironmentSnapshot,
+    maximum_parallel_steps: usize,
+    maximum_live_input_bytes: u64,
+) -> AdmittedWorkflow {
+    admit_fixture_with_inputs(
+        temporary_root,
+        execution_root,
+        source,
+        environment,
+        FixtureExecution {
+            limits: ExecutionPolicyLimits::new(
+                maximum_parallel_steps,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(
+                    1024,
+                    1024 * 1024,
+                    64 * 1024 * 1024,
+                    maximum_live_input_bytes,
+                ),
+                1024 * 1024,
+            ),
+            imports: ResolvedImports::default(),
+        },
+    )
+}
+
 fn admit_fixture_with_limits(
     temporary_root: &Path,
     execution_root: &Path,
@@ -3328,7 +3437,7 @@ fn admit_fixture_with_limits(
             limits: ExecutionPolicyLimits::new(
                 maximum_parallel_steps,
                 capture_limits,
-                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                 maximum_log_bytes,
             ),
             imports: ResolvedImports::default(),

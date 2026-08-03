@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::process::{CommandProbeError, CommandRunner, SystemCommandRunner};
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
+use crate::process::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
 const MINIMUM_VERSION: GitVersion = GitVersion(0, 0, 1);
 const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
+const MAXIMUM_STDOUT_BYTES: usize = 8 * 1024;
 
 pub(super) struct GitCheck {
     runner: Arc<dyn CommandRunner>,
@@ -38,8 +40,16 @@ impl DoctorCheck for GitCheck {
     }
 
     fn run(&self) -> Outcome {
-        match self.runner.run("git", &["--version"], self.timeout) {
-            Ok(output) if !output.success => fail(
+        match self.runner.run(CommandRequest {
+            program: Path::new("git"),
+            args: &["--version"],
+            timeout: self.timeout,
+            maximum_stdout_bytes: MAXIMUM_STDOUT_BYTES,
+            clear_environment: false,
+            environment: &[],
+            current_directory: None,
+        }) {
+            Ok(output) if !output.success => Outcome::fail(
                 "command_failed",
                 "git --version exited unsuccessfully.",
                 BTreeMap::new(),
@@ -47,25 +57,25 @@ impl DoctorCheck for GitCheck {
             Ok(output) => match parse_version(&output.stdout, output.truncated) {
                 Ok(version) if version >= MINIMUM_VERSION => pass(version),
                 Ok(version) => old_version(version),
-                Err(()) => fail(
+                Err(()) => Outcome::fail(
                     "invalid_version_output",
                     "git --version did not return a recognized version.",
                     BTreeMap::new(),
                 ),
             },
-            Err(CommandProbeError::CommandNotFound) => fail(
+            Err(CommandProbeError::CommandNotFound) => Outcome::fail(
                 "command_not_found",
                 "Git was not found on PATH.",
                 BTreeMap::new(),
             ),
-            Err(CommandProbeError::Timeout) => fail(
+            Err(CommandProbeError::Timeout) => Outcome::fail(
                 "command_timed_out",
                 "Git version inspection timed out.",
                 BTreeMap::new(),
             ),
             Err(
                 CommandProbeError::Spawn | CommandProbeError::Wait | CommandProbeError::PipeRead,
-            ) => fail(
+            ) => Outcome::fail(
                 "command_probe_failed",
                 "Git could not be inspected.",
                 BTreeMap::new(),
@@ -132,15 +142,6 @@ fn version_details(version: GitVersion) -> BTreeMap<String, String> {
     details
 }
 
-fn fail(code: &'static str, message: &'static str, details: BTreeMap<String, String>) -> Outcome {
-    Outcome {
-        status: Status::Fail,
-        code,
-        message: message.to_owned(),
-        details,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -148,7 +149,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{GitCheck, GitVersion, MINIMUM_VERSION, parse_version};
-    use crate::runner::doctor::process::{CommandOutput, CommandProbeError, CommandRunner};
+    use crate::process::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
     use crate::runner::doctor::{DoctorCheck, Outcome, Status};
 
     #[derive(Clone)]
@@ -157,14 +158,14 @@ mod tests {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(
-            &self,
-            program: &str,
-            args: &[&str],
-            _timeout: Duration,
-        ) -> Result<CommandOutput, CommandProbeError> {
-            assert_eq!(program, "git");
-            assert_eq!(args, ["--version"]);
+        fn run(&self, command: CommandRequest<'_>) -> Result<CommandOutput, CommandProbeError> {
+            assert_eq!(command.program, std::path::Path::new("git"));
+            assert_eq!(command.args, ["--version"]);
+            assert_eq!(command.timeout, Duration::from_millis(1));
+            assert_eq!(command.maximum_stdout_bytes, 8 * 1024);
+            assert!(!command.clear_environment);
+            assert!(command.environment.is_empty());
+            assert_eq!(command.current_directory, None);
             self.result.clone()
         }
     }

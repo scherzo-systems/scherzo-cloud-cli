@@ -69,6 +69,46 @@ mod tests {
     }
 
     #[test]
+    fn generated_audit_page_decodes_closed_variants() {
+        let input = serde_json::json!({
+            "items": [
+                {
+                    "id": "aud_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "occurredAt": "2026-08-04T12:00:00Z",
+                    "retention": {
+                        "identifier": "identity-tenancy-production-730d-v1",
+                        "retainUntil": "2028-08-03T12:00:00Z"
+                    },
+                    "detailsStatus": "details_available",
+                    "actor": {
+                        "kind": "principal",
+                        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
+                    },
+                    "action": "organization.created",
+                    "subject": {
+                        "kind": "organization",
+                        "id": "org_01k0z6r1w8f4jy2m7q9v3x5abc"
+                    },
+                    "changes": [{ "field": "state", "after": "active" }]
+                },
+                {
+                    "id": "aud_01k0z6r1w8f4jy2m7q9v3x5abd",
+                    "occurredAt": "2026-08-04T12:01:00Z",
+                    "retention": {
+                        "identifier": "identity-tenancy-production-730d-v1",
+                        "retainUntil": "2028-08-03T12:01:00Z"
+                    },
+                    "detailsStatus": "details_unavailable"
+                }
+            ]
+        });
+
+        let page: generated::models::OrganizationAuditRecordList =
+            serde_json::from_value(input).expect("contracted audit page should decode");
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
     fn membership_patch_client_uses_contract_media_type() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let body = r#"{"id":"mem_01k0z6r1w8f4jy2m7q9v3x5abc","organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc","principalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc","principalType":"human","role":"owner","state":"active","createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:00:00Z"}"#;

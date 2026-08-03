@@ -357,7 +357,7 @@ pub(crate) struct RequestedAction<Provisional, Cause, Output, Deadline> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TransitionEvent<Cause> {
+pub(crate) enum TransitionEvent<Cause, Deadline> {
     Step {
         sequence: TransitionSequence,
         step: String,
@@ -369,12 +369,17 @@ pub(crate) enum TransitionEvent<Cause> {
         from: WorkflowState<Cause>,
         to: WorkflowState<Cause>,
     },
+    CancellationAccepted {
+        sequence: TransitionSequence,
+        reason: CancellationReason,
+        deadline: Deadline,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) state: RuntimeState<Cause, Output>,
-    pub(crate) events: Vec<TransitionEvent<Cause>>,
+    pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
     pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output, Deadline>>,
     // Initialization is accepted by construction; reductions expose stale rejection to
     // occurrence adapters that retain resources until the coordinator commits a decision.
@@ -635,7 +640,6 @@ where
         | WorkflowState::Cancelled { .. } => return false,
     };
 
-    let from = reduction.state.workflow.clone();
     let to = WorkflowState::Executing {
         gate: SchedulingGate::Cancelling {
             reason: cancellation.reason,
@@ -643,10 +647,14 @@ where
         },
     };
     let sequence = next_sequence(&mut reduction.state);
-    reduction.state.workflow = to.clone();
+    reduction.state.workflow = to;
     reduction
         .events
-        .push(TransitionEvent::Workflow { sequence, from, to });
+        .push(TransitionEvent::CancellationAccepted {
+            sequence,
+            reason: cancellation.reason,
+            deadline: cancellation.deadline.clone(),
+        });
 
     let steps = reduction
         .state
@@ -742,9 +750,9 @@ where
     true
 }
 
-fn close_gate_for_failure<Cause, Output>(
+fn close_gate_for_failure<Cause, Output, Deadline>(
     state: &mut RuntimeState<Cause, Output>,
-    events: &mut Vec<TransitionEvent<Cause>>,
+    events: &mut Vec<TransitionEvent<Cause, Deadline>>,
     primary_failure: StepFailure<Cause>,
 ) where
     Cause: Clone,
@@ -1117,9 +1125,9 @@ fn set_current_action<Cause, Output>(
     }
 }
 
-fn transition_step<Cause, Output>(
+fn transition_step<Cause, Output, Deadline>(
     state: &mut RuntimeState<Cause, Output>,
-    events: &mut Vec<TransitionEvent<Cause>>,
+    events: &mut Vec<TransitionEvent<Cause, Deadline>>,
     step: &str,
     to: StepState<Cause, Output>,
     current_action: Option<ActionId>,

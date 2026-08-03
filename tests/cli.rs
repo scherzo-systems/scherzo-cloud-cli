@@ -24,6 +24,8 @@ mod account_signup;
 mod auth_login;
 #[path = "cli/organization.rs"]
 mod organization;
+#[path = "cli/pi_installation.rs"]
+mod pi_installation;
 #[path = "cli/workflow_validate.rs"]
 mod workflow_validate;
 
@@ -510,10 +512,13 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(doctor_stdout.contains("--check <ID>"));
     assert!(doctor_stdout.contains("--list-checks"));
     assert!(doctor_stdout.contains("--json"));
+    assert!(doctor_stdout.contains("--pi-executable <PATH>"));
     assert!(doctor.stderr.is_empty());
 
     assert!(serve.status.success());
-    assert!(String::from_utf8_lossy(&serve.stdout).contains("Usage: scherzo-cloud runner serve"));
+    let serve_stdout = String::from_utf8_lossy(&serve.stdout);
+    assert!(serve_stdout.contains("Usage: scherzo-cloud runner serve"));
+    assert!(serve_stdout.contains("--pi-executable <PATH>"));
     assert!(serve.stderr.is_empty());
 
     assert!(workflow_validate.status.success());
@@ -1256,7 +1261,10 @@ fn runner_doctor_lists_registered_checks_without_running_git() {
     let output = run_with_env(&["runner", "doctor", "--list-checks"], &[("PATH", path)]);
 
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"environment.command.git\n");
+    assert_eq!(
+        output.stdout,
+        b"environment.command.git\nexecution.harness.pi-json-v1\n"
+    );
     assert!(output.stderr.is_empty());
 }
 

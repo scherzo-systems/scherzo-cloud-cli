@@ -220,33 +220,68 @@ struct ResolvedDriverOccurrence<Provisional, Cause, Output> {
     acknowledgement: Option<DriverOccurrenceAcknowledgement>,
 }
 
+enum SelectedDriverOccurrence<Provisional, Cause, Output> {
+    Resolved(ResolvedDriverOccurrence<Provisional, Cause, Output>),
+    Claimed {
+        occurrence: DriverOccurrence<Provisional, Cause, Output>,
+        resolution: oneshot::Receiver<ClaimResolution>,
+    },
+}
+
 impl<Provisional, Cause, Output> DriverOccurrenceDelivery<Provisional, Cause, Output> {
-    async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
+    fn select(self) -> Option<SelectedDriverOccurrence<Provisional, Cause, Output>> {
         match self {
-            Self::Ready(occurrence) => Some(ResolvedDriverOccurrence {
-                occurrence,
-                acknowledgement: None,
-            }),
+            Self::Ready(occurrence) => Some(SelectedDriverOccurrence::Resolved(
+                ResolvedDriverOccurrence {
+                    occurrence,
+                    acknowledgement: None,
+                },
+            )),
             Self::Claimed {
                 occurrence,
                 observed,
                 resolution,
             } => {
                 observed.send(()).ok()?;
-                matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(
-                    ResolvedDriverOccurrence {
-                        occurrence,
-                        acknowledgement: None,
-                    },
-                )
+                Some(SelectedDriverOccurrence::Claimed {
+                    occurrence,
+                    resolution,
+                })
             }
             Self::Acknowledged {
                 occurrence,
                 acknowledgement,
-            } => Some(ResolvedDriverOccurrence {
+            } => Some(SelectedDriverOccurrence::Resolved(
+                ResolvedDriverOccurrence {
+                    occurrence,
+                    acknowledgement: Some(acknowledgement),
+                },
+            )),
+        }
+    }
+
+    async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
+        self.select()?.resolve().await
+    }
+}
+
+impl<Provisional, Cause, Output> SelectedDriverOccurrence<Provisional, Cause, Output> {
+    fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved(_))
+    }
+
+    async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
+        match self {
+            Self::Resolved(resolved) => Some(resolved),
+            Self::Claimed {
                 occurrence,
-                acknowledgement: Some(acknowledgement),
-            }),
+                resolution,
+            } => matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(
+                ResolvedDriverOccurrence {
+                    occurrence,
+                    acknowledgement: None,
+                },
+            ),
         }
     }
 }
@@ -353,6 +388,11 @@ impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> 
         }
     }
 
+    fn retain_delivery(&mut self, delivery: DriverOccurrenceDelivery<Provisional, Cause, Output>) {
+        debug_assert!(self.pending.is_none());
+        self.pending = Some(delivery);
+    }
+
     #[cfg(test)]
     pub(crate) async fn recv_with_acknowledgement(
         &mut self,
@@ -414,10 +454,10 @@ pub(crate) trait CoordinatorClock: Clone + Send + Sync + 'static {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommittedReduction<Cause, Output> {
+pub(crate) struct CommittedReduction<Cause, Output, Deadline> {
     pub(crate) occurrence_ordinal: OccurrenceOrdinal,
     pub(crate) state: RuntimeState<Cause, Output>,
-    pub(crate) events: Vec<TransitionEvent<Cause>>,
+    pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
 }
 
 pub(crate) trait CommitPort<Commit> {
@@ -446,7 +486,10 @@ pub(crate) struct CoordinationResult<Cause, Output> {
 
 enum CoordinatorInput<Provisional, Cause, Output, Deadline> {
     Cancellation(Occurrence<Provisional, Cause, Output, Deadline>),
-    Driver(DriverOccurrenceDelivery<Provisional, Cause, Output>),
+    Driver {
+        selected: SelectedDriverOccurrence<Provisional, Cause, Output>,
+        ordinal_assigned: bool,
+    },
 }
 
 pub(crate) struct Coordinator<Provisional, Cause, Output, Clock, Commits, Actions>
@@ -467,7 +510,7 @@ where
     Cause: Clone,
     Output: Clone,
     Clock: CoordinatorClock,
-    Commits: CommitPort<CommittedReduction<Cause, Output>>,
+    Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
 {
     pub(crate) fn new(
@@ -515,7 +558,7 @@ where
         }
 
         loop {
-            let (occurrence, acknowledgement) = loop {
+            let (occurrence, acknowledgement, ordinal_assigned) = loop {
                 let input = tokio::select! {
                     biased;
                     changed = cancellation.changed(), if !cancellation_admitted => {
@@ -535,24 +578,72 @@ where
                         let Some(driver_occurrence) = driver_occurrence else {
                             return Err(CoordinationError::OccurrenceChannelClosed);
                         };
-                        CoordinatorInput::Driver(driver_occurrence)
+                        if cancellation_admitted {
+                            let Some(selected) = driver_occurrence.select() else {
+                                continue;
+                            };
+                            CoordinatorInput::Driver {
+                                selected,
+                                ordinal_assigned: false,
+                            }
+                        } else {
+                            // Bias only orders this select poll. This read guard serializes
+                            // admission until the delivery is retained, assigned an ordinal,
+                            // or selected and acknowledged as a claim.
+                            let admitted_reason = cancellation.borrow_and_update();
+                            if let Some(reason) = *admitted_reason {
+                                self.occurrences.retain_delivery(driver_occurrence);
+                                cancellation_admitted = true;
+                                CoordinatorInput::Cancellation(
+                                    Occurrence::CancellationRequested {
+                                        reason,
+                                        deadline: self.clock.now() + grace,
+                                    },
+                                )
+                            } else {
+                                let Some(selected) = driver_occurrence.select() else {
+                                    continue;
+                                };
+                                let ordinal_assigned = selected.is_resolved();
+                                if ordinal_assigned {
+                                    ordinal = ordinal.next().ok_or(
+                                        CoordinationError::OccurrenceOrdinalExhausted,
+                                    )?;
+                                }
+                                CoordinatorInput::Driver {
+                                    selected,
+                                    ordinal_assigned,
+                                }
+                            }
+                        }
                     }
                 };
                 match input {
-                    CoordinatorInput::Cancellation(occurrence) => break (occurrence, None),
-                    CoordinatorInput::Driver(delivery) => {
-                        // A selected claim owns arbitration until its adapter settles, so a
+                    CoordinatorInput::Cancellation(occurrence) => {
+                        break (occurrence, None, false);
+                    }
+                    CoordinatorInput::Driver {
+                        selected,
+                        ordinal_assigned,
+                    } => {
+                        // An acknowledged claim owns arbitration until its adapter settles, so
                         // later cancellation cannot gain priority from diagnostic drain timing.
-                        let Some(resolved) = delivery.resolve().await else {
+                        let Some(resolved) = selected.resolve().await else {
                             continue;
                         };
-                        break (resolved.occurrence.into_runtime(), resolved.acknowledgement);
+                        break (
+                            resolved.occurrence.into_runtime(),
+                            resolved.acknowledgement,
+                            ordinal_assigned,
+                        );
                     }
                 }
             };
-            ordinal = ordinal
-                .next()
-                .ok_or(CoordinationError::OccurrenceOrdinalExhausted)?;
+            if !ordinal_assigned {
+                ordinal = ordinal
+                    .next()
+                    .ok_or(CoordinationError::OccurrenceOrdinalExhausted)?;
+            }
             let Some(state) = self.state.as_ref() else {
                 return Err(CoordinationError::ReducerStateUnavailable);
             };

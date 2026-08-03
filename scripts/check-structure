@@ -24,14 +24,21 @@ required_files=(
   scripts/check-change-fragments
   scripts/check-lint-policy
   scripts/check-msrv
+  scripts/check-pi-json-v1-extension
   scripts/check-structure
   scripts/classify-release-path
+  scripts/format-pi-json-v1-extension
   scripts/release-impact
   scripts/render-release-notes
   scripts/test-change-fragments
   scripts/test-release-impact
   scripts/test-release-notes
   scripts/test-release-path-classifier
+  src/execution/workflow/pi-json-v1-extension/package.json
+  src/execution/workflow/pi-json-v1-extension/package-lock.json
+  src/execution/workflow/pi-json-v1-extension/tsconfig.json
+  src/execution/workflow/pi-json-v1-extension/fixtures/generated/pi-json-v1-extension.ts
+  src/execution/workflow/pi-json-v1-extension/src/pi-json-v1-extension.ts
   src/timing.rs
   tests/fixtures/lint-policy/broadly_suppressed.rs
   tests/fixtures/lint-policy/main.rs
@@ -62,7 +69,7 @@ fi
 
 symbolic_link=$(
   find "$public_root" \
-    \( -name '.devenv*' -o -name .direnv -o -name target \) -prune -o \
+    \( -name '.devenv*' -o -name .direnv -o -name node_modules -o -name target \) -prune -o \
     -type l -print -quit
 )
 if [[ -n "$symbolic_link" ]]; then
@@ -106,7 +113,7 @@ fi
 
 path_dependency=$(
   find "$public_root" \
-    \( -name '.devenv*' -o -name .direnv -o -name target \) -prune -o \
+    \( -name '.devenv*' -o -name .direnv -o -name node_modules -o -name target \) -prune -o \
     -name Cargo.toml -type f -exec \
       grep -HEn '(^|[,{])[[:space:]]*path[[:space:]]*=' {} + \
     | head -n 1 \

@@ -25,6 +25,77 @@ test_root=$($fixture_git new-root)
 trap 'rm -rf "$test_root"' EXIT
 workflow_step_yaml=$test_root/write-release-notes.yml
 workflow_command=$test_root/write-release-notes.sh
+publish_job_yaml=$test_root/publish-release.yml
+
+awk '
+  $0 == "  publish_release:" {
+    in_job = 1
+  }
+  in_job && /^  [A-Za-z0-9_]+:/ && $0 != "  publish_release:" {
+    exit
+  }
+  in_job {
+    print
+  }
+' "$workflow" >"$publish_job_yaml"
+[[ -s $publish_job_yaml ]] || fail "Could not find the publish_release workflow job."
+
+write_notes_step_count=$(
+  grep -Fxc '      - name: Write release notes' "$publish_job_yaml" || true
+)
+[[ $write_notes_step_count -eq 1 ]] \
+  || fail "publish_release must contain exactly one Write release notes step."
+renderer_invocation_count=$(
+  grep -Fxc \
+    '          ./scripts/render-release-notes "${render_args[@]}" >"$rendered_notes"' \
+    "$publish_job_yaml" \
+    || true
+)
+[[ $renderer_invocation_count -eq 1 ]] \
+  || fail "publish_release must invoke the release-note renderer exactly once."
+
+unnamed_publish_steps=$(
+  awk '
+    $0 == "    steps:" {
+      in_steps = 1
+      next
+    }
+    in_steps && /^    [A-Za-z0-9_-]+:/ {
+      exit
+    }
+    in_steps && /^      -([[:space:]]|$)/ && $0 !~ /^      - name: / {
+      print
+    }
+  ' "$publish_job_yaml"
+)
+[[ -z $unnamed_publish_steps ]] || {
+  printf 'Unnamed publish_release steps:\n%s\n' "$unnamed_publish_steps" >&2
+  fail "Every publish_release step must have an explicit name."
+}
+
+actual_publish_steps=$(
+  awk '
+    /^      - name: / {
+      sub(/^      - name: /, "")
+      print
+    }
+  ' "$publish_job_yaml"
+)
+expected_publish_steps=$(cat <<'EOF'
+Check out release source
+Download release archives
+Recheck release plan
+Validate archives and create checksums
+Write release notes
+Attest release artifacts
+Publish GitHub Release
+EOF
+)
+[[ $actual_publish_steps == "$expected_publish_steps" ]] || {
+  printf 'Expected publish_release steps:\n%s\nActual:\n%s\n' \
+    "$expected_publish_steps" "$actual_publish_steps" >&2
+  fail "publish_release must render notes after local validation and before publication writes."
+}
 
 awk '
   $0 == "      - name: Write release notes" {
@@ -80,6 +151,26 @@ awk '
   }
 ' "$workflow_step_yaml" >"$workflow_command"
 [[ -s $workflow_command ]] || fail "Could not extract the Write release notes command."
+
+renderer_failure_root=$test_root/renderer-failure
+renderer_failure_temp=$test_root/renderer-failure-temp
+mkdir -p "$renderer_failure_root/scripts" "$renderer_failure_temp"
+printf '#!%s\nexit 23\n' "$(command -v bash)" \
+  >"$renderer_failure_root/scripts/render-release-notes"
+chmod +x "$renderer_failure_root/scripts/render-release-notes"
+if (
+  cd "$renderer_failure_root"
+  GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  LATEST_TAG=none \
+  RUNNER_TEMP="$renderer_failure_temp" \
+  SOURCE_REVISION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  VERSION=0.1.1 \
+    bash "$workflow_command"
+) >/dev/null 2>&1; then
+  fail "Write release notes did not propagate a renderer failure."
+fi
+[[ ! -e $renderer_failure_temp/release-notes.md ]] \
+  || fail "Write release notes created a release body after renderer failure."
 
 actual_permissions=$(
   awk '

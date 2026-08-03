@@ -137,7 +137,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             ExecutionPolicyLimits::new(
                 3,
                 CaptureLimits::new(17, 2 * 1024 * 1024, 8 * 1024 * 1024),
-                InputLimits::new(31, 2 * 1024 * 1024, 8 * 1024 * 1024),
+                InputLimits::new(31, 2 * 1024 * 1024, 8 * 1024 * 1024, 7 * 1024 * 1024),
                 64 * 1024,
             ),
             EnvironmentSnapshot::new([
@@ -204,6 +204,14 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             .maximum_total_input_bytes()
             .get(),
         8 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_live_input_bytes()
+            .get(),
+        7 * 1024 * 1024
     );
     assert_eq!(
         admitted
@@ -350,7 +358,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(captured_files, file_bytes, total_bytes),
-                        InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                        InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                         1024 * 1024,
                     ),
                     EnvironmentSnapshot::default(),
@@ -362,9 +370,10 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
         );
     }
 
-    for (values, value_bytes, total_bytes, kind, location) in [
+    for (values, value_bytes, total_bytes, live_bytes, kind, location) in [
         (
             0,
+            1,
             1,
             1,
             AdmissionFailureKind::NonPositiveInputValues,
@@ -374,6 +383,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
             1,
             0,
             1,
+            1,
             AdmissionFailureKind::NonPositiveInputValueBytes,
             AdmissionLocation::MaximumInputValueBytes,
         ),
@@ -381,8 +391,17 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
             1,
             1,
             0,
+            1,
             AdmissionFailureKind::NonPositiveTotalInputBytes,
             AdmissionLocation::MaximumTotalInputBytes,
+        ),
+        (
+            1,
+            1,
+            1,
+            0,
+            AdmissionFailureKind::NonPositiveLiveInputBytes,
+            AdmissionLocation::MaximumLiveInputBytes,
         ),
     ] {
         let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
@@ -396,7 +415,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                        InputLimits::new(values, value_bytes, total_bytes),
+                        InputLimits::new(values, value_bytes, total_bytes, live_bytes),
                         1024 * 1024,
                     ),
                     EnvironmentSnapshot::default(),
@@ -419,7 +438,7 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                 ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                    InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                    InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                     0,
                 ),
                 EnvironmentSnapshot::default(),
@@ -568,7 +587,7 @@ fn execution_context(
         ExecutionPolicyLimits::new(
             maximum_parallel_steps,
             CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-            InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+            InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
             1024 * 1024,
         ),
         EnvironmentSnapshot::default(),

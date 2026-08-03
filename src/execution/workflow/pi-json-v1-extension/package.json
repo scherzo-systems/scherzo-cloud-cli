@@ -1,0 +1,31 @@
+{
+  "name": "@scherzo-cloud/pi-json-v1-extension-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": "24.16.x",
+    "npm": "11.13.x"
+  },
+  "scripts": {
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run fixture:check && npm run runtime:check && npm test",
+    "fixture:check": "node --experimental-strip-types scripts/materialize-fixture.ts --check",
+    "fixture:generate": "node --experimental-strip-types scripts/materialize-fixture.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint --max-warnings 0 \"**/*.ts\"",
+    "runtime:check": "node --experimental-strip-types scripts/check-runtime-imports.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@types/node": "24.12.4",
+    "eslint": "10.8.0",
+    "prettier": "3.9.6",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.65.0"
+  }
+}

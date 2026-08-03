@@ -1,4 +1,3 @@
-pub(crate) fn timing_dependent_production_synchronization() {
-    std::thread::yield_now();
-    std::thread::park_timeout(std::time::Duration::from_millis(1));
+pub(crate) fn direct_elapsed_time_read(started_at: std::time::Instant) -> std::time::Duration {
+    started_at.elapsed()
 }

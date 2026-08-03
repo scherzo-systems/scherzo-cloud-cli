@@ -11,8 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::Sleeper;
 use super::connection::{
-    ActiveEffectEvent, ConnectionDependencies, ConnectionError, FrameSource, OpeningHello,
-    opening_hello, run_established,
+    ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError, FrameSource,
+    OpeningHello, opening_hello, run_established,
 };
 use super::test_support::{DeterminismTranscript, scripted_duplex, with_watchdog};
 use crate::runner::credential::test_credential;
@@ -59,7 +59,56 @@ enum ConversationKind {
 
 struct ReplayFrameSource {
     message_ids: Mutex<VecDeque<String>>,
+    message_id_references: HashMap<String, String>,
     timestamps: Mutex<VecDeque<String>>,
+}
+
+impl ReplayFrameSource {
+    fn new(conversation: &Conversation) -> Self {
+        let mut message_ids = VecDeque::new();
+        let mut message_id_references = HashMap::new();
+        let mut next_id = 1_u128;
+        for entry in conversation.entries.iter().filter(|entry| {
+            entry.from == ConversationPeer::Runner && entry.kind == ConversationKind::Text
+        }) {
+            let normalized = entry
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("messageId"))
+                .and_then(Value::as_str)
+                .expect("runner frame message ID placeholder")
+                .to_owned();
+            let concrete = format!(
+                "rmsg_{}",
+                ulid::Ulid::from(next_id).to_string().to_ascii_lowercase()
+            );
+            assert!(
+                message_id_references
+                    .insert(normalized.clone(), concrete.clone())
+                    .is_none(),
+                "conversation {} reuses runner message ID placeholder {normalized}",
+                conversation.name
+            );
+            message_ids.push_back(concrete);
+            next_id = next_id
+                .checked_add(1)
+                .expect("conversation message ID counter overflowed");
+        }
+        Self {
+            message_ids: Mutex::new(message_ids),
+            message_id_references,
+            timestamps: Mutex::new(runner_timestamps(conversation)),
+        }
+    }
+
+    fn concrete_message_id(&self, normalized: &str) -> String {
+        self.message_id_references
+            .get(normalized)
+            .unwrap_or_else(|| {
+                panic!("gateway acknowledgement references unknown runner frame {normalized}")
+            })
+            .clone()
+    }
 }
 
 impl FrameSource for ReplayFrameSource {
@@ -72,7 +121,7 @@ impl FrameSource for ReplayFrameSource {
             .lock()
             .expect("conversation message ID mutex poisoned")
             .pop_front()
-            .expect("conversation omitted a gateway acknowledgement for a runner frame")
+            .expect("conversation omitted a runner frame message ID")
     }
 
     fn utc_timestamp(&self) -> Result<String, ConnectionError> {
@@ -201,8 +250,87 @@ async fn replays_gateway_conversations_against_established_runner() {
         let name = conversation.name.clone();
         with_watchdog(replay_conversation(conversation))
             .await
-            .unwrap_or_else(|_| panic!("conversation replay timed out: {name}"));
+            .unwrap_or_else(|_| panic!("conversation replay timed out: {name}"))
+            .unwrap_or_else(|error| {
+                panic!("conversation {name} failed in established runner loop: {error}")
+            });
     }
+}
+
+#[tokio::test]
+async fn rejects_sequence_correct_acknowledgement_for_another_runner_frame() {
+    let path = bundled_conversation_path("gateway.handshake-one-effect");
+    let mut conversation = load_conversation(&path);
+    let acknowledgement = gateway_acknowledgement_mut(&mut conversation, 2);
+    *acknowledgement
+        .pointer_mut("/payload/acknowledgedMessageId")
+        .expect("gateway acknowledgement message ID") = Value::String("«mid-1»".to_owned());
+
+    let error = with_watchdog(replay_conversation(conversation))
+        .await
+        .expect("corrupted conversation replay timed out")
+        .expect_err("sequence-correct acknowledgement for another frame passed replay");
+    assert_eq!(
+        error.connection_cause(),
+        ConnectionCause::MismatchedEffectAcknowledgement
+    );
+
+    with_watchdog(replay_conversation(load_conversation(&path)))
+        .await
+        .expect("restored conversation replay timed out")
+        .expect("restored acknowledgement reference failed replay");
+}
+
+#[tokio::test]
+async fn rejects_gateway_frame_recorded_after_terminal_close() {
+    let path = bundled_conversation_path("gateway.handshake-one-effect");
+    let mut conversation = load_conversation(&path);
+    let mut trailing_acknowledgement = gateway_acknowledgement_mut(&mut conversation, 2).clone();
+    *trailing_acknowledgement
+        .pointer_mut("/payload/acknowledgedMessageId")
+        .expect("gateway acknowledgement message ID") = Value::String("«mid-1»".to_owned());
+    conversation.entries.push(ConversationEntry {
+        advance_ms: 0,
+        from: ConversationPeer::Gateway,
+        kind: ConversationKind::Text,
+        payload: Some(trailing_acknowledgement),
+    });
+
+    if std::panic::catch_unwind(|| validate_entries(&conversation)).is_err() {
+        return;
+    }
+    let result = with_watchdog(replay_conversation(conversation))
+        .await
+        .expect("corrupted conversation replay timed out");
+    assert!(
+        result.is_err(),
+        "replay accepted a gateway acknowledgement recorded after terminal close"
+    );
+}
+
+fn gateway_acknowledgement_mut(
+    conversation: &mut Conversation,
+    acknowledged_sequence: u64,
+) -> &mut Value {
+    conversation
+        .entries
+        .iter_mut()
+        .filter(|entry| entry.from == ConversationPeer::Gateway)
+        .filter_map(|entry| entry.payload.as_mut())
+        .find(|payload| {
+            payload.get("type").and_then(Value::as_str) == Some("observation_ack")
+                && payload
+                    .pointer("/payload/acknowledgedSequence")
+                    .and_then(Value::as_u64)
+                    == Some(acknowledged_sequence)
+        })
+        .expect("conversation has no matching acknowledgement confirmation")
+}
+
+fn bundled_conversation_path(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runner-conversations/v1")
+        .join(format!("{name}.json"))
 }
 
 fn load_conversations() -> Vec<Conversation> {
@@ -224,22 +352,24 @@ fn load_conversations() -> Vec<Conversation> {
     assert!(!paths.is_empty(), "no runner conversation fixtures found");
     paths
         .into_iter()
-        .map(|path| {
-            let encoded = fs::read(&path)
-                .unwrap_or_else(|error| panic!("read conversation {}: {error}", path.display()));
-            let conversation: Conversation = serde_json::from_slice(&encoded)
-                .unwrap_or_else(|error| panic!("decode conversation {}: {error}", path.display()));
-            assert_eq!(conversation.conversation_version, 1);
-            assert_eq!(conversation.recorded_by, "gateway");
-            assert_eq!(
-                path.file_stem().and_then(|name| name.to_str()),
-                Some(conversation.name.as_str()),
-                "conversation name does not match its file name"
-            );
-            validate_entries(&conversation);
-            conversation
-        })
+        .map(|path| load_conversation(&path))
         .collect()
+}
+
+fn load_conversation(path: &Path) -> Conversation {
+    let encoded = fs::read(path)
+        .unwrap_or_else(|error| panic!("read conversation {}: {error}", path.display()));
+    let conversation: Conversation = serde_json::from_slice(&encoded)
+        .unwrap_or_else(|error| panic!("decode conversation {}: {error}", path.display()));
+    assert_eq!(conversation.conversation_version, 1);
+    assert_eq!(conversation.recorded_by, "gateway");
+    assert_eq!(
+        path.file_stem().and_then(|name| name.to_str()),
+        Some(conversation.name.as_str()),
+        "conversation name does not match its file name"
+    );
+    validate_entries(&conversation);
+    conversation
 }
 
 fn validate_entries(conversation: &Conversation) {
@@ -248,7 +378,7 @@ fn validate_entries(conversation: &Conversation) {
         "conversation {} has no entries",
         conversation.name
     );
-    for entry in &conversation.entries {
+    for (index, entry) in conversation.entries.iter().enumerate() {
         assert_eq!(
             entry.payload.is_some(),
             entry.kind == ConversationKind::Text,
@@ -256,25 +386,26 @@ fn validate_entries(conversation: &Conversation) {
             conversation.name,
             entry.kind
         );
+        assert!(
+            entry.kind != ConversationKind::Close || index == conversation.entries.len() - 1,
+            "conversation {} has an entry after a terminal close",
+            conversation.name
+        );
     }
 }
 
-async fn replay_conversation(conversation: Conversation) {
+async fn replay_conversation(conversation: Conversation) -> Result<(), ConnectionError> {
     let opening = opening_metadata(&conversation);
-    let effect_message_ids = runner_effect_message_ids(&conversation);
-    let timestamps = runner_timestamps(&conversation);
-    let frame_source = ReplayFrameSource {
-        message_ids: Mutex::new(effect_message_ids),
-        timestamps: Mutex::new(timestamps),
-    };
+    let frame_source = ReplayFrameSource::new(&conversation);
     let config = Config::new("ws://127.0.0.1:1/v1/connect", test_credential(), true)
         .expect("configure conversation replay gateway");
     assert_eq!(config.credential().runner_id(), opening.runner_id);
+    let opening_message_id = frame_source.public_id("rmsg_");
     let encoded_opening = opening_hello(
         &frame_source,
         &opening.runner_id,
         REPLAY_BOOT_ID,
-        opening.message_id.clone(),
+        opening_message_id.clone(),
         opening.sequence,
         "conversation-replay",
     )
@@ -289,26 +420,6 @@ async fn replay_conversation(conversation: Conversation) {
         .sequence
         .checked_add(1)
         .expect("conversation opening sequence overflowed");
-    let established = run_established(
-        ConnectionDependencies::new(
-            &config,
-            &frame_source,
-            &sleeper,
-            &recorder,
-            &connection_event,
-            &active_effect_event,
-            1,
-        ),
-        OpeningHello {
-            boot_id: REPLAY_BOOT_ID,
-            encoded: &encoded_opening,
-            message_id: &opening.message_id,
-            sequence: opening.sequence,
-        },
-        &mut next_sequence,
-        reader,
-        writer,
-    );
     let expected_final_sequence = conversation
         .entries
         .iter()
@@ -317,40 +428,63 @@ async fn replay_conversation(conversation: Conversation) {
         .max()
         .and_then(|sequence| sequence.checked_add(1))
         .expect("conversation has no valid runner sequence");
-    let peer = async {
-        let mut normalizer = RunnerFrameNormalizer::default();
-        let mut expected_sleep_requests = 0;
-        for entry in &conversation.entries {
-            sleeper.advance(Duration::from_millis(entry.advance_ms));
-            match entry.from {
-                ConversationPeer::Gateway => {
-                    inbound.send(gateway_message(entry));
-                    if entry.kind != ConversationKind::Close {
-                        expected_sleep_requests += 1;
-                        sleeper.wait_for_requests(expected_sleep_requests).await;
+    let outcome = {
+        let established = run_established(
+            ConnectionDependencies::new(
+                &config,
+                &frame_source,
+                &sleeper,
+                &recorder,
+                &connection_event,
+                &active_effect_event,
+                1,
+            ),
+            OpeningHello {
+                boot_id: REPLAY_BOOT_ID,
+                encoded: &encoded_opening,
+                message_id: &opening_message_id,
+                sequence: opening.sequence,
+            },
+            &mut next_sequence,
+            reader,
+            writer,
+        );
+        let peer = async {
+            let mut normalizer = RunnerFrameNormalizer::default();
+            let mut expected_sleep_requests = 0;
+            for entry in &conversation.entries {
+                sleeper.advance(Duration::from_millis(entry.advance_ms));
+                match entry.from {
+                    ConversationPeer::Gateway => {
+                        inbound.send(gateway_message(entry, &frame_source));
+                        if entry.kind != ConversationKind::Close {
+                            expected_sleep_requests += 1;
+                            sleeper.wait_for_requests(expected_sleep_requests).await;
+                        }
                     }
-                }
-                ConversationPeer::Runner => {
-                    let actual = outbound.recv().await.unwrap_or_else(|| {
-                        panic!("runner stopped before entry in {}", conversation.name)
-                    });
-                    assert_runner_message(&conversation.name, entry, actual, &mut normalizer);
-                    if expected_sleep_requests == 0 {
-                        expected_sleep_requests = 1;
-                        sleeper.wait_for_requests(expected_sleep_requests).await;
+                    ConversationPeer::Runner => {
+                        let actual = outbound.recv().await.unwrap_or_else(|| {
+                            panic!("runner stopped before entry in {}", conversation.name)
+                        });
+                        assert_runner_message(&conversation.name, entry, actual, &mut normalizer);
+                        if expected_sleep_requests == 0 {
+                            expected_sleep_requests = 1;
+                            sleeper.wait_for_requests(expected_sleep_requests).await;
+                        }
                     }
                 }
             }
+        };
+
+        tokio::pin!(established);
+        tokio::pin!(peer);
+        tokio::select! {
+            biased;
+            outcome = &mut established => outcome,
+            () = &mut peer => established.await,
         }
     };
-
-    let (outcome, ()) = tokio::join!(established, peer);
-    let progress = outcome.unwrap_or_else(|error| {
-        panic!(
-            "conversation {} failed in established runner loop: {error}",
-            conversation.name
-        )
-    });
+    let progress = outcome?;
     assert!(progress.opening_acknowledged);
     assert!(progress.handshake_completed);
     assert_eq!(next_sequence, expected_final_sequence);
@@ -377,10 +511,10 @@ async fn replay_conversation(conversation: Conversation) {
         "conversation {} did not generate every expected timestamp",
         conversation.name
     );
+    Ok(())
 }
 
 struct OpeningMetadata {
-    message_id: String,
     runner_id: String,
     sequence: u64,
 }
@@ -394,30 +528,12 @@ fn opening_metadata(conversation: &Conversation) -> OpeningMetadata {
     let payload = hello.payload.as_ref().expect("runner hello payload");
     let sequence = payload["sequence"].as_u64().expect("runner hello sequence");
     OpeningMetadata {
-        message_id: acknowledged_message_id(conversation, sequence),
         runner_id: payload["runnerId"]
             .as_str()
             .expect("runner hello runner ID")
             .to_owned(),
         sequence,
     }
-}
-
-fn runner_effect_message_ids(conversation: &Conversation) -> VecDeque<String> {
-    conversation
-        .entries
-        .iter()
-        .filter(|entry| is_runner_text(entry, "effect_acknowledged"))
-        .map(|entry| {
-            let sequence = entry
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("sequence"))
-                .and_then(Value::as_u64)
-                .expect("effect acknowledgement sequence");
-            acknowledged_message_id(conversation, sequence)
-        })
-        .collect()
 }
 
 fn runner_timestamps(conversation: &Conversation) -> VecDeque<String> {
@@ -457,38 +573,27 @@ fn is_runner_text(entry: &ConversationEntry, frame_type: &str) -> bool {
             == Some(frame_type)
 }
 
-fn acknowledged_message_id(conversation: &Conversation, sequence: u64) -> String {
-    conversation
-        .entries
-        .iter()
-        .filter(|entry| entry.from == ConversationPeer::Gateway)
-        .filter_map(|entry| entry.payload.as_ref())
-        .find_map(|payload| {
-            (payload.get("type").and_then(Value::as_str) == Some("observation_ack")
-                && payload
-                    .pointer("/payload/acknowledgedSequence")
-                    .and_then(Value::as_u64)
-                    == Some(sequence))
-            .then(|| {
-                payload
+fn gateway_message(entry: &ConversationEntry, frame_source: &ReplayFrameSource) -> Message {
+    match entry.kind {
+        ConversationKind::Text => {
+            let mut payload = entry.payload.clone().expect("gateway text payload");
+            if payload.get("type").and_then(Value::as_str) == Some("observation_ack") {
+                let normalized = payload
                     .pointer("/payload/acknowledgedMessageId")
                     .and_then(Value::as_str)
-                    .expect("gateway acknowledgement message ID")
-                    .to_owned()
-            })
-        })
-        .unwrap_or_else(|| {
-            panic!("conversation has no gateway acknowledgement for sequence {sequence}")
-        })
-}
-
-fn gateway_message(entry: &ConversationEntry) -> Message {
-    match entry.kind {
-        ConversationKind::Text => Message::Text(
-            serde_json::to_string(entry.payload.as_ref().expect("gateway text payload"))
-                .expect("encode gateway conversation frame")
-                .into(),
-        ),
+                    .expect("gateway acknowledgement message ID placeholder")
+                    .to_owned();
+                *payload
+                    .pointer_mut("/payload/acknowledgedMessageId")
+                    .expect("gateway acknowledgement message ID") =
+                    Value::String(frame_source.concrete_message_id(&normalized));
+            }
+            Message::Text(
+                serde_json::to_string(&payload)
+                    .expect("encode gateway conversation frame")
+                    .into(),
+            )
+        }
         ConversationKind::Ping => Message::Ping(Vec::new().into()),
         ConversationKind::Pong => Message::Pong(Vec::new().into()),
         ConversationKind::Close => Message::Close(None),

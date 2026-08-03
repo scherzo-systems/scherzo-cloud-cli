@@ -120,7 +120,7 @@ struct ReferenceDto {
 }
 
 impl WorkflowDto {
-    pub(super) fn into_document(self) -> Option<WorkflowDocument> {
+    pub(super) fn into_document(self, step_order: Vec<String>) -> Option<WorkflowDocument> {
         let agent_profiles = self
             .agent_profiles
             .into_iter()
@@ -144,6 +144,7 @@ impl WorkflowDto {
             description: self.description,
             agent_profiles,
             steps,
+            step_order,
             exports,
         })
     }

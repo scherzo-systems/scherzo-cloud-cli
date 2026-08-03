@@ -318,9 +318,11 @@ fn request_deadline_bounds_the_complete_streaming_response() {
 
 #[test]
 fn refused_connection_maps_to_connection() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    // Keep the bound socket unlistened so the port cannot be reassigned to a
+    // concurrent fixture before the client observes the refused connection.
 
     let outcome = get_current_principal_with_timeout(
         &http_client(),

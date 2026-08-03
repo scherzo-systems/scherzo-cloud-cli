@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+package_root=$public_root/src/execution/workflow/pi-json-v1-extension
+
+usage() {
+  echo "usage: check-pi-json-v1-extension [--dependencies-only]" >&2
+  exit 2
+}
+
+mode=check
+case "${1:-}" in
+  "") ;;
+  --dependencies-only) mode=dependencies ;;
+  *) usage ;;
+esac
+if [[ $# -gt 1 ]]; then
+  usage
+fi
+
+cleanup() {
+  rm -rf -- "$package_root/node_modules"
+}
+trap cleanup EXIT
+cleanup
+
+(
+  cd "$package_root"
+  npm ci --ignore-scripts --no-audit --no-fund
+  npm ls --all >/dev/null
+  if [[ "$mode" == check ]]; then
+    npm_config_offline=true npm run check
+  fi
+)

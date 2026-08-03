@@ -8,6 +8,7 @@ pub(crate) struct WorkflowDocument {
     pub(crate) description: Option<String>,
     pub(crate) agent_profiles: BTreeMap<String, AgentProfile>,
     pub(crate) steps: BTreeMap<String, Step>,
+    pub(crate) step_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, OutputReference>,
 }
 

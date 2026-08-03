@@ -13,6 +13,14 @@ pub(crate) fn monotonic_now() -> Instant {
 
 #[expect(
     clippy::disallowed_methods,
+    reason = "this module is the production boundary for monotonic elapsed-time reads"
+)]
+pub(crate) fn elapsed(started_at: Instant) -> Duration {
+    started_at.elapsed()
+}
+
+#[expect(
+    clippy::disallowed_methods,
     reason = "this module is the production boundary for UTC wall-clock reads"
 )]
 pub(crate) fn utc_now() -> OffsetDateTime {

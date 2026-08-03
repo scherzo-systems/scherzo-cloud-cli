@@ -75,7 +75,7 @@ impl std::error::Error for ValidationFailure {}
 
 struct ValidatedGraph {
     direct_prerequisites: BTreeMap<String, Vec<String>>,
-    topological_order: Vec<String>,
+    presentation_order: Vec<String>,
     ancestors: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -131,14 +131,21 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         schema_version: document.schema_version,
         description: document.description,
         steps,
+        source_order: document.step_order,
+        presentation_order: graph.presentation_order,
         exports,
         required_imports,
-        topological_order: graph.topological_order,
     })
 }
 
 fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, ValidationFailure> {
     let direct_prerequisites = resolve_direct_prerequisites(document)?;
+    let source_indices = document
+        .step_order
+        .iter()
+        .enumerate()
+        .map(|(index, step)| (step.clone(), index))
+        .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<String, Vec<String>>::new();
     let mut remaining_prerequisites = BTreeMap::<String, usize>::new();
 
@@ -155,25 +162,27 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
     let mut ready = remaining_prerequisites
         .iter()
         .filter(|(_, count)| **count == 0)
-        .map(|(name, _)| name.clone())
+        .filter_map(|(name, _)| source_indices.get(name).map(|index| (*index, name.clone())))
         .collect::<BTreeSet<_>>();
-    let mut topological_order = Vec::with_capacity(document.steps.len());
+    let mut presentation_order = Vec::with_capacity(document.steps.len());
 
-    while let Some(step_name) = ready.pop_first() {
-        topological_order.push(step_name.clone());
+    while let Some((_, step_name)) = ready.pop_first() {
+        presentation_order.push(step_name.clone());
         if let Some(step_dependents) = dependents.get(&step_name) {
             for dependent in step_dependents {
                 if let Some(count) = remaining_prerequisites.get_mut(dependent) {
                     *count -= 1;
-                    if *count == 0 {
-                        ready.insert(dependent.clone());
+                    if *count == 0
+                        && let Some(index) = source_indices.get(dependent)
+                    {
+                        ready.insert((*index, dependent.clone()));
                     }
                 }
             }
         }
     }
 
-    if topological_order.len() != document.steps.len() {
+    if presentation_order.len() != document.steps.len() {
         return Err(ValidationFailure::new(
             ValidationFailureKind::DependencyCycle,
             ValidationLocation::WorkflowGraph,
@@ -181,7 +190,7 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
     }
 
     let mut ancestors = BTreeMap::<String, BTreeSet<String>>::new();
-    for step_name in &topological_order {
+    for step_name in &presentation_order {
         let mut step_ancestors = BTreeSet::new();
         for prerequisite in &direct_prerequisites[step_name] {
             step_ancestors.insert(prerequisite.clone());
@@ -194,7 +203,7 @@ fn validate_graph(document: &WorkflowDocument) -> Result<ValidatedGraph, Validat
 
     Ok(ValidatedGraph {
         direct_prerequisites,
-        topological_order,
+        presentation_order,
         ancestors,
     })
 }

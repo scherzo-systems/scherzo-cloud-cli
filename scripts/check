@@ -13,6 +13,7 @@ mkdir -p "$long_tmp"
 chmod 700 "$long_tmp"
 
 "$public_root/scripts/check-structure"
+"$public_root/scripts/check-pi-json-v1-extension"
 
 cd "$public_root"
 export CARGO_TERM_COLOR=never

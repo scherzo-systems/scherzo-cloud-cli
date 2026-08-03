@@ -10,8 +10,9 @@ profile management, one-page active member-directory reads, local Workflow V1
 definition validation, and an outbound, development-only runner transport.
 `scherzo-cloud runner serve` opens a versioned
 WebSocket connection, durably acknowledges received assignment offers, and never claims
-to execute them. `scherzo-cloud runner doctor` currently performs one local Git
-prerequisite check and does not claim that the runner is ready to execute assignments.
+to execute them. `scherzo-cloud runner doctor` performs one default local Git check and
+can validate an explicitly configured Pi installation for the closed `PiJsonV1` profile;
+it does not claim that the runner is ready to execute assignments.
 
 ## One executable with separate roles
 
@@ -57,12 +58,23 @@ is crate-private and accepts boxed checks from components assembled into this ex
 it is not a dynamic plugin API, does not discover libraries or scripts, and is not a
 third-party extension contract.
 
-The first registry entry is `environment.command.git`. It is deliberately the sole
-default check until the runner service has concrete configuration, identity, transport,
-and execution contracts. Doctor does not construct human deployment state, read the
-human credential store, or make a network request. Future runner bootstrap code can add
-compiled-in checks through the same registry without adding a central check-name enum,
-but it must keep those boundaries intact.
+The first registry entry is `environment.command.git`. It remains the sole default when
+no Pi executable is configured. The second entry,
+`execution.harness.pi-json-v1`, becomes a default check only when doctor receives
+`--pi-executable`; operators can also select it explicitly. Doctor does not construct
+human deployment state, read the human credential store, or make a network request.
+Future runner bootstrap code can add compiled-in checks through the same registry
+without adding a central check-name enum, but it must keep those boundaries intact.
+
+The Pi validator lives at the execution boundary and is shared by doctor and optional
+agent-capable Runner Serve initialization. It canonicalizes the configured path, invokes
+only that absolute executable's native version and help probes, and maps exact version
+0.82.1 plus its required non-model flags into an immutable
+`ValidatedPiInstallation`. The value carries the absolute path, closed version and
+profile enums, and a closed capability set. Neither run admission nor later execution
+needs executable discovery or native probing. Runner Serve keeps command-only startup
+available when no Pi path is configured; when one is configured, startup must validate
+and retain it before entering the service runtime.
 
 
 ## Runner service observability
@@ -202,6 +214,14 @@ separate phase model.
 Local execution and Runner Serve call the same execution component. Runner Serve adds
 assignment, lease, durable observation, and cleanup behavior around it, but connectivity
 code does not acquire source, schedule steps, or interpret workflow outputs.
+
+The private npm project under
+`src/execution/workflow/pi-json-v1-extension/` checks the single-file PiJsonV1 result
+extension and one deterministic materialization. It is not another execution component:
+Rust owns invocation identity, the retained schema and authoritative validation, and
+terminal workflow state. Workflow execution never invokes npm or reads this project's
+`node_modules`; a materialized extension uses only the Pi-provided extension API and
+TypeBox plus Node's `node:net` built-in.
 
 ## Public source isolation
 

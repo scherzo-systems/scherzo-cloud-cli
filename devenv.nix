@@ -28,6 +28,7 @@ in
     pkgs.ast-grep
     pkgs.git
     pkgs.jq
+    pkgs.nodejs_24
   ];
 
   enterTest = ''

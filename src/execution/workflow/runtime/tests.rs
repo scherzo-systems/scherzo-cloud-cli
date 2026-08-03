@@ -85,7 +85,7 @@ fn step_event(
     step: &str,
     from: StepStateKind,
     to: StepStateKind,
-) -> TransitionEvent<String> {
+) -> TransitionEvent<String, TestDeadline> {
     TransitionEvent::Step {
         sequence: sequence(value),
         step: step.to_owned(),
@@ -98,7 +98,7 @@ fn workflow_event(
     value: u64,
     from: WorkflowState<String>,
     to: WorkflowState<String>,
-) -> TransitionEvent<String> {
+) -> TransitionEvent<String, TestDeadline> {
     TransitionEvent::Workflow {
         sequence: sequence(value),
         from,
@@ -106,7 +106,7 @@ fn workflow_event(
     }
 }
 
-fn workflow_succeeded_event(value: u64) -> TransitionEvent<String> {
+fn workflow_succeeded_event(value: u64) -> TransitionEvent<String, TestDeadline> {
     workflow_event(
         value,
         WorkflowState::Executing {
@@ -114,6 +114,18 @@ fn workflow_succeeded_event(value: u64) -> TransitionEvent<String> {
         },
         WorkflowState::Succeeded,
     )
+}
+
+fn cancellation_event(
+    value: u64,
+    reason: CancellationReason,
+    arbiter_tick: u64,
+) -> TransitionEvent<String, TestDeadline> {
+    TransitionEvent::CancellationAccepted {
+        sequence: sequence(value),
+        reason,
+        deadline: deadline(arbiter_tick),
+    }
 }
 
 fn failure(step: &str, phase: FailurePhase, cause: &str) -> StepFailure<String> {
@@ -392,7 +404,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                 1024 * 1024,
             ),
             EnvironmentSnapshot::default(),
@@ -448,7 +460,7 @@ steps:
             ExecutionPolicyLimits::new(
                 2,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                 1024 * 1024,
             ),
             EnvironmentSnapshot::default(),
@@ -525,13 +537,7 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
     assert_eq!(
         reduction.events,
         [
-            workflow_event(
-                1,
-                WorkflowState::Executing {
-                    gate: SchedulingGate::Open,
-                },
-                cancelling.clone(),
-            ),
+            cancellation_event(1, reason, 5_000),
             step_event(2, "aRoot", StepStateKind::Pending, StepStateKind::Cancelled,),
             step_event(
                 3,
@@ -629,13 +635,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
     assert_eq!(
         cancelled.events,
         [
-            workflow_event(
-                7,
-                WorkflowState::Executing {
-                    gate: SchedulingGate::Open,
-                },
-                cancelling.clone(),
-            ),
+            cancellation_event(7, reason, 7_777),
             step_event(
                 8,
                 "aStarting",
@@ -1393,7 +1393,7 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
     assert_eq!(
         cancellation.events,
         [
-            workflow_event(11, failure_stopped, cancelling.clone()),
+            cancellation_event(11, reason, 8_888),
             step_event(
                 12,
                 "cActive",

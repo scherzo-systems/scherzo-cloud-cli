@@ -159,11 +159,13 @@ a trusted external guide owns action selection, explanation, and approval.
 ## Runner doctor
 
 Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to
-the runner. Today the default set contains only `environment.command.git`. It executes
-the `git` resolved from the runner process's `PATH`, requires a parseable version at
-least `0.0.1`, and reports a pass or failure for that check. A successful result does
-not mean the runner is ready to serve assignments: runner configuration, machine
-identity, connectivity, and execution requirements are not implemented or checked yet.
+the runner. Without an agent configuration, the default set contains only
+`environment.command.git`. It executes the `git` resolved from the runner process's
+`PATH`, requires a parseable version at least `0.0.1`, and reports a pass or failure for
+that check. Supplying `--pi-executable <PATH>` also makes
+`execution.harness.pi-json-v1` a default check. A successful result does not mean the
+runner is ready to serve assignments: runner configuration, machine identity,
+connectivity, and other execution requirements are not all checked yet.
 
 ```sh
 # Run the default checks.
@@ -171,6 +173,11 @@ scherzo-cloud runner doctor
 
 # Run a named check. Repeat --check to select more than one registered check.
 scherzo-cloud runner doctor --check environment.command.git
+
+# Validate an explicitly configured Pi installation only.
+scherzo-cloud runner doctor \
+  --check execution.harness.pi-json-v1 \
+  --pi-executable /absolute/path/to/pi
 
 # List IDs without running any checks.
 scherzo-cloud runner doctor --list-checks
@@ -183,7 +190,17 @@ Checks are registered statically by components compiled into this executable. Th
 command does not load plugins, read human credentials, contact Scherzo Cloud, or change
 runner configuration. It executes `git --version` with a five-second deadline, bounds
 captured standard output, drains standard error without reporting it, and exposes only
-a normalized numeric version in its report. The JSON report has no `ready` field.
+a normalized numeric version in its report.
+
+The Pi check canonicalizes only the configured executable and invokes that absolute path
+with one version probe and one capability-help probe. The probes use a cleared child
+environment, fresh temporary Pi state and working directory, and project/resource
+discovery disable flags. It admits only exact version 0.82.1 with the JSON event,
+ephemeral-session, extension, system-prompt append, and invocation-scoped `--approve`
+capabilities required by `PiJsonV1`. It does not search `PATH`, inspect model metadata or
+credentials, execute the caller's project, or read or write saved Pi project-trust
+decisions. Missing, unexecutable, malformed, unsupported-version, and missing-capability
+outcomes have distinct report codes. The JSON report has no `ready` field.
 
 ## Runner serve
 
@@ -197,6 +214,18 @@ reuse `~/.scherzo-cloud/credentials.json`.
 scherzo-cloud runner serve \
   --gateway-url wss://runners.example.test/v1/connect \
   --credential-file ~/.scherzo-cloud/runner.credential
+```
+
+Agent-capable startup additionally takes an explicit installation. Runner initialization
+validates it once and retains the resulting absolute path, exact 0.82.1 version,
+`PiJsonV1` profile, and required non-model capabilities for later admission; it does not
+repeat the probes while serving.
+
+```sh
+scherzo-cloud runner serve \
+  --gateway-url wss://runners.example.test/v1/connect \
+  --credential-file ~/.scherzo-cloud/runner.credential \
+  --pi-executable /absolute/path/to/pi
 ```
 
 For local development only, use a loopback `ws://` URL with the explicit opt-in:

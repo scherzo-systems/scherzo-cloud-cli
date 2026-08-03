@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Node development dependencies
+node_modules/
+
 # devenv and direnv
 .devenv*
 .direnv/

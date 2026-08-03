@@ -1,10 +1,12 @@
 mod git;
-pub(crate) mod process;
+mod pi;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::PathBuf;
 
 use git::GitCheck;
+use pi::PiCheck;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CheckDescriptor {
@@ -39,6 +41,21 @@ pub(crate) struct Outcome {
     pub(crate) code: &'static str,
     pub(crate) message: String,
     pub(crate) details: std::collections::BTreeMap<String, String>,
+}
+
+impl Outcome {
+    pub(crate) fn fail(
+        code: &'static str,
+        message: &'static str,
+        details: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            status: Status::Fail,
+            code,
+            message: message.to_owned(),
+            details,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -143,9 +160,10 @@ impl Registry {
     }
 }
 
-pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
+pub(crate) fn built_in_registry(pi_executable: Option<PathBuf>) -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
+    registry.register(Box::new(PiCheck::new(pi_executable)))?;
     Ok(registry)
 }
 
@@ -500,15 +518,22 @@ mod tests {
 
     #[test]
     fn built_in_registry_contains_the_default_git_check() {
-        let registry = built_in_registry().unwrap();
+        let registry = built_in_registry(None).unwrap();
 
         assert_eq!(
             registry.descriptors(),
-            vec![CheckDescriptor {
-                id: "environment.command.git",
-                title: "Git",
-                default: true,
-            }]
+            vec![
+                CheckDescriptor {
+                    id: "environment.command.git",
+                    title: "Git",
+                    default: true,
+                },
+                CheckDescriptor {
+                    id: "execution.harness.pi-json-v1",
+                    title: "PiJsonV1 installation",
+                    default: false,
+                },
+            ]
         );
     }
 }

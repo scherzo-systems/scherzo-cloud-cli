@@ -6,6 +6,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
 
+use super::observation::{
+    CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
+    ExecutionObservation, ExecutionObserver, SourceSequence,
+};
+use super::runtime::ActionId;
+
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +52,19 @@ impl CapturedDiagnosticStream {
             fully_drained: false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        bytes: impl Into<Arc<[u8]>>,
+        discarded_bytes: u64,
+        fully_drained: bool,
+    ) -> Self {
+        Self {
+            bytes: bytes.into(),
+            truncation: (discarded_bytes != 0).then_some(DiagnosticTruncation { discarded_bytes }),
+            fully_drained,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +74,17 @@ pub(crate) struct StepDiagnostic {
 }
 
 impl StepDiagnostic {
+    #[cfg(test)]
+    pub(crate) fn from_streams(
+        standard_output: CapturedDiagnosticStream,
+        standard_error: CapturedDiagnosticStream,
+    ) -> Self {
+        Self {
+            standard_output,
+            standard_error,
+        }
+    }
+
     pub(crate) fn standard_output(&self) -> &CapturedDiagnosticStream {
         &self.standard_output
     }
@@ -74,22 +104,40 @@ impl StepDiagnosticLog {
         lock_entries(&self.entries).get(step).cloned()
     }
 
-    pub(super) fn start_capture<StandardOutput, StandardError>(
+    pub(super) fn start_capture<Deadline, Observer, StandardOutput, StandardError>(
         &self,
         step: String,
+        invocation: ActionId,
         maximum_stream_bytes: NonZeroU64,
         standard_output: StandardOutput,
         standard_error: StandardError,
+        observer: Observer,
     ) -> PendingStepDiagnostic
     where
+        Deadline: Send + 'static,
+        Observer: ExecutionObserver<Deadline>,
         StandardOutput: AsyncRead + Unpin + Send + 'static,
         StandardError: AsyncRead + Unpin + Send + 'static,
     {
         PendingStepDiagnostic {
             log: self.clone(),
-            step,
-            standard_output: tokio::spawn(drain_stream(standard_output, maximum_stream_bytes)),
-            standard_error: tokio::spawn(drain_stream(standard_error, maximum_stream_bytes)),
+            step: step.clone(),
+            standard_output: tokio::spawn(drain_stream(
+                standard_output,
+                maximum_stream_bytes,
+                step.clone(),
+                invocation,
+                CommandOutputSource::StandardOutput,
+                observer.clone(),
+            )),
+            standard_error: tokio::spawn(drain_stream(
+                standard_error,
+                maximum_stream_bytes,
+                step,
+                invocation,
+                CommandOutputSource::StandardError,
+                observer,
+            )),
         }
     }
 
@@ -166,12 +214,21 @@ impl PendingStepDiagnostic {
     }
 }
 
-async fn drain_stream(
+async fn drain_stream<Deadline, Observer>(
     mut reader: impl AsyncRead + Unpin,
     maximum_bytes: NonZeroU64,
-) -> CapturedDiagnosticStream {
+    step: String,
+    invocation: ActionId,
+    source: CommandOutputSource,
+    observer: Observer,
+) -> CapturedDiagnosticStream
+where
+    Deadline: Send + 'static,
+    Observer: ExecutionObserver<Deadline>,
+{
     let mut capture = DiagnosticStreamCapture::new(maximum_bytes);
     let mut fully_drained = false;
+    let mut sequence = SourceSequence::first();
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
 
     loop {
@@ -184,9 +241,32 @@ async fn drain_stream(
             Err(failure) if failure.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        capture.capture(&buffer[..read]);
+        let bytes = Arc::<[u8]>::from(&buffer[..read]);
+        capture.capture(&bytes);
+        observer
+            .observe(ExecutionObservation::CommandOutput(
+                CommandOutputObservation {
+                    step: step.clone(),
+                    invocation,
+                    source,
+                    sequence,
+                    bytes,
+                },
+            ))
+            .await;
+        sequence = sequence.next();
     }
 
+    observer
+        .observe(ExecutionObservation::CommandOutputClosed(
+            CommandOutputClosedObservation {
+                step,
+                invocation,
+                source,
+                sequence,
+            },
+        ))
+        .await;
     capture.finish(fully_drained)
 }
 

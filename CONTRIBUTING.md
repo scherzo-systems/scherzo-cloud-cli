@@ -21,8 +21,11 @@ If you inspect or modify a local copy, run the canonical check from the reposito
 ```
 
 The project uses its standalone devenv environment to provide the minimum Rust toolchain
-declared in `Cargo.toml`. Run `devenv test` for the same formatting, linting, testing,
-source-boundary, and release build checks used by CI.
+declared in `Cargo.toml` and the pinned Node 24 line used by the private PiJsonV1
+extension project. Run `devenv test` for the same formatting, linting, testing,
+source-boundary, and release build checks used by CI. The canonical check performs a
+locked npm install before checking the extension; run
+`./scripts/check-pi-json-v1-extension` for that focused path.
 
 ## Rust baseline upgrades
 

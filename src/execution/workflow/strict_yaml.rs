@@ -4,7 +4,12 @@ use yaml_rust2::scanner::{Marker, Scanner, TScalarStyle, TokenType};
 
 use super::DecodeFailure;
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Value, DecodeFailure> {
+pub(super) struct ParsedYaml {
+    pub(super) value: Value,
+    pub(super) step_order: Vec<String>,
+}
+
+pub(super) fn parse(bytes: &[u8]) -> Result<ParsedYaml, DecodeFailure> {
     let source = std::str::from_utf8(bytes).map_err(|_| DecodeFailure::malformed_yaml())?;
     reject_forbidden_tokens(source)?;
 
@@ -20,7 +25,13 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Value, DecodeFailure> {
         return Err(DecodeFailure::forbidden_yaml());
     }
 
-    receiver.document.ok_or_else(DecodeFailure::malformed_yaml)
+    receiver
+        .document
+        .map(|value| ParsedYaml {
+            value,
+            step_order: receiver.step_order,
+        })
+        .ok_or_else(DecodeFailure::malformed_yaml)
 }
 
 fn reject_forbidden_tokens(source: &str) -> Result<(), DecodeFailure> {
@@ -51,6 +62,7 @@ struct JsonEventReceiver {
     document: Option<Value>,
     document_count: usize,
     error: Option<BuildError>,
+    step_order: Vec<String>,
 }
 
 enum Container {
@@ -58,6 +70,8 @@ enum Container {
     Mapping {
         entries: Map<String, Value>,
         pending_key: Option<String>,
+        is_step_mapping: bool,
+        source_keys: Vec<String>,
     },
 }
 
@@ -121,9 +135,18 @@ impl MarkedEventReceiver for JsonEventReceiver {
                     Err(BuildError::Forbidden)
                 } else {
                     validate_collection_tag(tag.as_ref(), CoreTag::Mapping).map(|()| {
+                        let is_step_mapping = matches!(
+                            self.stack.as_slice(),
+                            [Container::Mapping {
+                                pending_key: Some(key),
+                                ..
+                            }] if key == "steps"
+                        );
                         self.stack.push(Container::Mapping {
                             entries: Map::new(),
                             pending_key: None,
+                            is_step_mapping,
+                            source_keys: Vec::new(),
                         });
                     })
                 }
@@ -162,12 +185,17 @@ impl JsonEventReceiver {
         let Some(Container::Mapping {
             entries,
             pending_key,
+            is_step_mapping,
+            source_keys,
         }) = self.stack.pop()
         else {
             return Err(BuildError::Malformed);
         };
         if pending_key.is_some() {
             return Err(BuildError::Malformed);
+        }
+        if is_step_mapping {
+            self.step_order = source_keys;
         }
         self.insert_node(Value::Object(entries))
     }
@@ -181,6 +209,8 @@ impl JsonEventReceiver {
             Some(Container::Mapping {
                 entries,
                 pending_key,
+                is_step_mapping,
+                source_keys,
             }) => {
                 if let Some(key) = pending_key.take() {
                     if entries.contains_key(&key) {
@@ -195,6 +225,9 @@ impl JsonEventReceiver {
                 };
                 if key == "<<" {
                     return Err(BuildError::Forbidden);
+                }
+                if *is_step_mapping {
+                    source_keys.push(key.clone());
                 }
                 *pending_key = Some(key);
                 Ok(())

@@ -112,13 +112,27 @@ version, authentication, account, usage errors, invalid runner configuration, an
 ## Runner doctor
 
 `runner doctor` is offline. It does not load human deployment configuration, read the
-human credential store, contact a network service, or create persistent state. Its only
-built-in probe executes the `git` resolved from the runner process's `PATH` with the
-fixed `--version` argument.
+human credential store, contact a network service, or create persistent state. The Git
+check executes the `git` resolved from the runner process's `PATH` with the fixed
+`--version` argument.
 
-The probe has a five-second deadline, drains both child output streams so a child cannot
-block on a full pipe, retains at most 8 KiB of standard output, kills and waits for a
-child that exceeds the deadline, and rejects truncated output. It never copies raw
-standard output, standard error, operating-system error text, or process exit text into
-a human report, JSON report, or diagnostic. The only command-derived value reported is
-the strictly parsed and normalized numeric Git version.
+When an operator supplies `--pi-executable`, the PiJsonV1 check canonicalizes that
+configured path without searching `PATH`, then invokes only the resulting absolute path
+for a `--version` probe and a capability-help probe. The latter combines `--help` with
+Pi's invocation-scoped project rejection and resource-discovery disable flags. Both
+probes run from a fresh private temporary working directory with fresh home, Pi agent,
+and XDG directories. Their child environment is cleared before Scherzo supplies only
+those paths, deterministic no-color controls, and Pi's offline, no-update-check, and
+no-install-telemetry controls. Temporary state is removed after validation.
+
+The validator does not request provider or model data, check authentication, execute a
+workflow or caller project, install or update Pi, or substitute another executable. The
+help probe verifies the one-run `--approve` flag without reading `defaultProjectTrust` or
+reading or mutating the operator's `trust.json`.
+
+Each probe has a five-second deadline, runs in an owned process group, drains both child
+output streams so a child cannot block on a full pipe, bounds retained standard output,
+and terminates and reaps the group before joining those streams. Truncated output is
+rejected. Reports never copy raw standard output, standard error, operating-system error
+text, or process exit text. They expose only strictly parsed versions, closed capability
+identifiers, and the normalized path of a compatible installation.

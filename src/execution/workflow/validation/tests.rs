@@ -158,18 +158,43 @@ fn branching_and_disconnected_dag_retains_every_edge_and_step() {
         ("right", "join"),
     ] {
         let dependency_position = workflow
-            .topological_order
+            .presentation_order
             .iter()
             .position(|step| step == dependency)
             .unwrap();
         let dependent_position = workflow
-            .topological_order
+            .presentation_order
             .iter()
             .position(|step| step == dependent)
             .unwrap();
         assert!(dependency_position < dependent_position);
     }
-    assert!(workflow.topological_order.contains(&"isolated".to_owned()));
+    assert!(workflow.presentation_order.contains(&"isolated".to_owned()));
+}
+
+#[test]
+fn presentation_order_uses_source_index_for_each_kahn_ready_set() {
+    let source = "schemaVersion: 1
+steps:
+  z:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+  a:
+    kind: cmd
+    dependsOn: [z]
+    command:
+      argv: [\"true\"]
+  m:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+";
+
+    let workflow = validate_yaml(source).unwrap();
+
+    assert_eq!(workflow.source_order, ["z", "a", "m"]);
+    assert_eq!(workflow.presentation_order, ["z", "a", "m"]);
 }
 
 #[test]
@@ -364,7 +389,7 @@ steps:
     assert_eq!(consumer.inputs.len(), 2);
     assert_eq!(consumer.inputs["first"].value_type, WorkflowValueType::File);
     assert_eq!(
-        workflow.topological_order,
+        workflow.presentation_order,
         ["alpha", "beta", "middle", "zeta", "consumer"]
     );
 }
@@ -403,7 +428,7 @@ steps:
     };
     assert_eq!(consumer.common.prerequisites, ["middle", "producer"]);
     assert_eq!(
-        workflow.topological_order,
+        workflow.presentation_order,
         ["producer", "middle", "consumer"]
     );
 }
@@ -439,7 +464,7 @@ exports:
     };
     assert!(consumer.common.prerequisites.is_empty());
     assert!(workflow.required_imports.prompt);
-    assert_eq!(workflow.topological_order, ["consumer", "producer"]);
+    assert_eq!(workflow.presentation_order, ["consumer", "producer"]);
 }
 
 #[test]
@@ -621,13 +646,13 @@ exports:
 
     assert!(workflow.required_imports.prompt);
     let consumer_position = workflow
-        .topological_order
+        .presentation_order
         .iter()
         .position(|step| step == "consumer")
         .unwrap();
     for producer in ["responseProducer", "resultProducer"] {
         let producer_position = workflow
-            .topological_order
+            .presentation_order
             .iter()
             .position(|step| step == producer)
             .unwrap();

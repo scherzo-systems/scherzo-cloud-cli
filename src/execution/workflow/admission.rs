@@ -2,9 +2,13 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+#[cfg(test)]
+use std::future::{Future as _, poll_fn};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Barrier;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -17,18 +21,74 @@ pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancellationReason {
     UserRequest,
+    TerminationRequest,
+    CallerOutputFailure,
     RunnerShutdown,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct CancellationPendingPollBarrier {
+    reached: Arc<Barrier>,
+    resume: Arc<Barrier>,
+}
+
+#[cfg(test)]
+impl CancellationPendingPollBarrier {
+    pub(super) fn new() -> Self {
+        Self {
+            reached: Arc::new(Barrier::new(2)),
+            resume: Arc::new(Barrier::new(2)),
+        }
+    }
+
+    pub(super) fn wait_until_pending(&self) {
+        self.reached.wait();
+    }
+
+    pub(super) fn resume(&self) {
+        self.resume.wait();
+    }
+
+    fn block_until_resumed(&self) {
+        self.reached.wait();
+        self.resume.wait();
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for CancellationPendingPollBarrier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancellationPendingPollBarrier")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CancellationSource {
     reason: watch::Sender<Option<CancellationReason>>,
+    #[cfg(test)]
+    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
 }
 
 impl CancellationSource {
     pub(crate) fn new() -> Self {
         let (reason, _) = watch::channel(None);
-        Self { reason }
+        Self {
+            reason,
+            #[cfg(test)]
+            pending_poll_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_pending_poll_barrier(
+        pending_poll_barrier: CancellationPendingPollBarrier,
+    ) -> Self {
+        let mut source = Self::new();
+        source.pending_poll_barrier = Some(pending_poll_barrier);
+        source
     }
 
     pub(crate) fn request_cancellation(&self, reason: CancellationReason) -> bool {
@@ -49,8 +109,52 @@ impl CancellationSource {
         self.cancellation_reason().is_some()
     }
 
-    pub(super) fn subscribe(&self) -> watch::Receiver<Option<CancellationReason>> {
-        self.reason.subscribe()
+    pub(super) fn subscribe(&self) -> CancellationSubscription {
+        CancellationSubscription {
+            receiver: self.reason.subscribe(),
+            #[cfg(test)]
+            pending_poll_barrier: self.pending_poll_barrier.clone(),
+        }
+    }
+}
+
+pub(super) struct CancellationSubscription {
+    receiver: watch::Receiver<Option<CancellationReason>>,
+    #[cfg(test)]
+    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
+}
+
+impl CancellationSubscription {
+    pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        #[cfg(not(test))]
+        {
+            self.receiver.changed().await
+        }
+        #[cfg(test)]
+        {
+            let mut pending_poll_barrier = self.pending_poll_barrier.take();
+            let changed = self.receiver.changed();
+            tokio::pin!(changed);
+            poll_fn(|context| {
+                let result = changed.as_mut().poll(context);
+                if result.is_pending()
+                    && let Some(barrier) = pending_poll_barrier.take()
+                {
+                    barrier.block_until_resumed();
+                }
+                result
+            })
+            .await
+        }
+    }
+
+    pub(super) fn borrow_and_update(&mut self) -> watch::Ref<'_, Option<CancellationReason>> {
+        self.receiver.borrow_and_update()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_changed(&self) -> Result<bool, watch::error::RecvError> {
+        self.receiver.has_changed()
     }
 }
 
@@ -205,6 +309,7 @@ pub(crate) struct InputLimits {
     maximum_values: usize,
     maximum_value_bytes: u64,
     maximum_total_bytes: u64,
+    maximum_live_bytes: u64,
 }
 
 impl InputLimits {
@@ -212,11 +317,13 @@ impl InputLimits {
         maximum_values: usize,
         maximum_value_bytes: u64,
         maximum_total_bytes: u64,
+        maximum_live_bytes: u64,
     ) -> Self {
         Self {
             maximum_values,
             maximum_value_bytes,
             maximum_total_bytes,
+            maximum_live_bytes,
         }
     }
 }
@@ -281,6 +388,7 @@ pub(crate) struct ExecutionLimits {
     maximum_input_values: NonZeroUsize,
     maximum_input_value_bytes: NonZeroU64,
     maximum_total_input_bytes: NonZeroU64,
+    maximum_live_input_bytes: NonZeroU64,
     maximum_step_log_bytes: NonZeroU64,
 }
 
@@ -311,6 +419,10 @@ impl ExecutionLimits {
 
     pub(crate) fn maximum_total_input_bytes(self) -> NonZeroU64 {
         self.maximum_total_input_bytes
+    }
+
+    pub(crate) fn maximum_live_input_bytes(self) -> NonZeroU64 {
+        self.maximum_live_input_bytes
     }
 
     pub(crate) fn maximum_step_log_bytes(self) -> NonZeroU64 {
@@ -384,6 +496,7 @@ pub(crate) enum AdmissionFailureKind {
     NonPositiveInputValues,
     NonPositiveInputValueBytes,
     NonPositiveTotalInputBytes,
+    NonPositiveLiveInputBytes,
     NonPositiveStepLogBytes,
     NonPositiveCancellationGrace,
     CancellationGraceTooLong,
@@ -402,6 +515,7 @@ pub(crate) enum AdmissionLocation {
     MaximumInputValues,
     MaximumInputValueBytes,
     MaximumTotalInputBytes,
+    MaximumLiveInputBytes,
     MaximumStepLogBytes,
     CancellationPolicy,
 }
@@ -523,6 +637,13 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumTotalInputBytes,
             )
         })?;
+    let maximum_live_input_bytes = NonZeroU64::new(context.limits.input.maximum_live_bytes)
+        .ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveLiveInputBytes,
+                AdmissionLocation::MaximumLiveInputBytes,
+            )
+        })?;
     let maximum_step_log_bytes = NonZeroU64::new(context.limits.maximum_step_log_bytes)
         .ok_or_else(|| {
             AdmissionFailure::new(
@@ -558,6 +679,7 @@ pub(crate) fn admit_workflow(
                 maximum_input_values,
                 maximum_input_value_bytes,
                 maximum_total_input_bytes,
+                maximum_live_input_bytes,
                 maximum_step_log_bytes,
             },
             environment: context.environment.without_reserved_variables(),

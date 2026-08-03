@@ -12,9 +12,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports,
-    admit_workflow,
+    CancellationPendingPollBarrier, CancellationPolicy, CancellationReason, CancellationSource,
+    CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits,
+    ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{Action, StepState};
@@ -58,7 +58,7 @@ impl CoordinatorClock for TestClock {
 }
 
 type TestAction = RequestedAction<String, String, String, TestInstant>;
-type TestCommit = CommittedReduction<String, String>;
+type TestCommit = CommittedReduction<String, String, TestInstant>;
 type TestResult = CoordinationResult<String, String>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,7 +130,7 @@ fn admitted_fixture(source: CancellationSource, grace: Duration) -> AdmittedFixt
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                 1024 * 1024,
             ),
             EnvironmentSnapshot::default(),
@@ -153,8 +153,16 @@ struct ScheduleTranscript {
 }
 
 async fn run_cancellation_schedule() -> ScheduleTranscript {
-    let cancellation = CancellationSource::new();
+    let pending_poll = CancellationPendingPollBarrier::new();
+    let cancellation = CancellationSource::with_pending_poll_barrier(pending_poll.clone());
     let fixture = admitted_fixture(cancellation.clone(), Duration::from_secs(7));
+    let cancellation_request = cancellation.clone();
+    let requester = std::thread::spawn(move || {
+        pending_poll.wait_until_pending();
+        let admitted = cancellation_request.request_cancellation(CancellationReason::UserRequest);
+        pending_poll.resume();
+        admitted
+    });
     let clock_reads = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
     let timeline = Arc::new(Mutex::new(Vec::new()));
@@ -200,7 +208,6 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
             .send(DriverOccurrence::step_started(step.clone(), start_id))
             .await
             .unwrap();
-        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         start_release.resume.send(()).unwrap();
 
         let cancellation_commit = commits.recv().await.unwrap();
@@ -274,6 +281,7 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
     };
 
     let (result, (commits, actions)) = tokio::join!(coordinator.run(), driver);
+    assert!(requester.join().unwrap());
     assert_eq!(clock_reads.load(Ordering::SeqCst), 1);
     ScheduleTranscript {
         commits,
@@ -284,7 +292,7 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
 }
 
 #[tokio::test]
-async fn cancellation_priority_commit_order_and_terminal_shutdown_are_deterministic() {
+async fn cancellation_after_pending_poll_precedes_and_preserves_ready_driver() {
     let first = run_cancellation_schedule().await;
     let second = run_cancellation_schedule().await;
 

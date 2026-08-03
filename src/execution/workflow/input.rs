@@ -156,6 +156,7 @@ struct InputStagingInner {
     maximum_values: usize,
     maximum_value_bytes: u64,
     maximum_total_bytes: u64,
+    maximum_live_bytes: u64,
     lifecycle: RwLock<InputStagingLifecycle>,
     reservations: Mutex<ReservationLedger>,
     #[cfg(test)]
@@ -224,6 +225,7 @@ impl InputStaging {
             limits.maximum_input_values().get(),
             limits.maximum_input_value_bytes().get(),
             limits.maximum_total_input_bytes().get(),
+            limits.maximum_live_input_bytes().get(),
         )
     }
 
@@ -234,6 +236,7 @@ impl InputStaging {
         maximum_values: usize,
         maximum_value_bytes: u64,
         maximum_total_bytes: u64,
+        maximum_live_bytes: u64,
     ) -> Result<Self, InputStagingFailure> {
         let canonical_execution_root = fs::canonicalize(execution_root)
             .map_err(|_| InputStagingFailure::ExecutionRootUnavailable)?;
@@ -260,6 +263,7 @@ impl InputStaging {
                 maximum_values,
                 maximum_value_bytes,
                 maximum_total_bytes,
+                maximum_live_bytes,
                 lifecycle: RwLock::new(InputStagingLifecycle::Active),
                 reservations: Mutex::new(ReservationLedger::default()),
                 #[cfg(test)]
@@ -274,6 +278,7 @@ impl InputStaging {
             && self.inner.maximum_values == limits.maximum_input_values().get()
             && self.inner.maximum_value_bytes == limits.maximum_input_value_bytes().get()
             && self.inner.maximum_total_bytes == limits.maximum_total_input_bytes().get()
+            && self.inner.maximum_live_bytes == limits.maximum_live_input_bytes().get()
             && directory_identity(execution.root()).is_some_and(|(device, inode)| {
                 device == self.inner.execution_root_device
                     && inode == self.inner.execution_root_inode
@@ -332,16 +337,12 @@ impl InputStaging {
             .inner
             .maximum_values
             .saturating_mul(self.inner.maximum_parallel_steps);
-        let maximum_live_bytes = self
-            .inner
-            .maximum_total_bytes
-            .saturating_mul(u64::try_from(self.inner.maximum_parallel_steps).unwrap_or(u64::MAX));
         let updated_views = reservations.usage.views.checked_add(1);
         let updated_values = reservations.usage.values.checked_add(requested.values);
         let updated_bytes = reservations.usage.bytes.checked_add(requested.bytes);
         if updated_views.is_none_or(|views| views > self.inner.maximum_parallel_steps)
             || updated_values.is_none_or(|values| values > maximum_live_values)
-            || updated_bytes.is_none_or(|bytes| bytes > maximum_live_bytes)
+            || updated_bytes.is_none_or(|bytes| bytes > self.inner.maximum_live_bytes)
         {
             return Err(InputPreparationFailure::staging(
                 InputPreparationFailureKind::LiveLimitExceeded,

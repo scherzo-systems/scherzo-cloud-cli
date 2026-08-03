@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 
+use crate::execution::pi::validate_pi_installation;
 use crate::runner::credential::Credential;
 use crate::runner::service::Config;
 
@@ -21,10 +22,26 @@ pub(super) struct Command {
     /// Permit ws:// only for an explicit loopback development gateway URL.
     #[arg(long)]
     allow_insecure_http: bool,
+
+    /// Validate and retain this Pi executable for agent-capable assignments.
+    #[arg(long, value_name = "PATH")]
+    pi_executable: Option<PathBuf>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
+        let pi_installation = match self
+            .pi_executable
+            .as_deref()
+            .map(validate_pi_installation)
+            .transpose()
+        {
+            Ok(installation) => installation,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         let credential = match Credential::load(&self.credential_file) {
             Ok(credential) => credential,
             Err(error) => {
@@ -33,7 +50,10 @@ impl Command {
             }
         };
         let config = match Config::new(&self.gateway_url, credential, self.allow_insecure_http) {
-            Ok(config) => config,
+            Ok(config) => match pi_installation {
+                Some(installation) => config.with_pi_installation(installation),
+                None => config,
+            },
             Err(error) => {
                 eprintln!("Error: {error}");
                 return ExitCode::FAILURE;
