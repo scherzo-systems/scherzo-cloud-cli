@@ -435,6 +435,23 @@ where
         run: &WorkflowRunResult,
         publication: PublicationPresentation<'_>,
     ) -> WorkflowRunPresentationResult {
+        self.finish_internal(run, publication, true)
+    }
+
+    pub(crate) fn finish_without_terminal_json(
+        &self,
+        run: &WorkflowRunResult,
+        publication: PublicationPresentation<'_>,
+    ) -> WorkflowRunPresentationResult {
+        self.finish_internal(run, publication, false)
+    }
+
+    fn finish_internal(
+        &self,
+        run: &WorkflowRunResult,
+        publication: PublicationPresentation<'_>,
+        emit_terminal_json: bool,
+    ) -> WorkflowRunPresentationResult {
         let mut state = lock_state(&self.state);
         if state.finished {
             return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
@@ -470,7 +487,8 @@ where
                 WorkflowRunPresentationResult::PublicationFailed
             }
             PublicationPresentation::Published(terminal) => {
-                if state.mode == PresentationMode::Json
+                if emit_terminal_json
+                    && state.mode == PresentationMode::Json
                     && let Err(error) = write_pretty_json(&mut state.standard_output, terminal)
                 {
                     let failure = PresentationFailure::writer(

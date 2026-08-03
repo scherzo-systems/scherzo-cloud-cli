@@ -12,9 +12,9 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, organization profile management and one-page member-directory
-reads, local Workflow V1 definition validation, runner diagnostics, and a
-development-only outbound runner transport. `runner serve` connects to an explicitly
-configured runner gateway, receives and
+reads, local Workflow V1 definition validation and command-only execution, runner
+diagnostics, and a development-only outbound runner transport. `runner serve` connects
+to an explicitly configured runner gateway, receives and
 transport-acknowledges assignment offers, and emits structured service events without
 claiming that execution occurred.
 
@@ -63,6 +63,36 @@ execute command or agent steps, check harness or model availability, read human 
 runner credentials, or contact Scherzo Cloud. A zero exit status means only that the
 local definition resolved successfully.
 
+## Local workflow execution
+
+Use `scherzo-cloud workflow run` to execute a command-only Workflow V1 DAG in an
+existing caller-owned directory and atomically publish its terminal result:
+
+```sh
+scherzo-cloud workflow run \
+  --source-root ./my-repository \
+  --execution-root ./my-checkout \
+  --result-dir ./results/check-001 \
+  --max-parallel 2 \
+  .scherzo/workflows/check.yaml
+```
+
+The result destination must not exist, and its parent must already exist. Successful,
+failed, and orderly cancelled workflows publish `result.json` plus available exports
+before the command exits. The committed result-directory path is the only local run
+handle. Add `--json` for one terminal schema-version-1 object on stdout while the live
+presentation remains on stderr, or `--plain` to force the line presentation on stdout.
+
+Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
+`--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
+completely before execution. Workflow commands always receive closed standard input;
+the CLI never forwards prompt input or terminal input to them.
+
+Local execution snapshots the inherited environment after resolution and removes
+`SCHERZO_` variables before launching commands. The adapter does not read Scherzo human
+or runner credentials and does not contact Scherzo Cloud. Agent steps are rejected at
+admission without probing Pi, a provider, or a model.
+
 ## Version inspection
 
 Use `scherzo-cloud --version` or `scherzo-cloud version` for conventional one-line
@@ -72,7 +102,7 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 {
   "schemaVersion": 1,
   "command": "scherzo-cloud",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "executablePath": "/resolved/path/to/scherzo-cloud",
   "buildIdentity": "unknown"
 }
@@ -318,7 +348,7 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.6`. Planning takes the highest fragment impact since the latest stable tag:
+`0.8`. Planning takes the highest fragment impact since the latest stable tag:
 `internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
 and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
 fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact
@@ -372,7 +402,7 @@ devenv shell
 For the same entrypoint used by CI, run:
 
 ```sh
-devenv test
+./scripts/strict-devenv test
 ```
 
 The check verifies public-source isolation, formatting, every target and feature on the

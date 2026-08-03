@@ -106,6 +106,18 @@ pub(crate) struct ValidatedPiInstallation {
 }
 
 impl ValidatedPiInstallation {
+    #[cfg(test)]
+    pub(crate) fn fixture(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            version: PiVersion::V0_82_1,
+            profile: PiCompatibilityProfile::PiJsonV1,
+            capabilities: PiJsonV1Capabilities {
+                required: REQUIRED_CAPABILITIES,
+            },
+        }
+    }
+
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
     }

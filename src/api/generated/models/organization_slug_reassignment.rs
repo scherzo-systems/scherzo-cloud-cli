@@ -15,21 +15,29 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// OrganizationSlugReassignment : The target and its resulting slug. Former-holder identity and the target's consumed prior context are intentionally omitted.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrganizationMembershipHistoryList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::OrganizationMembershipHistoryEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct OrganizationSlugReassignment {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "slug")]
+    pub slug: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
 }
 
-impl OrganizationMembershipHistoryList {
+impl OrganizationSlugReassignment {
+    /// The target and its resulting slug. Former-holder identity and the target's consumed prior context are intentionally omitted.
     pub fn new(
-        items: Vec<models::OrganizationMembershipHistoryEntry>,
-    ) -> OrganizationMembershipHistoryList {
-        OrganizationMembershipHistoryList {
-            items,
-            next_cursor: None,
+        organization_id: String,
+        slug: String,
+        updated_at: String,
+    ) -> OrganizationSlugReassignment {
+        OrganizationSlugReassignment {
+            organization_id,
+            slug,
+            updated_at,
         }
     }
 }

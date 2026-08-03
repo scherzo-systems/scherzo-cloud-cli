@@ -6,6 +6,10 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
+use crate::execution::pi::{
+    PiCapability, PiCompatibilityProfile, PiVersion, ValidatedPiInstallation,
+};
+use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 
 const COMMAND_WORKFLOW: &str = r#"schemaVersion: 1
@@ -49,6 +53,31 @@ steps:
           - ref: imports.prompt
 "#;
 
+const MIXED_WORKFLOW: &str = r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+  agent:
+    kind: agent
+    dependsOn: [prepare]
+    agent:
+      profile: coding
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+          - ref: imports.prompt
+"#;
+
 struct WorkflowFixture {
     _temporary: TempDir,
     source_root: PathBuf,
@@ -63,7 +92,7 @@ impl WorkflowFixture {
         fs::create_dir(&source_root).unwrap();
         fs::create_dir(&execution_root).unwrap();
         fs::write(source_root.join("workflow.yaml"), source).unwrap();
-        if source == AGENT_WORKFLOW {
+        if source.contains("kind: agent") {
             fs::write(source_root.join("system.md"), "System.\n").unwrap();
             fs::write(source_root.join("message.md"), "Message.\n").unwrap();
         }
@@ -91,6 +120,212 @@ impl WorkflowFixture {
             grace,
         )
     }
+}
+
+struct AdmissionOperationRecorder {
+    directory: PathBuf,
+    operation_log: PathBuf,
+}
+
+impl AdmissionOperationRecorder {
+    fn new(root: &Path) -> Self {
+        let directory = root.join("admission-operation-recorder");
+        fs::create_dir(&directory).unwrap();
+        let operation_log = directory.join("operations.log");
+        let script = "#!/bin/sh\noperation_log=${0%/*}/operations.log\nprintf 'native operation: %s\\n' \"$*\" >> \"$operation_log\"\nexit 97\n";
+        for executable in [directory.join("validated-pi"), directory.join("pi")] {
+            fs::write(&executable, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        Self {
+            directory,
+            operation_log,
+        }
+    }
+
+    fn installation(&self) -> ValidatedPiInstallation {
+        ValidatedPiInstallation::fixture(self.directory.join("validated-pi"))
+    }
+
+    fn path(&self) -> &Path {
+        &self.directory
+    }
+
+    fn assert_empty(&self) {
+        assert!(
+            !self.operation_log.exists(),
+            "admission performed a native operation: {}",
+            fs::read_to_string(&self.operation_log).unwrap_or_default()
+        );
+    }
+}
+
+const THINKING_LEVELS: [(&str, Thinking); 7] = [
+    ("off", Thinking::Off),
+    ("minimal", Thinking::Minimal),
+    ("low", Thinking::Low),
+    ("medium", Thinking::Medium),
+    ("high", Thinking::High),
+    ("xhigh", Thinking::XHigh),
+    ("max", Thinking::Max),
+];
+
+fn all_thinking_levels_workflow() -> String {
+    let mut source = String::from("schemaVersion: 1\nagentProfiles:\n");
+    for (index, (thinking, _)) in THINKING_LEVELS.iter().enumerate() {
+        source.push_str(&format!(
+            "  profile{index}:\n    harness:\n      kind: pi\n      config:\n        model: future-provider/unknown-model-{index}\n        thinking: {thinking}\n"
+        ));
+    }
+    source.push_str("steps:\n");
+    for index in 0..THINKING_LEVELS.len() {
+        source.push_str(&format!(
+            "  agent{index}:\n    kind: agent\n    agent:\n      profile: profile{index}\n      systemPrompt: system.md\n      message:\n        text:\n          - file: message.md\n"
+        ));
+    }
+    source
+}
+
+#[test]
+fn admission_requires_pi_only_for_graphs_containing_agent_steps() {
+    for (source, agent_step_count) in [
+        (AGENT_WORKFLOW, 1),
+        (MIXED_WORKFLOW, 1),
+        (COMMAND_WORKFLOW_WITHOUT_IMPORTS, 0),
+    ] {
+        for supply_installation in [false, true] {
+            let fixture = WorkflowFixture::new(source);
+            let root_before = root_snapshot(&fixture.execution_root);
+            let imports = if agent_step_count == 0 {
+                ResolvedImports::default()
+            } else {
+                ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([]))
+            };
+            let mut context = fixture.context(
+                ExecutionRootLifecycle::EngineOwnedEphemeral,
+                1,
+                Duration::from_secs(1),
+            );
+            if supply_installation {
+                // A validated value is sufficient even when its pinned path no longer exists.
+                context = context.with_pi_installation(ValidatedPiInstallation::fixture(
+                    fixture.execution_root.join("removed-after-validation"),
+                ));
+            }
+
+            let result = admit_workflow(fixture.resolve(), imports, context);
+            if agent_step_count > 0 && !supply_installation {
+                assert_failure(
+                    result,
+                    AdmissionFailureKind::AgentStepRuntimeUnsupported,
+                    AdmissionLocation::Step {
+                        step: "agent".to_owned(),
+                    },
+                );
+            } else {
+                let admitted = result.unwrap();
+                assert_eq!(admitted.agent_steps().len(), agent_step_count);
+            }
+            assert_eq!(root_snapshot(&fixture.execution_root), root_before);
+        }
+    }
+}
+
+#[test]
+fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_lookups() {
+    let source = all_thinking_levels_workflow();
+    let fixture = WorkflowFixture::new(&source);
+    let resolved = fixture.resolve();
+    let recorder = AdmissionOperationRecorder::new(fixture._temporary.path());
+    let installation = recorder.installation();
+    let root_before = root_snapshot(&fixture.execution_root);
+
+    // Admission must consume only the resolved profile snapshots, not mutable source or registries.
+    fs::remove_dir_all(&fixture.source_root).unwrap();
+    let admitted = admit_workflow(
+        resolved,
+        ResolvedImports::default(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            ExecutionPolicyLimits::new(
+                2,
+                CaptureLimits::new(11, 3 * 1024 * 1024, 9 * 1024 * 1024),
+                InputLimits::new(13, 2 * 1024 * 1024, 7 * 1024 * 1024, 5 * 1024 * 1024),
+                96 * 1024,
+            ),
+            EnvironmentSnapshot::new([("PATH", recorder.path().to_string_lossy().into_owned())]),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(19)),
+        )
+        .with_pi_installation(installation.clone()),
+    )
+    .unwrap();
+
+    assert_eq!(admitted.agent_steps().len(), THINKING_LEVELS.len());
+    for (index, (_, thinking)) in THINKING_LEVELS.iter().enumerate() {
+        let step = admitted.agent_step(&format!("agent{index}")).unwrap();
+        assert_eq!(step.installation(), &installation);
+        assert_eq!(
+            step.installation().executable(),
+            recorder.path().join("validated-pi")
+        );
+        assert_eq!(step.installation().version(), PiVersion::V0_82_1);
+        assert_eq!(
+            step.installation().profile(),
+            PiCompatibilityProfile::PiJsonV1
+        );
+        assert!(
+            step.installation()
+                .capabilities()
+                .required()
+                .contains(&PiCapability::InvocationScopedProjectTrust)
+        );
+        assert_eq!(
+            step.configuration().model,
+            format!("future-provider/unknown-model-{index}")
+        );
+        assert_eq!(step.configuration().thinking, *thinking);
+        assert_eq!(
+            step.project_trust(),
+            ProjectTrustPolicy::InvocationScopedEnabled
+        );
+        assert_eq!(step.limits().maximum_system_prompt_bytes().get(), 64 * 1024);
+        assert_eq!(step.limits().maximum_message_bytes().get(), 64 * 1024);
+        assert_eq!(step.limits().maximum_response_bytes().get(), 1024 * 1024);
+        assert_eq!(step.limits().maximum_result_bytes().get(), 1024 * 1024);
+        assert_eq!(
+            step.limits()
+                .maximum_result_rejection_feedback_bytes()
+                .get(),
+            8 * 1024
+        );
+        assert_eq!(
+            step.limits().result_validation_deadline().get(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            step.limits().result_settlement_grace().get(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            step.limits().adapter_protocol().maximum_frame_bytes().get(),
+            16 * 1024 * 1024
+        );
+    }
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_captured_file_bytes()
+            .get(),
+        3 * 1024 * 1024
+    );
+    recorder.assert_empty();
+    assert_eq!(root_snapshot(&fixture.execution_root), root_before);
 }
 
 #[test]

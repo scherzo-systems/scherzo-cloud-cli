@@ -1,6 +1,5 @@
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Args;
@@ -14,18 +13,8 @@ const COMMAND_NAME: &str = "scherzo-cloud workflow validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(
-        long,
-        value_name = "ROOT",
-        help = "Explicit directory boundary for workflow source files"
-    )]
-    source_root: PathBuf,
-
-    #[arg(
-        value_name = "WORKFLOW_PATH",
-        help = "Workflow YAML path selected within the source root"
-    )]
-    workflow_path: PathBuf,
+    #[command(flatten)]
+    source: super::LocalWorkflowSource,
 
     #[arg(long, help = "Print the schema-version-1 validation result as JSON")]
     json: bool,
@@ -33,7 +22,7 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        match resolve(&self.source_root, &self.workflow_path) {
+        match resolve(&self.source.source_root, &self.source.workflow_path) {
             Ok(workflow) => {
                 let result = if self.json {
                     write_json_valid(&workflow)

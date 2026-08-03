@@ -732,6 +732,40 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
         )
         .unwrap()
     );
+
+    let cleanup_terminal = publish_workflow_result(
+        &fixture.destination("cleanup-failure"),
+        &fixture.artifacts,
+        &run,
+    )
+    .unwrap();
+    let cleanup_stdout = SharedWriter::default();
+    let cleanup_stderr = SharedWriter::default();
+    let cleanup = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Json, ColorChoice::Never),
+        cleanup_stdout.clone(),
+        cleanup_stderr.clone(),
+    )
+    .start(
+        &fixture.workflow,
+        2,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    assert!(matches!(
+        cleanup.finish_without_terminal_json(
+            &run,
+            PublicationPresentation::Published(&cleanup_terminal),
+        ),
+        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+    ));
+    assert!(cleanup_stdout.text().is_empty());
+    assert!(
+        cleanup_stderr
+            .text()
+            .contains("workflow succeeded · 3 succeeded")
+    );
+    assert!(cleanup_stderr.text().contains("result: "));
 }
 
 #[test]

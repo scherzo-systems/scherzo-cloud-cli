@@ -162,7 +162,7 @@ mod tests {
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
         assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
-        assert!(help.contains("workflow      Inspect local Workflow V1 definitions"));
+        assert!(help.contains("workflow      Validate and run local Workflow V1 definitions"));
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -224,9 +224,25 @@ mod tests {
         let help = command_help(&["workflow"]);
         let validate = command_help(&["workflow", "validate"]);
 
+        assert!(help.contains("run       Execute a local command-only Workflow V1 bundle"));
         assert!(
             help.contains("validate  Validate a local Workflow V1 bundle without executing it")
         );
+        let run = command_help(&["workflow", "run"]);
+        for option in [
+            "--source-root <ROOT>",
+            "--execution-root <PATH>",
+            "--result-dir <PATH>",
+            "--prompt-file <PATH|->",
+            "--attachment <MEDIA_TYPE> <PATH>",
+            "--max-parallel <COUNT>",
+            "--plain",
+            "--json",
+            "--color <auto|always|never>",
+            "<WORKFLOW_PATH>",
+        ] {
+            assert!(run.contains(option), "run help should contain {option}");
+        }
         assert!(validate.contains("--source-root <ROOT>"));
         assert!(validate.contains("<WORKFLOW_PATH>"));
         assert!(validate.contains("--json"));

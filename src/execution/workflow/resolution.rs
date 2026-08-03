@@ -118,6 +118,7 @@ pub(crate) struct WorkflowContentDigest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowSourceProvenance {
+    pub(crate) source_root: PathBuf,
     pub(crate) workflow_path: String,
 }
 
@@ -177,12 +178,14 @@ fn resolve_loaded_workflow(
     };
     resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
 
+    let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
     let content_digest = digest_source_closure(&source_closure)?;
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
         source: WorkflowSourceProvenance {
+            source_root,
             workflow_path: workflow_source.canonical_path,
         },
         content_digest,

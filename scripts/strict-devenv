@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: scripts/strict-devenv DEVENV_ARGUMENT...
+
+Validate the exported source's declarations and committed lock in a read-only
+preflight, then run the requested Devenv payload. Stale lock state fails before
+the payload, even when Devenv replaces the lock path atomically.
+EOF
+}
+
+die() {
+  printf 'strict-devenv: %s\n' "$*" >&2
+  exit 1
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+lock_path=$public_root/devenv.lock
+[[ -f "$public_root/devenv.nix" ]] || die "devenv.nix is required"
+[[ -e "$public_root/devenv.yaml" ]] || die "a usable devenv.yaml is required"
+[[ -f "$lock_path" && ! -L "$lock_path" ]] || die "devenv.lock must be a regular file"
+command -v devenv >/dev/null 2>&1 || die "devenv is required"
+
+devenv_environment=(
+  -u DEVENV_STATE
+  -u DEVENV_RUNTIME
+  -u DEVENV_DOTFILE
+  -u DEVENV_PROFILE
+  -u DEVENV_TASKS
+  -u DEVENV_TASK_FILE
+  "DEVENV_ROOT=$public_root"
+)
+
+validate_lock() (
+  local original_mode lock_snapshot
+
+  if original_mode=$(stat -c '%a' "$lock_path" 2>/dev/null); then
+    :
+  elif original_mode=$(stat -f '%Lp' "$lock_path" 2>/dev/null); then
+    :
+  else
+    die "cannot read permissions for devenv.lock"
+  fi
+
+  lock_snapshot=$(mktemp "${TMPDIR:-/tmp}/scherzo-devenv-lock.XXXXXX")
+  cp -p "$lock_path" "$lock_snapshot"
+
+  # Invoked indirectly by the EXIT trap below.
+  # shellcheck disable=SC2329
+  cleanup() {
+    local status=$? lock_changed=false comparison_status
+    trap - EXIT HUP INT TERM
+
+    if ! chmod "$original_mode" "$lock_path"; then
+      printf 'strict-devenv: cannot restore permissions for devenv.lock\n' >&2
+      status=1
+    fi
+    if git diff --no-index --quiet -- "$lock_snapshot" "$lock_path"; then
+      :
+    else
+      comparison_status=$?
+      if [[ $comparison_status -eq 1 ]]; then
+        lock_changed=true
+        if ! cp "$lock_snapshot" "$lock_path" \
+          || ! chmod "$original_mode" "$lock_path"; then
+          printf 'strict-devenv: cannot restore devenv.lock\n' >&2
+        fi
+      else
+        printf 'strict-devenv: cannot compare devenv.lock with its snapshot\n' >&2
+      fi
+      status=1
+    fi
+    rm -f "$lock_snapshot"
+
+    if [[ "$lock_changed" == true ]]; then
+      printf 'strict-devenv: devenv changed devenv.lock; restored the committed bytes\n' >&2
+    fi
+    exit "$status"
+  }
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  chmod a-w "$lock_path"
+  cd "$public_root"
+  env "${devenv_environment[@]}" devenv shell -- "$BASH" -c :
+)
+
+validate_lock
+cd "$public_root"
+exec env "${devenv_environment[@]}" devenv "$@"

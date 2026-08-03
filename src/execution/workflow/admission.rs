@@ -13,10 +13,21 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use super::agent::{AgentInvocationLimits, PositiveDuration};
+use super::pi::PiConfig;
+use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
-use super::validated::ValidatedStep;
+use super::validated::{ValidatedHarness, ValidatedStep};
+use crate::execution::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
 
 pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
+const MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES: u64 = 64 * 1024;
+const MAXIMUM_AGENT_MESSAGE_BYTES: u64 = 64 * 1024;
+const MAXIMUM_AGENT_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_AGENT_RESULT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES: u64 = 8 * 1024;
+const AGENT_RESULT_VALIDATION_DEADLINE: Duration = Duration::from_secs(5);
+const AGENT_RESULT_SETTLEMENT_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancellationReason {
@@ -107,6 +118,16 @@ impl CancellationSource {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation_reason().is_some()
+    }
+
+    pub(crate) async fn wait_for_cancellation(&self) -> CancellationReason {
+        let mut subscription = self.subscribe();
+        loop {
+            if let Some(reason) = *subscription.borrow_and_update() {
+                return reason;
+            }
+            let _ = subscription.changed().await;
+        }
     }
 
     pub(super) fn subscribe(&self) -> CancellationSubscription {
@@ -359,6 +380,7 @@ pub(crate) struct ExecutionContext {
     limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
+    pi_installation: Option<ValidatedPiInstallation>,
 }
 
 impl ExecutionContext {
@@ -375,7 +397,13 @@ impl ExecutionContext {
             limits,
             environment,
             cancellation,
+            pi_installation: None,
         }
+    }
+
+    pub(crate) fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
+        self.pi_installation = Some(installation);
+        self
     }
 }
 
@@ -461,11 +489,43 @@ impl AdmittedExecutionContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectTrustPolicy {
+    InvocationScopedEnabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedAgentStep {
+    installation: Arc<ValidatedPiInstallation>,
+    configuration: PiConfig,
+    project_trust: ProjectTrustPolicy,
+    limits: AgentInvocationLimits<PiJsonV1ProtocolLimits>,
+}
+
+impl AdmittedAgentStep {
+    pub(crate) fn installation(&self) -> &ValidatedPiInstallation {
+        &self.installation
+    }
+
+    pub(crate) fn configuration(&self) -> &PiConfig {
+        &self.configuration
+    }
+
+    pub(crate) fn project_trust(&self) -> ProjectTrustPolicy {
+        self.project_trust
+    }
+
+    pub(crate) fn limits(&self) -> &AgentInvocationLimits<PiJsonV1ProtocolLimits> {
+        &self.limits
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedWorkflow {
     workflow: Arc<ResolvedWorkflow>,
     imports: ResolvedImports,
     execution: AdmittedExecutionContext,
+    agent_steps: Arc<BTreeMap<String, AdmittedAgentStep>>,
 }
 
 impl AdmittedWorkflow {
@@ -479,6 +539,14 @@ impl AdmittedWorkflow {
 
     pub(crate) fn execution(&self) -> &AdmittedExecutionContext {
         &self.execution
+    }
+
+    pub(crate) fn agent_step(&self, step: &str) -> Option<&AdmittedAgentStep> {
+        self.agent_steps.get(step)
+    }
+
+    pub(crate) fn agent_steps(&self) -> &BTreeMap<String, AdmittedAgentStep> {
+        &self.agent_steps
     }
 }
 
@@ -576,17 +644,7 @@ pub(crate) fn admit_workflow(
         ));
     }
 
-    if let Some((step, _)) = workflow
-        .definition
-        .steps
-        .iter()
-        .find(|(_, step)| matches!(step, ValidatedStep::Agent(_)))
-    {
-        return Err(AdmissionFailure::new(
-            AdmissionFailureKind::AgentStepRuntimeUnsupported,
-            AdmissionLocation::Step { step: step.clone() },
-        ));
-    }
+    let agent_steps = admit_agent_steps(&workflow, context.pi_installation.as_ref())?;
 
     let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
         .ok_or_else(|| {
@@ -685,7 +743,76 @@ pub(crate) fn admit_workflow(
             environment: context.environment.without_reserved_variables(),
             cancellation: context.cancellation,
         },
+        agent_steps: Arc::new(agent_steps),
     })
+}
+
+fn admit_agent_steps(
+    workflow: &ResolvedWorkflow,
+    installation: Option<&ValidatedPiInstallation>,
+) -> Result<BTreeMap<String, AdmittedAgentStep>, AdmissionFailure> {
+    let installation = installation.map(|installation| Arc::new(installation.clone()));
+    workflow
+        .definition
+        .steps
+        .iter()
+        .filter_map(|(step_name, step)| {
+            let ValidatedStep::Agent(step) = step else {
+                return None;
+            };
+            Some((step_name, step))
+        })
+        .map(|(step_name, step)| {
+            let installation = installation.as_ref().ok_or_else(|| {
+                AdmissionFailure::new(
+                    AdmissionFailureKind::AgentStepRuntimeUnsupported,
+                    AdmissionLocation::Step {
+                        step: step_name.clone(),
+                    },
+                )
+            })?;
+            let PiCompatibilityProfile::PiJsonV1 = installation.profile();
+            let configuration = match &step.agent.harness {
+                ValidatedHarness::Pi(configuration) => configuration.clone(),
+            };
+            Ok((
+                step_name.clone(),
+                AdmittedAgentStep {
+                    installation: Arc::clone(installation),
+                    configuration,
+                    project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
+                    limits: pi_json_v1_limits(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
+    AgentInvocationLimits::new(
+        positive_u64(MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES),
+        positive_u64(MAXIMUM_AGENT_MESSAGE_BYTES),
+        positive_u64(MAXIMUM_AGENT_RESPONSE_BYTES),
+        positive_u64(MAXIMUM_AGENT_RESULT_BYTES),
+        positive_u64(MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES),
+        positive_duration(AGENT_RESULT_VALIDATION_DEADLINE),
+        positive_duration(AGENT_RESULT_SETTLEMENT_GRACE),
+        PiJsonV1ProtocolLimits::profile(),
+    )
+}
+
+fn positive_u64(value: u64) -> NonZeroU64 {
+    let Some(value) = NonZeroU64::new(value) else {
+        unreachable!("the fixed PiJsonV1 byte bounds are positive");
+    };
+    value
+}
+
+fn positive_duration(value: Duration) -> PositiveDuration {
+    let Some(value) = PositiveDuration::new(value) else {
+        unreachable!("the fixed PiJsonV1 duration bounds are positive");
+    };
+    value
 }
 
 fn canonical_execution_root(root: &Path) -> Result<PathBuf, AdmissionFailure> {

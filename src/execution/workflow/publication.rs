@@ -436,22 +436,52 @@ struct NoopPublicationObserver;
 
 impl PublicationObserver for NoopPublicationObserver {}
 
+pub(crate) struct PreparedResultDestination {
+    target: PublicationTarget,
+}
+
+pub(crate) fn prepare_result_destination(
+    destination: &Path,
+) -> Result<PreparedResultDestination, LocalPublicationError> {
+    PublicationTarget::validate(destination).map(|target| PreparedResultDestination { target })
+}
+
+pub(crate) fn publish_prepared_workflow_result(
+    destination: &PreparedResultDestination,
+    artifacts: &ArtifactStaging,
+    run: &WorkflowRunResult,
+) -> Result<WorkflowRunTerminalResultV1, LocalPublicationError> {
+    publish_prepared_with_observer(destination, artifacts, run, &mut NoopPublicationObserver)
+}
+
 pub(crate) fn publish_workflow_result(
     destination: &Path,
     artifacts: &ArtifactStaging,
     run: &WorkflowRunResult,
 ) -> Result<WorkflowRunTerminalResultV1, LocalPublicationError> {
-    publish_with_observer(destination, artifacts, run, &mut NoopPublicationObserver)
+    let destination = prepare_result_destination(destination)?;
+    publish_prepared_workflow_result(&destination, artifacts, run)
 }
 
+#[cfg(test)]
 fn publish_with_observer(
     destination: &Path,
     artifacts: &ArtifactStaging,
     run: &WorkflowRunResult,
     observer: &mut impl PublicationObserver,
 ) -> Result<WorkflowRunTerminalResultV1, LocalPublicationError> {
-    let target = PublicationTarget::validate(destination)?;
-    let mut staging = StagingDirectory::create(&target)?;
+    let destination = prepare_result_destination(destination)?;
+    publish_prepared_with_observer(&destination, artifacts, run, observer)
+}
+
+fn publish_prepared_with_observer(
+    destination: &PreparedResultDestination,
+    artifacts: &ArtifactStaging,
+    run: &WorkflowRunResult,
+    observer: &mut impl PublicationObserver,
+) -> Result<WorkflowRunTerminalResultV1, LocalPublicationError> {
+    let target = &destination.target;
+    let mut staging = StagingDirectory::create(target)?;
     observe(
         observer,
         &PublicationBoundary::StagingCreated,
@@ -617,7 +647,7 @@ fn publish_with_observer(
             LocalPublicationFailureKind::VerificationUnavailable,
         )
     })?;
-    staging.commit(&target)?;
+    staging.commit(target)?;
     drop(staging);
 
     let outcome = result.outcome;
@@ -626,7 +656,7 @@ fn publish_with_observer(
         command: COMMAND,
         outcome,
         exit_status: exit_status(run, outcome),
-        result_directory: target.normalized,
+        result_directory: target.normalized.clone(),
         result,
     };
     Ok(terminal)
@@ -1123,6 +1153,7 @@ impl PublicationTarget {
                     LocalPublicationFailureKind::InvalidResultPath,
                 )
             })?;
+        verify_publication_capability(&parent)?;
         Ok(Self {
             supplied_parent,
             parent,
@@ -1345,6 +1376,68 @@ impl Drop for StagingDirectory<'_> {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+fn verify_publication_capability(parent: &OwnedFd) -> Result<(), LocalPublicationError> {
+    let source = create_validation_directory(parent)?;
+    for _ in 0..STAGING_ATTEMPTS {
+        let destination = format!(
+            ".result-preflight-{}",
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
+        );
+        match renameat_with(
+            parent,
+            &source,
+            parent,
+            &destination,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                return unlinkat(parent, destination, AtFlags::REMOVEDIR).map_err(|_| {
+                    LocalPublicationError::new(
+                        LocalPublicationPhase::TargetValidation,
+                        LocalPublicationFailureKind::ParentUnavailable,
+                    )
+                });
+            }
+            Err(Errno::EXIST | Errno::NOTEMPTY) => {}
+            Err(_) => {
+                let _ = unlinkat(parent, &source, AtFlags::REMOVEDIR);
+                return Err(LocalPublicationError::new(
+                    LocalPublicationPhase::TargetValidation,
+                    LocalPublicationFailureKind::AtomicPublicationUnavailable,
+                ));
+            }
+        }
+    }
+    let _ = unlinkat(parent, source, AtFlags::REMOVEDIR);
+    Err(LocalPublicationError::new(
+        LocalPublicationPhase::TargetValidation,
+        LocalPublicationFailureKind::AtomicPublicationUnavailable,
+    ))
+}
+
+fn create_validation_directory(parent: &OwnedFd) -> Result<String, LocalPublicationError> {
+    for _ in 0..STAGING_ATTEMPTS {
+        let identity = format!(
+            ".result-preflight-{}",
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
+        );
+        match mkdirat(parent, &identity, Mode::RWXU) {
+            Ok(()) => return Ok(identity),
+            Err(Errno::EXIST) => {}
+            Err(_) => {
+                return Err(LocalPublicationError::new(
+                    LocalPublicationPhase::TargetValidation,
+                    LocalPublicationFailureKind::ParentUnavailable,
+                ));
+            }
+        }
+    }
+    Err(LocalPublicationError::new(
+        LocalPublicationPhase::TargetValidation,
+        LocalPublicationFailureKind::ParentUnavailable,
+    ))
 }
 
 fn create_staging_root(parent: &OwnedFd) -> Result<(String, OwnedFd), LocalPublicationError> {

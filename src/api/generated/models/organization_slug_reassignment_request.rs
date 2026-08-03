@@ -15,21 +15,23 @@
 use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// OrganizationSlugReassignmentRequest : A closed stale-context-safe operator reassignment request.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrganizationMembershipHistoryList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::OrganizationMembershipHistoryEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct OrganizationSlugReassignmentRequest {
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "slug")]
+    pub slug: String,
+    /// The exact lowercase URL-safe organization slug.
+    #[serde(rename = "expectedCurrentSlug")]
+    pub expected_current_slug: String,
 }
 
-impl OrganizationMembershipHistoryList {
-    pub fn new(
-        items: Vec<models::OrganizationMembershipHistoryEntry>,
-    ) -> OrganizationMembershipHistoryList {
-        OrganizationMembershipHistoryList {
-            items,
-            next_cursor: None,
+impl OrganizationSlugReassignmentRequest {
+    /// A closed stale-context-safe operator reassignment request.
+    pub fn new(slug: String, expected_current_slug: String) -> OrganizationSlugReassignmentRequest {
+        OrganizationSlugReassignmentRequest {
+            slug,
+            expected_current_slug,
         }
     }
 }

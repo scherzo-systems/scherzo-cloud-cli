@@ -26,6 +26,8 @@ mod auth_login;
 mod organization;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
+#[path = "cli/workflow_run.rs"]
+mod workflow_run;
 #[path = "cli/workflow_validate.rs"]
 mod workflow_validate;
 
@@ -432,7 +434,7 @@ fn no_arguments_print_composed_root_help() {
     assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
     assert!(stdout.contains("version       Print version information"));
     assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
-    assert!(stdout.contains("workflow      Inspect local Workflow V1 definitions"));
+    assert!(stdout.contains("workflow      Validate and run local Workflow V1 definitions"));
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }
@@ -472,6 +474,7 @@ fn workflow_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud workflow [COMMAND]"));
+    assert!(stdout.contains("run       Execute a local command-only Workflow V1 bundle"));
     assert!(stdout.contains("validate  Validate a local Workflow V1 bundle without executing it"));
     assert!(output.stderr.is_empty());
 }

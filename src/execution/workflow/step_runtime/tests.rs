@@ -2114,7 +2114,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
 }
 
 #[tokio::test]
-async fn input_staging_cleanup_failure_is_reported_and_retryable() {
+async fn input_staging_cleanup_is_deferred_to_caller_and_retryable() {
     with_watchdog(async {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -2163,9 +2163,10 @@ async fn input_staging_cleanup_failure_is_reported_and_retryable() {
 
         let (result, input_path) = tokio::join!(execution, command);
 
-        assert_eq!(result, Err(CoordinationError::InputStagingCleanup));
+        assert!(result.is_ok());
         assert!(input_path.exists());
         assert_eq!(artifacts.inputs.reservation_usage(), (1, 1, 12));
+        assert!(artifacts.inputs.release().is_err());
 
         artifacts.inputs.unblock_cleanup();
         artifacts.inputs.release().unwrap();

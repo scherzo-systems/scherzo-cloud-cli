@@ -26,6 +26,7 @@ required_files=(
   scripts/check-msrv
   scripts/check-pi-json-v1-extension
   scripts/check-structure
+  scripts/strict-devenv
   scripts/classify-release-path
   scripts/format-pi-json-v1-extension
   scripts/release-impact
@@ -34,6 +35,7 @@ required_files=(
   scripts/test-release-impact
   scripts/test-release-notes
   scripts/test-release-path-classifier
+  scripts/test-strict-devenv
   src/execution/workflow/pi-json-v1-extension/package.json
   src/execution/workflow/pi-json-v1-extension/package-lock.json
   src/execution/workflow/pi-json-v1-extension/tsconfig.json
@@ -81,6 +83,7 @@ while IFS= read -r -d '' script_file; do
   bash -n "$script_file"
 done < <(find "$public_root/scripts" -type f -print0)
 
+"$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/test-fixture-git"
 "$public_root/scripts/test-git-isolation-check"
 "$public_root/scripts/check-test-git-isolation"

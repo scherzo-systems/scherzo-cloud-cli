@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+strict_devenv=$public_root/scripts/strict-devenv
+workflow=$public_root/.github/workflows/check.yml
+
+fail() {
+  printf 'public strict-devenv test: %s\n' "$*" >&2
+  exit 1
+}
+
+check_ci_entrypoint() {
+  local candidate=$1
+  if grep -Eq '(^|[[:space:]])devenv[[:space:]]+test([[:space:]]|$)' "$candidate"; then
+    return 1
+  fi
+  grep -Fq 'run: ./scripts/strict-devenv test' "$candidate"
+}
+
+check_ci_entrypoint "$workflow" \
+  || fail "public CI does not enter Devenv through scripts/strict-devenv"
+
+direct_workflow=$(mktemp)
+test_root=$(mktemp -d)
+cleanup() {
+  rm -f "$direct_workflow"
+  rm -rf "$test_root"
+}
+trap cleanup EXIT
+printf '%s\n' 'run: devenv test' >"$direct_workflow"
+if check_ci_entrypoint "$direct_workflow"; then
+  fail "public CI inventory accepted a direct Devenv test invocation"
+fi
+
+fixture=$test_root/source
+mkdir -p "$fixture/scripts" "$fixture/bin"
+cp "$strict_devenv" "$fixture/scripts/strict-devenv"
+chmod +x "$fixture/scripts/strict-devenv"
+printf '{ }\n' >"$fixture/devenv.nix"
+printf 'inputs: {}\n' >"$fixture/devenv.yaml"
+printf 'committed public lock bytes\n' >"$fixture/devenv.lock"
+cp "$fixture/devenv.lock" "$test_root/lock-before"
+
+bash_binary=$(type -P bash) || fail "bash is required"
+printf '#!%s\n' "$bash_binary" >"$fixture/bin/devenv"
+cat >>"$fixture/bin/devenv" <<'STUB'
+set -euo pipefail
+
+selected_root=${DEVENV_ROOT:-$PWD}
+if [[ $(<"$selected_root/devenv.nix") == *"fixture declaration drift"* ]]; then
+  replacement=$selected_root/devenv.lock.replacement.$$
+  printf 'normalized public lock bytes\n' >"$replacement"
+  mv -f -- "$replacement" "$selected_root/devenv.lock"
+fi
+if [[ -n ${PUBLIC_TEST_ROOT_CAPTURE:-} ]]; then
+  printf '%s\n' "$selected_root" >"$PUBLIC_TEST_ROOT_CAPTURE"
+fi
+if [[ -n ${PUBLIC_TEST_STATE_CAPTURE:-} ]]; then
+  : >"$PUBLIC_TEST_STATE_CAPTURE"
+  for name in DEVENV_STATE DEVENV_RUNTIME DEVENV_DOTFILE DEVENV_PROFILE DEVENV_TASKS DEVENV_TASK_FILE; do
+    if [[ -v $name ]]; then
+      printf '%s\n' "$name" >>"$PUBLIC_TEST_STATE_CAPTURE"
+    fi
+  done
+fi
+if [[ $# -eq 1 && $1 == test ]]; then
+  touch "${PUBLIC_TEST_PAYLOAD:?}"
+  exit 0
+fi
+if [[ $# -ge 3 && $1 == shell && $2 == -- ]]; then
+  shift 2
+  exec "$@"
+fi
+printf 'unexpected fixture Devenv arguments: %s\n' "$*" >&2
+exit 2
+STUB
+chmod +x "$fixture/bin/devenv"
+
+printf '{ } # fixture declaration drift\n' >"$fixture/devenv.nix"
+stale_payload=$test_root/stale-payload
+set +e
+PATH="$fixture/bin:$PATH" \
+  PUBLIC_TEST_PAYLOAD="$stale_payload" \
+  "$fixture/scripts/strict-devenv" test >"$test_root/stale-output" 2>&1
+stale_status=$?
+set -e
+[[ $stale_status -ne 0 ]] || fail "declaration/lock drift unexpectedly passed"
+[[ ! -e "$stale_payload" ]] || fail "stale public validation reached its test payload"
+cmp -s "$test_root/lock-before" "$fixture/devenv.lock" \
+  || fail "stale public validation changed the checked-in lock bytes"
+
+printf '{ }\n' >"$fixture/devenv.nix"
+clean_payload=$test_root/clean-payload
+root_capture=$test_root/root-capture
+state_capture=$test_root/state-capture
+PATH="$fixture/bin:$PATH" \
+  DEVENV_ROOT="$test_root/wrong-root" \
+  DEVENV_STATE=outer-state \
+  DEVENV_RUNTIME=outer-runtime \
+  DEVENV_DOTFILE=outer-dotfile \
+  DEVENV_PROFILE=outer-profile \
+  DEVENV_TASKS=outer-tasks \
+  DEVENV_TASK_FILE=outer-task-file \
+  PUBLIC_TEST_PAYLOAD="$clean_payload" \
+  PUBLIC_TEST_ROOT_CAPTURE="$root_capture" \
+  PUBLIC_TEST_STATE_CAPTURE="$state_capture" \
+  "$fixture/scripts/strict-devenv" test
+[[ -e "$clean_payload" ]] || fail "clean public validation did not run its test payload"
+[[ $(<"$root_capture") == "$fixture" ]] \
+  || fail "public strict validation did not own DEVENV_ROOT"
+[[ ! -s "$state_capture" ]] \
+  || fail "public strict validation leaked inherited Devenv project state"
+cmp -s "$test_root/lock-before" "$fixture/devenv.lock" \
+  || fail "clean public validation changed the checked-in lock bytes"
+
+printf 'Public strict Devenv entrypoint checks passed.\n'

@@ -472,7 +472,6 @@ pub(crate) trait ActionPort<Action> {
 pub(crate) enum CoordinationError {
     ArtifactStagingMismatch,
     InputStagingMismatch,
-    InputStagingCleanup,
     OccurrenceChannelClosed,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,

@@ -1455,11 +1455,7 @@ where
         .run()
         .await;
     lifecycle.shutdown().await;
-    let result = result?;
-    inputs
-        .release()
-        .map_err(|_| CoordinationError::InputStagingCleanup)?;
-    Ok(result)
+    result
 }
 
 enum StepBody<'a> {
