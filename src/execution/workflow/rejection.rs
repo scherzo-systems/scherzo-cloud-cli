@@ -230,7 +230,11 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
         ),
         ResolutionFailureKind::InvalidResultSchemaDialect => (
             "invalid_result_schema_dialect",
-            "Declare JSON Schema Draft 2020-12 in the agent result schema.",
+            "Use one Draft 2020-12 schema resource without authored vocabularies.",
+        ),
+        ResolutionFailureKind::InvalidResultSchemaReference => (
+            "invalid_result_schema_reference",
+            "Keep result-schema references within one self-contained schema resource.",
         ),
         ResolutionFailureKind::InvalidResultSchema => (
             "invalid_result_schema",

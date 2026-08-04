@@ -35,6 +35,7 @@ fi
 
 fixture=$test_root/source
 mkdir -p "$fixture/scripts" "$fixture/bin"
+fixture=$(cd "$fixture" && pwd -P)
 cp "$strict_devenv" "$fixture/scripts/strict-devenv"
 chmod +x "$fixture/scripts/strict-devenv"
 printf '{ }\n' >"$fixture/devenv.nix"

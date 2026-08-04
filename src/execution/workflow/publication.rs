@@ -21,8 +21,9 @@ use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
 use super::admission::CancellationReason;
-use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind, open_directory};
+use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind};
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
+use super::execution_root::open_directory;
 use super::input::InputPreparationFailureKind;
 use super::resolution::WorkflowContentDigest;
 use super::runtime::{
@@ -438,6 +439,12 @@ impl PublicationObserver for NoopPublicationObserver {}
 
 pub(crate) struct PreparedResultDestination {
     target: PublicationTarget,
+}
+
+impl PreparedResultDestination {
+    pub(crate) fn result_directory(&self) -> &str {
+        &self.target.normalized
+    }
 }
 
 pub(crate) fn prepare_result_destination(
@@ -920,6 +927,7 @@ fn start_failure_cause(
         }
         StepStartFailure::OutputsUnsupported => FailureCauseV1::code("outputs_unsupported"),
         StepStartFailure::WorkingDirectory(failure) => FailureCauseV1::code(match failure {
+            WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
             WorkingDirectoryFailure::Unavailable => "working_directory_unavailable",
             WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
             WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",

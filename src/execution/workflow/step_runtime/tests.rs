@@ -33,6 +33,7 @@ use crate::execution::workflow::coordinator::{
     DriverOccurrenceTestAcknowledgement, OccurrenceReceiver, occurrence_channel,
 };
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
+use crate::execution::workflow::execution_root::ExecutionRootPrelaunchBoundary;
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
@@ -1990,6 +1991,105 @@ async fn cwd_and_launch_failures_are_typed_start_occurrences() {
             StepStartFailure::CommandLaunch(CommandLaunchFailure::NotFound),
         )
         .await;
+    })
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum RebindingCommand {
+    Absolute,
+    RelativePath,
+    AbsolutePath,
+}
+
+#[tokio::test]
+async fn execution_root_rebinding_at_the_prelaunch_boundary_fails_before_spawn() {
+    assert_execution_root_rebinding_fails_before_spawn(RebindingCommand::Absolute).await;
+}
+
+#[tokio::test]
+async fn execution_root_rebinding_during_relative_program_resolution_reports_root_failure() {
+    assert_execution_root_rebinding_fails_before_spawn(RebindingCommand::RelativePath).await;
+}
+
+#[tokio::test]
+async fn execution_root_rebinding_during_absolute_path_resolution_reports_root_failure() {
+    assert_execution_root_rebinding_fails_before_spawn(RebindingCommand::AbsolutePath).await;
+}
+
+async fn assert_execution_root_rebinding_fails_before_spawn(command: RebindingCommand) {
+    with_watchdog(async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        let moved_root = temporary.path().join("moved-execution");
+        fs::create_dir(&execution_root).unwrap();
+        let (argv, environment) = match command {
+            RebindingCommand::Absolute => (
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf started > command-ran".to_owned(),
+                ],
+                EnvironmentSnapshot::default(),
+            ),
+            RebindingCommand::RelativePath | RebindingCommand::AbsolutePath => {
+                let executable = execution_root.join("bin/root-bound-command");
+                fs::create_dir_all(executable.parent().unwrap()).unwrap();
+                fs::write(&executable, "#!/bin/sh\nprintf started > command-ran\n").unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+                let search_path = if matches!(command, RebindingCommand::RelativePath) {
+                    OsString::from("bin")
+                } else {
+                    executable.parent().unwrap().as_os_str().to_owned()
+                };
+                (
+                    vec!["root-bound-command".to_owned()],
+                    EnvironmentSnapshot::new([(OsString::from("PATH"), search_path)]),
+                )
+            }
+        };
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let source = workflow_source(&[("task", None, &argv)]);
+        let admitted = admit_fixture(temporary.path(), &execution_root, &source, environment, 1);
+        let artifacts = test_artifacts(&admitted);
+        let boundary = ExecutionRootPrelaunchBoundary::new();
+        admitted
+            .execution()
+            .root_identity()
+            .set_prelaunch_boundary(boundary.clone());
+        let action = start_actions(&admitted)["task"];
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+        let runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        let execution =
+            tokio::spawn(async move { runtime.execute_step("task".to_owned(), action).await });
+
+        let waiting = boundary.clone();
+        tokio::task::spawn_blocking(move || waiting.wait_until_reached())
+            .await
+            .unwrap();
+        fs::rename(&execution_root, &moved_root).unwrap();
+        fs::create_dir(&execution_root).unwrap();
+        boundary.resume();
+
+        assert_eq!(execution.await.unwrap(), Ok(()));
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStartFailed {
+                step: "task".to_owned(),
+                action,
+                cause: StepFailureCause::Start(StepStartFailure::WorkingDirectory(
+                    WorkingDirectoryFailure::ExecutionRootRebound,
+                )),
+            }
+        );
+        assert!(!moved_root.join("command-ran").exists());
+        assert!(!execution_root.join("command-ran").exists());
     })
     .await;
 }

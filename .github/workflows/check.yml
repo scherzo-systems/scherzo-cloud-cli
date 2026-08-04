@@ -134,6 +134,17 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Exercise descriptor-bound command cwd
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          SCHERZO_CLOUD_VERSION: ${{ needs.plan_release.outputs.version }}
+          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.plan_release.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
+            -- --nocapture
       - name: Verify release identity
         shell: bash
         env:

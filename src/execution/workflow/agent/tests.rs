@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::future::{Future, ready};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use super::scripted::{
 };
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, EnvironmentSnapshot};
+use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::runtime::TransitionSequence;
 
 #[derive(Clone)]
@@ -55,6 +56,7 @@ impl AgentAdapter<RecordingObservationSink> for ReturningWithoutTerminalAdapter 
 }
 
 struct InvocationFixture {
+    _temporary: tempfile::TempDir,
     invocation: TestInvocation,
     cancellation: CancellationSource,
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
@@ -63,6 +65,13 @@ struct InvocationFixture {
 }
 
 fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    std::fs::create_dir_all(execution_root.join("worktree")).unwrap();
+    let cwd = AdmittedExecutionRoot::admit(&execution_root)
+        .unwrap()
+        .select_working_directory(Some("worktree"))
+        .unwrap();
     let cancellation = CancellationSource::new();
     let identity = AgentInvocationIdentity::new(
         WorkflowRunId::from(Arc::from("run-fixed")),
@@ -75,6 +84,8 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
     let limits = AgentInvocationLimits::new(
         NonZeroU64::new(64 * 1024).unwrap(),
         NonZeroU64::new(64 * 1024).unwrap(),
+        NonZeroUsize::new(256).unwrap(),
+        NonZeroU64::new(256 * 1024 * 1024).unwrap(),
         NonZeroU64::new(1024 * 1024).unwrap(),
         NonZeroU64::new(1024 * 1024).unwrap(),
         NonZeroU64::new(8 * 1024).unwrap(),
@@ -90,10 +101,8 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
             Arc::from("0.82.1"),
             (),
         ),
-        AgentProcessContext::new(
-            "/execution/worktree".into(),
-            EnvironmentSnapshot::new([("PATH", "/runner/bin")]),
-        ),
+        AgentProcessContext::new(cwd, EnvironmentSnapshot::new([("PATH", "/runner/bin")])),
+        AgentInvocationStaging::new("/staging/invocation/result-endpoint".into()),
         AgentPrompt::new(Arc::from("system"), Arc::from("message")),
         Arc::from([StagedAgentAttachment::new(
             "/staging/invocation/000000".into(),
@@ -109,6 +118,7 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
     );
     let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
     InvocationFixture {
+        _temporary: temporary,
         invocation,
         cancellation,
         observations,
@@ -124,13 +134,14 @@ fn result_mode() -> AgentValueMode {
     }));
     AgentValueMode::Result {
         output: Arc::from("result"),
-        schema: RetainedResultSchema::new(
+        schema: RetainedResultSchema::compile(
             Arc::from(
                 br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
                     .as_slice(),
             ),
             document,
-        ),
+        )
+        .unwrap(),
     }
 }
 
@@ -186,7 +197,17 @@ fn invocation_retains_the_complete_immutable_engine_input() {
     );
     assert_eq!(invocation.adapter().version(), "0.82.1");
     assert_eq!(invocation.adapter().native_configuration(), &());
-    assert_eq!(invocation.process().cwd(), Path::new("/execution/worktree"));
+    assert_eq!(
+        invocation.process().cwd(),
+        std::fs::canonicalize(fixture._temporary.path().join("execution/worktree")).unwrap()
+    );
+    assert!(invocation.process().execution_root_is_bound());
+    let mut command = std::process::Command::new("unused");
+    invocation.process().bind_command(&mut command).unwrap();
+    assert_eq!(
+        invocation.staging().result_endpoint_directory(),
+        Path::new("/staging/invocation/result-endpoint")
+    );
     assert_eq!(
         invocation
             .process()
@@ -220,6 +241,11 @@ fn invocation_retains_the_complete_immutable_engine_input() {
         64 * 1024
     );
     assert_eq!(invocation.limits().maximum_message_bytes().get(), 64 * 1024);
+    assert_eq!(invocation.limits().maximum_attachments().get(), 256);
+    assert_eq!(
+        invocation.limits().maximum_attachment_bytes().get(),
+        256 * 1024 * 1024
+    );
     assert_eq!(
         invocation
             .limits()
@@ -384,6 +410,19 @@ async fn run_success(
         )
     ));
     outcome
+}
+
+#[test]
+fn validation_fatals_map_to_the_closed_agent_failure_causes() {
+    let deadline = PositiveDuration::new(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        AgentFailureCause::from(ResultValidationFatal::LimitExceeded { deadline }),
+        AgentFailureCause::ResultValidationLimitExceeded { deadline }
+    );
+    assert_eq!(
+        AgentFailureCause::from(ResultValidationFatal::WorkerFailed),
+        AgentFailureCause::HarnessProtocolFailed
+    );
 }
 
 #[tokio::test]

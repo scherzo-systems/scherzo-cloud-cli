@@ -1,7 +1,9 @@
+#[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(not(target_os = "macos"))]
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -83,6 +85,12 @@ fn run(args: &[String]) -> Output {
 
 fn result_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path.join("result.json")).unwrap()).unwrap()
+}
+
+fn normalized_result_destination(path: &Path) -> PathBuf {
+    fs::canonicalize(path.parent().unwrap())
+        .unwrap()
+        .join(path.file_name().unwrap())
 }
 
 fn producer_consumer_source() -> &'static str {
@@ -173,7 +181,11 @@ fn json_run_executes_imports_closed_stdin_publication_and_offline_boundaries() {
     assert_eq!(terminal["command"], "scherzo-cloud workflow run");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["exitStatus"], 0);
-    assert_eq!(terminal["resultDirectory"], destination.to_str().unwrap());
+    let normalized_destination = normalized_result_destination(&destination);
+    assert_eq!(
+        terminal["resultDirectory"],
+        normalized_destination.to_str().unwrap()
+    );
     assert_eq!(terminal["result"], result_json(&destination));
     assert_eq!(terminal["result"]["execution"]["maximumParallelSteps"], 2);
     assert_eq!(terminal["result"]["steps"][0]["id"], "produce");
@@ -190,6 +202,47 @@ fn json_run_executes_imports_closed_stdin_publication_and_offline_boundaries() {
         "workflow run adapter must not contact configured Cloud endpoints"
     );
     assert!(bundle.execution_root.exists());
+}
+
+#[test]
+fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch() {
+    for cwd in [None, Some("nested")] {
+        let cwd_field = cwd.map_or_else(String::new, |cwd| format!("    cwd: {cwd}\n"));
+        let output_path = cwd.map_or("command-ran", |_| "nested/command-ran");
+        let source = format!(
+            "schemaVersion: 1\nsteps:\n  rebind:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"set -eu; mv \\\"$ROOT_PATH\\\" \\\"$MOVED_ROOT\\\"; mkdir \\\"$ROOT_PATH\\\"; mkdir \\\"$ROOT_PATH/nested\\\"; mkdir \\\"$MOVED_ROOT/nested\\\"\"]\n  affected:\n    kind: cmd\n    dependsOn: [rebind]\n{cwd_field}    command:\n      argv: [\"sh\", \"-c\", \"printf ran > command-ran\"]\n    outputs:\n      marker:\n        kind: file\n        path: {output_path}\n        mediaType: text/plain\n"
+        );
+        let bundle = RunBundle::new(&source);
+        let normalized_execution_root = fs::canonicalize(&bundle.execution_root).unwrap();
+        let moved_root = bundle._temporary.path().join("moved-execution");
+        let destination = bundle.result(cwd.unwrap_or("default"));
+        let mut args = bundle.args(&destination);
+        args.insert(args.len() - 1, "--json".to_owned());
+        let output = isolated_command(&args)
+            .env("ROOT_PATH", &bundle.execution_root)
+            .env("MOVED_ROOT", &moved_root)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1));
+        let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(terminal["outcome"], "failed");
+        assert_eq!(terminal["result"]["outcome"], "failed");
+        assert_eq!(terminal["result"]["primaryFailure"]["step"], "affected");
+        assert_eq!(terminal["result"]["primaryFailure"]["phase"], "start");
+        assert_eq!(
+            terminal["result"]["primaryFailure"]["cause"]["code"],
+            "execution_root_rebound"
+        );
+        assert_eq!(
+            terminal["result"]["execution"]["executionRoot"],
+            normalized_execution_root.to_str().unwrap()
+        );
+        assert!(!terminal.to_string().contains("output_missing"));
+        assert!(destination.join("result.json").is_file());
+        assert!(!bundle.execution_root.join(output_path).exists());
+        assert!(!moved_root.join(output_path).exists());
+    }
 }
 
 #[test]
@@ -318,6 +371,8 @@ exports:
     );
 }
 
+// Darwin filesystems reject non-UTF-8 names before the CLI can inspect them.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn attachment_paths_accept_non_utf8_host_names() {
     let bundle = RunBundle::new(
@@ -558,7 +613,8 @@ fn failure_committed_before_a_signal_remains_the_primary_outcome() {
     loop {
         line.clear();
         assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
-        if line.contains("fail  failed") {
+        let mut fields = line.split_whitespace();
+        if fields.nth(1) == Some("fail") && fields.next() == Some("failed") {
             break;
         }
     }

@@ -14,6 +14,7 @@ use crate::execution::workflow::validated::{
 };
 
 const WORKFLOW_PATH: &str = "workflows/complete.yaml";
+const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const RESULT_SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false}
 "#;
 const WORKFLOW: &str = r#"schemaVersion: 1
@@ -158,6 +159,9 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
         }
     );
     assert_eq!(agent.common.cwd.as_deref(), Some("runtime/does-not-exist"));
+    let retained_schema = resolved.result_schema("agent", "result").unwrap();
+    assert_eq!(retained_schema.bytes(), RESULT_SCHEMA);
+    assert_eq!(retained_schema.document()["type"], "object");
 
     let retained_digest = resolved.content_digest.clone();
     fs::write(
@@ -514,6 +518,149 @@ fn required_text_and_result_schema_contracts_are_validated() {
         fs::write(bundle.root.join("schemas/result.schema.json"), bytes).unwrap();
         assert_failure_kind(bundle.resolve(), expected);
     }
+}
+
+#[test]
+fn self_contained_schema_resources_and_fragment_references_resolve() {
+    let accepted = [
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.invalid/authored-root",
+            "$defs": {
+                "slash/name": {"type": "object", "$anchor": "plain"},
+                "til~de": {"type": "object"},
+                "dynamic": {
+                    "$dynamicAnchor": "node",
+                    "type": "object",
+                    "properties": {"next": {"$dynamicRef": "#node"}}
+                }
+            },
+            "allOf": [
+                {"$ref": "#/$defs/slash~1name"},
+                {"$ref": "#/$defs/til~0de"},
+                {"$ref": "#plain"},
+                {"$dynamicRef": "#node"}
+            ]
+        }),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "$ref": "#"
+        }),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "properties": {
+                "$ref": {"type": "string"},
+                "$id": {"type": "string"}
+            },
+            "const": {
+                "$ref": "other.json",
+                "$dynamicRef": "other.json",
+                "$id": "literal",
+                "$schema": "literal",
+                "$vocabulary": "literal"
+            },
+            "enum": [{"$ref": "other.json"}],
+            "default": {"$id": "literal"},
+            "examples": [{"$schema": "literal"}],
+            "pattern": "^(a+)+$"
+        }),
+    ];
+
+    for schema in accepted {
+        let bundle = FixtureBundle::new();
+        write_result_schema(&bundle, &schema);
+        bundle.resolve().unwrap();
+    }
+}
+
+#[test]
+fn unsupported_schema_resources_and_references_fail_at_the_result_schema_location() {
+    let invalid_references = [
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$ref": "other.json"}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$dynamicRef": "https://example.invalid/schema#node"}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$ref": "#/$defs/missing"}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$ref": "#/const/value", "const": {"value": {"type": "string"}}}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$ref": "#missing"}),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "first": {"$anchor": "duplicate"},
+                "second": {"$anchor": "duplicate"}
+            }
+        }),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$defs": {"nested": {"$id": "nested"}}}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "properties": {"nested": {"$id": "nested"}}}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "items": {"$id": "nested"}}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "if": {"$id": "nested"}}),
+    ];
+
+    for schema in invalid_references {
+        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaReference);
+    }
+}
+
+#[test]
+fn nested_dialects_vocabularies_and_unsupported_patterns_are_rejected() {
+    let invalid_dialects = [
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "$defs": {"nested": {"$schema": JSON_SCHEMA_DIALECT}}
+        }),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "$vocabulary": {"https://example.invalid/vocabulary": true}
+        }),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "properties": {"nested": {"$vocabulary": {}}}
+        }),
+    ];
+    for schema in invalid_dialects {
+        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaDialect);
+    }
+
+    for schema in [
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "pattern": "^(a+)\\1$"}),
+        serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "pattern": "(?=a)a"}),
+        serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "patternProperties": {"(?<=a)b": {"type": "string"}}
+        }),
+    ] {
+        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchema);
+    }
+
+    let literal_pattern = FixtureBundle::new();
+    write_result_schema(
+        &literal_pattern,
+        &serde_json::json!({
+            "$schema": JSON_SCHEMA_DIALECT,
+            "const": {"pattern": "(?=unsupported literal)"},
+            "examples": [{"patternProperties": {"(?=literal)": true}}]
+        }),
+    );
+    literal_pattern.resolve().unwrap();
+}
+
+fn assert_result_schema_failure(schema: Value, kind: ResolutionFailureKind) {
+    let bundle = FixtureBundle::new();
+    write_result_schema(&bundle, &schema);
+    assert_failure(
+        bundle.resolve(),
+        kind,
+        ResolutionLocation::ResultSchema {
+            step: "agent".to_owned(),
+            output: "result".to_owned(),
+        },
+    );
+}
+
+fn write_result_schema(bundle: &FixtureBundle, schema: &Value) {
+    fs::write(
+        bundle.root.join("schemas/result.schema.json"),
+        serde_json::to_vec(schema).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]

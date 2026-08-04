@@ -21,6 +21,7 @@ use crate::execution::workflow::publication::{
 };
 use crate::execution::workflow::resolution::{self, WorkflowContentDigest};
 use crate::execution::workflow::runtime::{ActionId, StepFailure, TransitionSequence};
+use crate::execution::workflow::value::CapturedValue;
 
 #[derive(Clone, Default)]
 struct SharedWriter {
@@ -95,13 +96,16 @@ impl Write for FlushFailWriter {
 
 #[derive(Clone)]
 struct TestClock {
-    values: Arc<Mutex<VecDeque<OffsetDateTime>>>,
-    fallback: OffsetDateTime,
+    values: Arc<Mutex<VecDeque<ObservationTime>>>,
+    fallback: ObservationTime,
 }
 
 impl TestClock {
     fn fixed(value: &str) -> Self {
-        let fallback = OffsetDateTime::parse(value, &Rfc3339).unwrap();
+        let fallback = ObservationTime {
+            utc: OffsetDateTime::parse(value, &Rfc3339).unwrap(),
+            monotonic: crate::timing::monotonic_now(),
+        };
         Self {
             values: Arc::new(Mutex::new(VecDeque::new())),
             fallback,
@@ -109,9 +113,29 @@ impl TestClock {
     }
 
     fn sequence(values: &[&str]) -> Self {
+        let monotonic = crate::timing::monotonic_now();
         let values = values
             .iter()
-            .map(|value| OffsetDateTime::parse(value, &Rfc3339).unwrap())
+            .map(|value| ObservationTime {
+                utc: OffsetDateTime::parse(value, &Rfc3339).unwrap(),
+                monotonic,
+            })
+            .collect::<VecDeque<_>>();
+        let fallback = *values.back().unwrap();
+        Self {
+            values: Arc::new(Mutex::new(values)),
+            fallback,
+        }
+    }
+
+    fn sequence_with_elapsed(values: &[(&str, Duration)]) -> Self {
+        let monotonic = crate::timing::monotonic_now();
+        let values = values
+            .iter()
+            .map(|(value, elapsed)| ObservationTime {
+                utc: OffsetDateTime::parse(value, &Rfc3339).unwrap(),
+                monotonic: monotonic + *elapsed,
+            })
             .collect::<VecDeque<_>>();
         let fallback = *values.back().unwrap();
         Self {
@@ -122,7 +146,7 @@ impl TestClock {
 }
 
 impl ObservationClock for TestClock {
-    fn now(&self) -> OffsetDateTime {
+    fn sample(&self) -> ObservationTime {
         self.values
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -140,6 +164,8 @@ fn capabilities(
     TerminalCapabilities {
         stdout_is_terminal: stdout,
         stderr_is_terminal: stderr,
+        stdout_width: None,
+        stderr_width: None,
         term: term.map(OsString::from),
         no_color: no_color.map(OsString::from),
     }
@@ -151,6 +177,13 @@ fn config(mode: RequestedPresentationMode, color: ColorChoice) -> PresentationCo
         color,
         capabilities: capabilities(false, false, Some("xterm-256color"), None),
     }
+}
+
+fn plain_terminal_config(width: usize, color: ColorChoice) -> PresentationConfig {
+    let mut config = config(RequestedPresentationMode::Plain, color);
+    config.capabilities.stdout_is_terminal = true;
+    config.capabilities.stdout_width = Some(width);
+    config
 }
 
 struct Fixture {
@@ -238,6 +271,39 @@ impl Fixture {
             exports: BTreeMap::new(),
         }
     }
+}
+
+async fn render_start(source: &str, config: PresentationConfig) -> String {
+    let fixture = Fixture::new(source);
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(config, stdout.clone(), SharedWriter::default())
+        .start(
+            &fixture.workflow,
+            1,
+            TestClock::fixed("2026-08-02T12:01:44Z"),
+        )
+        .unwrap();
+    presentation
+        .observe(step_transition(
+            "expectedFailure",
+            StepStateKind::Starting,
+            None,
+        ))
+        .await;
+    stdout.text()
+}
+
+fn wrapping_workflow_source() -> &'static str {
+    r#"schemaVersion: 1
+steps:
+  expectedFailure:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf running; sleep 0.20; printf still-running; sleep 0.20; exit 17"
+"#
 }
 
 fn execution_context(root: PathBuf) -> ExecutionContext {
@@ -606,16 +672,144 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
         .await;
 
     let output = stdout.text();
-    assert!(output.contains("view opened 2026-08-02T12:01:44.999999999Z"));
-    assert!(output.contains("[12:01:45.123] a  start  cmd · printf 'hello world'"));
-    assert!(output.contains("a  stderr  warning"));
-    assert!(output.contains("a  stderr  final"));
+    assert!(output.contains(
+        "run result · workflow.yaml · 3 steps · concurrency 2\nstarted 2026-08-02 12:01:44Z"
+    ));
+    assert!(output.contains("[12:01:45] a          start       cmd · printf 'hello world'"));
+    assert!(output.contains("a          stderr      warning"));
+    assert!(output.contains("a          stderr      final"));
     assert!(!output.contains("\u{1b}[2J"));
     let acknowledgement = output.find("@workflow  cancelling  user_request").unwrap();
-    let step_cancelling = output.rfind("a  cancelling  user_request").unwrap();
+    let step_cancelling = output.rfind("a          cancelling  user_request").unwrap();
     assert!(acknowledgement < step_cancelling);
     assert_eq!(output.matches("@workflow  cancelling").count(), 1);
     assert!(stderr.text().is_empty());
+}
+
+#[tokio::test]
+async fn tty_events_wrap_details_with_hanging_and_stacked_layouts() {
+    let inline = render_start(
+        wrapping_workflow_source(),
+        plain_terminal_config(70, ColorChoice::Never),
+    )
+    .await;
+    let inline_lines = inline.lines().collect::<Vec<_>>();
+    let event_index = inline_lines
+        .iter()
+        .position(|line| line.starts_with("[12:01:44]"))
+        .unwrap();
+    let event_lines = &inline_lines[event_index..];
+    let detail_column = display_width(&event_lines[0][..event_lines[0].find("cmd ·").unwrap()]);
+    assert!(event_lines.len() > 1);
+    assert!(event_lines[0].contains("expectedFailure"));
+    for continuation in &event_lines[1..] {
+        let marker = continuation.find(VISUAL_CONTINUATION_MARKER).unwrap();
+        assert_eq!(display_width(&continuation[..marker]), detail_column);
+        assert!(!continuation.contains("[12:01:44]"));
+    }
+    assert!(event_lines.iter().all(|line| display_width(line) <= 70));
+
+    let colored = render_start(
+        wrapping_workflow_source(),
+        plain_terminal_config(70, ColorChoice::Always),
+    )
+    .await;
+    assert!(colored.contains(&format!(
+        "\u{1b}[{STYLE_CONTINUATION}m{VISUAL_CONTINUATION_MARKER}"
+    )));
+
+    let stacked = render_start(
+        wrapping_workflow_source(),
+        plain_terminal_config(60, ColorChoice::Never),
+    )
+    .await;
+    let stacked_lines = stacked.lines().collect::<Vec<_>>();
+    let event_index = stacked_lines
+        .iter()
+        .position(|line| line.starts_with("[12:01:44]"))
+        .unwrap();
+    let event_lines = &stacked_lines[event_index..];
+    assert_eq!(event_lines[0], "[12:01:44] expectedFailure start");
+    assert!(event_lines[1].starts_with("  cmd ·"));
+    assert!(
+        event_lines[2..]
+            .iter()
+            .all(|line| line.starts_with("    ↳ "))
+    );
+    assert!(event_lines.iter().all(|line| display_width(line) <= 60));
+}
+
+#[tokio::test]
+async fn redirected_events_remain_one_logical_record_per_line() {
+    let mut redirected = config(RequestedPresentationMode::Plain, ColorChoice::Never);
+    redirected.capabilities.stdout_width = Some(40);
+    let output = render_start(wrapping_workflow_source(), redirected).await;
+    let event_lines = output
+        .lines()
+        .filter(|line| line.starts_with("[12:01:44]"))
+        .collect::<Vec<_>>();
+    assert_eq!(event_lines.len(), 1);
+    assert!(event_lines[0].contains("sleep 0.20; exit 17'"));
+    assert!(!output.contains(VISUAL_CONTINUATION_MARKER));
+}
+
+#[tokio::test]
+async fn safety_fragmentation_keeps_its_own_prefixed_records_when_redirected() {
+    let fixture = Fixture::new(workflow_source());
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &fixture.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    presentation
+        .observe(ExecutionObservation::<OffsetDateTime>::CommandOutput(
+            CommandOutputObservation {
+                step: "a".to_owned(),
+                invocation: action(),
+                source: CommandOutputSource::StandardOutput,
+                sequence: SourceSequence::first(),
+                bytes: Arc::from(vec![b'x'; CHILD_FRAGMENT_BYTES + 1]),
+            },
+        ))
+        .await;
+    presentation
+        .observe(ExecutionObservation::<OffsetDateTime>::CommandOutputClosed(
+            CommandOutputClosedObservation {
+                step: "a".to_owned(),
+                invocation: action(),
+                source: CommandOutputSource::StandardOutput,
+                sequence: SourceSequence::first().next(),
+            },
+        ))
+        .await;
+
+    let output = stdout.text();
+    assert_eq!(output.matches("stdout").count(), 2);
+    assert!(output.contains(&format!("{SAFETY_CONTINUATION_MARKER} x")));
+    assert!(!output.contains(VISUAL_CONTINUATION_MARKER));
+}
+
+#[test]
+fn detail_wrapping_prefers_words_and_hard_wraps_by_display_cells() {
+    assert_eq!(
+        wrap_detail("alpha beta gamma", 10, 8),
+        ("alpha beta".to_owned(), vec!["gamma".to_owned()])
+    );
+    assert_eq!(
+        wrap_detail("abcdefgh", 3, 3),
+        ("abc".to_owned(), vec!["def".to_owned(), "gh".to_owned()])
+    );
+    assert_eq!(
+        wrap_detail("界界界", 4, 4),
+        ("界界".to_owned(), vec!["界".to_owned()])
+    );
 }
 
 #[tokio::test]
@@ -643,10 +837,17 @@ steps:
     .start(
         &fixture.workflow,
         1,
-        TestClock::fixed("2026-08-02T12:01:44Z"),
+        TestClock::sequence_with_elapsed(&[
+            ("2026-08-02T12:01:44Z", Duration::ZERO),
+            ("2026-08-02T12:01:45Z", Duration::from_secs(1)),
+            ("2026-08-02T12:01:47.25Z", Duration::from_millis(3250)),
+        ]),
     )
     .unwrap();
 
+    presentation
+        .observe(step_transition("produce", StepStateKind::Starting, None))
+        .await;
     presentation
         .observe(step_transition(
             "produce",
@@ -659,9 +860,90 @@ steps:
 
     let output = stdout.text();
     assert!(
-        output.find("produce  output  report · committed").unwrap()
-            < output.find("produce  done").unwrap()
+        output
+            .find("produce    output      report · file → report.txt")
+            .unwrap()
+            < output
+                .find("produce    done        exit 0 · 1 output after 2.2s")
+                .unwrap()
     );
+}
+
+#[tokio::test]
+async fn agent_success_uses_declared_value_kind_in_live_and_summary_details() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    std::fs::create_dir(&source_root).unwrap();
+    std::fs::write(
+        source_root.join("workflow.yaml"),
+        "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  plan:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      plan:
+        kind: agent_result
+        schema: schema.json
+",
+    )
+    .unwrap();
+    std::fs::write(source_root.join("system.md"), "Return a plan.").unwrap();
+    std::fs::write(source_root.join("message.md"), "Plan the change.").unwrap();
+    std::fs::write(
+        source_root.join("schema.json"),
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+    )
+    .unwrap();
+    let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(&workflow, 1, TestClock::fixed("2026-08-02T12:01:44Z"))
+    .unwrap();
+
+    presentation
+        .observe(step_transition(
+            "plan",
+            StepStateKind::Succeeded,
+            Some(ObservedStepTransition::OutputsCommitted {
+                outputs: vec!["plan".to_owned()],
+            }),
+        ))
+        .await;
+
+    let output = stdout.text();
+    assert!(output.contains("plan       output      plan · agent_result → schema.json"));
+    assert!(output.contains("plan       done        result captured · 1 output"));
+
+    let step = WorkflowRunStep {
+        id: "plan".to_owned(),
+        state: StepState::Succeeded {
+            outputs: BTreeMap::from([(
+                "plan".to_owned(),
+                CapturedValue::Json(Arc::new(Value::Object(serde_json::Map::new()))),
+            )]),
+        },
+        timing: None,
+        command_output: None,
+    };
+    let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::AgentResult).unwrap();
+    assert_eq!(summary_detail, "result captured · 1 output");
 }
 
 #[test]
@@ -710,16 +992,19 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
     ));
 
     let plain_view = plain_stdout.text();
-    assert!(plain_view.contains("step  kind  state  duration  detail"));
-    assert!(plain_view.find("a  cmd").unwrap() < plain_view.find("b  cmd").unwrap());
-    assert!(plain_view.find("b  cmd").unwrap() < plain_view.find("c  cmd").unwrap());
-    assert!(plain_view.contains("workflow succeeded · 3 succeeded"));
-    assert!(plain_view.contains("result: "));
+    assert!(plain_view.contains("── summary ─"));
+    assert!(plain_view.contains("step  kind  state"));
+    assert!(plain_view.find("a     cmd").unwrap() < plain_view.find("b     cmd").unwrap());
+    assert!(plain_view.find("b     cmd").unwrap() < plain_view.find("c     cmd").unwrap());
+    assert!(plain_view.contains("succeeded · exit 0 · 3 succeeded · 1.2s total"));
+    assert!(plain_view.contains(plain_terminal.result_directory()));
+    assert!(!plain_view.contains("result: "));
+    assert!(!plain_view.contains('\u{1b}'));
     assert!(plain_stderr.text().is_empty());
 
     let json_view = json_stderr.text();
-    assert!(json_view.contains("step  kind  state  duration  detail"));
-    assert!(json_view.contains("workflow succeeded · 3 succeeded"));
+    assert!(json_view.contains("step  kind  state"));
+    assert!(json_view.contains("succeeded · exit 0 · 3 succeeded · 1.2s total"));
     let terminal_bytes = json_stdout.text();
     assert!(terminal_bytes.contains("\n  \"schemaVersion\""));
     assert!(!terminal_bytes.contains('\u{1b}'));
@@ -763,9 +1048,13 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
     assert!(
         cleanup_stderr
             .text()
-            .contains("workflow succeeded · 3 succeeded")
+            .contains("succeeded · exit 0 · 3 succeeded · 1.2s total")
     );
-    assert!(cleanup_stderr.text().contains("result: "));
+    assert!(
+        cleanup_stderr
+            .text()
+            .contains(cleanup_terminal.result_directory())
+    );
 }
 
 #[test]
@@ -779,6 +1068,10 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         phase: FailurePhase::Execution,
         cause: cause.clone(),
     };
+    failed.steps[2].state = StepState::NotRun {
+        reason: NotRunReason::FailureStop,
+    };
+    failed.steps[2].timing = None;
     failed.outcome = RunOutcome::Failed {
         primary_failure: StepFailure {
             step: "b".to_owned(),
@@ -806,11 +1099,22 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         &failed,
         PublicationPresentation::Published(&failed_terminal),
     );
-    assert!(failed_output.text().contains("workflow failed"));
-    assert!(
-        failed_output
-            .text()
-            .contains("failure: b · execution · exit 23")
+    let failed_view = failed_output.text();
+    assert!(failed_view.contains("failed · exit 1"));
+    assert!(failed_view.contains("failure: b · execution · exit 23"));
+    let header = failed_view
+        .lines()
+        .find(|line| line.starts_with("step"))
+        .unwrap();
+    let not_run = failed_view
+        .lines()
+        .find(|line| line.starts_with("c "))
+        .unwrap();
+    assert_eq!(
+        header.find("detail").unwrap(),
+        not_run[..not_run.find("failure stop").unwrap()]
+            .chars()
+            .count()
     );
 
     let mut cancelled = fixture.succeeded_run();
@@ -854,7 +1158,7 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
             ..
         }
     ));
-    assert!(cancelled_output.text().contains("workflow cancelled"));
+    assert!(cancelled_output.text().contains("cancelled · exit 143"));
     assert!(
         cancelled_output
             .text()
@@ -890,7 +1194,7 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     assert!(stderr.text().contains("step  kind  state"));
     assert!(stderr.text().contains("workflow succeeded"));
     assert!(stderr.text().contains("result publication failed"));
-    assert!(!stderr.text().contains("result: "));
+    assert!(!stderr.text().contains("run result succeeded · exit"));
 }
 
 #[test]
@@ -1023,7 +1327,15 @@ fn terminal_json_writer_failure_reports_the_published_result_path() {
         Some(terminal.result_directory())
     );
     assert!(stderr.text().contains(terminal.result_directory()));
-    assert!(stderr.text().contains("workflow succeeded"));
+    assert!(stderr.text().contains("succeeded · exit 0"));
+}
+
+#[test]
+fn durations_use_compound_units_after_one_minute() {
+    assert_eq!(human_duration(Duration::from_millis(999)), "999ms");
+    assert_eq!(human_duration(Duration::from_millis(4250)), "4.2s");
+    assert_eq!(human_duration(Duration::from_secs(161)), "2m41s");
+    assert_eq!(human_duration(Duration::from_secs(3723)), "1h02m03s");
 }
 
 #[test]
@@ -1051,7 +1363,11 @@ fn json_color_always_styles_only_the_stderr_presentation() {
     .unwrap();
     presentation.finish(&run, PublicationPresentation::Published(&terminal));
 
-    assert!(stderr.text().contains("\u{1b}[32m"));
+    let presentation = stderr.text();
+    for style in [STYLE_PRIMARY, STYLE_SECONDARY, STYLE_MUTED, STYLE_SUCCESS] {
+        assert!(presentation.contains(&format!("\u{1b}[{style}m")));
+    }
+    assert!(!presentation.contains("\u{1b}[32m"));
     assert!(!stdout.text().contains('\u{1b}'));
     let _: Value = serde_json::from_str(&stdout.text()).unwrap();
 }

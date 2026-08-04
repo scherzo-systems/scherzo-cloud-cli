@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroU64;
@@ -10,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rustix::fs::{Access, AtFlags, CWD, accessat};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -29,6 +27,10 @@ use super::coordinator::{
 };
 use super::diagnostic::{PendingStepDiagnostic, StepDiagnosticLog};
 use super::document::Output;
+use super::execution_root::{
+    AdmittedExecutionRoot, AdmittedWorkingDirectory, ExecutableCandidate,
+    WorkingDirectorySelectionFailure,
+};
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
 use super::observation::{ExecutionObserver, NoopExecutionObserver};
 use super::runtime::{Action, ActionId, ActionInput, RequestedAction};
@@ -45,6 +47,7 @@ pub(crate) enum StepBodyKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkingDirectoryFailure {
+    ExecutionRootRebound,
     Unavailable,
     EscapesExecutionRoot,
     NotDirectory,
@@ -616,8 +619,11 @@ where
             return Err(StepStartFailure::OutputsUnsupported);
         }
 
-        let cwd =
-            prepare_working_directory(self.admitted.execution().root(), common.cwd.as_deref())?;
+        let cwd = resolve_working_directory(
+            self.admitted.execution().root_identity(),
+            common.cwd.as_deref(),
+        )
+        .map_err(StepStartFailure::WorkingDirectory)?;
         let body = match body {
             StepBody::Command(command) => {
                 let mut prepared = prepare_command(
@@ -1493,7 +1499,7 @@ enum PreparedStepBody {
 struct PreparedCommand {
     program: PathBuf,
     arguments: Vec<OsString>,
-    cwd: PathBuf,
+    cwd: AdmittedWorkingDirectory,
     environment: EnvironmentSnapshot,
     inputs: Option<InputView>,
 }
@@ -1518,16 +1524,21 @@ impl PreparedCommand {
             environment,
             inputs,
         } = self;
+        if !cwd.validate_execution_root() {
+            return Err(StepStartFailure::WorkingDirectory(
+                WorkingDirectoryFailure::ExecutionRootRebound,
+            ));
+        }
         let mut command = Command::new(program);
         command
             .args(arguments)
-            .current_dir(cwd)
             .env_clear()
             .envs(environment.variables())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.as_std_mut().process_group(0);
+        cwd.bind_command(command.as_std_mut());
         let child = command.spawn().map_err(|failure| {
             StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
         })?;
@@ -1644,30 +1655,27 @@ fn terminate_process_group(process_group: Pid) {
     let _ = kill_process_group(process_group, Signal::KILL);
 }
 
-fn prepare_working_directory(
-    execution_root: &Path,
+pub(super) fn resolve_working_directory(
+    execution_root: &AdmittedExecutionRoot,
     declared_cwd: Option<&str>,
-) -> Result<PathBuf, StepStartFailure> {
-    let candidate =
-        declared_cwd.map_or_else(|| execution_root.to_owned(), |cwd| execution_root.join(cwd));
-    let canonical = fs::canonicalize(candidate)
-        .map_err(|_| StepStartFailure::WorkingDirectory(WorkingDirectoryFailure::Unavailable))?;
-    if !canonical.starts_with(execution_root) {
-        return Err(StepStartFailure::WorkingDirectory(
-            WorkingDirectoryFailure::EscapesExecutionRoot,
-        ));
-    }
-    if !canonical.is_dir() {
-        return Err(StepStartFailure::WorkingDirectory(
-            WorkingDirectoryFailure::NotDirectory,
-        ));
-    }
-    Ok(canonical)
+) -> Result<AdmittedWorkingDirectory, WorkingDirectoryFailure> {
+    execution_root
+        .select_working_directory(declared_cwd)
+        .map_err(|failure| match failure {
+            WorkingDirectorySelectionFailure::ExecutionRootRebound => {
+                WorkingDirectoryFailure::ExecutionRootRebound
+            }
+            WorkingDirectorySelectionFailure::Unavailable => WorkingDirectoryFailure::Unavailable,
+            WorkingDirectorySelectionFailure::EscapesExecutionRoot => {
+                WorkingDirectoryFailure::EscapesExecutionRoot
+            }
+            WorkingDirectorySelectionFailure::NotDirectory => WorkingDirectoryFailure::NotDirectory,
+        })
 }
 
 fn prepare_command(
     argv: &[String],
-    cwd: PathBuf,
+    cwd: AdmittedWorkingDirectory,
     environment: EnvironmentSnapshot,
 ) -> Result<PreparedCommand, StepStartFailure> {
     let (program, arguments) = argv
@@ -1675,7 +1683,15 @@ fn prepare_command(
         .ok_or(StepStartFailure::CommandPreparation(
             CommandPreparationFailure::InvalidArgv,
         ))?;
-    let program = resolve_program(program, &cwd, &environment)?;
+    let program = match resolve_program(program, &cwd, &environment) {
+        Ok(program) => program,
+        Err(failure) if cwd.validate_execution_root() => return Err(failure),
+        Err(_) => {
+            return Err(StepStartFailure::WorkingDirectory(
+                WorkingDirectoryFailure::ExecutionRootRebound,
+            ));
+        }
+    };
     Ok(PreparedCommand {
         program,
         arguments: arguments.iter().map(OsString::from).collect(),
@@ -1687,7 +1703,7 @@ fn prepare_command(
 
 fn resolve_program(
     program: &str,
-    cwd: &Path,
+    cwd: &AdmittedWorkingDirectory,
     environment: &EnvironmentSnapshot,
 ) -> Result<PathBuf, StepStartFailure> {
     let program_path = Path::new(program);
@@ -1695,7 +1711,7 @@ fn resolve_program(
         return Ok(program_path.to_owned());
     }
     if program.contains(std::path::MAIN_SEPARATOR) {
-        return Ok(cwd.join(program_path));
+        return Ok(program_path.to_owned());
     }
 
     let search_path =
@@ -1706,26 +1722,11 @@ fn resolve_program(
             ))?;
     let mut unavailable_candidate = false;
     for directory in env::split_paths(search_path) {
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            cwd.join(directory)
-        };
-        let candidate = directory.join(program_path);
-        match candidate.metadata() {
-            Ok(metadata) if metadata.is_file() => {
-                if accessat(CWD, &candidate, Access::EXEC_OK, AtFlags::EACCESS).is_ok() {
-                    return Ok(candidate);
-                }
-                unavailable_candidate = true;
-            }
-            Ok(_) => unavailable_candidate = true,
-            Err(failure)
-                if matches!(
-                    failure.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(_) => unavailable_candidate = true,
+        let child_candidate = directory.join(program_path);
+        match cwd.executable_candidate(&child_candidate) {
+            ExecutableCandidate::Executable => return Ok(child_candidate),
+            ExecutableCandidate::Missing => {}
+            ExecutableCandidate::Unavailable => unavailable_candidate = true,
         }
     }
 

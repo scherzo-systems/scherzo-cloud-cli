@@ -5,17 +5,16 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use jsonschema::Validator;
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
+use super::result_validation::{ResultSchemaSupportFailure, RetainedResultSchema};
 use super::validated::{RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow};
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use super::{DecodeFailureKind, decode, validation};
 use crate::execution::workflow::document::Output;
 
 const CONTENT_CLOSURE_DOMAIN: &[u8] = b"scherzo.workflow.content-closure.v1\0";
-const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const MAX_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
 const SHA256_ALGORITHM: &str = "sha256";
 
@@ -35,6 +34,7 @@ pub(crate) enum ResolutionFailureKind {
     InvalidResultSchemaEncoding,
     InvalidResultSchemaJson,
     InvalidResultSchemaDialect,
+    InvalidResultSchemaReference,
     InvalidResultSchema,
     DigestInputTooLarge,
 }
@@ -126,6 +126,7 @@ pub(crate) struct WorkflowSourceProvenance {
 pub(crate) struct ResolvedWorkflow {
     pub(crate) definition: ValidatedWorkflow,
     pub(crate) source_closure: BTreeMap<String, Arc<[u8]>>,
+    result_schemas: BTreeMap<(String, String), RetainedResultSchema>,
     pub(crate) source: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
 }
@@ -137,6 +138,11 @@ impl ResolvedWorkflow {
 
     pub(crate) fn source_bytes(&self, canonical_path: &str) -> Option<&[u8]> {
         self.source_closure.get(canonical_path).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn result_schema(&self, step: &str, output: &str) -> Option<&RetainedResultSchema> {
+        self.result_schemas
+            .get(&(step.to_owned(), output.to_owned()))
     }
 }
 
@@ -176,7 +182,7 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         ));
     };
-    resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
+    let result_schemas = resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
 
     let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
@@ -184,6 +190,7 @@ fn resolve_loaded_workflow(
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
+        result_schemas,
         source: WorkflowSourceProvenance {
             source_root,
             workflow_path: workflow_source.canonical_path,
@@ -366,7 +373,8 @@ fn resolve_static_sources(
     definition: &mut ValidatedWorkflow,
     workflow_directory: &Path,
     sources: &mut SourceResolver,
-) -> Result<(), ResolutionFailure> {
+) -> Result<BTreeMap<(String, String), RetainedResultSchema>, ResolutionFailure> {
+    let mut result_schemas = BTreeMap::new();
     for (step_name, step) in &mut definition.steps {
         let ValidatedStep::Agent(agent_step) = step else {
             continue;
@@ -405,10 +413,13 @@ fn resolve_static_sources(
                 step: step_name.clone(),
                 output: output_name.clone(),
             };
-            *schema = resolve_result_schema(schema, workflow_directory, sources, location)?;
+            let (canonical_path, retained) =
+                resolve_result_schema(schema, workflow_directory, sources, location)?;
+            *schema = canonical_path;
+            result_schemas.insert((step_name.clone(), output_name.clone()), retained);
         }
     }
-    Ok(())
+    Ok(result_schemas)
 }
 
 #[derive(Clone, Copy)]
@@ -481,7 +492,7 @@ fn resolve_result_schema(
     workflow_directory: &Path,
     sources: &mut SourceResolver,
     location: ResolutionLocation,
-) -> Result<String, ResolutionFailure> {
+) -> Result<(String, RetainedResultSchema), ResolutionFailure> {
     let loaded = load_utf8_static_source(
         source_path,
         workflow_directory,
@@ -489,26 +500,26 @@ fn resolve_result_schema(
         &location,
         ResolutionFailureKind::InvalidResultSchemaEncoding,
     )?;
-    let schema = serde_json::from_slice::<Value>(&loaded.bytes).map_err(|_| {
+    let schema = Arc::new(serde_json::from_slice::<Value>(&loaded.bytes).map_err(|_| {
         ResolutionFailure::new(
             ResolutionFailureKind::InvalidResultSchemaJson,
             location.clone(),
         )
-    })?;
-    if schema.get("$schema").and_then(Value::as_str) != Some(JSON_SCHEMA_DIALECT) {
-        return Err(ResolutionFailure::new(
-            ResolutionFailureKind::InvalidResultSchemaDialect,
-            location,
-        ));
-    }
-    compile_result_schema(&schema).map_err(|_| {
-        ResolutionFailure::new(ResolutionFailureKind::InvalidResultSchema, location)
-    })?;
-    Ok(loaded.canonical_path)
-}
-
-fn compile_result_schema(schema: &Value) -> Result<Validator, ()> {
-    jsonschema::draft202012::new(schema).map_err(|_| ())
+    })?);
+    let retained =
+        RetainedResultSchema::compile(Arc::clone(&loaded.bytes), schema).map_err(|failure| {
+            let kind = match failure {
+                ResultSchemaSupportFailure::Dialect => {
+                    ResolutionFailureKind::InvalidResultSchemaDialect
+                }
+                ResultSchemaSupportFailure::Reference => {
+                    ResolutionFailureKind::InvalidResultSchemaReference
+                }
+                ResultSchemaSupportFailure::Schema => ResolutionFailureKind::InvalidResultSchema,
+            };
+            ResolutionFailure::new(kind, location)
+        })?;
+    Ok((loaded.canonical_path, retained))
 }
 
 fn load_utf8_static_source(

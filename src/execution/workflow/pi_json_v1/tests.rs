@@ -407,7 +407,7 @@ fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
             Arc::from("call-result"),
             Arc::from("scherzo_result_fixed"),
             Arc::new(json!({"result": {"answer": 42}})),
-            BoundedSchemaValidAgentResult::from_validated(
+            BoundedSchemaValidAgentResult::fixture(
                 result_value.clone(),
                 Arc::from(br#"{"answer":42}"#.as_slice()),
             ),
@@ -436,7 +436,7 @@ fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
             Arc::from("call-result"),
             Arc::from("scherzo_result_fixed"),
             Arc::new(json!({"result": {"answer": 42}})),
-            BoundedSchemaValidAgentResult::from_validated(
+            BoundedSchemaValidAgentResult::fixture(
                 result_value,
                 Arc::from(br#"{"answer":42}"#.as_slice()),
             ),

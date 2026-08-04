@@ -27,6 +27,10 @@ use std::env;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if execution::workflow::result_validation::internal_worker_requested() {
+        return execution::workflow::result_validation::run_internal_worker();
+    }
+
     match cli::parse(env::args_os()) {
         Ok(command) => command.execute(),
         Err(error) => {

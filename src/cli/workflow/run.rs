@@ -220,8 +220,9 @@ impl Command {
         };
 
         let output = WorkflowRunOutput::new(presentation_config, io::stdout(), io::stderr());
-        let presentation = match output.start(
+        let presentation = match output.start_for_result(
             &workflow,
+            destination.result_directory(),
             admitted.execution().limits().maximum_parallel_steps().get(),
             SystemObservationClock,
         ) {
@@ -471,10 +472,13 @@ async fn acquire_imports(
             .checked_add(size)
             .filter(|total| *total <= MAXIMUM_TOTAL_ATTACHMENT_BYTES)
             .ok_or(LocalRunError::AttachmentBytes)?;
-        resolved.push(ResolvedAttachment::new(
-            Arc::from(media_type),
-            Arc::from(bytes),
-        ));
+        let attachment = ResolvedAttachment::new(Arc::from(media_type), Arc::from(bytes));
+        let attachment = if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            attachment.with_diagnostic_source_name(Arc::from(name))
+        } else {
+            attachment
+        };
+        resolved.push(attachment);
     }
     Ok(ResolvedImports::new(prompt, Arc::from(resolved)))
 }
@@ -1053,6 +1057,8 @@ mod tests {
         let capabilities = TerminalCapabilities {
             stdout_is_terminal: true,
             stderr_is_terminal: false,
+            stdout_width: Some(100),
+            stderr_width: None,
             term: Some("xterm".into()),
             no_color: Some("1".into()),
         };

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::document::Output;
 use super::pi::PiConfig;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WorkflowValueType {
     Text,
     AttachmentCollection,
@@ -71,7 +71,7 @@ pub(crate) enum ResolvedValueSource {
     Output(ResolvedOutputSource),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ResolvedOutputSource {
     pub(crate) step: String,
     pub(crate) output: String,

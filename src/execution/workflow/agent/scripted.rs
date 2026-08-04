@@ -361,7 +361,7 @@ where
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
-            CompletedAgentInvocation::Result(BoundedSchemaValidAgentResult::from_validated(
+            CompletedAgentInvocation::Result(BoundedSchemaValidAgentResult::fixture(
                 value,
                 Arc::from(bytes),
             ))

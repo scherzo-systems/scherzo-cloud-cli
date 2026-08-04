@@ -1,6 +1,7 @@
 use std::future::{Future, ready};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,6 +9,9 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
+use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
+use super::result_validation::ResultValidationFatal;
+pub(crate) use super::result_validation::{BoundedSchemaValidAgentResult, RetainedResultSchema};
 use super::runtime::ActionId;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -99,23 +103,51 @@ impl<NativeConfiguration> AdmittedAgentAdapter<NativeConfiguration> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct AgentProcessContext {
-    cwd: PathBuf,
+    cwd: AdmittedWorkingDirectory,
     environment: EnvironmentSnapshot,
 }
 
 impl AgentProcessContext {
-    pub(crate) fn new(cwd: PathBuf, environment: EnvironmentSnapshot) -> Self {
+    pub(super) fn new(cwd: AdmittedWorkingDirectory, environment: EnvironmentSnapshot) -> Self {
         Self { cwd, environment }
     }
 
     pub(crate) fn cwd(&self) -> &Path {
-        &self.cwd
+        self.cwd.provenance_path()
+    }
+
+    pub(super) fn execution_root_is_bound(&self) -> bool {
+        self.cwd.validate_execution_root()
+    }
+
+    pub(super) fn bind_command(
+        &self,
+        command: &mut Command,
+    ) -> Result<(), WorkingDirectorySelectionFailure> {
+        self.cwd.bind_command_ref(command)
     }
 
     pub(crate) fn environment(&self) -> &EnvironmentSnapshot {
         &self.environment
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentInvocationStaging {
+    result_endpoint_directory: PathBuf,
+}
+
+impl AgentInvocationStaging {
+    pub(crate) fn new(result_endpoint_directory: PathBuf) -> Self {
+        Self {
+            result_endpoint_directory,
+        }
+    }
+
+    pub(crate) fn result_endpoint_directory(&self) -> &Path {
+        &self.result_endpoint_directory
     }
 }
 
@@ -176,26 +208,6 @@ impl StagedAgentAttachment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedResultSchema {
-    bytes: Arc<[u8]>,
-    document: Arc<Value>,
-}
-
-impl RetainedResultSchema {
-    pub(crate) fn new(bytes: Arc<[u8]>, document: Arc<Value>) -> Self {
-        Self { bytes, document }
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub(crate) fn document(&self) -> &Value {
-        &self.document
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentValueMode {
     None,
     Response {
@@ -248,6 +260,8 @@ impl PositiveDuration {
 pub(crate) struct AgentInvocationLimits<AdapterProtocolLimits> {
     maximum_system_prompt_bytes: NonZeroU64,
     maximum_message_bytes: NonZeroU64,
+    maximum_attachments: NonZeroUsize,
+    maximum_attachment_bytes: NonZeroU64,
     maximum_response_bytes: NonZeroU64,
     maximum_result_bytes: NonZeroU64,
     maximum_result_rejection_feedback_bytes: NonZeroU64,
@@ -264,6 +278,8 @@ impl<AdapterProtocolLimits> AgentInvocationLimits<AdapterProtocolLimits> {
     pub(crate) fn new(
         maximum_system_prompt_bytes: NonZeroU64,
         maximum_message_bytes: NonZeroU64,
+        maximum_attachments: NonZeroUsize,
+        maximum_attachment_bytes: NonZeroU64,
         maximum_response_bytes: NonZeroU64,
         maximum_result_bytes: NonZeroU64,
         maximum_result_rejection_feedback_bytes: NonZeroU64,
@@ -274,6 +290,8 @@ impl<AdapterProtocolLimits> AgentInvocationLimits<AdapterProtocolLimits> {
         Self {
             maximum_system_prompt_bytes,
             maximum_message_bytes,
+            maximum_attachments,
+            maximum_attachment_bytes,
             maximum_response_bytes,
             maximum_result_bytes,
             maximum_result_rejection_feedback_bytes,
@@ -289,6 +307,14 @@ impl<AdapterProtocolLimits> AgentInvocationLimits<AdapterProtocolLimits> {
 
     pub(crate) fn maximum_message_bytes(&self) -> NonZeroU64 {
         self.maximum_message_bytes
+    }
+
+    pub(crate) fn maximum_attachments(&self) -> NonZeroUsize {
+        self.maximum_attachments
+    }
+
+    pub(crate) fn maximum_attachment_bytes(&self) -> NonZeroU64 {
+        self.maximum_attachment_bytes
     }
 
     pub(crate) fn maximum_response_bytes(&self) -> NonZeroU64 {
@@ -488,6 +514,7 @@ pub(crate) struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, Ob
     identity: AgentInvocationIdentity,
     adapter: AdmittedAgentAdapter<NativeConfiguration>,
     process: AgentProcessContext,
+    staging: AgentInvocationStaging,
     prompt: AgentPrompt,
     attachments: Arc<[StagedAgentAttachment]>,
     value_mode: AgentValueMode,
@@ -509,6 +536,7 @@ where
         identity: AgentInvocationIdentity,
         adapter: AdmittedAgentAdapter<NativeConfiguration>,
         process: AgentProcessContext,
+        staging: AgentInvocationStaging,
         prompt: AgentPrompt,
         attachments: Arc<[StagedAgentAttachment]>,
         value_mode: AgentValueMode,
@@ -521,6 +549,7 @@ where
             identity,
             adapter,
             process,
+            staging,
             prompt,
             attachments,
             value_mode,
@@ -540,6 +569,10 @@ where
 
     pub(crate) fn process(&self) -> &AgentProcessContext {
         &self.process
+    }
+
+    pub(crate) fn staging(&self) -> &AgentInvocationStaging {
+        &self.staging
     }
 
     pub(crate) fn prompt(&self) -> &AgentPrompt {
@@ -610,29 +643,6 @@ impl BoundedAgentResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundedSchemaValidAgentResult {
-    value: Arc<Value>,
-    canonical_json: Arc<[u8]>,
-}
-
-impl BoundedSchemaValidAgentResult {
-    pub(crate) fn from_validated(value: Arc<Value>, canonical_json: Arc<[u8]>) -> Self {
-        Self {
-            value,
-            canonical_json,
-        }
-    }
-
-    pub(crate) fn value(&self) -> &Value {
-        &self.value
-    }
-
-    pub(crate) fn canonical_json(&self) -> &[u8] {
-        &self.canonical_json
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CompletedAgentInvocation {
     NoValue,
     Response(BoundedAgentResponse),
@@ -690,6 +700,17 @@ pub(crate) enum AgentOutcome {
     Completed(CompletedAgentInvocation),
     Failed { cause: AgentFailureCause },
     Cancelled { reason: CancellationReason },
+}
+
+impl From<ResultValidationFatal> for AgentFailureCause {
+    fn from(fatal: ResultValidationFatal) -> Self {
+        match fatal {
+            ResultValidationFatal::LimitExceeded { deadline } => {
+                Self::ResultValidationLimitExceeded { deadline }
+            }
+            ResultValidationFatal::WorkerFailed => Self::HarnessProtocolFailed,
+        }
+    }
 }
 
 #[derive(Clone)]

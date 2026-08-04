@@ -1,25 +1,27 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, chmodat, fchmod, fstat, mkdirat, openat, statat, unlinkat,
-};
+use rustix::fs::{AtFlags, Mode, chmodat, mkdirat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
-use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde_json::Value;
 
 use super::admission::{AdmittedExecutionContext, ResolvedAttachment};
-use super::artifact::{ArtifactReadFailure, ArtifactStaging, open_directory};
+use super::artifact::{ArtifactReadFailure, ArtifactStaging};
+use super::canonical_json;
+use super::execution_root::{AdmittedExecutionRoot, open_directory};
+#[cfg(test)]
+use super::private_staging::CleanupBlocker;
+use super::private_staging::{
+    StagingLifecycle, cleanup_staging, create_payload_file, create_staging_root,
+    finish_payload_file, mark_cleanup_failed, remove_staging_root, remove_tree_at,
+};
 use super::validated::WorkflowValueType;
 use super::value::CapturedValue;
 
@@ -146,8 +148,7 @@ pub(crate) struct InputStaging {
 }
 
 struct InputStagingInner {
-    execution_root_device: u64,
-    execution_root_inode: u64,
+    execution_root: AdmittedExecutionRoot,
     staging_parent: OwnedFd,
     staging_root: OwnedFd,
     staging_path: PathBuf,
@@ -157,17 +158,10 @@ struct InputStagingInner {
     maximum_value_bytes: u64,
     maximum_total_bytes: u64,
     maximum_live_bytes: u64,
-    lifecycle: RwLock<InputStagingLifecycle>,
+    lifecycle: RwLock<StagingLifecycle>,
     reservations: Mutex<ReservationLedger>,
     #[cfg(test)]
-    cleanup_blocked: AtomicBool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum InputStagingLifecycle {
-    Active,
-    CleanupFailed,
-    Released,
+    cleanup_blocker: CleanupBlocker,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -218,8 +212,8 @@ impl InputStaging {
         staging_parent: &Path,
     ) -> Result<Self, InputStagingFailure> {
         let limits = execution.limits();
-        Self::create_for_execution(
-            execution.root(),
+        Self::create_for_root(
+            execution.root_identity().clone(),
             staging_parent,
             limits.maximum_parallel_steps().get(),
             limits.maximum_input_values().get(),
@@ -229,8 +223,8 @@ impl InputStaging {
         )
     }
 
-    fn create_for_execution(
-        execution_root: &Path,
+    fn create_for_root(
+        execution_root: AdmittedExecutionRoot,
         staging_parent: &Path,
         maximum_parallel_steps: usize,
         maximum_values: usize,
@@ -238,23 +232,21 @@ impl InputStaging {
         maximum_total_bytes: u64,
         maximum_live_bytes: u64,
     ) -> Result<Self, InputStagingFailure> {
-        let canonical_execution_root = fs::canonicalize(execution_root)
-            .map_err(|_| InputStagingFailure::ExecutionRootUnavailable)?;
+        if !execution_root.pathname_is_bound() {
+            return Err(InputStagingFailure::ExecutionRootUnavailable);
+        }
         let canonical_staging_parent = fs::canonicalize(staging_parent)
             .map_err(|_| InputStagingFailure::StagingParentUnavailable)?;
-        if canonical_staging_parent.starts_with(&canonical_execution_root) {
+        if canonical_staging_parent.starts_with(execution_root.provenance_path()) {
             return Err(InputStagingFailure::StagingParentExposed);
         }
-        let execution_metadata = fs::metadata(&canonical_execution_root)
-            .map_err(|_| InputStagingFailure::ExecutionRootUnavailable)?;
         let staging_parent = open_directory(&canonical_staging_parent)
             .map_err(|_| InputStagingFailure::StagingParentUnavailable)?;
-        let (staging_identity, staging_root) = create_staging_root(&staging_parent)?;
+        let (staging_identity, staging_root) = create_input_staging_root(&staging_parent)?;
         let staging_path = canonical_staging_parent.join(staging_identity.as_ref());
         Ok(Self {
             inner: Arc::new(InputStagingInner {
-                execution_root_device: execution_metadata.dev(),
-                execution_root_inode: execution_metadata.ino(),
+                execution_root,
                 staging_parent,
                 staging_root,
                 staging_path,
@@ -264,10 +256,10 @@ impl InputStaging {
                 maximum_value_bytes,
                 maximum_total_bytes,
                 maximum_live_bytes,
-                lifecycle: RwLock::new(InputStagingLifecycle::Active),
+                lifecycle: RwLock::new(StagingLifecycle::Active),
                 reservations: Mutex::new(ReservationLedger::default()),
                 #[cfg(test)]
-                cleanup_blocked: AtomicBool::new(false),
+                cleanup_blocker: CleanupBlocker::default(),
             }),
         })
     }
@@ -279,10 +271,10 @@ impl InputStaging {
             && self.inner.maximum_value_bytes == limits.maximum_input_value_bytes().get()
             && self.inner.maximum_total_bytes == limits.maximum_total_input_bytes().get()
             && self.inner.maximum_live_bytes == limits.maximum_live_input_bytes().get()
-            && directory_identity(execution.root()).is_some_and(|(device, inode)| {
-                device == self.inner.execution_root_device
-                    && inode == self.inner.execution_root_inode
-            })
+            && self
+                .inner
+                .execution_root
+                .is_same_directory(execution.root_identity())
     }
 
     pub(crate) fn materialize(
@@ -293,7 +285,7 @@ impl InputStaging {
         let lifecycle = self.inner.lifecycle.read().map_err(|_| {
             InputPreparationFailure::staging(InputPreparationFailureKind::StagingUnavailable)
         })?;
-        if *lifecycle != InputStagingLifecycle::Active {
+        if *lifecycle != StagingLifecycle::Active {
             return Err(InputPreparationFailure::staging(
                 InputPreparationFailureKind::StagingUnavailable,
             ));
@@ -315,7 +307,7 @@ impl InputStaging {
                     self.inner.release_reservation(&identity);
                     Err(failure)
                 } else {
-                    self.inner.mark_cleanup_failed();
+                    mark_cleanup_failed(&self.inner.lifecycle);
                     Err(InputPreparationFailure::staging(
                         InputPreparationFailureKind::StagingUnavailable,
                     ))
@@ -528,12 +520,12 @@ impl InputStaging {
 
     #[cfg(test)]
     pub(crate) fn block_cleanup(&self) {
-        self.inner.cleanup_blocked.store(true, Ordering::Release);
+        self.inner.cleanup_blocker.block();
     }
 
     #[cfg(test)]
     pub(crate) fn unblock_cleanup(&self) {
-        self.inner.cleanup_blocked.store(false, Ordering::Release);
+        self.inner.cleanup_blocker.unblock();
     }
 }
 
@@ -552,81 +544,46 @@ impl InputStagingInner {
         let Ok(lifecycle) = self.lifecycle.read() else {
             return false;
         };
-        if *lifecycle == InputStagingLifecycle::Released {
+        if *lifecycle == StagingLifecycle::Released {
             return true;
         }
         let cleaned = self.remove_view_entry(identity);
         drop(lifecycle);
         if !cleaned {
-            self.mark_cleanup_failed();
+            mark_cleanup_failed(&self.lifecycle);
         }
         cleaned
     }
 
     fn remove_view_entry(&self, identity: &str) -> bool {
         #[cfg(test)]
-        if self.cleanup_blocked.load(Ordering::Acquire) {
+        if self.cleanup_blocker.is_blocked() {
             return false;
         }
         remove_tree_at(&self.staging_root, identity).is_ok()
     }
 
-    fn mark_cleanup_failed(&self) {
-        let Ok(mut lifecycle) = self.lifecycle.write() else {
-            return;
-        };
-        if *lifecycle == InputStagingLifecycle::Active {
-            *lifecycle = InputStagingLifecycle::CleanupFailed;
-        }
-    }
-
     fn cleanup(&self) -> Result<(), InputStagingReleaseFailure> {
-        let mut lifecycle = self
-            .lifecycle
-            .write()
-            .map_err(|_| InputStagingReleaseFailure::CleanupUnavailable)?;
-        if *lifecycle == InputStagingLifecycle::Released {
-            return Ok(());
-        }
-
-        let cleanup_result = self.cleanup_active();
-        *lifecycle = if cleanup_result.is_ok() {
-            InputStagingLifecycle::Released
-        } else {
-            InputStagingLifecycle::CleanupFailed
-        };
-        if cleanup_result.is_ok() {
+        let result = cleanup_staging(
+            &self.lifecycle,
+            InputStagingReleaseFailure::CleanupUnavailable,
+            || self.cleanup_active(),
+        );
+        if result.is_ok() {
             *lock_reservations(&self.reservations) = ReservationLedger::default();
         }
-        cleanup_result
+        result
     }
 
     fn cleanup_active(&self) -> Result<(), InputStagingReleaseFailure> {
         #[cfg(test)]
-        if self.cleanup_blocked.load(Ordering::Acquire) {
+        if self.cleanup_blocker.is_blocked() {
             return Err(InputStagingReleaseFailure::CleanupUnavailable);
         }
-        remove_directory_contents(&self.staging_root)
-            .map_err(|_| InputStagingReleaseFailure::CleanupUnavailable)?;
-
-        let opened = fstat(&self.staging_root)
-            .map_err(|_| InputStagingReleaseFailure::CleanupUnavailable)?;
-        let named = statat(
+        remove_staging_root(
             &self.staging_parent,
             self.staging_identity.as_ref(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|_| InputStagingReleaseFailure::CleanupUnavailable)?;
-        if opened.st_dev != named.st_dev
-            || opened.st_ino != named.st_ino
-            || FileType::from_raw_mode(named.st_mode) != FileType::Directory
-        {
-            return Err(InputStagingReleaseFailure::CleanupUnavailable);
-        }
-        unlinkat(
-            &self.staging_parent,
-            self.staging_identity.as_ref(),
-            AtFlags::REMOVEDIR,
+            &self.staging_root,
         )
         .map_err(|_| InputStagingReleaseFailure::CleanupUnavailable)
     }
@@ -769,92 +726,27 @@ struct ManifestItem {
     path: String,
 }
 
-struct CanonicalJson<'a>(&'a Value);
-
-impl Serialize for CanonicalJson<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self.0 {
-            Value::Null => serializer.serialize_unit(),
-            Value::Bool(value) => serializer.serialize_bool(*value),
-            Value::Number(value) => value.serialize(serializer),
-            Value::String(value) => serializer.serialize_str(value),
-            Value::Array(values) => {
-                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
-                for value in values {
-                    sequence.serialize_element(&CanonicalJson(value))?;
-                }
-                sequence.end()
-            }
-            Value::Object(values) => {
-                let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by(|(left, _), (right, _)| {
-                    left.as_bytes().cmp(right.as_bytes())
-                });
-                let mut map = serializer.serialize_map(Some(entries.len()))?;
-                for (key, value) in entries {
-                    map.serialize_entry(key, &CanonicalJson(value))?;
-                }
-                map.end()
-            }
-        }
-    }
-}
-
-struct LimitedCounter {
-    bytes: u64,
-    maximum: u64,
-    exceeded: bool,
-}
-
-impl Write for LimitedCounter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let length = u64::try_from(bytes.len())
-            .map_err(|_| io::Error::other("canonical JSON size is unavailable"))?;
-        let Some(updated) = self.bytes.checked_add(length) else {
-            self.exceeded = true;
-            return Err(io::Error::other("canonical JSON exceeds its limit"));
-        };
-        if updated > self.maximum {
-            self.exceeded = true;
-            return Err(io::Error::other("canonical JSON exceeds its limit"));
-        }
-        self.bytes = updated;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn canonical_json_size(
     value: &Value,
     maximum: u64,
     input_identity: &str,
 ) -> Result<u64, InputPreparationFailure> {
-    let mut counter = LimitedCounter {
-        bytes: 0,
-        maximum,
-        exceeded: false,
-    };
-    let result = serde_json::to_writer(&mut counter, &CanonicalJson(value));
-    if result.is_err() {
-        let kind = if counter.exceeded {
-            InputPreparationFailureKind::ValueSizeLimitExceeded
-        } else {
-            InputPreparationFailureKind::SourceUnavailable
+    canonical_json::encoded_size(value, maximum).map_err(|failure| {
+        let kind = match failure {
+            canonical_json::CanonicalJsonError::SizeLimitExceeded => {
+                InputPreparationFailureKind::ValueSizeLimitExceeded
+            }
+            canonical_json::CanonicalJsonError::SerializationFailed => {
+                InputPreparationFailureKind::SourceUnavailable
+            }
         };
-        return Err(InputPreparationFailure::for_input(input_identity, kind));
-    }
-    Ok(counter.bytes)
+        InputPreparationFailure::for_input(input_identity, kind)
+    })
 }
 
 fn write_canonical_json_read_only(path: &Path, value: &Value) -> io::Result<()> {
     let mut destination = create_payload_file(path)?;
-    serde_json::to_writer(&mut destination, &CanonicalJson(value)).map_err(io::Error::other)?;
+    canonical_json::to_writer(&mut destination, value).map_err(io::Error::other)?;
     finish_payload_file(destination)
 }
 
@@ -926,96 +818,11 @@ fn valid_input_name(name: &str) -> bool {
         && bytes[1..].iter().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn create_staging_root(
+fn create_input_staging_root(
     staging_parent: &OwnedFd,
 ) -> Result<(Arc<str>, OwnedFd), InputStagingFailure> {
-    for _ in 0..IDENTITY_ATTEMPTS {
-        let identity = Arc::<str>::from(format!(
-            ".inputs-{}",
-            ulid::Ulid::generate().to_string().to_ascii_lowercase()
-        ));
-        match mkdirat(staging_parent, identity.as_ref(), Mode::RWXU) {
-            Ok(()) => {
-                if chmodat(
-                    staging_parent,
-                    identity.as_ref(),
-                    Mode::RWXU,
-                    AtFlags::empty(),
-                )
-                .is_err()
-                {
-                    let _ = unlinkat(staging_parent, identity.as_ref(), AtFlags::REMOVEDIR);
-                    return Err(InputStagingFailure::IdentityUnavailable);
-                }
-                match openat(
-                    staging_parent,
-                    identity.as_ref(),
-                    input_directory_open_flags(),
-                    Mode::empty(),
-                ) {
-                    Ok(directory) => return Ok((identity, directory)),
-                    Err(_) => {
-                        let _ = unlinkat(staging_parent, identity.as_ref(), AtFlags::REMOVEDIR);
-                        return Err(InputStagingFailure::IdentityUnavailable);
-                    }
-                }
-            }
-            Err(Errno::EXIST) => {}
-            Err(_) => return Err(InputStagingFailure::IdentityUnavailable),
-        }
-    }
-    Err(InputStagingFailure::IdentityUnavailable)
-}
-
-fn input_directory_open_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
-}
-
-fn remove_tree_at(parent: &OwnedFd, identity: &str) -> Result<(), Errno> {
-    let directory = match openat(
-        parent,
-        identity,
-        input_directory_open_flags(),
-        Mode::empty(),
-    ) {
-        Ok(directory) => directory,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(failure) => return Err(failure),
-    };
-    remove_directory_contents(&directory)?;
-    match unlinkat(parent, identity, AtFlags::REMOVEDIR) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
-        Err(failure) => Err(failure),
-    }
-}
-
-fn remove_directory_contents(directory: &OwnedFd) -> Result<(), Errno> {
-    fchmod(directory, Mode::RWXU)?;
-    let entries = Dir::read_from(directory)?
-        .filter_map(|entry| match entry {
-            Ok(entry) if !matches!(entry.file_name().to_bytes(), b"." | b"..") => {
-                Some(Ok(entry.file_name().to_owned()))
-            }
-            Ok(_) => None,
-            Err(failure) => Some(Err(failure)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for name in entries {
-        let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-            let child = openat(
-                directory,
-                &name,
-                input_directory_open_flags(),
-                Mode::empty(),
-            )?;
-            remove_directory_contents(&child)?;
-            unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
-        } else {
-            unlinkat(directory, &name, AtFlags::empty())?;
-        }
-    }
-    Ok(())
+    create_staging_root(staging_parent, ".inputs", IDENTITY_ATTEMPTS)
+        .map_err(|()| InputStagingFailure::IdentityUnavailable)
 }
 
 fn ensure_directory(path: &Path, created: &mut bool) -> Result<(), InputPreparationFailure> {
@@ -1032,17 +839,6 @@ fn create_directory(path: &Path) -> Result<(), InputPreparationFailure> {
         .map_err(|_| {
             InputPreparationFailure::staging(InputPreparationFailureKind::StagingUnavailable)
         })
-}
-
-fn create_payload_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
-fn finish_payload_file(mut file: File) -> io::Result<()> {
-    file.flush()?;
-    file.set_permissions(fs::Permissions::from_mode(0o400))
 }
 
 fn write_bytes_read_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -1076,13 +872,6 @@ fn staging_for_item(input_identity: &str, index: usize) -> InputPreparationFailu
         index,
         InputPreparationFailureKind::StagingUnavailable,
     )
-}
-
-fn directory_identity(path: &Path) -> Option<(u64, u64)> {
-    let metadata = fs::metadata(path).ok()?;
-    metadata
-        .is_dir()
-        .then_some((metadata.dev(), metadata.ino()))
 }
 
 fn lock_reservations(reservations: &Mutex<ReservationLedger>) -> MutexGuard<'_, ReservationLedger> {

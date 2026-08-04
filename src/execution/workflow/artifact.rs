@@ -13,11 +13,15 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::path::PathBuf;
 
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, open, openat, statat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, statat, unlinkat,
 };
 use rustix::io::Errno;
 
 use super::admission::AdmittedExecutionContext;
+use super::execution_root::{AdmittedExecutionRoot, directory_open_flags, open_directory};
+use super::private_staging::{
+    StagingLifecycle, cleanup_staging, mark_cleanup_failed as mark_staging_cleanup_failed,
+};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
@@ -409,7 +413,7 @@ pub(crate) struct ArtifactStaging {
 }
 
 struct ArtifactStagingInner {
-    execution_root: OwnedFd,
+    execution_root: AdmittedExecutionRoot,
     staging_parent: OwnedFd,
     staging_root: OwnedFd,
     #[cfg(test)]
@@ -418,7 +422,7 @@ struct ArtifactStagingInner {
     maximum_files: NonZeroUsize,
     maximum_file_bytes: NonZeroU64,
     maximum_total_bytes: NonZeroU64,
-    lifecycle: RwLock<ArtifactStagingLifecycle>,
+    lifecycle: RwLock<StagingLifecycle>,
     artifacts: Mutex<BTreeSet<Arc<str>>>,
     budget: Mutex<CaptureBudgetLedger>,
     capture_serial: Mutex<()>,
@@ -434,21 +438,14 @@ struct CaptureBudgetLedger {
     reserved_bytes: u64,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ArtifactStagingLifecycle {
-    Active,
-    CleanupFailed,
-    Released,
-}
-
 impl ArtifactStaging {
     pub(crate) fn create(
         execution: &AdmittedExecutionContext,
         staging_parent: &Path,
     ) -> Result<Self, ArtifactStagingFailure> {
         let limits = execution.limits();
-        Self::create_for_execution(
-            execution.root(),
+        Self::create_for_root(
+            execution.root_identity().clone(),
             staging_parent,
             limits.maximum_captured_files(),
             limits.maximum_captured_file_bytes(),
@@ -456,6 +453,7 @@ impl ArtifactStaging {
         )
     }
 
+    #[cfg(test)]
     fn create_for_execution(
         execution_root: &Path,
         staging_parent: &Path,
@@ -463,16 +461,33 @@ impl ArtifactStaging {
         maximum_file_bytes: NonZeroU64,
         maximum_total_bytes: NonZeroU64,
     ) -> Result<Self, ArtifactStagingFailure> {
-        let canonical_execution_root = std::fs::canonicalize(execution_root)
+        let execution_root = AdmittedExecutionRoot::admit(execution_root)
             .map_err(|_| ArtifactStagingFailure::ExecutionRootUnavailable)?;
+        Self::create_for_root(
+            execution_root,
+            staging_parent,
+            maximum_files,
+            maximum_file_bytes,
+            maximum_total_bytes,
+        )
+    }
+
+    fn create_for_root(
+        execution_root: AdmittedExecutionRoot,
+        staging_parent: &Path,
+        maximum_files: NonZeroUsize,
+        maximum_file_bytes: NonZeroU64,
+        maximum_total_bytes: NonZeroU64,
+    ) -> Result<Self, ArtifactStagingFailure> {
+        if !execution_root.pathname_is_bound() {
+            return Err(ArtifactStagingFailure::ExecutionRootUnavailable);
+        }
         let canonical_staging_parent = std::fs::canonicalize(staging_parent)
             .map_err(|_| ArtifactStagingFailure::StagingParentUnavailable)?;
-        if canonical_staging_parent.starts_with(&canonical_execution_root) {
+        if canonical_staging_parent.starts_with(execution_root.provenance_path()) {
             return Err(ArtifactStagingFailure::StagingParentExposed);
         }
 
-        let execution_root = open_directory(&canonical_execution_root)
-            .map_err(|_| ArtifactStagingFailure::ExecutionRootUnavailable)?;
         let staging_parent_handle = open_directory(&canonical_staging_parent)
             .map_err(|_| ArtifactStagingFailure::StagingParentUnavailable)?;
         let (store_identity, staging_root) = create_staging_root(&staging_parent_handle)?;
@@ -490,7 +505,7 @@ impl ArtifactStaging {
                 maximum_files,
                 maximum_file_bytes,
                 maximum_total_bytes,
-                lifecycle: RwLock::new(ArtifactStagingLifecycle::Active),
+                lifecycle: RwLock::new(StagingLifecycle::Active),
                 artifacts: Mutex::new(BTreeSet::new()),
                 budget: Mutex::new(CaptureBudgetLedger::default()),
                 capture_serial: Mutex::new(()),
@@ -508,16 +523,9 @@ impl ArtifactStaging {
         {
             return false;
         }
-        let Ok(candidate_root) = open_directory(execution.root()) else {
-            return false;
-        };
-        let (Ok(bound_metadata), Ok(candidate_metadata)) =
-            (fstat(&self.inner.execution_root), fstat(&candidate_root))
-        else {
-            return false;
-        };
-        bound_metadata.st_dev == candidate_metadata.st_dev
-            && bound_metadata.st_ino == candidate_metadata.st_ino
+        self.inner
+            .execution_root
+            .is_same_directory(execution.root_identity())
     }
 
     pub(crate) fn capture_files(
@@ -798,7 +806,7 @@ impl ArtifactStaging {
                 CaptureFailureKind::StagingUnavailable,
             ))
         })?;
-        if *lifecycle != ArtifactStagingLifecycle::Active {
+        if *lifecycle != StagingLifecycle::Active {
             return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                 output_identity,
                 CaptureFailureKind::StagingUnavailable,
@@ -808,8 +816,8 @@ impl ArtifactStaging {
             CaptureAttemptFailure::Capture(CaptureFailure::new(Arc::clone(&output_identity), kind))
         })?;
         cancellation.boundary(&output_identity, CaptureBoundaryKind::BeforeSourceOpen)?;
-        let mut source =
-            open_regular_file(&self.inner.execution_root, &components).map_err(|kind| {
+        let mut source = open_regular_file(self.inner.execution_root.directory(), &components)
+            .map_err(|kind| {
                 CaptureAttemptFailure::Capture(CaptureFailure::new(
                     Arc::clone(&output_identity),
                     kind,
@@ -941,7 +949,7 @@ impl ArtifactStaging {
             .lifecycle
             .read()
             .map_err(|_| ArtifactReadFailure::Unavailable)?;
-        if *lifecycle != ArtifactStagingLifecycle::Active
+        if *lifecycle != StagingLifecycle::Active
             || handle.store_identity != self.inner.store_identity
         {
             return Err(ArtifactReadFailure::UnknownHandle);
@@ -996,7 +1004,7 @@ impl ArtifactStagingInner {
         let Ok(lifecycle) = self.lifecycle.read() else {
             return false;
         };
-        if *lifecycle == ArtifactStagingLifecycle::Released {
+        if *lifecycle == StagingLifecycle::Released {
             return true;
         }
         self.remove_artifact_while_active(artifact_identity)
@@ -1018,30 +1026,15 @@ impl ArtifactStagingInner {
     }
 
     fn mark_cleanup_failed(&self) {
-        let Ok(mut lifecycle) = self.lifecycle.write() else {
-            return;
-        };
-        if *lifecycle == ArtifactStagingLifecycle::Active {
-            *lifecycle = ArtifactStagingLifecycle::CleanupFailed;
-        }
+        mark_staging_cleanup_failed(&self.lifecycle);
     }
 
     fn cleanup(&self) -> Result<(), ArtifactReleaseFailure> {
-        let mut lifecycle = self
-            .lifecycle
-            .write()
-            .map_err(|_| ArtifactReleaseFailure::CleanupUnavailable)?;
-        if *lifecycle == ArtifactStagingLifecycle::Released {
-            return Ok(());
-        }
-
-        let cleanup_result = self.cleanup_active();
-        *lifecycle = if cleanup_result.is_ok() {
-            ArtifactStagingLifecycle::Released
-        } else {
-            ArtifactStagingLifecycle::CleanupFailed
-        };
-        cleanup_result
+        cleanup_staging(
+            &self.lifecycle,
+            ArtifactReleaseFailure::CleanupUnavailable,
+            || self.cleanup_active(),
+        )
     }
 
     fn cleanup_active(&self) -> Result<(), ArtifactReleaseFailure> {
@@ -1178,26 +1171,6 @@ fn capture_components(path: &Path) -> Result<Vec<OsString>, CaptureFailureKind> 
         return Err(CaptureFailureKind::EmptyPath);
     }
     Ok(components)
-}
-
-pub(super) fn open_directory(path: &Path) -> Result<OwnedFd, Errno> {
-    open(path, directory_open_flags(), Mode::empty())
-}
-
-fn directory_open_flags() -> OFlags {
-    let common = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        common | OFlags::PATH
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        common | OFlags::from_bits_retain(libc::O_SEARCH.unsigned_abs())
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    {
-        common | OFlags::RDONLY
-    }
 }
 
 fn create_staging_root(

@@ -158,7 +158,7 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
     let fixture = admitted_fixture(cancellation.clone(), Duration::from_secs(7));
     let cancellation_request = cancellation.clone();
     let requester = std::thread::spawn(move || {
-        pending_poll.wait_until_pending();
+        pending_poll.wait_until_reached();
         let admitted = cancellation_request.request_cancellation(CancellationReason::UserRequest);
         pending_poll.resume();
         admitted

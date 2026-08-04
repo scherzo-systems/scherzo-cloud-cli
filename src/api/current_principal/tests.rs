@@ -317,18 +317,14 @@ fn request_deadline_bounds_the_complete_streaming_response() {
 }
 
 #[test]
-fn refused_connection_maps_to_connection() {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let address = socket.local_addr().unwrap();
-    // Keep the bound socket unlistened so the port cannot be reassigned to a
-    // concurrent fixture before the client observes the refused connection.
+fn connection_closed_before_response_maps_to_connection() {
+    let server = TestServer::respond(Vec::new());
 
     let outcome = get_current_principal_with_timeout(
         &http_client(),
-        &format!("http://{address}"),
+        &server.api_url,
         None,
-        Duration::from_millis(250),
+        Duration::from_secs(2),
     )
     .unwrap();
 
@@ -336,6 +332,7 @@ fn refused_connection_maps_to_connection() {
         outcome,
         CurrentPrincipalOutcome::Unreachable(UnreachableCategory::Connection)
     );
+    server.finish_one();
 }
 
 #[test]

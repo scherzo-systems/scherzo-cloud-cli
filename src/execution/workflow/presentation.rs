@@ -4,15 +4,17 @@ use std::fmt;
 use std::future::{Future, ready};
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::watch;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
+use super::document::Output;
 use super::input::InputPreparationFailureKind;
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
@@ -36,6 +38,21 @@ use super::validated::{ValidatedHarness, ValidatedStep};
 const COMMAND: &str = "scherzo-cloud workflow run";
 const CHILD_FRAGMENT_BYTES: usize = 16 * 1024;
 const CONTROL_SEQUENCE_BYTES: usize = 4096;
+const EVENT_TOKEN_WIDTH: usize = 10;
+const MIN_INLINE_DETAIL_WIDTH: usize = 24;
+const STACKED_DETAIL_INDENT: usize = 2;
+const STACKED_CONTINUATION_INDENT: usize = 4;
+const SAFETY_CONTINUATION_MARKER: &str = "↪";
+const VISUAL_CONTINUATION_MARKER: &str = "↳";
+const STYLE_PRIMARY: &str = "38;2;205;214;244";
+const STYLE_SECONDARY: &str = "38;2;166;173;200";
+const STYLE_MUTED: &str = "38;2;127;132;156";
+const STYLE_ACTIVE: &str = "38;2;137;180;250";
+const STYLE_OUTPUT: &str = "38;2;148;226;213";
+const STYLE_SUCCESS: &str = "38;2;166;227;161";
+const STYLE_FAILURE: &str = "38;2;243;139;168";
+const STYLE_BLOCKED: &str = "38;2;250;179;135";
+const STYLE_CONTINUATION: &str = "2;38;2;127;132;156";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestedPresentationMode {
@@ -61,19 +78,48 @@ pub(crate) enum ColorChoice {
 pub(crate) struct TerminalCapabilities {
     pub(crate) stdout_is_terminal: bool,
     pub(crate) stderr_is_terminal: bool,
+    pub(crate) stdout_width: Option<usize>,
+    pub(crate) stderr_width: Option<usize>,
     pub(crate) term: Option<OsString>,
     pub(crate) no_color: Option<OsString>,
 }
 
 impl TerminalCapabilities {
     pub(crate) fn detect() -> Self {
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let stdout_is_terminal = stdout.is_terminal();
+        let stderr_is_terminal = stderr.is_terminal();
         Self {
-            stdout_is_terminal: io::stdout().is_terminal(),
-            stderr_is_terminal: io::stderr().is_terminal(),
+            stdout_is_terminal,
+            stderr_is_terminal,
+            stdout_width: if stdout_is_terminal {
+                detected_terminal_width(&stdout)
+            } else {
+                None
+            },
+            stderr_width: if stderr_is_terminal {
+                detected_terminal_width(&stderr)
+            } else {
+                None
+            },
             term: std::env::var_os("TERM"),
             no_color: std::env::var_os("NO_COLOR"),
         }
     }
+}
+
+#[cfg(unix)]
+fn detected_terminal_width<Fd: rustix::fd::AsFd>(descriptor: Fd) -> Option<usize> {
+    rustix::termios::tcgetwinsize(descriptor)
+        .ok()
+        .map(|size| usize::from(size.ws_col))
+        .filter(|width| *width != 0)
+}
+
+#[cfg(not(unix))]
+fn detected_terminal_width<Descriptor>(_descriptor: &Descriptor) -> Option<usize> {
+    None
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,22 +159,43 @@ impl PresentationConfig {
             }
         }
     }
+
+    fn wrapping_width(&self) -> Option<usize> {
+        match self.mode() {
+            PresentationMode::Plain if self.capabilities.stdout_is_terminal => {
+                self.capabilities.stdout_width
+            }
+            PresentationMode::Json if self.capabilities.stderr_is_terminal => {
+                self.capabilities.stderr_width
+            }
+            PresentationMode::Plain | PresentationMode::Json => None,
+        }
+    }
 }
 
 fn usable_term(term: Option<&OsStr>) -> bool {
     term.is_some_and(|term| !term.is_empty() && term.as_encoded_bytes() != b"dumb")
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObservationTime {
+    utc: OffsetDateTime,
+    monotonic: Instant,
+}
+
 pub(crate) trait ObservationClock: Clone + Send + Sync + 'static {
-    fn now(&self) -> OffsetDateTime;
+    fn sample(&self) -> ObservationTime;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SystemObservationClock;
 
 impl ObservationClock for SystemObservationClock {
-    fn now(&self) -> OffsetDateTime {
-        crate::timing::utc_now()
+    fn sample(&self) -> ObservationTime {
+        ObservationTime {
+            utc: crate::timing::utc_now(),
+            monotonic: crate::timing::monotonic_now(),
+        }
     }
 }
 
@@ -320,9 +387,23 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn start<Clock>(
         self,
         workflow: &ResolvedWorkflow,
+        maximum_parallel_steps: usize,
+        clock: Clock,
+    ) -> Result<WorkflowRunPresentation<StandardOutput, StandardError, Clock>, PresentationFailure>
+    where
+        Clock: ObservationClock,
+    {
+        self.start_for_result(workflow, "result", maximum_parallel_steps, clock)
+    }
+
+    pub(crate) fn start_for_result<Clock>(
+        self,
+        workflow: &ResolvedWorkflow,
+        result_directory: &str,
         maximum_parallel_steps: usize,
         clock: Clock,
     ) -> Result<WorkflowRunPresentation<StandardOutput, StandardError, Clock>, PresentationFailure>
@@ -334,6 +415,7 @@ where
             self.standard_output,
             self.standard_error,
             workflow,
+            result_directory,
             maximum_parallel_steps,
             clock,
         )
@@ -396,6 +478,7 @@ where
         standard_output: StandardOutput,
         standard_error: StandardError,
         workflow: &ResolvedWorkflow,
+        result_directory: &str,
         maximum_parallel_steps: usize,
         clock: Clock,
     ) -> Result<Self, PresentationFailure> {
@@ -403,15 +486,17 @@ where
         let mut state = PresentationState {
             mode: config.mode(),
             color: config.color_enabled(),
+            terminal_width: config.wrapping_width(),
             standard_output,
             standard_error,
-            definition: PresentationDefinition::from_workflow(workflow),
+            definition: PresentationDefinition::from_workflow(workflow, result_directory),
             child_streams: BTreeMap::new(),
+            step_starts: BTreeMap::new(),
             failure: None,
             failure_sender,
             finished: false,
         };
-        let opened_at = clock.now();
+        let opened_at = clock.sample().utc;
         if let Err(failure) = state.write_header(opened_at, maximum_parallel_steps) {
             state.report_output_failure(&failure);
             return Err(failure);
@@ -469,7 +554,7 @@ where
             return WorkflowRunPresentationResult::Failed(failure);
         }
 
-        let observed_at = self.clock.now();
+        let observed_at = self.clock.sample().utc;
         if let Err(failure) = state.finish_child_streams(observed_at) {
             let failure = failure.with_result_directory(result_directory);
             state.report_output_failure(&failure);
@@ -522,7 +607,7 @@ where
     ) -> impl Future<Output = ()> + Send {
         let mut state = lock_state(&self.state);
         if state.failure.is_none() && !state.finished {
-            let observed_at = self.clock.now();
+            let observed_at = self.clock.sample();
             if let Err(failure) = state.render_observation(observed_at, observation) {
                 state.record_failure(failure);
             }
@@ -543,10 +628,12 @@ fn lock_state<T, U>(
 struct PresentationState<StandardOutput, StandardError> {
     mode: PresentationMode,
     color: bool,
+    terminal_width: Option<usize>,
     standard_output: StandardOutput,
     standard_error: StandardError,
     definition: PresentationDefinition,
     child_streams: BTreeMap<ChildStreamKey, ChildStream>,
+    step_starts: BTreeMap<String, Instant>,
     failure: Option<PresentationFailure>,
     failure_sender: watch::Sender<Option<PresentationFailure>>,
     finished: bool,
@@ -555,18 +642,30 @@ struct PresentationState<StandardOutput, StandardError> {
 #[derive(Clone)]
 struct PresentationDefinition {
     workflow_path: String,
+    result_directory: String,
     presentation_order: Vec<String>,
     steps: BTreeMap<String, PresentationStep>,
+    scope_width: usize,
 }
 
 #[derive(Clone)]
 struct PresentationStep {
     kind: &'static str,
     start_detail: String,
+    success: StepSuccessPresentation,
+    outputs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+enum StepSuccessPresentation {
+    Command,
+    AgentResponse,
+    AgentResult,
+    AgentWithoutValue,
 }
 
 impl PresentationDefinition {
-    fn from_workflow(workflow: &ResolvedWorkflow) -> Self {
+    fn from_workflow(workflow: &ResolvedWorkflow, result_directory: &str) -> Self {
         let steps = workflow
             .definition
             .steps
@@ -587,29 +686,71 @@ impl PresentationDefinition {
                         PresentationStep {
                             kind: "cmd",
                             start_detail: visible_text(&detail),
+                            success: StepSuccessPresentation::Command,
+                            outputs: presentation_outputs(&command.common.outputs),
                         }
                     }
                     ValidatedStep::Agent(agent) => {
                         let ValidatedHarness::Pi(config) = &agent.agent.harness;
                         let thinking = format!("{:?}", config.thinking).to_ascii_lowercase();
+                        let success = agent
+                            .common
+                            .outputs
+                            .values()
+                            .find_map(|output| match output.definition {
+                                Output::AgentResponse => {
+                                    Some(StepSuccessPresentation::AgentResponse)
+                                }
+                                Output::AgentResult { .. } => {
+                                    Some(StepSuccessPresentation::AgentResult)
+                                }
+                                Output::File { .. } => None,
+                            })
+                            .unwrap_or(StepSuccessPresentation::AgentWithoutValue);
                         PresentationStep {
                             kind: "agent",
                             start_detail: visible_text(&format!(
-                                "agent · profile {} · pi · {} · thinking={thinking}",
+                                "agent · {} · pi · {} · thinking={thinking}",
                                 agent.agent.profile, config.model
                             )),
+                            success,
+                            outputs: presentation_outputs(&agent.common.outputs),
                         }
                     }
                 };
                 (id.clone(), presentation)
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let scope_width = steps
+            .keys()
+            .map(String::len)
+            .chain(std::iter::once("@workflow".len()))
+            .max()
+            .unwrap_or("@workflow".len());
         Self {
             workflow_path: workflow.source.workflow_path.clone(),
+            result_directory: result_directory.to_owned(),
             presentation_order: workflow.definition.presentation_order.clone(),
             steps,
+            scope_width,
         }
     }
+}
+
+fn presentation_outputs(
+    outputs: &BTreeMap<String, super::validated::ValidatedOutput>,
+) -> BTreeMap<String, String> {
+    outputs
+        .iter()
+        .map(|(name, output)| {
+            let detail = match &output.definition {
+                Output::AgentResponse => "agent_response".to_owned(),
+                Output::AgentResult { schema } => format!("agent_result → {schema}"),
+                Output::File { path, .. } => format!("file → {path}"),
+            };
+            (name.clone(), visible_text(&detail))
+        })
+        .collect()
 }
 
 impl<StandardOutput, StandardError> PresentationState<StandardOutput, StandardError>
@@ -622,13 +763,20 @@ where
         opened_at: OffsetDateTime,
         maximum_parallel_steps: usize,
     ) -> Result<(), PresentationFailure> {
-        let timestamp = rfc3339(opened_at)?;
+        let step_count = self.definition.steps.len();
+        let step_label = if step_count == 1 { "step" } else { "steps" };
+        let identity = visible_text(&self.definition.result_directory);
+        let metadata = format!(
+            " · {} · {step_count} {step_label} · concurrency {maximum_parallel_steps}",
+            visible_text(&self.definition.workflow_path)
+        );
         let header = format!(
-            "{} · {} steps · max parallel {}\nview opened {}\n\n",
-            visible_text(&self.definition.workflow_path),
-            self.definition.steps.len(),
-            maximum_parallel_steps,
-            timestamp
+            "{} {}{}\n{} {}\n\n",
+            self.styled_text("run", TextTone::Muted),
+            self.styled_text(&identity, TextTone::Primary),
+            self.styled_text(&metadata, TextTone::Secondary),
+            self.styled_text("started", TextTone::Muted),
+            self.styled_text(&header_timestamp(opened_at), TextTone::Secondary),
         );
         let writer = self.line_writer();
         writer
@@ -641,7 +789,7 @@ where
 
     fn render_observation<Deadline: DisplayDeadline>(
         &mut self,
-        observed_at: OffsetDateTime,
+        observed_at: ObservationTime,
         observation: ExecutionObservation<Deadline>,
     ) -> Result<(), PresentationFailure> {
         match observation {
@@ -649,10 +797,10 @@ where
                 self.render_transition(observed_at, transition)
             }
             ExecutionObservation::CommandOutput(output) => {
-                self.render_child_output(observed_at, output)
+                self.render_child_output(observed_at.utc, output)
             }
             ExecutionObservation::CommandOutputClosed(closed) => {
-                self.close_child_output(observed_at, closed)
+                self.close_child_output(observed_at.utc, closed)
             }
         }?;
         self.flush_line_writer()
@@ -660,7 +808,7 @@ where
 
     fn render_transition<Deadline: DisplayDeadline>(
         &mut self,
-        observed_at: OffsetDateTime,
+        observed_at: ObservationTime,
         transition: TransitionObservation<Deadline>,
     ) -> Result<(), PresentationFailure> {
         match transition.event {
@@ -669,7 +817,7 @@ where
             } => {
                 let deadline = rfc3339(deadline.deadline_utc())?;
                 self.write_event(
-                    observed_at,
+                    observed_at.utc,
                     "@workflow",
                     "cancelling",
                     &format!("{} · force stop at {deadline}", cancellation_reason(reason)),
@@ -678,29 +826,52 @@ where
             }
             TransitionEvent::Step { step, to, .. } => match to {
                 StepStateKind::Starting => {
+                    self.step_starts
+                        .entry(step.clone())
+                        .or_insert(observed_at.monotonic);
                     let detail = self
                         .definition
                         .steps
                         .get(&step)
                         .map(|step| step.start_detail.clone())
                         .unwrap_or_else(|| "cmd".to_owned());
-                    self.write_event(observed_at, &step, "start", &detail, TokenRole::Active)
+                    self.write_event(observed_at.utc, &step, "start", &detail, TokenRole::Active)
                 }
                 StepStateKind::Succeeded => {
-                    if let Some(ObservedStepTransition::OutputsCommitted { outputs }) =
-                        transition.step
-                    {
-                        for output in outputs {
-                            self.write_event(
-                                observed_at,
-                                &step,
-                                "output",
-                                &format!("{} · committed", visible_text(&output)),
-                                TokenRole::Output,
-                            )?;
-                        }
+                    let outputs = match transition.step {
+                        Some(ObservedStepTransition::OutputsCommitted { outputs }) => outputs,
+                        _ => Vec::new(),
+                    };
+                    for output in &outputs {
+                        let detail = self
+                            .definition
+                            .steps
+                            .get(&step)
+                            .and_then(|definition| definition.outputs.get(output))
+                            .map_or_else(
+                                || format!("{} · committed", visible_text(output)),
+                                |declaration| format!("{} · {declaration}", visible_text(output)),
+                            );
+                        self.write_event(
+                            observed_at.utc,
+                            &step,
+                            "output",
+                            &detail,
+                            TokenRole::Output,
+                        )?;
                     }
-                    self.write_event(observed_at, &step, "done", "", TokenRole::Success)
+                    let detail = self
+                        .definition
+                        .steps
+                        .get(&step)
+                        .map_or_else(String::new, |definition| {
+                            success_detail(definition.success, outputs.len())
+                        });
+                    let detail = completion_detail(
+                        detail,
+                        self.finish_step_duration(&step, observed_at.monotonic),
+                    );
+                    self.write_event(observed_at.utc, &step, "done", &detail, TokenRole::Success)
                 }
                 StepStateKind::Failed => {
                     let detail = match transition.step {
@@ -709,7 +880,17 @@ where
                         }
                         _ => "authoritative step failure".to_owned(),
                     };
-                    self.write_event(observed_at, &step, "failed", &detail, TokenRole::Failure)
+                    let detail = completion_detail(
+                        detail,
+                        self.finish_step_duration(&step, observed_at.monotonic),
+                    );
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "failed",
+                        &detail,
+                        TokenRole::Failure,
+                    )
                 }
                 StepStateKind::Blocked => {
                     let detail = match transition.step {
@@ -718,15 +899,25 @@ where
                         }
                         _ => "dependency did not succeed".to_owned(),
                     };
-                    self.write_event(observed_at, &step, "blocked", &detail, TokenRole::Blocked)
+                    self.step_starts.remove(&step);
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "blocked",
+                        &detail,
+                        TokenRole::Blocked,
+                    )
                 }
-                StepStateKind::NotRun => self.write_event(
-                    observed_at,
-                    &step,
-                    "not-run",
-                    "failure stop",
-                    TokenRole::Neutral,
-                ),
+                StepStateKind::NotRun => {
+                    self.step_starts.remove(&step);
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "not-run",
+                        "failure stop",
+                        TokenRole::Neutral,
+                    )
+                }
                 StepStateKind::Cancelling => {
                     let detail = match transition.step {
                         Some(ObservedStepTransition::Cancelling { reason }) => {
@@ -734,7 +925,13 @@ where
                         }
                         _ => "cancellation accepted",
                     };
-                    self.write_event(observed_at, &step, "cancelling", detail, TokenRole::Blocked)
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "cancelling",
+                        detail,
+                        TokenRole::Blocked,
+                    )
                 }
                 StepStateKind::Cancelled => {
                     let detail = match transition.step {
@@ -743,7 +940,17 @@ where
                         }
                         _ => "cancelled",
                     };
-                    self.write_event(observed_at, &step, "cancelled", detail, TokenRole::Blocked)
+                    let detail = completion_detail(
+                        detail.to_owned(),
+                        self.finish_step_duration(&step, observed_at.monotonic),
+                    );
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "cancelled",
+                        &detail,
+                        TokenRole::Blocked,
+                    )
                 }
                 StepStateKind::Pending
                 | StepStateKind::Running
@@ -751,6 +958,12 @@ where
             },
             TransitionEvent::Workflow { .. } => Ok(()),
         }
+    }
+
+    fn finish_step_duration(&mut self, step: &str, finished_at: Instant) -> Option<Duration> {
+        self.step_starts
+            .remove(step)
+            .map(|started_at| finished_at.saturating_duration_since(started_at))
     }
 
     fn render_child_output(
@@ -811,7 +1024,7 @@ where
             CommandOutputSource::StandardError => "stderr",
         };
         let detail = if record.continuation {
-            format!("↪ {}", record.payload)
+            format!("{SAFETY_CONTINUATION_MARKER} {}", record.payload)
         } else {
             record.payload
         };
@@ -826,20 +1039,76 @@ where
         detail: &str,
         role: TokenRole,
     ) -> Result<(), PresentationFailure> {
-        let token = self.styled_token(token, role);
-        let suffix = if detail.is_empty() {
-            String::new()
-        } else {
-            format!("  {detail}")
-        };
-        let line = format!(
-            "[{}] {}  {}{}\n",
-            observation_timestamp(observed_at),
-            visible_text(scope),
-            token,
-            suffix
+        let raw_timestamp = format!("[{}]", observation_timestamp(observed_at));
+        let visible_scope = visible_text(scope);
+        let scope_padding = " ".repeat(
+            self.definition
+                .scope_width
+                .saturating_sub(visible_scope.len()),
         );
-        self.write_line_bytes(line.as_bytes())
+        let timestamp = self.styled_text(&raw_timestamp, TextTone::Muted);
+        let scope = self.styled_text(&visible_scope, TextTone::Secondary);
+        let styled_token = self.styled_token(token, role);
+
+        if detail.is_empty() {
+            let line = format!("{timestamp} {scope}{scope_padding}  {styled_token}\n");
+            return self.write_line_bytes(line.as_bytes());
+        }
+
+        let token_padding = " ".repeat(EVENT_TOKEN_WIDTH.saturating_sub(token.len()));
+        let aligned_prefix =
+            format!("{timestamp} {scope}{scope_padding}  {styled_token}{token_padding}  ");
+        let raw_aligned_prefix =
+            format!("{raw_timestamp} {visible_scope}{scope_padding}  {token}{token_padding}  ");
+        let detail_column = display_width(&raw_aligned_prefix);
+        let Some(terminal_width) = self.terminal_width else {
+            let line = format!(
+                "{aligned_prefix}{}\n",
+                self.styled_text(detail, TextTone::Secondary)
+            );
+            return self.write_line_bytes(line.as_bytes());
+        };
+
+        let mut rendered = String::new();
+        if terminal_width.saturating_sub(detail_column) >= MIN_INLINE_DETAIL_WIDTH {
+            let continuation_prefix_width =
+                detail_column + display_width(VISUAL_CONTINUATION_MARKER) + " ".len();
+            let (first, continuations) = wrap_detail(
+                detail,
+                terminal_width.saturating_sub(detail_column),
+                terminal_width.saturating_sub(continuation_prefix_width),
+            );
+            rendered.push_str(&aligned_prefix);
+            rendered.push_str(&self.styled_text(&first, TextTone::Secondary));
+            rendered.push('\n');
+            for continuation in &continuations {
+                rendered.push_str(&" ".repeat(detail_column));
+                rendered.push_str(&self.styled(VISUAL_CONTINUATION_MARKER, STYLE_CONTINUATION));
+                rendered.push(' ');
+                rendered.push_str(&self.styled_text(continuation, TextTone::Secondary));
+                rendered.push('\n');
+            }
+        } else {
+            rendered.push_str(&format!("{timestamp} {scope} {styled_token}\n"));
+            let continuation_prefix_width =
+                STACKED_CONTINUATION_INDENT + display_width(VISUAL_CONTINUATION_MARKER) + " ".len();
+            let (first, continuations) = wrap_detail(
+                detail,
+                terminal_width.saturating_sub(STACKED_DETAIL_INDENT),
+                terminal_width.saturating_sub(continuation_prefix_width),
+            );
+            rendered.push_str(&" ".repeat(STACKED_DETAIL_INDENT));
+            rendered.push_str(&self.styled_text(&first, TextTone::Secondary));
+            rendered.push('\n');
+            for continuation in &continuations {
+                rendered.push_str(&" ".repeat(STACKED_CONTINUATION_INDENT));
+                rendered.push_str(&self.styled(VISUAL_CONTINUATION_MARKER, STYLE_CONTINUATION));
+                rendered.push(' ');
+                rendered.push_str(&self.styled_text(continuation, TextTone::Secondary));
+                rendered.push('\n');
+            }
+        }
+        self.write_line_bytes(rendered.as_bytes())
     }
 
     fn write_summary(
@@ -857,8 +1126,12 @@ where
                 PresentationFailureOperation::InvalidTerminalResult,
             ));
         }
-        self.write_line_bytes(b"\n-- summary --\n\n")?;
-        self.write_line_bytes(b"step  kind  state  duration  detail\n")?;
+        let divider = self.styled_text(
+            "── summary ────────────────────────────────────────────",
+            TextTone::Muted,
+        );
+        self.write_line_bytes(format!("\n{divider}\n\n").as_bytes())?;
+        let mut rows = Vec::with_capacity(steps.len());
         let order = self.definition.presentation_order.clone();
         for id in order {
             let Some(step) = steps.get(id.as_str()) else {
@@ -871,24 +1144,70 @@ where
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
-            let kind = definition.kind;
-            let Some((state, detail, role)) = summary_step(step) else {
+            let Some((state, detail, role)) = summary_step(step, definition.success) else {
                 return Err(PresentationFailure::operation(
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
-            let duration = step
-                .timing
-                .as_ref()
-                .map_or_else(|| "-".to_owned(), |timing| human_duration(timing.duration));
-            let state = self.styled_token(state, role);
-            let row = format!(
-                "{}  {kind}  {state}  {duration}  {}\n",
-                visible_text(&id),
-                visible_text(&detail)
-            );
-            self.write_line_bytes(row.as_bytes())?;
+            rows.push(SummaryRow {
+                step: visible_text(&id),
+                kind: definition.kind,
+                state,
+                duration: step
+                    .timing
+                    .as_ref()
+                    .map_or_else(|| "–".to_owned(), |timing| human_duration(timing.duration)),
+                detail: visible_text(&detail),
+                role,
+            });
         }
+        let step_width = rows
+            .iter()
+            .map(|row| row.step.len())
+            .chain(std::iter::once("step".len()))
+            .max()
+            .unwrap_or("step".len());
+        let kind_width = rows
+            .iter()
+            .map(|row| row.kind.len())
+            .chain(std::iter::once("kind".len()))
+            .max()
+            .unwrap_or("kind".len());
+        let state_width = rows
+            .iter()
+            .map(|row| row.state.len())
+            .chain(std::iter::once("state".len()))
+            .max()
+            .unwrap_or("state".len());
+        let duration_width = rows
+            .iter()
+            .map(|row| row.duration.chars().count())
+            .chain(std::iter::once("duration".len()))
+            .max()
+            .unwrap_or("duration".len());
+        let header = format!(
+            "{:<step_width$}  {:<kind_width$}  {:<state_width$}  {:<duration_width$}  detail",
+            "step", "kind", "state", "duration"
+        );
+        let header = self.styled_text(&header, TextTone::Muted);
+        self.write_line_bytes(format!("{header}\n").as_bytes())?;
+        for row in rows {
+            let step_padding = " ".repeat(step_width.saturating_sub(row.step.len()));
+            let kind_padding = " ".repeat(kind_width.saturating_sub(row.kind.len()));
+            let state_padding = " ".repeat(state_width.saturating_sub(row.state.len()));
+            let duration_padding =
+                " ".repeat(duration_width.saturating_sub(row.duration.chars().count()));
+            let step = self.styled_text(&row.step, TextTone::Primary);
+            let kind = self.styled_text(row.kind, TextTone::Secondary);
+            let state = self.styled_token(row.state, row.role);
+            let duration = self.styled_text(&row.duration, TextTone::Secondary);
+            let detail = self.styled_text(&row.detail, TextTone::Secondary);
+            let line = format!(
+                "{step}{step_padding}  {kind}{kind_padding}  {state}{state_padding}  {duration}{duration_padding}  {detail}\n"
+            );
+            self.write_line_bytes(line.as_bytes())?;
+        }
+        self.write_line_bytes(b"\n")?;
 
         let counts = terminal_counts(run);
         let outcome = match &run.outcome {
@@ -901,13 +1220,38 @@ where
             RunOutcome::Failed { .. } => TokenRole::Failure,
             RunOutcome::Cancelled { .. } => TokenRole::Blocked,
         };
-        let mut outcome_line = format!("workflow {}", self.styled_token(outcome, role));
+        let mut outcome_line = match publication {
+            PublicationPresentation::Published(terminal) => format!(
+                "{} {} {}{}",
+                self.styled_text("run", TextTone::Muted),
+                self.styled_text(
+                    &visible_text(terminal.result_directory()),
+                    TextTone::Primary,
+                ),
+                self.styled_token(outcome, role),
+                self.styled_text(
+                    &format!(" · exit {}", terminal.exit_status()),
+                    TextTone::Secondary,
+                ),
+            ),
+            PublicationPresentation::Failed(_) => format!(
+                "{} {}",
+                self.styled_text("workflow", TextTone::Secondary),
+                self.styled_token(outcome, role),
+            ),
+        };
         for (name, count) in counts {
             if count != 0 {
-                outcome_line.push_str(&format!(" · {count} {name}"));
+                outcome_line.push_str(
+                    &self.styled_text(&format!(" · {count} {name}"), TextTone::Secondary),
+                );
             }
         }
-        outcome_line.push_str(&format!(" · {}\n", human_duration(run.timing.duration)));
+        outcome_line.push_str(&self.styled_text(
+            &format!(" · {} total", human_duration(run.timing.duration)),
+            TextTone::Secondary,
+        ));
+        outcome_line.push('\n');
         self.write_line_bytes(outcome_line.as_bytes())?;
 
         match &run.outcome {
@@ -916,32 +1260,40 @@ where
             } => {
                 let detail = failure_detail(primary_failure.phase, &primary_failure.cause);
                 let line = format!(
-                    "failure: {} · {}\n",
-                    visible_text(&primary_failure.step),
-                    visible_text(&detail)
+                    "{} {}\n",
+                    self.styled_token("failure:", TokenRole::Failure),
+                    self.styled_text(
+                        &format!(
+                            "{} · {}",
+                            visible_text(&primary_failure.step),
+                            visible_text(&detail)
+                        ),
+                        TextTone::Secondary,
+                    ),
                 );
                 self.write_line_bytes(line.as_bytes())?;
             }
             RunOutcome::Cancelled { reason } => {
-                let line = format!("cancellation: {}\n", cancellation_reason(*reason));
+                let line = format!(
+                    "{} {}\n",
+                    self.styled_token("cancellation:", TokenRole::Blocked),
+                    self.styled_text(cancellation_reason(*reason), TextTone::Secondary),
+                );
                 self.write_line_bytes(line.as_bytes())?;
             }
             RunOutcome::Succeeded => {}
         }
 
-        match publication {
-            PublicationPresentation::Published(terminal) => {
-                let line = format!("result: {}\n", visible_text(terminal.result_directory()));
-                self.write_line_bytes(line.as_bytes())?;
-            }
-            PublicationPresentation::Failed(error) => {
-                let line = format!(
-                    "result publication failed: {:?} · {:?}\n",
-                    error.phase(),
-                    error.kind()
-                );
-                self.write_line_bytes(line.as_bytes())?;
-            }
+        if let PublicationPresentation::Failed(error) = publication {
+            let line = format!(
+                "{} {}\n",
+                self.styled_token("result publication failed:", TokenRole::Failure),
+                self.styled_text(
+                    &format!("{:?} · {:?}", error.phase(), error.kind()),
+                    TextTone::Secondary,
+                ),
+            );
+            self.write_line_bytes(line.as_bytes())?;
         }
         self.flush_line_writer()
     }
@@ -985,18 +1337,32 @@ where
     }
 
     fn styled_token(&self, token: &str, role: TokenRole) -> String {
-        if !self.color || role == TokenRole::Neutral {
-            return token.to_owned();
-        }
         let code = match role {
-            TokenRole::Active => "34",
-            TokenRole::Output => "36",
-            TokenRole::Success => "32",
-            TokenRole::Failure => "31",
-            TokenRole::Blocked => "33",
-            TokenRole::Neutral => return token.to_owned(),
+            TokenRole::Active => STYLE_ACTIVE,
+            TokenRole::Output => STYLE_OUTPUT,
+            TokenRole::Success => STYLE_SUCCESS,
+            TokenRole::Failure => STYLE_FAILURE,
+            TokenRole::Blocked => STYLE_BLOCKED,
+            TokenRole::Neutral => STYLE_MUTED,
         };
-        format!("\x1b[{code}m{token}\x1b[0m")
+        self.styled(token, code)
+    }
+
+    fn styled_text(&self, text: &str, tone: TextTone) -> String {
+        let code = match tone {
+            TextTone::Primary => STYLE_PRIMARY,
+            TextTone::Secondary => STYLE_SECONDARY,
+            TextTone::Muted => STYLE_MUTED,
+        };
+        self.styled(text, code)
+    }
+
+    fn styled(&self, text: &str, code: &str) -> String {
+        if self.color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
     }
 
     fn record_failure(&mut self, failure: PresentationFailure) {
@@ -1015,6 +1381,22 @@ enum TokenRole {
     Failure,
     Blocked,
     Neutral,
+}
+
+#[derive(Clone, Copy)]
+enum TextTone {
+    Primary,
+    Secondary,
+    Muted,
+}
+
+struct SummaryRow {
+    step: String,
+    kind: &'static str,
+    state: &'static str,
+    duration: String,
+    detail: String,
+    role: TokenRole,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1370,11 +1752,90 @@ fn is_unicode_control(character: char) -> bool {
 fn observation_timestamp(value: OffsetDateTime) -> String {
     let value = value.to_offset(UtcOffset::UTC);
     format!(
-        "{:02}:{:02}:{:02}.{:03}",
+        "{:02}:{:02}:{:02}",
         value.hour(),
         value.minute(),
-        value.second(),
-        value.millisecond()
+        value.second()
+    )
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn wrap_detail(
+    detail: &str,
+    first_width: usize,
+    continuation_width: usize,
+) -> (String, Vec<String>) {
+    let (first, mut remainder) = next_detail_segment(detail, first_width);
+    let mut continuations = Vec::new();
+    while !remainder.is_empty() {
+        let (continuation, next) = next_detail_segment(remainder, continuation_width);
+        continuations.push(continuation.to_owned());
+        remainder = next;
+    }
+    (first.to_owned(), continuations)
+}
+
+fn next_detail_segment(value: &str, maximum_width: usize) -> (&str, &str) {
+    let maximum_width = maximum_width.max(1);
+    if display_width(value) <= maximum_width {
+        return (value, "");
+    }
+
+    let mut used_width = 0_usize;
+    let mut fitting_end = 0;
+    for (index, character) in value.char_indices() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used_width.saturating_add(character_width) > maximum_width {
+            if used_width == 0 {
+                fitting_end = index + character.len_utf8();
+            }
+            break;
+        }
+        used_width += character_width;
+        fitting_end = index + character.len_utf8();
+    }
+
+    let candidate = &value[..fitting_end];
+    if value[fitting_end..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        return (
+            candidate.trim_end_matches(char::is_whitespace),
+            value[fitting_end..].trim_start_matches(char::is_whitespace),
+        );
+    }
+    if let Some((boundary, whitespace)) =
+        candidate.char_indices().rev().find(|(index, character)| {
+            character.is_whitespace()
+                && *index != 0
+                && candidate[..*index]
+                    .chars()
+                    .any(|candidate| !candidate.is_whitespace())
+        })
+    {
+        return (
+            candidate[..boundary].trim_end_matches(char::is_whitespace),
+            value[boundary + whitespace.len_utf8()..].trim_start_matches(char::is_whitespace),
+        );
+    }
+    (candidate, &value[fitting_end..])
+}
+
+fn header_timestamp(value: OffsetDateTime) -> String {
+    let value = value.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        value.year(),
+        u8::from(value.month()),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
     )
 }
 
@@ -1480,6 +1941,7 @@ fn failure_cause(cause: &StepFailureCause) -> String {
             }
             StepStartFailure::OutputsUnsupported => "outputs unsupported".to_owned(),
             StepStartFailure::WorkingDirectory(failure) => match failure {
+                WorkingDirectoryFailure::ExecutionRootRebound => "execution root rebound",
                 WorkingDirectoryFailure::Unavailable => "working directory unavailable",
                 WorkingDirectoryFailure::EscapesExecutionRoot => "working directory escape",
                 WorkingDirectoryFailure::NotDirectory => "working directory not directory",
@@ -1539,16 +2001,37 @@ fn failure_cause(cause: &StepFailureCause) -> String {
     }
 }
 
-fn summary_step(step: &WorkflowRunStep) -> Option<(&'static str, String, TokenRole)> {
+fn completion_detail(detail: String, duration: Option<Duration>) -> String {
+    match duration {
+        Some(duration) => format!("{detail} after {}", human_duration(duration)),
+        None => detail,
+    }
+}
+
+fn success_detail(presentation: StepSuccessPresentation, output_count: usize) -> String {
+    let base = match presentation {
+        StepSuccessPresentation::Command => "exit 0",
+        StepSuccessPresentation::AgentResponse => "response captured",
+        StepSuccessPresentation::AgentResult => "result captured",
+        StepSuccessPresentation::AgentWithoutValue => "no requested agent value",
+    };
+    match output_count {
+        0 => base.to_owned(),
+        1 => format!("{base} · 1 output"),
+        count => format!("{base} · {count} outputs"),
+    }
+}
+
+fn summary_step(
+    step: &WorkflowRunStep,
+    success: StepSuccessPresentation,
+) -> Option<(&'static str, String, TokenRole)> {
     match &step.state {
-        StepState::Succeeded { outputs } => {
-            let detail = if outputs.is_empty() {
-                "exit 0".to_owned()
-            } else {
-                format!("exit 0 · {} outputs", outputs.len())
-            };
-            Some(("succeeded", detail, TokenRole::Success))
-        }
+        StepState::Succeeded { outputs } => Some((
+            "succeeded",
+            success_detail(success, outputs.len()),
+            TokenRole::Success,
+        )),
         StepState::Failed { phase, cause } => {
             Some(("failed", failure_detail(*phase, cause), TokenRole::Failure))
         }
@@ -1604,12 +2087,18 @@ fn human_duration(duration: Duration) -> String {
     if milliseconds < 1000 {
         return format!("{milliseconds}ms");
     }
-    let seconds = milliseconds as f64 / 1000.0;
-    if seconds < 60.0 {
-        return format!("{seconds:.1}s");
+    if duration.as_secs() < 60 {
+        return format!("{:.1}s", duration.as_secs_f64());
     }
-    let minutes = seconds / 60.0;
-    format!("{minutes:.1}m")
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = total_seconds % 3600 / 60;
+    let seconds = total_seconds % 60;
+    if hours == 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    }
 }
 
 #[cfg(test)]

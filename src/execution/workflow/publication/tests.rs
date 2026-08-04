@@ -265,6 +265,9 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
         ("cancelled", cancelled, "cancelled", 130),
     ] {
         let destination = fixture.destination(name);
+        let normalized_destination = fs::canonicalize(destination.parent().unwrap())
+            .unwrap()
+            .join(destination.file_name().unwrap());
         let terminal = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
         let terminal_value = serde_json::to_value(&terminal).unwrap();
         let (bytes, result_value) = read_result(&destination);
@@ -273,7 +276,10 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
         assert_eq!(result_value, terminal_value["result"]);
         assert_eq!(terminal_value["outcome"], expected_outcome);
         assert_eq!(terminal_value["exitStatus"], expected_status);
-        assert_eq!(terminal.result_directory(), destination.to_str().unwrap());
+        assert_eq!(
+            terminal.result_directory(),
+            normalized_destination.to_str().unwrap()
+        );
         assert_eq!(
             serde_json::to_value(terminal.result()).unwrap(),
             result_value

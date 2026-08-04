@@ -95,6 +95,24 @@ fn staging_cannot_be_created_inside_the_execution_root() {
 }
 
 #[test]
+fn capture_remains_bound_to_the_admitted_directory_after_path_rebinding() {
+    let fixture = CaptureFixture::new(64);
+    let moved_root = fixture._temporary.path().join("moved-execution");
+    fs::write(fixture.execution_root.join("report.bin"), b"admitted bytes").unwrap();
+    fs::rename(&fixture.execution_root, &moved_root).unwrap();
+    fs::create_dir(&fixture.execution_root).unwrap();
+    fs::write(
+        fixture.execution_root.join("report.bin"),
+        b"replacement bytes",
+    )
+    .unwrap();
+
+    let captured = fixture.capture("report.bin").unwrap();
+
+    assert_eq!(fixture.read(&captured), b"admitted bytes");
+}
+
+#[test]
 fn captures_a_regular_file_with_path_free_metadata_and_independent_bytes() {
     let fixture = CaptureFixture::new(64);
     fs::create_dir(fixture.execution_root.join("nested")).unwrap();

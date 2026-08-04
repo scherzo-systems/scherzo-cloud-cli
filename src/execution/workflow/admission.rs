@@ -1,28 +1,30 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
 #[cfg(test)]
 use std::future::{Future as _, poll_fn};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Barrier;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
 use super::agent::{AgentInvocationLimits, PositiveDuration};
+use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
+#[cfg(test)]
+use super::test_support::SynchronousGate;
 use super::validated::{ValidatedHarness, ValidatedStep};
 use crate::execution::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
 
 pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES: u64 = 64 * 1024;
 const MAXIMUM_AGENT_MESSAGE_BYTES: u64 = 64 * 1024;
+const MAXIMUM_AGENT_ATTACHMENTS: usize = 256;
+const MAXIMUM_AGENT_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_AGENT_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_AGENT_RESULT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES: u64 = 8 * 1024;
@@ -38,43 +40,7 @@ pub(crate) enum CancellationReason {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
-pub(super) struct CancellationPendingPollBarrier {
-    reached: Arc<Barrier>,
-    resume: Arc<Barrier>,
-}
-
-#[cfg(test)]
-impl CancellationPendingPollBarrier {
-    pub(super) fn new() -> Self {
-        Self {
-            reached: Arc::new(Barrier::new(2)),
-            resume: Arc::new(Barrier::new(2)),
-        }
-    }
-
-    pub(super) fn wait_until_pending(&self) {
-        self.reached.wait();
-    }
-
-    pub(super) fn resume(&self) {
-        self.resume.wait();
-    }
-
-    fn block_until_resumed(&self) {
-        self.reached.wait();
-        self.resume.wait();
-    }
-}
-
-#[cfg(test)]
-impl fmt::Debug for CancellationPendingPollBarrier {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CancellationPendingPollBarrier")
-            .finish_non_exhaustive()
-    }
-}
+pub(super) type CancellationPendingPollBarrier = SynchronousGate;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CancellationSource {
@@ -183,11 +149,21 @@ impl CancellationSubscription {
 pub(crate) struct ResolvedAttachment {
     media_type: Arc<str>,
     bytes: Arc<[u8]>,
+    diagnostic_source_name: Option<Arc<str>>,
 }
 
 impl ResolvedAttachment {
     pub(crate) fn new(media_type: Arc<str>, bytes: Arc<[u8]>) -> Self {
-        Self { media_type, bytes }
+        Self {
+            media_type,
+            bytes,
+            diagnostic_source_name: None,
+        }
+    }
+
+    pub(crate) fn with_diagnostic_source_name(mut self, name: Arc<str>) -> Self {
+        self.diagnostic_source_name = Some(name);
+        self
     }
 
     pub(crate) fn media_type(&self) -> &str {
@@ -196,6 +172,10 @@ impl ResolvedAttachment {
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn diagnostic_source_name(&self) -> Option<&str> {
+        self.diagnostic_source_name.as_deref()
     }
 }
 
@@ -460,7 +440,7 @@ impl ExecutionLimits {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedExecutionContext {
-    root: PathBuf,
+    root: AdmittedExecutionRoot,
     root_lifecycle: ExecutionRootLifecycle,
     limits: ExecutionLimits,
     environment: EnvironmentSnapshot,
@@ -469,6 +449,10 @@ pub(crate) struct AdmittedExecutionContext {
 
 impl AdmittedExecutionContext {
     pub(crate) fn root(&self) -> &Path {
+        self.root.provenance_path()
+    }
+
+    pub(super) fn root_identity(&self) -> &AdmittedExecutionRoot {
         &self.root
     }
 
@@ -792,6 +776,8 @@ fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
     AgentInvocationLimits::new(
         positive_u64(MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES),
         positive_u64(MAXIMUM_AGENT_MESSAGE_BYTES),
+        positive_usize(MAXIMUM_AGENT_ATTACHMENTS),
+        positive_u64(MAXIMUM_AGENT_ATTACHMENT_BYTES),
         positive_u64(MAXIMUM_AGENT_RESPONSE_BYTES),
         positive_u64(MAXIMUM_AGENT_RESULT_BYTES),
         positive_u64(MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES),
@@ -808,6 +794,13 @@ fn positive_u64(value: u64) -> NonZeroU64 {
     value
 }
 
+fn positive_usize(value: usize) -> NonZeroUsize {
+    let Some(value) = NonZeroUsize::new(value) else {
+        unreachable!("the fixed PiJsonV1 count bounds are positive");
+    };
+    value
+}
+
 fn positive_duration(value: Duration) -> PositiveDuration {
     let Some(value) = PositiveDuration::new(value) else {
         unreachable!("the fixed PiJsonV1 duration bounds are positive");
@@ -815,26 +808,18 @@ fn positive_duration(value: Duration) -> PositiveDuration {
     value
 }
 
-fn canonical_execution_root(root: &Path) -> Result<PathBuf, AdmissionFailure> {
-    let canonical = fs::canonicalize(root).map_err(|_| {
-        AdmissionFailure::new(
-            AdmissionFailureKind::ExecutionRootUnavailable,
-            AdmissionLocation::ExecutionRoot,
-        )
-    })?;
-    let metadata = fs::metadata(&canonical).map_err(|_| {
-        AdmissionFailure::new(
-            AdmissionFailureKind::ExecutionRootUnavailable,
-            AdmissionLocation::ExecutionRoot,
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(AdmissionFailure::new(
-            AdmissionFailureKind::ExecutionRootNotDirectory,
-            AdmissionLocation::ExecutionRoot,
-        ));
-    }
-    Ok(canonical)
+fn canonical_execution_root(root: &Path) -> Result<AdmittedExecutionRoot, AdmissionFailure> {
+    AdmittedExecutionRoot::admit(root).map_err(|failure| {
+        let kind = match failure {
+            ExecutionRootAdmissionFailure::Unavailable => {
+                AdmissionFailureKind::ExecutionRootUnavailable
+            }
+            ExecutionRootAdmissionFailure::NotDirectory => {
+                AdmissionFailureKind::ExecutionRootNotDirectory
+            }
+        };
+        AdmissionFailure::new(kind, AdmissionLocation::ExecutionRoot)
+    })
 }
 
 #[cfg(test)]

@@ -153,6 +153,58 @@ mod tests {
         command.render_help().to_string()
     }
 
+    fn collect_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
+        assert!(
+            !command.is_allow_external_subcommands_set(),
+            "customer command {prefix:?} accepts external subcommands"
+        );
+        for child in command
+            .get_subcommands()
+            .filter(|child| child.get_name() != "help")
+        {
+            for name in std::iter::once(child.get_name()).chain(child.get_all_aliases()) {
+                let path = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix} {name}")
+                };
+                paths.push(path.clone());
+                collect_command_paths(child, &path, paths);
+            }
+        }
+    }
+
+    #[test]
+    fn customer_command_surface_is_exact_and_has_no_operator_entrypoint() {
+        let mut actual = Vec::new();
+        collect_command_paths(&Cli::command(), "", &mut actual);
+        actual.sort();
+        actual.dedup();
+        let expected = [
+            "account",
+            "account signup",
+            "auth",
+            "auth login",
+            "auth logout",
+            "auth status",
+            "organization",
+            "organization create",
+            "organization members",
+            "organization members list",
+            "organization show",
+            "organization update",
+            "runner",
+            "runner doctor",
+            "runner serve",
+            "version",
+            "workflow",
+            "workflow run",
+            "workflow validate",
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn root_help_is_composed_from_command_metadata() {
         let help = command_help(&[]);
