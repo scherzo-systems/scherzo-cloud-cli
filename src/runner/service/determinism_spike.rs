@@ -1,5 +1,5 @@
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
+use super::assignment::AssignmentManager;
 use super::backoff::Backoff;
 use super::connection::{
     ActiveEffectEvent, ConnectionDependencies, ConnectionError, ConnectionProgress, FrameSource,
@@ -16,8 +17,8 @@ use super::connection::{
 use super::test_support::{
     DeterminismTranscript, ScriptedConnection, ScriptedInbound, ScriptedReader, ScriptedWriter,
     SleepRelease, assignment_offer, controlled_sleeper_with_transcript, deterministic_frame_source,
-    effect_observation_acknowledgement, observation_acknowledgement, scripted_connector,
-    scripted_duplex, sleep_request, welcome, with_watchdog,
+    effect_observation_acknowledgement, healthy_wall_clock, observation_acknowledgement,
+    scripted_connector, scripted_duplex, sleep_request, welcome, with_watchdog,
 };
 use super::{Config, ConnectionLoopDependencies, Sleeper, run_connection_loop};
 use crate::runner::credential::test_credential;
@@ -274,7 +275,14 @@ async fn run_reconnect_scenario() -> Vec<String> {
     let boot_id = frame_source.public_id("rbt_");
     let (recorder, _capture) = test_recorder(&boot_id);
     let service = run_connection_loop(
-        ConnectionLoopDependencies::new(config, frame_source, sleeper, recorder, boot_id),
+        ConnectionLoopDependencies::new(
+            config,
+            frame_source,
+            sleeper,
+            recorder,
+            healthy_wall_clock(),
+            boot_id,
+        ),
         &connector,
         Backoff::with_fixed_unit(1.0),
         async {
@@ -402,6 +410,7 @@ async fn run_terminal_close_scenario() -> Vec<String> {
             frame_source,
             sleeper,
             recorder,
+            healthy_wall_clock(),
             boot_id,
         ),
         &connector,
@@ -490,6 +499,11 @@ impl EstablishedRuntime {
         let (recorder, _capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
+        let assignment_manager = Mutex::new(AssignmentManager::new(
+            &self.config,
+            BOOT_ID.to_owned(),
+            healthy_wall_clock(),
+        ));
         run_established(
             ConnectionDependencies::new(
                 &self.config,
@@ -498,6 +512,7 @@ impl EstablishedRuntime {
                 &recorder,
                 &connection_event,
                 &active_effect_event,
+                &assignment_manager,
                 1,
             ),
             opening_frame(&self.opening),
@@ -548,7 +563,7 @@ fn established_fixture(transcript: &DeterminismTranscript) -> EstablishedFixture
 }
 
 fn deterministic_config() -> Config {
-    Config::new("ws://127.0.0.1:1/v1/connect", test_credential(), true)
+    Config::fixture("ws://127.0.0.1:1/v1/connect", test_credential(), true)
         .expect("configure deterministic gateway")
 }
 

@@ -20,7 +20,8 @@ use crate::execution::workflow::observation::{
     TransitionObservation,
 };
 use crate::execution::workflow::publication::{
-    WorkflowRunCancellation, WorkflowRunTiming, WorkflowStepTiming, publish_workflow_result,
+    WorkflowRunCancellation, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
+    publish_workflow_result,
 };
 use crate::execution::workflow::resolution::{self, WorkflowContentDigest};
 use crate::execution::workflow::runtime::{ActionId, StepFailure, TransitionSequence};
@@ -267,6 +268,7 @@ impl Fixture {
                 .keys()
                 .map(|id| WorkflowRunStep {
                     id: id.clone(),
+                    kind: WorkflowRunStepKind::Command,
                     state: StepState::Succeeded {
                         outputs: BTreeMap::new(),
                     },
@@ -376,67 +378,61 @@ fn step_transition(
 }
 
 #[test]
-fn automatic_tui_requires_usable_unreserved_input_and_output_terminals() {
-    for (stdin, stdout, term, reserved, expected) in [
-        (
-            true,
-            true,
-            Some("xterm-256color"),
-            false,
-            PresentationMode::Tui,
-        ),
-        (
-            false,
-            true,
-            Some("xterm-256color"),
-            false,
-            PresentationMode::Plain,
-        ),
-        (
-            true,
-            false,
-            Some("xterm-256color"),
-            false,
-            PresentationMode::Plain,
-        ),
-        (true, true, None, false, PresentationMode::Plain),
-        (true, true, Some(""), false, PresentationMode::Plain),
-        (true, true, Some("dumb"), false, PresentationMode::Plain),
-        (
-            true,
-            true,
-            Some("xterm-256color"),
-            true,
-            PresentationMode::Plain,
-        ),
+fn capability_matrix_selects_one_mode_without_consulting_runtime_state() {
+    for stdin in [false, true] {
+        for stdout in [false, true] {
+            for stderr in [false, true] {
+                let mut terminal = capabilities(stdout, stderr, Some("xterm-256color"), None);
+                terminal.stdin_is_terminal = stdin;
+                for (requested_mode, expected) in [
+                    (
+                        RequestedPresentationMode::Automatic,
+                        if stdin && stdout {
+                            PresentationMode::Tui
+                        } else {
+                            PresentationMode::Plain
+                        },
+                    ),
+                    (RequestedPresentationMode::Plain, PresentationMode::Plain),
+                    (RequestedPresentationMode::Json, PresentationMode::Json),
+                ] {
+                    assert_eq!(
+                        PresentationConfig {
+                            requested_mode,
+                            color: ColorChoice::Auto,
+                            capabilities: terminal.clone(),
+                            standard_input_reserved: false,
+                        }
+                        .mode(),
+                        expected,
+                        "stdin={stdin}, stdout={stdout}, stderr={stderr}, requested={requested_mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    for (term, no_color, standard_input_reserved) in [
+        (None, None, false),
+        (Some(""), None, false),
+        (Some("dumb"), None, false),
+        (Some("xterm-256color"), None, true),
+        (Some("xterm-256color"), Some("1"), false),
     ] {
-        let mut terminal = capabilities(stdout, false, term, None);
-        terminal.stdin_is_terminal = stdin;
+        let mut terminal = capabilities(true, true, term, no_color);
+        terminal.stdin_is_terminal = true;
         let selected = PresentationConfig {
             requested_mode: RequestedPresentationMode::Automatic,
             color: ColorChoice::Auto,
             capabilities: terminal,
-            standard_input_reserved: reserved,
+            standard_input_reserved,
+        };
+        let expected = if term == Some("xterm-256color") && !standard_input_reserved {
+            PresentationMode::Tui
+        } else {
+            PresentationMode::Plain
         };
         assert_eq!(selected.mode(), expected);
-    }
-
-    let mut terminal = capabilities(true, true, Some("xterm"), None);
-    terminal.stdin_is_terminal = true;
-    for (requested_mode, expected) in [
-        (RequestedPresentationMode::Plain, PresentationMode::Plain),
-        (RequestedPresentationMode::Json, PresentationMode::Json),
-    ] {
-        assert_eq!(
-            PresentationConfig {
-                requested_mode,
-                color: ColorChoice::Auto,
-                capabilities: terminal.clone(),
-                standard_input_reserved: false,
-            }
-            .mode(),
-            expected
-        );
     }
 }
 
@@ -639,6 +635,10 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
     )
     .start(&fixture.workflow, 2, clock)
     .unwrap();
+    assert_eq!(
+        presentation.opened_at().utc,
+        timestamp("2026-08-02T12:01:44.999999999Z")
+    );
 
     presentation
         .observe(step_transition("a", StepStateKind::Starting, None))
@@ -946,6 +946,7 @@ steps:
 
     let step = WorkflowRunStep {
         id: "plan".to_owned(),
+        kind: WorkflowRunStepKind::Agent,
         state: StepState::Succeeded {
             outputs: BTreeMap::from([(
                 "plan".to_owned(),

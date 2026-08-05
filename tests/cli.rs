@@ -26,6 +26,8 @@ mod auth_login;
 mod organization;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
+#[path = "cli/workflow_retry.rs"]
+mod workflow_retry;
 #[path = "cli/workflow_run.rs"]
 mod workflow_run;
 #[path = "cli/workflow_status.rs"]
@@ -437,7 +439,9 @@ fn no_arguments_print_composed_root_help() {
     assert!(stdout.contains("version       Print version information"));
     assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
     assert!(
-        stdout.contains("workflow      Validate, run, and inspect local Workflow V1 definitions")
+        stdout.contains(
+            "workflow      Validate, run, retry, and inspect local Workflow V1 definitions"
+        )
     );
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
@@ -478,7 +482,7 @@ fn workflow_without_a_subcommand_prints_composed_help() {
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud workflow [COMMAND]"));
-    assert!(stdout.contains("run       Execute a local command-only Workflow V1 bundle"));
+    assert!(stdout.contains("run       Execute a local Workflow V1 command and agent DAG"));
     assert!(
         stdout.contains("status    Inspect one durable local workflow run without changing it")
     );
@@ -529,6 +533,14 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(serve.status.success());
     let serve_stdout = String::from_utf8_lossy(&serve.stdout);
     assert!(serve_stdout.contains("Usage: scherzo-cloud runner serve"));
+    for required in [
+        "--workflow-id <WORKFLOW_ID>",
+        "--workflow-source-root <ROOT>",
+        "--workflow-path <PATH>",
+        "--work-root <ROOT>",
+    ] {
+        assert!(serve_stdout.contains(required));
+    }
     assert!(serve_stdout.contains("--pi-executable <PATH>"));
     assert!(serve.stderr.is_empty());
 
@@ -1484,6 +1496,14 @@ fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
             "https://not-a-websocket.example.test",
             "--credential-file",
             &credential_path,
+            "--workflow-id",
+            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+            "--workflow-source-root",
+            "schemas",
+            "--workflow-path",
+            "workflow-v1.schema.json",
+            "--work-root",
+            "tests",
         ],
         &environment,
     );
@@ -1540,6 +1560,14 @@ fn privacy_and_malformed_configuration_make_no_otlp_request() {
                 "--credential-file",
                 &credential_path,
                 "--allow-insecure-http",
+                "--workflow-id",
+                "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+                "--workflow-source-root",
+                "schemas",
+                "--workflow-path",
+                "workflow-v1.schema.json",
+                "--work-root",
+                "tests",
             ],
             &environment,
         );
@@ -1582,6 +1610,14 @@ fn runner_serve_requires_configuration_and_redacts_invalid_credentials() {
         "wss://gateway.example.test/v1/connect",
         "--credential-file",
         &credential_path,
+        "--workflow-id",
+        "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+        "--workflow-source-root",
+        "schemas",
+        "--workflow-path",
+        "workflow-v1.schema.json",
+        "--work-root",
+        "tests",
     ]);
 
     assert_eq!(output.status.code(), Some(1));

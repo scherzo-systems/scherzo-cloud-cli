@@ -1,10 +1,9 @@
-use std::io;
 use std::sync::Arc;
 
 use nix::errno::Errno;
 use nix::sys::signal::killpg;
 use nix::unistd::Pid as NixPid;
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpgid};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedProcessGroup {
@@ -75,6 +74,7 @@ impl ProcessGuardRegistry {
         Ok(ProcessGuardRegistration {
             durable: self.durable.clone(),
             guard_id,
+            quiesced: false,
         })
     }
 }
@@ -82,6 +82,7 @@ impl ProcessGuardRegistry {
 pub(crate) struct ProcessGuardRegistration {
     durable: Option<Arc<dyn DurableProcessGuardStore>>,
     guard_id: Option<String>,
+    quiesced: bool,
 }
 
 impl ProcessGuardRegistration {
@@ -93,12 +94,17 @@ impl ProcessGuardRegistration {
         }
     }
 
-    pub(crate) fn mark_quiesced(&self) -> Result<(), ()> {
-        match (&self.durable, &self.guard_id) {
-            (Some(durable), Some(guard_id)) => durable.mark_quiesced(guard_id),
-            (None, None) => Ok(()),
-            _ => Err(()),
+    pub(crate) fn mark_quiesced(&mut self) -> Result<(), ()> {
+        if self.quiesced {
+            return Ok(());
         }
+        match (&self.durable, &self.guard_id) {
+            (Some(durable), Some(guard_id)) => durable.mark_quiesced(guard_id)?,
+            (None, None) => {}
+            _ => return Err(()),
+        }
+        self.quiesced = true;
+        Ok(())
     }
 }
 
@@ -134,7 +140,19 @@ pub(crate) fn capture_process_group_identity(
     AuthenticatedProcessGroup::new(process_group, process.start_identity)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_vendor = "apple")]
+pub(crate) fn capture_process_group_identity(
+    process_group: Pid,
+) -> Option<AuthenticatedProcessGroup> {
+    let raw = process_group.as_raw_pid();
+    let process = read_apple_process(raw).ok().flatten()?;
+    if process.pid != i64::from(raw) || process.process_group != i64::from(raw) {
+        return None;
+    }
+    AuthenticatedProcessGroup::new(process_group, process.start_identity)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 pub(crate) fn capture_process_group_identity(
     _process_group: Pid,
 ) -> Option<AuthenticatedProcessGroup> {
@@ -185,6 +203,10 @@ pub(super) fn interrupt_process_group(process_group: Pid) {
 
 pub(super) fn terminate_process_group(process_group: Pid) {
     let _ = kill_process_group(process_group, Signal::KILL);
+}
+
+pub(super) fn reap_process_group_children(process_group: Pid) {
+    while matches!(waitpgid(process_group, WaitOptions::NOHANG), Ok(Some(_))) {}
 }
 
 pub(super) fn process_group_is_quiescent(process_group: Pid) -> bool {
@@ -276,20 +298,35 @@ pub(crate) fn system_process_identity_observation(
 fn read_linux_process(pid: i64) -> Result<Option<ObservedProcess>, ()> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
     linux_process_identity(pid, &stat).map(Some).ok_or(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_vendor = "apple")]
+pub(crate) fn system_process_identity_observation(
+    identity: &AuthenticatedProcessGroup,
+) -> ProcessIdentityObservation {
+    let process_group = identity.process_group().as_raw_pid();
+    match read_apple_process(process_group) {
+        Ok(Some(leader)) => observe_process_snapshot(identity, &[leader]),
+        Ok(None) => match apple_process_group_exists(process_group) {
+            Ok(false) => ProcessIdentityObservation::Absent,
+            Ok(true) | Err(()) => ProcessIdentityObservation::Unavailable,
+        },
+        Err(()) => ProcessIdentityObservation::Unavailable,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 pub(crate) fn system_process_identity_observation(
     _identity: &AuthenticatedProcessGroup,
 ) -> ProcessIdentityObservation {
     ProcessIdentityObservation::Unavailable
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObservedProcess {
     pid: i64,
@@ -298,7 +335,7 @@ struct ObservedProcess {
     state: LeaderState,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn observe_process_snapshot(
     identity: &AuthenticatedProcessGroup,
     processes: &[ObservedProcess],
@@ -349,6 +386,64 @@ fn linux_process_identity(pid: i64, stat: &str) -> Option<ObservedProcess> {
         start_identity: (*fields.get(19)?).to_owned(),
         state,
     })
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(
+    unsafe_code,
+    reason = "the Darwin process-identity boundary reads fixed libproc structures"
+)]
+fn read_apple_process(pid: i32) -> Result<Option<ObservedProcess>, ()> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size_i32 = i32::try_from(size).map_err(|_| ())?;
+    // SAFETY: libproc receives the exact size and writable address of `proc_bsdinfo`.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_i32,
+        )
+    };
+    if read == 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(()),
+        };
+    }
+    if read != size_i32 {
+        return Err(());
+    }
+    // SAFETY: a full-sized successful libproc read initialized the structure.
+    let info = unsafe { info.assume_init() };
+    let state = match info.pbi_status {
+        libc::SSTOP => LeaderState::Stopped,
+        libc::SZOMB => LeaderState::Zombie,
+        _ => LeaderState::Running,
+    };
+    Ok(Some(ObservedProcess {
+        pid: i64::from(info.pbi_pid),
+        process_group: i64::from(info.pbi_pgid),
+        start_identity: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        state,
+    }))
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(
+    unsafe_code,
+    reason = "the Darwin process-group boundary asks libproc for one numeric member"
+)]
+fn apple_process_group_exists(process_group: i32) -> Result<bool, ()> {
+    let mut member = 0_i32;
+    let size = i32::try_from(std::mem::size_of_val(&member)).map_err(|_| ())?;
+    // SAFETY: libproc receives the exact size and writable address of one `pid_t`.
+    let count = unsafe {
+        libc::proc_listpgrppids(process_group, std::ptr::from_mut(&mut member).cast(), size)
+    };
+    if count < 0 { Err(()) } else { Ok(count > 0) }
 }
 
 #[cfg(test)]
@@ -418,7 +513,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn recycled_leader_identifier_is_evidence_that_the_recorded_group_is_absent() {
         let processes = [ObservedProcess {
@@ -434,7 +529,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn exact_zombie_leader_keeps_the_identity_authenticated_until_reap() {
         let processes = [ObservedProcess {

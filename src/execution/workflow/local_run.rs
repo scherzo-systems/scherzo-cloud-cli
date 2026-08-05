@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use ring::digest::{SHA256, digest};
 use rustix::fs::{
@@ -20,17 +21,19 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::admission::AdmittedWorkflow;
+use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
 use super::coordinator::{CommitPort, CommittedActionKind, CommittedReduction};
 use super::execution_root::AdmittedExecutionRoot;
 use super::private_staging::{
     create_staging_root, directory_entry_names, remove_staging_root, same_file,
 };
 use super::process_group::{
-    AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
-    ProcessIdentityObservation, system_process_identity_observation,
+    AuthenticatedProcessGroup, AuthenticatedSignalResult, DurableProcessGuardStore,
+    ProcessGuardRegistry, ProcessIdentityObservation, system_process_identity_observation,
+    terminate_authenticated_process_group,
 };
 use super::publication::{CancellationReasonV1, cancellation_reason};
+use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::runtime::{StepState, WorkflowState};
 use super::schema_common::{lowercase_hex, utc_timestamp};
 
@@ -45,9 +48,14 @@ const PRIVATE_DIRECTORY: &str = ".private";
 const INITIAL_ATTEMPT_NUMBER: u64 = 1;
 const INITIAL_ATTEMPT_DIRECTORY: &str = "000001";
 const STAGING_ATTEMPTS: usize = 16;
+const PRIVATE_STAGING_ATTEMPTS: usize = 16;
 const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
 const MAXIMUM_DURABLE_JSON_BYTES: u64 = 4 * 1024 * 1024;
+const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = 321 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTICS: usize = 256;
+const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const QUIESCENCE_POLL_ATTEMPTS: usize = 2_000;
 const SHA256_ALGORITHM: &str = "sha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +120,7 @@ struct WorkflowManifestV1 {
     schema_version: u8,
     workflow_path: String,
     source_root: String,
+    maximum_parallel_steps: usize,
     source_files: Vec<ManifestSourceFileV1>,
     imports: ManifestImportsV1,
 }
@@ -530,6 +539,98 @@ pub(crate) enum LocalRetryEligibility {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalRetryRejection {
+    run_directory: PathBuf,
+    attempt_number: u64,
+    reason: RetryIneligibilityReason,
+    guard_ids: Vec<String>,
+    ownership_reason: Option<OwnershipUnprovenReason>,
+}
+
+impl LocalRetryRejection {
+    pub(crate) fn run_directory(&self) -> &Path {
+        &self.run_directory
+    }
+
+    pub(crate) const fn attempt_number(&self) -> u64 {
+        self.attempt_number
+    }
+
+    pub(crate) const fn reason(&self) -> RetryIneligibilityReason {
+        self.reason
+    }
+
+    pub(crate) fn guard_ids(&self) -> &[String] {
+        &self.guard_ids
+    }
+
+    pub(crate) const fn ownership_reason(&self) -> Option<OwnershipUnprovenReason> {
+        self.ownership_reason
+    }
+}
+
+pub(crate) enum LocalRetryOpen {
+    Acquired(Box<PendingLocalRetry>),
+    Rejected(LocalRetryRejection),
+}
+
+pub(crate) struct PendingLocalRetry {
+    normalized: PathBuf,
+    root: Arc<OwnedFd>,
+    lock: File,
+    state: Arc<StateStore>,
+    workflow: ResolvedWorkflow,
+    imports: ResolvedImports,
+    maximum_parallel_steps: usize,
+}
+
+impl PendingLocalRetry {
+    pub(crate) fn run_directory(&self) -> &Path {
+        &self.normalized
+    }
+
+    pub(crate) fn execution_specification(&self) -> (&ResolvedWorkflow, &ResolvedImports, usize) {
+        (&self.workflow, &self.imports, self.maximum_parallel_steps)
+    }
+
+    pub(crate) fn reused_execution_root_attempts(
+        &self,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<Vec<u64>, LocalRunDirectoryError> {
+        let execution_root = admitted
+            .execution()
+            .root()
+            .to_str()
+            .ok_or(LocalRunDirectoryError::InvalidPath)?;
+        let state = lock_state(&self.state.current)?;
+        Ok(state
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.execution_root == execution_root)
+            .map(|attempt| attempt.attempt_number)
+            .collect())
+    }
+
+    pub(crate) fn begin(
+        self,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<LocalAttemptOwner, LocalRetryBeginError> {
+        begin_local_retry(self, admitted, &SystemLocalRecoveryAuthority)
+    }
+}
+
+pub(crate) enum LocalRetryBeginError {
+    Rejected(LocalRetryRejection),
+    Operational(LocalRunDirectoryError),
+}
+
+impl From<LocalRunDirectoryError> for LocalRetryBeginError {
+    fn from(error: LocalRunDirectoryError) -> Self {
+        Self::Operational(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalStatusAttempt {
     pub(crate) attempt_number: u64,
     pub(crate) trigger: &'static str,
@@ -561,16 +662,20 @@ pub(crate) trait DurableDeadline {
     fn deadline_utc(&self) -> OffsetDateTime;
 }
 
-pub(crate) struct InitialLocalRun {
+pub(crate) struct LocalAttemptOwner {
     normalized: PathBuf,
     root: Arc<OwnedFd>,
     _lock: File,
     private_directory: PathBuf,
+    attempt_directory: OwnedFd,
     result_directory: PathBuf,
+    attempt_number: u64,
     state: Arc<StateStore>,
 }
 
-impl InitialLocalRun {
+pub(crate) type InitialLocalRun = LocalAttemptOwner;
+
+impl LocalAttemptOwner {
     pub(crate) fn create(
         requested: &Path,
         admitted: &AdmittedWorkflow,
@@ -590,8 +695,30 @@ impl InitialLocalRun {
         &self.result_directory
     }
 
+    pub(crate) fn attempt_directory_handle(&self) -> &OwnedFd {
+        &self.attempt_directory
+    }
+
+    pub(crate) fn private_directory_handle(&self) -> &OwnedFd {
+        &self.state.private
+    }
+
+    pub(crate) fn create_private_staging(
+        &self,
+    ) -> Result<AttemptPrivateStaging, LocalRunDirectoryError> {
+        let (identity, root) =
+            create_staging_root(&self.state.private, "workflow", PRIVATE_STAGING_ATTEMPTS)
+                .map_err(|()| LocalRunDirectoryError::StagingUnavailable)?;
+        Ok(AttemptPrivateStaging {
+            parent: Arc::clone(&self.state.private),
+            path: self.private_directory.join(identity.as_ref()),
+            identity,
+            root,
+        })
+    }
+
     pub(crate) const fn attempt_number(&self) -> u64 {
-        INITIAL_ATTEMPT_NUMBER
+        self.attempt_number
     }
 
     pub(crate) fn commit_port(&self) -> LocalRunCommitPort {
@@ -687,7 +814,30 @@ impl InitialLocalRun {
     }
 }
 
-impl Drop for InitialLocalRun {
+pub(crate) struct AttemptPrivateStaging {
+    parent: Arc<OwnedFd>,
+    path: PathBuf,
+    identity: Arc<str>,
+    root: OwnedFd,
+}
+
+impl AttemptPrivateStaging {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn root_handle(&self) -> &OwnedFd {
+        &self.root
+    }
+}
+
+impl Drop for AttemptPrivateStaging {
+    fn drop(&mut self) {
+        let _ = remove_staging_root(&self.parent, &self.identity, &self.root);
+    }
+}
+
+impl Drop for LocalAttemptOwner {
     fn drop(&mut self) {
         // Closing normally releases the process-associated lock. Unlock explicitly so
         // an orderly owner release is immediately visible to status and retry queries.
@@ -952,6 +1102,7 @@ fn create_with_observer(
     mkdir(&run_staging, ATTEMPTS_DIRECTORY)?;
     let attempts = open_directory_at(&run_staging, ATTEMPTS_DIRECTORY)?;
     mkdir(&attempts, INITIAL_ATTEMPT_DIRECTORY)?;
+    let attempt_directory = open_directory_at(&attempts, INITIAL_ATTEMPT_DIRECTORY)?;
     mkdir(&run_staging, PRIVATE_DIRECTORY)?;
     let private = open_directory_at(&run_staging, PRIVATE_DIRECTORY)?;
 
@@ -1026,12 +1177,14 @@ fn create_with_observer(
         .join(ATTEMPTS_DIRECTORY)
         .join(INITIAL_ATTEMPT_DIRECTORY)
         .join("result");
-    Ok(InitialLocalRun {
+    Ok(LocalAttemptOwner {
         normalized: target.normalized,
         root,
         _lock: lock,
         private_directory,
+        attempt_directory,
         result_directory,
+        attempt_number: INITIAL_ATTEMPT_NUMBER,
         state,
     })
 }
@@ -1221,6 +1374,7 @@ fn retain_execution_specification(
         schema_version: 1,
         workflow_path: admitted.workflow().source.workflow_path.clone(),
         source_root,
+        maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps().get(),
         source_files,
         imports: ManifestImportsV1 {
             prompt,
@@ -1252,55 +1406,19 @@ fn initial_state(
     local_run_id: String,
     created_at: String,
 ) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
-    let execution_root = admitted
-        .execution()
-        .root()
-        .to_str()
-        .ok_or(LocalRunDirectoryError::InvalidPath)?
-        .to_owned();
-    let steps = admitted
-        .workflow()
-        .definition
-        .presentation_order
-        .iter()
-        .map(|id| AttemptStepV1 {
-            id: id.clone(),
-            state: AttemptStepStateV1::Pending,
-        })
-        .collect();
+    let attempt = fresh_attempt(
+        admitted,
+        INITIAL_ATTEMPT_NUMBER,
+        AttemptTriggerV1::Initial,
+        None,
+        created_at,
+    )?;
     Ok(LocalRunStateV1 {
         schema_version: 1,
         local_run_id,
         revision: 1,
         current_attempt_number: INITIAL_ATTEMPT_NUMBER,
-        attempts: vec![LocalAttemptV1 {
-            attempt_id: generate_uuid()?,
-            attempt_number: INITIAL_ATTEMPT_NUMBER,
-            trigger: AttemptTriggerV1::Initial,
-            prior_attempt_number: None,
-            state: AttemptStateV1::Created,
-            execution_root,
-            created_at,
-            started_at: None,
-            settled_at: None,
-            owner: AttemptOwnerV1 {
-                owner_nonce: generate_uuid()?,
-                execution_host: execution_host()?,
-            },
-            cancellation: None,
-            interruption: None,
-            rejection: None,
-            progress: AttemptProgressV1 {
-                accepted_occurrence_ordinal: 0,
-                last_transition_sequence: 0,
-                steps,
-                outstanding_actions: Vec::new(),
-            },
-            process_guards: Vec::new(),
-            result: AttemptResultV1::NotPublished {
-                reason: ResultAbsentReasonV1::AttemptNonterminal,
-            },
-        }],
+        attempts: vec![attempt],
         diagnostics: Vec::new(),
     })
 }
@@ -1560,15 +1678,7 @@ fn verify_initial_staging(
     expected_state: &LocalRunStateV1,
 ) -> Result<(), LocalRunDirectoryError> {
     let entries = directory_entries(root)?;
-    let expected = BTreeSet::from([
-        RUN_FILE.as_bytes().to_vec(),
-        STATE_FILE.as_bytes().to_vec(),
-        LOCK_FILE.as_bytes().to_vec(),
-        WORKFLOW_DIRECTORY.as_bytes().to_vec(),
-        ATTEMPTS_DIRECTORY.as_bytes().to_vec(),
-        PRIVATE_DIRECTORY.as_bytes().to_vec(),
-    ]);
-    if entries != expected
+    if entries != run_root_entries()
         || read_run(root)? != *expected_run
         || read_state(root)? != *expected_state
     {
@@ -1585,6 +1695,282 @@ fn read_run(root: &OwnedFd) -> Result<LocalRunV1, LocalRunDirectoryError> {
 fn read_state(root: &OwnedFd) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
     let bytes = read_regular_file(root, STATE_FILE)?;
     decode_state(&bytes)
+}
+
+pub(crate) fn acquire_local_retry(
+    requested: &Path,
+) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
+    for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
+        let normalized = std::fs::canonicalize(requested)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        if normalized.to_str().is_none() {
+            return Err(LocalRunDirectoryError::InvalidPath);
+        }
+        let root = open_directory_path(&normalized)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        let lock = open_retry_lock(&root)?;
+        match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                verify_retry_lock_identity(&root, &lock)?;
+                return open_locked_retry(normalized, root, lock);
+            }
+            Err(Errno::AGAIN | Errno::ACCESS) => {
+                let snapshot = read_local_run_status(requested)
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                if snapshot.retry
+                    == LocalRetryEligibility::Ineligible(RetryIneligibilityReason::RunLocked)
+                {
+                    return Ok(LocalRetryOpen::Rejected(retry_rejection_from_snapshot(
+                        &snapshot,
+                        RetryIneligibilityReason::RunLocked,
+                    )));
+                }
+            }
+            Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+        }
+    }
+    Err(LocalRunDirectoryError::StateConflict)
+}
+
+fn open_retry_lock(root: &OwnedFd) -> Result<File, LocalRunDirectoryError> {
+    let lock = openat(
+        root,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| LocalRunDirectoryError::LockUnavailable)?;
+    verify_retry_lock_identity(root, &lock)?;
+    Ok(lock)
+}
+
+fn verify_retry_lock_identity(root: &OwnedFd, lock: &File) -> Result<(), LocalRunDirectoryError> {
+    let opened = fstat(lock).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let current = statat(root, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
+        || opened.st_dev != current.st_dev
+        || opened.st_ino != current.st_ino
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn open_locked_retry(
+    normalized: PathBuf,
+    root: OwnedFd,
+    lock: File,
+) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
+    verify_existing_run_layout(&root)?;
+    let run = read_run(&root)?;
+    let state = read_state(&root)?;
+    if state.local_run_id != run.local_run_id {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let current = state
+        .attempts
+        .last()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let recovery = recovery_status(current, false);
+    if let LocalRetryEligibility::Ineligible(reason) =
+        retry_eligibility(current.state, &recovery, false)
+    {
+        return Ok(LocalRetryOpen::Rejected(retry_rejection(
+            normalized,
+            current.attempt_number,
+            reason,
+            &recovery,
+        )));
+    }
+
+    let (workflow, imports, maximum_parallel_steps) = load_retained_execution(&root, &run)?;
+    let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
+    let root = Arc::new(root);
+    let state = Arc::new(StateStore {
+        root: Arc::clone(&root),
+        private,
+        current: Mutex::new(state),
+    });
+    Ok(LocalRetryOpen::Acquired(Box::new(PendingLocalRetry {
+        normalized,
+        root,
+        lock,
+        state,
+        workflow,
+        imports,
+        maximum_parallel_steps,
+    })))
+}
+
+fn verify_existing_run_layout(root: &OwnedFd) -> Result<(), LocalRunDirectoryError> {
+    if directory_entries(root)? != run_root_entries() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    Ok(())
+}
+
+fn run_root_entries() -> BTreeSet<Vec<u8>> {
+    BTreeSet::from([
+        RUN_FILE.as_bytes().to_vec(),
+        STATE_FILE.as_bytes().to_vec(),
+        LOCK_FILE.as_bytes().to_vec(),
+        WORKFLOW_DIRECTORY.as_bytes().to_vec(),
+        ATTEMPTS_DIRECTORY.as_bytes().to_vec(),
+        PRIVATE_DIRECTORY.as_bytes().to_vec(),
+    ])
+}
+
+fn load_retained_execution(
+    root: &OwnedFd,
+    run: &LocalRunV1,
+) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
+    let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
+    let expected_workflow_entries = BTreeSet::from([
+        WORKFLOW_MANIFEST_FILE.as_bytes().to_vec(),
+        WORKFLOW_FILES_DIRECTORY.as_bytes().to_vec(),
+    ]);
+    if directory_entries(&workflow_directory)? != expected_workflow_entries {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let manifest_bytes = read_regular_file(&workflow_directory, WORKFLOW_MANIFEST_FILE)?;
+    if DigestV1::sha256(&manifest_bytes) != run.workflow_manifest_digest {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let manifest: WorkflowManifestV1 = decode_schema_one(&manifest_bytes)?;
+    validate_manifest(&manifest).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let files = open_directory_at(&workflow_directory, WORKFLOW_FILES_DIRECTORY)?;
+    let expected_entries = (1..retained_manifest_file_count(&manifest)?)
+        .map(retained_file_name)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(String::into_bytes)
+        .collect::<BTreeSet<_>>();
+    if directory_entries(&files)? != expected_entries {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut read_file = |file: &ManifestFileV1| {
+        let name = retained_file_name(file.ordinal)?;
+        let bytes = read_retained_file(&files, &name)?;
+        let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAXIMUM_RETAINED_TOTAL_BYTES)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        if size != file.size_bytes || DigestV1::sha256(&bytes) != file.digest {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        Ok(bytes)
+    };
+
+    let mut source_closure = BTreeMap::new();
+    for source in &manifest.source_files {
+        if source_closure
+            .insert(
+                source.path.clone(),
+                Arc::<[u8]>::from(read_file(&source.file)?),
+            )
+            .is_some()
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    let prompt = manifest
+        .imports
+        .prompt
+        .as_ref()
+        .map(|file| {
+            String::from_utf8(read_file(file)?)
+                .map(Arc::<str>::from)
+                .map_err(|_| LocalRunDirectoryError::StateInvalid)
+        })
+        .transpose()?;
+    let attachments = manifest
+        .imports
+        .attachments
+        .iter()
+        .map(|attachment| {
+            Ok(ResolvedAttachment::new(
+                Arc::<str>::from(attachment.media_type.as_str()),
+                Arc::<[u8]>::from(read_file(&attachment.file)?),
+            ))
+        })
+        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
+    let workflow = resolve_retained(
+        PathBuf::from(&manifest.source_root),
+        &manifest.workflow_path,
+        source_closure,
+    )
+    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if workflow.content_digest.algorithm.as_str() != run.workflow_digest.algorithm
+        || workflow.content_digest.value != run.workflow_digest.value
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok((
+        workflow,
+        ResolvedImports::new(prompt, Arc::from(attachments)),
+        manifest.maximum_parallel_steps,
+    ))
+}
+
+fn retained_manifest_file_count(
+    manifest: &WorkflowManifestV1,
+) -> Result<u64, LocalRunDirectoryError> {
+    let count = manifest
+        .source_files
+        .len()
+        .checked_add(usize::from(manifest.imports.prompt.is_some()))
+        .and_then(|count| count.checked_add(manifest.imports.attachments.len()))
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn read_retained_file(parent: &OwnedFd, name: &str) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    read_regular_file_bounded(parent, name, MAXIMUM_RETAINED_FILE_BYTES)
+}
+
+fn retry_rejection_from_snapshot(
+    snapshot: &LocalRunStatusSnapshot,
+    reason: RetryIneligibilityReason,
+) -> LocalRetryRejection {
+    retry_rejection(
+        snapshot.run_directory.clone(),
+        snapshot.current_attempt_number,
+        reason,
+        &snapshot.recovery,
+    )
+}
+
+fn retry_rejection(
+    run_directory: PathBuf,
+    attempt_number: u64,
+    reason: RetryIneligibilityReason,
+    recovery: &LocalRecoveryStatus,
+) -> LocalRetryRejection {
+    let (guard_ids, ownership_reason) = match recovery {
+        LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } => {
+            (guard_ids.clone(), Some(*reason))
+        }
+        LocalRecoveryStatus::Active
+        | LocalRecoveryStatus::Settled
+        | LocalRecoveryStatus::Abandoned => (Vec::new(), None),
+    };
+    LocalRetryRejection {
+        run_directory,
+        attempt_number,
+        reason,
+        guard_ids,
+        ownership_reason,
+    }
 }
 
 pub(crate) fn read_local_run_status(
@@ -1751,6 +2137,296 @@ impl LocalRecoveryAuthority for SystemLocalRecoveryAuthority {
     }
 }
 
+trait LocalQuiescenceAuthority: LocalRecoveryAuthority {
+    fn terminate_process(&self, guard: &ProcessGuardV1) -> AuthenticatedSignalResult;
+
+    fn wait_for_process_change(&self);
+}
+
+impl LocalQuiescenceAuthority for SystemLocalRecoveryAuthority {
+    fn terminate_process(&self, guard: &ProcessGuardV1) -> AuthenticatedSignalResult {
+        authenticated_process_group(guard)
+            .map_or(AuthenticatedSignalResult::Unavailable, |identity| {
+                terminate_authenticated_process_group(&identity)
+            })
+    }
+
+    fn wait_for_process_change(&self) {
+        crate::timing::sleep(QUIESCENCE_POLL_INTERVAL);
+    }
+}
+
+fn begin_local_retry(
+    pending: PendingLocalRetry,
+    admitted: &AdmittedWorkflow,
+    authority: &impl LocalQuiescenceAuthority,
+) -> Result<LocalAttemptOwner, LocalRetryBeginError> {
+    verify_retry_lock_identity(&pending.root, &pending.lock)?;
+    if admitted.workflow().content_digest.algorithm.as_str()
+        != pending.workflow.content_digest.algorithm.as_str()
+        || admitted.workflow().content_digest.value != pending.workflow.content_digest.value
+    {
+        return Err(LocalRunDirectoryError::StateConflict.into());
+    }
+    if existing_run_overlaps_execution_root(&pending, admitted)? {
+        return Err(LocalRunDirectoryError::ExecutionRootOverlap.into());
+    }
+
+    let current = lock_state(&pending.state.current)?.clone();
+    let prior = current
+        .attempts
+        .last()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let recovery = recovery_status_with(prior, false, authority);
+    if let LocalRetryEligibility::Ineligible(reason) =
+        retry_eligibility(prior.state, &recovery, false)
+    {
+        return Err(LocalRetryBeginError::Rejected(retry_rejection(
+            pending.normalized.clone(),
+            prior.attempt_number,
+            reason,
+            &recovery,
+        )));
+    }
+
+    let next_attempt_number = prior
+        .attempt_number
+        .checked_add(1)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let next_attempt = retry_attempt(admitted, next_attempt_number, prior.attempt_number)?;
+    if let Err((guard_ids, ownership_reason)) = quiesce_attempt(prior, authority) {
+        return Err(LocalRetryBeginError::Rejected(LocalRetryRejection {
+            run_directory: pending.normalized.clone(),
+            attempt_number: prior.attempt_number,
+            reason: RetryIneligibilityReason::OwnershipUnproven,
+            guard_ids,
+            ownership_reason: Some(ownership_reason),
+        }));
+    }
+
+    let attempt_directory = create_or_verify_attempt_directory(&pending.root, next_attempt_number)?;
+    pending.state.update(|state| {
+        if state.current_attempt_number != prior.attempt_number {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let current_attempt = current_attempt_mut(state)?;
+        if !current_attempt.state.is_terminal() {
+            for guard in &mut current_attempt.process_guards {
+                guard.state = ProcessGuardStateV1::Quiesced;
+            }
+            let execution_may_have_started = current_attempt.started_at.is_some();
+            settle_interrupted_attempt(
+                current_attempt,
+                InterruptionCauseV1::ExecutionOwnerLost,
+                execution_may_have_started,
+            )?;
+        }
+        state.current_attempt_number = next_attempt_number;
+        state.attempts.push(next_attempt.clone());
+        Ok(())
+    })?;
+
+    let attempt_directory_name =
+        attempt_directory_name(next_attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let private_directory = pending.normalized.join(PRIVATE_DIRECTORY);
+    let result_directory = pending
+        .normalized
+        .join(ATTEMPTS_DIRECTORY)
+        .join(attempt_directory_name)
+        .join("result");
+    Ok(LocalAttemptOwner {
+        normalized: pending.normalized,
+        root: pending.root,
+        _lock: pending.lock,
+        private_directory,
+        attempt_directory,
+        result_directory,
+        attempt_number: next_attempt_number,
+        state: pending.state,
+    })
+}
+
+fn existing_run_overlaps_execution_root(
+    pending: &PendingLocalRetry,
+    admitted: &AdmittedWorkflow,
+) -> Result<bool, LocalRunDirectoryError> {
+    Ok(
+        paths_overlap(&pending.normalized, admitted.execution().root())
+            || admitted
+                .execution()
+                .root_identity()
+                .contains_directory(&pending.root)
+                .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?,
+    )
+}
+
+fn retry_attempt(
+    admitted: &AdmittedWorkflow,
+    attempt_number: u64,
+    prior_attempt_number: u64,
+) -> Result<LocalAttemptV1, LocalRunDirectoryError> {
+    fresh_attempt(
+        admitted,
+        attempt_number,
+        AttemptTriggerV1::ExplicitRetry,
+        Some(prior_attempt_number),
+        timestamp(crate::timing::utc_now())?,
+    )
+}
+
+fn fresh_attempt(
+    admitted: &AdmittedWorkflow,
+    attempt_number: u64,
+    trigger: AttemptTriggerV1,
+    prior_attempt_number: Option<u64>,
+    created_at: String,
+) -> Result<LocalAttemptV1, LocalRunDirectoryError> {
+    let execution_root = admitted
+        .execution()
+        .root()
+        .to_str()
+        .ok_or(LocalRunDirectoryError::InvalidPath)?
+        .to_owned();
+    let steps = admitted
+        .workflow()
+        .definition
+        .presentation_order
+        .iter()
+        .map(|id| AttemptStepV1 {
+            id: id.clone(),
+            state: AttemptStepStateV1::Pending,
+        })
+        .collect();
+    Ok(LocalAttemptV1 {
+        attempt_id: generate_uuid()?,
+        attempt_number,
+        trigger,
+        prior_attempt_number,
+        state: AttemptStateV1::Created,
+        execution_root,
+        created_at,
+        started_at: None,
+        settled_at: None,
+        owner: AttemptOwnerV1 {
+            owner_nonce: generate_uuid()?,
+            execution_host: execution_host()?,
+        },
+        cancellation: None,
+        interruption: None,
+        rejection: None,
+        progress: AttemptProgressV1 {
+            accepted_occurrence_ordinal: 0,
+            last_transition_sequence: 0,
+            steps,
+            outstanding_actions: Vec::new(),
+        },
+        process_guards: Vec::new(),
+        result: AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::AttemptNonterminal,
+        },
+    })
+}
+
+fn quiesce_attempt(
+    attempt: &LocalAttemptV1,
+    authority: &impl LocalQuiescenceAuthority,
+) -> Result<(), (Vec<String>, OwnershipUnprovenReason)> {
+    let guards = attempt
+        .process_guards
+        .iter()
+        .filter(|guard| !matches!(guard.state, ProcessGuardStateV1::Quiesced))
+        .collect::<Vec<_>>();
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let current_host = authority.execution_host().map_err(|()| {
+        (
+            guards.iter().map(|guard| guard.guard_id.clone()).collect(),
+            OwnershipUnprovenReason::ExecutionHostIdentityUnavailable,
+        )
+    })?;
+    let matching = guards
+        .iter()
+        .copied()
+        .filter(|guard| guard.execution_host == current_host)
+        .collect::<Vec<_>>();
+    let mut exact = Vec::new();
+    let mut unproven = Vec::new();
+    for guard in matching {
+        match authority.observe_process(guard) {
+            ProcessIdentityObservation::Exact { .. } => exact.push(guard),
+            ProcessIdentityObservation::Absent => {}
+            ProcessIdentityObservation::Unavailable => unproven.push(guard.guard_id.clone()),
+        }
+    }
+    if !unproven.is_empty() {
+        return Err(process_inspection_unproven(unproven));
+    }
+    for guard in &exact {
+        match authority.terminate_process(guard) {
+            AuthenticatedSignalResult::Signalled | AuthenticatedSignalResult::Absent => {}
+            AuthenticatedSignalResult::Unavailable => unproven.push(guard.guard_id.clone()),
+        }
+    }
+    if !unproven.is_empty() {
+        return Err(process_inspection_unproven(unproven));
+    }
+    for _ in 0..QUIESCENCE_POLL_ATTEMPTS {
+        let mut surviving = Vec::new();
+        let mut unavailable = Vec::new();
+        for guard in &exact {
+            match authority.observe_process(guard) {
+                ProcessIdentityObservation::Absent => {}
+                ProcessIdentityObservation::Exact { .. } => surviving.push(*guard),
+                ProcessIdentityObservation::Unavailable => {
+                    unavailable.push(guard.guard_id.clone());
+                }
+            }
+        }
+        if !unavailable.is_empty() {
+            return Err(process_inspection_unproven(unavailable));
+        }
+        if surviving.is_empty() {
+            return Ok(());
+        }
+        authority.wait_for_process_change();
+    }
+    Err(process_inspection_unproven(
+        exact.iter().map(|guard| guard.guard_id.clone()).collect(),
+    ))
+}
+
+fn process_inspection_unproven(guard_ids: Vec<String>) -> (Vec<String>, OwnershipUnprovenReason) {
+    (
+        guard_ids,
+        OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
+    )
+}
+
+fn create_or_verify_attempt_directory(
+    root: &OwnedFd,
+    attempt_number: u64,
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    let name =
+        attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    match mkdirat(&attempts, &name, Mode::RWXU) {
+        Ok(()) => {
+            sync_directory(&attempts)?;
+            open_directory_at(&attempts, &name)
+        }
+        Err(Errno::EXIST) => {
+            let attempt = open_directory_at(&attempts, &name)?;
+            if directory_entries(&attempt)?.is_empty() {
+                Ok(attempt)
+            } else {
+                Err(LocalRunDirectoryError::StateConflict)
+            }
+        }
+        Err(_) => Err(LocalRunDirectoryError::StagingUnavailable),
+    }
+}
+
 fn recovery_status(attempt: &LocalAttemptV1, lock_held: bool) -> LocalRecoveryStatus {
     recovery_status_with(attempt, lock_held, &SystemLocalRecoveryAuthority)
 }
@@ -1787,9 +2463,9 @@ fn recovery_status_with(
         .iter()
         .filter(|guard| guard.execution_host == current_host)
         .filter(|guard| {
-            !matches!(
+            matches!(
                 authority.observe_process(guard),
-                ProcessIdentityObservation::Absent
+                ProcessIdentityObservation::Unavailable
             )
         })
         .map(|guard| guard.guard_id.clone())
@@ -1880,24 +2556,22 @@ const fn publication_failure_phase_name(phase: PublicationFailurePhaseV1) -> &'s
 }
 
 fn process_identity_observation(guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+    authenticated_process_group(guard).map_or(ProcessIdentityObservation::Unavailable, |identity| {
+        system_process_identity_observation(&identity)
+    })
+}
+
+fn authenticated_process_group(guard: &ProcessGuardV1) -> Option<AuthenticatedProcessGroup> {
     if !matches!(
         guard.liveness.kind,
         ProcessLivenessKindV1::LeaderStartIdentity
     ) {
-        return ProcessIdentityObservation::Unavailable;
+        return None;
     }
-    let Some(process_group) = i32::try_from(guard.process_group_id)
+    let process_group = i32::try_from(guard.process_group_id)
         .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        return ProcessIdentityObservation::Unavailable;
-    };
-    let Some(identity) =
-        AuthenticatedProcessGroup::new(process_group, guard.liveness.value.clone())
-    else {
-        return ProcessIdentityObservation::Unavailable;
-    };
-    system_process_identity_observation(&identity)
+        .and_then(rustix::process::Pid::from_raw)?;
+    AuthenticatedProcessGroup::new(process_group, guard.liveness.value.clone())
 }
 
 fn decode_run(bytes: &[u8]) -> Result<LocalRunV1, LocalRunDirectoryError> {
@@ -1955,9 +2629,20 @@ fn validate_run(run: &LocalRunV1) -> Result<(), LocalRunDirectoryError> {
 
 fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirectoryError> {
     if manifest.schema_version != 1
-        || manifest.workflow_path.is_empty()
+        || !is_canonical_relative_path(&manifest.workflow_path)
         || !is_canonical_absolute_path(&manifest.source_root)
+        || !(1..=256).contains(&manifest.maximum_parallel_steps)
+        || manifest.source_files.is_empty()
     {
+        return Err(LocalRunDirectoryError::SerializationUnavailable);
+    }
+    let mut source_paths = BTreeSet::new();
+    for source in &manifest.source_files {
+        if !is_canonical_relative_path(&source.path) || !source_paths.insert(source.path.as_str()) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+    }
+    if !source_paths.contains(manifest.workflow_path.as_str()) {
         return Err(LocalRunDirectoryError::SerializationUnavailable);
     }
     let mut expected_ordinal = 1_u64;
@@ -2188,6 +2873,17 @@ fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirec
     }
 }
 
+fn is_canonical_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::Normal(_))
+                && component.as_os_str().to_str().is_some()
+        })
+        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+}
+
 fn is_canonical_absolute_path(value: &str) -> bool {
     let path = Path::new(value);
     if !path.is_absolute()
@@ -2213,6 +2909,14 @@ fn validate_execution_host(host: &ExecutionHostV1) -> bool {
 }
 
 fn read_regular_file(parent: &OwnedFd, name: &str) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    read_regular_file_bounded(parent, name, MAXIMUM_DURABLE_JSON_BYTES)
+}
+
+fn read_regular_file_bounded(
+    parent: &OwnedFd,
+    name: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, LocalRunDirectoryError> {
     let file = openat(
         parent,
         name,
@@ -2225,19 +2929,19 @@ fn read_regular_file(parent: &OwnedFd, name: &str) -> Result<Vec<u8>, LocalRunDi
         || metadata.st_size < 0
         || u64::try_from(metadata.st_size)
             .ok()
-            .is_none_or(|size| size > MAXIMUM_DURABLE_JSON_BYTES)
+            .is_none_or(|size| size > maximum_bytes)
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
     let mut file = File::from(file);
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
-        .take(MAXIMUM_DURABLE_JSON_BYTES + 1)
+        .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
     if u64::try_from(bytes.len())
         .ok()
-        .is_none_or(|size| size > MAXIMUM_DURABLE_JSON_BYTES)
+        .is_none_or(|size| size > maximum_bytes)
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }

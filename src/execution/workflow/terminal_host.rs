@@ -1,12 +1,16 @@
 mod dag_layout;
 
+use std::future::Future;
 use std::io::{self, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use futures_util::StreamExt as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -27,9 +31,11 @@ use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
     header_timestamp, human_duration, shell_quote, step_kind, visible_text,
 };
-use super::presentation_feed::{AcceptedRecordOrder, WorkflowPresentationStep};
+use super::presentation_feed::{
+    AcceptedRecordOrder, AgentPresentationObservationKind, WorkflowPresentationStep,
+};
 use super::run_view_model::{
-    WorkflowRunCleanupResult, WorkflowRunCleanupState, WorkflowRunLogRecord,
+    WorkflowRunCleanupResult, WorkflowRunCleanupState, WorkflowRunLogRecord, WorkflowRunLogSource,
     WorkflowRunOutputDisposition, WorkflowRunOutputUnavailableReason, WorkflowRunPublicationResult,
     WorkflowRunPublicationState, WorkflowRunStepLog, WorkflowRunStepView, WorkflowRunViewModel,
     WorkflowRunViewSnapshot,
@@ -52,11 +58,15 @@ const LOG_SEPARATOR_WIDTH: usize = 3;
 const LOG_SOURCE_GUTTER_WIDTH: usize = LOG_SOURCE_WIDTH + LOG_SEPARATOR_WIDTH;
 const LOG_TIMESTAMPED_GUTTER_WIDTH: usize = LOG_TIMESTAMP_WIDTH + 1 + LOG_SOURCE_GUTTER_WIDTH;
 const MINIMUM_TIMESTAMPED_LOG_CONTENT_WIDTH: usize = 12;
+const TERMINAL_LIFECYCLE_HANDSHAKE_ENVIRONMENT: &str =
+    "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
 pub(crate) struct WorkflowTerminalHost {
+    activation: Option<oneshot::Sender<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<TerminalHostExit, PresentationFailure>>,
     cancellation: CancellationSource,
+    execution_active: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,70 +84,129 @@ impl WorkflowTerminalHost {
     where
         Clock: super::run_timing::ObservationClock,
     {
-        let mut terminal = match TerminalSession::enter() {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
-                return Err(presentation_failure(
-                    PresentationFailureOperation::TerminalSetup,
-                    &error,
-                ));
-            }
+        Self::start_with_boundary(view, cancellation, color, SystemTerminalBoundary::new())
+    }
+
+    fn start_with_boundary<Clock, Boundary>(
+        view: WorkflowRunViewModel<Clock>,
+        cancellation: CancellationSource,
+        color: bool,
+        boundary: Boundary,
+    ) -> Result<Self, PresentationFailure>
+    where
+        Clock: super::run_timing::ObservationClock,
+        Boundary: TerminalBoundary,
+    {
+        let mut terminal = RestoringTerminal::new(boundary);
+        let area = terminal.boundary.setup().map_err(|error| {
+            presentation_failure(PresentationFailureOperation::TerminalSetup, &error)
+        })?;
+        let mut interaction = HostInteraction {
+            terminal_area: area,
+            ..HostInteraction::default()
         };
-        let mut interaction = HostInteraction::default();
-        if let Err(error) = terminal.draw(
+        if let Err(error) = terminal.boundary.draw(
             &view.snapshot_for_render(interaction.selected),
             &mut interaction,
             color,
         ) {
-            cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
             let failure = presentation_failure(PresentationFailureOperation::TerminalDraw, &error);
             let _ = terminal.restore();
             return Err(failure);
         }
 
-        let (shutdown, receiver) = oneshot::channel();
+        let (activation, activation_receiver) = oneshot::channel();
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
         let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(run_terminal(
-            terminal,
-            view,
-            task_cancellation,
-            color,
-            receiver,
-            interaction,
-        ));
+        let execution_active = Arc::new(AtomicBool::new(false));
+        let task_execution_active = Arc::clone(&execution_active);
+        let task = tokio::spawn(async move {
+            let mut unwind_guard = TerminalTaskUnwindGuard::new(
+                task_cancellation.clone(),
+                Arc::clone(&task_execution_active),
+            );
+            let activated = tokio::select! {
+                biased;
+                _ = &mut shutdown_receiver => false,
+                activation = activation_receiver => activation.is_ok(),
+            };
+            let result = if activated {
+                run_terminal(
+                    terminal,
+                    view,
+                    task_cancellation,
+                    task_execution_active,
+                    color,
+                    shutdown_receiver,
+                    interaction,
+                )
+                .await
+            } else {
+                restore_terminal(
+                    &mut terminal,
+                    TerminalHostExit::Stopped,
+                    &task_cancellation,
+                    false,
+                )
+            };
+            unwind_guard.disarm();
+            result
+        });
         Ok(Self {
+            activation: Some(activation),
             shutdown: Some(shutdown),
             task,
             cancellation,
+            execution_active,
         })
     }
 
+    pub(crate) fn activate_execution(&mut self) -> Result<(), PresentationFailure> {
+        let Some(activation) = self.activation.take() else {
+            return Err(PresentationFailure::operation(
+                PresentationFailureOperation::TerminalTask,
+            ));
+        };
+        self.execution_active.store(true, Ordering::SeqCst);
+        if activation.send(()).is_err() {
+            self.execution_active.store(false, Ordering::SeqCst);
+            return Err(PresentationFailure::operation(
+                PresentationFailureOperation::TerminalTask,
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn wait(mut self) -> Result<TerminalHostExit, PresentationFailure> {
+        drop(self.activation.take());
         let shutdown = self.shutdown.take();
         let cancellation = self.cancellation.clone();
         let result = self.task.await;
         drop(shutdown);
-        Self::join_result(&cancellation, result)
+        Self::join_result(&cancellation, &self.execution_active, result)
     }
 
     pub(crate) async fn stop(mut self) -> Result<TerminalHostExit, PresentationFailure> {
+        drop(self.activation.take());
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         let cancellation = self.cancellation.clone();
         let result = self.task.await;
-        Self::join_result(&cancellation, result)
+        Self::join_result(&cancellation, &self.execution_active, result)
     }
 
     fn join_result(
         cancellation: &CancellationSource,
+        execution_active: &AtomicBool,
         result: Result<Result<TerminalHostExit, PresentationFailure>, tokio::task::JoinError>,
     ) -> Result<TerminalHostExit, PresentationFailure> {
         match result {
             Ok(result) => result,
             Err(_) => {
-                cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+                if execution_active.load(Ordering::SeqCst) {
+                    cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+                }
                 Err(PresentationFailure {
                     operation: PresentationFailureOperation::TerminalTask,
                     error_kind: None,
@@ -148,88 +217,207 @@ impl WorkflowTerminalHost {
     }
 }
 
-async fn run_terminal<Clock>(
-    terminal: TerminalSession,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalLifecycleEvent {
+    HelpOpened,
+    QuitEligible,
+}
+
+trait TerminalBoundary: Send + 'static {
+    fn setup(&mut self) -> io::Result<Rect>;
+
+    fn draw(
+        &mut self,
+        snapshot: &WorkflowRunViewSnapshot,
+        interaction: &mut HostInteraction,
+        color: bool,
+    ) -> io::Result<()>;
+
+    fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send;
+
+    fn resize(&mut self) -> io::Result<Rect>;
+
+    fn restore(&mut self) -> io::Result<()>;
+
+    fn notify_lifecycle(&mut self, _event: TerminalLifecycleEvent) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TerminalTaskUnwindGuard {
+    cancellation: CancellationSource,
+    execution_active: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TerminalTaskUnwindGuard {
+    fn new(cancellation: CancellationSource, execution_active: Arc<AtomicBool>) -> Self {
+        Self {
+            cancellation,
+            execution_active,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalTaskUnwindGuard {
+    fn drop(&mut self) {
+        if self.armed && self.execution_active.load(Ordering::SeqCst) {
+            self.cancellation
+                .request_cancellation(CancellationReason::CallerOutputFailure);
+        }
+    }
+}
+
+struct RestoringTerminal<Boundary: TerminalBoundary> {
+    boundary: Boundary,
+    restored: bool,
+}
+
+impl<Boundary: TerminalBoundary> RestoringTerminal<Boundary> {
+    fn new(boundary: Boundary) -> Self {
+        Self {
+            boundary,
+            restored: false,
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !begin_restoration(&mut self.restored) {
+            return Ok(());
+        }
+        self.boundary.restore()
+    }
+}
+
+impl<Boundary: TerminalBoundary> Drop for RestoringTerminal<Boundary> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+async fn run_terminal<Clock, Boundary>(
+    mut terminal: RestoringTerminal<Boundary>,
     view: WorkflowRunViewModel<Clock>,
     cancellation: CancellationSource,
+    execution_active: Arc<AtomicBool>,
     color: bool,
     mut shutdown: oneshot::Receiver<()>,
     mut interaction: HostInteraction,
 ) -> Result<TerminalHostExit, PresentationFailure>
 where
     Clock: super::run_timing::ObservationClock,
+    Boundary: TerminalBoundary,
 {
-    let TerminalSession {
-        mut surface,
-        mut input,
-        mut restore,
-    } = terminal;
     let mut changes = view.subscribe();
     let mut redraw = redraw_interval();
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = redraw.tick().await;
-    // The execution may advance before this task subscribes, so the first tick must
-    // refresh the setup-time frame even when no later notification is observed.
+    // The execution may advance before this task subscribes, so the first timed tick
+    // refreshes the setup-time frame even when no later notification is observed.
     let mut dirty = true;
 
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => {
-                return restore_terminal(&mut restore, TerminalHostExit::Stopped, &cancellation);
+                return restore_terminal(
+                    &mut terminal,
+                    TerminalHostExit::Stopped,
+                    &cancellation,
+                    execution_active.load(Ordering::SeqCst),
+                );
             }
-            event = input.next_event() => {
+            event = terminal.boundary.next_event() => {
                 let event = match event {
                     Ok(event) => event,
                     Err(error) => {
+                        let snapshot = view.snapshot_for_render(interaction.selected);
+                        let active = workflow_is_executing(&snapshot);
+                        execution_active.store(active, Ordering::SeqCst);
                         return fail_terminal(
-                            &mut restore,
+                            &mut terminal,
                             PresentationFailureOperation::TerminalInput,
                             &error,
                             &cancellation,
+                            active,
                         );
                     }
                 };
+                let snapshot = view.snapshot_for_render(interaction.selected);
+                notify_quit_eligibility(&mut terminal.boundary, &snapshot);
+                let active = workflow_is_executing(&snapshot);
+                execution_active.store(active, Ordering::SeqCst);
                 if event == TerminalInputEvent::Resize {
-                    match surface.resize() {
+                    match terminal.boundary.resize() {
                         Ok(area) => interaction.terminal_area = area,
                         Err(error) => {
                             return fail_terminal(
-                                &mut restore,
+                                &mut terminal,
                                 PresentationFailureOperation::TerminalDraw,
                                 &error,
                                 &cancellation,
+                                active,
                             );
                         }
                     }
                 } else {
-                    let snapshot = view.snapshot_for_render(interaction.selected);
-                    if interaction.handle_key(event, &snapshot, &cancellation) == HostControl::Quit
-                    {
+                    let control = interaction.handle_key(event, &snapshot, &cancellation);
+                    if event == TerminalInputEvent::Help && interaction.help_visible {
+                        let _ = terminal
+                            .boundary
+                            .notify_lifecycle(TerminalLifecycleEvent::HelpOpened);
+                    }
+                    if control == HostControl::Quit {
                         return restore_terminal(
-                            &mut restore,
+                            &mut terminal,
                             TerminalHostExit::Quit,
                             &cancellation,
+                            false,
                         );
                     }
                 }
-                dirty = true;
+                let snapshot = view.snapshot_for_render(interaction.selected);
+                notify_quit_eligibility(&mut terminal.boundary, &snapshot);
+                let active = workflow_is_executing(&snapshot);
+                execution_active.store(active, Ordering::SeqCst);
+                if let Err(error) = terminal.boundary.draw(&snapshot, &mut interaction, color) {
+                    return fail_terminal(
+                        &mut terminal,
+                        PresentationFailureOperation::TerminalDraw,
+                        &error,
+                        &cancellation,
+                        active,
+                    );
+                }
+                dirty = false;
             }
             changed = changes.changed() => {
                 if changed.is_ok() {
                     let _ = changes.borrow_and_update();
+                    let snapshot = view.snapshot_for_render(interaction.selected);
+                    notify_quit_eligibility(&mut terminal.boundary, &snapshot);
+                    execution_active.store(workflow_is_executing(&snapshot), Ordering::SeqCst);
                     dirty = true;
                 }
             }
             _ = redraw.tick() => {
                 let snapshot = view.snapshot_for_render(interaction.selected);
+                notify_quit_eligibility(&mut terminal.boundary, &snapshot);
+                let active = workflow_is_executing(&snapshot);
+                execution_active.store(active, Ordering::SeqCst);
                 if dirty || !snapshot.timing.frozen {
-                    if let Err(error) = surface.draw(&snapshot, &mut interaction, color) {
+                    if let Err(error) = terminal.boundary.draw(&snapshot, &mut interaction, color) {
                         return fail_terminal(
-                            &mut restore,
+                            &mut terminal,
                             PresentationFailureOperation::TerminalDraw,
                             &error,
                             &cancellation,
+                            active,
                         );
                     }
                     dirty = false;
@@ -237,6 +425,19 @@ where
             }
         }
     }
+}
+
+fn notify_quit_eligibility<Boundary: TerminalBoundary>(
+    boundary: &mut Boundary,
+    snapshot: &WorkflowRunViewSnapshot,
+) {
+    if snapshot.quit_eligible {
+        let _ = boundary.notify_lifecycle(TerminalLifecycleEvent::QuitEligible);
+    }
+}
+
+fn workflow_is_executing(snapshot: &WorkflowRunViewSnapshot) -> bool {
+    matches!(snapshot.workflow, WorkflowState::Executing { .. })
 }
 
 #[expect(
@@ -247,14 +448,17 @@ fn redraw_interval() -> tokio::time::Interval {
     tokio::time::interval(REDRAW_INTERVAL)
 }
 
-fn restore_terminal(
-    restore: &mut TerminalRestore,
+fn restore_terminal<Boundary: TerminalBoundary>(
+    terminal: &mut RestoringTerminal<Boundary>,
     exit: TerminalHostExit,
     cancellation: &CancellationSource,
+    execution_active: bool,
 ) -> Result<TerminalHostExit, PresentationFailure> {
-    restore.restore().map_or_else(
+    terminal.restore().map_or_else(
         |error| {
-            cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+            if execution_active {
+                cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+            }
             Err(presentation_failure(
                 PresentationFailureOperation::TerminalRestore,
                 &error,
@@ -264,15 +468,18 @@ fn restore_terminal(
     )
 }
 
-fn fail_terminal(
-    restore: &mut TerminalRestore,
+fn fail_terminal<Boundary: TerminalBoundary>(
+    terminal: &mut RestoringTerminal<Boundary>,
     operation: PresentationFailureOperation,
     error: &io::Error,
     cancellation: &CancellationSource,
+    execution_active: bool,
 ) -> Result<TerminalHostExit, PresentationFailure> {
-    cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+    if execution_active {
+        cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
+    }
     let failure = presentation_failure(operation, error);
-    let _ = restore.restore();
+    let _ = terminal.restore();
     Err(failure)
 }
 
@@ -287,19 +494,47 @@ fn presentation_failure(
     }
 }
 
-struct TerminalSession {
-    surface: TerminalSurface,
+struct SystemTerminalBoundary {
+    surface: Option<TerminalSurface>,
     input: TerminalInput,
-    restore: TerminalRestore,
+    restore: Option<TerminalRestore>,
+    lifecycle_handshake: Option<UnixStream>,
+    quit_eligibility_reported: bool,
 }
 
-impl TerminalSession {
-    fn enter() -> io::Result<Self> {
-        let mut restore = TerminalRestore::enter_raw_mode()?;
-        let input = TerminalInput::new();
+impl SystemTerminalBoundary {
+    fn new() -> Self {
+        Self {
+            surface: None,
+            input: TerminalInput::new(),
+            restore: None,
+            lifecycle_handshake: None,
+            quit_eligibility_reported: false,
+        }
+    }
+
+    fn surface_mut(&mut self) -> io::Result<&mut TerminalSurface> {
+        self.surface.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "terminal surface is not set up",
+            )
+        })
+    }
+}
+
+impl TerminalBoundary for SystemTerminalBoundary {
+    fn setup(&mut self) -> io::Result<Rect> {
+        self.lifecycle_handshake = std::env::var_os(TERMINAL_LIFECYCLE_HANDSHAKE_ENVIRONMENT)
+            .map(std::path::PathBuf::from)
+            .map(UnixStream::connect)
+            .transpose()?;
+        self.restore = Some(TerminalRestore::enter_raw_mode()?);
         let area = selected_output_area()?;
         let mut output = io::stdout();
-        restore.alternate_screen = true;
+        if let Some(restore) = &mut self.restore {
+            restore.alternate_screen = true;
+        }
         execute!(output, EnterAlternateScreen, Hide)?;
         let terminal = Terminal::with_options(
             CrosstermBackend::new(output),
@@ -307,14 +542,11 @@ impl TerminalSession {
                 viewport: Viewport::Fixed(area),
             },
         )?;
-        Ok(Self {
-            surface: TerminalSurface {
-                terminal,
-                graph: None,
-            },
-            input,
-            restore,
-        })
+        self.surface = Some(TerminalSurface {
+            terminal,
+            graph: None,
+        });
+        Ok(area)
     }
 
     fn draw(
@@ -323,11 +555,38 @@ impl TerminalSession {
         interaction: &mut HostInteraction,
         color: bool,
     ) -> io::Result<()> {
-        self.surface.draw(snapshot, interaction, color)
+        self.surface_mut()?.draw(snapshot, interaction, color)
+    }
+
+    fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send {
+        self.input.next_event()
+    }
+
+    fn resize(&mut self) -> io::Result<Rect> {
+        self.surface_mut()?.resize()
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        self.restore.restore()
+        self.restore
+            .as_mut()
+            .map_or(Ok(()), TerminalRestore::restore)
+    }
+
+    fn notify_lifecycle(&mut self, event: TerminalLifecycleEvent) -> io::Result<()> {
+        if event == TerminalLifecycleEvent::QuitEligible && self.quit_eligibility_reported {
+            return Ok(());
+        }
+        let Some(handshake) = &mut self.lifecycle_handshake else {
+            self.quit_eligibility_reported |= event == TerminalLifecycleEvent::QuitEligible;
+            return Ok(());
+        };
+        let message = match event {
+            TerminalLifecycleEvent::HelpOpened => b"help-open\n".as_slice(),
+            TerminalLifecycleEvent::QuitEligible => b"quit-eligible\n".as_slice(),
+        };
+        handshake.write_all(message)?;
+        self.quit_eligibility_reported |= event == TerminalLifecycleEvent::QuitEligible;
+        Ok(())
     }
 }
 
@@ -456,6 +715,14 @@ struct TerminalRestore {
     restored: bool,
 }
 
+fn begin_restoration(restored: &mut bool) -> bool {
+    if *restored {
+        return false;
+    }
+    *restored = true;
+    true
+}
+
 impl TerminalRestore {
     fn enter_raw_mode() -> io::Result<Self> {
         let input = io::stdin();
@@ -475,26 +742,41 @@ impl TerminalRestore {
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        if self.restored {
+        if !begin_restoration(&mut self.restored) {
             return Ok(());
         }
-        self.restored = true;
-        let mut first_error = None;
-        if self.alternate_screen {
-            let mut output = io::stdout();
-            retain_first_error(
-                execute!(output, Show, LeaveAlternateScreen).and_then(|()| output.flush()),
-                &mut first_error,
-            );
-        }
+        let mut output = io::stdout();
         let input = io::stdin();
-        retain_first_error(
-            tcsetattr(&input, OptionalActions::Now, &self.original_input_mode)
-                .map_err(io::Error::from),
-            &mut first_error,
-        );
-        first_error.map_or(Ok(()), Err)
+        attempt_terminal_restoration(
+            self.alternate_screen,
+            &mut output,
+            |output| queue!(output, LeaveAlternateScreen),
+            |output| queue!(output, Show),
+            Write::flush,
+            || {
+                tcsetattr(&input, OptionalActions::Now, &self.original_input_mode)
+                    .map_err(io::Error::from)
+            },
+        )
     }
+}
+
+fn attempt_terminal_restoration<Output: Write>(
+    alternate_screen: bool,
+    output: &mut Output,
+    mut leave_alternate_screen: impl FnMut(&mut Output) -> io::Result<()>,
+    mut show_cursor: impl FnMut(&mut Output) -> io::Result<()>,
+    mut flush_output: impl FnMut(&mut Output) -> io::Result<()>,
+    mut restore_input_mode: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut first_error = None;
+    if alternate_screen {
+        retain_first_error(leave_alternate_screen(output), &mut first_error);
+        retain_first_error(show_cursor(output), &mut first_error);
+        retain_first_error(flush_output(output), &mut first_error);
+    }
+    retain_first_error(restore_input_mode(), &mut first_error);
+    first_error.map_or(Ok(()), Err)
 }
 
 impl Drop for TerminalRestore {
@@ -2069,8 +2351,20 @@ impl LogGutter {
             spans.push(Span::raw(" "));
         }
         let source = match record.source {
-            CommandOutputSource::StandardOutput => "stdout",
-            CommandOutputSource::StandardError => "stderr",
+            WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput) => "stdout",
+            WorkflowRunLogSource::Command(CommandOutputSource::StandardError) => "stderr",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Assistant) => "assist",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Reasoning) => "reason",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolCall) => "tool",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolResult) => "result",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Diagnostic) => "diag",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Usage) => "usage",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Model) => "model",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Lifecycle) => "life",
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ValueRejected) => {
+                "reject"
+            }
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::HarnessEvent) => "event",
         };
         spans.push(Span::styled(
             format!("{source:<LOG_SOURCE_WIDTH$}"),
@@ -2443,7 +2737,9 @@ fn publication_status(snapshot: &WorkflowRunViewSnapshot) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::num::NonZeroUsize;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -2453,13 +2749,157 @@ mod tests {
         CommandOutputObservation, ExecutionObservation, ExecutionObserver, SourceSequence,
     };
     use crate::execution::workflow::presentation_feed::AcceptedRecordOrder;
-    use crate::execution::workflow::resolution;
+    use crate::execution::workflow::publication::{
+        WorkflowRunCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
+        WorkflowRunTiming, WorkflowStepTiming,
+    };
+    use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
     use crate::execution::workflow::run_timing::{
         ObservationClock, ObservationTime, RunTimingObservation,
     };
     use crate::execution::workflow::run_view_model::{WorkflowRunElapsed, WorkflowRunStepLog};
-    use crate::execution::workflow::runtime::{ActionId, FailurePhase, TransitionSequence};
+    use crate::execution::workflow::runtime::{
+        ActionId, FailurePhase, RunOutcome, StepState, TransitionSequence,
+    };
     use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BoundaryAction {
+        Setup,
+        Draw(Rect),
+        Input(TerminalInputEvent),
+        InputFailure,
+        Resize(Rect),
+        Restore,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct BoundaryFailures {
+        setup: bool,
+        draw_at: Option<usize>,
+        restore: bool,
+    }
+
+    enum ScriptedInput {
+        Event(TerminalInputEvent),
+        Failure,
+        Panic,
+    }
+
+    struct ScriptedTerminalBoundary {
+        area: Rect,
+        resize_areas: VecDeque<Rect>,
+        input: tokio::sync::mpsc::UnboundedReceiver<ScriptedInput>,
+        actions: tokio::sync::mpsc::UnboundedSender<BoundaryAction>,
+        failures: BoundaryFailures,
+        draw_count: usize,
+    }
+
+    impl ScriptedTerminalBoundary {
+        fn new(
+            area: Rect,
+            resize_areas: impl IntoIterator<Item = Rect>,
+            failures: BoundaryFailures,
+        ) -> (
+            Self,
+            tokio::sync::mpsc::UnboundedSender<ScriptedInput>,
+            tokio::sync::mpsc::UnboundedReceiver<BoundaryAction>,
+        ) {
+            let (input_sender, input) = tokio::sync::mpsc::unbounded_channel();
+            let (actions, action_receiver) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Self {
+                    area,
+                    resize_areas: resize_areas.into_iter().collect(),
+                    input,
+                    actions,
+                    failures,
+                    draw_count: 0,
+                },
+                input_sender,
+                action_receiver,
+            )
+        }
+
+        fn record(&self, action: BoundaryAction) {
+            let _ = self.actions.send(action);
+        }
+    }
+
+    impl TerminalBoundary for ScriptedTerminalBoundary {
+        fn setup(&mut self) -> io::Result<Rect> {
+            self.record(BoundaryAction::Setup);
+            if self.failures.setup {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected setup failure",
+                ));
+            }
+            Ok(self.area)
+        }
+
+        fn draw(
+            &mut self,
+            _snapshot: &WorkflowRunViewSnapshot,
+            interaction: &mut HostInteraction,
+            _color: bool,
+        ) -> io::Result<()> {
+            self.draw_count = self.draw_count.saturating_add(1);
+            self.record(BoundaryAction::Draw(interaction.terminal_area));
+            if self.failures.draw_at == Some(self.draw_count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected draw failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send {
+            let actions = self.actions.clone();
+            async move {
+                match self.input.recv().await {
+                    Some(ScriptedInput::Event(event)) => {
+                        let _ = actions.send(BoundaryAction::Input(event));
+                        Ok(event)
+                    }
+                    Some(ScriptedInput::Failure) => {
+                        let _ = actions.send(BoundaryAction::InputFailure);
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "injected input failure",
+                        ))
+                    }
+                    Some(ScriptedInput::Panic) => {
+                        std::panic::panic_any("injected terminal input panic")
+                    }
+                    None => Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "scripted terminal input closed",
+                    )),
+                }
+            }
+        }
+
+        fn resize(&mut self) -> io::Result<Rect> {
+            if let Some(area) = self.resize_areas.pop_front() {
+                self.area = area;
+            }
+            self.record(BoundaryAction::Resize(self.area));
+            Ok(self.area)
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.record(BoundaryAction::Restore);
+            if self.failures.restore {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected restore failure",
+                ));
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn selected_terminal_events_map_to_host_controls() {
@@ -3152,6 +3592,265 @@ mod tests {
             ),
             HostControl::Quit
         );
+    }
+
+    #[test]
+    fn restoration_attempts_every_operation_after_cursor_failure() {
+        let actions = RefCell::new(Vec::new());
+        let mut output = io::sink();
+
+        let failure = attempt_terminal_restoration(
+            true,
+            &mut output,
+            |_| {
+                actions.borrow_mut().push("leave alternate screen");
+                Ok(())
+            },
+            |_| {
+                actions.borrow_mut().push("show cursor");
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected cursor restoration failure",
+                ))
+            },
+            |_| {
+                actions.borrow_mut().push("flush output");
+                Ok(())
+            },
+            || {
+                actions.borrow_mut().push("restore input mode");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            actions.into_inner(),
+            [
+                "leave alternate screen",
+                "show cursor",
+                "flush output",
+                "restore input mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_and_initial_render_failures_attempt_restoration_before_execution() {
+        for (failures, expected_operation, expected_actions) in [
+            (
+                BoundaryFailures {
+                    setup: true,
+                    ..BoundaryFailures::default()
+                },
+                PresentationFailureOperation::TerminalSetup,
+                vec![BoundaryAction::Setup, BoundaryAction::Restore],
+            ),
+            (
+                BoundaryFailures {
+                    draw_at: Some(1),
+                    ..BoundaryFailures::default()
+                },
+                PresentationFailureOperation::TerminalDraw,
+                vec![
+                    BoundaryAction::Setup,
+                    BoundaryAction::Draw(Rect::new(0, 0, 80, 24)),
+                    BoundaryAction::Restore,
+                ],
+            ),
+        ] {
+            let (_temporary, _workflow, view, _) = scripted_host_view();
+            let cancellation = CancellationSource::new();
+            let (boundary, _input, mut actions) =
+                ScriptedTerminalBoundary::new(Rect::new(0, 0, 80, 24), [], failures);
+
+            let failure = WorkflowTerminalHost::start_with_boundary(
+                view,
+                cancellation.clone(),
+                false,
+                boundary,
+            )
+            .err()
+            .expect("injected setup must fail");
+
+            assert_eq!(failure.operation, expected_operation);
+            assert_eq!(cancellation.cancellation_reason(), None);
+            assert_eq!(
+                std::iter::from_fn(|| actions.try_recv().ok()).collect::<Vec<_>>(),
+                expected_actions
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_input_is_inert_until_execution_is_activated() {
+        let (_temporary, _workflow, view, _) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) =
+            ScriptedTerminalBoundary::new(Rect::new(0, 0, 80, 24), [], BoundaryFailures::default());
+        let host =
+            WorkflowTerminalHost::start_with_boundary(view, cancellation.clone(), false, boundary)
+                .unwrap();
+        wait_for_action(&mut actions, BoundaryAction::Setup).await;
+        wait_for_action(&mut actions, BoundaryAction::Draw(Rect::new(0, 0, 80, 24))).await;
+
+        input.send(ScriptedInput::Failure).unwrap();
+        assert_eq!(cancellation.cancellation_reason(), None);
+        assert_eq!(host.stop().await.unwrap(), TerminalHostExit::Stopped);
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+        assert_eq!(cancellation.cancellation_reason(), None);
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn scripted_input_keeps_q_inert_during_execution_and_restores_after_cancellation() {
+        let (_temporary, workflow, view, now) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) = ScriptedTerminalBoundary::new(
+            Rect::new(0, 0, 80, 24),
+            [Rect::new(0, 0, 40, 8), Rect::new(0, 0, 100, 30)],
+            BoundaryFailures::default(),
+        );
+        let host = start_active_scripted_host(view.clone(), cancellation.clone(), boundary);
+        wait_for_action(&mut actions, BoundaryAction::Setup).await;
+        wait_for_action(&mut actions, BoundaryAction::Draw(Rect::new(0, 0, 80, 24))).await;
+
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Resize))
+            .unwrap();
+        wait_for_action(&mut actions, BoundaryAction::Resize(Rect::new(0, 0, 40, 8))).await;
+        wait_for_action(&mut actions, BoundaryAction::Draw(Rect::new(0, 0, 40, 8))).await;
+
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Quit))
+            .unwrap();
+        wait_for_action(
+            &mut actions,
+            BoundaryAction::Input(TerminalInputEvent::Quit),
+        )
+        .await;
+        wait_for_action(&mut actions, BoundaryAction::Draw(Rect::new(0, 0, 40, 8))).await;
+        assert_eq!(cancellation.cancellation_reason(), None);
+
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Cancel))
+            .unwrap();
+        assert_eq!(
+            cancellation.wait_for_cancellation().await,
+            CancellationReason::UserRequest
+        );
+        wait_for_action(
+            &mut actions,
+            BoundaryAction::Input(TerminalInputEvent::Cancel),
+        )
+        .await;
+
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Resize))
+            .unwrap();
+        wait_for_action(
+            &mut actions,
+            BoundaryAction::Resize(Rect::new(0, 0, 100, 30)),
+        )
+        .await;
+        complete_scripted_view(&view, &workflow, now, Some(CancellationReason::UserRequest));
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Quit))
+            .unwrap();
+
+        assert_eq!(host.wait().await.unwrap(), TerminalHostExit::Quit);
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::UserRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_stop_and_injected_runtime_failures_restore_the_terminal() {
+        let (_temporary, _workflow, view, _) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, _input, mut actions) =
+            ScriptedTerminalBoundary::new(Rect::new(0, 0, 80, 24), [], BoundaryFailures::default());
+        let host =
+            WorkflowTerminalHost::start_with_boundary(view, cancellation.clone(), false, boundary)
+                .unwrap();
+        assert_eq!(host.stop().await.unwrap(), TerminalHostExit::Stopped);
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+        assert_eq!(cancellation.cancellation_reason(), None);
+
+        assert_scripted_runtime_failure(
+            BoundaryFailures {
+                draw_at: Some(2),
+                ..BoundaryFailures::default()
+            },
+            ScriptedInput::Event(TerminalInputEvent::Other),
+            PresentationFailureOperation::TerminalDraw,
+        )
+        .await;
+        assert_scripted_runtime_failure(
+            BoundaryFailures::default(),
+            ScriptedInput::Failure,
+            PresentationFailureOperation::TerminalInput,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_task_unwind_requests_cancellation_before_application_join() {
+        let (_temporary, _workflow, view, _) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) =
+            ScriptedTerminalBoundary::new(Rect::new(0, 0, 80, 24), [], BoundaryFailures::default());
+        let host = start_active_scripted_host(view, cancellation.clone(), boundary);
+        input.send(ScriptedInput::Panic).unwrap();
+
+        while actions.recv().await.is_some() {}
+
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::CallerOutputFailure),
+            "an active workflow must be cancelled as soon as its terminal task unwinds"
+        );
+        let failure = host.wait().await.unwrap_err();
+        assert_eq!(
+            failure.operation,
+            PresentationFailureOperation::TerminalTask
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_and_task_unwind_attempt_restoration_with_closed_precedence() {
+        let (_temporary, workflow, view, now) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) = ScriptedTerminalBoundary::new(
+            Rect::new(0, 0, 80, 24),
+            [],
+            BoundaryFailures {
+                restore: true,
+                ..BoundaryFailures::default()
+            },
+        );
+        let host = start_active_scripted_host(view.clone(), cancellation.clone(), boundary);
+        complete_scripted_view(&view, &workflow, now, None);
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Quit))
+            .unwrap();
+        let failure = host.wait().await.unwrap_err();
+        assert_eq!(
+            failure.operation,
+            PresentationFailureOperation::TerminalRestore
+        );
+        assert_eq!(cancellation.cancellation_reason(), None);
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+
+        assert_scripted_runtime_failure(
+            BoundaryFailures::default(),
+            ScriptedInput::Panic,
+            PresentationFailureOperation::TerminalTask,
+        )
+        .await;
     }
 
     #[test]
@@ -3996,6 +4695,147 @@ mod tests {
         assert!(!terminal.contains("Ctrl-C cancels"));
     }
 
+    fn start_active_scripted_host(
+        view: WorkflowRunViewModel<FixedClock>,
+        cancellation: CancellationSource,
+        boundary: ScriptedTerminalBoundary,
+    ) -> WorkflowTerminalHost {
+        let mut host =
+            WorkflowTerminalHost::start_with_boundary(view, cancellation, false, boundary).unwrap();
+        host.activate_execution().unwrap();
+        host
+    }
+
+    async fn assert_scripted_runtime_failure(
+        failures: BoundaryFailures,
+        scripted_input: ScriptedInput,
+        expected_operation: PresentationFailureOperation,
+    ) {
+        let (_temporary, _workflow, view, _) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) =
+            ScriptedTerminalBoundary::new(Rect::new(0, 0, 80, 24), [], failures);
+        let host = start_active_scripted_host(view, cancellation.clone(), boundary);
+        input.send(scripted_input).unwrap();
+
+        let failure = host.wait().await.unwrap_err();
+
+        assert_eq!(failure.operation, expected_operation);
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::CallerOutputFailure)
+        );
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+    }
+
+    async fn wait_for_action(
+        actions: &mut tokio::sync::mpsc::UnboundedReceiver<BoundaryAction>,
+        expected: BoundaryAction,
+    ) {
+        loop {
+            let action = actions
+                .recv()
+                .await
+                .expect("terminal action channel closed");
+            if action == expected {
+                return;
+            }
+        }
+    }
+
+    fn scripted_host_view() -> (
+        tempfile::TempDir,
+        ResolvedWorkflow,
+        WorkflowRunViewModel<FixedClock>,
+        ObservationTime,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary.path().join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        )
+        .unwrap();
+        let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
+        let now = ObservationTime {
+            utc: time::OffsetDateTime::UNIX_EPOCH,
+            monotonic: crate::timing::monotonic_now(),
+        };
+        let clock = FixedClock { now };
+        let view = WorkflowRunViewModel::new(
+            &workflow,
+            1,
+            RunTimingObservation::new(now),
+            clock,
+            super::super::run_view_model::StepLogCapacity::default(),
+        );
+        (temporary, workflow, view, now)
+    }
+
+    fn complete_scripted_view(
+        view: &WorkflowRunViewModel<FixedClock>,
+        workflow: &ResolvedWorkflow,
+        started: ObservationTime,
+        cancellation: Option<CancellationReason>,
+    ) {
+        let duration = Duration::from_millis(20);
+        let (outcome, cancellation_fact, step_state, step_timing) = match cancellation {
+            Some(reason) => (
+                RunOutcome::Cancelled { reason },
+                Some(WorkflowRunCancellation {
+                    reason,
+                    force_stop_deadline: started.utc + Duration::from_secs(10),
+                }),
+                StepState::Cancelled { reason },
+                None,
+            ),
+            None => (
+                RunOutcome::Succeeded,
+                None,
+                StepState::Succeeded {
+                    outputs: BTreeMap::new(),
+                },
+                Some(WorkflowStepTiming {
+                    started_at: started.utc,
+                    duration,
+                }),
+            ),
+        };
+        let run = WorkflowRunResult {
+            run_directory: workflow.source.source_root.clone(),
+            attempt_number: 1,
+            workflow_path: workflow.source.workflow_path.clone(),
+            source_root: workflow.source.source_root.clone(),
+            content_digest: workflow.content_digest.clone(),
+            execution_root: workflow.source.source_root.clone(),
+            maximum_parallel_steps: NonZeroUsize::new(1).unwrap(),
+            timing: WorkflowRunTiming {
+                started_at: started.utc,
+                finished_at: started.utc + duration,
+                duration,
+            },
+            outcome,
+            cancellation: cancellation_fact,
+            steps: vec![WorkflowRunStep {
+                id: "complete".to_owned(),
+                kind: WorkflowRunStepKind::Command,
+                state: step_state,
+                timing: step_timing,
+                command_output: None,
+            }],
+            exports: BTreeMap::new(),
+        };
+        view.reconcile_terminal_result(&run).unwrap();
+        view.mark_quiescent();
+        view.begin_publication();
+        view.complete_publication(WorkflowRunPublicationResult::Succeeded {
+            result_directory: "result".to_owned(),
+        });
+        view.begin_cleanup();
+        view.complete_cleanup(WorkflowRunCleanupResult::Succeeded);
+        view.mark_execution_ownership_released();
+        assert!(view.snapshot().quit_eligible);
+    }
+
     #[derive(Clone, Copy)]
     struct FixedClock {
         now: ObservationTime,
@@ -4024,8 +4864,8 @@ mod tests {
             invocation: ActionId {
                 transition_sequence: TransitionSequence::default(),
             },
-            source,
-            source_sequence: SourceSequence::first(),
+            source: WorkflowRunLogSource::Command(source),
+            source_sequence: SourceSequence::first().get(),
             payload: Arc::from(payload),
             continuation,
         }

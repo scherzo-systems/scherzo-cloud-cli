@@ -6,6 +6,7 @@ use super::DecodeFailureKind;
 use super::admission::{AdmissionFailure, AdmissionFailureKind, AdmissionLocation};
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolutionLocation};
 use super::validation::{ValidationFailureKind, ValidationLocation};
+use crate::execution::pi::{PiIncompatibility, PiInstallationFailure, PiProbe};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct RejectionDiagnostic<'a> {
@@ -31,6 +32,18 @@ impl<'a> RejectionDiagnostic<'a> {
             message,
             location: RejectionLocation::from_admission(failure.location())?,
         })
+    }
+
+    pub(crate) fn from_pi_installation(failure: &PiInstallationFailure) -> Self {
+        let (code, message) = pi_installation_classification(failure);
+        Self {
+            code,
+            message,
+            location: RejectionLocation {
+                profile: Some("PiJsonV1"),
+                ..RejectionLocation::simple("agent_harness")
+            },
+        }
     }
 }
 
@@ -325,6 +338,35 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ValidationFailureKind::InvalidExportTarget => (
             "invalid_export_target",
             "Reference a declared step output from the workflow export.",
+        ),
+    }
+}
+
+fn pi_installation_classification(failure: &PiInstallationFailure) -> (&'static str, &'static str) {
+    match failure {
+        PiInstallationFailure::Missing => (
+            "missing_pi_installation",
+            "Install a supported `pi` executable in the inherited PATH.",
+        ),
+        PiInstallationFailure::Unexecutable => (
+            "unexecutable_pi_installation",
+            "The selected `pi` executable could not complete its validation probes.",
+        ),
+        PiInstallationFailure::Malformed(PiProbe::Version) => (
+            "malformed_pi_version",
+            "The selected `pi` executable returned a malformed version.",
+        ),
+        PiInstallationFailure::Malformed(PiProbe::Capabilities) => (
+            "malformed_pi_capabilities",
+            "The selected `pi` executable returned malformed capability help.",
+        ),
+        PiInstallationFailure::Unsupported(PiIncompatibility::Version(_)) => (
+            "unsupported_pi_version",
+            "The selected `pi` version is outside the supported PiJsonV1 range.",
+        ),
+        PiInstallationFailure::Unsupported(PiIncompatibility::Capability(_)) => (
+            "unsupported_pi_capability",
+            "The selected `pi` executable lacks a capability required by PiJsonV1.",
         ),
     }
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use jsonschema::{Draft, PatternOptions, Retrieve, Uri};
 use ring::digest::{SHA256, digest};
+use rustix::net::{RecvFlags, recv};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -340,19 +341,79 @@ async fn serve_connection<Clock: CoordinatorClock>(
     {
         return false;
     }
-    let command = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => return false,
-        command = response => command,
-    };
-    let Ok(command) = command else {
-        let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
-        return true;
+    let command = match wait_for_response_command(&mut stream, stop, response).await {
+        Ok(command) => command,
+        Err(ResponseWaitFailure::TrailingRequest) => {
+            discard_buffered_request(&stream);
+            let response = ValidatePiResultV1Response::fatal(CHANNEL_FAILURE_CAUSE);
+            let _ = write_response_frame(&mut stream, stop, &response, maximum_frame_bytes).await;
+            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
+            return true;
+        }
+        Err(ResponseWaitFailure::SenderDropped) => {
+            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
+            return true;
+        }
+        Err(ResponseWaitFailure::Stopped) => return false,
     };
     let delivered =
         write_response_frame(&mut stream, stop, &command.response, maximum_frame_bytes).await;
     let _ = command.delivered.send(delivered);
     true
+}
+
+enum ResponseWaitFailure {
+    TrailingRequest,
+    SenderDropped,
+    Stopped,
+}
+
+async fn wait_for_response_command(
+    stream: &mut UnixStream,
+    stop: &mut watch::Receiver<bool>,
+    response: oneshot::Receiver<ResponseCommand>,
+) -> Result<ResponseCommand, ResponseWaitFailure> {
+    let mut response = response;
+    let mut trailing = [0_u8; 1];
+    tokio::select! {
+        biased;
+        _ = wait_for_stop(stop) => Err(ResponseWaitFailure::Stopped),
+        read = stream.read(&mut trailing) => match read {
+            Ok(0) => tokio::select! {
+                biased;
+                _ = wait_for_stop(stop) => Err(ResponseWaitFailure::Stopped),
+                command = &mut response => command.map_err(|_| ResponseWaitFailure::SenderDropped),
+            },
+            Ok(_) | Err(_) => Err(ResponseWaitFailure::TrailingRequest),
+        },
+        command = &mut response => match command {
+            Ok(_) if has_trailing_request(stream) => Err(ResponseWaitFailure::TrailingRequest),
+            Ok(command) => Ok(command),
+            Err(_) => Err(ResponseWaitFailure::SenderDropped),
+        },
+    }
+}
+
+// Query the socket directly because Tokio's cached readiness can lag a peer write
+// that completed before the validator's response became ready.
+fn has_trailing_request(stream: &UnixStream) -> bool {
+    let mut trailing = [0_u8; 1];
+    match recv(stream, &mut trailing, RecvFlags::DONTWAIT | RecvFlags::PEEK) {
+        Ok((_, 0)) => false,
+        Err(rustix::io::Errno::AGAIN) => false,
+        Ok(_) | Err(_) => true,
+    }
+}
+
+fn discard_buffered_request(stream: &UnixStream) {
+    let mut trailing = [0_u8; 1024];
+    loop {
+        match recv(stream, &mut trailing, RecvFlags::DONTWAIT) {
+            Ok((_, 0)) | Err(rustix::io::Errno::AGAIN) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 enum FrameRead {
@@ -404,17 +465,15 @@ async fn read_request_frame<Clock: CoordinatorClock>(
         return FrameRead::ProtocolFailure;
     }
 
+    // Pi 0.83's Bun node:net compatibility closes both socket halves on end(),
+    // so a request-side EOF would also discard the response. Reject any already
+    // buffered trailing frame bytes, then let the length prefix delimit the one
+    // request while the server owns closing the connection after its response.
     let mut trailing = [0_u8; 1];
-    let deadline_wait = clock.wait_until(deadline);
-    tokio::pin!(deadline_wait);
-    let read_trailing = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => return FrameRead::Stopped,
-        () = &mut deadline_wait => return FrameRead::ProtocolFailure,
-        result = stream.read(&mut trailing) => result,
-    };
-    if !matches!(read_trailing, Ok(0)) {
-        return FrameRead::ProtocolFailure;
+    match stream.try_read(&mut trailing) {
+        Ok(0) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Ok(_) | Err(_) => return FrameRead::ProtocolFailure,
     }
     serde_json::from_slice(&payload)
         .map(FrameRead::Request)
@@ -648,6 +707,8 @@ fn validate_result_endpoint_directory(directory: &Path) -> Result<(), ()> {
 
 fn socket_alias_directory(tool_name: &str) -> Result<PathBuf, ()> {
     let identity = tool_name.strip_prefix(TOOL_NAME_PREFIX).ok_or(())?;
+    #[cfg(test)]
+    let identity = format!("{identity}-{}", std::process::id());
     Ok(Path::new(SOCKET_ALIAS_ROOT).join(format!(".szp-{identity}")))
 }
 

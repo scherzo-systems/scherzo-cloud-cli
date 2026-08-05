@@ -10,11 +10,14 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::Sleeper;
+use super::assignment::AssignmentManager;
 use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError, FrameSource,
     OpeningHello, opening_hello, run_established,
 };
-use super::test_support::{DeterminismTranscript, scripted_duplex, with_watchdog};
+use super::test_support::{
+    DeterminismTranscript, healthy_wall_clock, scripted_duplex, with_watchdog,
+};
 use crate::runner::credential::test_credential;
 use crate::runner::service::Config;
 use crate::runner::telemetry::test_recorder;
@@ -397,7 +400,7 @@ fn validate_entries(conversation: &Conversation) {
 async fn replay_conversation(conversation: Conversation) -> Result<(), ConnectionError> {
     let opening = opening_metadata(&conversation);
     let frame_source = ReplayFrameSource::new(&conversation);
-    let config = Config::new("ws://127.0.0.1:1/v1/connect", test_credential(), true)
+    let config = Config::fixture("ws://127.0.0.1:1/v1/connect", test_credential(), true)
         .expect("configure conversation replay gateway");
     assert_eq!(config.credential().runner_id(), opening.runner_id);
     let opening_message_id = frame_source.public_id("rmsg_");
@@ -414,6 +417,11 @@ async fn replay_conversation(conversation: Conversation) -> Result<(), Connectio
     let (recorder, _capture) = test_recorder(REPLAY_BOOT_ID);
     let connection_event = recorder.start("runner.conversation_replay", []);
     let active_effect_event = ActiveEffectEvent::new();
+    let assignment_manager = Mutex::new(AssignmentManager::new(
+        &config,
+        REPLAY_BOOT_ID.to_owned(),
+        healthy_wall_clock(),
+    ));
     let transcript = DeterminismTranscript::default();
     let (inbound, reader, writer, mut outbound) = scripted_duplex(transcript);
     let mut next_sequence = opening
@@ -437,6 +445,7 @@ async fn replay_conversation(conversation: Conversation) -> Result<(), Connectio
                 &recorder,
                 &connection_event,
                 &active_effect_event,
+                &assignment_manager,
                 1,
             ),
             OpeningHello {

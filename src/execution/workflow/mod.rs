@@ -4,6 +4,7 @@ pub(crate) mod agent_input;
 pub(crate) mod artifact;
 mod canonical_json;
 pub(crate) mod child_guard;
+pub(crate) mod command_contract;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
 pub(crate) mod document;

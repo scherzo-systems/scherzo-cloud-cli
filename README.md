@@ -12,12 +12,12 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, organization profile management and one-page member-directory
-reads, local Workflow V1 definition validation, command-only execution, and durable run
-status inspection, runner
+reads, local Workflow V1 definition validation, mixed command and agent execution, and
+durable run status inspection, runner
 diagnostics, and a development-only outbound runner transport. `runner serve` connects
-to an explicitly configured runner gateway, receives and
-transport-acknowledges assignment offers, and emits structured service events without
-claiming that execution occurred.
+to an explicitly configured runner gateway, transport-acknowledges assignment effects,
+and resolves and admits one configured local command workflow without claiming that
+execution occurred.
 
 The CLI can create an organization, read or update its initial profile, and list one
 page of active members. It cannot configure repositories, invite or change members,
@@ -66,8 +66,9 @@ local definition resolved successfully.
 
 ## Local workflow execution
 
-Use `scherzo-cloud workflow run` to execute a command-only Workflow V1 DAG in an
-existing caller-owned directory and create one durable local run directory:
+Use `scherzo-cloud workflow run` to execute a mixed command and PiJsonV1 agent
+Workflow V1 DAG in an existing caller-owned directory and create one durable local run
+directory:
 
 ```sh
 scherzo-cloud workflow run \
@@ -91,10 +92,35 @@ Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and
 completely before execution. Workflow commands always receive closed standard input;
 the CLI never forwards prompt input or terminal input to them.
 
+Without `--plain` or `--json`, run uses the interactive terminal interface when stdin and
+stdout are terminals, `TERM` is present and neither empty nor `dumb`, and stdin is not
+reserved by `--prompt-file -`. Every other combination keeps the plain line stream.
+Stderr terminal status does not select the interface. `NO_COLOR` disables semantic color
+under `--color=auto` but does not disable interactive mode; `--color=always` overrides it.
+
+The interface keeps a stable step selection, an inspector, and bounded per-step logs.
+Use `Up`/`Down` or `j`/`k` to select a step, `Enter` and `Escape` to enter and leave its
+full log, and `?` for all log navigation controls. Wide and narrow terminals use
+side-by-side or stacked layouts. Resizing recomputes the layout without leaving
+interactive mode; below 64 columns or 20 rows a resize notice replaces the panes while
+execution, `Ctrl-C`, and eventual `q` handling continue.
+
+`Ctrl-C` requests the existing orderly `user_request` cancellation and does not abandon
+owned child work. `q` is ignored while execution, publication, cleanup, or run ownership
+is active. Once the retained attempt is complete, the interface remains open for
+post-run inspection until `q`; Scherzo then restores raw mode, the alternate screen, and
+the cursor before invoking the shared standard plain-summary renderer. The summary and
+process status are therefore the same contracts used by forced plain output. Inspect the
+durable run later with `workflow status --run-dir <PATH>`; retry is always explicit.
+
 Local execution snapshots the inherited environment after resolution and removes
-`SCHERZO_` variables before launching commands. The adapter does not read Scherzo human
-or runner credentials and does not contact Scherzo Cloud. Agent steps are rejected at
-admission without probing Pi, a provider, or a model.
+`SCHERZO_` variables before launching commands or agents. When the resolved workflow has
+an agent step, the adapter selects the first executable `pi` in inherited `PATH`,
+validates it once for PiJsonV1, and pins its canonical path for the run. Command-only
+workflows do not resolve or probe Pi. The adapter does not read Scherzo human or runner
+credentials and does not contact Scherzo Cloud; an admitted agent harness may use the
+provider and other host authority selected by its closed profile and inherited
+environment.
 
 ## Local workflow status
 
@@ -283,7 +309,11 @@ reuse `~/.scherzo-cloud/credentials.json`.
 ```sh
 scherzo-cloud runner serve \
   --gateway-url wss://runners.example.test/v1/connect \
-  --credential-file ~/.scherzo-cloud/runner.credential
+  --credential-file ~/.scherzo-cloud/runner.credential \
+  --workflow-id wfl_01k0z6r1w8f4jy2m7q9v3x5abr \
+  --workflow-source-root ./repository \
+  --workflow-path .scherzo/workflows/check.yaml \
+  --work-root ./runner-work
 ```
 
 Agent-capable startup additionally takes an explicit installation. Runner initialization
@@ -296,6 +326,10 @@ repeat the probes while serving.
 scherzo-cloud runner serve \
   --gateway-url wss://runners.example.test/v1/connect \
   --credential-file ~/.scherzo-cloud/runner.credential \
+  --workflow-id wfl_01k0z6r1w8f4jy2m7q9v3x5abr \
+  --workflow-source-root ./repository \
+  --workflow-path .scherzo/workflows/check.yaml \
+  --work-root ./runner-work \
   --pi-executable /absolute/path/to/pi
 ```
 
@@ -305,17 +339,24 @@ For local development only, use a loopback `ws://` URL with the explicit opt-in:
 scherzo-cloud runner serve \
   --gateway-url ws://127.0.0.1:8081/v1/connect \
   --credential-file ./runner.credential \
-  --allow-insecure-http
+  --allow-insecure-http \
+  --workflow-id wfl_01k0z6r1w8f4jy2m7q9v3x5abr \
+  --workflow-source-root ./repository \
+  --workflow-path .scherzo/workflows/check.yaml \
+  --work-root ./runner-work
 ```
 
 The runner reconnects after transient failures with jittered backoff, replies to
 WebSocket Ping controls, and uses at-least-once transport acknowledgement. Terminal
 failures — a gateway transport-integrity rejection (WebSocket close status 1008) or a
 rejected credential or configuration at upgrade — exit nonzero instead of retrying;
-restarting the process begins a fresh boot and re-reads the credential file. It
-receives at most one assignment effect at a time. Receiving an offer is not assignment
-acceptance or execution; repository checkout, workflow execution, and production runner
-enrollment remain unimplemented.
+restarting the process begins a fresh boot and re-reads the credential file. The source
+and work roots must be existing, nonoverlapping directories, and the workflow path must
+remain within its source root. The service maps only the configured workflow ID, validates
+the welcomed execution-lease policy and local clock health, and reserves its one local
+slot before reporting semantic acceptance. Transport receipt and semantic acceptance are
+separate; execution still requires a later start effect and is not implemented by this
+increment. Repository checkout and production runner enrollment also remain unimplemented.
 
 While the service runs, standard error contains newline-delimited JSON. Each outbound
 attempt completes one `runner.gateway_connection` event with safe runner and boot IDs,

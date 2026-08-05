@@ -1,3 +1,4 @@
+mod retry;
 mod run;
 mod status;
 mod validate;
@@ -7,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand, ValueEnum};
 
-pub(super) const ABOUT: &str = "Validate, run, and inspect local Workflow V1 definitions";
+pub(super) const ABOUT: &str = "Validate, run, retry, and inspect local Workflow V1 definitions";
 const NAME: &str = "workflow";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -36,6 +37,26 @@ pub(super) struct PresentationOptions {
 }
 
 #[derive(Debug, Args)]
+pub(super) struct ExistingLocalRun {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Existing durable directory for exactly one workflow run"
+    )]
+    pub(super) run_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct LocalExecutionRoot {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Existing caller-owned workflow execution directory"
+    )]
+    pub(super) execution_root: PathBuf,
+}
+
+#[derive(Debug, Args)]
 pub(super) struct LocalWorkflowSource {
     #[arg(
         long,
@@ -59,7 +80,9 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
-    #[command(about = run::ABOUT)]
+    #[command(about = retry::ABOUT)]
+    Retry(retry::Command),
+    #[command(about = run::ABOUT, after_help = run::AFTER_HELP)]
     Run(run::Command),
     #[command(about = status::ABOUT)]
     Status(status::Command),
@@ -71,6 +94,7 @@ impl Command {
     pub(super) fn execute(self) -> ExitCode {
         match self.command {
             None => super::print_help(&[NAME]),
+            Some(WorkflowCommand::Retry(command)) => command.execute(),
             Some(WorkflowCommand::Run(command)) => command.execute(),
             Some(WorkflowCommand::Status(command)) => command.execute(),
             Some(WorkflowCommand::Validate(command)) => command.execute(),

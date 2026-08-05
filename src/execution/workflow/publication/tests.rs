@@ -117,6 +117,7 @@ fn diagnostic(fully_drained: bool) -> StepDiagnostic {
 fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunStep {
     WorkflowRunStep {
         id: id.to_owned(),
+        kind: WorkflowRunStepKind::Command,
         state: StepState::Succeeded { outputs },
         timing: Some(WorkflowStepTiming {
             started_at: timestamp_fixture("2026-08-02T12:01:44.01Z"),
@@ -335,6 +336,59 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
     assert!(!fixture.destination("failed").join("exports/0002").exists());
     assert!(!fixture.destination("failed").join("exports/0004").exists());
     assert!(staging_paths(&fixture.results_parent).is_empty());
+}
+
+#[test]
+fn publishes_text_json_and_file_exports_with_typed_canonical_metadata() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let ExportValue::Available { output: file } = run.exports.remove("reportA").unwrap() else {
+        panic!("reportA must be available");
+    };
+    run.exports = BTreeMap::from([
+        ("file".to_owned(), ExportValue::Available { output: file }),
+        (
+            "response".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Text(Arc::from("agent response\n")),
+            },
+        ),
+        (
+            "result".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Json(Arc::new(serde_json::json!({"z": 2, "a": 1}))),
+            },
+        ),
+    ]);
+    let destination = fixture.destination("typed-exports");
+
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let (_, result) = read_result(&destination);
+
+    assert_eq!(
+        fs::read(destination.join("exports/0001")).unwrap(),
+        b"upper report bytes"
+    );
+    assert_eq!(
+        fs::read(destination.join("exports/0002")).unwrap(),
+        b"agent response\n"
+    );
+    assert_eq!(
+        fs::read(destination.join("exports/0003")).unwrap(),
+        br#"{"a":1,"z":2}"#
+    );
+    assert_eq!(result["exports"]["file"]["kind"], "file");
+    assert_eq!(
+        result["exports"]["file"]["mediaType"],
+        "application/junit+xml"
+    );
+    assert_eq!(result["exports"]["response"]["kind"], "text");
+    assert_eq!(
+        result["exports"]["response"]["mediaType"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(result["exports"]["result"]["kind"], "json");
+    assert_eq!(result["exports"]["result"]["mediaType"], "application/json");
 }
 
 #[test]

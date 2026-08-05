@@ -1,16 +1,18 @@
 use std::ffi::OsString;
+use std::fs;
 use std::future::{Future, pending};
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Add as _;
 use std::os::unix::process::CommandExt as _;
+use std::path::Path;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 use rustix::process::Pid;
 use tokio::io::AsyncReadExt as _;
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::result_bridge::{
@@ -27,12 +29,14 @@ use crate::execution::workflow::agent::{
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
     AgentValueMode, PositiveDuration,
 };
+use crate::execution::workflow::child_guard::{StoppedChildGuard, force_stop_direct_child};
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::observation::{ExecutionObserver, NoopExecutionObserver};
 use crate::execution::workflow::pi::PiConfig;
 use crate::execution::workflow::process_group::{
-    interrupt_process_group, process_group_is_quiescent, terminate_process_group,
+    ProcessGuardRegistration, interrupt_process_group, process_group_is_quiescent,
+    reap_process_group_children, terminate_authenticated_process_group, terminate_process_group,
 };
 use crate::execution::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
@@ -162,40 +166,16 @@ where
         if let Some(result_bridge) = result_bridge.as_ref() {
             plan.add_result_extension(result_bridge.bridge.extension_path());
         }
-        let mut command = match build_command(&invocation, &plan) {
-            Ok(command) => command,
+        let Some(process_directives) = invocation.take_process_directives() else {
+            let _ = shutdown_result_bridge(result_bridge).await;
+            return failed(AgentFailureCause::HarnessStartFailed);
+        };
+        let (process, standard_error) = match launch_process(&invocation, &plan).await {
+            Ok(launched) => launched,
             Err(cause) => {
                 let _ = shutdown_result_bridge(result_bridge).await;
                 return failed(cause);
             }
-        };
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                let _ = shutdown_result_bridge(result_bridge).await;
-                return failed(AgentFailureCause::HarnessStartFailed);
-            }
-        };
-        let Some(process_group) = child
-            .id()
-            .and_then(|process_id| i32::try_from(process_id).ok())
-            .and_then(Pid::from_raw)
-        else {
-            stop_child(&mut child, None).await;
-            let _ = shutdown_result_bridge(result_bridge).await;
-            return failed(AgentFailureCause::HarnessStartFailed);
-        };
-        let (Some(standard_output), Some(standard_error)) =
-            (child.stdout.take(), child.stderr.take())
-        else {
-            stop_child(&mut child, Some(process_group)).await;
-            let _ = shutdown_result_bridge(result_bridge).await;
-            return failed(AgentFailureCause::HarnessStartFailed);
-        };
-        let Some(process_directives) = invocation.take_process_directives() else {
-            stop_child(&mut child, Some(process_group)).await;
-            let _ = shutdown_result_bridge(result_bridge).await;
-            return failed(AgentFailureCause::HarnessStartFailed);
         };
         let diagnostic = self.diagnostics.start_standard_error_capture(
             invocation.identity().step().to_owned(),
@@ -217,11 +197,7 @@ where
         let outcome = drive_process(
             &invocation,
             started,
-            LaunchedPiProcess {
-                child,
-                process_group,
-                standard_output,
-            },
+            process,
             parser,
             process_directives,
             &mut result_bridge,
@@ -317,11 +293,6 @@ where
     Sink: AgentObservationSink,
 {
     check_input_bound(
-        invocation.prompt().system_prompt(),
-        invocation.limits().maximum_system_prompt_bytes(),
-        AgentInputKind::SystemPrompt,
-    )?;
-    check_input_bound(
         invocation.prompt().message(),
         invocation.limits().maximum_message_bytes(),
         AgentInputKind::Message,
@@ -338,6 +309,11 @@ where
         .process()
         .protocol_cwd()
         .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let system_prompt = combined_system_prompt(
+        &expected_cwd,
+        invocation.prompt().system_prompt(),
+        invocation.limits().maximum_system_prompt_bytes(),
+    )?;
     let expected_cwd = expected_cwd
         .to_str()
         .map(Arc::from)
@@ -354,7 +330,7 @@ where
         OsString::from("--thinking"),
         OsString::from(config.thinking.as_str()),
         OsString::from("--append-system-prompt"),
-        OsString::from(invocation.prompt().system_prompt()),
+        OsString::from(system_prompt),
     ]);
     for attachment in invocation.attachments() {
         let mut argument = OsString::from("@");
@@ -394,6 +370,126 @@ where
     Ok(command)
 }
 
+async fn launch_process<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    if !invocation.process_guards().is_durable() {
+        return launch_direct_process(invocation, plan).await;
+    }
+
+    let environment = invocation
+        .process()
+        .environment()
+        .variables()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let mut child = StoppedChildGuard::spawn(
+        invocation.adapter().executable(),
+        &plan.arguments,
+        &environment,
+        |command| {
+            invocation
+                .process()
+                .bind_command(command)
+                .map_err(|_| io::Error::other("agent working directory is unavailable"))
+        },
+    )
+    .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let process_group = child.identity().process_group();
+    let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
+    else {
+        let _ = child.force_stop().await;
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    let mut registration = match invocation.process_guards().register(
+        invocation.identity().step(),
+        invocation.identity().invocation().transition_sequence.get(),
+        child.identity(),
+    ) {
+        Ok(registration) => registration,
+        Err(()) => {
+            let _ = child.force_stop().await;
+            return Err(AgentFailureCause::HarnessStartFailed);
+        }
+    };
+    if child.continue_execution().is_err() || registration.mark_released().is_err() {
+        let _ = child.force_stop().await;
+        let _ = registration.mark_quiesced();
+        return Err(AgentFailureCause::HarnessStartFailed);
+    }
+
+    Ok((
+        LaunchedPiProcess {
+            child: PiChild::Guarded {
+                child,
+                registration,
+            },
+            process_group,
+            standard_output,
+        },
+        standard_error,
+    ))
+}
+
+async fn launch_direct_process<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    let mut command = build_command(invocation, plan)?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let Some(process_group) = child
+        .id()
+        .and_then(|process_id| i32::try_from(process_id).ok())
+        .and_then(Pid::from_raw)
+    else {
+        stop_child(&mut child, None).await;
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    let (Some(standard_output), Some(standard_error)) = (child.stdout.take(), child.stderr.take())
+    else {
+        stop_child(&mut child, Some(process_group)).await;
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    Ok((
+        LaunchedPiProcess {
+            child: PiChild::Direct(child),
+            process_group,
+            standard_output,
+        },
+        standard_error,
+    ))
+}
+
+// Pi 0.83 treats the CLI append value as a replacement for the trusted
+// project's APPEND_SYSTEM.md, so preserve both inputs in the one native flag.
+fn combined_system_prompt(
+    working_directory: &Path,
+    workflow_prompt: &str,
+    maximum_bytes: NonZeroU64,
+) -> Result<String, AgentFailureCause> {
+    let project_prompt = match fs::read_to_string(working_directory.join(".pi/APPEND_SYSTEM.md")) {
+        Ok(prompt) => Some(prompt),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err(AgentFailureCause::HarnessStartFailed),
+    };
+    let combined = project_prompt.map_or_else(
+        || workflow_prompt.to_owned(),
+        |project_prompt| format!("{project_prompt}\n\n{workflow_prompt}"),
+    );
+    check_input_bound(&combined, maximum_bytes, AgentInputKind::SystemPrompt)?;
+    Ok(combined)
+}
+
 fn check_input_bound(
     value: &str,
     admitted_bytes: NonZeroU64,
@@ -411,10 +507,57 @@ fn check_input_bound(
 }
 
 struct LaunchedPiProcess {
-    child: Child,
+    child: PiChild,
     process_group: Pid,
     standard_output: ChildStdout,
 }
+
+enum PiChild {
+    Guarded {
+        child: StoppedChildGuard,
+        registration: ProcessGuardRegistration,
+    },
+    Direct(Child),
+}
+
+impl PiChild {
+    fn force_process_group(&self, process_group: Pid) {
+        match self {
+            Self::Guarded { child, .. } => {
+                let _ = terminate_authenticated_process_group(child.identity());
+            }
+            Self::Direct(_) => terminate_process_group(process_group),
+        }
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus, ()> {
+        let status = match self {
+            Self::Guarded { child, .. } => child.wait().await.map_err(|_| ()),
+            Self::Direct(child) => child.wait().await.map_err(|_| ()),
+        }?;
+        self.mark_quiesced()?;
+        Ok(status)
+    }
+
+    async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
+        self.force_process_group(process_group);
+        match self {
+            Self::Guarded { child, .. } => child.force_stop().await.map_err(|_| ())?,
+            Self::Direct(child) => force_stop_direct_child(child).await?,
+        }
+        self.mark_quiesced()
+    }
+
+    fn mark_quiesced(&mut self) -> Result<(), ()> {
+        match self {
+            Self::Guarded { registration, .. } => registration.mark_quiesced(),
+            Self::Direct(_) => Ok(()),
+        }
+    }
+}
+
+const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
 
 struct ResultSettlementConfiguration<Clock> {
     clock: Clock,
@@ -446,6 +589,7 @@ where
     let (stop_supervisor, supervisor_shutdown) = oneshot::channel();
     let (begin_settlement, settlement_starts) = mpsc::unbounded_channel();
     let (settlement_outcomes, mut settlement_outcome) = mpsc::unbounded_channel();
+    let mut process_group_probe_clock = settlement.clock.clone();
     let process_supervisor = tokio::spawn(supervise_process_group(
         process_group,
         cancellation_source.clone(),
@@ -459,6 +603,7 @@ where
     let mut standard_output_closed = false;
     let mut process_completion = None;
     let mut process_group_quiescent = false;
+    let mut process_group_termination_requested = false;
     let mut settlement_admitted = false;
     let mut settlement_active = false;
     let mut parser_enabled = true;
@@ -491,8 +636,7 @@ where
                             if begin_settlement.send(()).is_err() {
                                 failure = Some(AgentFailureCause::HarnessProtocolFailed);
                                 parser_enabled = false;
-                                terminate_process_group(process_group);
-                                let _ = child.start_kill();
+                                child.force_process_group(process_group);
                             } else {
                                 settlement_admitted = true;
                                 settlement_active = true;
@@ -509,8 +653,7 @@ where
                                 if reports_start && started.report().is_err() {
                                     failure = Some(AgentFailureCause::HarnessProtocolFailed);
                                     parser_enabled = false;
-                                    terminate_process_group(process_group);
-                                    let _ = child.start_kill();
+                                    child.force_process_group(process_group);
                                     break;
                                 }
                                 let emitted = invocation.observations().emit(observation).await;
@@ -522,8 +665,7 @@ where
                                 if emitted.is_err() {
                                     failure = Some(AgentFailureCause::HarnessProtocolFailed);
                                     parser_enabled = false;
-                                    terminate_process_group(process_group);
-                                    let _ = child.start_kill();
+                                    child.force_process_group(process_group);
                                     break;
                                 }
                             }
@@ -533,8 +675,7 @@ where
                         {
                             failure = Some(cause);
                             parser_enabled = false;
-                            terminate_process_group(process_group);
-                            let _ = child.start_kill();
+                            child.force_process_group(process_group);
                         }
                     }
                     Ok(_) => {}
@@ -545,8 +686,7 @@ where
                                 cancelled = Some(reason);
                             } else {
                                 failure = Some(parser.failure_for_current_phase());
-                                terminate_process_group(process_group);
-                                let _ = child.start_kill();
+                                child.force_process_group(process_group);
                             }
                             parser_enabled = false;
                         }
@@ -570,16 +710,14 @@ where
                             } else if emitted.is_err() {
                                 failure = Some(AgentFailureCause::HarnessProtocolFailed);
                                 parser_enabled = false;
-                                terminate_process_group(process_group);
-                                let _ = child.start_kill();
+                                child.force_process_group(process_group);
                             }
                         }
                     }
                     ResultEventProgress::Failed(cause) => {
                         failure = Some(cause);
                         parser_enabled = false;
-                        terminate_process_group(process_group);
-                        let _ = child.start_kill();
+                        child.force_process_group(process_group);
                     }
                     ResultEventProgress::Cancelled(reason) => {
                         cancelled = Some(reason);
@@ -594,8 +732,7 @@ where
                         standard_output_closed = true;
                         failure = Some(AgentFailureCause::ResultSettlementFailed);
                         parser_enabled = false;
-                        terminate_process_group(process_group);
-                        let _ = child.start_kill();
+                        child.force_process_group(process_group);
                     }
                 }
             }
@@ -608,22 +745,26 @@ where
                         if cancelled.is_none() {
                             failure = Some(parser.failure_for_current_phase());
                         }
-                        terminate_process_group(process_group);
-                        let _ = child.start_kill();
+                        child.force_process_group(process_group);
                     }
                 }
             }
+            () = wait_for_process_group_probe(&mut process_group_probe_clock),
+                if process_group_termination_requested => {}
         }
 
         if standard_output_closed
             && (process_completion.is_some() || wait_failed)
             && !process_group_quiescent
         {
+            reap_process_group_children(process_group);
             if process_group_is_quiescent(process_group) {
                 process_group_quiescent = true;
-            } else if !settlement_active || !parser_enabled {
-                terminate_process_group(process_group);
-                process_group_quiescent = true;
+            } else if (!settlement_active || !parser_enabled)
+                && !process_group_termination_requested
+            {
+                child.force_process_group(process_group);
+                process_group_termination_requested = true;
             }
         }
     }
@@ -632,11 +773,13 @@ where
         cancelled = cancellation_source.cancellation_reason();
     }
     if !process_group_quiescent {
-        terminate_process_group(process_group);
+        child.force_process_group(process_group);
     }
     if process_completion.is_none() {
-        let _ = child.start_kill();
         process_completion = child.wait().await.ok();
+        if process_completion.is_none() {
+            let _ = child.force_stop(process_group).await;
+        }
     }
     let _ = stop_supervisor.send(());
     let _ = process_supervisor.await;
@@ -657,6 +800,11 @@ where
         return failed(parser.failure_for_current_phase());
     };
     parser.finish(PiJsonV1ProcessCompletion::exited(status.success()))
+}
+
+async fn wait_for_process_group_probe<Clock: CoordinatorClock>(clock: &mut Clock) {
+    let deadline = clock.now().add(PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL);
+    clock.clone().wait_until(deadline).await;
 }
 
 enum ResultEventProgress {

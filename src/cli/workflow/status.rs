@@ -1,6 +1,5 @@
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,12 +27,8 @@ const STYLE_BLOCKED: &str = "38;2;250;179;135";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Existing durable directory for exactly one workflow run"
-    )]
-    run_dir: PathBuf,
+    #[command(flatten)]
+    run: super::ExistingLocalRun,
 
     #[command(flatten)]
     presentation: super::PresentationOptions,
@@ -100,7 +95,7 @@ impl Command {
 
     fn execute_blocking(&self, cancelled: &AtomicBool, completed: &AtomicBool) -> ExitCode {
         debug_assert!(!(self.presentation.plain && self.presentation.json));
-        let snapshot = read_local_run_status(&self.run_dir);
+        let snapshot = read_local_run_status(&self.run.run_dir);
         if cancelled.load(Ordering::Acquire) {
             return ExitCode::FAILURE;
         }

@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use super::agent::{AgentInvocationLimits, PositiveDuration};
+use super::command_contract::ResolvedCommandWorkflow;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
@@ -21,6 +22,14 @@ use super::validated::{ValidatedHarness, ValidatedStep};
 use crate::execution::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
 
 pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
+const MAXIMUM_CAPTURED_FILES: usize = 1024;
+const MAXIMUM_CAPTURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_TOTAL_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_INPUT_VALUES: usize = 1024;
+const MAXIMUM_INPUT_VALUE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_TOTAL_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_LIVE_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_STEP_LOG_BYTES: u64 = 64 * 1024;
 const MAXIMUM_AGENT_SYSTEM_PROMPT_BYTES: u64 = 64 * 1024;
 const MAXIMUM_AGENT_MESSAGE_BYTES: u64 = 64 * 1024;
 const MAXIMUM_AGENT_ATTACHMENTS: usize = 256;
@@ -353,6 +362,26 @@ impl ExecutionPolicyLimits {
     }
 }
 
+pub(crate) fn default_execution_policy_limits(
+    maximum_parallel_steps: usize,
+) -> ExecutionPolicyLimits {
+    ExecutionPolicyLimits::new(
+        maximum_parallel_steps,
+        CaptureLimits::new(
+            MAXIMUM_CAPTURED_FILES,
+            MAXIMUM_CAPTURED_FILE_BYTES,
+            MAXIMUM_TOTAL_CAPTURED_BYTES,
+        ),
+        InputLimits::new(
+            MAXIMUM_INPUT_VALUES,
+            MAXIMUM_INPUT_VALUE_BYTES,
+            MAXIMUM_TOTAL_INPUT_BYTES,
+            MAXIMUM_LIVE_INPUT_BYTES,
+        ),
+        MAXIMUM_STEP_LOG_BYTES,
+    )
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
@@ -534,6 +563,25 @@ impl AdmittedWorkflow {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedCommandWorkflow {
+    admitted: AdmittedWorkflow,
+}
+
+impl AdmittedCommandWorkflow {
+    pub(crate) fn workflow(&self) -> &ResolvedWorkflow {
+        self.admitted.workflow()
+    }
+
+    pub(crate) fn execution(&self) -> &AdmittedExecutionContext {
+        self.admitted.execution()
+    }
+
+    pub(crate) fn into_workflow(self) -> AdmittedWorkflow {
+        self.admitted
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionFailureKind {
     MissingRequiredPrompt,
@@ -578,6 +626,24 @@ pub(crate) struct AdmissionFailure {
     location: AdmissionLocation,
 }
 
+impl AdmissionFailureKind {
+    pub(crate) const fn is_execution_root_failure(self) -> bool {
+        matches!(
+            self,
+            Self::ExecutionRootUnavailable | Self::ExecutionRootNotDirectory
+        )
+    }
+
+    pub(crate) const fn is_projected_execution_limit_failure(self) -> bool {
+        matches!(
+            self,
+            Self::NonPositiveParallelism
+                | Self::NonPositiveCancellationGrace
+                | Self::CancellationGraceTooLong
+        )
+    }
+}
+
 impl AdmissionFailure {
     pub(crate) fn kind(&self) -> AdmissionFailureKind {
         self.kind
@@ -603,6 +669,15 @@ impl fmt::Display for AdmissionFailure {
 }
 
 impl std::error::Error for AdmissionFailure {}
+
+pub(crate) fn admit_command_workflow(
+    workflow: ResolvedCommandWorkflow,
+    imports: ResolvedImports,
+    context: ExecutionContext,
+) -> Result<AdmittedCommandWorkflow, AdmissionFailure> {
+    admit_workflow(workflow.into_workflow(), imports, context)
+        .map(|admitted| AdmittedCommandWorkflow { admitted })
+}
 
 pub(crate) fn admit_workflow(
     workflow: ResolvedWorkflow,

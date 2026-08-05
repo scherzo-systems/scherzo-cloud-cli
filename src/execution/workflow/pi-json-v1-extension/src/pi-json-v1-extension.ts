@@ -223,7 +223,9 @@ const validateOverSocket: ResultValidator = (socketPath, request, signal) =>
 
     socket.once("connect", () => {
       try {
-        socket.end(encodeFrame(request));
+        // Pi 0.83's Bun runtime closes both socket halves on end(), so the
+        // length-bounded request is written without a request-side EOF.
+        socket.write(encodeFrame(request));
       } catch (error: unknown) {
         fail(
           error instanceof Error

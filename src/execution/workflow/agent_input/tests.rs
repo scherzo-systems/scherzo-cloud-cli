@@ -168,6 +168,7 @@ impl Fixture {
             identity(),
             &self.upstream,
             cancellation,
+            crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
             NoopAgentObservationSink,
         )
     }
@@ -548,6 +549,7 @@ fn cancellation_at_the_ready_barrier_removes_partial_staging_without_launch() {
             identity(),
             &upstream,
             cancellation,
+            crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
             NoopAgentObservationSink,
         );
         result_sender.send(result.map(|_| ())).unwrap();
@@ -681,6 +683,7 @@ fn execution_root_rebinding_during_materialization_is_rejected_before_launch() {
         identity(),
         &fixture.upstream,
         CancellationSource::new(),
+        crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
         NoopAgentObservationSink,
     );
 

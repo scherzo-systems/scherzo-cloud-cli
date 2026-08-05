@@ -2395,6 +2395,28 @@ fn parse_optional_usage(object: &Map<String, Value>) -> Option<Option<Usage>> {
 }
 
 #[cfg(test)]
+pub(super) struct PendingResultValidation;
+
+#[cfg(test)]
+impl crate::execution::workflow::result_validation::RunningResultValidation
+    for PendingResultValidation
+{
+    async fn wait(
+        &mut self,
+    ) -> Result<crate::execution::workflow::result_validation::ValidationWorkerDecision, ()> {
+        std::future::pending().await
+    }
+
+    fn request_stop(&mut self) {}
+
+    fn quiesce(self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+#[cfg(test)]
 mod adapter_tests;
+#[cfg(test)]
+mod conformance_tests;
 #[cfg(test)]
 mod tests;

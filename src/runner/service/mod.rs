@@ -1,3 +1,4 @@
+mod assignment;
 mod backoff;
 mod config;
 mod connection;
@@ -11,13 +12,14 @@ mod test_support;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use opentelemetry::KeyValue;
 
-pub(crate) use config::Config;
+pub(crate) use config::{AssignmentConfig, Config};
 
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
+use assignment::{AssignmentManager, SystemWallClockHealth, WallClockHealth};
 use backoff::Backoff;
 use connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
@@ -100,6 +102,7 @@ struct ConnectionLoopDependencies {
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
+    wall_clock: Arc<dyn WallClockHealth>,
     boot_id: String,
 }
 
@@ -109,6 +112,7 @@ impl ConnectionLoopDependencies {
         frame_source: Arc<dyn FrameSource>,
         sleeper: Arc<dyn Sleeper>,
         recorder: Arc<Recorder>,
+        wall_clock: Arc<dyn WallClockHealth>,
         boot_id: String,
     ) -> Self {
         Self {
@@ -116,6 +120,7 @@ impl ConnectionLoopDependencies {
             frame_source,
             sleeper,
             recorder,
+            wall_clock,
             boot_id,
         }
     }
@@ -160,12 +165,14 @@ async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
     let recorder = Recorder::stderr(&boot_id);
+    let wall_clock: Arc<dyn WallClockHealth> = Arc::new(SystemWallClockHealth);
     let mut shutdown = ProcessShutdown::new()?;
     run_service_loop(
         config,
         frame_source,
         sleeper,
         recorder,
+        wall_clock,
         boot_id,
         &mut shutdown,
     )
@@ -178,6 +185,7 @@ async fn run_until_cancelled_with_dependencies(
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
+    wall_clock: Arc<dyn WallClockHealth>,
     mut shutdown: Box<dyn Shutdown>,
 ) -> Result<(), ServiceError> {
     let boot_id = frame_source.public_id("rbt_");
@@ -186,6 +194,7 @@ async fn run_until_cancelled_with_dependencies(
         frame_source,
         sleeper,
         recorder,
+        wall_clock,
         boot_id,
         shutdown.as_mut(),
     )
@@ -197,11 +206,19 @@ async fn run_service_loop(
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
+    wall_clock: Arc<dyn WallClockHealth>,
     boot_id: String,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
     run_connection_loop(
-        ConnectionLoopDependencies::new(config, frame_source, sleeper, recorder, boot_id),
+        ConnectionLoopDependencies::new(
+            config,
+            frame_source,
+            sleeper,
+            recorder,
+            wall_clock,
+            boot_id,
+        ),
         &WebSocketConnector,
         Backoff::new(),
         shutdown.wait(),
@@ -223,8 +240,11 @@ where
         frame_source,
         sleeper,
         recorder,
+        wall_clock,
         boot_id,
     } = dependencies;
+    let assignment_manager =
+        Mutex::new(AssignmentManager::new(&config, boot_id.clone(), wall_clock));
     tokio::pin!(cancellation);
     let mut opening_sequence = 1;
     let mut sequence = opening_sequence;
@@ -259,6 +279,7 @@ where
                     &recorder,
                     &connection_event,
                     &active_effect_event,
+                    &assignment_manager,
                     attempt,
                 ),
                 opening: OpeningHello {
@@ -419,7 +440,7 @@ mod tests {
         SleepRelease, accept_fixture_socket, accept_fixture_socket_with_headers,
         accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_listener, observation_acknowledgement,
+        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
         offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
     use super::{
@@ -466,7 +487,7 @@ mod tests {
         TestCapture,
         Arc<Notify>,
     ) {
-        let config = Config::new(endpoint, test_credential(), true).expect("configure gateway");
+        let config = Config::fixture(endpoint, test_credential(), true).expect("configure gateway");
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, shutdown_trigger) = controlled_shutdown();
         let service = tokio::spawn(run_until_cancelled_with_dependencies(
@@ -474,6 +495,7 @@ mod tests {
             deterministic_frame_source(),
             sleeper,
             recorder,
+            healthy_wall_clock(),
             shutdown,
         ));
         (service, capture, shutdown_trigger)
@@ -542,7 +564,8 @@ mod tests {
         });
 
         let endpoint = format!("{endpoint}?secret=URL-QUERY-MUST-NOT-LEAK");
-        let config = Config::new(&endpoint, test_credential(), true).expect("configure gateway");
+        let config =
+            Config::fixture(&endpoint, test_credential(), true).expect("configure gateway");
         let (sleeper, _sleep_requests) = controlled_sleeper();
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, _shutdown_trigger) = controlled_shutdown();
@@ -551,6 +574,7 @@ mod tests {
             deterministic_frame_source(),
             sleeper,
             recorder,
+            healthy_wall_clock(),
             shutdown,
         ))
         .await

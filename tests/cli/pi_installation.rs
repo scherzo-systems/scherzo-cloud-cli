@@ -8,17 +8,26 @@ use super::{private_credential_directory, run_with_env, write_runner_credential}
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CAPABILITY_PROBE: &str = "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help";
 const CLOSED_PROBES: &[u8] = b"--version\n--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help\n";
-const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+pub(super) const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
 const REQUIRED_CAPABILITIES: &str = "json_event_stream,ephemeral_session,extension_loading,system_prompt_append,invocation_scoped_project_trust";
 
-struct PiFixture {
+pub(super) struct PiFixture {
     _directory: tempfile::TempDir,
     executable: PathBuf,
     probe_log: PathBuf,
 }
 
 impl PiFixture {
-    fn new(version: &str, help: &str, executable: bool) -> Self {
+    pub(super) fn new(version: &str, help: &str, executable: bool) -> Self {
+        Self::with_execution(version, help, executable, "exit 97")
+    }
+
+    pub(super) fn with_execution(
+        version: &str,
+        help: &str,
+        executable: bool,
+        execution: &str,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary Pi directory should be created");
         let executable_path = directory.path().join("pi");
         let probe_log = directory.path().join("probes.log");
@@ -44,7 +53,7 @@ impl PiFixture {
             quote(help)
         )
         .unwrap();
-        writeln!(file, "  *) exit 97 ;;").unwrap();
+        writeln!(file, "  *) {execution} ;;").unwrap();
         writeln!(file, "esac").unwrap();
         drop(file);
 
@@ -55,18 +64,22 @@ impl PiFixture {
         }
     }
 
-    fn executable(&self) -> &str {
+    pub(super) fn executable(&self) -> &str {
         self.executable
             .to_str()
             .expect("fake Pi path should be UTF-8")
     }
 
-    fn recorded_probes(&self) -> Vec<u8> {
+    pub(super) fn recorded_probes(&self) -> Vec<u8> {
         fs::read(&self.probe_log).unwrap_or_default()
+    }
+
+    pub(super) fn path_directory(&self) -> &Path {
+        self.executable.parent().unwrap()
     }
 }
 
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
@@ -276,6 +289,14 @@ fn agent_capable_runner_initialization_uses_the_same_validator_once() {
             "https://not-a-websocket.example.test",
             "--credential-file",
             &credential_path,
+            "--workflow-id",
+            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+            "--workflow-source-root",
+            "schemas",
+            "--workflow-path",
+            "workflow-v1.schema.json",
+            "--work-root",
+            "tests",
             "--pi-executable",
             fixture.executable(),
         ],
@@ -300,6 +321,14 @@ fn agent_capable_runner_initialization_uses_the_same_validator_once() {
             "wss://gateway.example.test/v1/connect",
             "--credential-file",
             "/credential/must-not-be-read",
+            "--workflow-id",
+            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+            "--workflow-source-root",
+            "schemas",
+            "--workflow-path",
+            "workflow-v1.schema.json",
+            "--work-root",
+            "tests",
             "--pi-executable",
             incompatible.executable(),
         ],

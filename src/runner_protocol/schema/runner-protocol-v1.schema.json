@@ -1,0 +1,2112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scherzo.dev/contracts/runner-protocol-v1.schema.json",
+  "title": "Runner protocol version 1",
+  "description": "Closed JSON text frames exchanged by a Scherzo runner and gateway.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/RunnerHello"
+    },
+    {
+      "$ref": "#/$defs/RunnerEffectAcknowledged"
+    },
+    {
+      "$ref": "#/$defs/RunnerAssignmentAccepted"
+    },
+    {
+      "$ref": "#/$defs/RunnerAssignmentRejected"
+    },
+    {
+      "$ref": "#/$defs/RunnerAssignmentInterrupted"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionLeaseRenewalRequested"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionStarted"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionTransition"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionFinished"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionInterrupted"
+    },
+    {
+      "$ref": "#/$defs/RunnerExecutionAborted"
+    },
+    {
+      "$ref": "#/$defs/CloudWelcome"
+    },
+    {
+      "$ref": "#/$defs/CloudObservationAck"
+    },
+    {
+      "$ref": "#/$defs/CloudAssignmentOffer"
+    },
+    {
+      "$ref": "#/$defs/CloudAssignmentStart"
+    },
+    {
+      "$ref": "#/$defs/CloudAssignmentLeaseRenewed"
+    },
+    {
+      "$ref": "#/$defs/CloudAssignmentRelease"
+    }
+  ],
+  "$defs": {
+    "runnerId": {
+      "type": "string",
+      "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "bootId": {
+      "type": "string",
+      "pattern": "^rbt_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "runnerMessageId": {
+      "type": "string",
+      "pattern": "^rmsg_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "cloudMessageId": {
+      "type": "string",
+      "pattern": "^cmsg_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^rsn_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "effectId": {
+      "type": "string",
+      "pattern": "^eff_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "assignmentId": {
+      "type": "string",
+      "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "workflowId": {
+      "type": "string",
+      "pattern": "^wfl_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "executionSpecId": {
+      "type": "string",
+      "pattern": "^xsp_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?Z$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "nonnegativeSequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "ExecutionLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximumParallelSteps": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "cancellationGraceSeconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        }
+      },
+      "required": [
+        "maximumParallelSteps",
+        "cancellationGraceSeconds"
+      ]
+    },
+    "ExecutionSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "executionSpecId": {
+          "$ref": "#/$defs/executionSpecId"
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "registeredWorkflowId": {
+          "$ref": "#/$defs/workflowId"
+        },
+        "executionLimits": {
+          "$ref": "#/$defs/ExecutionLimits"
+        }
+      },
+      "required": [
+        "executionSpecId",
+        "schemaVersion",
+        "registeredWorkflowId",
+        "executionLimits"
+      ]
+    },
+    "ExecutionLeasePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "maxClockUncertaintyMilliseconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "forceStopAndReapBudgetMilliseconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "terminalReportDeliveryBudgetMilliseconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "startDeliveryBudgetMilliseconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "renewalDeliveryBudgetMilliseconds": {
+          "$ref": "#/$defs/nonnegativeSequence"
+        },
+        "leaseDurationMilliseconds": {
+          "$ref": "#/$defs/sequence"
+        },
+        "fencingMarginMilliseconds": {
+          "$ref": "#/$defs/sequence"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "maxClockUncertaintyMilliseconds",
+        "forceStopAndReapBudgetMilliseconds",
+        "terminalReportDeliveryBudgetMilliseconds",
+        "startDeliveryBudgetMilliseconds",
+        "renewalDeliveryBudgetMilliseconds",
+        "leaseDurationMilliseconds",
+        "fencingMarginMilliseconds"
+      ]
+    },
+    "Lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "leaseSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "leaseExpiresAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "runnerStopBefore": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "required": [
+        "leaseSequence",
+        "leaseExpiresAt",
+        "runnerStopBefore"
+      ]
+    },
+    "RunnerUnableReason": {
+      "enum": [
+        "execution_environment_unavailable",
+        "workflow_mapping_unavailable",
+        "workflow_source_unavailable",
+        "workflow_contract_invalid",
+        "workflow_admission_rejected"
+      ]
+    },
+    "ExecutionSpecInvalidReason": {
+      "enum": [
+        "unsupported_schema_version",
+        "invalid_execution_limits"
+      ]
+    },
+    "AssignmentDecline": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "capacity_unavailable"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "runner_unable"
+            },
+            "reason": {
+              "$ref": "#/$defs/RunnerUnableReason"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "execution_spec_invalid"
+            },
+            "reason": {
+              "$ref": "#/$defs/ExecutionSpecInvalidReason"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "RunnerEnvelope": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "direction": {
+          "const": "runner_to_cloud"
+        },
+        "messageId": {
+          "$ref": "#/$defs/runnerMessageId"
+        },
+        "runnerId": {
+          "$ref": "#/$defs/runnerId"
+        },
+        "bootId": {
+          "$ref": "#/$defs/bootId"
+        },
+        "sequence": {
+          "$ref": "#/$defs/sequence"
+        },
+        "sentAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "type": {
+          "type": "string"
+        },
+        "payloadVersion": {
+          "const": 1
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "direction",
+        "messageId",
+        "runnerId",
+        "bootId",
+        "sequence",
+        "sentAt",
+        "type",
+        "payloadVersion",
+        "payload"
+      ]
+    },
+    "RunnerHello": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "hello"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "runnerVersion": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "maxConcurrentRuns": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 2147483647
+                }
+              },
+              "required": [
+                "runnerVersion",
+                "maxConcurrentRuns"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerEffectAcknowledged": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "effect_acknowledged"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                }
+              },
+              "required": [
+                "effectId"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerAssignmentAccepted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_accepted"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "offeredExecutionSpecId": {
+                  "$ref": "#/$defs/executionSpecId"
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "offeredExecutionSpecId"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerAssignmentRejected": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_rejected"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "decline": {
+                  "$ref": "#/$defs/AssignmentDecline"
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "decline"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerAssignmentInterrupted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_interrupted"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "type": "string",
+                  "pattern": "^atm_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+                },
+                "reason": {
+                  "enum": [
+                    "graceful_shutdown",
+                    "execution_lease_expired"
+                  ]
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "reason"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudEnvelope": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "direction": {
+          "const": "cloud_to_runner"
+        },
+        "messageId": {
+          "$ref": "#/$defs/cloudMessageId"
+        },
+        "sentAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "type": {
+          "type": "string"
+        },
+        "payloadVersion": {
+          "const": 1
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "direction",
+        "messageId",
+        "sentAt",
+        "type",
+        "payloadVersion",
+        "payload"
+      ]
+    },
+    "CloudWelcome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "welcome"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sessionId": {
+                  "$ref": "#/$defs/sessionId"
+                },
+                "pingIntervalSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60
+                },
+                "pongTimeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 300
+                },
+                "leasePolicy": {
+                  "$ref": "#/$defs/ExecutionLeasePolicy"
+                }
+              },
+              "required": [
+                "sessionId",
+                "pingIntervalSeconds",
+                "pongTimeoutSeconds",
+                "leasePolicy"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudObservationAck": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "observation_ack"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "acknowledgedMessageId": {
+                  "$ref": "#/$defs/runnerMessageId"
+                },
+                "acknowledgedSequence": {
+                  "$ref": "#/$defs/sequence"
+                }
+              },
+              "required": [
+                "acknowledgedMessageId",
+                "acknowledgedSequence"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudAssignmentOffer": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_offer"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "executionSpec": {
+                  "$ref": "#/$defs/ExecutionSpec"
+                },
+                "offerExpiresAt": {
+                  "$ref": "#/$defs/utcTimestamp"
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "executionSpec",
+                "offerExpiresAt"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudAssignmentStart": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_start"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "executionSpecId": {
+                  "$ref": "#/$defs/executionSpecId"
+                },
+                "lease": {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Lease"
+                    },
+                    {
+                      "properties": {
+                        "leaseSequence": {
+                          "const": 1
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "executionSpecId",
+                "lease"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudAssignmentRelease": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_release"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "reason": {
+                  "enum": [
+                    "stale_or_invalid_acceptance",
+                    "execution_lease_expired"
+                  ]
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "reason"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "attemptId": {
+      "type": "string",
+      "pattern": "^atm_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "positiveSequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "stepId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+    },
+    "RuntimeCancellationReason": {
+      "enum": [
+        "user_request",
+        "termination_request",
+        "caller_output_failure",
+        "runner_shutdown",
+        "execution_lease_expired"
+      ]
+    },
+    "ExecutorFaultReason": {
+      "enum": [
+        "execution_environment_lost",
+        "engine_result_inconsistent",
+        "runner_internal_failure"
+      ]
+    },
+    "StepFailureEvidence": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StartStepFailureEvidence"
+        },
+        {
+          "$ref": "#/$defs/ExecutionStepFailureEvidence"
+        }
+      ]
+    },
+    "WorkflowFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stepId": {
+          "$ref": "#/$defs/stepId"
+        },
+        "failure": {
+          "$ref": "#/$defs/StepFailureEvidence"
+        }
+      },
+      "required": [
+        "stepId",
+        "failure"
+      ]
+    },
+    "WorkflowState": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/WorkflowExecutingOpenState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowExecutingFailureStoppedState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowExecutingCancellingState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowSucceededState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowFailedState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowFailedAfterCancellationState"
+        },
+        {
+          "$ref": "#/$defs/WorkflowCancelledState"
+        }
+      ]
+    },
+    "StepStateKind": {
+      "enum": [
+        "pending",
+        "starting",
+        "running",
+        "capturing_outputs",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "blocked",
+        "not_run",
+        "cancelled"
+      ]
+    },
+    "SimpleStepTransitionEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "starting"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "starting"
+            },
+            "to": {
+              "const": "running"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "running"
+            },
+            "to": {
+              "const": "capturing_outputs"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "capturing_outputs"
+            },
+            "to": {
+              "const": "succeeded"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to"
+          ]
+        }
+      ]
+    },
+    "FailedStepTransitionEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "starting"
+            },
+            "to": {
+              "const": "failed"
+            },
+            "failure": {
+              "$ref": "#/$defs/StartStepFailureEvidence"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "running"
+            },
+            "to": {
+              "const": "failed"
+            },
+            "failure": {
+              "$ref": "#/$defs/ExecutionStepFailureEvidence"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to",
+            "failure"
+          ]
+        }
+      ]
+    },
+    "BlockedStepTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "step_state_changed"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "stepId": {
+          "$ref": "#/$defs/stepId"
+        },
+        "from": {
+          "const": "pending"
+        },
+        "to": {
+          "const": "blocked"
+        },
+        "dependency": {
+          "$ref": "#/$defs/stepId"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "stepId",
+        "from",
+        "to",
+        "dependency"
+      ]
+    },
+    "NotRunStepTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "step_state_changed"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "stepId": {
+          "$ref": "#/$defs/stepId"
+        },
+        "from": {
+          "const": "pending"
+        },
+        "to": {
+          "const": "not_run"
+        },
+        "reason": {
+          "const": "failure_stop"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "stepId",
+        "from",
+        "to",
+        "reason"
+      ]
+    },
+    "CancellingStepTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "step_state_changed"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "stepId": {
+          "$ref": "#/$defs/stepId"
+        },
+        "from": {
+          "enum": [
+            "starting",
+            "running",
+            "capturing_outputs"
+          ]
+        },
+        "to": {
+          "const": "cancelling"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "stepId",
+        "from",
+        "to",
+        "reason"
+      ]
+    },
+    "CancelledStepTransitionEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "cancelling"
+            },
+            "to": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "$ref": "#/$defs/RuntimeCancellationReason"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "WorkflowStateChangedEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowExecutingFailureStoppedState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingFailureStoppedState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingOpenState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowSucceededState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingFailureStoppedState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowCancelledState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "workflow_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "from": {
+              "$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"
+            },
+            "to": {
+              "$ref": "#/$defs/WorkflowFailedAfterCancellationState"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "from",
+            "to"
+          ]
+        }
+      ]
+    },
+    "CancellationAcceptedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "cancellation_accepted"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        },
+        "deadline": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "reason",
+        "deadline"
+      ]
+    },
+    "WorkflowTransitionEvent": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SimpleStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/FailedStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/BlockedStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/NotRunStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/CancellingStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/CancelledStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/WorkflowStateChangedEvent"
+        },
+        {
+          "$ref": "#/$defs/CancellationAcceptedEvent"
+        }
+      ]
+    },
+    "WorkflowTerminalOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "const": "succeeded"
+            }
+          },
+          "required": [
+            "outcome"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "const": "failed"
+            },
+            "failure": {
+              "$ref": "#/$defs/WorkflowFailure"
+            }
+          },
+          "required": [
+            "outcome",
+            "failure"
+          ]
+        }
+      ]
+    },
+    "RunnerExecutionLeaseRenewalRequested": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "currentLeaseSequence": {
+                  "$ref": "#/$defs/positiveSequence"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "currentLeaseSequence"
+              ]
+            },
+            "type": {
+              "const": "execution_lease_renewal_requested"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerExecutionStarted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId"
+              ]
+            },
+            "type": {
+              "const": "execution_started"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerExecutionTransition": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "executionEventSequence": {
+                  "$ref": "#/$defs/positiveSequence"
+                },
+                "workflowEvent": {
+                  "$ref": "#/$defs/WorkflowTransitionEvent"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "executionEventSequence",
+                "workflowEvent"
+              ]
+            },
+            "type": {
+              "const": "execution_transition"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerExecutionFinished": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "finalExecutionEventSequence": {
+                  "$ref": "#/$defs/positiveSequence"
+                },
+                "outcome": {
+                  "$ref": "#/$defs/WorkflowTerminalOutcome"
+                }
+              },
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "finalExecutionEventSequence",
+                "outcome"
+              ]
+            },
+            "type": {
+              "const": "execution_finished"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerExecutionInterrupted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignmentId": {
+                      "$ref": "#/$defs/assignmentId"
+                    },
+                    "attemptId": {
+                      "$ref": "#/$defs/attemptId"
+                    },
+                    "finalExecutionEventSequence": {
+                      "$ref": "#/$defs/positiveSequence"
+                    },
+                    "reason": {
+                      "const": "graceful_shutdown"
+                    },
+                    "terminalOutcome": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "outcome": {
+                          "const": "cancelled"
+                        },
+                        "reason": {
+                          "const": "runner_shutdown"
+                        }
+                      },
+                      "required": [
+                        "outcome",
+                        "reason"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "assignmentId",
+                    "attemptId",
+                    "finalExecutionEventSequence",
+                    "reason",
+                    "terminalOutcome"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignmentId": {
+                      "$ref": "#/$defs/assignmentId"
+                    },
+                    "attemptId": {
+                      "$ref": "#/$defs/attemptId"
+                    },
+                    "finalExecutionEventSequence": {
+                      "$ref": "#/$defs/positiveSequence"
+                    },
+                    "reason": {
+                      "const": "execution_lease_expired"
+                    },
+                    "terminalOutcome": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "outcome": {
+                          "const": "cancelled"
+                        },
+                        "reason": {
+                          "const": "execution_lease_expired"
+                        }
+                      },
+                      "required": [
+                        "outcome",
+                        "reason"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "assignmentId",
+                    "attemptId",
+                    "finalExecutionEventSequence",
+                    "reason",
+                    "terminalOutcome"
+                  ]
+                }
+              ]
+            },
+            "type": {
+              "const": "execution_interrupted"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerExecutionAborted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignmentId": {
+                      "$ref": "#/$defs/assignmentId"
+                    },
+                    "attemptId": {
+                      "$ref": "#/$defs/attemptId"
+                    },
+                    "lastExecutionEventSequence": {
+                      "$ref": "#/$defs/nonnegativeSequence"
+                    },
+                    "reason": {
+                      "enum": [
+                        "execution_environment_lost",
+                        "runner_internal_failure"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "assignmentId",
+                    "attemptId",
+                    "lastExecutionEventSequence",
+                    "reason"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignmentId": {
+                      "$ref": "#/$defs/assignmentId"
+                    },
+                    "attemptId": {
+                      "$ref": "#/$defs/attemptId"
+                    },
+                    "lastExecutionEventSequence": {
+                      "$ref": "#/$defs/positiveSequence"
+                    },
+                    "reason": {
+                      "const": "engine_result_inconsistent"
+                    }
+                  },
+                  "required": [
+                    "assignmentId",
+                    "attemptId",
+                    "lastExecutionEventSequence",
+                    "reason"
+                  ]
+                }
+              ]
+            },
+            "type": {
+              "const": "execution_aborted"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudAssignmentLeaseRenewed": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_lease_renewed"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "lease": {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Lease"
+                    },
+                    {
+                      "properties": {
+                        "leaseSequence": {
+                          "type": "integer",
+                          "minimum": 2,
+                          "maximum": 9223372036854775807
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "lease"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "StartStepFailureEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "const": "start"
+        },
+        "cause": {
+          "enum": [
+            "step_unavailable",
+            "preparation_task_unavailable",
+            "execution_root_rebound",
+            "working_directory_unavailable",
+            "working_directory_escape",
+            "working_directory_not_directory",
+            "invalid_argv",
+            "path_not_configured",
+            "executable_not_found",
+            "executable_unavailable",
+            "command_not_found",
+            "command_permission_denied",
+            "command_invalid_input",
+            "command_launch_failed"
+          ]
+        }
+      },
+      "required": [
+        "phase",
+        "cause"
+      ]
+    },
+    "ExecutionStepFailureEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "execution"
+            },
+            "cause": {
+              "enum": [
+                "command_terminated",
+                "command_wait_failed"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "cause"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "execution"
+            },
+            "cause": {
+              "const": "command_unsuccessful_exit"
+            },
+            "exitCode": {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "phase",
+            "cause",
+            "exitCode"
+          ]
+        }
+      ]
+    },
+    "WorkflowExecutingOpenState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "executing"
+        },
+        "gate": {
+          "const": "open"
+        }
+      },
+      "required": [
+        "state",
+        "gate"
+      ]
+    },
+    "WorkflowExecutingFailureStoppedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "executing"
+        },
+        "gate": {
+          "const": "failure_stopped"
+        },
+        "primaryFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        }
+      },
+      "required": [
+        "state",
+        "gate",
+        "primaryFailure"
+      ]
+    },
+    "WorkflowExecutingCancellingState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "executing"
+        },
+        "gate": {
+          "const": "cancelling"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        }
+      },
+      "required": [
+        "state",
+        "gate",
+        "reason"
+      ]
+    },
+    "WorkflowExecutingCancellingAfterFailureState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "executing"
+        },
+        "gate": {
+          "const": "cancelling"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        },
+        "priorFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        }
+      },
+      "required": [
+        "state",
+        "gate",
+        "reason",
+        "priorFailure"
+      ]
+    },
+    "WorkflowSucceededState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "succeeded"
+        }
+      },
+      "required": [
+        "state"
+      ]
+    },
+    "WorkflowFailedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "failed"
+        },
+        "primaryFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        }
+      },
+      "required": [
+        "state",
+        "primaryFailure"
+      ]
+    },
+    "WorkflowFailedAfterCancellationState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "failed"
+        },
+        "primaryFailure": {
+          "$ref": "#/$defs/WorkflowFailure"
+        },
+        "laterCancellation": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        }
+      },
+      "required": [
+        "state",
+        "primaryFailure",
+        "laterCancellation"
+      ]
+    },
+    "WorkflowCancelledState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "cancelled"
+        },
+        "reason": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ]
+    }
+  }
+}

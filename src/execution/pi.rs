@@ -12,6 +12,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_VERSION_OUTPUT_BYTES: usize = 128;
 const MAXIMUM_CAPABILITY_OUTPUT_BYTES: usize = 16 * 1024;
 pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.83.0 <0.84.0";
+pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.83.0";
 const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 83, 0);
 const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 84, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
@@ -134,7 +135,7 @@ impl ValidatedPiInstallation {
     pub(crate) fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: PiVersion::parse("0.83.0".to_owned()).unwrap(),
+            version: PiVersion::parse(PI_JSON_V1_QUALIFICATION_VERSION.to_owned()).unwrap(),
             profile: PiCompatibilityProfile::PiJsonV1,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
@@ -218,10 +219,28 @@ impl fmt::Display for PiInstallationFailure {
 
 impl std::error::Error for PiInstallationFailure {}
 
+pub(crate) fn discover_and_validate_pi_installation(
+    search_path: Option<&OsStr>,
+) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
+    let executable =
+        discover_executable(OsStr::new("pi"), search_path).ok_or(PiInstallationFailure::Missing)?;
+    validate_pi_installation(&executable)
+}
+
 pub(crate) fn validate_pi_installation(
     configured_executable: &Path,
 ) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
     validate_pi_installation_with(configured_executable, &SystemCommandRunner)
+}
+
+fn discover_executable(name: &OsStr, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(search_path?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 fn validate_pi_installation_with(

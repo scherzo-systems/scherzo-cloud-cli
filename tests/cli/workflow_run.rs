@@ -1,23 +1,29 @@
 #[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use nix::pty::{Winsize, openpty};
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
+use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
 use super::{CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES};
 
 const WORKFLOW_PATH: &str = "workflow.yaml";
 const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
+const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
 #[cfg(target_os = "linux")]
 fn wait_for_process_poll() {
@@ -57,6 +63,22 @@ impl RunBundle {
         self.result_parent.join(name)
     }
 
+    fn write_source(&self, path: &str, bytes: impl AsRef<[u8]>) {
+        let destination = self.source_root.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(destination, bytes).unwrap();
+    }
+
+    pub(super) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub(super) fn execution_root(&self) -> &Path {
+        &self.execution_root
+    }
+
     pub(super) fn args(&self, result: &Path) -> Vec<String> {
         vec![
             "workflow".to_owned(),
@@ -92,6 +114,89 @@ pub(super) fn isolated_command(args: &[String]) -> Command {
 
 pub(super) fn run(args: &[String]) -> Output {
     isolated_command(args).output().unwrap()
+}
+
+fn serve_fake_provider(
+    socket_path: &Path,
+    expected_requests: usize,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    let listener = UnixListener::bind(socket_path).unwrap();
+    std::thread::spawn(move || {
+        let mut observed = Vec::new();
+        for _ in 0..expected_requests {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut payload = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).unwrap()];
+            stream.read_exact(&mut payload).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            let response = fake_provider_response(&request);
+            let payload = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+                .unwrap();
+            stream.write_all(&payload).unwrap();
+            observed.push(request);
+        }
+        observed
+    })
+}
+
+fn fake_provider_response(request: &serde_json::Value) -> serde_json::Value {
+    match request["kind"].as_str() {
+        Some("before_agent_start") => serde_json::json!({"kind": "release"}),
+        Some("model") => {
+            let system = request["systemPrompt"].as_str().unwrap();
+            if system.contains("MODE_NONE") {
+                let has_tool_result = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "toolResult");
+                if has_tool_result {
+                    serde_json::json!({
+                        "kind": "text",
+                        "blocks": ["no requested value"],
+                        "stopReason": "stop"
+                    })
+                } else {
+                    serde_json::json!({
+                        "kind": "toolCalls",
+                        "calls": [{
+                            "id": "write-agent-file",
+                            "name": "fixture_write",
+                            "arguments": {}
+                        }]
+                    })
+                }
+            } else if system.contains("MODE_RESPONSE") {
+                serde_json::json!({
+                    "kind": "text",
+                    "blocks": ["agent ", "response"],
+                    "stopReason": "stop"
+                })
+            } else if system.contains("MODE_RESULT") {
+                let tool_name = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .find(|name| name.starts_with("scherzo_result_"))
+                    .unwrap();
+                serde_json::json!({
+                    "kind": "toolCalls",
+                    "calls": [{
+                        "id": "submit-result",
+                        "name": tool_name,
+                        "arguments": {"result": {"answer": 42, "source": "agent response"}}
+                    }]
+                })
+            } else {
+                panic!("unexpected model system prompt")
+            }
+        }
+        kind => panic!("unexpected fake-provider request: {kind:?}"),
+    }
 }
 
 fn attempt_result(path: &Path) -> PathBuf {
@@ -139,6 +244,558 @@ exports:
   result:
     ref: outputs.consume.result
 "#
+}
+
+fn response_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: pi
+      config:
+        model: fixture/model
+        thinking: off
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.answer.response
+"#
+}
+
+fn response_pi_execution() -> String {
+    let frames = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/execution/workflow/pi_json_v1/fixtures/response-success.jsonl"
+    ));
+    let remaining = frames
+        .lines()
+        .skip(1)
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "cwd=$(pwd); printf '{{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-4000-8000-000000000001\",\"timestamp\":\"2026-07-30T12:00:00Z\",\"cwd\":\"%s\"}}\\n' \"$cwd\"; printf '%s\\n' {remaining}"
+    )
+}
+
+#[test]
+fn command_only_run_and_help_remain_pi_independent() {
+    let help = run(&["workflow".to_owned(), "run".to_owned(), "--help".to_owned()]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(!help.contains("--pi"));
+    assert!(!help.contains("pi-executable"));
+
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf command-only\"]\n",
+    );
+    let empty_path = tempfile::tempdir().unwrap();
+    let destination = bundle.result("without-pi");
+    let output = isolated_command(&bundle.args(&destination))
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("command-only"));
+    assert!(attempt_result(&destination).join("result.json").is_file());
+}
+
+#[test]
+fn agent_installation_rejections_use_inherited_path_order_without_publication() {
+    let missing_bundle = RunBundle::new(response_agent_source());
+    missing_bundle.write_source("system.md", "system");
+    missing_bundle.write_source("message.md", "prompt");
+    let missing_path = tempfile::tempdir().unwrap();
+    let missing_destination = missing_bundle.result("missing");
+    let mut missing_args = missing_bundle.args(&missing_destination);
+    missing_args.insert(missing_args.len() - 1, "--json".to_owned());
+    let missing = isolated_command(&missing_args)
+        .env("PATH", missing_path.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stderr.is_empty());
+    let terminal: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "rejected");
+    assert_eq!(terminal["phase"], "installation");
+    assert_eq!(
+        terminal["diagnostics"][0]["code"],
+        "missing_pi_installation"
+    );
+    assert_eq!(
+        terminal["diagnostics"][0]["location"],
+        serde_json::json!({"kind": "agent_harness", "profile": "PiJsonV1"})
+    );
+    assert!(!missing_destination.exists());
+
+    let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
+    let fallback = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let ordered_path =
+        std::env::join_paths([incompatible.path_directory(), fallback.path_directory()]).unwrap();
+    let incompatible_bundle = RunBundle::new(response_agent_source());
+    incompatible_bundle.write_source("system.md", "system");
+    incompatible_bundle.write_source("message.md", "prompt");
+    let incompatible_destination = incompatible_bundle.result("incompatible");
+    let output = isolated_command(&incompatible_bundle.args(&incompatible_destination))
+        .env("PATH", ordered_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported_pi_version"));
+    assert_eq!(incompatible.recorded_probes(), b"--version\n");
+    assert!(fallback.recorded_probes().is_empty());
+    assert!(!incompatible_destination.exists());
+}
+
+#[test]
+fn compatible_path_pi_is_validated_once_pinned_and_executes_an_agent() {
+    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+    let bundle = RunBundle::new(response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("agent-response");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = isolated_command(&args)
+        .env("PATH", pi.path_directory())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probes = pi.recorded_probes();
+    let probes = String::from_utf8(probes).unwrap();
+    let lines = probes.lines().collect::<Vec<_>>();
+    assert_eq!(probes.matches("--mode json").count(), 1);
+    assert!(lines.len() >= 3);
+    assert_eq!(lines[0], "--version");
+    assert_eq!(
+        lines[1],
+        "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help"
+    );
+    assert!(lines[2].starts_with("--mode json --approve --no-session"));
+
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"]["steps"][0]["kind"], "agent");
+    assert_eq!(terminal["result"]["exports"]["response"]["kind"], "text");
+    assert_eq!(
+        terminal["result"]["exports"]["response"]["mediaType"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"hello world"
+    );
+    let live = String::from_utf8(output.stderr).unwrap();
+    assert!(live.contains("event       assistant · hello"));
+    assert!(live.contains("event       usage · input 1 · output 2"));
+}
+
+struct AgentBarrierFixture {
+    _directory: TempDir,
+    ready: fs::File,
+    release: fs::File,
+    hold: fs::File,
+    ready_path: PathBuf,
+    release_path: PathBuf,
+    hold_path: PathBuf,
+}
+
+impl AgentBarrierFixture {
+    fn new() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("scherzo-agent-barrier-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let ready_path = directory.path().join("ready");
+        let release_path = directory.path().join("release");
+        let hold_path = directory.path().join("hold");
+        for path in [&ready_path, &release_path, &hold_path] {
+            mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        }
+        let open_control = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+        };
+        Self {
+            ready: open_control(&ready_path),
+            release: open_control(&release_path),
+            hold: open_control(&hold_path),
+            ready_path,
+            release_path,
+            hold_path,
+            _directory: directory,
+        }
+    }
+
+    fn command(&self, args: &[String], pi: &PiFixture) -> Command {
+        let mut command = isolated_command(args);
+        command
+            .env("PATH", pi.path_directory())
+            .env("WORKFLOW_READY_FIFO", &self.ready_path)
+            .env("WORKFLOW_RELEASE_FIFO", &self.release_path)
+            .env("WORKFLOW_HOLD_FIFO", &self.hold_path);
+        command
+    }
+
+    fn wait_until_started(&mut self) {
+        let mut ready = [0_u8; 1];
+        self.ready.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+    }
+
+    fn release_observation(&mut self) {
+        self.release.write_all(b"go\n").unwrap();
+    }
+}
+
+fn barrier_pi_execution() -> &'static str {
+    r#"trap 'exit 130' INT TERM
+cwd=$(pwd)
+printf '{"type":"session","version":3,"id":"00000000-0000-4000-8000-000000000001","timestamp":"2026-07-30T12:00:00Z","cwd":"%s"}\n' "$cwd"
+printf '%s\n' '{"type":"agent_start"}'
+printf '\001' > "$WORKFLOW_READY_FIFO"
+IFS= read -r _ < "$WORKFLOW_RELEASE_FIFO"
+printf '%s\n' '{"type":"fixture_observation","payload":"typed"}'
+IFS= read -r _ < "$WORKFLOW_HOLD_FIFO""#
+}
+
+#[test]
+fn running_agent_process_group_is_durably_guarded() {
+    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, barrier_pi_execution());
+    let bundle = RunBundle::new(response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("agent-process-guard");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let mut barrier = AgentBarrierFixture::new();
+    let child = barrier
+        .command(&args, &pi)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    barrier.wait_until_started();
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    let guards = state["attempts"][0]["processGuards"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+
+    assert_eq!(guards.len(), 1, "a running Pi group must be recoverable");
+    assert_eq!(guards[0]["stepId"], "answer");
+    assert!(matches!(
+        guards[0]["state"].as_str(),
+        Some("prepared" | "released")
+    ));
+}
+
+#[test]
+fn agent_signal_and_output_failure_cancel_and_quiesce_the_pi_group() {
+    for (mode, expected_reason, expected_status) in [
+        ("signal", "user_request", 130),
+        ("output", "caller_output_failure", 1),
+    ] {
+        let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, barrier_pi_execution());
+        let bundle = RunBundle::new(response_agent_source());
+        bundle.write_source("system.md", "system");
+        bundle.write_source("message.md", "prompt");
+        let destination = bundle.result(mode);
+        let mut args = bundle.args(&destination);
+        args.insert(
+            args.len() - 1,
+            if mode == "signal" {
+                "--json"
+            } else {
+                "--plain"
+            }
+            .to_owned(),
+        );
+        let mut barrier = AgentBarrierFixture::new();
+        let mut child = barrier
+            .command(&args, &pi)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        barrier.wait_until_started();
+
+        if mode == "signal" {
+            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+            kill_process(pid, Signal::INT).unwrap();
+        } else {
+            drop(child.stdout.take());
+            barrier.release_observation();
+        }
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        let retained = result_json(&destination);
+        assert_eq!(retained["outcome"], "cancelled");
+        assert_eq!(retained["cancellation"]["reason"], expected_reason);
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["attempts"][0]["state"], "cancelled");
+        assert_eq!(
+            state["attempts"][0]["progress"]["outstandingActions"],
+            serde_json::json!([])
+        );
+        assert_eq!(state["attempts"][0]["result"]["status"], "published");
+        assert!(barrier.hold.metadata().unwrap().file_type().is_fifo());
+        if mode == "signal" {
+            let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(terminal["exitStatus"], 130);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("workflow run output failure")
+            );
+        }
+    }
+}
+
+fn mixed_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: pi
+      config:
+        model: scherzo-fake/conformance
+        thinking: xhigh
+steps:
+  seed:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf seed > seed.txt"]
+    outputs:
+      seed:
+        kind: file
+        path: seed.txt
+        mediaType: text/plain
+  noValue:
+    kind: agent
+    dependsOn: [seed]
+    agent:
+      profile: local
+      systemPrompt: none-system.md
+      message:
+        text:
+          - file: message.md
+        attachments:
+          - ref: outputs.seed.seed
+    outputs:
+      file:
+        kind: file
+        path: agent-file.txt
+        mediaType: text/plain
+  response:
+    kind: agent
+    dependsOn: [noValue]
+    agent:
+      profile: local
+      systemPrompt: response-system.md
+      message:
+        text:
+          - file: message.md
+        attachments:
+          - ref: outputs.noValue.file
+    outputs:
+      response:
+        kind: agent_response
+  result:
+    kind: agent
+    dependsOn: [response]
+    agent:
+      profile: local
+      systemPrompt: result-system.md
+      message:
+        text:
+          - ref: outputs.response.response
+    outputs:
+      result:
+        kind: agent_result
+        schema: result.schema.json
+exports:
+  file:
+    ref: outputs.noValue.file
+  response:
+    ref: outputs.response.response
+  result:
+    ref: outputs.result.result
+  seed:
+    ref: outputs.seed.seed
+"#
+}
+
+const FIXTURE_WRITE_EXTENSION: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { writeFile } from "node:fs/promises";
+import { Type } from "typebox";
+
+export default function fixtureWrite(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "fixture_write",
+    label: "Fixture write",
+    description: "Write the deterministic agent fixture file",
+    parameters: Type.Object({}),
+    async execute() {
+      await writeFile("agent-file.txt", "agent file\n", "utf8");
+      return { content: [{ type: "text" as const, text: "written" }], details: {} };
+    },
+  });
+}
+"#;
+
+#[test]
+fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
+    let Some(pinned_pi) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
+        return;
+    };
+    let bundle = RunBundle::new(mixed_agent_source());
+    for (path, text) in [
+        ("none-system.md", "MODE_NONE"),
+        ("response-system.md", "MODE_RESPONSE"),
+        ("result-system.md", "MODE_RESULT"),
+        ("message.md", "fixture message"),
+    ] {
+        bundle.write_source(path, text);
+    }
+    bundle.write_source(
+        "result.schema.json",
+        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["answer","source"],"properties":{"answer":{"const":42},"source":{"const":"agent response"}},"additionalProperties":false}"#,
+    );
+    bundle.write_source(
+        "../execution/.pi/extensions/fake-provider.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/execution/workflow/pi-json-v1-extension/src/conformance/fake-provider.ts"
+        )),
+    );
+    bundle.write_source(
+        "../execution/.pi/extensions/fixture-write.ts",
+        FIXTURE_WRITE_EXTENSION,
+    );
+
+    let isolated_path = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(pinned_pi, isolated_path.path().join("pi")).unwrap();
+    let developer = tempfile::Builder::new()
+        .prefix("scherzo-cli-agent-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let agent_directory = developer.path().join("agent");
+    let home = developer.path().join("home");
+    let config = developer.path().join("config");
+    let cache = developer.path().join("cache");
+    let data = developer.path().join("data");
+    let state = developer.path().join("state");
+    for directory in [&agent_directory, &home, &config, &cache, &data, &state] {
+        fs::create_dir(directory).unwrap();
+    }
+    let socket_path = developer.path().join("provider.sock");
+    let provider = serve_fake_provider(&socket_path, 7);
+    let destination = bundle.result("mixed-agent");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .args(args)
+        .env_clear()
+        .env("PATH", isolated_path.path())
+        .env("HOME", &home)
+        .env("PI_CODING_AGENT_DIR", &agent_directory)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_STATE_HOME", &state)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_TELEMETRY", "0")
+        .env("WORKFLOW_RUN_FIXTURE_SOCKET", &socket_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = provider.join().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["kind"] == "model")
+            .count(),
+        4
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"]["steps"][0]["kind"], "cmd");
+    for index in 1..=3 {
+        assert_eq!(terminal["result"]["steps"][index]["kind"], "agent");
+    }
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"agent file\n"
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0002")).unwrap(),
+        b"agent response"
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0003")).unwrap(),
+        br#"{"answer":42,"source":"agent response"}"#
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0004")).unwrap(),
+        b"seed"
+    );
+    assert_eq!(terminal["result"]["exports"]["file"]["kind"], "file");
+    assert_eq!(terminal["result"]["exports"]["response"]["kind"], "text");
+    assert_eq!(terminal["result"]["exports"]["result"]["kind"], "json");
+    assert_eq!(
+        terminal["result"]["exports"]["result"]["mediaType"],
+        "application/json"
+    );
+    let live = String::from_utf8(output.stderr).unwrap();
+    assert!(live.contains("event       tool_call · started"));
+    assert!(live.contains("event       assistant · agent "));
+    assert!(live.contains("event       tool_result"));
 }
 
 #[test]
@@ -293,7 +950,13 @@ fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch(
         let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(terminal["outcome"], "failed");
         assert_eq!(terminal["result"]["outcome"], "failed");
-        assert_eq!(terminal["result"]["primaryFailure"]["step"], "affected");
+        assert_eq!(
+            terminal["result"]["primaryFailure"]["step"],
+            "affected",
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(terminal["result"]["primaryFailure"]["phase"], "start");
         assert_eq!(
             terminal["result"]["primaryFailure"]["cause"]["code"],
@@ -563,7 +1226,8 @@ steps:
         - -c
         - |
           while ! grep -q '\"state\": \"running\"' "$RUN_STATE"; do sleep 0.01; done
-          printf partial > "$RUN_STATE"
+          printf partial > "$RUN_STATE.corrupt"
+          mv "$RUN_STATE.corrupt" "$RUN_STATE"
   forbidden:
     kind: cmd
     dependsOn: [corrupt]
@@ -602,7 +1266,8 @@ steps:
         - -c
         - |
           while [ "$(grep -c '\"state\": \"running\"' "$RUN_STATE")" -lt 3 ]; do sleep 0.01; done
-          printf partial > "$RUN_STATE"
+          printf partial > "$RUN_STATE.corrupt"
+          mv "$RUN_STATE.corrupt" "$RUN_STATE"
   survivor:
     kind: cmd
     command:
@@ -686,6 +1351,31 @@ fn run_directory_may_have_a_nonexistent_parent_suffix() {
 }
 
 #[test]
+fn tui_setup_failure_prevents_execution_and_releases_the_attempt() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  forbidden:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf started > \\\"$WORKFLOW_MARKER\\\"\"]\n",
+    );
+    let destination = bundle.result("tui-setup-failure");
+    let marker = bundle.execution_root().join("started");
+
+    let output = run_with_unusable_tui(&bundle.args(&destination), |command| {
+        command.env("WORKFLOW_MARKER", &marker);
+    });
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    assert_executor_fault_before_execution(&destination, 0);
+    assert!(!attempt_result(&destination).exists());
+    assert_attempt_resources_released(&destination);
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1);
+    assert!(stderr.contains("TerminalSetup"));
+    assert!(!stderr.contains("summary"));
+}
+
+#[test]
 fn presentation_setup_failure_settles_the_published_attempt() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  forbidden:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n",
@@ -714,6 +1404,303 @@ fn presentation_setup_failure_settles_the_published_attempt() {
         })
     );
     assert!(!attempt_result(&destination).exists());
+}
+
+#[test]
+fn real_pty_boundary_restores_input_mode_before_the_standard_summary_handoff() {
+    let (finished, completion) = std::sync::mpsc::channel();
+    let progress = std::sync::Arc::new(std::sync::Mutex::new("starting"));
+    let worker_progress = std::sync::Arc::clone(&progress);
+    let worker = std::thread::spawn(move || {
+        let _ = finished.send(run_real_pty_boundary_smoke(&worker_progress));
+    });
+
+    // Success is driven only by the readiness strings and process exit below. This
+    // watchdog bounds failure reporting if the real OS terminal boundary stops making
+    // progress; it is not a success condition or an interaction delay.
+    let result = match completion.recv_timeout(std::time::Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(error) => {
+            let progress = *progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::panic::panic_any(format!(
+                "PTY workflow boundary watchdog expired at {progress}: {error}"
+            ));
+        }
+    };
+    result.expect("PTY workflow boundary failed");
+    worker
+        .join()
+        .expect("PTY workflow boundary worker panicked");
+}
+
+fn run_real_pty_boundary_smoke(
+    progress: &std::sync::Mutex<&'static str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  handshake:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf ready > \\\"$READY_FIFO\\\"; IFS= read -r release < \\\"$RELEASE_FIFO\\\"; test \\\"$release\\\" = release\"]\n",
+    );
+    let destination = bundle.result("pty-boundary");
+    let ready_fifo = bundle._temporary.path().join("ready.fifo");
+    let release_fifo = bundle._temporary.path().join("release.fifo");
+    let fifo_mode = Mode::S_IRUSR | Mode::S_IWUSR;
+    mkfifo(&ready_fifo, fifo_mode)?;
+    mkfifo(&release_fifo, fifo_mode)?;
+    let handshake_directory = tempfile::tempdir_in("/tmp")?;
+    let handshake_path = handshake_directory.path().join("tui.socket");
+    let handshake_listener = UnixListener::bind(&handshake_path)?;
+
+    let size = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&size), None::<&nix::sys::termios::Termios>)?;
+    let original_mode = rustix::termios::tcgetattr(&pty.slave)?;
+    let child_input = rustix::io::dup(&pty.slave)?;
+    let child_output = rustix::io::dup(&pty.slave)?;
+    let master_reader = rustix::io::dup(&pty.master)?;
+    let mut master_writer = File::from(pty.master);
+    let mut master_reader = File::from(master_reader);
+
+    let mut child = isolated_command(&bundle.args(&destination))
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1")
+        .env("READY_FIFO", &ready_fifo)
+        .env("RELEASE_FIFO", &release_fifo)
+        .env(TUI_HANDSHAKE_VARIABLE, &handshake_path)
+        .stdin(Stdio::from(child_input))
+        .stdout(Stdio::from(child_output))
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "terminal handshake connection";
+    let (handshake, _) = handshake_listener.accept()?;
+    let mut handshake = BufReader::new(handshake);
+
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "command readiness";
+    let mut ready = OpenOptions::new().read(true).open(&ready_fifo)?;
+    let mut ready_bytes = [0_u8; 5];
+    ready.read_exact(&mut ready_bytes)?;
+    if ready_bytes != *b"ready" {
+        return Err("workflow command emitted an invalid readiness handshake".into());
+    }
+
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "active q acknowledgement";
+    let mut terminal_output = Vec::new();
+    master_writer.write_all(b"q?")?;
+    master_writer.flush()?;
+    read_terminal_handshake(&mut handshake, "help-open")?;
+
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "command release";
+    let mut release = OpenOptions::new().write(true).open(&release_fifo)?;
+    release.write_all(b"release\n")?;
+    release.flush()?;
+    drop(release);
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "quit readiness";
+    read_terminal_handshake(&mut handshake, "quit-eligible")?;
+
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "process exit";
+    master_writer.write_all(b"q")?;
+    master_writer.flush()?;
+    let status = child.wait()?;
+    let restored_mode = rustix::termios::tcgetattr(&pty.slave)?;
+    assert_eq!(restored_mode.input_modes, original_mode.input_modes);
+    assert_eq!(restored_mode.output_modes, original_mode.output_modes);
+    assert_eq!(restored_mode.control_modes, original_mode.control_modes);
+    assert_eq!(restored_mode.local_modes, original_mode.local_modes);
+    assert_eq!(
+        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN],
+        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN]
+    );
+    assert_eq!(
+        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME],
+        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
+    );
+    drop(pty.slave);
+    read_pty_to_end(&mut master_reader, &mut terminal_output)?;
+
+    let mut stderr = String::new();
+    if let Some(mut child_stderr) = child.stderr.take() {
+        child_stderr.read_to_string(&mut stderr)?;
+    }
+    if !status.success() {
+        return Err(format!("PTY workflow exited with {status}: {stderr}").into());
+    }
+    let rendered = String::from_utf8_lossy(&terminal_output);
+    assert!(rendered.contains("summary"));
+    assert!(rendered.contains("succeeded · exit 0"));
+    assert!(stderr.is_empty(), "unexpected PTY stderr: {stderr}");
+    Ok(())
+}
+
+pub(super) fn run_with_unusable_tui(
+    args: &[String],
+    configure: impl FnOnce(&mut Command),
+) -> Output {
+    let size = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&size), None::<&nix::sys::termios::Termios>).unwrap();
+    let original_mode = rustix::termios::tcgetattr(&pty.slave).unwrap();
+    let child_input = rustix::io::dup(&pty.slave).unwrap();
+    let child_output = rustix::io::dup(&pty.slave).unwrap();
+    let mut master_reader = File::from(pty.master);
+    let handshake_directory = tempfile::tempdir().unwrap();
+    let unavailable_handshake = handshake_directory.path().join("missing.socket");
+    let mut command = isolated_command(args);
+    configure(&mut command);
+    let mut child = command
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1")
+        .env(TUI_HANDSHAKE_VARIABLE, unavailable_handshake)
+        .stdin(Stdio::from(child_input))
+        .stdout(Stdio::from(child_output))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let status = child.wait().unwrap();
+    let restored_mode = rustix::termios::tcgetattr(&pty.slave).unwrap();
+    assert_eq!(restored_mode.input_modes, original_mode.input_modes);
+    assert_eq!(restored_mode.output_modes, original_mode.output_modes);
+    assert_eq!(restored_mode.control_modes, original_mode.control_modes);
+    assert_eq!(restored_mode.local_modes, original_mode.local_modes);
+    assert_eq!(
+        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN],
+        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN]
+    );
+    assert_eq!(
+        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME],
+        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
+    );
+    drop(pty.slave);
+
+    let flags = fcntl_getfl(&master_reader).unwrap();
+    fcntl_setfl(&master_reader, flags | OFlags::NONBLOCK).unwrap();
+    let mut stdout = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match master_reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => stdout.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read failed TUI output: {error}"),
+        }
+    }
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+pub(super) fn assert_attempt_resources_released(run_directory: &Path) {
+    assert!(
+        fs::read_dir(run_directory.join(".private"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_directory.join("run.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    fs4::FileExt::unlock(&lock).unwrap();
+}
+
+pub(super) fn assert_executor_fault_before_execution(run_directory: &Path, attempt_index: usize) {
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_directory.join("state.json")).unwrap()).unwrap();
+    let attempt = &state["attempts"][attempt_index];
+    assert_eq!(attempt["state"], "interrupted");
+    assert!(attempt.get("startedAt").is_none());
+    assert!(attempt.get("cancellation").is_none());
+    assert_eq!(
+        attempt["interruption"],
+        serde_json::json!({
+            "cause": "executor_fault",
+            "executionMayHaveStarted": false,
+            "cancellationRequested": false
+        })
+    );
+    assert!(
+        attempt["progress"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["state"] == "pending")
+    );
+    assert_eq!(
+        attempt["result"],
+        serde_json::json!({
+            "status": "not_published",
+            "reason": "interrupted"
+        })
+    );
+}
+
+fn read_terminal_handshake(
+    handshake: &mut BufReader<UnixStream>,
+    expected: &str,
+) -> std::io::Result<()> {
+    let mut event = String::new();
+    if handshake.read_line(&mut event)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "terminal lifecycle handshake closed",
+        ));
+    }
+    if event.trim_end() != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected terminal lifecycle event {expected}, received {event:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_pty_to_end(reader: &mut File, output: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[test]

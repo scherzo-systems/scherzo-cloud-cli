@@ -17,11 +17,14 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use time::OffsetDateTime;
 use tokio::io::unix::AsyncFd;
 
+use crate::execution::pi::{PiInstallationFailure, discover_and_validate_pi_installation};
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
-    ResolvedAttachment, ResolvedImports, admit_workflow,
+    AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
+    EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, ResolvedAttachment,
+    ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
+use crate::execution::workflow::agent::WorkflowRunId;
+use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStagingFailure};
 use crate::execution::workflow::artifact::ArtifactStaging;
 use crate::execution::workflow::coordinator::CoordinationError;
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -29,9 +32,10 @@ use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{WorkflowExecutionResult, execute_workflow};
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::local_run::{
-    DurableDeadline, InitialLocalRun, PublicationFailurePhaseV1,
+    DurableDeadline, InitialLocalRun, LocalAttemptOwner, PublicationFailurePhaseV1,
 };
 use crate::execution::workflow::observation::{ExecutionObservation, ExecutionObserver};
+use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
 use crate::execution::workflow::presentation::{
     ColorChoice, PresentationConfig, PresentationFailure, PresentationFailureOperation,
     PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
@@ -41,8 +45,8 @@ use crate::execution::workflow::presentation::{
 use crate::execution::workflow::presentation_feed::DisplayDeadline;
 use crate::execution::workflow::publication::{
     LocalPublicationError, LocalPublicationPhase, WorkflowRunCancellation, WorkflowRunResult,
-    WorkflowRunStep, WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowStepTiming,
-    prepare_attempt_result_destination, publish_prepared_workflow_result,
+    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
+    WorkflowStepTiming, prepare_attempt_result_destination, publish_prepared_workflow_result,
 };
 use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve};
 use crate::execution::workflow::run_timing::{
@@ -55,34 +59,35 @@ use crate::execution::workflow::runtime::RunOutcome;
 use crate::execution::workflow::step_runtime::AgentExecution;
 use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
 
-pub(super) const ABOUT: &str = "Execute a local command-only Workflow V1 bundle";
+pub(super) const ABOUT: &str = "Execute a local Workflow V1 command and agent DAG";
+pub(super) const AFTER_HELP: &str = "Interactive mode:
+  Automatic mode uses the terminal interface only when stdin and stdout are terminals,
+  TERM is usable, and stdin is not reserved by --prompt-file -. Resize keeps the
+  interface active; undersized terminals show a resize notice without changing modes.
+  Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
+  Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
+  After q, Scherzo restores the terminal and prints the standard plain summary.";
 
 const MAXIMUM_PARALLEL_STEPS: usize = 256;
 const MAXIMUM_PROMPT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_CAPTURED_FILES: usize = 1024;
-const MAXIMUM_CAPTURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_TOTAL_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_INPUT_VALUES: usize = 1024;
-const MAXIMUM_INPUT_VALUE_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_TOTAL_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_LIVE_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_STEP_LOG_BYTES: u64 = 64 * 1024;
 const CANCELLATION_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecutionLeaf {
+    Run,
+    Retry,
+}
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
     source: super::LocalWorkflowSource,
 
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Existing caller-owned workflow execution directory"
-    )]
-    execution_root: PathBuf,
+    #[command(flatten)]
+    execution: super::LocalExecutionRoot,
 
     #[arg(
         long,
@@ -112,7 +117,7 @@ pub(super) struct Command {
         value_name = "COUNT",
         default_value_t = 1,
         value_parser = parse_parallelism,
-        help = "Maximum simultaneous command steps"
+        help = "Maximum simultaneous workflow steps"
     )]
     max_parallel: usize,
 
@@ -122,18 +127,7 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                write_diagnostic(format_args!("start local workflow runtime: {error}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        runtime.block_on(self.execute_async())
+        execute_with_runtime("start local workflow runtime", self.execute_async())
     }
 
     async fn execute_async(self) -> ExitCode {
@@ -163,8 +157,20 @@ impl Command {
                 });
             }
         };
-        let context =
-            execution_context(self.execution_root, self.max_parallel, cancellation.clone());
+        let context = match execution_context_for_workflow(
+            &workflow,
+            self.execution.execution_root,
+            self.max_parallel,
+            cancellation.clone(),
+        ) {
+            Ok(context) => context,
+            Err(failure) => {
+                signal_task.abort();
+                return rejection_output(presentation_config, |output| {
+                    output.render_pi_installation_rejection(&workflow, &failure)
+                });
+            }
+        };
         let admitted = match admit_workflow(workflow.clone(), imports, context) {
             Ok(admitted) => admitted,
             Err(failure) => {
@@ -188,205 +194,14 @@ impl Command {
                 return diagnose(error);
             }
         };
-        let run_directory = match owned_run.run_directory().to_str() {
-            Some(path) => path,
-            None => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run);
-                return diagnose(LocalRunError::UnrepresentablePath);
-            }
-        };
-        let destination = match prepare_attempt_result_destination(
-            owned_run.result_directory(),
-            owned_run.private_directory(),
-        ) {
-            Ok(destination) => destination,
-            Err(error) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run);
-                return diagnose(error);
-            }
-        };
-        let private_staging = match create_private_staging(owned_run.private_directory()) {
-            Ok(staging) => staging,
-            Err(error) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run);
-                return diagnose(error);
-            }
-        };
-        let artifacts = match ArtifactStaging::create(admitted.execution(), private_staging.path())
-        {
-            Ok(artifacts) => artifacts,
-            Err(error) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run);
-                return diagnose(error);
-            }
-        };
-        let inputs = match InputStaging::create(admitted.execution(), private_staging.path()) {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run);
-                let cleanup_failed = artifacts.release().is_err();
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                return diagnose(error);
-            }
-        };
-
-        let run_clock = SystemObservationClock;
-        let started = run_clock.sample();
-        let timing_observation = RunTimingObservation::new(started);
-        let (observer, mut host) = match presentation_config.mode() {
-            PresentationMode::Tui => {
-                let view = WorkflowRunViewModel::new(
-                    &workflow,
-                    admitted.execution().limits().maximum_parallel_steps().get(),
-                    timing_observation,
-                    run_clock,
-                    StepLogCapacity::default(),
-                );
-                let terminal = WorkflowTerminalHost::start(
-                    view.clone(),
-                    cancellation.clone(),
-                    presentation_config.color_enabled(),
-                );
-                let (terminal, failure) = match terminal {
-                    Ok(terminal) => (Some(terminal), None),
-                    Err(failure) => (None, Some(failure)),
-                };
-                (
-                    RunExecutionObserver::Tui(view.clone()),
-                    ActiveRunHost::Tui {
-                        view,
-                        terminal,
-                        failure,
-                        config: presentation_config,
-                    },
-                )
-            }
-            PresentationMode::Plain | PresentationMode::Json => {
-                let output =
-                    WorkflowRunOutput::new(presentation_config, io::stdout(), io::stderr());
-                let presentation = match output.start_for_result(
-                    &workflow,
-                    run_directory,
-                    admitted.execution().limits().maximum_parallel_steps().get(),
-                    SystemObservationClock,
-                ) {
-                    Ok(presentation) => presentation,
-                    Err(error) => {
-                        signal_task.abort();
-                        settle_before_execution_failure(&owned_run);
-                        let cleanup_failed =
-                            inputs.release().is_err() | artifacts.release().is_err();
-                        record_private_cleanup_failure(&owned_run, cleanup_failed);
-                        return diagnose(error);
-                    }
-                };
-                let timing = TimingObserver::new(
-                    presentation.clone(),
-                    cancellation.clone(),
-                    timing_observation,
-                    run_clock,
-                );
-                (
-                    RunExecutionObserver::Standard(timing),
-                    ActiveRunHost::Standard(presentation),
-                )
-            }
-        };
-
-        let diagnostics = StepDiagnosticLog::default();
-        let execution = execute_workflow(
-            admitted.clone(),
-            &artifacts,
-            &inputs,
-            &diagnostics,
-            AgentExecution::disabled(),
-            SystemExecutionClock,
-            owned_run.commit_port(),
-            observer.clone(),
-            owned_run.process_guard_registry(),
-        )
-        .await;
-        signal_task.abort();
-
-        let execution = match execution {
-            Ok(execution) => execution,
-            Err(error) => {
-                if error == CoordinationError::CommitFailed {
-                    let _ = owned_run.record_state_persistence_failure();
-                }
-                let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                host.stop_terminal().await;
-                return diagnose(LocalRunError::Coordination(error));
-            }
-        };
-        let observed_timing = observer.snapshot();
-        let run_timing = match observed_run_timing(&observed_timing) {
-            Some(timing) => timing,
-            None => {
-                let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                host.stop_terminal().await;
-                return diagnose(LocalRunError::InvalidTerminalResult);
-            }
-        };
-        let run = match build_run_result(
-            &workflow,
-            &admitted,
-            &diagnostics,
-            execution,
-            observed_timing,
-            run_timing,
-            &owned_run,
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                host.stop_terminal().await;
-                return diagnose(error);
-            }
-        };
-        if let Err(error) = host.reconcile_and_mark_quiescent(&run) {
-            let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose(error);
-        }
-
-        host.begin_publication();
-        let publication = publish_prepared_workflow_result(&destination, &artifacts, &run);
-        let state_publication = match &publication {
-            Ok(_) => owned_run.record_result_published(),
-            Err(error) => {
-                owned_run.record_result_publication_failed(publication_failure_phase(error.phase()))
-            }
-        };
-        host.complete_publication(&publication);
-        host.begin_cleanup();
-        let input_release = inputs.release();
-        let artifact_release = artifacts.release();
-        let cleanup_failed = input_release.is_err() || artifact_release.is_err();
-        let cleanup_state = if cleanup_failed {
-            owned_run.record_private_cleanup_failure()
-        } else {
-            Ok(())
-        };
-        host.complete_cleanup(cleanup_failed);
-        let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
-
-        drop(owned_run);
-        host.finish(
-            &workflow,
-            &run,
-            &publication,
-            cleanup_failed,
-            state_commit_failed,
+        execute_owned_attempt(
+            workflow,
+            admitted,
+            owned_run,
+            cancellation,
+            signal_task,
+            presentation_config,
+            ExecutionLeaf::Run,
         )
         .await
     }
@@ -396,22 +211,378 @@ impl Command {
     }
 
     fn presentation_config_with(&self, capabilities: TerminalCapabilities) -> PresentationConfig {
-        PresentationConfig {
-            requested_mode: if self.presentation.json {
-                RequestedPresentationMode::Json
-            } else if self.presentation.plain {
-                RequestedPresentationMode::Plain
-            } else {
-                RequestedPresentationMode::Automatic
-            },
-            color: match self.presentation.color {
-                super::ColorArgument::Auto => ColorChoice::Auto,
-                super::ColorArgument::Always => ColorChoice::Always,
-                super::ColorArgument::Never => ColorChoice::Never,
-            },
+        presentation_config_with(
+            &self.presentation,
+            self.prompt_file.as_deref() == Some(Path::new("-")),
             capabilities,
-            standard_input_reserved: self.prompt_file.as_deref() == Some(Path::new("-")),
+        )
+    }
+}
+
+pub(super) fn execute_with_runtime(
+    failure_context: &str,
+    execution: impl Future<Output = ExitCode>,
+) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return diagnose(format_args!("{failure_context}: {error}")),
+    };
+    runtime.block_on(execution)
+}
+
+pub(super) fn presentation_config(presentation: &super::PresentationOptions) -> PresentationConfig {
+    presentation_config_with(presentation, false, TerminalCapabilities::detect())
+}
+
+fn presentation_config_with(
+    presentation: &super::PresentationOptions,
+    standard_input_reserved: bool,
+    capabilities: TerminalCapabilities,
+) -> PresentationConfig {
+    PresentationConfig {
+        requested_mode: if presentation.json {
+            RequestedPresentationMode::Json
+        } else if presentation.plain {
+            RequestedPresentationMode::Plain
+        } else {
+            RequestedPresentationMode::Automatic
+        },
+        color: match presentation.color {
+            super::ColorArgument::Auto => ColorChoice::Auto,
+            super::ColorArgument::Always => ColorChoice::Always,
+            super::ColorArgument::Never => ColorChoice::Never,
+        },
+        capabilities,
+        standard_input_reserved,
+    }
+}
+
+struct PreparedExecutionPresentation<Observer, Host> {
+    observer: Observer,
+    host: Host,
+    timing: RunTimingObservation,
+}
+
+fn initialize_execution_presentation<Observer, Host, Clock>(
+    clock: Clock,
+    initialize: impl FnOnce() -> Result<
+        PreparedExecutionPresentation<Observer, Host>,
+        PresentationFailure,
+    >,
+) -> Result<PreparedExecutionPresentation<Observer, Host>, PresentationFailure>
+where
+    Clock: ObservationClock,
+{
+    let prepared = initialize()?;
+    prepared.timing.mark_execution_started(clock.sample());
+    Ok(prepared)
+}
+
+pub(super) async fn execute_owned_attempt(
+    workflow: ResolvedWorkflow,
+    admitted: AdmittedWorkflow,
+    owned_run: LocalAttemptOwner,
+    cancellation: CancellationSource,
+    signal_task: tokio::task::JoinHandle<()>,
+    presentation_config: PresentationConfig,
+    leaf: ExecutionLeaf,
+) -> ExitCode {
+    let run_directory = match owned_run.run_directory().to_str() {
+        Some(path) => path.to_owned(),
+        None => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            return diagnose(LocalRunError::UnrepresentablePath);
         }
+    };
+    let destination = match prepare_attempt_result_destination(
+        owned_run.result_directory(),
+        owned_run.private_directory(),
+        owned_run.attempt_directory_handle(),
+        owned_run.private_directory_handle(),
+    ) {
+        Ok(destination) => destination,
+        Err(error) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            return diagnose(error);
+        }
+    };
+    let private_staging = match owned_run.create_private_staging() {
+        Ok(staging) => staging,
+        Err(_) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            return diagnose(LocalRunError::PrivateStaging);
+        }
+    };
+    let artifacts = match ArtifactStaging::create_bound(
+        admitted.execution(),
+        private_staging.path(),
+        private_staging.root_handle(),
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            return diagnose(error);
+        }
+    };
+    let inputs = match InputStaging::create_bound(
+        admitted.execution(),
+        private_staging.path(),
+        private_staging.root_handle(),
+    ) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            let cleanup_failed = artifacts.release().is_err();
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            return diagnose(error);
+        }
+    };
+    let agent_staging = if admitted.agent_steps().is_empty() {
+        None
+    } else {
+        match AgentInputStaging::create(admitted.execution(), private_staging.path()) {
+            Ok(staging) => Some(staging),
+            Err(error) => {
+                signal_task.abort();
+                settle_before_execution_failure(&owned_run);
+                let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
+                record_private_cleanup_failure(&owned_run, cleanup_failed);
+                return diagnose(LocalRunError::AgentInputStaging(error));
+            }
+        }
+    };
+
+    let run_clock = SystemObservationClock;
+    let prepared =
+        initialize_execution_presentation(run_clock, || match presentation_config.mode() {
+            PresentationMode::Tui => {
+                let presentation_opened = run_clock.sample();
+                let timing_observation = RunTimingObservation::new(presentation_opened);
+                let view = WorkflowRunViewModel::new(
+                    &workflow,
+                    admitted.execution().limits().maximum_parallel_steps().get(),
+                    timing_observation.clone(),
+                    run_clock,
+                    StepLogCapacity::default(),
+                );
+                let terminal = WorkflowTerminalHost::start(
+                    view.clone(),
+                    cancellation.clone(),
+                    presentation_config.color_enabled(),
+                )?;
+                Ok(PreparedExecutionPresentation {
+                    observer: RunExecutionObserver::Tui(view.clone()),
+                    host: ActiveRunHost::Tui {
+                        view,
+                        terminal: Some(terminal),
+                        failure: None,
+                        config: Box::new(presentation_config),
+                        leaf,
+                    },
+                    timing: timing_observation,
+                })
+            }
+            PresentationMode::Plain | PresentationMode::Json => {
+                let output = execution_output(presentation_config, &owned_run, leaf);
+                let presentation = output.start_for_result(
+                    &workflow,
+                    &run_directory,
+                    admitted.execution().limits().maximum_parallel_steps().get(),
+                    run_clock,
+                )?;
+                let timing_observation = RunTimingObservation::new(presentation.opened_at());
+                let timing = TimingObserver::new(
+                    presentation.clone(),
+                    cancellation.clone(),
+                    timing_observation.clone(),
+                    run_clock,
+                );
+                Ok(PreparedExecutionPresentation {
+                    observer: RunExecutionObserver::Standard(timing),
+                    host: ActiveRunHost::Standard(presentation),
+                    timing: timing_observation,
+                })
+            }
+        });
+    let PreparedExecutionPresentation {
+        observer, mut host, ..
+    } = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run);
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            return diagnose(failure);
+        }
+    };
+
+    if let Err(failure) = host.activate_execution() {
+        signal_task.abort();
+        settle_before_execution_failure(&owned_run);
+        let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+        record_private_cleanup_failure(&owned_run, cleanup_failed);
+        host.stop_terminal().await;
+        return diagnose(failure);
+    }
+
+    let diagnostics = StepDiagnosticLog::default();
+    let agents = match &agent_staging {
+        Some(staging) => {
+            let adapter = match PiJsonV1Adapter::new(
+                diagnostics.clone(),
+                admitted.execution().limits().maximum_step_log_bytes(),
+                SystemExecutionClock,
+                observer.clone(),
+            ) {
+                Ok(adapter) => adapter,
+                Err(_) => {
+                    signal_task.abort();
+                    settle_before_execution_failure(&owned_run);
+                    let cleanup_failed =
+                        release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                    record_private_cleanup_failure(&owned_run, cleanup_failed);
+                    host.stop_terminal().await;
+                    return diagnose(LocalRunError::AgentRuntime);
+                }
+            };
+            AgentExecution::enabled(
+                WorkflowRunId::from(Arc::from(run_directory.as_str())),
+                staging.clone(),
+                adapter,
+            )
+        }
+        None => AgentExecution::Disabled,
+    };
+    let execution = execute_workflow(
+        admitted.clone(),
+        &artifacts,
+        &inputs,
+        &diagnostics,
+        agents,
+        SystemExecutionClock,
+        owned_run.commit_port(),
+        observer.clone(),
+        owned_run.process_guard_registry(),
+    )
+    .await;
+    signal_task.abort();
+
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            if error == CoordinationError::CommitFailed {
+                let _ = owned_run.record_state_persistence_failure();
+            }
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose(LocalRunError::Coordination(error));
+        }
+    };
+    let observed_timing = observer.snapshot();
+    let run_timing = match observed_run_timing(&observed_timing) {
+        Some(timing) => timing,
+        None => {
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose(LocalRunError::InvalidTerminalResult);
+        }
+    };
+    let run = match build_run_result(
+        &workflow,
+        &admitted,
+        &diagnostics,
+        execution,
+        observed_timing,
+        run_timing,
+        &owned_run,
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose(error);
+        }
+    };
+    if let Err(error) = host.reconcile_and_mark_quiescent(&run) {
+        let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+        record_private_cleanup_failure(&owned_run, cleanup_failed);
+        host.stop_terminal().await;
+        return diagnose(error);
+    }
+
+    host.begin_publication();
+    let mut publication = publish_prepared_workflow_result(&destination, &artifacts, &run);
+    if leaf == ExecutionLeaf::Retry
+        && let Ok(terminal) = &mut publication
+    {
+        terminal.mark_retry();
+    }
+    let state_publication = match &publication {
+        Ok(_) => owned_run.record_result_published(),
+        Err(error) => {
+            owned_run.record_result_publication_failed(publication_failure_phase(error.phase()))
+        }
+    };
+    host.complete_publication(&publication);
+    host.begin_cleanup();
+    let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+    let cleanup_state = if cleanup_failed {
+        owned_run.record_private_cleanup_failure()
+    } else {
+        Ok(())
+    };
+    host.complete_cleanup(cleanup_failed);
+    let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
+
+    drop(owned_run);
+    host.mark_execution_ownership_released();
+    host.finish(
+        &workflow,
+        &run,
+        &publication,
+        cleanup_failed,
+        state_commit_failed,
+    )
+    .await
+}
+
+fn release_execution_staging(
+    inputs: &InputStaging,
+    agents: Option<&AgentInputStaging>,
+    artifacts: &ArtifactStaging,
+) -> bool {
+    let input_failed = inputs.release().is_err();
+    let agent_failed = agents.is_some_and(|staging| staging.release().is_err());
+    let artifact_failed = artifacts.release().is_err();
+    input_failed || agent_failed || artifact_failed
+}
+
+fn execution_output(
+    config: PresentationConfig,
+    owned_run: &LocalAttemptOwner,
+    leaf: ExecutionLeaf,
+) -> WorkflowRunOutput<io::Stdout, io::Stderr> {
+    let output = WorkflowRunOutput::new(config, io::stdout(), io::stderr());
+    match leaf {
+        ExecutionLeaf::Run => output,
+        ExecutionLeaf::Retry => output.for_retry(owned_run.run_directory()),
     }
 }
 
@@ -419,7 +590,14 @@ fn rejection_output(
     config: PresentationConfig,
     render: impl FnOnce(WorkflowRunOutput<io::Stdout, io::Stderr>) -> WorkflowRunPresentationResult,
 ) -> ExitCode {
-    let result = render(WorkflowRunOutput::new(config, io::stdout(), io::stderr()));
+    rejection_exit(render(WorkflowRunOutput::new(
+        config,
+        io::stdout(),
+        io::stderr(),
+    )))
+}
+
+pub(super) fn rejection_exit(result: WorkflowRunPresentationResult) -> ExitCode {
     match result {
         WorkflowRunPresentationResult::Rejected
         | WorkflowRunPresentationResult::Failed(_)
@@ -447,32 +625,33 @@ fn parse_parallelism(value: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("value must be between 1 and {MAXIMUM_PARALLEL_STEPS}"))
 }
 
-fn execution_context(
+pub(super) fn execution_context_for_workflow(
+    workflow: &ResolvedWorkflow,
     root: PathBuf,
     maximum_parallel_steps: usize,
     cancellation: CancellationSource,
-) -> ExecutionContext {
-    ExecutionContext::new(
+) -> Result<ExecutionContext, PiInstallationFailure> {
+    let environment = EnvironmentSnapshot::new(env::vars_os());
+    let context = ExecutionContext::new(
         root,
         ExecutionRootLifecycle::CallerOwnedRetained,
-        ExecutionPolicyLimits::new(
-            maximum_parallel_steps,
-            CaptureLimits::new(
-                MAXIMUM_CAPTURED_FILES,
-                MAXIMUM_CAPTURED_FILE_BYTES,
-                MAXIMUM_TOTAL_CAPTURED_BYTES,
-            ),
-            InputLimits::new(
-                MAXIMUM_INPUT_VALUES,
-                MAXIMUM_INPUT_VALUE_BYTES,
-                MAXIMUM_TOTAL_INPUT_BYTES,
-                MAXIMUM_LIVE_INPUT_BYTES,
-            ),
-            MAXIMUM_STEP_LOG_BYTES,
-        ),
-        EnvironmentSnapshot::new(env::vars_os()),
+        default_execution_policy_limits(maximum_parallel_steps),
+        environment.clone(),
         CancellationPolicy::new(cancellation, CANCELLATION_GRACE),
-    )
+    );
+    if workflow.definition.steps.values().any(|step| {
+        matches!(
+            step,
+            crate::execution::workflow::validated::ValidatedStep::Agent(_)
+        )
+    }) {
+        let installation = discover_and_validate_pi_installation(
+            environment.variable(std::ffi::OsStr::new("PATH")),
+        )?;
+        Ok(context.with_pi_installation(installation))
+    } else {
+        Ok(context)
+    }
 }
 
 async fn acquire_imports(
@@ -667,14 +846,7 @@ async fn read_stdin_bounded(
     result
 }
 
-fn create_private_staging(private_directory: &Path) -> Result<tempfile::TempDir, LocalRunError> {
-    tempfile::Builder::new()
-        .prefix("workflow-")
-        .tempdir_in(private_directory)
-        .map_err(|_| LocalRunError::PrivateStaging)
-}
-
-fn start_signal_observation(
+pub(super) fn start_signal_observation(
     cancellation: CancellationSource,
 ) -> Result<tokio::task::JoinHandle<()>, LocalRunError> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -795,11 +967,26 @@ enum ActiveRunHost {
         view: WorkflowRunViewModel<SystemObservationClock>,
         terminal: Option<WorkflowTerminalHost>,
         failure: Option<PresentationFailure>,
-        config: PresentationConfig,
+        config: Box<PresentationConfig>,
+        leaf: ExecutionLeaf,
     },
 }
 
 impl ActiveRunHost {
+    fn activate_execution(&mut self) -> Result<(), PresentationFailure> {
+        match self {
+            Self::Standard(_) => Ok(()),
+            Self::Tui { terminal, .. } => terminal.as_mut().map_or_else(
+                || {
+                    Err(PresentationFailure::operation(
+                        PresentationFailureOperation::TerminalTask,
+                    ))
+                },
+                WorkflowTerminalHost::activate_execution,
+            ),
+        }
+    }
+
     async fn stop_terminal(&mut self) {
         if let Self::Tui {
             terminal, failure, ..
@@ -860,6 +1047,12 @@ impl ActiveRunHost {
         }
     }
 
+    fn mark_execution_ownership_released(&self) {
+        if let Self::Tui { view, .. } = self {
+            view.mark_execution_ownership_released();
+        }
+    }
+
     async fn finish(
         &mut self,
         workflow: &ResolvedWorkflow,
@@ -891,6 +1084,7 @@ impl ActiveRunHost {
                 terminal,
                 failure,
                 config,
+                leaf,
                 ..
             } => {
                 if let Some(active) = terminal.take() {
@@ -929,7 +1123,12 @@ impl ActiveRunHost {
                     return ExitCode::FAILURE;
                 }
 
-                let output = WorkflowRunOutput::new(config.clone(), io::stdout(), io::stderr());
+                let output =
+                    WorkflowRunOutput::new(config.as_ref().clone(), io::stdout(), io::stderr());
+                let output = match *leaf {
+                    ExecutionLeaf::Run => output,
+                    ExecutionLeaf::Retry => output.for_retry(&run.run_directory),
+                };
                 let presented = match publication {
                     Ok(terminal) => output.render_standard_summary(
                         workflow,
@@ -1058,13 +1257,14 @@ where
 }
 
 fn observed_run_timing(timing: &RunTimingSnapshot) -> Option<WorkflowRunTiming> {
+    let started = timing.execution_started?;
     let finished = timing.terminal?;
     Some(WorkflowRunTiming {
-        started_at: timing.started.utc,
+        started_at: started.utc,
         finished_at: finished.utc,
         duration: finished
             .monotonic
-            .saturating_duration_since(timing.started.monotonic),
+            .saturating_duration_since(started.monotonic),
     })
 }
 
@@ -1140,11 +1340,23 @@ fn build_run_result(
                 })
             }
         };
+        let kind = match workflow.definition.steps.get(id) {
+            Some(crate::execution::workflow::validated::ValidatedStep::Command(_)) => {
+                WorkflowRunStepKind::Command
+            }
+            Some(crate::execution::workflow::validated::ValidatedStep::Agent(_)) => {
+                WorkflowRunStepKind::Agent
+            }
+            None => return Err(LocalRunError::InvalidTerminalResult),
+        };
         steps.push(WorkflowRunStep {
             id: id.clone(),
+            kind,
             state,
             timing,
-            command_output: diagnostics.get(id),
+            command_output: (kind == WorkflowRunStepKind::Command)
+                .then(|| diagnostics.get(id))
+                .flatten(),
         });
     }
     if !states.is_empty() {
@@ -1167,7 +1379,7 @@ fn build_run_result(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ImportFailureKind {
+pub(super) enum ImportFailureKind {
     Unavailable,
     NotRegularFile,
     Interrupted,
@@ -1177,7 +1389,7 @@ enum ImportFailureKind {
 }
 
 #[derive(Debug)]
-enum LocalRunError {
+pub(super) enum LocalRunError {
     Import {
         kind: ImportFailureKind,
         path: Option<PathBuf>,
@@ -1187,6 +1399,8 @@ enum LocalRunError {
     AttachmentMediaTypeEncoding,
     UnrepresentablePath,
     PrivateStaging,
+    AgentInputStaging(AgentInputStagingFailure),
+    AgentRuntime,
     SignalObservation,
     Coordination(CoordinationError),
     InvalidTerminalResult,
@@ -1215,6 +1429,10 @@ impl fmt::Display for LocalRunError {
                 "prepare local workflow paths: an authoritative path is not valid UTF-8",
             ),
             Self::PrivateStaging => formatter.write_str("prepare private local workflow staging"),
+            Self::AgentInputStaging(error) => {
+                write!(formatter, "prepare private local agent staging: {error}")
+            }
+            Self::AgentRuntime => formatter.write_str("prepare local PiJsonV1 runtime"),
             Self::SignalObservation => {
                 formatter.write_str("install local workflow signal observation")
             }
@@ -1230,7 +1448,7 @@ impl fmt::Display for LocalRunError {
 
 impl std::error::Error for LocalRunError {}
 
-fn diagnose(error: impl fmt::Display) -> ExitCode {
+pub(super) fn diagnose(error: impl fmt::Display) -> ExitCode {
     write_diagnostic(format_args!("{error}"));
     ExitCode::FAILURE
 }
@@ -1246,7 +1464,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use time::format_description::well_known::Rfc3339;
 
@@ -1273,6 +1491,47 @@ mod tests {
     impl ObservationClock for ScriptedClock {
         fn sample(&self) -> ObservationTime {
             self.points.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledObservationClock {
+        current: Arc<Mutex<ObservationTime>>,
+    }
+
+    impl ControlledObservationClock {
+        fn new(current: ObservationTime) -> Self {
+            Self {
+                current: Arc::new(Mutex::new(current)),
+            }
+        }
+
+        fn set(&self, current: ObservationTime) {
+            *self.current.lock().unwrap() = current;
+        }
+    }
+
+    impl ObservationClock for ControlledObservationClock {
+        fn sample(&self) -> ObservationTime {
+            *self.current.lock().unwrap()
+        }
+    }
+
+    struct DelayedHeaderWriter {
+        clock: ControlledObservationClock,
+        completed_at: ObservationTime,
+        flushed: Arc<AtomicBool>,
+    }
+
+    impl Write for DelayedHeaderWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.clock.set(self.completed_at);
+            self.flushed.store(true, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1314,7 +1573,9 @@ mod tests {
                 source_root: PathBuf::from("source"),
                 workflow_path: PathBuf::from("workflow.yaml"),
             },
-            execution_root: PathBuf::from("execution"),
+            execution: super::super::LocalExecutionRoot {
+                execution_root: PathBuf::from("execution"),
+            },
             run_dir: PathBuf::from("run"),
             prompt_file: None,
             attachment: Vec::new(),
@@ -1362,22 +1623,83 @@ mod tests {
         assert!(!cancellation.request_cancellation(CancellationReason::UserRequest));
     }
 
-    #[tokio::test]
-    async fn timing_observer_forwards_once_and_uses_the_terminal_transition() {
+    #[test]
+    fn execution_handoff_samples_timing_after_the_plain_header_is_flushed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("source");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::write(
+            source_root.join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  step:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        )
+        .unwrap();
+        let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let monotonic = crate::timing::monotonic_now();
-        let started = timing_point(monotonic, "2026-08-02T12:01:44Z", 0);
-        let step_started = timing_point(monotonic, "2026-08-02T12:01:44.01Z", 10);
-        let step_finished = timing_point(monotonic, "2026-08-02T12:01:44.02Z", 20);
-        let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 30);
+        let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
+        let initialized = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
+        let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
+        let clock = ControlledObservationClock::new(opened);
+        let flushed = Arc::new(AtomicBool::new(false));
+
+        let prepared = initialize_execution_presentation(clock.clone(), || {
+            let presentation = WorkflowRunOutput::new(
+                PresentationConfig {
+                    requested_mode: RequestedPresentationMode::Plain,
+                    color: ColorChoice::Never,
+                    capabilities: TerminalCapabilities {
+                        stdin_is_terminal: false,
+                        stdout_is_terminal: false,
+                        stderr_is_terminal: false,
+                        stdout_width: None,
+                        stderr_width: None,
+                        term: None,
+                        no_color: None,
+                    },
+                    standard_input_reserved: false,
+                },
+                DelayedHeaderWriter {
+                    clock: clock.clone(),
+                    completed_at: initialized,
+                    flushed: flushed.clone(),
+                },
+                io::sink(),
+            )
+            .start_for_result(&workflow, "result", 1, clock.clone())?;
+            let timing = RunTimingObservation::new(presentation.opened_at());
+            Ok(PreparedExecutionPresentation {
+                observer: presentation,
+                host: (),
+                timing,
+            })
+        })
+        .unwrap();
+
+        assert!(flushed.load(Ordering::SeqCst));
+        prepared.timing.record(&terminal_transition(), terminal);
+        let timing = observed_run_timing(&prepared.timing.snapshot()).unwrap();
+        assert_eq!(timing.started_at, initialized.utc);
+        assert_eq!(timing.duration, Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn timing_observer_excludes_presentation_opening_and_uses_terminal_transition() {
+        let monotonic = crate::timing::monotonic_now();
+        let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
+        let started = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
+        let step_started = timing_point(monotonic, "2026-08-02T12:01:44.01Z", 510);
+        let step_finished = timing_point(monotonic, "2026-08-02T12:01:44.02Z", 520);
+        let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
         let observations = Arc::new(AtomicUsize::new(0));
         let cancellation = CancellationSource::new();
+        let timing = RunTimingObservation::new(opened);
+        timing.mark_execution_started(started);
         let observer = TimingObserver::new(
             RecordingPresentation {
                 observations: observations.clone(),
                 failed: false,
             },
             cancellation,
-            RunTimingObservation::new(started),
+            timing,
             ScriptedClock::new([step_started, step_finished, terminal]),
         );
 
@@ -1412,13 +1734,15 @@ mod tests {
         let cancellation = CancellationSource::new();
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         let observed_at = timing_point(monotonic, "2026-08-02T12:01:44Z", 0);
+        let timing = RunTimingObservation::new(observed_at);
+        timing.mark_execution_started(observed_at);
         let observer = TimingObserver::new(
             RecordingPresentation {
                 observations: Arc::new(AtomicUsize::new(0)),
                 failed: true,
             },
             cancellation.clone(),
-            RunTimingObservation::new(observed_at),
+            timing,
             ScriptedClock::new([observed_at]),
         );
 

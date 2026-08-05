@@ -27,7 +27,8 @@ pub(crate) struct ObservedStepTiming {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunTimingSnapshot {
-    pub(crate) started: ObservationTime,
+    pub(crate) presentation_opened: ObservationTime,
+    pub(crate) execution_started: Option<ObservationTime>,
     pub(crate) steps: BTreeMap<String, ObservedStepTiming>,
     pub(crate) cancellation: Option<(CancellationReason, OffsetDateTime)>,
     pub(crate) terminal: Option<ObservationTime>,
@@ -40,16 +41,23 @@ pub(crate) struct RunTimingObservation {
 }
 
 impl RunTimingObservation {
-    pub(crate) fn new(started: ObservationTime) -> Self {
+    pub(crate) fn new(presentation_opened: ObservationTime) -> Self {
         Self {
             state: Arc::new(Mutex::new(RunTimingSnapshot {
-                started,
+                presentation_opened,
+                execution_started: None,
                 steps: BTreeMap::new(),
                 cancellation: None,
                 terminal: None,
                 quiesced: None,
             })),
         }
+    }
+
+    pub(crate) fn mark_execution_started(&self, observed_at: ObservationTime) {
+        lock_timing(&self.state)
+            .execution_started
+            .get_or_insert(observed_at);
     }
 
     pub(crate) fn observe<Deadline: DisplayDeadline>(

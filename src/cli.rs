@@ -198,6 +198,7 @@ mod tests {
             "runner serve",
             "version",
             "workflow",
+            "workflow retry",
             "workflow run",
             "workflow status",
             "workflow validate",
@@ -215,9 +216,9 @@ mod tests {
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
         assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
-        assert!(
-            help.contains("workflow      Validate, run, and inspect local Workflow V1 definitions")
-        );
+        assert!(help.contains(
+            "workflow      Validate, run, retry, and inspect local Workflow V1 definitions"
+        ));
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -279,7 +280,10 @@ mod tests {
         let help = command_help(&["workflow"]);
         let validate = command_help(&["workflow", "validate"]);
 
-        assert!(help.contains("run       Execute a local command-only Workflow V1 bundle"));
+        assert!(
+            help.contains("retry     Retry every step of an eligible durable local workflow run")
+        );
+        assert!(help.contains("run       Execute a local Workflow V1 command and agent DAG"));
         assert!(
             help.contains("status    Inspect one durable local workflow run without changing it")
         );
@@ -301,6 +305,19 @@ mod tests {
         ] {
             assert!(run.contains(option), "run help should contain {option}");
         }
+        let retry = command_help(&["workflow", "retry"]);
+        for option in [
+            "--run-dir <PATH>",
+            "--execution-root <PATH>",
+            "--plain",
+            "--json",
+            "--color <auto|always|never>",
+        ] {
+            assert!(retry.contains(option), "retry help should contain {option}");
+        }
+        assert!(!retry.contains("--source-root"));
+        assert!(!retry.contains("--prompt-file"));
+        assert!(!retry.contains("--max-parallel"));
         let status = command_help(&["workflow", "status"]);
         for option in [
             "--run-dir <PATH>",

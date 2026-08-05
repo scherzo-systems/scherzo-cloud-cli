@@ -26,6 +26,10 @@ checking, and Node's built-in test runner.
 The pinned Devenv environment supplies Node 24. After the locked install, the script
 sets npm's offline mode for all package checks so lint, formatting, type-checking,
 generation checking, and tests cannot resolve a missing package from a registry.
+The source tree also type-checks the qualification-only fake provider against the
+exact Pi 0.83.0 extension and provider APIs. That provider communicates only through
+framed local Unix sockets and is copied into isolated test projects by the Rust
+conformance suite; it is never available to workflow configuration.
 
 For a direct clean install and package-only check:
 

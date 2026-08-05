@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::{Future, ready};
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,11 +17,12 @@ use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
 use super::document::Output;
 use super::input::InputPreparationFailureKind;
+use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
 use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
 use super::presentation_feed::{
-    AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedChildOutput,
-    PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
-    WorkflowPresentationStep, is_unicode_control,
+    AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedAgentObservation,
+    NormalizedChildOutput, PresentationRecord, PresentationRecordKind, PresentationTransition,
+    WorkflowPresentationFeed, WorkflowPresentationStep, is_unicode_control,
 };
 use super::publication::{
     LocalPublicationError, WorkflowRunResult, WorkflowRunStep, WorkflowRunTerminalResultV1,
@@ -36,8 +38,10 @@ use super::step_runtime::{
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
 use super::validated::ValidatedStep;
+use crate::execution::pi::PiInstallationFailure;
 
-const COMMAND: &str = "scherzo-cloud workflow run";
+const RUN_COMMAND: &str = "scherzo-cloud workflow run";
+const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -237,7 +241,7 @@ impl PresentationFailure {
         }
     }
 
-    fn operation(operation: PresentationFailureOperation) -> Self {
+    pub(crate) fn operation(operation: PresentationFailureOperation) -> Self {
         Self {
             operation,
             error_kind: None,
@@ -290,6 +294,8 @@ pub(crate) struct WorkflowRunOutput<StandardOutput, StandardError> {
     config: PresentationConfig,
     standard_output: StandardOutput,
     standard_error: StandardError,
+    command: &'static str,
+    retry_run_directory: Option<String>,
 }
 
 impl<StandardOutput, StandardError> WorkflowRunOutput<StandardOutput, StandardError>
@@ -306,30 +312,30 @@ where
             config,
             standard_output,
             standard_error,
+            command: RUN_COMMAND,
+            retry_run_directory: None,
         }
     }
 
+    pub(crate) fn for_retry(mut self, run_directory: &Path) -> Self {
+        self.command = RETRY_COMMAND;
+        self.retry_run_directory = run_directory.to_str().map(str::to_owned);
+        self
+    }
+
     pub(crate) fn render_resolution_rejection(
-        mut self,
+        self,
         failure: &ResolutionFailure,
     ) -> WorkflowRunPresentationResult {
-        let diagnostic = RejectionDiagnostic::from_resolution(failure);
-        let rejection = TerminalRejectionV1 {
-            schema_version: 1,
-            command: COMMAND,
-            outcome: "rejected",
-            exit_status: 1,
-            phase: "resolution",
-            workflow: failure
-                .workflow_path()
-                .map(|path| RejectedWorkflowV1 { path }),
-            diagnostics: [diagnostic.clone()],
-        };
-        self.write_rejection(&rejection, &diagnostic)
+        self.write_workflow_rejection(
+            "resolution",
+            failure.workflow_path(),
+            RejectionDiagnostic::from_resolution(failure),
+        )
     }
 
     pub(crate) fn render_admission_rejection(
-        mut self,
+        self,
         workflow: &ResolvedWorkflow,
         failure: &AdmissionFailure,
     ) -> WorkflowRunPresentationResult {
@@ -338,35 +344,107 @@ where
                 PresentationFailureOperation::UnsupportedRejection,
             ));
         };
+        self.write_workflow_rejection(
+            "admission",
+            Some(&workflow.source.workflow_path),
+            diagnostic,
+        )
+    }
+
+    pub(crate) fn render_pi_installation_rejection(
+        self,
+        workflow: &ResolvedWorkflow,
+        failure: &PiInstallationFailure,
+    ) -> WorkflowRunPresentationResult {
+        self.write_workflow_rejection(
+            "installation",
+            Some(&workflow.source.workflow_path),
+            RejectionDiagnostic::from_pi_installation(failure),
+        )
+    }
+
+    fn write_workflow_rejection(
+        mut self,
+        phase: &'static str,
+        workflow_path: Option<&str>,
+        diagnostic: RejectionDiagnostic<'_>,
+    ) -> WorkflowRunPresentationResult {
+        let retry_run_directory = self.retry_run_directory.clone();
         let rejection = TerminalRejectionV1 {
             schema_version: 1,
-            command: COMMAND,
+            command: self.command,
             outcome: "rejected",
             exit_status: 1,
-            phase: "admission",
-            workflow: Some(RejectedWorkflowV1 {
-                path: &workflow.source.workflow_path,
-            }),
+            phase,
+            run_directory: retry_run_directory.as_deref(),
+            workflow: workflow_path.map(|path| RejectedWorkflowV1 { path }),
             diagnostics: [diagnostic.clone()],
         };
-        self.write_rejection(&rejection, &diagnostic)
+        self.write_rejection(
+            &rejection,
+            &format!(
+                "workflow rejected: {} at {}: {}",
+                diagnostic.code, diagnostic.location, diagnostic.message
+            ),
+        )
+    }
+
+    pub(crate) fn render_retry_rejection(
+        mut self,
+        rejection: &LocalRetryRejection,
+    ) -> WorkflowRunPresentationResult {
+        let Some(run_directory) = rejection.run_directory().to_str() else {
+            return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                PresentationFailureOperation::InvalidTerminalResult,
+            ));
+        };
+        let message = retry_rejection_message(rejection.reason());
+        let diagnostic = RetryDiagnosticV1 {
+            code: rejection.reason().as_str(),
+            message,
+            location: RetryLocationV1 {
+                kind: "attempt",
+                attempt_number: rejection.attempt_number(),
+                guard_ids: rejection.guard_ids(),
+                ownership_reason: rejection.ownership_reason().map(|reason| reason.as_str()),
+            },
+        };
+        let terminal = RetryRejectionV1 {
+            schema_version: 1,
+            command: RETRY_COMMAND,
+            outcome: "rejected",
+            exit_status: 1,
+            phase: "retry",
+            run_directory,
+            attempt_number: rejection.attempt_number(),
+            diagnostics: [diagnostic],
+        };
+        self.write_rejection(
+            &terminal,
+            &format!(
+                "workflow retry rejected: {} at attempt {}: {message}",
+                rejection.reason().as_str(),
+                rejection.attempt_number()
+            ),
+        )
     }
 
     fn write_rejection(
         &mut self,
-        rejection: &TerminalRejectionV1<'_>,
-        diagnostic: &RejectionDiagnostic<'_>,
+        rejection: &impl Serialize,
+        human_message: &str,
     ) -> WorkflowRunPresentationResult {
         let result = match self.config.mode() {
-            PresentationMode::Tui | PresentationMode::Plain => writeln!(
-                self.standard_error,
-                "Error: workflow rejected: {} at {}: {}",
-                diagnostic.code, diagnostic.location, diagnostic.message
-            )
-            .and_then(|()| self.standard_error.flush())
-            .map_err(|error| {
-                PresentationFailure::writer(PresentationFailureOperation::DiagnosticWriter, &error)
-            }),
+            PresentationMode::Tui | PresentationMode::Plain => {
+                { writeln!(self.standard_error, "Error: {human_message}") }
+                    .and_then(|()| self.standard_error.flush())
+                    .map_err(|error| {
+                        PresentationFailure::writer(
+                            PresentationFailureOperation::DiagnosticWriter,
+                            &error,
+                        )
+                    })
+            }
             PresentationMode::Json => write_pretty_json(&mut self.standard_output, rejection)
                 .map_err(|error| {
                     PresentationFailure::writer(
@@ -468,8 +546,58 @@ struct TerminalRejectionV1<'a> {
     outcome: &'static str,
     exit_status: u8,
     phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_directory: Option<&'a str>,
     workflow: Option<RejectedWorkflowV1<'a>>,
     diagnostics: [RejectionDiagnostic<'a>; 1],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryRejectionV1<'a> {
+    schema_version: u8,
+    command: &'static str,
+    outcome: &'static str,
+    exit_status: u8,
+    phase: &'static str,
+    run_directory: &'a str,
+    attempt_number: u64,
+    diagnostics: [RetryDiagnosticV1<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct RetryDiagnosticV1<'a> {
+    code: &'static str,
+    message: &'static str,
+    location: RetryLocationV1<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryLocationV1<'a> {
+    kind: &'static str,
+    attempt_number: u64,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    guard_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ownership_reason: Option<&'static str>,
+}
+
+const fn retry_rejection_message(reason: RetryIneligibilityReason) -> &'static str {
+    match reason {
+        RetryIneligibilityReason::RunLocked => {
+            "The current attempt still has an active execution owner."
+        }
+        RetryIneligibilityReason::LatestAttemptSucceeded => {
+            "A succeeded run cannot be retried; create a new run."
+        }
+        RetryIneligibilityReason::LatestAttemptRejected => {
+            "A rejected run cannot be retried; create a new run with a usable specification."
+        }
+        RetryIneligibilityReason::OwnershipUnproven => {
+            "The predecessor process groups cannot be proven safe to quiesce."
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -489,6 +617,7 @@ fn write_pretty_json(writer: &mut impl Write, value: &impl Serialize) -> io::Res
 pub(crate) struct WorkflowRunPresentation<StandardOutput, StandardError, Clock> {
     state: Arc<Mutex<PresentationState<StandardOutput, StandardError>>>,
     clock: Clock,
+    opened_at: ObservationTime,
 }
 
 impl<StandardOutput, StandardError, Clock> Clone
@@ -500,6 +629,7 @@ where
         Self {
             state: Arc::clone(&self.state),
             clock: self.clock.clone(),
+            opened_at: self.opened_at,
         }
     }
 }
@@ -535,15 +665,20 @@ where
             failure_sender,
             finished: false,
         };
-        let opened_at = clock.sample().utc;
-        if let Err(failure) = state.write_header(opened_at, maximum_parallel_steps) {
+        let opened_at = clock.sample();
+        if let Err(failure) = state.write_header(opened_at.utc, maximum_parallel_steps) {
             state.report_output_failure(&failure);
             return Err(failure);
         }
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
             clock,
+            opened_at,
         })
+    }
+
+    pub(crate) const fn opened_at(&self) -> ObservationTime {
+        self.opened_at
     }
 
     pub(crate) fn subscribe_failures(&self) -> watch::Receiver<Option<PresentationFailure>> {
@@ -810,6 +945,9 @@ where
             PresentationRecordKind::ChildOutput(output) => {
                 self.render_child_output(record.observed_at, output)
             }
+            PresentationRecordKind::AgentObservation(observation) => {
+                self.render_agent_observation(record.observed_at, observation)
+            }
         }
     }
 
@@ -996,6 +1134,29 @@ where
             payload
         };
         self.write_event(observed_at, &step, token, &detail, TokenRole::Neutral)
+    }
+
+    fn render_agent_observation(
+        &mut self,
+        observed_at: OffsetDateTime,
+        observation: NormalizedAgentObservation,
+    ) -> Result<(), PresentationFailure> {
+        let detail = if observation.continuation {
+            format!(
+                "{} · {SAFETY_CONTINUATION_MARKER} {}",
+                observation.kind.as_str(),
+                observation.payload
+            )
+        } else {
+            format!("{} · {}", observation.kind.as_str(), observation.payload)
+        };
+        self.write_event(
+            observed_at,
+            &observation.step,
+            "event",
+            &detail,
+            TokenRole::Neutral,
+        )
     }
 
     fn finish_child_streams(

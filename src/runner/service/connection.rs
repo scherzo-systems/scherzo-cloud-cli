@@ -16,6 +16,10 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use crate::runner::service::Sleeper;
+use crate::runner::service::assignment::{
+    AssignmentDecision, AssignmentManager, AssignmentManagerFailure, AssignmentOffer,
+    WelcomePolicyFailure,
+};
 use crate::runner::service::config::Config;
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use crate::runner_protocol::{
@@ -143,6 +147,17 @@ impl<'a> ProtocolLog<'a> {
                 envelope,
                 effect_id,
             } => (envelope, "effect_acknowledged", effect_id, None),
+            RunnerFrame::AssignmentAccepted {
+                envelope,
+                effect_id,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "assignment_accepted",
+                effect_id,
+                Some(assignment_id),
+            ),
             RunnerFrame::AssignmentRejected {
                 envelope,
                 effect_id,
@@ -246,15 +261,28 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_start",
-                vec![
-                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
-                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
-                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
-                    KeyValue::new(
-                        telemetry::attribute::PROTOCOL_LEASE_EXPIRES_AT,
-                        lease_expires_at.clone(),
-                    ),
-                ],
+                leased_assignment_effect_attributes(
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    lease_expires_at,
+                ),
+            ),
+            CloudFrame::AssignmentLeaseRenewed {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                lease_expires_at,
+            } => (
+                envelope,
+                "assignment_lease_renewed",
+                leased_assignment_effect_attributes(
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    lease_expires_at,
+                ),
             ),
             CloudFrame::AssignmentRelease {
                 envelope,
@@ -369,6 +397,26 @@ impl<'a> ProtocolLog<'a> {
     }
 }
 
+fn leased_assignment_effect_attributes(
+    effect_id: &str,
+    assignment_id: &str,
+    run_id: &str,
+    lease_expires_at: &str,
+) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.to_owned()),
+        KeyValue::new(
+            telemetry::attribute::ASSIGNMENT_ID,
+            assignment_id.to_owned(),
+        ),
+        KeyValue::new(telemetry::attribute::RUN_ID, run_id.to_owned()),
+        KeyValue::new(
+            telemetry::attribute::PROTOCOL_LEASE_EXPIRES_AT,
+            lease_expires_at.to_owned(),
+        ),
+    ]
+}
+
 fn protocol_text_attributes(
     direction: &'static str,
     frame_type: &'static str,
@@ -481,6 +529,10 @@ pub(crate) enum ConnectionCause {
     GatewayClosedConnection,
     ConnectionCounterOverflow,
     EffectAcknowledgementUnconfirmed,
+    InvalidExecutionLeasePolicy,
+    ChangedExecutionLeasePolicy,
+    ConflictingAssignmentOffer,
+    AssignmentDecisionCapacity,
 }
 
 impl ConnectionCause {
@@ -528,6 +580,12 @@ impl ConnectionCause {
             Self::EffectAcknowledgementUnconfirmed => {
                 "effect acknowledgement confirmation not received"
             }
+            Self::InvalidExecutionLeasePolicy => "invalid execution lease policy",
+            Self::ChangedExecutionLeasePolicy => {
+                "execution lease policy changed within runner boot"
+            }
+            Self::ConflictingAssignmentOffer => "conflicting assignment offer",
+            Self::AssignmentDecisionCapacity => "assignment decision capacity exhausted",
         }
     }
 
@@ -569,6 +627,10 @@ impl ConnectionCause {
             Self::GatewayClosedConnection => "gateway_closed_connection",
             Self::ConnectionCounterOverflow => "connection_counter_overflow",
             Self::EffectAcknowledgementUnconfirmed => "effect_acknowledgement_unconfirmed",
+            Self::InvalidExecutionLeasePolicy => "invalid_execution_lease_policy",
+            Self::ChangedExecutionLeasePolicy => "changed_execution_lease_policy",
+            Self::ConflictingAssignmentOffer => "conflicting_assignment_offer",
+            Self::AssignmentDecisionCapacity => "assignment_decision_capacity",
         }
     }
 
@@ -796,17 +858,25 @@ pub(crate) async fn run(
     result
 }
 
-#[derive(Clone)]
-struct SemanticResponse {
-    effect_id: String,
-    assignment_id: String,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingObservationKind {
+    EffectReceipt,
+    AssignmentDecision { assignment_id: String },
 }
 
-struct PendingEffectAcknowledgement {
+struct PendingObservation {
     message_id: String,
     sequence: u64,
-    semantic_response: Option<SemanticResponse>,
-    confirms_effect: bool,
+    kind: PendingObservationKind,
+}
+
+enum AssignmentManagerEffect {
+    Offer(AssignmentOffer),
+    Release {
+        assignment_id: String,
+        run_id: String,
+    },
+    None,
 }
 
 pub(super) struct ActiveEffectEvent {
@@ -912,10 +982,15 @@ pub(super) struct ConnectionDependencies<'a> {
     recorder: &'a Recorder,
     connection_event: &'a Event,
     active_effect_event: &'a ActiveEffectEvent,
+    assignment_manager: &'a Mutex<AssignmentManager>,
     connection_attempt: u64,
 }
 
 impl<'a> ConnectionDependencies<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the connection adapter receives explicit service and attempt-scoped boundaries"
+    )]
     pub(super) fn new(
         config: &'a Config,
         frame_source: &'a dyn FrameSource,
@@ -923,6 +998,7 @@ impl<'a> ConnectionDependencies<'a> {
         recorder: &'a Recorder,
         connection_event: &'a Event,
         active_effect_event: &'a ActiveEffectEvent,
+        assignment_manager: &'a Mutex<AssignmentManager>,
         connection_attempt: u64,
     ) -> Self {
         Self {
@@ -932,6 +1008,7 @@ impl<'a> ConnectionDependencies<'a> {
             recorder,
             connection_event,
             active_effect_event,
+            assignment_manager,
             connection_attempt,
         }
     }
@@ -955,6 +1032,7 @@ where
         recorder,
         connection_event,
         active_effect_event,
+        assignment_manager,
         connection_attempt,
     } = dependencies;
     let mut protocol = ProtocolLog::new(
@@ -980,13 +1058,36 @@ where
     let mut progress = ConnectionProgress::unacknowledged();
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
     record_progress(connection_event, progress);
-    let mut pending_effect_acknowledgement: Option<PendingEffectAcknowledgement> = None;
+    let mut pending_observation: Option<PendingObservation> = None;
     // The gateway may deliver one next effect after acknowledging the current
     // effect while the runner's resulting semantic response is still pending.
     let mut buffered_effect: Option<CloudFrame> = None;
 
     loop {
-        let ready_effect = if pending_effect_acknowledgement.is_none() {
+        if pending_observation.is_none() && progress.handshake_completed {
+            let decision = assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_decision();
+            if let Some(decision) = decision {
+                pending_observation = Some(
+                    send_assignment_decision(
+                        &mut writer,
+                        config,
+                        frame_source,
+                        opening.boot_id,
+                        next_sequence,
+                        &mut protocol,
+                        &mut progress,
+                        connection_event,
+                        decision,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+        }
+        let ready_effect = if pending_observation.is_none() {
             buffered_effect.take()
         } else {
             None
@@ -1114,8 +1215,32 @@ where
             CloudFrame::Welcome {
                 ping_interval_seconds,
                 pong_timeout_seconds,
+                lease_policy,
                 ..
             } if inbound_silence_timeout.is_none() => {
+                let policy_result = assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain_lease_policy(&lease_policy);
+                let cause = match policy_result {
+                    Ok(()) => None,
+                    Err(WelcomePolicyFailure::Invalid) => {
+                        Some(ConnectionCause::InvalidExecutionLeasePolicy)
+                    }
+                    Err(WelcomePolicyFailure::Changed) => {
+                        Some(ConnectionCause::ChangedExecutionLeasePolicy)
+                    }
+                };
+                if let Some(cause) = cause {
+                    return Err(protocol_violation(
+                        &mut writer,
+                        sleeper,
+                        &mut protocol,
+                        progress,
+                        cause,
+                    )
+                    .await);
+                }
                 let _ = ping_interval_seconds;
                 inbound_silence_timeout = Some(Duration::from_secs(pong_timeout_seconds));
             }
@@ -1134,7 +1259,7 @@ where
                 acknowledged_sequence,
                 ..
             } => {
-                let Some(pending) = pending_effect_acknowledgement.as_ref() else {
+                let Some(pending) = pending_observation.take() else {
                     return Err(protocol_violation(
                         &mut writer,
                         sleeper,
@@ -1156,125 +1281,113 @@ where
                     )
                     .await);
                 }
-                let confirms_effect = pending.confirms_effect;
-                let semantic_response = pending.semantic_response.clone();
-                if confirms_effect {
-                    progress.effect_acknowledgements_confirmed =
-                        match progress.incremented(progress.effect_acknowledgements_confirmed) {
+                match pending.kind {
+                    PendingObservationKind::EffectReceipt => {
+                        progress.effect_acknowledgements_confirmed = match progress
+                            .incremented(progress.effect_acknowledgements_confirmed)
+                        {
                             Ok(count) => count,
                             Err(error) => {
-                                if pending_effect_acknowledgement.take().is_some() {
-                                    active_effect_event.finish(
-                                        Outcome::Failure,
-                                        Some(ConnectionCause::ConnectionCounterOverflow),
-                                    );
-                                }
+                                active_effect_event.finish(
+                                    Outcome::Failure,
+                                    Some(ConnectionCause::ConnectionCounterOverflow),
+                                );
                                 return Err(error);
                             }
                         };
-                    record_progress(connection_event, progress);
-                    active_effect_event.finish(Outcome::Success, None);
+                        record_progress(connection_event, progress);
+                        active_effect_event.finish(Outcome::Success, None);
+                    }
+                    PendingObservationKind::AssignmentDecision { assignment_id } => {
+                        assignment_manager
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .acknowledge_decision(&assignment_id);
+                    }
                 }
-                pending_effect_acknowledgement = if let Some(response) = semantic_response {
-                    let sequence = *next_sequence;
-                    let Some(incremented_sequence) = next_sequence.checked_add(1) else {
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::ObservationSequenceOverflow,
-                        ));
-                    };
-                    *next_sequence = incremented_sequence;
-                    let message_id = frame_source.public_id("rmsg_");
-                    let sent_at = frame_source.utc_timestamp().map_err(|_| {
-                        ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::FormatEffectAcknowledgementTimestamp,
-                        )
-                    })?;
-                    let frame = RunnerFrame::AssignmentRejected {
-                        envelope: RunnerEnvelope {
-                            message_id: message_id.clone(),
-                            runner_id: config.credential().runner_id().to_owned(),
-                            boot_id: opening.boot_id.to_owned(),
-                            sequence,
-                            sent_at,
-                        },
-                        effect_id: response.effect_id,
-                        assignment_id: response.assignment_id,
-                        decline_type: "runner_unable".to_owned(),
-                        decline_reason: Some("workflow_mapping_unavailable".to_owned()),
-                    };
-                    let encoded = encode_runner_frame(&frame).map_err(|_| {
-                        ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::EncodeEffectAcknowledgement,
-                        )
-                    })?;
-                    let encoded = std::str::from_utf8(&encoded).map_err(|_| {
-                        ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::EncodeEffectAcknowledgementUtf8,
-                        )
-                    })?;
-                    writer
-                        .send(Message::Text(encoded.into()))
-                        .await
-                        .map_err(|_| {
-                            ConnectionError::retryable(
-                                progress,
-                                ConnectionCause::SendEffectAcknowledgement,
-                            )
-                        })?;
-                    protocol.runner_text(&frame);
-                    progress.runner_text_frames_sent =
-                        progress.incremented(progress.runner_text_frames_sent)?;
-                    record_progress(connection_event, progress);
-                    Some(PendingEffectAcknowledgement {
-                        message_id,
-                        sequence,
-                        semantic_response: None,
-                        confirms_effect: false,
-                    })
-                } else {
-                    None
-                };
             }
             effect @ CloudFrame::AssignmentOffer { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
+            | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
                 if progress.handshake_completed
-                    && pending_effect_acknowledgement
-                        .as_ref()
-                        .is_some_and(|pending| !pending.confirms_effect)
+                    && pending_observation.as_ref().is_some_and(|pending| {
+                        matches!(
+                            pending.kind,
+                            PendingObservationKind::AssignmentDecision { .. }
+                        )
+                    })
                     && buffered_effect.is_none() =>
             {
                 buffered_effect = Some(effect);
             }
             effect @ CloudFrame::AssignmentOffer { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
+            | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
-                if progress.handshake_completed && pending_effect_acknowledgement.is_none() =>
+                if progress.handshake_completed && pending_observation.is_none() =>
             {
-                let (effect_id, assignment_id, run_id, rejected_spec) = match effect {
+                let (effect_id, assignment_id, run_id, manager_effect) = match effect {
                     CloudFrame::AssignmentOffer {
                         effect_id,
                         assignment_id,
                         run_id,
-                        execution_spec_id,
+                        execution_spec,
                         ..
-                    } => (effect_id, assignment_id, run_id, Some(execution_spec_id)),
+                    } => {
+                        let offer = AssignmentOffer {
+                            effect_id: effect_id.clone(),
+                            assignment_id: assignment_id.clone(),
+                            run_id: run_id.clone(),
+                            execution_spec: *execution_spec,
+                        };
+                        (
+                            effect_id,
+                            assignment_id,
+                            run_id,
+                            AssignmentManagerEffect::Offer(offer),
+                        )
+                    }
                     CloudFrame::AssignmentStart {
                         effect_id,
                         assignment_id,
                         run_id,
                         ..
-                    }
-                    | CloudFrame::AssignmentRelease {
+                    } => (
+                        effect_id,
+                        assignment_id,
+                        run_id,
+                        AssignmentManagerEffect::None,
+                    ),
+                    CloudFrame::AssignmentLeaseRenewed {
                         effect_id,
                         assignment_id,
                         run_id,
                         ..
-                    } => (effect_id, assignment_id, run_id, None),
+                    } => (
+                        effect_id,
+                        assignment_id,
+                        run_id,
+                        AssignmentManagerEffect::None,
+                    ),
+                    CloudFrame::AssignmentRelease {
+                        effect_id,
+                        assignment_id,
+                        run_id,
+                        ..
+                    } => {
+                        let release_assignment_id = assignment_id.clone();
+                        let release_run_id = run_id.clone();
+                        (
+                            effect_id,
+                            assignment_id,
+                            run_id,
+                            AssignmentManagerEffect::Release {
+                                assignment_id: release_assignment_id,
+                                run_id: release_run_id,
+                            },
+                        )
+                    }
                     _ => {
                         return Err(ConnectionError::terminal(
                             progress,
@@ -1377,18 +1490,44 @@ where
                 protocol.runner_text(&frame);
                 progress.runner_text_frames_sent =
                     progress.incremented(progress.runner_text_frames_sent)?;
-
-                let semantic_response = rejected_spec.map(|_| SemanticResponse {
-                    effect_id,
-                    assignment_id,
-                });
                 record_progress(connection_event, progress);
-                pending_effect_acknowledgement = Some(PendingEffectAcknowledgement {
+                pending_observation = Some(PendingObservation {
                     message_id,
                     sequence,
-                    semantic_response,
-                    confirms_effect: true,
+                    kind: PendingObservationKind::EffectReceipt,
                 });
+
+                let manager_result = {
+                    let mut manager = assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match manager_effect {
+                        AssignmentManagerEffect::Offer(offer) => manager.handle_offer(offer),
+                        AssignmentManagerEffect::Release {
+                            assignment_id,
+                            run_id,
+                        } => manager.handle_release(&assignment_id, &run_id),
+                        AssignmentManagerEffect::None => Ok(()),
+                    }
+                };
+                if let Err(failure) = manager_result {
+                    let cause = match failure {
+                        AssignmentManagerFailure::ConflictingOffer => {
+                            ConnectionCause::ConflictingAssignmentOffer
+                        }
+                        AssignmentManagerFailure::DecisionCapacity => {
+                            ConnectionCause::AssignmentDecisionCapacity
+                        }
+                    };
+                    return Err(protocol_violation(
+                        &mut writer,
+                        sleeper,
+                        &mut protocol,
+                        progress,
+                        cause,
+                    )
+                    .await);
+                }
             }
             _ => {
                 return Err(protocol_violation(
@@ -1409,6 +1548,65 @@ where
             record_progress(connection_event, progress);
         }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the connection adapter owns the complete transport envelope and progress projection"
+)]
+async fn send_assignment_decision<W>(
+    writer: &mut W,
+    config: &Config,
+    frame_source: &dyn FrameSource,
+    boot_id: &str,
+    next_sequence: &mut u64,
+    protocol: &mut ProtocolLog<'_>,
+    progress: &mut ConnectionProgress,
+    connection_event: &Event,
+    decision: AssignmentDecision,
+) -> Result<PendingObservation, ConnectionError>
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+        ConnectionError::terminal(*progress, ConnectionCause::ObservationSequenceOverflow)
+    })?;
+    let message_id = frame_source.public_id("rmsg_");
+    let sent_at = frame_source.utc_timestamp().map_err(|_| {
+        ConnectionError::terminal(
+            *progress,
+            ConnectionCause::FormatEffectAcknowledgementTimestamp,
+        )
+    })?;
+    let assignment_id = decision.assignment_id().to_owned();
+    let frame = decision.runner_frame(RunnerEnvelope {
+        message_id: message_id.clone(),
+        runner_id: config.credential().runner_id().to_owned(),
+        boot_id: boot_id.to_owned(),
+        sequence,
+        sent_at,
+    });
+    let encoded = encode_runner_frame(&frame).map_err(|_| {
+        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
+    })?;
+    let encoded = std::str::from_utf8(&encoded).map_err(|_| {
+        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgementUtf8)
+    })?;
+    writer
+        .send(Message::Text(encoded.into()))
+        .await
+        .map_err(|_| {
+            ConnectionError::retryable(*progress, ConnectionCause::SendEffectAcknowledgement)
+        })?;
+    protocol.runner_text(&frame);
+    progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
+    record_progress(connection_event, *progress);
+    Ok(PendingObservation {
+        message_id,
+        sequence,
+        kind: PendingObservationKind::AssignmentDecision { assignment_id },
+    })
 }
 
 pub(crate) fn opening_hello(
@@ -1449,7 +1647,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -1473,11 +1671,12 @@ mod tests {
     };
     use crate::runner::credential::{Credential, test_credential};
     use crate::runner::service::Sleeper;
+    use crate::runner::service::assignment::AssignmentManager;
     use crate::runner::service::config::Config;
     use crate::runner::service::test_support::{
         accept_fixture_socket, accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_listener, observation_acknowledgement,
+        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
         offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
     };
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
@@ -1495,6 +1694,7 @@ mod tests {
         capture: TestCapture,
         connection_event: Event,
         active_effect_event: ActiveEffectEvent,
+        assignment_manager: Mutex<AssignmentManager>,
         opening: Vec<u8>,
     }
 
@@ -1506,6 +1706,11 @@ mod tests {
             let (sleeper, _sleep_requests) = controlled_sleeper();
             let (recorder, capture) = test_recorder(BOOT_ID);
             let connection_event = recorder.start("runner.gateway_connection", []);
+            let assignment_manager = Mutex::new(AssignmentManager::new(
+                &config,
+                BOOT_ID.to_owned(),
+                healthy_wall_clock(),
+            ));
             Self {
                 config,
                 frame_source,
@@ -1514,6 +1719,7 @@ mod tests {
                 capture,
                 connection_event,
                 active_effect_event: ActiveEffectEvent::new(),
+                assignment_manager,
                 opening,
             }
         }
@@ -1526,6 +1732,7 @@ mod tests {
                 self.recorder.as_ref(),
                 &self.connection_event,
                 &self.active_effect_event,
+                &self.assignment_manager,
                 1,
             )
         }
@@ -1843,6 +2050,26 @@ mod tests {
                 "effect acknowledgement confirmation not received",
                 "effect_acknowledgement_unconfirmed",
             ),
+            (
+                ConnectionCause::InvalidExecutionLeasePolicy,
+                "invalid execution lease policy",
+                "invalid_execution_lease_policy",
+            ),
+            (
+                ConnectionCause::ChangedExecutionLeasePolicy,
+                "execution lease policy changed within runner boot",
+                "changed_execution_lease_policy",
+            ),
+            (
+                ConnectionCause::ConflictingAssignmentOffer,
+                "conflicting assignment offer",
+                "conflicting_assignment_offer",
+            ),
+            (
+                ConnectionCause::AssignmentDecisionCapacity,
+                "assignment decision capacity exhausted",
+                "assignment_decision_capacity",
+            ),
         ];
         let mut slugs = std::collections::HashSet::new();
         for (cause, message, slug) in causes {
@@ -2022,7 +2249,7 @@ mod tests {
         let path = directory.path().join("runner.credential");
         fs::write(&path, CREDENTIAL).expect("write credential");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set credential mode");
-        let config = Config::new(
+        let config = Config::fixture(
             &endpoint,
             Credential::load(&path).expect("load credential"),
             true,
@@ -2513,6 +2740,11 @@ mod tests {
         let (recorder, capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
+        let assignment_manager = Mutex::new(AssignmentManager::new(
+            config,
+            BOOT_ID.to_owned(),
+            healthy_wall_clock(),
+        ));
         let result = run(
             ConnectionDependencies::new(
                 config,
@@ -2521,6 +2753,7 @@ mod tests {
                 &recorder,
                 &connection_event,
                 &active_effect_event,
+                &assignment_manager,
                 1,
             ),
             OpeningHello {
@@ -2546,7 +2779,7 @@ mod tests {
     }
 
     fn test_config(endpoint: &str) -> Config {
-        Config::new(endpoint, test_credential(), true).expect("configure gateway")
+        Config::fixture(endpoint, test_credential(), true).expect("configure gateway")
     }
 
     fn test_opening(config: &Config, frame_source: &dyn FrameSource) -> Vec<u8> {

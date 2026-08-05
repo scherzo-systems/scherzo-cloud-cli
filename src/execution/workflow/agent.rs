@@ -10,6 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
+use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
 pub(crate) use super::result_validation::{BoundedSchemaValidAgentResult, RetainedResultSchema};
 use super::runtime::ActionId;
@@ -438,6 +439,19 @@ pub(crate) struct AgentObservationEnvelope {
 }
 
 impl AgentObservationEnvelope {
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        identity: AgentInvocationIdentity,
+        sequence: u64,
+        observation: AgentObservation,
+    ) -> Self {
+        Self {
+            identity,
+            sequence: InvocationObservationSequence(sequence),
+            observation,
+        }
+    }
+
     pub(crate) fn run(&self) -> &WorkflowRunId {
         self.identity.run()
     }
@@ -553,6 +567,7 @@ pub(crate) struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, Ob
     value_mode: AgentValueMode,
     limits: AgentInvocationLimits<AdapterProtocolLimits>,
     cancellation: CancellationSource,
+    process_guards: ProcessGuardRegistry,
     observations: OrderedAgentObservationSink<ObservationSink>,
     process_control: AgentProcessControl,
     process_directives: Option<mpsc::UnboundedReceiver<AgentProcessDirective>>,
@@ -577,6 +592,7 @@ where
         value_mode: AgentValueMode,
         limits: AgentInvocationLimits<AdapterProtocolLimits>,
         cancellation: CancellationSource,
+        process_guards: ProcessGuardRegistry,
         observation_sink: ObservationSink,
     ) -> Self {
         let observations = OrderedAgentObservationSink::new(identity.clone(), observation_sink);
@@ -591,6 +607,7 @@ where
             value_mode,
             limits,
             cancellation,
+            process_guards,
             observations,
             process_control,
             process_directives: Some(process_directives),
@@ -631,6 +648,10 @@ where
 
     pub(crate) fn cancellation(&self) -> &CancellationSource {
         &self.cancellation
+    }
+
+    pub(crate) fn process_guards(&self) -> &ProcessGuardRegistry {
+        &self.process_guards
     }
 
     pub(crate) fn observations(&self) -> &OrderedAgentObservationSink<ObservationSink> {

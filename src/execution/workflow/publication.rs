@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
+use super::agent_input::AgentInputStartFailure;
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind};
+use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::execution_root::open_directory;
 use super::input::InputPreparationFailureKind;
@@ -38,6 +40,7 @@ use super::step_runtime::{
 use super::value::CapturedValue;
 
 const COMMAND: &str = "scherzo-cloud workflow run";
+const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;
@@ -62,9 +65,16 @@ pub(crate) struct WorkflowRunCancellation {
     pub(crate) force_stop_deadline: OffsetDateTime,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunStepKind {
+    Command,
+    Agent,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WorkflowRunStep {
     pub(crate) id: String,
+    pub(crate) kind: WorkflowRunStepKind,
     pub(crate) state: StepState<StepFailureCause, CapturedValue>,
     pub(crate) timing: Option<WorkflowStepTiming>,
     pub(crate) command_output: Option<StepDiagnostic>,
@@ -213,6 +223,10 @@ impl WorkflowRunTerminalResultV1 {
 
     pub(crate) fn result(&self) -> &WorkflowResultV1 {
         &self.result
+    }
+
+    pub(crate) fn mark_retry(&mut self) {
+        self.command = RETRY_COMMAND;
     }
 }
 
@@ -463,16 +477,22 @@ impl PreparedResultDestination {
 pub(crate) fn prepare_result_destination(
     destination: &Path,
 ) -> Result<PreparedResultDestination, LocalPublicationError> {
-    PublicationTarget::validate(destination, None)
+    PublicationTarget::validate(destination, None, None)
         .map(|target| PreparedResultDestination { target })
 }
 
 pub(crate) fn prepare_attempt_result_destination(
     destination: &Path,
     private_staging: &Path,
+    expected_result_parent: &OwnedFd,
+    expected_staging_parent: &OwnedFd,
 ) -> Result<PreparedResultDestination, LocalPublicationError> {
-    PublicationTarget::validate(destination, Some(private_staging))
-        .map(|target| PreparedResultDestination { target })
+    PublicationTarget::validate(
+        destination,
+        Some(private_staging),
+        Some((expected_result_parent, expected_staging_parent)),
+    )
+    .map(|target| PreparedResultDestination { target })
 }
 
 pub(crate) fn publish_prepared_workflow_result(
@@ -540,13 +560,33 @@ fn publish_prepared_with_observer(
                     Some(name),
                 )?;
                 let file_name = format!("{ordinal:04}");
-                let file = output.as_file().ok_or_else(|| {
-                    LocalPublicationError::for_export(
-                        LocalPublicationPhase::ExportCopy,
-                        LocalPublicationFailureKind::UnsupportedExport,
-                        name,
-                    )
-                })?;
+                let (kind, media_type, expected_size) = match output {
+                    CapturedValue::File(file) => {
+                        ("file", file.media_type().to_owned(), file.size())
+                    }
+                    CapturedValue::Text(text) => (
+                        "text",
+                        "text/plain; charset=utf-8".to_owned(),
+                        u64::try_from(text.len()).map_err(|_| {
+                            LocalPublicationError::for_export(
+                                LocalPublicationPhase::ExportCopy,
+                                LocalPublicationFailureKind::UnsupportedExport,
+                                name,
+                            )
+                        })?,
+                    ),
+                    CapturedValue::Json(value) => (
+                        "json",
+                        "application/json".to_owned(),
+                        canonical_json::encoded_size(value, u64::MAX).map_err(|_| {
+                            LocalPublicationError::for_export(
+                                LocalPublicationPhase::ExportCopy,
+                                LocalPublicationFailureKind::UnsupportedExport,
+                                name,
+                            )
+                        })?,
+                    ),
+                };
                 let mut destination = staging.create_export(&file_name).map_err(|kind| {
                     LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
                 })?;
@@ -555,27 +595,27 @@ fn publish_prepared_with_observer(
                     let mut hashing = HashingWriter {
                         destination: &mut destination,
                         digest: &mut digest,
+                        bytes: 0,
                     };
-                    let copied = artifacts
-                        .copy_to(file.handle(), &mut hashing)
-                        .map_err(|failure| copy_error(name, failure))?;
-                    hashing.flush().map_err(|_| {
-                        LocalPublicationError::for_export(
-                            LocalPublicationPhase::ExportCopy,
-                            LocalPublicationFailureKind::ExportWriteUnavailable,
-                            name,
-                        )
-                    })?;
-                    copied
+                    match output {
+                        CapturedValue::File(file) => {
+                            artifacts
+                                .copy_to(file.handle(), &mut hashing)
+                                .map_err(|failure| copy_error(name, failure))?;
+                        }
+                        CapturedValue::Text(text) => hashing
+                            .write_all(text.as_bytes())
+                            .map_err(|_| export_write_error(name))?,
+                        CapturedValue::Json(value) => {
+                            canonical_json::to_writer(&mut hashing, value)
+                                .map_err(|_| export_write_error(name))?
+                        }
+                    }
+                    hashing.flush().map_err(|_| export_write_error(name))?;
+                    hashing.bytes
                 };
-                destination.flush().map_err(|_| {
-                    LocalPublicationError::for_export(
-                        LocalPublicationPhase::ExportCopy,
-                        LocalPublicationFailureKind::ExportWriteUnavailable,
-                        name,
-                    )
-                })?;
-                if copied != file.size() {
+                destination.flush().map_err(|_| export_write_error(name))?;
+                if copied != expected_size {
                     return Err(LocalPublicationError::for_export(
                         LocalPublicationPhase::ExportCopy,
                         LocalPublicationFailureKind::ArtifactUnavailable,
@@ -600,8 +640,8 @@ fn publish_prepared_with_observer(
                 exports.insert(
                     name.clone(),
                     ExportV1::Available {
-                        kind: "file",
-                        media_type: file.media_type().to_owned(),
+                        kind,
+                        media_type,
                         path: format!("{EXPORT_DIRECTORY}/{file_name}"),
                         size_bytes: copied,
                         digest: DigestV1 {
@@ -706,6 +746,14 @@ fn observe(
             |export| LocalPublicationError::for_export(phase, kind, export),
         )
     })
+}
+
+fn export_write_error(export: &str) -> LocalPublicationError {
+    LocalPublicationError::for_export(
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::ExportWriteUnavailable,
+        export,
+    )
 }
 
 fn copy_error(export: &str, failure: ArtifactReadFailure) -> LocalPublicationError {
@@ -850,9 +898,16 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         .map(command_output_v1)
         .transpose()?;
 
+    if step.kind == WorkflowRunStepKind::Agent && command_output.is_some() {
+        return Err(invalid_run_result());
+    }
+
     Ok(WorkflowStepV1 {
         id: step.id.clone(),
-        kind: "cmd",
+        kind: match step.kind {
+            WorkflowRunStepKind::Command => "cmd",
+            WorkflowRunStepKind::Agent => "agent",
+        },
         state,
         started_at,
         duration_milliseconds,
@@ -952,8 +1007,9 @@ fn start_failure_cause(
             cause.collection_index = failure.collection_index();
             cause
         }
-        StepStartFailure::AgentInput(_) | StepStartFailure::AgentRuntimeUnavailable => {
-            return Err(invalid_run_result());
+        StepStartFailure::AgentInput(failure) => agent_input_failure_cause(failure),
+        StepStartFailure::AgentRuntimeUnavailable => {
+            FailureCauseV1::code("agent_runtime_unavailable")
         }
         StepStartFailure::Agent(failure) => FailureCauseV1::code(failure.code()),
         StepStartFailure::OutputsUnsupported => FailureCauseV1::code("outputs_unsupported"),
@@ -977,6 +1033,35 @@ fn start_failure_cause(
         }),
     };
     Ok(cause)
+}
+
+fn agent_input_failure_cause(failure: &AgentInputStartFailure) -> FailureCauseV1 {
+    FailureCauseV1::code(match failure {
+        AgentInputStartFailure::StepUnavailable => "agent_step_unavailable",
+        AgentInputStartFailure::AgentAdmissionUnavailable => "agent_admission_unavailable",
+        AgentInputStartFailure::InputsUnavailable => "agent_inputs_unavailable",
+        AgentInputStartFailure::MissingUpstreamValue { .. } => "agent_input_missing_upstream",
+        AgentInputStartFailure::ValueTypeMismatch { .. } => "agent_input_type_mismatch",
+        AgentInputStartFailure::RetainedSourceUnavailable { .. } => "agent_source_unavailable",
+        AgentInputStartFailure::InvalidRetainedText { .. } => "agent_source_text_invalid",
+        AgentInputStartFailure::ResultSchemaUnavailable { .. } => "agent_result_schema_unavailable",
+        AgentInputStartFailure::InvalidValueMode => "agent_value_mode_invalid",
+        AgentInputStartFailure::AttachmentCountLimitExceeded { .. } => {
+            "agent_attachment_count_limit"
+        }
+        AgentInputStartFailure::AttachmentBytesLimitExceeded { .. } => {
+            "agent_attachment_bytes_limit"
+        }
+        AgentInputStartFailure::WorkingDirectory(failure) => match failure {
+            WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
+            WorkingDirectoryFailure::Unavailable => "working_directory_unavailable",
+            WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
+            WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",
+        },
+        AgentInputStartFailure::ArtifactStagingMismatch => "artifact_staging_mismatch",
+        AgentInputStartFailure::AgentStagingMismatch => "agent_staging_mismatch",
+        AgentInputStartFailure::StagingUnavailable => "agent_input_staging_unavailable",
+    })
 }
 
 fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
@@ -1101,12 +1186,17 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
 struct HashingWriter<'a> {
     destination: &'a mut File,
     digest: &'a mut DigestContext,
+    bytes: u64,
 }
 
 impl Write for HashingWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = self.destination.write(bytes)?;
         self.digest.update(&bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(u64::try_from(written).map_err(|_| io::Error::other("export size"))?)
+            .ok_or_else(|| io::Error::other("export size"))?;
         Ok(written)
     }
 
@@ -1127,6 +1217,7 @@ impl PublicationTarget {
     fn validate(
         destination: &Path,
         private_staging: Option<&Path>,
+        expected_parents: Option<(&OwnedFd, &OwnedFd)>,
     ) -> Result<Self, LocalPublicationError> {
         let name = destination.file_name().ok_or_else(|| {
             LocalPublicationError::new(
@@ -1203,6 +1294,13 @@ impl PublicationTarget {
                 )
             })?,
         };
+        if let Some((expected_parent, expected_staging_parent)) = expected_parents
+            && (!same_file(expected_parent, &parent).map_err(|_| invalid_publication_parent())?
+                || !same_file(expected_staging_parent, &staging_parent)
+                    .map_err(|_| invalid_publication_parent())?)
+        {
+            return Err(invalid_publication_parent());
+        }
         verify_publication_capability(&staging_parent, &parent)?;
         Ok(Self {
             supplied_parent,
@@ -1240,6 +1338,13 @@ impl PublicationTarget {
         ensure_absent(&self.parent, &self.name)
             .map_err(|kind| LocalPublicationError::new(LocalPublicationPhase::Commit, kind))
     }
+}
+
+fn invalid_publication_parent() -> LocalPublicationError {
+    LocalPublicationError::new(
+        LocalPublicationPhase::TargetValidation,
+        LocalPublicationFailureKind::ParentUnavailable,
+    )
 }
 
 struct StagingDirectory<'a> {

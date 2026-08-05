@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
-use rustix::process::{Pid, getpgid};
+use rustix::process::{Pid, WaitId, WaitIdOptions, getpgid, waitid};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::adapter::{PiJsonV1Adapter, build_command, prepare_launch};
 use super::*;
@@ -51,6 +51,7 @@ const TERMINAL_TOOL_USE: &str = include_str!("fixtures/terminal-tool-use.jsonl")
 #[derive(Clone)]
 enum TestClock {
     Pending,
+    Yielding,
     Controlled {
         now_seconds: Arc<AtomicU64>,
         registrations: mpsc::UnboundedSender<Duration>,
@@ -63,7 +64,7 @@ impl CoordinatorClock for TestClock {
 
     fn now(&mut self) -> Self::Instant {
         match self {
-            Self::Pending => Duration::ZERO,
+            Self::Pending | Self::Yielding => Duration::ZERO,
             Self::Controlled { now_seconds, .. } => {
                 Duration::from_secs(now_seconds.load(Ordering::SeqCst))
             }
@@ -71,13 +72,14 @@ impl CoordinatorClock for TestClock {
     }
 
     async fn wait_until(&self, deadline: Self::Instant) {
-        let Self::Controlled {
-            registrations,
-            release,
-            ..
-        } = self
-        else {
-            return pending().await;
+        let (registrations, release) = match self {
+            Self::Pending => return pending().await,
+            Self::Yielding => return explicit_scheduling_point().await,
+            Self::Controlled {
+                registrations,
+                release,
+                ..
+            } => (registrations, release),
         };
         let _ = registrations.send(deadline);
         let mut release = release.clone();
@@ -86,7 +88,16 @@ impl CoordinatorClock for TestClock {
                 return;
             }
         }
+        explicit_scheduling_point().await;
     }
+}
+
+async fn explicit_scheduling_point() {
+    let (complete, completed) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = complete.send(());
+    });
+    let _ = completed.await;
 }
 
 const FAKE_PI: &str = r#"#!/bin/sh
@@ -192,6 +203,11 @@ case "$PI_FIXTURE_MODE" in
       --exact execution::workflow::pi_json_v1::adapter_tests::detached_standard_output_holder_process \
       --ignored 3>&1 >/dev/null 2>&1 &
     ;;
+  result-bridge-in-group-descendant)
+    "$PI_FIXTURE_DETACHED_HOLDER" \
+      --exact execution::workflow::pi_json_v1::adapter_tests::in_group_descendant_reaper_process \
+      --ignored >/dev/null 2>&1 &
+    ;;
 esac
 "#;
 
@@ -215,10 +231,9 @@ const STUBBORN_DESCENDANT_PI: &str = r#"#!/bin/sh
 set -eu
 trap 'printf "interrupted\n" > "$PI_FIXTURE_STDIN"; exit 0' INT
 printf '%s\n' "$$" > "$PI_FIXTURE_PROCESS"
-sh -c 'trap "" INT; while :; do :; done' &
+sh -c 'trap "" INT; printf "descendant-ready\n" > "$PI_FIXTURE_DESCENDANT_READY"; while :; do :; done' &
 descendant=$!
 printf '%s\n' "$descendant" > "$PI_FIXTURE_DESCENDANT"
-printf 'descendant-ready\n' > "$PI_FIXTURE_DESCENDANT_READY"
 printf 'phase diagnostic\n' >&2
 printf 'ready\n' > "$PI_FIXTURE_READY"
 while :; do :; done
@@ -541,6 +556,7 @@ impl ProcessFixture {
             value_mode,
             invocation_limits(),
             CancellationSource::new(),
+            crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
             RecordingObservationSink {
                 observations: observation_sender,
                 gate: Arc::clone(&observation_gate),
@@ -595,7 +611,7 @@ fn count_result_mode() -> AgentValueMode {
     }
 }
 
-fn invocation_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
+pub(super) fn invocation_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
     AgentInvocationLimits::new(
         NonZeroU64::new(MAXIMUM_INPUT_BYTES).unwrap(),
         NonZeroU64::new(MAXIMUM_INPUT_BYTES).unwrap(),
@@ -611,12 +627,12 @@ fn invocation_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
 }
 
 #[derive(Clone, Copy)]
-struct InlineValidationWorker;
+pub(super) struct InlineValidationWorker;
 
 #[derive(Clone, Copy)]
 struct DeadlineValidationWorker;
 
-struct InlineValidation {
+pub(super) struct InlineValidation {
     decision: Option<Result<ValidationWorkerDecision, ()>>,
 }
 
@@ -631,31 +647,13 @@ impl ResultValidationWorker for InlineValidationWorker {
 }
 
 impl ResultValidationWorker for DeadlineValidationWorker {
-    type Running = DeadlineValidation;
+    type Running = PendingResultValidation;
 
     fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(DeadlineValidation)
+        Ok(PendingResultValidation)
     }
 }
 
-struct DeadlineValidation;
-
-// These worker states intentionally share only inert stop/quiesce mechanics; their wait
-// behavior must stay separate so deadline tests cannot accidentally become ready.
-// jscpd:ignore-start
-impl RunningResultValidation for DeadlineValidation {
-    async fn wait(&mut self) -> Result<ValidationWorkerDecision, ()> {
-        pending().await
-    }
-
-    fn request_stop(&mut self) {}
-
-    fn quiesce(self) -> impl Future<Output = ()> + Send {
-        ready(())
-    }
-}
-
-// jscpd:ignore-end
 impl RunningResultValidation for InlineValidation {
     fn wait(&mut self) -> impl Future<Output = Result<ValidationWorkerDecision, ()>> + Send {
         ready(self.decision.take().unwrap())
@@ -689,7 +687,7 @@ fn start_invocation(
     AgentStartReceiver,
     AgentTerminalReceiver,
 ) {
-    start_invocation_with_clock(invocation, diagnostics, TestClock::Pending)
+    start_invocation_with_clock(invocation, diagnostics, TestClock::Yielding)
 }
 
 fn start_invocation_with_clock<Clock>(
@@ -925,6 +923,8 @@ struct RunningResultFixture {
     settlement_ready: PathBuf,
     settlement_release: PathBuf,
     process: PathBuf,
+    descendant: PathBuf,
+    descendant_ready: PathBuf,
     tool_name: String,
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
     cancellation: CancellationSource,
@@ -1107,6 +1107,8 @@ where
         settlement_ready: fixture.result_settlement_ready,
         settlement_release: fixture.result_settlement_release,
         process: fixture.process,
+        descendant: fixture.descendant,
+        descendant_ready: fixture.descendant_ready,
         tool_name,
         observations: fixture.observations,
         cancellation,
@@ -1116,7 +1118,7 @@ where
 fn validation_socket_address(tool_name: &str) -> PathBuf {
     let identity = tool_name.strip_prefix("scherzo_result_").unwrap();
     Path::new("/tmp")
-        .join(format!(".szp-{identity}"))
+        .join(format!(".szp-{identity}-{}", std::process::id()))
         .join("e")
         .join("result-validation.sock")
 }
@@ -1429,6 +1431,41 @@ async fn settlement_expiry_terminates_the_process_group_and_discards_the_candida
 }
 
 #[tokio::test]
+async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
+    with_watchdog(async {
+        let (mut running, now_seconds, deadline_release, mut registered_deadlines) =
+            launch_controlled_settlement_fixture("result-bridge-in-group-descendant").await;
+        advance_result_fixture_to_settlement(&mut running, &mut registered_deadlines).await;
+        let process = process_id(&fs::read(&running.process).unwrap());
+        let descendant = process_id(&fs::read(&running.descendant).unwrap());
+        assert_eq!(getpgid(Some(descendant)).unwrap(), process);
+
+        now_seconds.store(130, Ordering::SeqCst);
+        deadline_release.send_replace(true);
+        read_signal(running.descendant_ready.clone()).await;
+        assert_eq!(
+            getpgid(Some(descendant)).unwrap(),
+            process,
+            "the unreaped descendant must keep the process group observable"
+        );
+        assert!(
+            !running.terminal.is_finished(),
+            "the adapter must not report completion while the process group still exists"
+        );
+
+        write_signal(running.settlement_release.clone()).await;
+        assert_eq!(
+            running.finish().await,
+            AgentOutcome::Failed {
+                cause: AgentFailureCause::ResultSettlementFailed
+            }
+        );
+        assert!(getpgid(Some(descendant)).is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn stdout_eof_after_settlement_grace_discards_the_candidate() {
     with_watchdog(async {
         let (mut running, now_seconds, deadline_release, mut registered_deadlines) =
@@ -1495,7 +1532,7 @@ async fn validation_exhaustion_returns_fatal_before_the_typed_failure() {
         let request = running.first_request();
         let response =
             tokio::spawn(async move { validation_socket_exchange(&socket_address, request).await });
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert_eq!(
                 registered_deadlines.recv().await,
                 Some(Duration::from_secs(105))
@@ -1526,7 +1563,7 @@ async fn cancellation_preempts_socket_validation_without_a_fatal_reply() {
             tokio::spawn(
                 async move { validation_socket_raw_exchange(&socket_address, request).await },
             );
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert_eq!(
                 registered_deadlines.recv().await,
                 Some(Duration::from_secs(105))
@@ -1941,6 +1978,48 @@ fn detached_standard_output_holder_process() {
     fs::write(ready, b"settlement-ready\n").unwrap();
     let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
     assert!(!fs::read(release).unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "launched as an out-of-group reaper by the process-group regression"]
+fn in_group_descendant_reaper_process() {
+    let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "execution::workflow::pi_json_v1::adapter_tests::in_group_descendant_process",
+            "--ignored",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let descendant_pid =
+        Pid::from_raw(i32::try_from(descendant.id()).unwrap()).expect("child PID must be positive");
+    rustix::process::setsid().unwrap();
+    let descendant_path = std::env::var_os("PI_FIXTURE_DESCENDANT").unwrap();
+    fs::write(descendant_path, format!("{}\n", descendant.id())).unwrap();
+    let settlement_ready = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_READY").unwrap();
+    fs::write(settlement_ready, b"settlement-ready\n").unwrap();
+
+    waitid(
+        WaitId::Pid(descendant_pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+    )
+    .unwrap();
+    let descendant_ready = std::env::var_os("PI_FIXTURE_DESCENDANT_READY").unwrap();
+    fs::write(descendant_ready, b"descendant-zombie\n").unwrap();
+    let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
+    assert!(!fs::read(release).unwrap().is_empty());
+    assert!(!descendant.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "launched as the in-group descendant by the process-group regression"]
+fn in_group_descendant_process() {
+    loop {
+        std::thread::park();
+    }
 }
 
 #[test]

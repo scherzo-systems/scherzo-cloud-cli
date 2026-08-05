@@ -8,10 +8,12 @@ secure local human credential store, OAuth Device Authorization, server-confirme
 authentication status, explicit human-principal signup, local logout, organization
 profile management, one-page active member-directory reads, local Workflow V1
 definition validation, and an outbound, development-only runner transport.
-`scherzo-cloud runner serve` opens a versioned
-WebSocket connection, durably acknowledges received assignment offers, and never claims
-to execute them. `scherzo-cloud runner doctor` performs one default local Git check and
-can validate an explicitly configured Pi installation for the closed `PiJsonV1` profile;
+`scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
+acknowledges received assignment effects, and uses the shared workflow resolver and
+admission boundary to accept one configured local command workflow. Execution remains
+separately authorized by a later start effect and is not part of the current service.
+`scherzo-cloud runner doctor` performs one default local Git check and can validate an
+explicitly configured Pi installation for the closed `PiJsonV1` profile;
 it does not claim that the runner is ready to execute assignments.
 
 ## One executable with separate roles
@@ -66,16 +68,17 @@ human deployment state, read the human credential store, or make a network reque
 Future runner bootstrap code can add compiled-in checks through the same registry
 without adding a central check-name enum, but it must keep those boundaries intact.
 
-The Pi validator lives at the execution boundary and is shared by doctor and optional
-agent-capable Runner Serve initialization. It canonicalizes the configured path, invokes
-only that absolute executable's native version and help probes, and maps canonical
-stable versions in `>=0.83.0 <0.84.0` plus their required non-model flags into an
-immutable `ValidatedPiInstallation`. The value carries the absolute path, ordered
-numeric and exact observed version, closed profile enum, and closed capability set.
-Neither run admission nor later execution
-needs executable discovery or native probing. Runner Serve keeps command-only startup
-available when no Pi path is configured; when one is configured, startup must validate
-and retain it before entering the service runtime.
+The Pi validator lives at the execution boundary and is shared by doctor, the local
+Workflow Run adapter, and optional agent-capable Runner Serve initialization. For an
+agent workflow, the local adapter selects the first executable `pi` in inherited `PATH`;
+doctor and Runner Serve retain their explicit executable configuration. Validation
+canonicalizes the selected path, invokes only that absolute executable's native version
+and help probes, and maps canonical stable versions in `>=0.83.0 <0.84.0` plus their
+required non-model flags into an immutable `ValidatedPiInstallation`. The value carries
+the absolute path, ordered numeric and exact observed version, closed profile enum, and
+closed capability set. Shared admission and later execution need no executable discovery
+or native probing. Command-only local runs and Runner Serve startup remain available
+without Pi.
 
 
 ## Runner service observability
@@ -178,11 +181,18 @@ refresh logic, or authorization scopes accidentally.
 ## Execution boundary
 
 The runner service coordinates cloud assignments and supplies each run's execution
-context, including its filesystem root and lifecycle. It does not schedule workflow
-steps, perform retries, manage checkpoints, or execute agents. Those responsibilities
-belong to a new execution component implemented in this repository and initially
-embedded in the Rust executable. The runner invokes its versioned one-run boundary and
-translates structured events and outcomes into the cloud runner protocol.
+context, including its filesystem root and lifecycle. The connection adapter owns frame
+transport and effect receipt only; a service-scoped assignment manager retains the
+welcomed lease policy, one local capacity slot, admitted workflow, execution root, and
+stable semantic decisions across reconnects. Development configuration maps exactly one
+Cloud workflow ID to a contained local workflow path, while assignment payloads supply
+no host path or diagnostic text.
+
+The runner does not schedule workflow steps, perform retries, manage checkpoints, or
+execute agents. Those responsibilities belong to the execution component implemented in
+this repository and embedded in the Rust executable. A later increment invokes its
+versioned one-run boundary after start authorization and translates structured events and
+outcomes into the cloud runner protocol.
 
 The execution component will be organized as an internal source boundary before there
 is evidence that a separately published crate or process is necessary. All of its
@@ -193,11 +203,13 @@ configuration, and runtime layout are not compatibility targets.
 
 ## Workflow execution model
 
-A run invocation resolves one workflow and supplies its resolved imports. Workflow
-resolution is a closed union: a local invocation may select an explicit file path,
-while a Cloud invocation selects a registered workflow identity that the control plane
-resolves to an immutable revision and digest. Both paths produce the same internal
-resolved workflow before execution begins.
+A run invocation resolves one workflow and supplies its resolved imports. Every
+invocation produces the same internal resolved workflow, including its immutable static
+source closure and digest, before execution begins. A local invocation currently begins
+from an explicit file path. The Cloud source-selection and transfer contract remains
+undefined; the current Runner Serve development slice instead maps an opaque workflow
+selector to operator-configured local source. That selector is neither an architectural
+workflow identity nor authoritative source provenance.
 
 A workflow contains a schema version, one dependency graph of command and agent steps,
 explicit data references, and output declarations. It has no mandatory checkout,

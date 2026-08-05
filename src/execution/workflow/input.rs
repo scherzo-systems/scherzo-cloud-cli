@@ -20,7 +20,7 @@ use super::execution_root::{AdmittedExecutionRoot, open_directory};
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
     StagingLifecycle, cleanup_staging, create_payload_file, create_staging_root,
-    finish_payload_file, mark_cleanup_failed, remove_staging_root, remove_tree_at,
+    finish_payload_file, mark_cleanup_failed, remove_staging_root, remove_tree_at, same_file,
 };
 use super::validated::WorkflowValueType;
 use super::value::CapturedValue;
@@ -147,6 +147,11 @@ pub(crate) struct InputStaging {
     inner: Arc<InputStagingInner>,
 }
 
+struct StagingParent<'a> {
+    path: &'a Path,
+    expected: Option<&'a OwnedFd>,
+}
+
 struct InputStagingInner {
     execution_root: AdmittedExecutionRoot,
     staging_parent: OwnedFd,
@@ -211,10 +216,37 @@ impl InputStaging {
         execution: &AdmittedExecutionContext,
         staging_parent: &Path,
     ) -> Result<Self, InputStagingFailure> {
+        Self::create_with_parent(
+            execution,
+            StagingParent {
+                path: staging_parent,
+                expected: None,
+            },
+        )
+    }
+
+    pub(crate) fn create_bound(
+        execution: &AdmittedExecutionContext,
+        staging_parent: &Path,
+        expected_parent: &OwnedFd,
+    ) -> Result<Self, InputStagingFailure> {
+        Self::create_with_parent(
+            execution,
+            StagingParent {
+                path: staging_parent,
+                expected: Some(expected_parent),
+            },
+        )
+    }
+
+    fn create_with_parent(
+        execution: &AdmittedExecutionContext,
+        staging: StagingParent<'_>,
+    ) -> Result<Self, InputStagingFailure> {
         let limits = execution.limits();
         Self::create_for_root(
             execution.root_identity().clone(),
-            staging_parent,
+            staging,
             limits.maximum_parallel_steps().get(),
             limits.maximum_input_values().get(),
             limits.maximum_input_value_bytes().get(),
@@ -225,7 +257,7 @@ impl InputStaging {
 
     fn create_for_root(
         execution_root: AdmittedExecutionRoot,
-        staging_parent: &Path,
+        staging: StagingParent<'_>,
         maximum_parallel_steps: usize,
         maximum_values: usize,
         maximum_value_bytes: u64,
@@ -235,13 +267,19 @@ impl InputStaging {
         if !execution_root.pathname_is_bound() {
             return Err(InputStagingFailure::ExecutionRootUnavailable);
         }
-        let canonical_staging_parent = fs::canonicalize(staging_parent)
+        let canonical_staging_parent = fs::canonicalize(staging.path)
             .map_err(|_| InputStagingFailure::StagingParentUnavailable)?;
         if canonical_staging_parent.starts_with(execution_root.provenance_path()) {
             return Err(InputStagingFailure::StagingParentExposed);
         }
         let staging_parent = open_directory(&canonical_staging_parent)
             .map_err(|_| InputStagingFailure::StagingParentUnavailable)?;
+        if staging
+            .expected
+            .is_some_and(|expected| !same_file(expected, &staging_parent).unwrap_or(false))
+        {
+            return Err(InputStagingFailure::StagingParentUnavailable);
+        }
         let (staging_identity, staging_root) = create_input_staging_root(&staging_parent)?;
         let staging_path = canonical_staging_parent.join(staging_identity.as_ref());
         Ok(Self {

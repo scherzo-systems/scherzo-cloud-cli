@@ -175,10 +175,7 @@ fn deterministic_recovery_fixtures_classify_exact_absent_and_lost_inspection() {
                 },
             },
         ),
-        LocalRecoveryStatus::OwnershipUnproven {
-            guard_ids: guard_ids.clone(),
-            reason: OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
-        }
+        LocalRecoveryStatus::Abandoned
     );
     assert_eq!(
         recovery_status_with(
@@ -283,6 +280,7 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
             .unwrap();
     assert_eq!(manifest["schemaVersion"], 1);
     assert_eq!(manifest["workflowPath"], "workflow.yaml");
+    assert_eq!(manifest["maximumParallelSteps"], 2);
     assert_eq!(manifest["sourceFiles"][0]["relativeFile"], "files/0001");
     assert_eq!(manifest["imports"]["prompt"]["relativeFile"], "files/0002");
     assert_eq!(
@@ -520,6 +518,184 @@ fn atomic_state_replace_rejects_a_concurrent_authoritative_change() {
     assert_eq!(
         fs::read(run.run_directory().join(STATE_FILE)).unwrap(),
         b"partial"
+    );
+}
+
+fn settle_as_workflow_failed(run: &InitialLocalRun) {
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.state = AttemptStateV1::WorkflowFailed;
+            attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.progress.steps[1].state = AttemptStepStateV1::NotRun;
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("retry-fresh");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    let predecessor = read_state(initial.root_handle()).unwrap().attempts[0].clone();
+    drop(initial);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed attempt should be retryable");
+    };
+    let pending = *pending;
+    let (_, imports, maximum_parallel_steps) = pending.execution_specification();
+    assert_eq!(maximum_parallel_steps, 2);
+    assert_eq!(imports.prompt(), Some("durable prompt\n"));
+    assert_eq!(imports.attachments()[0].bytes(), [0_u8, 1, 0xff]);
+    let retry = pending.begin(&fixture.admitted).unwrap_or_else(|_| {
+        panic!("eligible retry should commit");
+    });
+
+    assert_eq!(retry.attempt_number(), 2);
+    let state = read_state(retry.root_handle()).unwrap();
+    assert_eq!(state.current_attempt_number, 2);
+    assert_eq!(state.attempts[0], predecessor);
+    let attempt = &state.attempts[1];
+    assert_eq!(attempt.trigger, AttemptTriggerV1::ExplicitRetry);
+    assert_eq!(attempt.prior_attempt_number, Some(1));
+    assert_eq!(attempt.state, AttemptStateV1::Created);
+    assert_eq!(attempt.progress.accepted_occurrence_ordinal, 0);
+    assert_eq!(attempt.progress.last_transition_sequence, 0);
+    assert!(attempt.progress.outstanding_actions.is_empty());
+    assert!(attempt.process_guards.is_empty());
+    assert!(
+        attempt
+            .progress
+            .steps
+            .iter()
+            .all(|step| step.state == AttemptStepStateV1::Pending)
+    );
+    assert!(run_path.join("attempts/000002").is_dir());
+    assert!(!run_path.join("attempts/000002/result").exists());
+}
+
+#[test]
+fn owner_loss_after_retry_commit_consumes_the_attempt_number() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("retry-crash");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    drop(initial);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed attempt should be retryable");
+    };
+    let retry = (*pending).begin(&fixture.admitted).unwrap_or_else(|_| {
+        panic!("first retry should commit");
+    });
+    assert_eq!(retry.attempt_number(), 2);
+    drop(retry);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("abandoned retry should itself be retryable");
+    };
+    let next = (*pending).begin(&fixture.admitted).unwrap_or_else(|_| {
+        panic!("abandoned retry should settle and advance");
+    });
+    assert_eq!(next.attempt_number(), 3);
+    let state = read_state(next.root_handle()).unwrap();
+    assert_eq!(state.attempts.len(), 3);
+    assert_eq!(state.attempts[1].state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        state.attempts[1].interruption,
+        Some(AttemptInterruptionV1 {
+            cause: InterruptionCauseV1::ExecutionOwnerLost,
+            execution_may_have_started: false,
+            cancellation_requested: false,
+        })
+    );
+    assert_eq!(state.attempts[2].attempt_number, 3);
+    assert!(run_path.join("attempts/000002").is_dir());
+    assert!(run_path.join("attempts/000003").is_dir());
+}
+
+struct ExactThenAbsentAuthority {
+    host: ExecutionHostV1,
+    observations: std::cell::RefCell<VecDeque<ProcessIdentityObservation>>,
+    terminations: std::cell::Cell<usize>,
+}
+
+impl LocalRecoveryAuthority for ExactThenAbsentAuthority {
+    fn execution_host(&self) -> Result<ExecutionHostV1, ()> {
+        Ok(self.host.clone())
+    }
+
+    fn observe_process(&self, _guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+        self.observations.borrow_mut().pop_front().unwrap()
+    }
+}
+
+impl LocalQuiescenceAuthority for ExactThenAbsentAuthority {
+    fn terminate_process(&self, _guard: &ProcessGuardV1) -> AuthenticatedSignalResult {
+        self.terminations.set(self.terminations.get() + 1);
+        AuthenticatedSignalResult::Signalled
+    }
+
+    fn wait_for_process_change(&self) {}
+}
+
+#[test]
+fn abandoned_exact_group_is_authenticated_terminated_and_proven_absent() {
+    let attempt = fixture_guarded_attempt();
+    let authority = ExactThenAbsentAuthority {
+        host: attempt.owner.execution_host.clone(),
+        observations: std::cell::RefCell::new(VecDeque::from([
+            ProcessIdentityObservation::Exact {
+                leader: crate::execution::workflow::process_group::LeaderState::Running,
+            },
+            ProcessIdentityObservation::Absent,
+        ])),
+        terminations: std::cell::Cell::new(0),
+    };
+
+    assert_eq!(quiesce_attempt(&attempt, &authority), Ok(()));
+    assert_eq!(authority.terminations.get(), 1);
+}
+
+#[test]
+fn retry_execution_setup_rejects_a_rebound_run_path() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("retry-rebound");
+    let moved_path = fixture.run_path("retry-original");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    drop(initial);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed attempt should be retryable");
+    };
+    let retry = (*pending)
+        .begin(&fixture.admitted)
+        .unwrap_or_else(|_| panic!("eligible retry should commit"));
+
+    fs::rename(&run_path, moved_path).unwrap();
+    fs::create_dir(&run_path).unwrap();
+    fs::create_dir(run_path.join(PRIVATE_DIRECTORY)).unwrap();
+    fs::create_dir_all(run_path.join("attempts/000002")).unwrap();
+
+    let prepared = crate::execution::workflow::publication::prepare_attempt_result_destination(
+        retry.result_directory(),
+        retry.private_directory(),
+        retry.attempt_directory_handle(),
+        retry.private_directory_handle(),
+    );
+    assert!(
+        prepared.is_err(),
+        "execution setup must not adopt a replacement at the run path"
     );
 }
 

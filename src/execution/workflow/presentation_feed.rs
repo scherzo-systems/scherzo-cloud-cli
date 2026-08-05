@@ -2,6 +2,10 @@ use std::collections::BTreeMap;
 
 use time::OffsetDateTime;
 
+use super::agent::{
+    AgentDiagnosticLevel, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
+    AgentToolCallPhase, AgentValueKind,
+};
 use super::document::Output;
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
@@ -146,6 +150,7 @@ pub(crate) struct PresentationRecord {
 pub(crate) enum PresentationRecordKind {
     Transition(PresentationTransition),
     ChildOutput(NormalizedChildOutput),
+    AgentObservation(NormalizedAgentObservation),
 }
 
 pub(crate) type PresentationTransition = TransitionObservation<OffsetDateTime>;
@@ -156,6 +161,47 @@ pub(crate) struct NormalizedChildOutput {
     pub(crate) invocation: ActionId,
     pub(crate) source: CommandOutputSource,
     pub(crate) source_sequence: SourceSequence,
+    pub(crate) payload: String,
+    pub(crate) continuation: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentPresentationObservationKind {
+    Assistant,
+    Reasoning,
+    ToolCall,
+    ToolResult,
+    Diagnostic,
+    Usage,
+    Model,
+    Lifecycle,
+    ValueRejected,
+    HarnessEvent,
+}
+
+impl AgentPresentationObservationKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistant => "assistant",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Diagnostic => "diagnostic",
+            Self::Usage => "usage",
+            Self::Model => "model",
+            Self::Lifecycle => "lifecycle",
+            Self::ValueRejected => "value_rejected",
+            Self::HarnessEvent => "harness_event",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizedAgentObservation {
+    pub(crate) step: String,
+    pub(crate) invocation: ActionId,
+    pub(crate) observation_sequence: u64,
+    pub(crate) kind: AgentPresentationObservationKind,
     pub(crate) payload: String,
     pub(crate) continuation: bool,
 }
@@ -195,7 +241,9 @@ impl WorkflowPresentationFeed {
             ExecutionObservation::CommandOutputClosed(closed) => {
                 self.close_child_output(observed_at, closed)
             }
-            ExecutionObservation::Agent(_) => Vec::new(),
+            ExecutionObservation::Agent(observation) => {
+                self.accept_agent_observation(observed_at, observation)
+            }
         }
     }
 
@@ -267,6 +315,36 @@ impl WorkflowPresentationFeed {
             .collect()
     }
 
+    fn accept_agent_observation(
+        &mut self,
+        observed_at: OffsetDateTime,
+        envelope: AgentObservationEnvelope,
+    ) -> Vec<PresentationRecord> {
+        let step = envelope.step().to_owned();
+        let invocation = envelope.invocation();
+        let observation_sequence = envelope.sequence().get();
+        let (kind, payload) = normalized_agent_payload(envelope.observation());
+        let mut stream = ChildStream::default();
+        let mut normalized = stream.push(payload.as_bytes());
+        normalized.extend(stream.close());
+        normalized
+            .into_iter()
+            .map(|record| {
+                self.record(
+                    observed_at,
+                    PresentationRecordKind::AgentObservation(NormalizedAgentObservation {
+                        step: step.clone(),
+                        invocation,
+                        observation_sequence,
+                        kind,
+                        payload: record.payload,
+                        continuation: record.continuation,
+                    }),
+                )
+            })
+            .collect()
+    }
+
     fn child_record(
         &mut self,
         observed_at: OffsetDateTime,
@@ -332,6 +410,111 @@ fn normalize_transition<Deadline: DisplayDeadline>(
     PresentationTransition {
         event,
         step: transition.step,
+    }
+}
+
+fn normalized_agent_payload(
+    observation: &AgentObservation,
+) -> (AgentPresentationObservationKind, String) {
+    match observation {
+        AgentObservation::AssistantText { text } => (
+            AgentPresentationObservationKind::Assistant,
+            text.to_string(),
+        ),
+        AgentObservation::Reasoning { text } => (
+            AgentPresentationObservationKind::Reasoning,
+            text.to_string(),
+        ),
+        AgentObservation::ToolCall {
+            call_id,
+            name,
+            phase,
+        } => (
+            AgentPresentationObservationKind::ToolCall,
+            format!("{} · {} · {}", agent_tool_call_phase(*phase), name, call_id),
+        ),
+        AgentObservation::ToolResult {
+            call_id,
+            is_error,
+            content,
+        } => (
+            AgentPresentationObservationKind::ToolResult,
+            format!(
+                "{} · {} · {}",
+                call_id,
+                if *is_error { "error" } else { "ok" },
+                content
+            ),
+        ),
+        AgentObservation::Diagnostic { level, message } => (
+            AgentPresentationObservationKind::Diagnostic,
+            format!("{} · {}", agent_diagnostic_level(*level), message),
+        ),
+        AgentObservation::Usage {
+            input_tokens,
+            output_tokens,
+        } => (
+            AgentPresentationObservationKind::Usage,
+            format!("input {input_tokens} · output {output_tokens}"),
+        ),
+        AgentObservation::Model { name } => {
+            (AgentPresentationObservationKind::Model, name.to_string())
+        }
+        AgentObservation::Lifecycle { milestone } => (
+            AgentPresentationObservationKind::Lifecycle,
+            agent_lifecycle_milestone(*milestone).to_owned(),
+        ),
+        AgentObservation::ValueRejected { kind, feedback } => (
+            AgentPresentationObservationKind::ValueRejected,
+            format!("{} · {}", agent_value_kind(*kind), feedback),
+        ),
+        AgentObservation::UnrecognizedHarnessEvent { .. } => (
+            AgentPresentationObservationKind::HarnessEvent,
+            "unrecognized harness event".to_owned(),
+        ),
+    }
+}
+
+const fn agent_tool_call_phase(phase: AgentToolCallPhase) -> &'static str {
+    match phase {
+        AgentToolCallPhase::Started => "started",
+        AgentToolCallPhase::Updated => "updated",
+        AgentToolCallPhase::Completed => "completed",
+    }
+}
+
+const fn agent_diagnostic_level(level: AgentDiagnosticLevel) -> &'static str {
+    match level {
+        AgentDiagnosticLevel::Information => "information",
+        AgentDiagnosticLevel::Warning => "warning",
+        AgentDiagnosticLevel::Error => "error",
+    }
+}
+
+const fn agent_value_kind(kind: AgentValueKind) -> &'static str {
+    match kind {
+        AgentValueKind::None => "none",
+        AgentValueKind::Response => "response",
+        AgentValueKind::Result => "result",
+    }
+}
+
+const fn agent_lifecycle_milestone(milestone: AgentLifecycleMilestone) -> &'static str {
+    match milestone {
+        AgentLifecycleMilestone::SessionEstablished => "session_established",
+        AgentLifecycleMilestone::HarnessStarted => "harness_started",
+        AgentLifecycleMilestone::MessageStarted => "message_started",
+        AgentLifecycleMilestone::MessageUpdated => "message_updated",
+        AgentLifecycleMilestone::MessageCompleted => "message_completed",
+        AgentLifecycleMilestone::TurnStarted => "turn_started",
+        AgentLifecycleMilestone::TurnCompleted => "turn_completed",
+        AgentLifecycleMilestone::RetryStarted => "retry_started",
+        AgentLifecycleMilestone::RetryCompleted => "retry_completed",
+        AgentLifecycleMilestone::CompactionStarted => "compaction_started",
+        AgentLifecycleMilestone::CompactionCompleted => "compaction_completed",
+        AgentLifecycleMilestone::QueueUpdated => "queue_updated",
+        AgentLifecycleMilestone::HarnessCompleted => "harness_completed",
+        AgentLifecycleMilestone::HarnessQuiescent => "harness_quiescent",
     }
 }
 

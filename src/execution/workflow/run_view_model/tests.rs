@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 
 use super::*;
-use crate::execution::workflow::observation::{CommandOutputObservation, TransitionObservation};
+use crate::execution::workflow::observation::{
+    CommandOutputObservation, SourceSequence, TransitionObservation,
+};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{ActionId, FailurePhase, TransitionSequence};
 use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
@@ -84,7 +86,9 @@ fn model(
     clock: ControlledClock,
     capacity: StepLogCapacity,
 ) -> WorkflowRunViewModel<ControlledClock> {
-    let timing = RunTimingObservation::new(clock.sample());
+    let opened_at = clock.sample();
+    let timing = RunTimingObservation::new(opened_at);
+    timing.mark_execution_started(opened_at);
     WorkflowRunViewModel::new(workflow, 2, timing, clock, capacity)
 }
 
@@ -149,6 +153,35 @@ fn output(
 
 fn step<'a>(snapshot: &'a WorkflowRunViewSnapshot, id: &str) -> &'a WorkflowRunStepView {
     snapshot.steps.iter().find(|step| step.id == id).unwrap()
+}
+
+#[test]
+fn execution_duration_excludes_time_spent_opening_the_view() {
+    let (_temporary, workflow) = resolved_workflow();
+    let base = crate::timing::monotonic_now();
+    let opened_at = point(base, 0);
+    let clock = ControlledClock::new(opened_at);
+    let timing = RunTimingObservation::new(opened_at);
+    let view = WorkflowRunViewModel::new(
+        &workflow,
+        2,
+        timing.clone(),
+        clock.clone(),
+        StepLogCapacity::default(),
+    );
+
+    clock.set(point(base, 500));
+    let opening = view.snapshot();
+    assert_eq!(opening.timing.started_at, opened_at.utc);
+    assert_eq!(opening.timing.duration, Duration::ZERO);
+    assert!(opening.timing.frozen);
+
+    timing.mark_execution_started(point(base, 500));
+    clock.set(point(base, 530));
+    let executing = view.snapshot();
+    assert_eq!(executing.timing.started_at, point(base, 500).utc);
+    assert_eq!(executing.timing.duration, Duration::from_millis(30));
+    assert!(!executing.timing.frozen);
 }
 
 #[tokio::test]
@@ -272,7 +305,7 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
         })
     );
     assert!(matches!(terminal.workflow, WorkflowState::Cancelled { .. }));
-    assert!(terminal.quit_eligible);
+    assert!(!terminal.quit_eligible);
     assert_eq!(terminal.timing.duration, Duration::from_millis(71));
     assert!(terminal.timing.frozen);
     assert_eq!(*changes.borrow(), terminal.generation);
@@ -324,7 +357,7 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     );
     assert_eq!(
         prepare.records[0].source,
-        CommandOutputSource::StandardError
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardError)
     );
     assert!(prepare.records[0].continuation);
     assert_eq!(prepare.records[0].observed_at, point(base, 1).utc);
@@ -337,7 +370,7 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     assert_eq!(consume.discarded_records, 0);
     assert_eq!(
         consume.records[0].source,
-        CommandOutputSource::StandardOutput
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput)
     );
     assert_eq!(consume.records[0].payload.as_ref(), "other");
 
@@ -364,6 +397,7 @@ fn lifecycle_completion_requires_matching_started_phase() {
         result_directory: "results".to_owned(),
     });
     view.complete_cleanup(WorkflowRunCleanupResult::Succeeded);
+    view.mark_execution_ownership_released();
 
     let snapshot = view.snapshot();
     assert_eq!(
@@ -371,11 +405,11 @@ fn lifecycle_completion_requires_matching_started_phase() {
         WorkflowRunPublicationState::NotStarted
     );
     assert_eq!(snapshot.cleanup, WorkflowRunCleanupState::NotStarted);
-    assert!(snapshot.quit_eligible);
+    assert!(!snapshot.quit_eligible);
 }
 
 #[tokio::test]
-async fn terminal_result_reconciles_facts_and_quit_ignores_local_lifecycle() {
+async fn terminal_result_requires_the_complete_local_lifecycle_before_quit() {
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
@@ -425,9 +459,10 @@ async fn terminal_result_reconciles_facts_and_quit_ignores_local_lifecycle() {
         point(base, 10).utc
     );
     assert_eq!(reconciled.timing.duration, Duration::from_millis(90));
-    assert!(reconciled.quit_eligible);
+    assert!(!reconciled.quit_eligible);
 
     view.mark_quiescent();
+    assert!(!view.snapshot().quit_eligible);
     view.begin_publication();
     view.complete_publication(WorkflowRunPublicationResult::Failed(
         WorkflowRunPublicationFailure {
@@ -436,9 +471,11 @@ async fn terminal_result_reconciles_facts_and_quit_ignores_local_lifecycle() {
             export: None,
         },
     ));
-    assert!(view.snapshot().quit_eligible);
+    assert!(!view.snapshot().quit_eligible);
     view.begin_cleanup();
     view.complete_cleanup(WorkflowRunCleanupResult::Failed);
+    assert!(!view.snapshot().quit_eligible);
+    view.mark_execution_ownership_released();
 
     let completed = view.snapshot();
     assert!(completed.quit_eligible);
@@ -478,6 +515,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         steps: vec![
             super::super::publication::WorkflowRunStep {
                 id: "prepare".to_owned(),
+                kind: super::super::publication::WorkflowRunStepKind::Command,
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "report".to_owned(),
@@ -492,6 +530,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
             },
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
+                kind: super::super::publication::WorkflowRunStepKind::Command,
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "receipt".to_owned(),

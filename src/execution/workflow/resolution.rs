@@ -151,10 +151,26 @@ pub(crate) fn resolve(
     source_root: &Path,
     selected_workflow: &Path,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
-    let mut sources = SourceResolver::new(source_root)?;
+    resolve_with_sources(SourceResolver::new(source_root)?, selected_workflow)
+}
+
+pub(crate) fn resolve_retained(
+    source_root: PathBuf,
+    workflow_path: &str,
+    source_closure: BTreeMap<String, Arc<[u8]>>,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    resolve_with_sources(
+        SourceResolver::from_retained(source_root, source_closure)?,
+        Path::new(workflow_path),
+    )
+}
+
+fn resolve_with_sources(
+    mut sources: SourceResolver,
+    selected_workflow: &Path,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let selected_candidate = sources.path_from_root(selected_workflow);
     let workflow_source = sources.load(&selected_candidate, ResolutionLocation::Workflow)?;
-
     let workflow_path = workflow_source.canonical_path.clone();
     resolve_loaded_workflow(sources, workflow_source)
         .map_err(|failure| failure.with_workflow_path(workflow_path))
@@ -211,6 +227,7 @@ struct SourceResolver {
     supplied_root: PathBuf,
     closure: BTreeMap<String, Arc<[u8]>>,
     retained_bytes: u64,
+    retained_only: bool,
 }
 
 impl SourceResolver {
@@ -252,6 +269,37 @@ impl SourceResolver {
             supplied_root,
             closure: BTreeMap::new(),
             retained_bytes: 0,
+            retained_only: false,
+        })
+    }
+
+    fn from_retained(
+        canonical_root: PathBuf,
+        closure: BTreeMap<String, Arc<[u8]>>,
+    ) -> Result<Self, ResolutionFailure> {
+        if !canonical_root.is_absolute()
+            || canonical_root.to_str().is_none()
+            || lexical_normalize(&canonical_root).as_deref() != Some(canonical_root.as_path())
+        {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::InvalidCanonicalPath,
+                ResolutionLocation::SourceRoot,
+            ));
+        }
+        let retained_bytes = closure.values().try_fold(0_u64, |total, bytes| {
+            total.checked_add(u64::try_from(bytes.len()).ok()?)
+        });
+        let Some(retained_bytes) =
+            retained_bytes.filter(|total| *total <= MAX_SOURCE_CLOSURE_BYTES)
+        else {
+            return Err(source_closure_too_large(ResolutionLocation::ContentDigest));
+        };
+        Ok(Self {
+            supplied_root: canonical_root.clone(),
+            canonical_root,
+            closure,
+            retained_bytes,
+            retained_only: true,
         })
     }
 
@@ -274,6 +322,31 @@ impl SourceResolver {
                 ResolutionFailureKind::LexicalSourceEscape,
                 location,
             ));
+        }
+        if self.retained_only {
+            let canonical_host_path = lexical_normalize(candidate).ok_or_else(|| {
+                ResolutionFailure::new(
+                    ResolutionFailureKind::InvalidCanonicalPath,
+                    location.clone(),
+                )
+            })?;
+            let canonical_path =
+                canonical_relative_path(&self.canonical_root, &canonical_host_path).ok_or_else(
+                    || {
+                        ResolutionFailure::new(
+                            ResolutionFailureKind::InvalidCanonicalPath,
+                            location.clone(),
+                        )
+                    },
+                )?;
+            let bytes = self.closure.get(&canonical_path).cloned().ok_or_else(|| {
+                ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location)
+            })?;
+            return Ok(LoadedSource {
+                canonical_host_path,
+                canonical_path,
+                bytes,
+            });
         }
 
         let canonical_host_path = fs::canonicalize(candidate).map_err(|_| {

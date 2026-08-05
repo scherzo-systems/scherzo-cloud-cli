@@ -9,10 +9,10 @@ use tokio::sync::watch;
 use super::admission::CancellationReason;
 use super::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, ObservedStepTransition,
-    SourceSequence,
 };
 use super::presentation_feed::{
-    AcceptedRecordOrder, DisplayDeadline, MAX_NORMALIZED_CHILD_RECORD_BYTES, NormalizedChildOutput,
+    AcceptedRecordOrder, AgentPresentationObservationKind, DisplayDeadline,
+    MAX_NORMALIZED_CHILD_RECORD_BYTES, NormalizedAgentObservation, NormalizedChildOutput,
     PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
     WorkflowPresentationStep,
 };
@@ -66,13 +66,19 @@ impl Default for StepLogCapacity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunLogSource {
+    Command(CommandOutputSource),
+    Agent(AgentPresentationObservationKind),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowRunLogRecord {
     pub(crate) accepted_order: AcceptedRecordOrder,
     pub(crate) observed_at: OffsetDateTime,
     pub(crate) invocation: super::runtime::ActionId,
-    pub(crate) source: CommandOutputSource,
-    pub(crate) source_sequence: SourceSequence,
+    pub(crate) source: WorkflowRunLogSource,
+    pub(crate) source_sequence: u64,
     pub(crate) payload: Arc<str>,
     pub(crate) continuation: bool,
 }
@@ -255,6 +261,7 @@ where
                 quiescent: false,
                 publication: WorkflowRunPublicationState::NotStarted,
                 cleanup: WorkflowRunCleanupState::NotStarted,
+                execution_ownership_released: false,
                 log_capacity,
                 last_accepted_order: None,
                 generation: 0,
@@ -306,7 +313,11 @@ where
                 )
             })
             .collect();
-        let quit_eligible = !matches!(state.workflow, WorkflowState::Executing { .. });
+        let quit_eligible = state.authoritative_result
+            && state.quiescent
+            && matches!(state.publication, WorkflowRunPublicationState::Completed(_))
+            && matches!(state.cleanup, WorkflowRunCleanupState::Completed(_))
+            && state.execution_ownership_released;
         WorkflowRunViewSnapshot {
             generation: state.generation,
             workflow_path: state.workflow_path.clone(),
@@ -411,6 +422,16 @@ where
         });
     }
 
+    pub(crate) fn mark_execution_ownership_released(&self) {
+        self.update(|state| {
+            if state.execution_ownership_released {
+                return false;
+            }
+            state.execution_ownership_released = true;
+            true
+        });
+    }
+
     fn update(&self, update: impl FnOnce(&mut WorkflowRunViewState) -> bool) {
         let generation = {
             let mut state = lock_state(&self.inner);
@@ -465,6 +486,7 @@ struct WorkflowRunViewState {
     quiescent: bool,
     publication: WorkflowRunPublicationState,
     cleanup: WorkflowRunCleanupState,
+    execution_ownership_released: bool,
     log_capacity: StepLogCapacity,
     last_accepted_order: Option<AcceptedRecordOrder>,
     generation: u64,
@@ -484,10 +506,21 @@ impl WorkflowRunViewState {
                 let Some(index) = self.step_indexes.get(&output.step).copied() else {
                     return;
                 };
-                self.steps[index].log.push(
+                self.steps[index].log.push_command(
                     record.accepted_order,
                     record.observed_at,
                     output,
+                    self.log_capacity,
+                );
+            }
+            PresentationRecordKind::AgentObservation(observation) => {
+                let Some(index) = self.step_indexes.get(&observation.step).copied() else {
+                    return;
+                };
+                self.steps[index].log.push_agent(
+                    record.accepted_order,
+                    record.observed_at,
+                    observation,
                     self.log_capacity,
                 );
             }
@@ -686,16 +719,62 @@ struct StepLogRing {
 }
 
 impl StepLogRing {
-    fn push(
+    fn push_command(
         &mut self,
         accepted_order: AcceptedRecordOrder,
         observed_at: OffsetDateTime,
         output: NormalizedChildOutput,
         capacity: StepLogCapacity,
     ) {
-        let payload_bytes = u64::try_from(output.payload.len()).unwrap_or(u64::MAX);
+        self.push(
+            accepted_order,
+            observed_at,
+            output.invocation,
+            WorkflowRunLogSource::Command(output.source),
+            output.source_sequence.get(),
+            output.payload,
+            output.continuation,
+            capacity,
+        );
+    }
+
+    fn push_agent(
+        &mut self,
+        accepted_order: AcceptedRecordOrder,
+        observed_at: OffsetDateTime,
+        observation: NormalizedAgentObservation,
+        capacity: StepLogCapacity,
+    ) {
+        self.push(
+            accepted_order,
+            observed_at,
+            observation.invocation,
+            WorkflowRunLogSource::Agent(observation.kind),
+            observation.observation_sequence,
+            observation.payload,
+            observation.continuation,
+            capacity,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the bounded log record keeps normalized source identity explicit"
+    )]
+    fn push(
+        &mut self,
+        accepted_order: AcceptedRecordOrder,
+        observed_at: OffsetDateTime,
+        invocation: super::runtime::ActionId,
+        source: WorkflowRunLogSource,
+        source_sequence: u64,
+        payload: String,
+        continuation: bool,
+        capacity: StepLogCapacity,
+    ) {
+        let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let maximum_bytes = u64::try_from(capacity.maximum_bytes()).unwrap_or(u64::MAX);
-        debug_assert!(output.payload.len() <= MAX_NORMALIZED_CHILD_RECORD_BYTES);
+        debug_assert!(payload.len() <= MAX_NORMALIZED_CHILD_RECORD_BYTES);
         while !self.records.is_empty()
             && (self.records.len() >= capacity.maximum_records()
                 || self.retained_bytes.saturating_add(payload_bytes) > maximum_bytes)
@@ -708,11 +787,11 @@ impl StepLogRing {
         self.records.push_back(WorkflowRunLogRecord {
             accepted_order,
             observed_at,
-            invocation: output.invocation,
-            source: output.source,
-            source_sequence: output.source_sequence,
-            payload: Arc::from(output.payload),
-            continuation: output.continuation,
+            invocation,
+            source,
+            source_sequence,
+            payload: Arc::from(payload),
+            continuation,
         });
     }
 
@@ -835,11 +914,18 @@ fn workflow_state_from_outcome(
 }
 
 fn observed_run_elapsed(timing: &RunTimingSnapshot, now: ObservationTime) -> WorkflowRunElapsed {
+    let Some(started) = timing.execution_started else {
+        return WorkflowRunElapsed {
+            started_at: timing.presentation_opened.utc,
+            duration: Duration::ZERO,
+            frozen: true,
+        };
+    };
     let finished = timing.terminal.or(timing.quiesced);
     let finished_at = finished.map_or(now.monotonic, |point| point.monotonic);
     WorkflowRunElapsed {
-        started_at: timing.started.utc,
-        duration: finished_at.saturating_duration_since(timing.started.monotonic),
+        started_at: started.utc,
+        duration: finished_at.saturating_duration_since(started.monotonic),
         frozen: finished.is_some(),
     }
 }

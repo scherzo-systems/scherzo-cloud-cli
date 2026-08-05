@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
+use crate::runner::service::assignment::{WallClockHealth, WallClockHealthFailure};
 use crate::runner::service::connection::{ConnectionError, FrameSource, run_established};
 use crate::runner::service::{ConnectionAttempt, ConnectionFuture, Connector, Sleeper};
 
@@ -55,6 +56,18 @@ pub(crate) fn deterministic_frame_source() -> Arc<dyn FrameSource> {
     Arc::new(DeterministicFrameSource {
         next: AtomicU64::new(0),
     })
+}
+
+struct HealthyWallClock;
+
+impl WallClockHealth for HealthyWallClock {
+    fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure> {
+        Ok(Duration::ZERO)
+    }
+}
+
+pub(crate) fn healthy_wall_clock() -> Arc<dyn WallClockHealth> {
+    Arc::new(HealthyWallClock)
 }
 
 #[derive(Clone, Default)]

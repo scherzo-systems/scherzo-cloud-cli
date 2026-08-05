@@ -5,7 +5,7 @@ use clap::Args;
 
 use crate::execution::pi::validate_pi_installation;
 use crate::runner::credential::Credential;
-use crate::runner::service::Config;
+use crate::runner::service::{AssignmentConfig, Config};
 
 pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
 
@@ -22,6 +22,22 @@ pub(super) struct Command {
     /// Permit ws:// only for an explicit loopback development gateway URL.
     #[arg(long)]
     allow_insecure_http: bool,
+
+    /// Cloud workflow ID mapped by this development runner.
+    #[arg(long, value_name = "WORKFLOW_ID")]
+    workflow_id: String,
+
+    /// Existing directory boundary for the registered workflow's local sources.
+    #[arg(long, value_name = "ROOT")]
+    workflow_source_root: PathBuf,
+
+    /// Workflow YAML path selected within the workflow source root.
+    #[arg(long, value_name = "PATH")]
+    workflow_path: PathBuf,
+
+    /// Existing directory under which runner-owned execution roots are created.
+    #[arg(long, value_name = "ROOT")]
+    work_root: PathBuf,
 
     /// Validate and retain this Pi executable for agent-capable assignments.
     #[arg(long, value_name = "PATH")]
@@ -49,7 +65,24 @@ impl Command {
                 return ExitCode::FAILURE;
             }
         };
-        let config = match Config::new(&self.gateway_url, credential, self.allow_insecure_http) {
+        let assignment = match AssignmentConfig::new(
+            self.workflow_id,
+            &self.workflow_source_root,
+            &self.workflow_path,
+            &self.work_root,
+        ) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let config = match Config::new(
+            &self.gateway_url,
+            credential,
+            self.allow_insecure_http,
+            assignment,
+        ) {
             Ok(config) => match pi_installation {
                 Some(installation) => config.with_pi_installation(installation),
                 None => config,

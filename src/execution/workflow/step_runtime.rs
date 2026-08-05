@@ -31,7 +31,7 @@ use super::artifact::{
     ArtifactStaging, CaptureAttemptFailure, CaptureCancellation, CaptureCandidateSet,
     CaptureDeclaration, CaptureFailure,
 };
-use super::child_guard::StoppedChildGuard;
+use super::child_guard::{StoppedChildGuard, force_stop_direct_child};
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
     CoordinatorClock, DriverOccurrence, DriverOccurrenceAcceptance, DriverOccurrenceClaim,
@@ -1145,6 +1145,7 @@ where
                     identity,
                     &upstream,
                     self.admitted.execution().cancellation().source().clone(),
+                    self.process_guards.clone(),
                     AgentExecutionObservationSink {
                         observer: self.observer.clone(),
                         deadline: PhantomData,
@@ -2366,7 +2367,8 @@ impl PreparedCommand {
         let child = if guarded {
             CommandChild::Guarded(
                 StoppedChildGuard::spawn(&program, &arguments, &environment, |command| {
-                    cwd.bind_command(command)
+                    cwd.bind_command(command);
+                    Ok(())
                 })
                 .map_err(|failure| {
                     StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
@@ -2446,7 +2448,6 @@ enum LaunchedStepBody {
     Command {
         child: CommandChild,
         registration: Option<ProcessGuardRegistration>,
-        guard_quiesced: bool,
         diagnostic: Option<PendingStepDiagnostic>,
         inputs: Option<InputView>,
     },
@@ -2482,7 +2483,6 @@ impl LaunchedStepBody {
         Ok(Self::Command {
             child,
             registration: None,
-            guard_quiesced: false,
             diagnostic: Some(diagnostic),
             inputs,
         })
@@ -2496,7 +2496,6 @@ impl LaunchedStepBody {
                 identity: None,
             },
             registration: None,
-            guard_quiesced: false,
             diagnostic: Some(diagnostic),
             inputs: None,
         }
@@ -2594,29 +2593,17 @@ impl LaunchedStepBody {
             Self::Command {
                 child: CommandChild::Direct { child, .. },
                 ..
-            } => {
-                let _ = child.start_kill();
-                child.wait().await.map_err(|_| ())?;
-            }
+            } => force_stop_direct_child(child).await?,
         }
         self.mark_quiesced()
     }
 
     fn mark_quiesced(&mut self) -> Result<(), ()> {
         match self {
-            Self::Command {
-                registration,
-                guard_quiesced,
-                ..
-            } => {
-                if !*guard_quiesced {
-                    if let Some(registration) = registration {
-                        registration.mark_quiesced()?;
-                    }
-                    *guard_quiesced = true;
-                }
-                Ok(())
-            }
+            Self::Command { registration, .. } => match registration {
+                Some(registration) => registration.mark_quiesced(),
+                None => Ok(()),
+            },
         }
     }
 

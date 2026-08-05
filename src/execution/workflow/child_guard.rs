@@ -10,16 +10,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
+#[cfg(target_os = "linux")]
+use rustix::process::waitpgid;
 use rustix::process::{
     Pid, Signal, WaitId, WaitIdOptions, WaitOptions, getpid, getppid, kill_process,
-    kill_process_group, waitid, waitpgid, waitpid,
+    kill_process_group, waitid, waitpid,
 };
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
+#[cfg(any(target_vendor = "apple", test))]
+use super::process_group::process_group_is_quiescent;
 use super::process_group::{
     AuthenticatedProcessGroup, AuthenticatedSignalResult, LeaderState, ProcessIdentityInspector,
-    ProcessIdentityObservation, SystemProcessIdentityInspector,
+    ProcessIdentityObservation, SystemProcessIdentityInspector, capture_process_group_identity,
     continue_authenticated_process_group, system_process_identity_observation,
     terminate_authenticated_process_group, terminate_authenticated_process_group_with,
 };
@@ -101,9 +105,9 @@ impl StoppedChildGuard {
         program: &Path,
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
-        configure: impl FnOnce(&mut std::process::Command),
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Self> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "authenticated child process guards are unavailable",
@@ -128,7 +132,7 @@ impl StoppedChildGuard {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.as_std_mut().process_group(0);
-        configure(command.as_std_mut());
+        configure(command.as_std_mut())?;
         let mut child = command.spawn()?;
         let owner_control = child
             .stdin
@@ -217,7 +221,7 @@ impl StoppedChildGuard {
     }
 
     pub(crate) async fn force_stop(&mut self) -> io::Result<()> {
-        let _ = terminate_authenticated_process_group(&self.identity);
+        let termination = terminate_authenticated_process_group(&self.identity);
         if let Some(mut control) = self.owner_control.take() {
             let _ = control.write_all(&[TERMINATE]);
             let _ = control.flush();
@@ -226,7 +230,7 @@ impl StoppedChildGuard {
         if require_quiesced_marker(self.staging.path()).is_ok() {
             return Ok(());
         }
-        cleanup_adopted_group(&self.identity)?;
+        cleanup_adopted_group(&self.identity, termination)?;
         write_atomic(&self.staging.path().join(QUIESCED_FILE), b"quiesced\n")
             .map_err(|()| io::Error::other("failed to record guarded group cleanup"))
     }
@@ -238,6 +242,11 @@ impl Drop for StoppedChildGuard {
         // enough to terminate and reap the stopped or released process group.
         self.owner_control.take();
     }
+}
+
+pub(crate) async fn force_stop_direct_child(child: &mut Child) -> Result<(), ()> {
+    let _ = child.start_kill();
+    child.wait().await.map(|_| ()).map_err(|_| ())
 }
 
 fn wait_for_json<Document>(child: &mut Child, path: &Path) -> io::Result<Document>
@@ -419,7 +428,12 @@ fn monitor_guarded_child(
             }
             return Err(());
         }
-        match inspector.observe(identity) {
+        let observation = match observe_owned_leader(identity, inspector) {
+            Ok(observation) => observation,
+            Err(Errno::INTR) => continue,
+            Err(_) => ProcessIdentityObservation::Unavailable,
+        };
+        match observation {
             ProcessIdentityObservation::Exact {
                 leader: LeaderState::Zombie,
             } => {
@@ -438,6 +452,71 @@ fn monitor_guarded_child(
         }
         crate::timing::sleep(WORKER_POLL_INTERVAL);
     }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn observe_owned_leader(
+    identity: &AuthenticatedProcessGroup,
+    inspector: &impl ProcessIdentityInspector,
+) -> Result<ProcessIdentityObservation, Errno> {
+    observe_owned_leader_with(identity, inspector, || {
+        match waitid(
+            WaitId::Pid(identity.process_group()),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(Errno::CHILD) => Ok(false),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+fn observe_owned_leader(
+    identity: &AuthenticatedProcessGroup,
+    _inspector: &impl ProcessIdentityInspector,
+) -> Result<ProcessIdentityObservation, Errno> {
+    match waitid(
+        WaitId::Pid(identity.process_group()),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    ) {
+        Ok(Some(_)) => Ok(ProcessIdentityObservation::Exact {
+            leader: LeaderState::Zombie,
+        }),
+        // The authenticated guard is the direct parent and never reaps the leader
+        // outside cleanup. That relationship pins the identity while Darwin's
+        // libproc view may be transiently unavailable around process exit.
+        Ok(None) => Ok(ProcessIdentityObservation::Exact {
+            leader: LeaderState::Running,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(not(target_vendor = "apple"), test))]
+fn observe_owned_leader_with(
+    identity: &AuthenticatedProcessGroup,
+    inspector: &impl ProcessIdentityInspector,
+    mut exited_without_reaping: impl FnMut() -> Result<bool, Errno>,
+) -> Result<ProcessIdentityObservation, Errno> {
+    if exited_without_reaping()? {
+        return Ok(ProcessIdentityObservation::Exact {
+            leader: LeaderState::Zombie,
+        });
+    }
+    let observation = inspector.observe(identity);
+    if matches!(
+        observation,
+        ProcessIdentityObservation::Absent | ProcessIdentityObservation::Unavailable
+    ) && exited_without_reaping()?
+    {
+        // Darwin's libproc stops exposing a leader as it becomes a zombie. The
+        // second non-reaping child observation closes that transition race.
+        return Ok(ProcessIdentityObservation::Exact {
+            leader: LeaderState::Zombie,
+        });
+    }
+    Ok(observation)
 }
 
 fn run_leader_worker() -> Result<(), ()> {
@@ -482,25 +561,31 @@ fn install_parent_death_protection() -> Result<(), ()> {
     rustix::process::set_parent_process_death_signal(Some(Signal::KILL)).map_err(|_| ())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_vendor = "apple")]
+fn install_parent_death_protection() -> Result<(), ()> {
+    // Darwin has no parent-death signal. The leader cannot execute before the
+    // independent guard authenticates and releases it, and the guard's control
+    // pipe turns execution-owner loss into process-group cleanup.
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn install_parent_death_protection() -> Result<(), ()> {
     Err(())
 }
 
 fn identity_for_stopped_leader(leader: Pid) -> Result<AuthenticatedProcessGroup, ()> {
-    let stat = fs::read_to_string(format!("/proc/{}/stat", leader.as_raw_pid())).map_err(|_| ())?;
-    let fields = stat
-        .rsplit_once(") ")
-        .ok_or(())?
-        .1
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>();
-    if fields.first() != Some(&"T")
-        || fields.get(2).and_then(|value| value.parse::<i32>().ok()) != Some(leader.as_raw_pid())
-    {
-        return Err(());
+    let identity = capture_process_group_identity(leader).ok_or(())?;
+    if matches!(
+        system_process_identity_observation(&identity),
+        ProcessIdentityObservation::Exact {
+            leader: LeaderState::Stopped
+        }
+    ) {
+        Ok(identity)
+    } else {
+        Err(())
     }
-    AuthenticatedProcessGroup::new(leader, (*fields.get(19).ok_or(())?).to_owned()).ok_or(())
 }
 
 fn cleanup_owned_group(
@@ -532,11 +617,18 @@ fn terminate_owned_group(
     // pins the PID and authenticates this fallback even when inspection is lost.
     match kill_process_group(identity.process_group(), Signal::KILL) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
+        // Darwin reports EPERM when the retained group contains only the
+        // unreaped zombie leader. Reaping that owned child removes the group.
+        Err(Errno::PERM) if cfg!(target_vendor = "apple") => Ok(()),
         Err(_) => Err(()),
     }
 }
 
-fn cleanup_adopted_group(identity: &AuthenticatedProcessGroup) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+fn cleanup_adopted_group(
+    identity: &AuthenticatedProcessGroup,
+    _termination: AuthenticatedSignalResult,
+) -> io::Result<()> {
     let options = WaitIdOptions::EXITED
         | WaitIdOptions::STOPPED
         | WaitIdOptions::CONTINUED
@@ -566,6 +658,36 @@ fn cleanup_adopted_group(identity: &AuthenticatedProcessGroup) -> io::Result<()>
     reap_owned_process_group(identity.process_group())
 }
 
+#[cfg(target_vendor = "apple")]
+fn cleanup_adopted_group(
+    identity: &AuthenticatedProcessGroup,
+    termination: AuthenticatedSignalResult,
+) -> io::Result<()> {
+    match termination {
+        AuthenticatedSignalResult::Signalled => reap_owned_process_group(identity.process_group()),
+        AuthenticatedSignalResult::Absent
+            if process_group_is_quiescent(identity.process_group()) =>
+        {
+            Ok(())
+        }
+        AuthenticatedSignalResult::Absent | AuthenticatedSignalResult::Unavailable => Err(
+            io::Error::other("guarded process group ownership is unavailable"),
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn cleanup_adopted_group(
+    _identity: &AuthenticatedProcessGroup,
+    _termination: AuthenticatedSignalResult,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "authenticated child process guards are unavailable",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
     let started = crate::timing::monotonic_now();
     loop {
@@ -587,6 +709,29 @@ fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
+    let started = crate::timing::monotonic_now();
+    while !process_group_is_quiescent(process_group) {
+        if crate::timing::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "guarded process group did not exit",
+            ));
+        }
+        crate::timing::sleep(WORKER_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn reap_owned_process_group(_process_group: Pid) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "authenticated child process guards are unavailable",
+    ))
+}
+
 fn require_quiesced_marker(root: &Path) -> io::Result<()> {
     match fs::metadata(root.join(QUIESCED_FILE)) {
         Ok(metadata) if metadata.is_file() => Ok(()),
@@ -600,7 +745,12 @@ fn enable_child_subreaper() -> io::Result<()> {
     nix::sys::prctl::set_child_subreaper(true).map_err(io::Error::other)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "apple")]
+fn enable_child_subreaper() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn enable_child_subreaper() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -653,8 +803,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::process::Command as StdCommand;
 
+    #[cfg(target_os = "linux")]
     use super::super::process_group::capture_process_group_identity;
     use super::*;
 
@@ -666,9 +818,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exit_between_child_and_identity_observations_is_still_a_zombie() {
+        let identity =
+            AuthenticatedProcessGroup::new(Pid::from_raw(41).unwrap(), "start-identity".to_owned())
+                .unwrap();
+        let mut exit_observations = [false, true].into_iter();
+
+        assert_eq!(
+            observe_owned_leader_with(&identity, &UnavailableInspector, || {
+                Ok(exit_observations.next().unwrap())
+            })
+            .unwrap(),
+            ProcessIdentityObservation::Exact {
+                leader: LeaderState::Zombie
+            }
+        );
+        assert_eq!(exit_observations.next(), None);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn unavailable_inspection_fails_closed_and_reaps_descendants() {
+    fn unavailable_inspection_fails_closed_and_quiesces_descendants() {
         enable_child_subreaper().unwrap();
         let staging = tempfile::tempdir().unwrap();
         let descendant_file = staging.path().join("descendant.pid");
@@ -692,7 +863,6 @@ mod tests {
             }
             crate::timing::sleep(Duration::from_millis(10));
         }
-        let descendant = fs::read_to_string(&descendant_file).unwrap();
         let (_owner_event, owner_events) = mpsc::channel();
 
         assert!(
@@ -707,6 +877,6 @@ mod tests {
         );
 
         assert!(staging.path().join(QUIESCED_FILE).is_file());
-        assert!(!Path::new("/proc").join(descendant.trim()).exists());
+        assert!(process_group_is_quiescent(identity.process_group()));
     }
 }

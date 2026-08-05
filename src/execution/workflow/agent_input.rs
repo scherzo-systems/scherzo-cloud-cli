@@ -31,6 +31,7 @@ use super::private_staging::{
     StagingLifecycle, cleanup_staging, create_staging_root, finish_payload_file,
     mark_cleanup_failed, remove_open_tree_at, remove_staging_root,
 };
+use super::process_group::ProcessGuardRegistry;
 use super::step_runtime::{WorkingDirectoryFailure, resolve_working_directory};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedMessageSource,
@@ -513,6 +514,10 @@ impl AttachmentBudget {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "materialization makes every launch-owned dependency explicit"
+)]
 pub(crate) fn materialize_agent_invocation<Sink>(
     admitted: &AdmittedWorkflow,
     artifacts: &ArtifactStaging,
@@ -520,6 +525,7 @@ pub(crate) fn materialize_agent_invocation<Sink>(
     identity: AgentInvocationIdentity,
     upstream_outputs: &BTreeMap<ResolvedOutputSource, CapturedValue>,
     cancellation: CancellationSource,
+    process_guards: ProcessGuardRegistry,
     observation_sink: Sink,
 ) -> Result<MaterializedAgentInvocation<Sink>, AgentInputMaterializationError>
 where
@@ -615,6 +621,7 @@ where
         plan.value_mode,
         admitted_step.limits().clone(),
         cancellation,
+        process_guards,
         observation_sink,
     );
     drop(lifecycle);

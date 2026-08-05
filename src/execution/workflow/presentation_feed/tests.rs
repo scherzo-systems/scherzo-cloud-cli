@@ -4,6 +4,9 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 
 use super::*;
+use crate::execution::workflow::agent::{
+    AgentInvocationIdentity, AgentObservation, AgentObservationEnvelope, WorkflowRunId,
+};
 use crate::execution::workflow::observation::{CommandOutputSource, ObservedStepTransition};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{FailurePhase, StepStateKind, TransitionSequence};
@@ -107,6 +110,61 @@ steps:
             outputs: BTreeMap::new(),
         }
     );
+}
+
+#[test]
+fn agent_observations_are_typed_normalized_ordered_and_hide_native_events() {
+    let (_temporary, workflow) = resolved_workflow(
+        "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: fixture/model\n        thinking: off\nsteps:\n  a:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text:\n          - file: message.md\n",
+    );
+    let mut feed = WorkflowPresentationFeed::new(&workflow);
+    let identity = AgentInvocationIdentity::new(
+        WorkflowRunId::from(Arc::from("run")),
+        Arc::from("a"),
+        action(),
+    );
+
+    let assistant = feed.accept(
+        timestamp("2026-08-04T12:00:00.001Z"),
+        ExecutionObservation::<OffsetDateTime>::Agent(AgentObservationEnvelope::fixture(
+            identity.clone(),
+            1,
+            AgentObservation::AssistantText {
+                text: Arc::from("visible\u{1b}[2J\nsecond\u{202e}"),
+            },
+        )),
+    );
+    let native = feed.accept(
+        timestamp("2026-08-04T12:00:00.002Z"),
+        ExecutionObservation::<OffsetDateTime>::Agent(AgentObservationEnvelope::fixture(
+            identity,
+            2,
+            AgentObservation::UnrecognizedHarnessEvent {
+                event: Arc::new(serde_json::json!({"nativeSecret": "must-not-escape"})),
+            },
+        )),
+    );
+
+    assert_eq!(assistant.len(), 2);
+    assert_eq!(assistant[0].accepted_order.get(), 1);
+    assert_eq!(assistant[1].accepted_order.get(), 2);
+    let PresentationRecordKind::AgentObservation(first) = &assistant[0].kind else {
+        panic!("assistant text must remain typed");
+    };
+    assert_eq!(first.kind, AgentPresentationObservationKind::Assistant);
+    assert_eq!(first.observation_sequence, 1);
+    assert_eq!(first.payload, "visible");
+    let PresentationRecordKind::AgentObservation(second) = &assistant[1].kind else {
+        panic!("assistant text line must remain typed");
+    };
+    assert_eq!(second.payload, "second\\u{202e}");
+    let PresentationRecordKind::AgentObservation(native) = &native[0].kind else {
+        panic!("unknown harness events must be normalized");
+    };
+    assert_eq!(native.kind, AgentPresentationObservationKind::HarnessEvent);
+    assert_eq!(native.observation_sequence, 2);
+    assert_eq!(native.payload, "unrecognized harness event");
+    assert!(!format!("{native:?}").contains("nativeSecret"));
 }
 
 #[test]

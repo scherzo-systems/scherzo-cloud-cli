@@ -125,6 +125,7 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         value_mode.clone(),
         limits,
         cancellation.clone(),
+        crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
         RecordingObservationSink {
             observations: observation_sender,
         },

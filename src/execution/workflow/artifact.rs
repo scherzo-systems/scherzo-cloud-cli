@@ -21,6 +21,7 @@ use super::admission::AdmittedExecutionContext;
 use super::execution_root::{AdmittedExecutionRoot, directory_open_flags, open_directory};
 use super::private_staging::{
     StagingLifecycle, cleanup_staging, mark_cleanup_failed as mark_staging_cleanup_failed,
+    same_file,
 };
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -447,6 +448,23 @@ impl ArtifactStaging {
         Self::create_for_root(
             execution.root_identity().clone(),
             staging_parent,
+            None,
+            limits.maximum_captured_files(),
+            limits.maximum_captured_file_bytes(),
+            limits.maximum_total_captured_bytes(),
+        )
+    }
+
+    pub(crate) fn create_bound(
+        execution: &AdmittedExecutionContext,
+        staging_parent: &Path,
+        expected_parent: &OwnedFd,
+    ) -> Result<Self, ArtifactStagingFailure> {
+        let limits = execution.limits();
+        Self::create_for_root(
+            execution.root_identity().clone(),
+            staging_parent,
+            Some(expected_parent),
             limits.maximum_captured_files(),
             limits.maximum_captured_file_bytes(),
             limits.maximum_total_captured_bytes(),
@@ -466,6 +484,7 @@ impl ArtifactStaging {
         Self::create_for_root(
             execution_root,
             staging_parent,
+            None,
             maximum_files,
             maximum_file_bytes,
             maximum_total_bytes,
@@ -475,6 +494,7 @@ impl ArtifactStaging {
     fn create_for_root(
         execution_root: AdmittedExecutionRoot,
         staging_parent: &Path,
+        expected_parent: Option<&OwnedFd>,
         maximum_files: NonZeroUsize,
         maximum_file_bytes: NonZeroU64,
         maximum_total_bytes: NonZeroU64,
@@ -490,6 +510,11 @@ impl ArtifactStaging {
 
         let staging_parent_handle = open_directory(&canonical_staging_parent)
             .map_err(|_| ArtifactStagingFailure::StagingParentUnavailable)?;
+        if expected_parent
+            .is_some_and(|expected| !same_file(expected, &staging_parent_handle).unwrap_or(false))
+        {
+            return Err(ArtifactStagingFailure::StagingParentUnavailable);
+        }
         let (store_identity, staging_root) = create_staging_root(&staging_parent_handle)?;
         #[cfg(test)]
         let staging_path = canonical_staging_parent.join(store_identity.as_ref());
