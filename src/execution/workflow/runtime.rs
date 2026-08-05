@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use super::admission::{AdmittedWorkflow, CancellationReason};
 use super::validated::{
-    ResolvedValueSource, ValidatedCommonStep, ValidatedStep, ValidatedWorkflow,
+    ResolvedValueSource, ValidatedCommonStep, ValidatedMessageSource, ValidatedStep,
+    ValidatedWorkflow,
 };
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -205,7 +206,27 @@ impl RuntimeDefinition {
                                 .iter()
                                 .map(|(name, reference)| (name.clone(), reference.source.clone()))
                                 .collect(),
-                            ValidatedStep::Agent(_) => BTreeMap::new(),
+                            ValidatedStep::Agent(agent) => agent
+                                .agent
+                                .message
+                                .text
+                                .iter()
+                                .chain(&agent.agent.message.attachments)
+                                .filter_map(|source| match source {
+                                    ValidatedMessageSource::Reference {
+                                        source: ResolvedValueSource::Output(source),
+                                        ..
+                                    } => Some((
+                                        source.reference(),
+                                        ResolvedValueSource::Output(source.clone()),
+                                    )),
+                                    ValidatedMessageSource::File { .. }
+                                    | ValidatedMessageSource::Reference {
+                                        source: ResolvedValueSource::Import(_),
+                                        ..
+                                    } => None,
+                                })
+                                .collect(),
                         },
                         declared_outputs: common.outputs.keys().cloned().collect(),
                     },

@@ -129,6 +129,22 @@ async fn run_assignment_scenario() -> Vec<String> {
             acknowledgement_message_id,
             2,
         ));
+        let semantic = next_outbound(&mut fixture.outbound).await;
+        let semantic = decode_text(&semantic, "semantic assignment response");
+        assert_eq!(semantic["type"], "assignment_rejected");
+        assert_eq!(semantic["sequence"], 3);
+        assert_eq!(
+            semantic["payload"]["decline"]["reason"],
+            "workflow_mapping_unavailable"
+        );
+        let semantic_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture.inbound.send(effect_observation_acknowledgement(
+            semantic["messageId"]
+                .as_str()
+                .expect("semantic assignment response message ID"),
+            3,
+        ));
         let stress_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
         fixture
@@ -149,6 +165,7 @@ async fn run_assignment_scenario() -> Vec<String> {
         drop(first_silence_timer);
         drop(second_silence_timer);
         drop(assignment_silence_timer);
+        drop(semantic_silence_timer);
         drop(final_silence_timer);
     };
 
@@ -156,7 +173,7 @@ async fn run_assignment_scenario() -> Vec<String> {
     let outcome = outcome.expect("run deterministic established connection");
     assert!(outcome.opening_acknowledged);
     assert!(outcome.handshake_completed);
-    assert_eq!(next_sequence, 3);
+    assert_eq!(next_sequence, 4);
     transcript.record(
         "scenario.outcome:gateway-close:opening_acknowledged=true:handshake_completed=true"
             .to_owned(),
@@ -593,7 +610,11 @@ fn scripted_assignment_offer() -> Message {
         decoded["payload"]["runId"],
         "run_01k0z6r1w8f4jy2m7q9v3x5abj"
     );
-    assert_eq!(decoded["payload"]["leaseExpiresAt"], "2026-07-23T01:00:00Z");
+    assert_eq!(decoded["payload"]["offerExpiresAt"], "2026-07-23T01:00:00Z");
+    assert_eq!(
+        decoded["payload"]["executionSpec"]["registeredWorkflowId"],
+        "wfl_01k0z6r1w8f4jy2m7q9v3x5abc"
+    );
     offer
 }
 

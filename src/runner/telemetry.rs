@@ -26,7 +26,6 @@ pub(crate) mod attribute {
     pub(crate) const ERROR_TYPE: &str = "error.type";
     pub(crate) const FAILURE_KIND: &str = "scherzo.connection.failure_kind";
     pub(crate) const HANDSHAKE_COMPLETED: &str = "scherzo.runner.handshake_completed";
-    pub(crate) const LEASE_REMAINING_MS: &str = "scherzo.delivery.lease_remaining_ms";
     pub(crate) const OPENING_ACKNOWLEDGED: &str = "scherzo.runner.opening_acknowledged";
     pub(crate) const RUN_ID: &str = "scherzo.run.id";
     pub(crate) const RUNNER_BOOT_ID: &str = "scherzo.runner.boot_id";

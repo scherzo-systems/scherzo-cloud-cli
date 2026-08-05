@@ -11,10 +11,23 @@ use crate::execution::workflow::agent::{
 const CWD: &str = "/execution/worktree";
 const RESPONSE_SUCCESS: &[u8] = include_bytes!("fixtures/response-success.jsonl");
 const NATIVE_RECOVERY: &[u8] = include_bytes!("fixtures/native-recovery.jsonl");
+const PARALLEL_WORK_BEFORE_RESULT: &[u8] =
+    include_bytes!("fixtures/parallel-work-before-result.jsonl");
+const SIBLING_RESULT_CORRECTION: &[u8] = include_bytes!("fixtures/sibling-result-correction.jsonl");
 const TERMINAL_TOOL_USE: &[u8] = include_bytes!("fixtures/terminal-tool-use.jsonl");
 
 fn parser(kind: AgentValueKind) -> PiJsonV1Parser {
     PiJsonV1Parser::profile(Arc::from(CWD), kind)
+}
+
+fn result_parser() -> PiJsonV1Parser {
+    PiJsonV1Parser::new(
+        Arc::from(CWD),
+        AgentValueKind::Result,
+        NonZeroU64::new(MAXIMUM_RESPONSE_BYTES).unwrap(),
+        PiJsonV1ProtocolLimits::profile(),
+        Some(Arc::from("scherzo_result_fixed")),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -43,6 +56,41 @@ fn replay(bytes: &[u8], kind: AgentValueKind) -> RecordedReplay {
     let mut parser = parser(kind);
     let mut observations = Vec::new();
     let _ = parser.push_stdout(bytes, |observation| observations.push(observation));
+    RecordedReplay {
+        observations,
+        outcome: parser.finish(PiJsonV1ProcessCompletion::exited(true)),
+    }
+}
+
+fn replay_accepted_result(bytes: &[u8], call_id: &str) -> RecordedReplay {
+    let end_offset = event_offset_for_call(bytes, "tool_execution_end", call_id);
+    let arguments = Arc::new(json!({"result": {"answer": 42}}));
+    let mut parser = result_parser();
+    let mut observations = Vec::new();
+    parser
+        .push_stdout(&bytes[..end_offset], |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    parser
+        .correlate_result_request("scherzo_result_fixed", call_id, arguments.as_ref())
+        .unwrap();
+    parser
+        .accept_result(AcceptedPiJsonV1Result::new(
+            Arc::from(call_id),
+            Arc::from("scherzo_result_fixed"),
+            arguments,
+            BoundedSchemaValidAgentResult::fixture(
+                Arc::new(json!({"answer": 42})),
+                Arc::from(br#"{"answer":42}"#.as_slice()),
+            ),
+        ))
+        .unwrap();
+    parser
+        .push_stdout(&bytes[end_offset..], |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
     RecordedReplay {
         observations,
         outcome: parser.finish(PiJsonV1ProcessCompletion::exited(true)),
@@ -116,6 +164,137 @@ fn terminal(outcome: AgentOutcome) -> RecordedReplay {
         observations: Vec::new(),
         outcome,
     }
+}
+
+fn reused_result_identity_then_correction_transcript() -> Vec<u8> {
+    let usage = json!({
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+    });
+    let earlier = json!({
+        "role": "assistant",
+        "content": [{"type": "toolCall", "id": "call-blocked-result", "name": "inspect", "arguments": {"path": "old.txt"}}],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": usage,
+        "stopReason": "toolUse",
+        "timestamp": 1
+    });
+    let earlier_result = json!({
+        "role": "toolResult",
+        "toolCallId": "call-blocked-result",
+        "toolName": "inspect",
+        "content": [{"type": "text", "text": "old contents"}],
+        "details": {},
+        "isError": false,
+        "timestamp": 2
+    });
+    let mut events = values(SIBLING_RESULT_CORRECTION);
+    events.retain(|event| {
+        event.get("toolCallId").and_then(Value::as_str) != Some("call-sibling-read")
+            && event
+                .get("message")
+                .and_then(|message| message.get("toolCallId"))
+                .and_then(Value::as_str)
+                != Some("call-sibling-read")
+    });
+    visit_assistant_messages(&mut events, |assistant| {
+        if assistant["timestamp"] == 2 {
+            assistant["content"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|block| block["id"] != "call-sibling-read");
+        }
+    });
+    for event in &mut events {
+        if event["type"] == "turn_end" {
+            event["toolResults"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|result| result["toolCallId"] != "call-sibling-read");
+        } else if event["type"] == "agent_end" {
+            event["messages"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|message| message["toolCallId"] != "call-sibling-read");
+        }
+    }
+    events.splice(
+        2..2,
+        [
+            json!({"type": "turn_start"}),
+            json!({"type": "message_start", "message": earlier}),
+            json!({"type": "message_end", "message": earlier}),
+            json!({"type": "tool_execution_start", "toolCallId": "call-blocked-result", "toolName": "inspect", "args": {"path": "old.txt"}}),
+            json!({"type": "tool_execution_end", "toolCallId": "call-blocked-result", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "old contents"}], "details": {}}, "isError": false}),
+            json!({"type": "message_start", "message": earlier_result}),
+            json!({"type": "message_end", "message": earlier_result}),
+            json!({"type": "turn_end", "message": earlier, "toolResults": [earlier_result]}),
+        ],
+    );
+    let messages = events
+        .iter_mut()
+        .find(|event| event["type"] == "agent_end")
+        .unwrap()["messages"]
+        .as_array_mut()
+        .unwrap();
+    messages.splice(0..0, [earlier, earlier_result]);
+    String::from_utf8(encoded(&events))
+        .unwrap()
+        .replace(
+            "No result was accepted. Call the workflow result tool by itself, without sibling tool calls.",
+            "No result was accepted. The workflow result call could not be correlated.",
+        )
+        .into_bytes()
+}
+
+fn parallel_work_then_stop_transcript() -> Vec<u8> {
+    let mut events = values(PARALLEL_WORK_BEFORE_RESULT);
+    let second_turn = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "turn_start")
+        .nth(1)
+        .map(|(index, _)| index)
+        .unwrap();
+    let mut completed_messages = events[..second_turn]
+        .iter()
+        .filter(|event| event["type"] == "message_end")
+        .map(|event| event["message"].clone())
+        .collect::<Vec<_>>();
+    events.truncate(second_turn);
+    let assistant = json!({
+        "role": "assistant",
+        "content": [{"type": "text", "text": "parallel work completed"}],
+        "api": "test-api",
+        "provider": "test-provider",
+        "model": "test-model",
+        "usage": {
+            "input": 2,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 3,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+        },
+        "stopReason": "stop",
+        "timestamp": 5
+    });
+    completed_messages.push(assistant.clone());
+    events.extend([
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": assistant}),
+        json!({"type": "message_end", "message": assistant}),
+        json!({"type": "turn_end", "message": assistant, "toolResults": []}),
+        json!({"type": "agent_end", "messages": completed_messages, "willRetry": false}),
+        json!({"type": "agent_settled"}),
+    ]);
+    encoded(&events)
 }
 
 fn tool_error_then_success_transcript() -> Vec<u8> {
@@ -346,6 +525,50 @@ fn compaction_and_provider_failures_remain_observational_during_native_recovery(
 }
 
 #[test]
+fn pending_is_partial_only_and_recorded_streams_reach_terminal_reasons() {
+    for (fixture, terminal_reason) in [(RESPONSE_SUCCESS, "stop"), (TERMINAL_TOOL_USE, "toolUse")] {
+        let events = values(fixture);
+        let partial_reasons = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("message_start" | "message_update")
+                )
+            })
+            .filter_map(|event| event["message"]["stopReason"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!partial_reasons.is_empty());
+        assert!(partial_reasons.iter().all(|reason| *reason == "pending"));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| {
+                    event["type"] == "message_end" && event["message"]["role"] == "assistant"
+                })
+                .unwrap()["message"]["stopReason"],
+            terminal_reason
+        );
+    }
+
+    assert!(matches!(
+        replay(RESPONSE_SUCCESS, AgentValueKind::Response).outcome(),
+        AgentOutcome::Completed(CompletedAgentInvocation::Response(_))
+    ));
+    assert_failure(
+        &replay(TERMINAL_TOOL_USE, AgentValueKind::Result),
+        AgentFailureCause::MissingResult,
+    );
+    assert_failure(
+        &replay(
+            &simple_transcript("pending", json!([])),
+            AgentValueKind::None,
+        ),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
 fn terminal_stop_reasons_use_the_closed_mode_table() {
     let no_value = replay(&simple_transcript("stop", json!([])), AgentValueKind::None);
     assert_eq!(
@@ -395,6 +618,173 @@ fn terminal_stop_reasons_use_the_closed_mode_table() {
 }
 
 #[test]
+fn ordinary_parallel_work_remains_valid_in_every_output_mode() {
+    let stop_transcript = parallel_work_then_stop_transcript();
+    assert_eq!(
+        replay(&stop_transcript, AgentValueKind::None).outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+    assert_eq!(
+        replay(&stop_transcript, AgentValueKind::Response).outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Response(
+            BoundedAgentResponse::from_bounded(Arc::from("parallel work completed")),
+        ))
+    );
+    assert_failure(
+        &replay(&stop_transcript, AgentValueKind::Result),
+        AgentFailureCause::MissingResult,
+    );
+
+    let first = replay_accepted_result(PARALLEL_WORK_BEFORE_RESULT, "call-final-result");
+    let second = replay_accepted_result(PARALLEL_WORK_BEFORE_RESULT, "call-final-result");
+    assert_eq!(first, second);
+    assert!(matches!(
+        first.outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(
+        first
+            .observations
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                AgentObservation::ToolCall {
+                    phase: AgentToolCallPhase::Started,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn sibling_result_rejection_and_singleton_correction_are_repeatable() {
+    let first = replay_accepted_result(SIBLING_RESULT_CORRECTION, "call-corrected-result");
+    let second = replay_accepted_result(SIBLING_RESULT_CORRECTION, "call-corrected-result");
+    assert_eq!(first, second);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = &first.outcome else {
+        panic!("the corrected singleton result must complete");
+    };
+    assert_eq!(result.value(), &json!({"answer": 42}));
+    assert!(first.observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::ToolResult {
+            call_id,
+            is_error: true,
+            ..
+        } if call_id.as_ref() == "call-blocked-result"
+    )));
+    assert!(first.observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::ToolResult {
+            call_id,
+            is_error: false,
+            ..
+        } if call_id.as_ref() == "call-sibling-read"
+    )));
+}
+
+#[test]
+fn reused_result_identity_cannot_be_recovered_into_a_committed_result() {
+    let transcript = reused_result_identity_then_correction_transcript();
+    let ambiguous_call = event_offset_for_call_occurrence(
+        &transcript,
+        "tool_execution_start",
+        "call-blocked-result",
+        1,
+    );
+    let mut parser = result_parser();
+    assert_eq!(
+        parser.push_ignoring(&transcript[..ambiguous_call]),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    assert_failure(
+        &terminal(parser.finish(PiJsonV1ProcessCompletion::exited(true))),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
+fn result_identity_ambiguity_and_post_acceptance_work_are_protocol_failures() {
+    let singleton_end = event_offset(TERMINAL_TOOL_USE, "tool_execution_end");
+    for (name, call_id, arguments) in [
+        (
+            "scherzo_result_wrong",
+            "call-result",
+            json!({"result": {"answer": 42}}),
+        ),
+        (
+            "scherzo_result_fixed",
+            "call-wrong",
+            json!({"result": {"answer": 42}}),
+        ),
+        (
+            "scherzo_result_fixed",
+            "call-result",
+            json!({"result": {"answer": 41}}),
+        ),
+    ] {
+        let mut parser = result_parser();
+        parser
+            .push_ignoring(&TERMINAL_TOOL_USE[..singleton_end])
+            .unwrap();
+        assert_eq!(
+            parser.correlate_result_request(name, call_id, &arguments),
+            Err(AgentFailureCause::HarnessProtocolFailed)
+        );
+    }
+
+    let sibling_end = event_offset_for_call(
+        SIBLING_RESULT_CORRECTION,
+        "tool_execution_end",
+        "call-blocked-result",
+    );
+    let mut ambiguous = result_parser();
+    ambiguous
+        .push_ignoring(&SIBLING_RESULT_CORRECTION[..sibling_end])
+        .unwrap();
+    assert_eq!(
+        ambiguous.correlate_result_request(
+            "scherzo_result_fixed",
+            "call-blocked-result",
+            &json!({"result": {"answer": 0}}),
+        ),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+
+    let mut accepted = result_parser();
+    accepted
+        .push_ignoring(&TERMINAL_TOOL_USE[..singleton_end])
+        .unwrap();
+    let arguments = Arc::new(json!({"result": {"answer": 42}}));
+    accepted
+        .correlate_result_request("scherzo_result_fixed", "call-result", arguments.as_ref())
+        .unwrap();
+    accepted
+        .accept_result(AcceptedPiJsonV1Result::new(
+            Arc::from("call-result"),
+            Arc::from("scherzo_result_fixed"),
+            arguments,
+            BoundedSchemaValidAgentResult::fixture(
+                Arc::new(json!({"answer": 42})),
+                Arc::from(br#"{"answer":42}"#.as_slice()),
+            ),
+        ))
+        .unwrap();
+    assert_eq!(
+        accepted.push_ignoring(b"{\"type\":\"turn_start\"}\n"),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+
+    let mut unvalidated_success = result_parser();
+    assert_eq!(
+        unvalidated_success.push_ignoring(TERMINAL_TOOL_USE),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+}
+
+#[test]
 fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
     let end_offset = event_offset(TERMINAL_TOOL_USE, "tool_execution_end");
     let mut accepted_parser = parser(AgentValueKind::Result);
@@ -402,6 +792,13 @@ fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
         .push_ignoring(&TERMINAL_TOOL_USE[..end_offset])
         .unwrap();
     let result_value = Arc::new(json!({"answer": 42}));
+    accepted_parser
+        .correlate_result_request(
+            "scherzo_result_fixed",
+            "call-result",
+            &json!({"result": {"answer": 42}}),
+        )
+        .unwrap();
     accepted_parser
         .accept_result(AcceptedPiJsonV1Result::new(
             Arc::from("call-result"),
@@ -432,6 +829,13 @@ fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
     let mut parser = parser(AgentValueKind::Result);
     parser.push_ignoring(&contradictory[..end_offset]).unwrap();
     parser
+        .correlate_result_request(
+            "scherzo_result_fixed",
+            "call-result",
+            &json!({"result": {"answer": 42}}),
+        )
+        .unwrap();
+    parser
         .accept_result(AcceptedPiJsonV1Result::new(
             Arc::from("call-result"),
             Arc::from("scherzo_result_fixed"),
@@ -447,6 +851,81 @@ fn accepted_singleton_result_requires_matching_native_terminal_sequence() {
         &terminal(parser.finish(PiJsonV1ProcessCompletion::exited(true))),
         AgentFailureCause::HarnessProtocolFailed,
     );
+}
+
+#[test]
+fn rejected_validation_cannot_be_followed_by_native_tool_success() {
+    let end_offset = event_offset(TERMINAL_TOOL_USE, "tool_execution_end");
+    let mut parser = parser(AgentValueKind::Result);
+    parser
+        .push_ignoring(&TERMINAL_TOOL_USE[..end_offset])
+        .unwrap();
+    parser
+        .correlate_result_request(
+            "scherzo_result_fixed",
+            "call-result",
+            &json!({"result": {"answer": 42}}),
+        )
+        .unwrap();
+
+    // A native tool-result handler must not contradict the authoritative rejection.
+    let contradictory_end = encoded(&[json!({
+        "type": "tool_execution_end",
+        "toolCallId": "call-result",
+        "toolName": "scherzo_result_fixed",
+        "result": {
+            "content": [{"type": "text", "text": "rewritten as success"}],
+            "details": {}
+        },
+        "isError": false
+    })]);
+    assert_eq!(
+        parser.push_ignoring(&contradictory_end),
+        Err(AgentFailureCause::HarnessProtocolFailed),
+    );
+}
+
+#[test]
+fn terminal_result_settlement_uses_semantic_numeric_equality() {
+    let mut events = values(TERMINAL_TOOL_USE);
+    let transcript_arguments = json!({"result": {"count": 1.0}});
+    visit_assistant_messages(&mut events, |assistant| {
+        assistant["content"][0]["arguments"] = transcript_arguments.clone();
+    });
+    events
+        .iter_mut()
+        .find(|event| event["type"] == "tool_execution_start")
+        .unwrap()["args"] = transcript_arguments;
+    let transcript = encoded(&events);
+    let end_offset = event_offset(&transcript, "tool_execution_end");
+    let mut parser = parser(AgentValueKind::Result);
+    parser.push_ignoring(&transcript[..end_offset]).unwrap();
+
+    let socket_arguments = Arc::new(json!({"result": {"count": 1}}));
+    parser
+        .correlate_result_request(
+            "scherzo_result_fixed",
+            "call-result",
+            socket_arguments.as_ref(),
+        )
+        .unwrap();
+    parser
+        .accept_result(AcceptedPiJsonV1Result::new(
+            Arc::from("call-result"),
+            Arc::from("scherzo_result_fixed"),
+            socket_arguments,
+            BoundedSchemaValidAgentResult::fixture(
+                Arc::new(json!({"count": 1})),
+                Arc::from(br#"{"count":1}"#.as_slice()),
+            ),
+        ))
+        .unwrap();
+    parser.push_ignoring(&transcript[end_offset..]).unwrap();
+
+    assert!(matches!(
+        parser.finish(PiJsonV1ProcessCompletion::exited(true)),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
 }
 
 #[test]
@@ -704,20 +1183,38 @@ fn eof_exit_and_terminal_disagreement_invalidate_provisional_values() {
         },
     );
 
-    let cancelled = terminal({
-        let bytes = simple_transcript("aborted", json!([]));
+    for exit_success in [false, true] {
+        let cancelled = terminal({
+            let mut parser = parser(AgentValueKind::Response);
+            parser.push_ignoring(RESPONSE_SUCCESS).unwrap();
+            parser.finish(PiJsonV1ProcessCompletion::cancelled(
+                exit_success,
+                CancellationReason::UserRequest,
+            ))
+        });
+        assert_eq!(
+            cancelled.outcome(),
+            &AgentOutcome::Cancelled {
+                reason: CancellationReason::UserRequest
+            },
+            "cancellation must discard the provisional response for every exit status"
+        );
+    }
+
+    let cancelled_after_protocol_failure = terminal({
         let mut parser = parser(AgentValueKind::None);
-        parser.push_ignoring(&bytes).unwrap();
+        assert!(parser.push_ignoring(b"not-json\n").is_err());
         parser.finish(PiJsonV1ProcessCompletion::cancelled(
             false,
             CancellationReason::UserRequest,
         ))
     });
     assert_eq!(
-        cancelled.outcome(),
+        cancelled_after_protocol_failure.outcome(),
         &AgentOutcome::Cancelled {
             reason: CancellationReason::UserRequest
-        }
+        },
+        "late native protocol failures cannot replace accepted cancellation"
     );
 }
 
@@ -750,6 +1247,32 @@ fn event_offset(bytes: &[u8], event_type: &str) -> usize {
     panic!("fixture must contain {event_type}");
 }
 
+fn event_offset_for_call(bytes: &[u8], event_type: &str, call_id: &str) -> usize {
+    event_offset_for_call_occurrence(bytes, event_type, call_id, 0)
+}
+
+fn event_offset_for_call_occurrence(
+    bytes: &[u8],
+    event_type: &str,
+    call_id: &str,
+    expected_occurrence: usize,
+) -> usize {
+    let mut offset = 0;
+    let mut occurrence = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let frame = line.strip_suffix(b"\n").unwrap_or(line);
+        let event = serde_json::from_slice::<Value>(frame).unwrap();
+        if event["type"] == event_type && event["toolCallId"] == call_id {
+            if occurrence == expected_occurrence {
+                return offset;
+            }
+            occurrence += 1;
+        }
+        offset += line.len();
+    }
+    panic!("fixture must contain occurrence {expected_occurrence} of {event_type} for {call_id}");
+}
+
 fn visit_assistant_messages(values: &mut [Value], mut visit: impl FnMut(&mut Value)) {
     fn descend(value: &mut Value, visit: &mut impl FnMut(&mut Value)) {
         match value {
@@ -777,6 +1300,18 @@ fn visit_assistant_messages(values: &mut [Value], mut visit: impl FnMut(&mut Val
 }
 
 #[test]
+fn argument_correlation_uses_exact_json_semantics_including_numeric_equivalence() {
+    assert!(semantically_equal_json(
+        &json!({"result": {"count": 1, "items": [true, null]}}),
+        &json!({"result": {"items": [true, null], "count": 1.0}}),
+    ));
+    assert!(!semantically_equal_json(
+        &json!({"result": 9_007_199_254_740_993_u64}),
+        &json!({"result": 9_007_199_254_740_992.0_f64}),
+    ));
+}
+
+#[test]
 fn retained_correlation_state_is_bounded_by_the_protocol_frame_limit() {
     let limits = PiJsonV1ProtocolLimits {
         maximum_frame_bytes: NonZeroU64::new(512).unwrap(),
@@ -786,6 +1321,7 @@ fn retained_correlation_state_is_bounded_by_the_protocol_frame_limit() {
         AgentValueKind::None,
         NonZeroU64::new(1024).unwrap(),
         limits,
+        None,
     );
     let mut events = vec![
         json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-000000000007", "timestamp": "2026-07-30T12:00:00Z", "cwd": CWD}),
@@ -810,6 +1346,7 @@ fn parser_accepts_an_explicit_smaller_admitted_response_limit() {
         AgentValueKind::Response,
         NonZeroU64::new(4).unwrap(),
         PiJsonV1ProtocolLimits::profile(),
+        None,
     );
     assert_eq!(
         parser.push_ignoring(&simple_transcript(

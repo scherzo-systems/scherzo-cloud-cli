@@ -1,0 +1,872 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::future::{Future, ready};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use time::OffsetDateTime;
+use tokio::sync::watch;
+
+use super::admission::CancellationReason;
+use super::observation::{
+    CommandOutputSource, ExecutionObservation, ExecutionObserver, ObservedStepTransition,
+    SourceSequence,
+};
+use super::presentation_feed::{
+    AcceptedRecordOrder, DisplayDeadline, MAX_NORMALIZED_CHILD_RECORD_BYTES, NormalizedChildOutput,
+    PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
+    WorkflowPresentationStep,
+};
+use super::publication::{
+    LocalPublicationError, LocalPublicationFailureKind, LocalPublicationPhase, WorkflowRunResult,
+    WorkflowRunTiming, WorkflowStepTiming,
+};
+use super::resolution::ResolvedWorkflow;
+use super::run_timing::{
+    ObservationClock, ObservationTime, RunTimingObservation, RunTimingSnapshot,
+};
+use super::runtime::{
+    RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
+};
+use super::step_runtime::StepFailureCause;
+
+const DEFAULT_LOG_RECORDS_PER_STEP: usize = 1024;
+const DEFAULT_LOG_BYTES_PER_STEP: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StepLogCapacity {
+    maximum_records: usize,
+    maximum_bytes: usize,
+}
+
+impl StepLogCapacity {
+    pub(crate) fn new(maximum_records: usize, maximum_bytes: usize) -> Option<Self> {
+        (maximum_records != 0 && maximum_bytes >= MAX_NORMALIZED_CHILD_RECORD_BYTES).then_some(
+            Self {
+                maximum_records,
+                maximum_bytes,
+            },
+        )
+    }
+
+    pub(crate) const fn maximum_records(self) -> usize {
+        self.maximum_records
+    }
+
+    pub(crate) const fn maximum_bytes(self) -> usize {
+        self.maximum_bytes
+    }
+}
+
+impl Default for StepLogCapacity {
+    fn default() -> Self {
+        Self {
+            maximum_records: DEFAULT_LOG_RECORDS_PER_STEP,
+            maximum_bytes: DEFAULT_LOG_BYTES_PER_STEP,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunLogRecord {
+    pub(crate) accepted_order: AcceptedRecordOrder,
+    pub(crate) observed_at: OffsetDateTime,
+    pub(crate) invocation: super::runtime::ActionId,
+    pub(crate) source: CommandOutputSource,
+    pub(crate) source_sequence: SourceSequence,
+    pub(crate) payload: Arc<str>,
+    pub(crate) continuation: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunStepLog {
+    pub(crate) records: Vec<WorkflowRunLogRecord>,
+    pub(crate) observed_records: u64,
+    pub(crate) retained_records: u64,
+    pub(crate) retained_bytes: u64,
+    pub(crate) discarded_records: u64,
+    pub(crate) discarded_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunOutputUnavailableReason {
+    Failed,
+    Blocked,
+    NotRun,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunOutputDisposition {
+    Pending,
+    Committed,
+    Unavailable(WorkflowRunOutputUnavailableReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunElapsed {
+    pub(crate) started_at: OffsetDateTime,
+    pub(crate) duration: Duration,
+    pub(crate) frozen: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunStepView {
+    pub(crate) id: String,
+    pub(crate) definition: WorkflowPresentationStep,
+    pub(crate) state: StepStateKind,
+    pub(crate) fact: Option<ObservedStepTransition>,
+    pub(crate) timing: Option<WorkflowRunElapsed>,
+    pub(crate) outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
+    pub(crate) log: WorkflowRunStepLog,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunCancellationView {
+    pub(crate) reason: CancellationReason,
+    pub(crate) force_stop_deadline: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunPublicationFailure {
+    pub(crate) phase: LocalPublicationPhase,
+    pub(crate) kind: LocalPublicationFailureKind,
+    pub(crate) export: Option<String>,
+}
+
+impl From<&LocalPublicationError> for WorkflowRunPublicationFailure {
+    fn from(error: &LocalPublicationError) -> Self {
+        Self {
+            phase: error.phase(),
+            kind: error.kind(),
+            export: error.export().map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunPublicationResult {
+    Succeeded { result_directory: String },
+    Failed(WorkflowRunPublicationFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunPublicationState {
+    NotStarted,
+    Publishing,
+    Completed(WorkflowRunPublicationResult),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunCleanupResult {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunCleanupState {
+    NotStarted,
+    Cleaning,
+    Completed(WorkflowRunCleanupResult),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowRunViewSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) workflow_path: String,
+    pub(crate) maximum_parallel_steps: usize,
+    pub(crate) workflow: WorkflowState<StepFailureCause>,
+    pub(crate) timing: WorkflowRunElapsed,
+    pub(crate) steps: Vec<WorkflowRunStepView>,
+    pub(crate) cancellation: Option<WorkflowRunCancellationView>,
+    pub(crate) authoritative_result: bool,
+    pub(crate) quiescent: bool,
+    pub(crate) publication: WorkflowRunPublicationState,
+    pub(crate) cleanup: WorkflowRunCleanupState,
+    pub(crate) quit_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunViewModelError {
+    AlreadyReconciled,
+    InvalidTerminalResult,
+}
+
+pub(crate) struct WorkflowRunViewModel<Clock> {
+    inner: Arc<Mutex<WorkflowRunViewState>>,
+    timing: RunTimingObservation,
+    clock: Clock,
+    changes: watch::Sender<u64>,
+}
+
+impl<Clock: Clone> Clone for WorkflowRunViewModel<Clock> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            timing: self.timing.clone(),
+            clock: self.clock.clone(),
+            changes: self.changes.clone(),
+        }
+    }
+}
+
+impl<Clock> WorkflowRunViewModel<Clock>
+where
+    Clock: ObservationClock,
+{
+    pub(crate) fn new(
+        workflow: &ResolvedWorkflow,
+        maximum_parallel_steps: usize,
+        timing: RunTimingObservation,
+        clock: Clock,
+        log_capacity: StepLogCapacity,
+    ) -> Self {
+        let feed = WorkflowPresentationFeed::new(workflow);
+        let steps = feed
+            .definition()
+            .presentation_order
+            .iter()
+            .filter_map(|id| {
+                feed.definition()
+                    .steps
+                    .get(id)
+                    .cloned()
+                    .map(|definition| WorkflowRunStepViewState::new(id.clone(), definition))
+            })
+            .collect::<Vec<_>>();
+        let step_indexes = steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.id.clone(), index))
+            .collect();
+        let (changes, _) = watch::channel(0);
+        Self {
+            inner: Arc::new(Mutex::new(WorkflowRunViewState {
+                workflow_path: feed.definition().workflow_path.clone(),
+                maximum_parallel_steps,
+                feed,
+                step_indexes,
+                steps,
+                workflow: WorkflowState::Executing {
+                    gate: SchedulingGate::Open,
+                },
+                cancellation: None,
+                authoritative_result: false,
+                terminal_timing: None,
+                quiescent: false,
+                publication: WorkflowRunPublicationState::NotStarted,
+                cleanup: WorkflowRunCleanupState::NotStarted,
+                log_capacity,
+                last_accepted_order: None,
+                generation: 0,
+            })),
+            timing,
+            clock,
+            changes,
+        }
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub(crate) fn timing_observation(&self) -> RunTimingObservation {
+        self.timing.clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> WorkflowRunViewSnapshot {
+        self.snapshot_with_logs(None)
+    }
+
+    pub(crate) fn snapshot_for_render(&self, selected_step: usize) -> WorkflowRunViewSnapshot {
+        self.snapshot_with_logs(Some(selected_step))
+    }
+
+    fn snapshot_with_logs(&self, selected_step: Option<usize>) -> WorkflowRunViewSnapshot {
+        let now = self.clock.sample();
+        let state = lock_state(&self.inner);
+        let timing = self.timing.snapshot();
+        let workflow_timing = state.terminal_timing.as_ref().map_or_else(
+            || observed_run_elapsed(&timing, now),
+            |terminal| WorkflowRunElapsed {
+                started_at: terminal.started_at,
+                duration: terminal.duration,
+                frozen: true,
+            },
+        );
+        let steps = state
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                step.snapshot(
+                    &timing,
+                    now,
+                    state.authoritative_result,
+                    selected_step.is_none_or(|selected| selected == index),
+                )
+            })
+            .collect();
+        let quit_eligible = !matches!(state.workflow, WorkflowState::Executing { .. });
+        WorkflowRunViewSnapshot {
+            generation: state.generation,
+            workflow_path: state.workflow_path.clone(),
+            maximum_parallel_steps: state.maximum_parallel_steps,
+            workflow: state.workflow.clone(),
+            timing: workflow_timing,
+            steps,
+            cancellation: state.cancellation.clone(),
+            authoritative_result: state.authoritative_result,
+            quiescent: state.quiescent,
+            publication: state.publication.clone(),
+            cleanup: state.cleanup,
+            quit_eligible,
+        }
+    }
+
+    pub(crate) fn reconcile_terminal_result(
+        &self,
+        run: &WorkflowRunResult,
+    ) -> Result<(), WorkflowRunViewModelError> {
+        let generation = {
+            let mut state = lock_state(&self.inner);
+            if state.authoritative_result {
+                return Err(WorkflowRunViewModelError::AlreadyReconciled);
+            }
+            validate_terminal_result(&state, run)?;
+            let closing_records = state.feed.finish_child_streams(run.timing.finished_at);
+            for record in closing_records {
+                state.apply_record(record);
+            }
+
+            state.workflow = workflow_state_from_outcome(&run.outcome);
+            state.cancellation =
+                run.cancellation
+                    .as_ref()
+                    .map(|cancellation| WorkflowRunCancellationView {
+                        reason: cancellation.reason,
+                        force_stop_deadline: cancellation.force_stop_deadline,
+                    });
+            for (view, terminal) in state.steps.iter_mut().zip(&run.steps) {
+                view.reconcile(terminal);
+            }
+            state.terminal_timing = Some(run.timing.clone());
+            state.authoritative_result = true;
+            state.advance_generation()
+        };
+        self.changes.send_replace(generation);
+        Ok(())
+    }
+
+    pub(crate) fn mark_quiescent(&self) {
+        let generation = {
+            let mut state = lock_state(&self.inner);
+            if state.quiescent {
+                return;
+            }
+            let observed_at = self.clock.sample();
+            self.timing.mark_quiesced(observed_at);
+            state.quiescent = true;
+            state.advance_generation()
+        };
+        self.changes.send_replace(generation);
+    }
+
+    pub(crate) fn begin_publication(&self) {
+        self.update(|state| {
+            if state.publication != WorkflowRunPublicationState::NotStarted {
+                return false;
+            }
+            state.publication = WorkflowRunPublicationState::Publishing;
+            true
+        });
+    }
+
+    pub(crate) fn complete_publication(&self, result: WorkflowRunPublicationResult) {
+        self.update(|state| {
+            if state.publication != WorkflowRunPublicationState::Publishing {
+                return false;
+            }
+            state.publication = WorkflowRunPublicationState::Completed(result);
+            true
+        });
+    }
+
+    pub(crate) fn begin_cleanup(&self) {
+        self.update(|state| {
+            if state.cleanup != WorkflowRunCleanupState::NotStarted {
+                return false;
+            }
+            state.cleanup = WorkflowRunCleanupState::Cleaning;
+            true
+        });
+    }
+
+    pub(crate) fn complete_cleanup(&self, result: WorkflowRunCleanupResult) {
+        self.update(|state| {
+            if state.cleanup != WorkflowRunCleanupState::Cleaning {
+                return false;
+            }
+            state.cleanup = WorkflowRunCleanupState::Completed(result);
+            true
+        });
+    }
+
+    fn update(&self, update: impl FnOnce(&mut WorkflowRunViewState) -> bool) {
+        let generation = {
+            let mut state = lock_state(&self.inner);
+            update(&mut state).then(|| state.advance_generation())
+        };
+        if let Some(generation) = generation {
+            self.changes.send_replace(generation);
+        }
+    }
+}
+
+impl<Clock, Deadline> ExecutionObserver<Deadline> for WorkflowRunViewModel<Clock>
+where
+    Clock: ObservationClock,
+    Deadline: DisplayDeadline,
+{
+    fn observe(
+        &self,
+        observation: ExecutionObservation<Deadline>,
+    ) -> impl Future<Output = ()> + Send {
+        let generation = {
+            let mut state = lock_state(&self.inner);
+            let observed_at = self.clock.sample();
+            self.timing.record(&observation, observed_at);
+            let records = state.feed.accept(observed_at.utc, observation);
+            if records.is_empty() {
+                None
+            } else {
+                for record in records {
+                    state.apply_record(record);
+                }
+                Some(state.advance_generation())
+            }
+        };
+        if let Some(generation) = generation {
+            self.changes.send_replace(generation);
+        }
+        ready(())
+    }
+}
+
+struct WorkflowRunViewState {
+    workflow_path: String,
+    maximum_parallel_steps: usize,
+    feed: WorkflowPresentationFeed,
+    step_indexes: BTreeMap<String, usize>,
+    steps: Vec<WorkflowRunStepViewState>,
+    workflow: WorkflowState<StepFailureCause>,
+    cancellation: Option<WorkflowRunCancellationView>,
+    authoritative_result: bool,
+    terminal_timing: Option<WorkflowRunTiming>,
+    quiescent: bool,
+    publication: WorkflowRunPublicationState,
+    cleanup: WorkflowRunCleanupState,
+    log_capacity: StepLogCapacity,
+    last_accepted_order: Option<AcceptedRecordOrder>,
+    generation: u64,
+}
+
+impl WorkflowRunViewState {
+    fn apply_record(&mut self, record: PresentationRecord) {
+        if let Some(previous) = self.last_accepted_order {
+            debug_assert!(record.accepted_order > previous);
+        }
+        self.last_accepted_order = Some(record.accepted_order);
+        match record.kind {
+            PresentationRecordKind::Transition(transition) => {
+                self.apply_transition(transition);
+            }
+            PresentationRecordKind::ChildOutput(output) => {
+                let Some(index) = self.step_indexes.get(&output.step).copied() else {
+                    return;
+                };
+                self.steps[index].log.push(
+                    record.accepted_order,
+                    record.observed_at,
+                    output,
+                    self.log_capacity,
+                );
+            }
+        }
+    }
+
+    fn apply_transition(&mut self, transition: PresentationTransition) {
+        match transition.event {
+            TransitionEvent::Step { step, to, .. } => {
+                let Some(index) = self.step_indexes.get(&step).copied() else {
+                    return;
+                };
+                self.steps[index].apply_transition(to, transition.step);
+            }
+            TransitionEvent::Workflow { to, .. } => self.workflow = to,
+            TransitionEvent::CancellationAccepted {
+                reason, deadline, ..
+            } => {
+                let prior_failure = match &self.workflow {
+                    WorkflowState::Executing {
+                        gate: SchedulingGate::FailureStopped { primary_failure },
+                    }
+                    | WorkflowState::Executing {
+                        gate:
+                            SchedulingGate::Cancelling {
+                                prior_failure: Some(primary_failure),
+                                ..
+                            },
+                    } => Some(primary_failure.clone()),
+                    WorkflowState::Executing { .. }
+                    | WorkflowState::Succeeded
+                    | WorkflowState::Failed { .. }
+                    | WorkflowState::Cancelled { .. } => None,
+                };
+                self.workflow = WorkflowState::Executing {
+                    gate: SchedulingGate::Cancelling {
+                        reason,
+                        prior_failure,
+                    },
+                };
+                self.cancellation = Some(WorkflowRunCancellationView {
+                    reason,
+                    force_stop_deadline: deadline,
+                });
+            }
+        }
+    }
+
+    fn advance_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+}
+
+struct WorkflowRunStepViewState {
+    id: String,
+    definition: WorkflowPresentationStep,
+    state: StepStateKind,
+    fact: Option<ObservedStepTransition>,
+    outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
+    log: StepLogRing,
+    terminal_timing: Option<WorkflowStepTiming>,
+}
+
+impl WorkflowRunStepViewState {
+    fn new(id: String, definition: WorkflowPresentationStep) -> Self {
+        let outputs = definition
+            .outputs()
+            .keys()
+            .map(|name| (name.clone(), WorkflowRunOutputDisposition::Pending))
+            .collect();
+        Self {
+            id,
+            definition,
+            state: StepStateKind::Pending,
+            fact: None,
+            outputs,
+            log: StepLogRing::default(),
+            terminal_timing: None,
+        }
+    }
+
+    fn apply_transition(&mut self, state: StepStateKind, detail: Option<ObservedStepTransition>) {
+        self.state = state;
+        self.fact = match &detail {
+            Some(ObservedStepTransition::OutputsCommitted { .. }) | None => None,
+            Some(_) => detail.clone(),
+        };
+        match state {
+            StepStateKind::Succeeded => {
+                if let Some(ObservedStepTransition::OutputsCommitted { outputs }) = detail {
+                    for output in outputs {
+                        if let Some(disposition) = self.outputs.get_mut(&output) {
+                            *disposition = WorkflowRunOutputDisposition::Committed;
+                        }
+                    }
+                }
+            }
+            StepStateKind::Failed => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
+            }
+            StepStateKind::Blocked => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
+            }
+            StepStateKind::NotRun => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::NotRun);
+            }
+            StepStateKind::Cancelled => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Cancelled);
+            }
+            StepStateKind::Pending
+            | StepStateKind::Starting
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs
+            | StepStateKind::Cancelling => {}
+        }
+    }
+
+    fn reconcile(&mut self, terminal: &super::publication::WorkflowRunStep) {
+        self.state = terminal_state_kind(&terminal.state);
+        self.fact = terminal_step_fact(&terminal.state);
+        match &terminal.state {
+            StepState::Succeeded { outputs } => {
+                for (name, disposition) in &mut self.outputs {
+                    *disposition = if outputs.contains_key(name) {
+                        WorkflowRunOutputDisposition::Committed
+                    } else {
+                        WorkflowRunOutputDisposition::Pending
+                    };
+                }
+            }
+            StepState::Failed { .. } => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
+            }
+            StepState::Blocked { .. } => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
+            }
+            StepState::NotRun { .. } => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::NotRun);
+            }
+            StepState::Cancelled { .. } => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Cancelled);
+            }
+            StepState::Pending
+            | StepState::Starting
+            | StepState::Running
+            | StepState::CapturingOutputs
+            | StepState::Cancelling { .. } => {}
+        }
+        self.terminal_timing = terminal.timing.clone();
+    }
+
+    fn make_outputs_unavailable(&mut self, reason: WorkflowRunOutputUnavailableReason) {
+        for disposition in self.outputs.values_mut() {
+            *disposition = WorkflowRunOutputDisposition::Unavailable(reason);
+        }
+    }
+
+    fn snapshot(
+        &self,
+        timing: &RunTimingSnapshot,
+        now: ObservationTime,
+        authoritative_result: bool,
+        include_log_records: bool,
+    ) -> WorkflowRunStepView {
+        let step_timing = if authoritative_result {
+            self.terminal_timing
+                .as_ref()
+                .map(|terminal| WorkflowRunElapsed {
+                    started_at: terminal.started_at,
+                    duration: terminal.duration,
+                    frozen: true,
+                })
+        } else {
+            observed_step_elapsed(timing, &self.id, now)
+        };
+        WorkflowRunStepView {
+            id: self.id.clone(),
+            definition: self.definition.clone(),
+            state: self.state,
+            fact: self.fact.clone(),
+            timing: step_timing,
+            outputs: self.outputs.clone(),
+            log: self.log.snapshot(include_log_records),
+        }
+    }
+}
+
+#[derive(Default)]
+struct StepLogRing {
+    records: VecDeque<WorkflowRunLogRecord>,
+    retained_bytes: u64,
+    observed_records: u64,
+    discarded_records: u64,
+    discarded_bytes: u64,
+}
+
+impl StepLogRing {
+    fn push(
+        &mut self,
+        accepted_order: AcceptedRecordOrder,
+        observed_at: OffsetDateTime,
+        output: NormalizedChildOutput,
+        capacity: StepLogCapacity,
+    ) {
+        let payload_bytes = u64::try_from(output.payload.len()).unwrap_or(u64::MAX);
+        let maximum_bytes = u64::try_from(capacity.maximum_bytes()).unwrap_or(u64::MAX);
+        debug_assert!(output.payload.len() <= MAX_NORMALIZED_CHILD_RECORD_BYTES);
+        while !self.records.is_empty()
+            && (self.records.len() >= capacity.maximum_records()
+                || self.retained_bytes.saturating_add(payload_bytes) > maximum_bytes)
+        {
+            self.discard_oldest();
+        }
+
+        self.observed_records = self.observed_records.saturating_add(1);
+        self.retained_bytes = self.retained_bytes.saturating_add(payload_bytes);
+        self.records.push_back(WorkflowRunLogRecord {
+            accepted_order,
+            observed_at,
+            invocation: output.invocation,
+            source: output.source,
+            source_sequence: output.source_sequence,
+            payload: Arc::from(output.payload),
+            continuation: output.continuation,
+        });
+    }
+
+    fn discard_oldest(&mut self) {
+        let Some(discarded) = self.records.pop_front() else {
+            return;
+        };
+        let discarded_bytes = u64::try_from(discarded.payload.len()).unwrap_or(u64::MAX);
+        self.retained_bytes = self.retained_bytes.saturating_sub(discarded_bytes);
+        self.discarded_records = self.discarded_records.saturating_add(1);
+        self.discarded_bytes = self.discarded_bytes.saturating_add(discarded_bytes);
+    }
+
+    fn snapshot(&self, include_records: bool) -> WorkflowRunStepLog {
+        WorkflowRunStepLog {
+            records: if include_records {
+                self.records.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            observed_records: self.observed_records,
+            retained_records: u64::try_from(self.records.len()).unwrap_or(u64::MAX),
+            retained_bytes: self.retained_bytes,
+            discarded_records: self.discarded_records,
+            discarded_bytes: self.discarded_bytes,
+        }
+    }
+}
+
+fn validate_terminal_result(
+    state: &WorkflowRunViewState,
+    run: &WorkflowRunResult,
+) -> Result<(), WorkflowRunViewModelError> {
+    if run.workflow_path != state.workflow_path || run.steps.len() != state.steps.len() {
+        return Err(WorkflowRunViewModelError::InvalidTerminalResult);
+    }
+    for (view, terminal) in state.steps.iter().zip(&run.steps) {
+        if view.id != terminal.id || !terminal_step_is_valid(view, terminal) {
+            return Err(WorkflowRunViewModelError::InvalidTerminalResult);
+        }
+    }
+    Ok(())
+}
+
+fn terminal_step_is_valid(
+    view: &WorkflowRunStepViewState,
+    terminal: &super::publication::WorkflowRunStep,
+) -> bool {
+    match &terminal.state {
+        StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
+        StepState::Failed { .. }
+        | StepState::Blocked { .. }
+        | StepState::NotRun { .. }
+        | StepState::Cancelled { .. } => true,
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Cancelling { .. } => false,
+    }
+}
+
+fn terminal_state_kind(
+    state: &StepState<StepFailureCause, super::value::CapturedValue>,
+) -> StepStateKind {
+    match state {
+        StepState::Pending => StepStateKind::Pending,
+        StepState::Starting => StepStateKind::Starting,
+        StepState::Running => StepStateKind::Running,
+        StepState::CapturingOutputs => StepStateKind::CapturingOutputs,
+        StepState::Cancelling { .. } => StepStateKind::Cancelling,
+        StepState::Succeeded { .. } => StepStateKind::Succeeded,
+        StepState::Failed { .. } => StepStateKind::Failed,
+        StepState::Blocked { .. } => StepStateKind::Blocked,
+        StepState::NotRun { .. } => StepStateKind::NotRun,
+        StepState::Cancelled { .. } => StepStateKind::Cancelled,
+    }
+}
+
+fn terminal_step_fact(
+    state: &StepState<StepFailureCause, super::value::CapturedValue>,
+) -> Option<ObservedStepTransition> {
+    match state {
+        StepState::Failed { phase, cause } => Some(ObservedStepTransition::Failed {
+            phase: *phase,
+            cause: cause.clone(),
+        }),
+        StepState::Blocked { dependency } => Some(ObservedStepTransition::Blocked {
+            dependency: dependency.clone(),
+        }),
+        StepState::NotRun { reason } => Some(ObservedStepTransition::NotRun { reason: *reason }),
+        StepState::Cancelling { reason } => {
+            Some(ObservedStepTransition::Cancelling { reason: *reason })
+        }
+        StepState::Cancelled { reason } => {
+            Some(ObservedStepTransition::Cancelled { reason: *reason })
+        }
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Succeeded { .. } => None,
+    }
+}
+
+fn workflow_state_from_outcome(
+    outcome: &RunOutcome<StepFailureCause>,
+) -> WorkflowState<StepFailureCause> {
+    match outcome {
+        RunOutcome::Succeeded => WorkflowState::Succeeded,
+        RunOutcome::Failed {
+            primary_failure,
+            later_cancellation,
+        } => WorkflowState::Failed {
+            primary_failure: primary_failure.clone(),
+            later_cancellation: *later_cancellation,
+        },
+        RunOutcome::Cancelled { reason } => WorkflowState::Cancelled { reason: *reason },
+    }
+}
+
+fn observed_run_elapsed(timing: &RunTimingSnapshot, now: ObservationTime) -> WorkflowRunElapsed {
+    let finished = timing.terminal.or(timing.quiesced);
+    let finished_at = finished.map_or(now.monotonic, |point| point.monotonic);
+    WorkflowRunElapsed {
+        started_at: timing.started.utc,
+        duration: finished_at.saturating_duration_since(timing.started.monotonic),
+        frozen: finished.is_some(),
+    }
+}
+
+fn observed_step_elapsed(
+    timing: &RunTimingSnapshot,
+    step: &str,
+    now: ObservationTime,
+) -> Option<WorkflowRunElapsed> {
+    let observed = timing.steps.get(step)?;
+    let finished = observed
+        .finished
+        .or_else(|| timing.quiesced.map(|point| point.monotonic));
+    Some(WorkflowRunElapsed {
+        started_at: observed.started.utc,
+        duration: finished
+            .unwrap_or(now.monotonic)
+            .saturating_duration_since(observed.started.monotonic),
+        frozen: finished.is_some(),
+    })
+}
+
+fn lock_state(state: &Mutex<WorkflowRunViewState>) -> MutexGuard<'_, WorkflowRunViewState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests;

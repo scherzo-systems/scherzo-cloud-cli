@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
@@ -116,6 +116,10 @@ impl AgentProcessContext {
 
     pub(crate) fn cwd(&self) -> &Path {
         self.cwd.provenance_path()
+    }
+
+    pub(super) fn protocol_cwd(&self) -> Result<PathBuf, WorkingDirectorySelectionFailure> {
+        self.cwd.protocol_path()
     }
 
     pub(super) fn execution_root_is_bound(&self) -> bool {
@@ -510,6 +514,35 @@ pub(crate) enum AgentObservationEmissionError {
     SequenceExhausted,
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentProcessControl {
+    directives: mpsc::UnboundedSender<AgentProcessDirective>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentProcessDirective {
+    Interrupt,
+    Force,
+}
+
+pub(crate) fn agent_process_control_channel() -> (
+    AgentProcessControl,
+    mpsc::UnboundedReceiver<AgentProcessDirective>,
+) {
+    let (directives, receiver) = mpsc::unbounded_channel();
+    (AgentProcessControl { directives }, receiver)
+}
+
+impl AgentProcessControl {
+    pub(crate) fn interrupt(&self) {
+        let _ = self.directives.send(AgentProcessDirective::Interrupt);
+    }
+
+    pub(crate) fn force(&self) {
+        let _ = self.directives.send(AgentProcessDirective::Force);
+    }
+}
+
 pub(crate) struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, ObservationSink> {
     identity: AgentInvocationIdentity,
     adapter: AdmittedAgentAdapter<NativeConfiguration>,
@@ -521,6 +554,8 @@ pub(crate) struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, Ob
     limits: AgentInvocationLimits<AdapterProtocolLimits>,
     cancellation: CancellationSource,
     observations: OrderedAgentObservationSink<ObservationSink>,
+    process_control: AgentProcessControl,
+    process_directives: Option<mpsc::UnboundedReceiver<AgentProcessDirective>>,
 }
 
 impl<NativeConfiguration, AdapterProtocolLimits, ObservationSink>
@@ -545,6 +580,7 @@ where
         observation_sink: ObservationSink,
     ) -> Self {
         let observations = OrderedAgentObservationSink::new(identity.clone(), observation_sink);
+        let (process_control, process_directives) = agent_process_control_channel();
         Self {
             identity,
             adapter,
@@ -556,6 +592,8 @@ where
             limits,
             cancellation,
             observations,
+            process_control,
+            process_directives: Some(process_directives),
         }
     }
 
@@ -598,6 +636,16 @@ where
     pub(crate) fn observations(&self) -> &OrderedAgentObservationSink<ObservationSink> {
         &self.observations
     }
+
+    pub(crate) fn process_control(&self) -> &AgentProcessControl {
+        &self.process_control
+    }
+
+    pub(crate) fn take_process_directives(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<AgentProcessDirective>> {
+        self.process_directives.take()
+    }
 }
 
 pub(crate) trait AgentAdapter<Sink>: Clone + Send + Sync + 'static
@@ -610,6 +658,7 @@ where
     fn invoke(
         &self,
         invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
+        started: AgentStartCallback,
         terminal: AgentTerminalCallback,
     ) -> impl Future<Output = ()> + Send;
 }
@@ -617,13 +666,14 @@ where
 pub(crate) async fn invoke_agent_adapter<Adapter, Sink>(
     adapter: &Adapter,
     invocation: AgentInvocation<Adapter::NativeConfiguration, Adapter::ProtocolLimits, Sink>,
+    started: AgentStartCallback,
     terminal: AgentTerminalCallback,
 ) where
     Adapter: AgentAdapter<Sink>,
     Sink: AgentObservationSink,
 {
     let unreported_return = terminal.clone();
-    adapter.invoke(invocation, terminal).await;
+    adapter.invoke(invocation, started, terminal).await;
     let _ = unreported_return.report(AgentOutcome::Failed {
         cause: AgentFailureCause::HarnessProtocolFailed,
     });
@@ -639,6 +689,10 @@ impl BoundedAgentResponse {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn into_text(self) -> Arc<str> {
+        self.0
     }
 }
 
@@ -695,6 +749,22 @@ pub(crate) enum AgentFailureCause {
     ResultSettlementFailed,
 }
 
+impl AgentFailureCause {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::HarnessStartFailed => "harness_start_failed",
+            Self::HarnessInputTooLarge { .. } => "harness_input_too_large",
+            Self::HarnessFailed { .. } => "harness_failed",
+            Self::HarnessProtocolFailed => "harness_protocol_failed",
+            Self::MissingResponse => "missing_response",
+            Self::MissingResult => "missing_result",
+            Self::ResultValidationLimitExceeded { .. } => "result_validation_limit_exceeded",
+            Self::CapturedValueTooLarge => "captured_value_too_large",
+            Self::ResultSettlementFailed => "result_settlement_failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentOutcome {
     Completed(CompletedAgentInvocation),
@@ -711,6 +781,59 @@ impl From<ResultValidationFatal> for AgentFailureCause {
             ResultValidationFatal::WorkerFailed => Self::HarnessProtocolFailed,
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentStartCallback {
+    state: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl AgentStartCallback {
+    pub(crate) fn report(&self) -> Result<(), AgentStartReportError> {
+        let mut sender = match self.state.lock() {
+            Ok(sender) => sender,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let sender = sender
+            .take()
+            .ok_or(AgentStartReportError::AlreadyReported)?;
+        sender
+            .send(())
+            .map_err(|_| AgentStartReportError::ReceiverClosed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentStartReportError {
+    AlreadyReported,
+    ReceiverClosed,
+}
+
+pub(crate) struct AgentStartReceiver {
+    started: oneshot::Receiver<()>,
+}
+
+impl AgentStartReceiver {
+    pub(crate) async fn receive(self) -> Result<(), AgentStartReceiveError> {
+        self.started
+            .await
+            .map_err(|_| AgentStartReceiveError::CallbackDropped)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentStartReceiveError {
+    CallbackDropped,
+}
+
+pub(crate) fn agent_start_channel() -> (AgentStartCallback, AgentStartReceiver) {
+    let (started, receiver) = oneshot::channel();
+    (
+        AgentStartCallback {
+            state: Arc::new(Mutex::new(Some(started))),
+        },
+        AgentStartReceiver { started: receiver },
+    )
 }
 
 #[derive(Clone)]

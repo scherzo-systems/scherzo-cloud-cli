@@ -78,6 +78,12 @@ pub(crate) struct ResolvedOutputSource {
     pub(crate) value_type: WorkflowValueType,
 }
 
+impl ResolvedOutputSource {
+    pub(crate) fn reference(&self) -> String {
+        format!("outputs.{}.{}", self.step, self.output)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedOutput {
     pub(crate) definition: Output,

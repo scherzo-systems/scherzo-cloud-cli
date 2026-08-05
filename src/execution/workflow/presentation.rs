@@ -16,28 +16,28 @@ use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
 use super::document::Output;
 use super::input::InputPreparationFailureKind;
-use super::observation::{
-    CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
-    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
+use super::presentation_feed::{
+    AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedChildOutput,
+    PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
+    WorkflowPresentationStep, is_unicode_control,
 };
 use super::publication::{
     LocalPublicationError, WorkflowRunResult, WorkflowRunStep, WorkflowRunTerminalResultV1,
 };
 use super::rejection::RejectionDiagnostic;
 use super::resolution::{ResolutionFailure, ResolvedWorkflow};
+use super::run_timing::{ObservationClock, ObservationTime};
 use super::runtime::{
     FailurePhase, NotRunReason, RunOutcome, StepState, StepStateKind, TransitionEvent,
 };
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
-    StepBodyKind, StepExecutionFailure, StepFailureCause, StepStartFailure,
-    WorkingDirectoryFailure,
+    StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
-use super::validated::{ValidatedHarness, ValidatedStep};
+use super::validated::ValidatedStep;
 
 const COMMAND: &str = "scherzo-cloud workflow run";
-const CHILD_FRAGMENT_BYTES: usize = 16 * 1024;
-const CONTROL_SEQUENCE_BYTES: usize = 4096;
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -63,6 +63,7 @@ pub(crate) enum RequestedPresentationMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PresentationMode {
+    Tui,
     Plain,
     Json,
 }
@@ -76,6 +77,7 @@ pub(crate) enum ColorChoice {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalCapabilities {
+    pub(crate) stdin_is_terminal: bool,
     pub(crate) stdout_is_terminal: bool,
     pub(crate) stderr_is_terminal: bool,
     pub(crate) stdout_width: Option<usize>,
@@ -86,11 +88,13 @@ pub(crate) struct TerminalCapabilities {
 
 impl TerminalCapabilities {
     pub(crate) fn detect() -> Self {
+        let stdin = io::stdin();
         let stdout = io::stdout();
         let stderr = io::stderr();
         let stdout_is_terminal = stdout.is_terminal();
         let stderr_is_terminal = stderr.is_terminal();
         Self {
+            stdin_is_terminal: stdin.is_terminal(),
             stdout_is_terminal,
             stderr_is_terminal,
             stdout_width: if stdout_is_terminal {
@@ -127,12 +131,20 @@ pub(crate) struct PresentationConfig {
     pub(crate) requested_mode: RequestedPresentationMode,
     pub(crate) color: ColorChoice,
     pub(crate) capabilities: TerminalCapabilities,
+    pub(crate) standard_input_reserved: bool,
 }
 
 impl PresentationConfig {
     pub(crate) fn mode(&self) -> PresentationMode {
         match self.requested_mode {
-            // The TUI is not yet an available projection, so automatic human output is plain.
+            RequestedPresentationMode::Automatic
+                if !self.standard_input_reserved
+                    && self.capabilities.stdin_is_terminal
+                    && self.capabilities.stdout_is_terminal
+                    && usable_term(self.capabilities.term.as_deref()) =>
+            {
+                PresentationMode::Tui
+            }
             RequestedPresentationMode::Automatic | RequestedPresentationMode::Plain => {
                 PresentationMode::Plain
             }
@@ -146,7 +158,9 @@ impl PresentationConfig {
             ColorChoice::Never => false,
             ColorChoice::Auto => {
                 let destination_is_terminal = match self.mode() {
-                    PresentationMode::Plain => self.capabilities.stdout_is_terminal,
+                    PresentationMode::Tui | PresentationMode::Plain => {
+                        self.capabilities.stdout_is_terminal
+                    }
                     PresentationMode::Json => self.capabilities.stderr_is_terminal,
                 };
                 destination_is_terminal
@@ -162,6 +176,7 @@ impl PresentationConfig {
 
     fn wrapping_width(&self) -> Option<usize> {
         match self.mode() {
+            PresentationMode::Tui => None,
             PresentationMode::Plain if self.capabilities.stdout_is_terminal => {
                 self.capabilities.stdout_width
             }
@@ -177,16 +192,6 @@ fn usable_term(term: Option<&OsStr>) -> bool {
     term.is_some_and(|term| !term.is_empty() && term.as_encoded_bytes() != b"dumb")
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ObservationTime {
-    utc: OffsetDateTime,
-    monotonic: Instant,
-}
-
-pub(crate) trait ObservationClock: Clone + Send + Sync + 'static {
-    fn sample(&self) -> ObservationTime;
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SystemObservationClock;
 
@@ -199,22 +204,17 @@ impl ObservationClock for SystemObservationClock {
     }
 }
 
-pub(crate) trait DisplayDeadline: Clone + Send + 'static {
-    fn deadline_utc(&self) -> OffsetDateTime;
-}
-
-impl DisplayDeadline for OffsetDateTime {
-    fn deadline_utc(&self) -> OffsetDateTime {
-        *self
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PresentationFailureOperation {
     HeaderWriter,
     LineWriter,
     DiagnosticWriter,
     TerminalJsonWriter,
+    TerminalSetup,
+    TerminalInput,
+    TerminalDraw,
+    TerminalRestore,
+    TerminalTask,
     TimestampFormatting,
     UnsupportedRejection,
     InvalidTerminalResult,
@@ -358,7 +358,7 @@ where
         diagnostic: &RejectionDiagnostic<'_>,
     ) -> WorkflowRunPresentationResult {
         let result = match self.config.mode() {
-            PresentationMode::Plain => writeln!(
+            PresentationMode::Tui | PresentationMode::Plain => writeln!(
                 self.standard_error,
                 "Error: workflow rejected: {} at {}: {}",
                 diagnostic.code, diagnostic.location, diagnostic.message
@@ -419,6 +419,44 @@ where
             maximum_parallel_steps,
             clock,
         )
+    }
+
+    pub(crate) fn render_standard_summary(
+        self,
+        workflow: &ResolvedWorkflow,
+        run: &WorkflowRunResult,
+        publication: PublicationPresentation<'_>,
+    ) -> WorkflowRunPresentationResult {
+        let mut config = self.config;
+        config.requested_mode = RequestedPresentationMode::Plain;
+        let result_directory = match &publication {
+            PublicationPresentation::Published(terminal) => Some(terminal.result_directory()),
+            PublicationPresentation::Failed(_) => None,
+        };
+        let (failure_sender, _) = watch::channel(None);
+        let mut state = PresentationState {
+            mode: PresentationMode::Plain,
+            color: config.color_enabled(),
+            terminal_width: config.wrapping_width(),
+            standard_output: self.standard_output,
+            standard_error: self.standard_error,
+            definition: PresentationDefinition::from_workflow(
+                workflow,
+                result_directory.unwrap_or("result"),
+            ),
+            feed: WorkflowPresentationFeed::new(workflow),
+            last_accepted_order: None,
+            step_starts: BTreeMap::new(),
+            failure: None,
+            failure_sender,
+            finished: true,
+        };
+        if let Err(failure) =
+            state.write_summary_or_report_failure(run, &publication, result_directory)
+        {
+            return failure;
+        }
+        state.present_publication_result(publication, false)
     }
 }
 
@@ -490,7 +528,8 @@ where
             standard_output,
             standard_error,
             definition: PresentationDefinition::from_workflow(workflow, result_directory),
-            child_streams: BTreeMap::new(),
+            feed: WorkflowPresentationFeed::new(workflow),
+            last_accepted_order: None,
             step_starts: BTreeMap::new(),
             failure: None,
             failure_sender,
@@ -554,42 +593,19 @@ where
             return WorkflowRunPresentationResult::Failed(failure);
         }
 
-        let observed_at = self.clock.sample().utc;
+        let observed_at = self.clock.sample();
         if let Err(failure) = state.finish_child_streams(observed_at) {
             let failure = failure.with_result_directory(result_directory);
             state.report_output_failure(&failure);
             return WorkflowRunPresentationResult::Failed(failure);
         }
-        if let Err(failure) = state.write_summary(run, &publication) {
-            let failure = failure.with_result_directory(result_directory);
-            state.report_output_failure(&failure);
-            return WorkflowRunPresentationResult::Failed(failure);
+        if let Err(failure) =
+            state.write_summary_or_report_failure(run, &publication, result_directory)
+        {
+            return failure;
         }
 
-        match publication {
-            PublicationPresentation::Failed(error) => {
-                state.write_publication_diagnostic(error);
-                WorkflowRunPresentationResult::PublicationFailed
-            }
-            PublicationPresentation::Published(terminal) => {
-                if emit_terminal_json
-                    && state.mode == PresentationMode::Json
-                    && let Err(error) = write_pretty_json(&mut state.standard_output, terminal)
-                {
-                    let failure = PresentationFailure::writer(
-                        PresentationFailureOperation::TerminalJsonWriter,
-                        &error,
-                    )
-                    .with_result_directory(Some(terminal.result_directory()));
-                    state.report_output_failure(&failure);
-                    return WorkflowRunPresentationResult::Failed(failure);
-                }
-                WorkflowRunPresentationResult::Published {
-                    exit_status: terminal.exit_status(),
-                    result_directory: terminal.result_directory().to_owned(),
-                }
-            }
-        }
+        state.present_publication_result(publication, emit_terminal_json)
     }
 }
 
@@ -632,7 +648,8 @@ struct PresentationState<StandardOutput, StandardError> {
     standard_output: StandardOutput,
     standard_error: StandardError,
     definition: PresentationDefinition,
-    child_streams: BTreeMap<ChildStreamKey, ChildStream>,
+    feed: WorkflowPresentationFeed,
+    last_accepted_order: Option<AcceptedRecordOrder>,
     step_starts: BTreeMap<String, Instant>,
     failure: Option<PresentationFailure>,
     failure_sender: watch::Sender<Option<PresentationFailure>>,
@@ -641,17 +658,13 @@ struct PresentationState<StandardOutput, StandardError> {
 
 #[derive(Clone)]
 struct PresentationDefinition {
-    workflow_path: String,
     result_directory: String,
-    presentation_order: Vec<String>,
     steps: BTreeMap<String, PresentationStep>,
     scope_width: usize,
 }
 
 #[derive(Clone)]
 struct PresentationStep {
-    kind: &'static str,
-    start_detail: String,
     success: StepSuccessPresentation,
     outputs: BTreeMap<String, String>,
 }
@@ -672,27 +685,11 @@ impl PresentationDefinition {
             .iter()
             .map(|(id, step)| {
                 let presentation = match step {
-                    ValidatedStep::Command(command) => {
-                        let argv = command
-                            .argv
-                            .iter()
-                            .map(|argument| shell_quote(argument))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let detail = command.common.cwd.as_ref().map_or_else(
-                            || format!("cmd · {argv}"),
-                            |cwd| format!("cmd · {cwd} $ {argv}"),
-                        );
-                        PresentationStep {
-                            kind: "cmd",
-                            start_detail: visible_text(&detail),
-                            success: StepSuccessPresentation::Command,
-                            outputs: presentation_outputs(&command.common.outputs),
-                        }
-                    }
+                    ValidatedStep::Command(command) => PresentationStep {
+                        success: StepSuccessPresentation::Command,
+                        outputs: presentation_outputs(&command.common.outputs),
+                    },
                     ValidatedStep::Agent(agent) => {
-                        let ValidatedHarness::Pi(config) = &agent.agent.harness;
-                        let thinking = format!("{:?}", config.thinking).to_ascii_lowercase();
                         let success = agent
                             .common
                             .outputs
@@ -708,11 +705,6 @@ impl PresentationDefinition {
                             })
                             .unwrap_or(StepSuccessPresentation::AgentWithoutValue);
                         PresentationStep {
-                            kind: "agent",
-                            start_detail: visible_text(&format!(
-                                "agent · {} · pi · {} · thinking={thinking}",
-                                agent.agent.profile, config.model
-                            )),
                             success,
                             outputs: presentation_outputs(&agent.common.outputs),
                         }
@@ -728,9 +720,7 @@ impl PresentationDefinition {
             .max()
             .unwrap_or("@workflow".len());
         Self {
-            workflow_path: workflow.source.workflow_path.clone(),
             result_directory: result_directory.to_owned(),
-            presentation_order: workflow.definition.presentation_order.clone(),
             steps,
             scope_width,
         }
@@ -763,12 +753,13 @@ where
         opened_at: OffsetDateTime,
         maximum_parallel_steps: usize,
     ) -> Result<(), PresentationFailure> {
-        let step_count = self.definition.steps.len();
+        let feed_definition = self.feed.definition();
+        let step_count = feed_definition.steps.len();
         let step_label = if step_count == 1 { "step" } else { "steps" };
         let identity = visible_text(&self.definition.result_directory);
         let metadata = format!(
             " · {} · {step_count} {step_label} · concurrency {maximum_parallel_steps}",
-            visible_text(&self.definition.workflow_path)
+            visible_text(&feed_definition.workflow_path)
         );
         let header = format!(
             "{} {}{}\n{} {}\n\n",
@@ -792,30 +783,46 @@ where
         observed_at: ObservationTime,
         observation: ExecutionObservation<Deadline>,
     ) -> Result<(), PresentationFailure> {
-        match observation {
-            ExecutionObservation::Transition(transition) => {
-                self.render_transition(observed_at, transition)
-            }
-            ExecutionObservation::CommandOutput(output) => {
-                self.render_child_output(observed_at.utc, output)
-            }
-            ExecutionObservation::CommandOutputClosed(closed) => {
-                self.close_child_output(observed_at.utc, closed)
-            }
-        }?;
+        let records = self.feed.accept(observed_at.utc, observation);
+        for record in records {
+            self.render_record(record, observed_at.monotonic)?;
+        }
         self.flush_line_writer()
     }
 
-    fn render_transition<Deadline: DisplayDeadline>(
+    fn render_record(
+        &mut self,
+        record: PresentationRecord,
+        observed_monotonic: Instant,
+    ) -> Result<(), PresentationFailure> {
+        if let Some(previous) = self.last_accepted_order {
+            debug_assert!(record.accepted_order > previous);
+        }
+        self.last_accepted_order = Some(record.accepted_order);
+        match record.kind {
+            PresentationRecordKind::Transition(transition) => self.render_transition(
+                ObservationTime {
+                    utc: record.observed_at,
+                    monotonic: observed_monotonic,
+                },
+                transition,
+            ),
+            PresentationRecordKind::ChildOutput(output) => {
+                self.render_child_output(record.observed_at, output)
+            }
+        }
+    }
+
+    fn render_transition(
         &mut self,
         observed_at: ObservationTime,
-        transition: TransitionObservation<Deadline>,
+        transition: PresentationTransition,
     ) -> Result<(), PresentationFailure> {
         match transition.event {
             TransitionEvent::CancellationAccepted {
                 reason, deadline, ..
             } => {
-                let deadline = rfc3339(deadline.deadline_utc())?;
+                let deadline = rfc3339(deadline)?;
                 self.write_event(
                     observed_at.utc,
                     "@workflow",
@@ -830,11 +837,11 @@ where
                         .entry(step.clone())
                         .or_insert(observed_at.monotonic);
                     let detail = self
-                        .definition
+                        .feed
+                        .definition()
                         .steps
                         .get(&step)
-                        .map(|step| step.start_detail.clone())
-                        .unwrap_or_else(|| "cmd".to_owned());
+                        .map_or_else(|| "cmd".to_owned(), start_detail);
                     self.write_event(observed_at.utc, &step, "start", &detail, TokenRole::Active)
                 }
                 StepStateKind::Succeeded => {
@@ -969,66 +976,36 @@ where
     fn render_child_output(
         &mut self,
         observed_at: OffsetDateTime,
-        output: CommandOutputObservation,
+        output: NormalizedChildOutput,
     ) -> Result<(), PresentationFailure> {
-        let key = ChildStreamKey::from_output(&output);
-        let records = self
-            .child_streams
-            .entry(key)
-            .or_default()
-            .push(&output.bytes);
-        for record in records {
-            self.write_child_record(observed_at, &output.step, output.source, record)?;
-        }
-        Ok(())
-    }
-
-    fn close_child_output(
-        &mut self,
-        observed_at: OffsetDateTime,
-        closed: CommandOutputClosedObservation,
-    ) -> Result<(), PresentationFailure> {
-        let key = ChildStreamKey::from_closed(&closed);
-        let records = self
-            .child_streams
-            .remove(&key)
-            .map_or_else(Vec::new, ChildStream::close);
-        for record in records {
-            self.write_child_record(observed_at, &closed.step, closed.source, record)?;
-        }
-        Ok(())
+        let NormalizedChildOutput {
+            step,
+            invocation: _,
+            source,
+            source_sequence: _,
+            payload,
+            continuation,
+        } = output;
+        let token = match source {
+            super::observation::CommandOutputSource::StandardOutput => "stdout",
+            super::observation::CommandOutputSource::StandardError => "stderr",
+        };
+        let detail = if continuation {
+            format!("{SAFETY_CONTINUATION_MARKER} {payload}")
+        } else {
+            payload
+        };
+        self.write_event(observed_at, &step, token, &detail, TokenRole::Neutral)
     }
 
     fn finish_child_streams(
         &mut self,
-        observed_at: OffsetDateTime,
+        observed_at: ObservationTime,
     ) -> Result<(), PresentationFailure> {
-        let streams = std::mem::take(&mut self.child_streams);
-        for (key, stream) in streams {
-            for record in stream.close() {
-                self.write_child_record(observed_at, &key.step, key.source(), record)?;
-            }
+        for record in self.feed.finish_child_streams(observed_at.utc) {
+            self.render_record(record, observed_at.monotonic)?;
         }
         Ok(())
-    }
-
-    fn write_child_record(
-        &mut self,
-        observed_at: OffsetDateTime,
-        step: &str,
-        source: CommandOutputSource,
-        record: ChildRecord,
-    ) -> Result<(), PresentationFailure> {
-        let token = match source {
-            CommandOutputSource::StandardOutput => "stdout",
-            CommandOutputSource::StandardError => "stderr",
-        };
-        let detail = if record.continuation {
-            format!("{SAFETY_CONTINUATION_MARKER} {}", record.payload)
-        } else {
-            record.payload
-        };
-        self.write_event(observed_at, step, token, &detail, TokenRole::Neutral)
     }
 
     fn write_event(
@@ -1111,6 +1088,22 @@ where
         self.write_line_bytes(rendered.as_bytes())
     }
 
+    fn write_summary_or_report_failure(
+        &mut self,
+        run: &WorkflowRunResult,
+        publication: &PublicationPresentation<'_>,
+        result_directory: Option<&str>,
+    ) -> Result<(), WorkflowRunPresentationResult> {
+        match self.write_summary(run, publication) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let failure = failure.with_result_directory(result_directory);
+                self.report_output_failure(&failure);
+                Err(WorkflowRunPresentationResult::Failed(failure))
+            }
+        }
+    }
+
     fn write_summary(
         &mut self,
         run: &WorkflowRunResult,
@@ -1121,7 +1114,10 @@ where
             .iter()
             .map(|step| (step.id.as_str(), step))
             .collect::<BTreeMap<_, _>>();
-        if steps.len() != self.definition.steps.len() || steps.len() != run.steps.len() {
+        if steps.len() != self.feed.definition().steps.len()
+            || steps.len() != self.definition.steps.len()
+            || steps.len() != run.steps.len()
+        {
             return Err(PresentationFailure::operation(
                 PresentationFailureOperation::InvalidTerminalResult,
             ));
@@ -1132,26 +1128,31 @@ where
         );
         self.write_line_bytes(format!("\n{divider}\n\n").as_bytes())?;
         let mut rows = Vec::with_capacity(steps.len());
-        let order = self.definition.presentation_order.clone();
+        let order = self.feed.definition().presentation_order.clone();
         for id in order {
             let Some(step) = steps.get(id.as_str()) else {
                 return Err(PresentationFailure::operation(
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
-            let Some(definition) = self.definition.steps.get(&id) else {
+            let Some(definition) = self.feed.definition().steps.get(&id) else {
                 return Err(PresentationFailure::operation(
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
-            let Some((state, detail, role)) = summary_step(step, definition.success) else {
+            let Some(details) = self.definition.steps.get(&id) else {
+                return Err(PresentationFailure::operation(
+                    PresentationFailureOperation::InvalidTerminalResult,
+                ));
+            };
+            let Some((state, detail, role)) = summary_step(step, details.success) else {
                 return Err(PresentationFailure::operation(
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
             rows.push(SummaryRow {
                 step: visible_text(&id),
-                kind: definition.kind,
+                kind: step_kind(definition),
                 state,
                 duration: step
                     .timing
@@ -1304,6 +1305,37 @@ where
         })
     }
 
+    fn present_publication_result(
+        &mut self,
+        publication: PublicationPresentation<'_>,
+        emit_terminal_json: bool,
+    ) -> WorkflowRunPresentationResult {
+        match publication {
+            PublicationPresentation::Failed(error) => {
+                self.write_publication_diagnostic(error);
+                WorkflowRunPresentationResult::PublicationFailed
+            }
+            PublicationPresentation::Published(terminal) => {
+                if emit_terminal_json
+                    && self.mode == PresentationMode::Json
+                    && let Err(error) = write_pretty_json(&mut self.standard_output, terminal)
+                {
+                    let failure = PresentationFailure::writer(
+                        PresentationFailureOperation::TerminalJsonWriter,
+                        &error,
+                    )
+                    .with_result_directory(Some(terminal.result_directory()));
+                    self.report_output_failure(&failure);
+                    return WorkflowRunPresentationResult::Failed(failure);
+                }
+                WorkflowRunPresentationResult::Published {
+                    exit_status: terminal.exit_status(),
+                    result_directory: terminal.result_directory().to_owned(),
+                }
+            }
+        }
+    }
+
     fn write_publication_diagnostic(&mut self, error: &LocalPublicationError) {
         let _ = writeln!(self.standard_error, "Error: {error}")
             .and_then(|()| self.standard_error.flush());
@@ -1331,7 +1363,7 @@ where
 
     fn line_writer(&mut self) -> &mut dyn Write {
         match self.mode {
-            PresentationMode::Plain => &mut self.standard_output,
+            PresentationMode::Tui | PresentationMode::Plain => &mut self.standard_output,
             PresentationMode::Json => &mut self.standard_error,
         }
     }
@@ -1397,356 +1429,6 @@ struct SummaryRow {
     duration: String,
     detail: String,
     role: TokenRole,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ChildStreamKey {
-    step: String,
-    invocation_sequence: u64,
-    source: u8,
-}
-
-impl ChildStreamKey {
-    fn from_output(output: &CommandOutputObservation) -> Self {
-        Self::new(&output.step, output.invocation, output.source)
-    }
-
-    fn from_closed(output: &CommandOutputClosedObservation) -> Self {
-        Self::new(&output.step, output.invocation, output.source)
-    }
-
-    fn new(step: &str, invocation: super::runtime::ActionId, source: CommandOutputSource) -> Self {
-        Self {
-            step: step.to_owned(),
-            invocation_sequence: invocation.transition_sequence.get(),
-            source: source_number(source),
-        }
-    }
-
-    fn source(&self) -> CommandOutputSource {
-        if self.source == 0 {
-            CommandOutputSource::StandardOutput
-        } else {
-            CommandOutputSource::StandardError
-        }
-    }
-}
-
-fn source_number(source: CommandOutputSource) -> u8 {
-    match source {
-        CommandOutputSource::StandardOutput => 0,
-        CommandOutputSource::StandardError => 1,
-    }
-}
-
-#[derive(Default)]
-struct ChildStream {
-    normalizer: ChildNormalizer,
-    pending_carriage_return: bool,
-    line_has_data: bool,
-    line_has_record: bool,
-}
-
-struct ChildRecord {
-    payload: String,
-    continuation: bool,
-}
-
-impl ChildStream {
-    fn push(&mut self, bytes: &[u8]) -> Vec<ChildRecord> {
-        let mut records = Vec::new();
-        for &byte in bytes {
-            if self.pending_carriage_return {
-                self.pending_carriage_return = false;
-                self.finish_line(&mut records, true);
-                if byte == b'\n' {
-                    continue;
-                }
-            }
-            match byte {
-                b'\r' => self.pending_carriage_return = true,
-                b'\n' => self.finish_line(&mut records, true),
-                _ => {
-                    self.line_has_data = true;
-                    self.normalizer
-                        .push(byte, &mut records, &mut self.line_has_record);
-                }
-            }
-        }
-        records
-    }
-
-    fn close(mut self) -> Vec<ChildRecord> {
-        let mut records = Vec::new();
-        if self.pending_carriage_return {
-            self.pending_carriage_return = false;
-            self.finish_line(&mut records, true);
-        } else if self.line_has_data {
-            self.finish_line(&mut records, false);
-        }
-        records
-    }
-
-    fn finish_line(&mut self, records: &mut Vec<ChildRecord>, framed: bool) {
-        self.normalizer.finish(records, &mut self.line_has_record);
-        if !self.normalizer.payload.is_empty()
-            || (!self.line_has_record && (framed || self.line_has_data))
-        {
-            records.push(ChildRecord {
-                payload: std::mem::take(&mut self.normalizer.payload),
-                continuation: self.line_has_record,
-            });
-        }
-        self.normalizer.reset_line();
-        self.line_has_data = false;
-        self.line_has_record = false;
-    }
-}
-
-#[derive(Default)]
-struct ChildNormalizer {
-    payload: String,
-    column: usize,
-    utf8: Vec<u8>,
-    control: Option<ControlCandidate>,
-}
-
-struct ControlCandidate {
-    bytes: Vec<u8>,
-    kind: ControlKind,
-}
-
-#[derive(Clone, Copy)]
-enum ControlKind {
-    Dispatch,
-    Csi { intermediates: bool },
-    Osc,
-    String,
-}
-
-impl ChildNormalizer {
-    fn push(&mut self, byte: u8, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
-        if self.control.is_some() {
-            self.push_control(byte, records, line_has_record);
-        } else if byte == 0x1b {
-            self.finish_utf8(records, line_has_record);
-            self.control = Some(ControlCandidate {
-                bytes: vec![byte],
-                kind: ControlKind::Dispatch,
-            });
-        } else {
-            self.push_ordinary(byte, records, line_has_record);
-        }
-    }
-
-    fn push_control(
-        &mut self,
-        byte: u8,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        let Some(mut candidate) = self.control.take() else {
-            return;
-        };
-        candidate.bytes.push(byte);
-        let complete = match candidate.kind {
-            ControlKind::Dispatch => match byte {
-                b'[' => {
-                    candidate.kind = ControlKind::Csi {
-                        intermediates: false,
-                    };
-                    false
-                }
-                b']' => {
-                    candidate.kind = ControlKind::Osc;
-                    false
-                }
-                b'P' | b'X' | b'^' | b'_' => {
-                    candidate.kind = ControlKind::String;
-                    false
-                }
-                0x30..=0x7e => true,
-                _ => {
-                    self.abandon(candidate, records, line_has_record);
-                    return;
-                }
-            },
-            ControlKind::Csi { intermediates } => {
-                if (0x40..=0x7e).contains(&byte) {
-                    true
-                } else if !intermediates && (0x30..=0x3f).contains(&byte) {
-                    false
-                } else if (0x20..=0x2f).contains(&byte) {
-                    candidate.kind = ControlKind::Csi {
-                        intermediates: true,
-                    };
-                    false
-                } else {
-                    self.abandon(candidate, records, line_has_record);
-                    return;
-                }
-            }
-            ControlKind::Osc => byte == 0x07 || candidate.bytes.ends_with(b"\x1b\\"),
-            ControlKind::String => candidate.bytes.ends_with(b"\x1b\\"),
-        };
-        if complete {
-            return;
-        }
-        if candidate.bytes.len() == CONTROL_SEQUENCE_BYTES {
-            self.abandon(candidate, records, line_has_record);
-        } else {
-            self.control = Some(candidate);
-        }
-    }
-
-    fn abandon(
-        &mut self,
-        candidate: ControlCandidate,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        for byte in candidate.bytes {
-            self.push_ordinary(byte, records, line_has_record);
-        }
-        self.finish_utf8(records, line_has_record);
-    }
-
-    fn push_ordinary(
-        &mut self,
-        byte: u8,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        if self.utf8.is_empty() {
-            if byte.is_ascii() {
-                self.emit_ascii(byte, records, line_has_record);
-            } else if utf8_length(byte).is_some() {
-                self.utf8.push(byte);
-            } else {
-                self.emit_invalid_byte(byte, records, line_has_record);
-            }
-            return;
-        }
-
-        self.utf8.push(byte);
-        let expected = utf8_length(self.utf8[0]).unwrap_or(1);
-        if self.utf8.len() < expected && (byte & 0xc0) == 0x80 {
-            return;
-        }
-        let bytes = std::mem::take(&mut self.utf8);
-        if bytes.len() == expected
-            && let Ok(value) = std::str::from_utf8(&bytes)
-            && let Some(character) = value.chars().next()
-        {
-            self.emit_character(character, records, line_has_record);
-            return;
-        }
-        self.emit_invalid_byte(bytes[0], records, line_has_record);
-        for byte in bytes.into_iter().skip(1) {
-            self.push_ordinary(byte, records, line_has_record);
-        }
-    }
-
-    fn emit_ascii(&mut self, byte: u8, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
-        match byte {
-            b'\t' => {
-                let spaces = 8 - self.column % 8;
-                self.emit_text(&" ".repeat(spaces), records, line_has_record);
-                self.column += spaces;
-            }
-            0x20..=0x7e => {
-                self.emit_text(&char::from(byte).to_string(), records, line_has_record);
-                self.column += 1;
-            }
-            _ => self.emit_invalid_byte(byte, records, line_has_record),
-        }
-    }
-
-    fn emit_character(
-        &mut self,
-        character: char,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        if is_unicode_control(character) {
-            let escaped = format!("\\u{{{:x}}}", u32::from(character));
-            self.column += escaped.len();
-            self.emit_text(&escaped, records, line_has_record);
-        } else {
-            self.column += 1;
-            self.emit_text(&character.to_string(), records, line_has_record);
-        }
-    }
-
-    fn emit_invalid_byte(
-        &mut self,
-        byte: u8,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        let escaped = format!("\\x{byte:02x}");
-        self.column += escaped.len();
-        self.emit_text(&escaped, records, line_has_record);
-    }
-
-    fn emit_text(
-        &mut self,
-        text: &str,
-        records: &mut Vec<ChildRecord>,
-        line_has_record: &mut bool,
-    ) {
-        if !self.payload.is_empty() && self.payload.len() + text.len() > CHILD_FRAGMENT_BYTES {
-            self.emit_fragment(records, line_has_record);
-        }
-        self.payload.push_str(text);
-        if self.payload.len() >= CHILD_FRAGMENT_BYTES {
-            self.emit_fragment(records, line_has_record);
-        }
-    }
-
-    fn emit_fragment(&mut self, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
-        records.push(ChildRecord {
-            payload: std::mem::take(&mut self.payload),
-            continuation: *line_has_record,
-        });
-        *line_has_record = true;
-    }
-
-    fn finish(&mut self, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
-        if let Some(candidate) = self.control.take() {
-            self.abandon(candidate, records, line_has_record);
-        }
-        self.finish_utf8(records, line_has_record);
-    }
-
-    fn finish_utf8(&mut self, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
-        let pending = std::mem::take(&mut self.utf8);
-        for byte in pending {
-            self.emit_invalid_byte(byte, records, line_has_record);
-        }
-    }
-
-    fn reset_line(&mut self) {
-        self.payload.clear();
-        self.column = 0;
-        self.utf8.clear();
-        self.control = None;
-    }
-}
-
-fn utf8_length(byte: u8) -> Option<usize> {
-    match byte {
-        0xc2..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf4 => Some(4),
-        _ => None,
-    }
-}
-
-fn is_unicode_control(character: char) -> bool {
-    let value = u32::from(character);
-    matches!(value, 0x80..=0x9f | 0xad | 0x61c | 0x6dd | 0x70f | 0x890..=0x891 | 0x8e2 | 0x180e | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff | 0xfff9..=0xfffb | 0x110bd | 0x110cd | 0x13430..=0x1345f | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0001 | 0xe0020..=0xe007f)
-        || matches!(value, 0x600..=0x605)
 }
 
 fn observation_timestamp(value: OffsetDateTime) -> String {
@@ -1826,7 +1508,7 @@ fn next_detail_segment(value: &str, maximum_width: usize) -> (&str, &str) {
     (candidate, &value[fitting_end..])
 }
 
-fn header_timestamp(value: OffsetDateTime) -> String {
+pub(crate) fn header_timestamp(value: OffsetDateTime) -> String {
     let value = value.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
@@ -1848,7 +1530,39 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, PresentationFailure> {
         })
 }
 
-fn shell_quote(argument: &str) -> String {
+fn start_detail(step: &WorkflowPresentationStep) -> String {
+    let detail = match step {
+        WorkflowPresentationStep::Command { argv, cwd, .. } => {
+            let argv = argv
+                .iter()
+                .map(|argument| shell_quote(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            cwd.as_ref().map_or_else(
+                || format!("cmd · {argv}"),
+                |cwd| format!("cmd · {cwd} $ {argv}"),
+            )
+        }
+        WorkflowPresentationStep::Agent {
+            profile, harness, ..
+        } => match harness {
+            AgentPresentationHarness::Pi { model, thinking } => {
+                let thinking = format!("{thinking:?}").to_ascii_lowercase();
+                format!("agent · {profile} · pi · {model} · thinking={thinking}")
+            }
+        },
+    };
+    visible_text(&detail)
+}
+
+pub(crate) fn step_kind(step: &WorkflowPresentationStep) -> &'static str {
+    match step {
+        WorkflowPresentationStep::Command { .. } => "cmd",
+        WorkflowPresentationStep::Agent { .. } => "agent",
+    }
+}
+
+pub(crate) fn shell_quote(argument: &str) -> String {
     let argument = visible_argument_text(argument);
     if !argument.is_empty()
         && argument.bytes().all(|byte| {
@@ -1868,7 +1582,7 @@ fn visible_argument_text(value: &str) -> String {
     visible_text_with_backslash(value, true)
 }
 
-fn visible_text(value: &str) -> String {
+pub(crate) fn visible_text(value: &str) -> String {
     visible_text_with_backslash(value, false)
 }
 
@@ -1889,7 +1603,7 @@ fn visible_text_with_backslash(value: &str, escape_backslash: bool) -> String {
     visible
 }
 
-fn cancellation_reason(reason: CancellationReason) -> &'static str {
+pub(crate) fn cancellation_reason(reason: CancellationReason) -> &'static str {
     match reason {
         CancellationReason::UserRequest => "user_request",
         CancellationReason::TerminationRequest => "termination_request",
@@ -1906,7 +1620,7 @@ fn failure_phase(phase: FailurePhase) -> &'static str {
     }
 }
 
-fn failure_detail(phase: FailurePhase, cause: &StepFailureCause) -> String {
+pub(crate) fn failure_detail(phase: FailurePhase, cause: &StepFailureCause) -> String {
     format!("{} · {}", failure_phase(phase), failure_cause(cause))
 }
 
@@ -1939,17 +1653,15 @@ fn failure_cause(cause: &StepFailureCause) -> String {
                     |input| format!("{code} · input {input}"),
                 )
             }
+            StepStartFailure::AgentInput(failure) => format!("agent input · {failure:?}"),
+            StepStartFailure::Agent(failure) => failure.code().replace('_', " "),
+            StepStartFailure::AgentRuntimeUnavailable => "agent runtime unavailable".to_owned(),
             StepStartFailure::OutputsUnsupported => "outputs unsupported".to_owned(),
             StepStartFailure::WorkingDirectory(failure) => match failure {
                 WorkingDirectoryFailure::ExecutionRootRebound => "execution root rebound",
                 WorkingDirectoryFailure::Unavailable => "working directory unavailable",
                 WorkingDirectoryFailure::EscapesExecutionRoot => "working directory escape",
                 WorkingDirectoryFailure::NotDirectory => "working directory not directory",
-            }
-            .to_owned(),
-            StepStartFailure::UnsupportedBody(kind) => match kind {
-                StepBodyKind::Command => "command body unsupported",
-                StepBodyKind::Agent => "agent body unsupported",
             }
             .to_owned(),
             StepStartFailure::CommandPreparation(failure) => match failure {
@@ -1976,6 +1688,9 @@ fn failure_cause(cause: &StepFailureCause) -> String {
             }
             CommandExecutionFailure::Wait => "command wait failed".to_owned(),
         },
+        StepFailureCause::Execution(StepExecutionFailure::Agent(failure)) => {
+            failure.code().replace('_', " ")
+        }
         StepFailureCause::OutputCapture(failure) => match failure {
             OutputCaptureFailure::StepUnavailable => "step unavailable".to_owned(),
             OutputCaptureFailure::UnsupportedOutput => "output unsupported".to_owned(),
@@ -2082,7 +1797,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 5] {
     counts
 }
 
-fn human_duration(duration: Duration) -> String {
+pub(crate) fn human_duration(duration: Duration) -> String {
     let milliseconds = duration.as_millis();
     if milliseconds < 1000 {
         return format!("{milliseconds}ms");

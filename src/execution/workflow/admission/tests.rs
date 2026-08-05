@@ -6,9 +6,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
-use crate::execution::pi::{
-    PiCapability, PiCompatibilityProfile, PiVersion, ValidatedPiInstallation,
-};
+use crate::execution::pi::{PiCapability, PiCompatibilityProfile, ValidatedPiInstallation};
 use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 
@@ -273,7 +271,7 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             step.installation().executable(),
             recorder.path().join("validated-pi")
         );
-        assert_eq!(step.installation().version(), PiVersion::V0_82_1);
+        assert_eq!(step.installation().version().as_str(), "0.83.0");
         assert_eq!(
             step.installation().profile(),
             PiCompatibilityProfile::PiJsonV1

@@ -10,17 +10,24 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use super::*;
+use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
     ResolvedAttachment, ResolvedImports, admit_workflow,
 };
+use crate::execution::workflow::agent::scripted::{ScriptedAgentAdapter, ScriptedAgentValue};
+use crate::execution::workflow::agent::{
+    AgentFailureCause, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
+    WorkflowRunId,
+};
+use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::{ArtifactReadFailure, ArtifactStaging};
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
@@ -34,7 +41,8 @@ use crate::execution::workflow::runtime::{
     ExportValue, FailurePhase, NotRunReason, StepState, StepStateKind, TransitionEvent,
 };
 use crate::execution::workflow::step_runtime::{
-    CommandExecutionFailure, StepExecutionFailure, StepFailureCause,
+    AgentExecution, CommandExecutionFailure, StepExecutionFailure, StepFailureCause,
+    StepStartFailure,
 };
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
@@ -72,11 +80,41 @@ impl CoordinatorClock for TestClock {
     }
 }
 
+async fn execute_workflow<Clock, Observer, Adapter>(
+    admitted: AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    inputs: &InputStaging,
+    diagnostics: &StepDiagnosticLog,
+    agents: AgentExecution<Adapter>,
+    clock: Clock,
+    observer: Observer,
+) -> Result<WorkflowExecutionResult, CoordinationError>
+where
+    Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+{
+    super::execute_workflow(
+        admitted,
+        artifacts,
+        inputs,
+        diagnostics,
+        agents,
+        clock,
+        NoopCommitPort,
+        observer,
+        crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
+    )
+    .await
+}
+
 #[derive(Clone)]
 struct RecordingObserver {
     entries: RecordedObservations,
     notifications: mpsc::UnboundedSender<ExecutionObservation<TestInstant>>,
     terminal_gate: Option<TerminalGate>,
+    step_success_gate: Option<TerminalGate>,
 }
 
 #[derive(Clone)]
@@ -94,6 +132,7 @@ impl RecordingObserver {
                 entries: Arc::clone(&entries),
                 notifications,
                 terminal_gate: None,
+                step_success_gate: None,
             },
             entries,
             observed,
@@ -116,6 +155,23 @@ impl RecordingObserver {
         });
         (observer, entries, observed, terminal_reached, release)
     }
+
+    fn with_step_success_gate() -> (
+        Self,
+        RecordedObservations,
+        ObservationReceiver,
+        mpsc::UnboundedReceiver<()>,
+        watch::Sender<bool>,
+    ) {
+        let (mut observer, entries, observed) = Self::new();
+        let (reached, success_reached) = mpsc::unbounded_channel();
+        let (release, released) = watch::channel(false);
+        observer.step_success_gate = Some(TerminalGate {
+            reached,
+            release: released,
+        });
+        (observer, entries, observed, success_reached, release)
+    }
 }
 
 impl ExecutionObserver<TestInstant> for RecordingObserver {
@@ -128,11 +184,14 @@ impl ExecutionObserver<TestInstant> for RecordingObserver {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(observation.clone());
         let _ = self.notifications.send(observation.clone());
-        let gate = self.terminal_gate.clone();
+        let gate = if is_terminal_cancellation(&observation) {
+            self.terminal_gate.clone()
+        } else if is_step_success(&observation) {
+            self.step_success_gate.clone()
+        } else {
+            None
+        };
         async move {
-            if !is_terminal_cancellation(&observation) {
-                return;
-            }
             let Some(mut gate) = gate else {
                 return;
             };
@@ -159,6 +218,19 @@ fn is_terminal_cancellation(observation: &ExecutionObservation<TestInstant>) -> 
     )
 }
 
+fn is_step_success(observation: &ExecutionObservation<TestInstant>) -> bool {
+    matches!(
+        observation,
+        ExecutionObservation::Transition(TransitionObservation {
+            event: TransitionEvent::Step {
+                to: StepStateKind::Succeeded,
+                ..
+            },
+            ..
+        })
+    )
+}
+
 struct ExecutionFixture {
     _temporary: tempfile::TempDir,
     execution_root: PathBuf,
@@ -166,10 +238,31 @@ struct ExecutionFixture {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
     inputs: InputStaging,
+    agent_inputs: AgentInputStaging,
 }
 
 fn execution_fixture(
     source: &str,
+    imports: ResolvedImports,
+    environment: EnvironmentSnapshot,
+    cancellation: CancellationSource,
+    parallelism: usize,
+    log_bytes: u64,
+) -> ExecutionFixture {
+    execution_fixture_with_source_files(
+        source,
+        &[],
+        imports,
+        environment,
+        cancellation,
+        parallelism,
+        log_bytes,
+    )
+}
+
+fn execution_fixture_with_source_files(
+    source: &str,
+    source_files: &[(&str, &[u8])],
     imports: ResolvedImports,
     environment: EnvironmentSnapshot,
     cancellation: CancellationSource,
@@ -184,6 +277,13 @@ fn execution_fixture(
     fs::create_dir(&execution_root).unwrap();
     fs::create_dir(&staging_root).unwrap();
     fs::write(source_root.join("workflow.yaml"), source).unwrap();
+    for (path, bytes) in source_files {
+        let path = source_root.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, bytes).unwrap();
+    }
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
         imports,
@@ -198,11 +298,13 @@ fn execution_fixture(
             ),
             environment,
             CancellationPolicy::new(cancellation, Duration::from_secs(1)),
-        ),
+        )
+        .with_pi_installation(ValidatedPiInstallation::fixture("/validated/pi".into())),
     )
     .unwrap();
     let artifacts = ArtifactStaging::create(admitted.execution(), &staging_root).unwrap();
     let inputs = InputStaging::create(admitted.execution(), &staging_root).unwrap();
+    let agent_inputs = AgentInputStaging::create(admitted.execution(), &staging_root).unwrap();
     ExecutionFixture {
         _temporary: temporary,
         execution_root,
@@ -210,6 +312,7 @@ fn execution_fixture(
         admitted,
         artifacts,
         inputs,
+        agent_inputs,
     }
 }
 
@@ -234,6 +337,7 @@ async fn command_stdin_fixture_process() {
         &fixture.artifacts,
         &fixture.inputs,
         &StepDiagnosticLog::default(),
+        AgentExecution::disabled(),
         TestClock,
         NoopExecutionObserver,
     )
@@ -309,6 +413,7 @@ printf consumer-standard-error >&2
             &fixture.artifacts,
             &fixture.inputs,
             &diagnostics,
+            AgentExecution::disabled(),
             TestClock,
             observer,
         )
@@ -391,6 +496,7 @@ async fn failure_stops_new_work_but_retains_the_successful_sibling_output() {
                 &artifacts,
                 &inputs,
                 &diagnostics,
+                AgentExecution::disabled(),
                 TestClock,
                 observer,
             )
@@ -479,6 +585,7 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
                 &artifacts,
                 &inputs,
                 &diagnostics,
+                AgentExecution::disabled(),
                 TestClock,
                 observer,
             )
@@ -523,7 +630,8 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
             .filter_map(|entry| match entry {
                 ExecutionObservation::Transition(transition) => Some(&transition.event),
                 ExecutionObservation::CommandOutput(_)
-                | ExecutionObservation::CommandOutputClosed(_) => None,
+                | ExecutionObservation::CommandOutputClosed(_)
+                | ExecutionObservation::Agent(_) => None,
             })
             .collect::<Vec<_>>();
         let accepted = transitions.iter().position(|transition| matches!(
@@ -579,6 +687,7 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
             &fixture.artifacts,
             &fixture.inputs,
             &diagnostics,
+            AgentExecution::disabled(),
             TestClock,
             observer,
         )
@@ -597,7 +706,8 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
             .filter_map(|entry| match entry {
                 ExecutionObservation::Transition(transition) => Some(transition.event.clone()),
                 ExecutionObservation::CommandOutput(_)
-                | ExecutionObservation::CommandOutputClosed(_) => None,
+                | ExecutionObservation::CommandOutputClosed(_)
+                | ExecutionObservation::Agent(_) => None,
             })
             .collect::<Vec<_>>();
         assert!(matches!(
@@ -622,6 +732,1045 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
                 }
             ] if *deadline == TestInstant(Duration::from_secs(1)) && step == "never"
         ));
+    })
+    .await;
+}
+
+const AGENT_PROFILE: &str = r#"agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+"#;
+
+fn agent_runtime(
+    fixture: &ExecutionFixture,
+    adapter: ScriptedAgentAdapter,
+) -> AgentExecution<ScriptedAgentAdapter> {
+    AgentExecution::enabled(
+        WorkflowRunId::from(Arc::from("run-fixed")),
+        fixture.agent_inputs.clone(),
+        adapter,
+    )
+}
+
+#[tokio::test]
+async fn agent_response_and_file_commit_atomically_before_command_data_flow() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  produce:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+      artifact:
+        kind: file
+        path: agent.txt
+        mediaType: text/plain
+  consume:
+    kind: cmd
+    inputs:
+      response:
+        ref: outputs.produce.response
+    command:
+      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$SCHERZO_STEP_INPUTS/values/response\" || true; printf '%s' \"$value\" > consumed.txt"]
+    outputs:
+      consumed:
+        kind: file
+        path: consumed.txt
+        mediaType: text/plain
+exports:
+  response:
+    ref: outputs.produce.response
+  artifact:
+    ref: outputs.produce.artifact
+  consumed:
+    ref: outputs.consume.consumed
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"produce the declared outputs")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            2,
+            1024,
+        );
+        fs::write(fixture.execution_root.join("agent.txt"), b"agent artifact").unwrap();
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let diagnostics = StepDiagnosticLog::default();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &diagnostics,
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        assert_eq!(started.identity().run().as_ref(), "run-fixed");
+        assert_eq!(started.identity().step(), "produce");
+        started
+            .control()
+            .observe(AgentObservation::Lifecycle {
+                milestone: AgentLifecycleMilestone::HarnessStarted,
+            })
+            .await
+            .unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Response(Arc::from("agent response")))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let StepState::Succeeded { outputs } = &result.steps["produce"] else {
+            panic!("agent producer did not succeed");
+        };
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(
+            &outputs["response"],
+            CapturedValue::Text(value) if value.as_ref() == "agent response"
+        ));
+        let ExportValue::Available { output } = &result.exports["consumed"] else {
+            panic!("downstream command output was unavailable");
+        };
+        let mut consumed = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut consumed)
+            .unwrap();
+        assert_eq!(consumed, b"agent response");
+        let ExportValue::Available { output } = &result.exports["artifact"] else {
+            panic!("agent file output was unavailable");
+        };
+        let mut artifact = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut artifact)
+            .unwrap();
+        assert_eq!(artifact, b"agent artifact");
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn structured_agent_result_flows_only_through_its_explicit_command_binding() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  produce:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: result.schema.json
+  consume:
+    kind: cmd
+    inputs:
+      result:
+        ref: outputs.produce.result
+    command:
+      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$SCHERZO_STEP_INPUTS/values/result\" || true; printf '%s' \"$value\" > consumed.json"]
+    outputs:
+      consumed:
+        kind: file
+        path: consumed.json
+        mediaType: application/json
+exports:
+  result:
+    ref: outputs.produce.result
+  consumed:
+    ref: outputs.consume.consumed
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[
+                ("prompt.md", b"return a result"),
+                (
+                    "result.schema.json",
+                    br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                ),
+            ],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                "z": 2,
+                "a": 1
+            }))))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        let ExportValue::Available { output } = &result.exports["result"] else {
+            panic!("structured result was unavailable");
+        };
+        assert!(matches!(
+            output,
+            CapturedValue::Json(value) if value.as_ref() == &json!({"z": 2, "a": 1})
+        ));
+        let ExportValue::Available { output } = &result.exports["consumed"] else {
+            panic!("result consumer was unavailable");
+        };
+        let mut consumed = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut consumed)
+            .unwrap();
+        assert_eq!(consumed, br#"{"a":1,"z":2}"#);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  aResponse:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+  bResult:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      result:
+        kind: agent_result
+        schema: result.schema.json
+  cFile:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "true"]
+    outputs:
+      artifact:
+        kind: file
+        path: upstream.txt
+        mediaType: text/plain
+  zConsumer:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - ref: outputs.aResponse.response
+        attachments:
+          - ref: outputs.bResult.result
+          - ref: outputs.cFile.artifact
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[
+                ("prompt.md", b"consume committed values"),
+                (
+                    "result.schema.json",
+                    br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                ),
+            ],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            3,
+            1024,
+        );
+        fs::write(fixture.execution_root.join("upstream.txt"), b"file exact").unwrap();
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let mut execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let first = control.wait_until_started().await.unwrap();
+        let second = control.wait_until_started().await.unwrap();
+        let producers = BTreeMap::from([
+            (first.identity().step().to_owned(), first.control().clone()),
+            (second.identity().step().to_owned(), second.control().clone()),
+        ]);
+        assert_eq!(
+            producers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["aResponse", "bResult"]
+        );
+        for producer in producers.values() {
+            producer.start().await.unwrap();
+        }
+        producers["aResponse"]
+            .propose(ScriptedAgentValue::Response(Arc::from("response exact")))
+            .await
+            .unwrap();
+        producers["bResult"]
+            .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                "z": 2,
+                "a": 1
+            }))))
+            .await
+            .unwrap();
+        producers["aResponse"].complete().await.unwrap();
+        producers["bResult"].complete().await.unwrap();
+
+        let consumer = tokio::select! {
+            consumer = control.wait_until_started() => match consumer {
+                Ok(consumer) => consumer,
+                Err(failure) => panic!(
+                    "adapter stopped before the dependent agent started ({failure:?}): {:?}",
+                    (&mut execution).await
+                ),
+            },
+            result = &mut execution => panic!(
+                "workflow finished before the dependent agent started: {result:?}"
+            ),
+        };
+        assert_eq!(consumer.identity().step(), "zConsumer");
+        assert_eq!(consumer.message(), "response exact");
+        assert_eq!(consumer.attachments().len(), 2);
+        assert_eq!(consumer.attachments()[0].media_type(), "application/json");
+        assert_eq!(
+            fs::read(consumer.attachments()[0].path()).unwrap(),
+            br#"{"a":1,"z":2}"#
+        );
+        assert_eq!(consumer.attachments()[1].media_type(), "text/plain");
+        assert_eq!(
+            fs::read(consumer.attachments()[1].path()).unwrap(),
+            b"file exact"
+        );
+        consumer.control().start().await.unwrap();
+        consumer.control().complete().await.unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert!(matches!(
+            result.steps["zConsumer"],
+            StepState::Succeeded { .. }
+        ));
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn failed_agent_file_capture_commits_neither_response_nor_file() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  produce:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+      missing:
+        kind: file
+        path: missing.txt
+        mediaType: text/plain
+  consume:
+    kind: cmd
+    inputs:
+      response:
+        ref: outputs.produce.response
+    command:
+      argv: ["/bin/true"]
+exports:
+  response:
+    ref: outputs.produce.response
+  missing:
+    ref: outputs.produce.missing
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"produce output")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Response(Arc::from("must not commit")))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert!(matches!(
+            result.steps["produce"],
+            StepState::Failed {
+                phase: FailurePhase::OutputCapture,
+                ..
+            }
+        ));
+        assert_eq!(
+            result.steps["consume"],
+            StepState::Blocked {
+                dependency: "produce".to_owned()
+            }
+        );
+        assert!(matches!(
+            result.exports["response"],
+            ExportValue::Unavailable { .. }
+        ));
+        assert!(matches!(
+            result.exports["missing"],
+            ExportValue::Unavailable { .. }
+        ));
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AgentEngineTranscript {
+    observations: Vec<AgentObservationEnvelope>,
+    terminal_transitions: Vec<StepStateKind>,
+}
+
+#[tokio::test]
+async fn no_value_agent_observations_are_repeatable_and_never_become_outputs() {
+    let first = run_no_value_agent_transcript().await;
+    let second = run_no_value_agent_transcript().await;
+    assert_eq!(first, second);
+    assert_eq!(first.observations.len(), 2);
+    assert_eq!(first.observations[0].sequence().get(), 1);
+    assert_eq!(first.observations[1].sequence().get(), 2);
+    assert_eq!(first.terminal_transitions, [StepStateKind::Succeeded]);
+}
+
+async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  observe:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"observe only")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let (observer, entries, _observed) = RecordingObserver::new();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    observer,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        for observation in [
+            AgentObservation::AssistantText {
+                text: Arc::from("not an implicit response"),
+            },
+            AgentObservation::Lifecycle {
+                milestone: AgentLifecycleMilestone::HarnessQuiescent,
+            },
+        ] {
+            started.control().observe(observation).await.unwrap();
+        }
+        started.control().complete().await.unwrap();
+        let result = execution.await.unwrap().unwrap();
+        let StepState::Succeeded { outputs } = &result.steps["observe"] else {
+            panic!("no-value agent did not succeed");
+        };
+        assert!(outputs.is_empty());
+        assert!(result.exports.is_empty());
+        let entries = entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observations = entries
+            .iter()
+            .filter_map(|observation| match observation {
+                ExecutionObservation::Agent(observation) => Some(observation.clone()),
+                ExecutionObservation::Transition(_)
+                | ExecutionObservation::CommandOutput(_)
+                | ExecutionObservation::CommandOutputClosed(_) => None,
+            })
+            .collect();
+        let terminal_transitions = entries
+            .iter()
+            .filter_map(|observation| match observation {
+                ExecutionObservation::Transition(TransitionObservation {
+                    event: TransitionEvent::Step { step, to, .. },
+                    ..
+                }) if step == "observe"
+                    && matches!(
+                        to,
+                        StepStateKind::Succeeded | StepStateKind::Failed | StepStateKind::Cancelled
+                    ) =>
+                {
+                    Some(*to)
+                }
+                ExecutionObservation::Transition(_)
+                | ExecutionObservation::CommandOutput(_)
+                | ExecutionObservation::CommandOutputClosed(_)
+                | ExecutionObservation::Agent(_) => None,
+            })
+            .collect();
+        AgentEngineTranscript {
+            observations,
+            terminal_transitions,
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn committed_agent_completion_wins_a_later_cancellation_before_delivery_finishes() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  complete:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+exports:
+  response:
+    ref: outputs.complete.response
+"#
+        );
+        let cancellation = CancellationSource::new();
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"complete")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            cancellation.clone(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let (observer, _entries, _observed, mut success_reached, release_success) =
+            RecordingObserver::with_step_success_gate();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    observer,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Response(Arc::from("winner")))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+        success_reached.recv().await.unwrap();
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        assert!(!execution.is_finished());
+        release_success.send(true).unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert!(matches!(
+            result.exports["response"],
+            ExportValue::Available {
+                output: CapturedValue::Text(ref value)
+            } if value.as_ref() == "winner"
+        ));
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_failure_stops_pending_command_but_keeps_active_agent_outputs() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  aFail:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+  bCommit:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+      artifact:
+        kind: file
+        path: retained.txt
+        mediaType: text/plain
+  cActive:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+  zStopped:
+    kind: cmd
+    dependsOn: [aFail]
+    command:
+      argv: ["/bin/true"]
+exports:
+  response:
+    ref: outputs.bCommit.response
+  artifact:
+    ref: outputs.bCommit.artifact
+"#
+        );
+        let cancellation = CancellationSource::new();
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"execute")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            cancellation.clone(),
+            3,
+            1024,
+        );
+        fs::write(fixture.execution_root.join("retained.txt"), b"retained").unwrap();
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let (observer, _entries, mut observed) = RecordingObserver::new();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    observer,
+                )
+                .await
+            }
+        });
+
+        let first = control.wait_until_started().await.unwrap();
+        let second = control.wait_until_started().await.unwrap();
+        let third = control.wait_until_started().await.unwrap();
+        let controls = BTreeMap::from([
+            (first.identity().step().to_owned(), first.control().clone()),
+            (
+                second.identity().step().to_owned(),
+                second.control().clone(),
+            ),
+            (third.identity().step().to_owned(), third.control().clone()),
+        ]);
+        assert_eq!(
+            controls.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["aFail", "bCommit", "cActive"]
+        );
+        for control in controls.values() {
+            control.start().await.unwrap();
+        }
+        controls["bCommit"]
+            .propose(ScriptedAgentValue::Response(Arc::from("committed")))
+            .await
+            .unwrap();
+        controls["bCommit"].complete().await.unwrap();
+        wait_for_step_transition(&mut observed, "bCommit", StepStateKind::Succeeded).await;
+        controls["aFail"]
+            .fail(AgentFailureCause::HarnessFailed {
+                detail: crate::execution::workflow::agent::AgentHarnessFailureDetail::ModelError,
+            })
+            .await
+            .unwrap();
+        wait_for_step_transition(&mut observed, "aFail", StepStateKind::Failed).await;
+        assert!(cancellation.request_cancellation(CancellationReason::RunnerShutdown));
+
+        let result = execution.await.unwrap().unwrap();
+        assert!(matches!(
+            result.outcome,
+            RunOutcome::Failed {
+                later_cancellation: Some(CancellationReason::RunnerShutdown),
+                ..
+            }
+        ));
+        assert_eq!(
+            result.steps["zStopped"],
+            StepState::Blocked {
+                dependency: "aFail".to_owned()
+            }
+        );
+        assert_eq!(
+            result.steps["cActive"],
+            StepState::Cancelled {
+                reason: CancellationReason::RunnerShutdown
+            }
+        );
+        assert!(matches!(
+            result.exports["response"],
+            ExportValue::Available {
+                output: CapturedValue::Text(_)
+            }
+        ));
+        assert!(matches!(
+            result.exports["artifact"],
+            ExportValue::Available {
+                output: CapturedValue::File(_)
+            }
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_discards_provisional_agent_value_and_waits_for_adapter_quiescence() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  active:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: agent_response
+      artifact:
+        kind: file
+        path: side-effect.txt
+        mediaType: text/plain
+  pending:
+    kind: cmd
+    dependsOn: [active]
+    command:
+      argv: ["/bin/true"]
+exports:
+  response:
+    ref: outputs.active.response
+  artifact:
+    ref: outputs.active.artifact
+"#
+        );
+        let cancellation = CancellationSource::new();
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"remain active")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            cancellation.clone(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Response(Arc::from("provisional")))
+            .await
+            .unwrap();
+        let side_effect = fixture.execution_root.join("side-effect.txt");
+        fs::write(&side_effect, b"ordinary filesystem side effect").unwrap();
+        let mut barrier = started.control().block().unwrap();
+        barrier.wait_until_blocked().await.unwrap();
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        assert!(!execution.is_finished());
+        barrier.release().unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(
+            result.outcome,
+            RunOutcome::Cancelled {
+                reason: CancellationReason::UserRequest
+            }
+        );
+        assert_eq!(
+            result.steps["active"],
+            StepState::Cancelled {
+                reason: CancellationReason::UserRequest
+            }
+        );
+        assert_eq!(
+            result.steps["pending"],
+            StepState::Cancelled {
+                reason: CancellationReason::UserRequest
+            }
+        );
+        assert!(matches!(
+            result.exports["response"],
+            ExportValue::Unavailable { .. }
+        ));
+        assert!(matches!(
+            result.exports["artifact"],
+            ExportValue::Unavailable { .. }
+        ));
+        assert_eq!(
+            fs::read(side_effect).unwrap(),
+            b"ordinary filesystem side effect",
+            "cancellation must not roll back ordinary filesystem writes"
+        );
+        assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_start_failure_is_a_start_failure() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  task:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+"#
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("prompt.md", b"start")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::default(),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = ScriptedAgentAdapter::new();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started
+            .control()
+            .fail(AgentFailureCause::HarnessStartFailed)
+            .await
+            .unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                result.steps["task"],
+                StepState::Failed {
+                    phase: FailurePhase::Start,
+                    cause: StepFailureCause::Start(StepStartFailure::Agent(
+                        AgentFailureCause::HarnessStartFailed
+                    )),
+                }
+            ),
+            "a pre-start harness failure must not transition the step through running: {:?}",
+            result.steps["task"]
+        );
     })
     .await;
 }
@@ -663,7 +1812,8 @@ fn observed_stream(
             }
             ExecutionObservation::Transition(_)
             | ExecutionObservation::CommandOutput(_)
-            | ExecutionObservation::CommandOutputClosed(_) => None,
+            | ExecutionObservation::CommandOutputClosed(_)
+            | ExecutionObservation::Agent(_) => None,
         })
         .collect::<Vec<_>>();
     assert!(!observations.is_empty());
@@ -687,7 +1837,8 @@ fn observed_stream(
             }
             ExecutionObservation::Transition(_)
             | ExecutionObservation::CommandOutput(_)
-            | ExecutionObservation::CommandOutputClosed(_) => None,
+            | ExecutionObservation::CommandOutputClosed(_)
+            | ExecutionObservation::Agent(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(closed.len(), 1);

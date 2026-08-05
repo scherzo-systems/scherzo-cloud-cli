@@ -453,15 +453,34 @@ pub(crate) trait CoordinatorClock: Clone + Send + Sync + 'static {
     fn wait_until(&self, deadline: Self::Instant) -> impl Future<Output = ()> + Send;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommittedActionKind {
+    StartStep,
+    CaptureOutputs,
+    CancelStep,
+    FinishRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedAction {
+    pub(crate) id: ActionId,
+    pub(crate) kind: CommittedActionKind,
+    pub(crate) step: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommittedReduction<Cause, Output, Deadline> {
     pub(crate) occurrence_ordinal: OccurrenceOrdinal,
+    pub(crate) occurrence_accepted: bool,
     pub(crate) state: RuntimeState<Cause, Output>,
     pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
+    pub(crate) actions: Vec<CommittedAction>,
 }
 
 pub(crate) trait CommitPort<Commit> {
-    fn commit(&mut self, commit: Commit) -> impl Future<Output = ()>;
+    type Error;
+
+    fn commit(&mut self, commit: Commit) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
 pub(crate) trait ActionPort<Action> {
@@ -472,6 +491,9 @@ pub(crate) trait ActionPort<Action> {
 pub(crate) enum CoordinationError {
     ArtifactStagingMismatch,
     InputStagingMismatch,
+    AgentInputStagingMismatch,
+    AgentRuntimeUnavailable,
+    CommitFailed,
     OccurrenceChannelClosed,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
@@ -666,17 +688,19 @@ where
             occurrence_accepted,
         } = reduction;
         let terminal = !matches!(&state.workflow, WorkflowState::Executing { .. });
-        self.state = Some(state);
-        let Some(committed_state) = self.state.clone() else {
-            return Err(CoordinationError::ReducerStateUnavailable);
-        };
+        let committed_actions = actions.iter().map(committed_action).collect();
+        let committed_state = state.clone();
         self.commits
             .commit(CommittedReduction {
                 occurrence_ordinal,
+                occurrence_accepted,
                 state: committed_state,
                 events,
+                actions: committed_actions,
             })
-            .await;
+            .await
+            .map_err(|_| CoordinationError::CommitFailed)?;
+        self.state = Some(state);
         if let Some(finalization) =
             acknowledgement.and_then(|acknowledgement| acknowledgement.resolve(occurrence_accepted))
         {
@@ -702,6 +726,28 @@ where
             state,
             last_occurrence_ordinal,
         })
+    }
+}
+
+fn committed_action<Provisional, Cause, Output, Deadline>(
+    requested: &RequestedAction<Provisional, Cause, Output, Deadline>,
+) -> CommittedAction {
+    let (kind, step) = match &requested.action {
+        runtime::Action::StartStep { step, .. } => {
+            (CommittedActionKind::StartStep, Some(step.clone()))
+        }
+        runtime::Action::CaptureOutputs { step, .. } => {
+            (CommittedActionKind::CaptureOutputs, Some(step.clone()))
+        }
+        runtime::Action::CancelStep { step, .. } => {
+            (CommittedActionKind::CancelStep, Some(step.clone()))
+        }
+        runtime::Action::FinishRun { .. } => (CommittedActionKind::FinishRun, None),
+    };
+    CommittedAction {
+        id: requested.id,
+        kind,
+        step,
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -101,6 +102,24 @@ pub(super) fn remove_open_tree_at(
         return Err(Errno::IO);
     }
     unlinkat(parent, identity, AtFlags::REMOVEDIR)
+}
+
+pub(super) fn same_file(left: &OwnedFd, right: &OwnedFd) -> Result<bool, Errno> {
+    let left = fstat(left)?;
+    let right = fstat(right)?;
+    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+}
+
+pub(super) fn directory_entry_names(directory: &OwnedFd) -> Result<BTreeSet<Vec<u8>>, Errno> {
+    let mut entries = BTreeSet::new();
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            entries.insert(name.to_vec());
+        }
+    }
+    Ok(entries)
 }
 
 pub(super) fn remove_staging_root(

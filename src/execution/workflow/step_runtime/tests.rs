@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::ops::Add;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use super::*;
@@ -24,6 +25,7 @@ use crate::execution::workflow::admission::{
     ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
     ResolvedAttachment, ResolvedImports, admit_workflow,
 };
+use crate::execution::workflow::agent::{AgentProcessDirective, agent_process_control_channel};
 use crate::execution::workflow::artifact::{
     ArtifactStaging, CaptureBoundary, CaptureBoundaryKind, CaptureBoundaryObserver,
     CaptureDeclaration, CaptureFailure, CaptureFailureKind,
@@ -55,9 +57,10 @@ const FIXTURE_DESCENDANT: &str = "descendant";
 const LITERAL_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 
-type TestOccurrence = Occurrence<(), StepFailureCause, CapturedValue, ()>;
-type TestReceiver = OccurrenceReceiver<(), StepFailureCause, CapturedValue>;
-type TestRequestedAction = RequestedAction<(), StepFailureCause, CapturedValue, TestInstant>;
+type TestOccurrence = Occurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue, ()>;
+type TestReceiver = OccurrenceReceiver<ProvisionalStepOutputs, StepFailureCause, CapturedValue>;
+type TestRequestedAction =
+    RequestedAction<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>;
 type TestRuntimeState = runtime::RuntimeState<StepFailureCause, CapturedValue>;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -397,9 +400,11 @@ struct RecordingCommitPort {
 }
 
 impl CommitPort<WorkflowCommit> for RecordingCommitPort {
-    fn commit(&mut self, commit: WorkflowCommit) -> impl Future<Output = ()> {
+    type Error = std::convert::Infallible;
+
+    fn commit(&mut self, commit: WorkflowCommit) -> impl Future<Output = Result<(), Self::Error>> {
         let _ = self.commits.send(commit);
-        std::future::ready(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -434,7 +439,7 @@ async fn command_uses_contained_cwd_literal_argv_and_isolates_parent_environment
                 Occurrence::StepExecutionCompleted {
                     step: "task".to_owned(),
                     action: run.action,
-                    provisional: (),
+                    provisional: ProvisionalStepOutputs::command(),
                 }
             );
         }
@@ -712,28 +717,34 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
     } = prepare_fixture_command_with_output(ProgramForm::Absolute, 0).await;
     fs::write(cwd.join("report.txt"), b"uncommitted report").unwrap();
     let artifacts = test_artifacts(&admitted);
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(&admitted, None);
     let start = initialized
         .actions
         .iter()
         .find(|requested| matches!(&requested.action, Action::StartStep { step, .. } if step == "task"))
         .unwrap();
-    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "task".to_owned(),
-            action: start.id,
-        },
-    );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &running.state,
-        Occurrence::StepExecutionCompleted {
-            step: "task".to_owned(),
-            action: start.id,
-            provisional: (),
-        },
-    );
+    let running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start.id,
+            },
+        );
+    let capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "task".to_owned(),
+                action: start.id,
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let capture = capture_requested
         .actions
         .iter()
@@ -741,13 +752,14 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
             matches!(&requested.action, Action::CaptureOutputs { step, .. } if step == "task")
         })
         .unwrap();
-    let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &capture_requested.state,
-        Occurrence::CancellationRequested {
-            reason: CancellationReason::UserRequest,
-            deadline: TestInstant(Duration::from_secs(1)),
-        },
-    );
+    let cancelled =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &capture_requested.state,
+            Occurrence::CancellationRequested {
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::from_secs(1)),
+            },
+        );
     assert_eq!(
         cancelled.state.steps["task"].state,
         StepState::Cancelling {
@@ -818,7 +830,12 @@ steps:
             2,
         );
         let (capturing, captures) = capturing_actions(&admitted);
-        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let cancelled = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
             &capturing,
             Occurrence::CancellationRequested {
                 reason: CancellationReason::UserRequest,
@@ -905,7 +922,12 @@ steps:
             1,
         );
         let (capturing, captures) = capturing_actions(&admitted);
-        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let cancelled = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
             &capturing,
             Occurrence::CancellationRequested {
                 reason: CancellationReason::UserRequest,
@@ -1008,7 +1030,12 @@ exports:
             assert_eq!(artifacts.staging.reservation_usage(), (1, 9));
 
             if cancel_first {
-                let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+                let cancelled = runtime::reduce::<
+                    ProvisionalStepOutputs,
+                    StepFailureCause,
+                    CapturedValue,
+                    TestInstant,
+                >(
                     &capturing,
                     Occurrence::CancellationRequested {
                         reason: CancellationReason::UserRequest,
@@ -1042,14 +1069,18 @@ exports:
                 acknowledgement.resolve(committed.occurrence_accepted).await;
                 assert!(committed.occurrence_accepted);
                 assert_eq!(committed.state.workflow, WorkflowState::Succeeded);
-                let late_cancellation =
-                    runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-                        &committed.state,
-                        Occurrence::CancellationRequested {
-                            reason: CancellationReason::UserRequest,
-                            deadline: TestInstant(Duration::from_secs(1)),
-                        },
-                    );
+                let late_cancellation = runtime::reduce::<
+                    ProvisionalStepOutputs,
+                    StepFailureCause,
+                    CapturedValue,
+                    TestInstant,
+                >(
+                    &committed.state,
+                    Occurrence::CancellationRequested {
+                        reason: CancellationReason::UserRequest,
+                        deadline: TestInstant(Duration::from_secs(1)),
+                    },
+                );
                 assert!(!late_cancellation.occurrence_accepted);
                 assert!(late_cancellation.actions.is_empty());
                 assert_eq!(late_cancellation.state, committed.state);
@@ -1117,7 +1148,12 @@ steps:
             .find(|path| fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some()))
             .unwrap();
         artifacts.staging.block_artifact_unlinks();
-        let cancelled = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let cancelled = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
             &capturing,
             Occurrence::CancellationRequested {
                 reason: CancellationReason::UserRequest,
@@ -1359,24 +1395,30 @@ exports:
         EnvironmentSnapshot::default(),
         1,
     );
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(&admitted, None);
     let start = initialized.actions[0].id;
-    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "task".to_owned(),
-            action: start,
-        },
-    );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &running.state,
-        Occurrence::StepExecutionCompleted {
-            step: "task".to_owned(),
-            action: start,
-            provisional: (),
-        },
-    );
+    let running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start,
+            },
+        );
+    let capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "task".to_owned(),
+                action: start,
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let capture = capture_requested
         .actions
         .iter()
@@ -1472,24 +1514,30 @@ steps:
         EnvironmentSnapshot::default(),
         1,
     );
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(&admitted, None);
     let start = initialized.actions[0].id;
-    let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "task".to_owned(),
-            action: start,
-        },
-    );
-    let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &running.state,
-        Occurrence::StepExecutionCompleted {
-            step: "task".to_owned(),
-            action: start,
-            provisional: (),
-        },
-    );
+    let running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start,
+            },
+        );
+    let capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "task".to_owned(),
+                action: start,
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let capture = capture_requested.actions[0].clone();
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
     sender
@@ -1572,24 +1620,30 @@ exports:
         sender,
         TestClock,
     );
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(&admitted, None);
     let prior_start = initialized.actions[0].id;
-    let prior_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "prior".to_owned(),
-            action: prior_start,
-        },
-    );
-    let prior_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &prior_running.state,
-        Occurrence::StepExecutionCompleted {
-            step: "prior".to_owned(),
-            action: prior_start,
-            provisional: (),
-        },
-    );
+    let prior_running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "prior".to_owned(),
+                action: prior_start,
+            },
+        );
+    let prior_capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &prior_running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "prior".to_owned(),
+                action: prior_start,
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let prior_capture = prior_capture_requested.actions[0].id;
     runtime
         .capture_outputs("prior".to_owned(), prior_capture)
@@ -1607,20 +1661,21 @@ exports:
         .find(|requested| matches!(&requested.action, Action::StartStep { step, .. } if step == "failing"))
         .unwrap()
         .id;
-    let failing_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &prior_committed.state,
-        Occurrence::StepStarted {
-            step: "failing".to_owned(),
-            action: failing_start,
-        },
-    );
+    let failing_running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &prior_committed.state,
+            Occurrence::StepStarted {
+                step: "failing".to_owned(),
+                action: failing_start,
+            },
+        );
     let failing_capture_requested =
-        runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
             &failing_running.state,
             Occurrence::StepExecutionCompleted {
                 step: "failing".to_owned(),
                 action: failing_start,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             },
         );
     let failing_capture = failing_capture_requested.actions[0].id;
@@ -1724,8 +1779,12 @@ steps:
         2,
         CaptureLimits::new(2, 3, 3),
     );
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(&admitted, None);
     let starts = initialized
         .actions
         .iter()
@@ -1734,37 +1793,41 @@ steps:
             _ => unreachable!(),
         })
         .collect::<BTreeMap<_, _>>();
-    let alpha_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "alpha".to_owned(),
-            action: starts["alpha"],
-        },
-    );
-    let both_running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &alpha_running.state,
-        Occurrence::StepStarted {
-            step: "beta".to_owned(),
-            action: starts["beta"],
-        },
-    );
-    let alpha_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &both_running.state,
-        Occurrence::StepExecutionCompleted {
-            step: "alpha".to_owned(),
-            action: starts["alpha"],
-            provisional: (),
-        },
-    );
+    let alpha_running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "alpha".to_owned(),
+                action: starts["alpha"],
+            },
+        );
+    let both_running =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &alpha_running.state,
+            Occurrence::StepStarted {
+                step: "beta".to_owned(),
+                action: starts["beta"],
+            },
+        );
+    let alpha_capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &both_running.state,
+            Occurrence::StepExecutionCompleted {
+                step: "alpha".to_owned(),
+                action: starts["alpha"],
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let alpha_capture = alpha_capture_requested.actions[0].clone();
-    let beta_capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &alpha_capture_requested.state,
-        Occurrence::StepExecutionCompleted {
-            step: "beta".to_owned(),
-            action: starts["beta"],
-            provisional: (),
-        },
-    );
+    let beta_capture_requested =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &alpha_capture_requested.state,
+            Occurrence::StepExecutionCompleted {
+                step: "beta".to_owned(),
+                action: starts["beta"],
+                provisional: ProvisionalStepOutputs::command(),
+            },
+        );
     let beta_capture = beta_capture_requested.actions[0].clone();
     assert!(alpha_capture.id < beta_capture.id);
 
@@ -1938,7 +2001,7 @@ async fn bare_program_search_skips_a_candidate_inaccessible_to_the_caller() {
             Occurrence::StepExecutionCompleted {
                 step: "task".to_owned(),
                 action,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             }
         );
         assert_eq!(execution.await.unwrap(), Ok(()));
@@ -2317,21 +2380,21 @@ async fn unavailable_captured_input_fails_preparation_without_launching_command(
         let foreign_value = CapturedValue::file(foreign_outputs.remove("report").unwrap());
 
         let initialized =
-            runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
+            runtime::initialize::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(&admitted, None);
         let producer_start = initialized.actions[0].id;
-        let running = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let running = runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
             &initialized.state,
             Occurrence::StepStarted {
                 step: "produce".to_owned(),
                 action: producer_start,
             },
         );
-        let capture_requested = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let capture_requested = runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
             &running.state,
             Occurrence::StepExecutionCompleted {
                 step: "produce".to_owned(),
                 action: producer_start,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             },
         );
         let capture_action = capture_requested.actions[0].id;
@@ -2382,6 +2445,48 @@ async fn unavailable_captured_input_fails_preparation_without_launching_command(
             listener.accept(),
             Err(failure) if failure.kind() == io::ErrorKind::WouldBlock
         ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_process_control_escalates_at_the_cancel_action_deadline() {
+    with_watchdog(async {
+        let PreparedFixtureCommand {
+            _temporary,
+            admitted,
+            ..
+        } = prepare_fixture_command(ProgramForm::Absolute, 0).await;
+        let deadline = TestInstant(Duration::from_secs(41));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let Action::StartStep { step, .. } = start.action else {
+            panic!("fixture did not produce a start action");
+        };
+        let (clock, mut deadline_control) = ControlledClock::new(TestInstant(Duration::ZERO));
+        let (sender, _receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime =
+            StepRuntime::new(admitted, artifacts.staging, artifacts.inputs, sender, clock);
+        let _cancellation = runtime.register_start(step, start.id).unwrap();
+        assert!(matches!(
+            runtime.with_work(|work| work.begin_launch(start.id)),
+            BeginLaunch::Launch
+        ));
+        let (process_control, mut directives) = agent_process_control_channel();
+        assert!(matches!(
+            runtime.with_work(|work| work.record_agent_launch(start.id, process_control)),
+            RecordLaunch::Running
+        ));
+
+        runtime.release(cancel).await;
+        assert_eq!(
+            directives.recv().await,
+            Some(AgentProcessDirective::Interrupt)
+        );
+        assert_eq!(deadline_control.next_deadline().await, deadline);
+        deadline_control.release();
+        assert_eq!(directives.recv().await, Some(AgentProcessDirective::Force));
+        runtime.with_work(|work| work.abandon(start.id));
     })
     .await;
 }
@@ -2441,12 +2546,16 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
             TestClock,
         );
         let cancellation = runtime.register_start(step.clone(), start.id).unwrap();
-        let CancellationRegistration::Active { wake, interrupt } =
-            runtime.request_cancellation(cancel_step, cancel.id, deadline)
+        let CancellationRegistration::Active {
+            wake,
+            interrupt,
+            agent_deadline,
+        } = runtime.request_cancellation(cancel_step, cancel.id, deadline)
         else {
             panic!("prelaunch cancellation was not registered");
         };
         assert!(interrupt.is_none());
+        assert!(agent_deadline.is_none());
         wake.unwrap().send(()).unwrap();
 
         let execution = runtime.execute_registered_step(step, start.id, inputs, cancellation);
@@ -2595,7 +2704,7 @@ async fn output_beyond_each_log_limit_is_drained_before_success() {
             Occurrence::StepExecutionCompleted {
                 step: "task".to_owned(),
                 action,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             }
         );
         assert_eq!(execution.await.unwrap(), Ok(()));
@@ -2653,12 +2762,7 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
             standard_error,
             crate::execution::workflow::observation::NoopExecutionObserver,
         );
-        let mut launched = LaunchedStepBody::Command {
-            child,
-            process_group: None,
-            diagnostic: Some(pending),
-            inputs: None,
-        };
+        let mut launched = LaunchedStepBody::fixture(child, pending);
         let settlement_runtime = runtime.clone();
         let settlement = settlement_runtime.settle_launched(
             "task".to_owned(),
@@ -2774,11 +2878,12 @@ async fn concurrent_commands_receive_distinct_process_groups() {
             let Occurrence::StepExecutionCompleted {
                 step,
                 action,
-                provisional: (),
+                provisional,
             } = next_occurrence(&mut receiver).await
             else {
                 panic!("command did not report zero-exit completion");
             };
+            assert_eq!(provisional, ProvisionalStepOutputs::command());
             completed.insert(step, action);
         }
         assert_eq!(completed, actions);
@@ -2984,7 +3089,7 @@ async fn natural_exit_before_cancel_delivery_has_no_late_lifecycle_or_cleanup_wo
             Occurrence::StepExecutionCompleted {
                 step: "task".to_owned(),
                 action: start_action,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             }
         );
 
@@ -3045,7 +3150,7 @@ async fn cancellation_after_the_owned_child_exits_still_terminates_its_descendan
             Occurrence::StepExecutionCompleted {
                 step: "task".to_owned(),
                 action: start_action,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             }
         );
 
@@ -3238,8 +3343,12 @@ async fn prepare_group_command(mode: &str) -> PreparedGroupCommand {
 fn capturing_actions(
     admitted: &AdmittedWorkflow,
 ) -> (TestRuntimeState, BTreeMap<String, TestRequestedAction>) {
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(admitted, None);
     let starts = initialized
         .actions
         .iter()
@@ -3250,7 +3359,12 @@ fn capturing_actions(
         .collect::<BTreeMap<_, _>>();
     let mut state = initialized.state;
     for (step, action) in &starts {
-        state = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        state = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
             &state,
             Occurrence::StepStarted {
                 step: step.clone(),
@@ -3262,12 +3376,17 @@ fn capturing_actions(
 
     let mut captures = BTreeMap::new();
     for (step, action) in starts {
-        let reduction = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
+        let reduction = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
             &state,
             Occurrence::StepExecutionCompleted {
                 step: step.clone(),
                 action,
-                provisional: (),
+                provisional: ProvisionalStepOutputs::command(),
             },
         );
         let capture = reduction
@@ -3286,21 +3405,26 @@ fn running_cancellation_actions(
     admitted: &AdmittedWorkflow,
     deadline: TestInstant,
 ) -> (TestRequestedAction, TestRequestedAction) {
-    let initialized =
-        runtime::initialize::<(), StepFailureCause, CapturedValue, TestInstant>(admitted, None);
+    let initialized = runtime::initialize::<
+        ProvisionalStepOutputs,
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >(admitted, None);
     let start = initialized
         .actions
         .iter()
         .find(|requested| matches!(requested.action, Action::StartStep { .. }))
         .unwrap()
         .clone();
-    let started = runtime::reduce::<(), StepFailureCause, CapturedValue, TestInstant>(
-        &initialized.state,
-        Occurrence::StepStarted {
-            step: "task".to_owned(),
-            action: start.id,
-        },
-    );
+    let started =
+        runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start.id,
+            },
+        );
     let cancelled = runtime::reduce(
         &started.state,
         Occurrence::CancellationRequested {
@@ -3579,16 +3703,18 @@ fn admit_fixture_with_inputs(
 }
 
 fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
-    runtime::initialize::<(), StepFailureCause, CapturedValue, ()>(admitted, None)
-        .actions
-        .into_iter()
-        .filter_map(|requested| match requested.action {
-            Action::StartStep { step, .. } => Some((step, requested.id)),
-            Action::CaptureOutputs { .. }
-            | Action::CancelStep { .. }
-            | Action::FinishRun { .. } => None,
-        })
-        .collect()
+    runtime::initialize::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, ()>(
+        admitted, None,
+    )
+    .actions
+    .into_iter()
+    .filter_map(|requested| match requested.action {
+        Action::StartStep { step, .. } => Some((step, requested.id)),
+        Action::CaptureOutputs { .. } | Action::CancelStep { .. } | Action::FinishRun { .. } => {
+            None
+        }
+    })
+    .collect()
 }
 
 async fn assert_start_failure(admitted: AdmittedWorkflow, step: &str, expected: StepStartFailure) {

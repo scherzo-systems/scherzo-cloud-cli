@@ -12,7 +12,8 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, organization profile management and one-page member-directory
-reads, local Workflow V1 definition validation and command-only execution, runner
+reads, local Workflow V1 definition validation, command-only execution, and durable run
+status inspection, runner
 diagnostics, and a development-only outbound runner transport. `runner serve` connects
 to an explicitly configured runner gateway, receives and
 transport-acknowledges assignment offers, and emits structured service events without
@@ -66,22 +67,24 @@ local definition resolved successfully.
 ## Local workflow execution
 
 Use `scherzo-cloud workflow run` to execute a command-only Workflow V1 DAG in an
-existing caller-owned directory and atomically publish its terminal result:
+existing caller-owned directory and create one durable local run directory:
 
 ```sh
 scherzo-cloud workflow run \
   --source-root ./my-repository \
   --execution-root ./my-checkout \
-  --result-dir ./results/check-001 \
+  --run-dir ./runs/check-001 \
   --max-parallel 2 \
   .scherzo/workflows/check.yaml
 ```
 
-The result destination must not exist, and its parent must already exist. Successful,
-failed, and orderly cancelled workflows publish `result.json` plus available exports
-before the command exits. The committed result-directory path is the only local run
-handle. Add `--json` for one terminal schema-version-1 object on stdout while the live
-presentation remains on stderr, or `--plain` to force the line presentation on stdout.
+The run directory must not exist and must be disjoint from the execution root. The CLI
+normalizes it from its nearest existing parent and creates any missing parent suffix.
+The CLI retains immutable workflow and import bytes, durable
+closed run and attempt state, and attempt 1's atomic result beneath
+`attempts/000001/result`. The run-directory path is the local run handle. Add `--json`
+for one terminal schema-version-1 object on stdout while the live presentation remains
+on stderr, or `--plain` to force the line presentation on stdout.
 
 Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
 `--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
@@ -93,6 +96,41 @@ Local execution snapshots the inherited environment after resolution and removes
 or runner credentials and does not contact Scherzo Cloud. Agent steps are rejected at
 admission without probing Pi, a provider, or a model.
 
+## Local workflow status
+
+Inspect the durable state and retry eligibility of an existing local run without changing
+it:
+
+```sh
+scherzo-cloud workflow status --run-dir ./runs/check-001
+```
+
+Status reads only the closed `run.json` and `state.json` contracts and an existing
+regular `run.lock`; it never scans `.private`, creates the lock, acquires execution
+ownership, waits for an owner, signals child work, or reads standard input. Its
+non-acquiring lock query combines with two matching state revisions to distinguish an
+active owner, a settled run, an abandoned nonterminal attempt, and ownership that cannot
+be proven safely. An exact live process-group identity remains `ownership_unproven`; an
+unlocked outstanding start action without its required process-guard registration makes
+the run directory invalid rather than retry-eligible. The retry projection is eligible
+or uses the first applicable closed reason in this order: `run_locked`,
+`ownership_unproven`, `latest_attempt_succeeded`, then `latest_attempt_rejected`.
+
+Without a mode option, and with `--plain`, one complete human snapshot is written to
+stdout and operational diagnostics use stderr. `--json` writes exactly one ANSI-free
+object conforming to
+[`schemas/workflow-status-result-v1.schema.json`](schemas/workflow-status-result-v1.schema.json)
+to stdout; run-directory, schema, lock-query, and unstable-snapshot failures are encoded
+in that object rather than duplicated on stderr. Status has no TUI or live presentation
+stream.
+
+`--color` accepts `auto`, `always`, or `never`. It affects only semantic tokens in plain
+output; `auto` requires terminal stdout, a usable `TERM`, and an unset or empty
+`NO_COLOR`. JSON never contains ANSI. A complete snapshot returns 0 regardless of run
+or retry disposition, an operational or output failure returns 1, and a command-line
+usage error returns 2. SIGINT or SIGTERM before completed output returns 130 or 143,
+respectively.
+
 ## Version inspection
 
 Use `scherzo-cloud --version` or `scherzo-cloud version` for conventional one-line
@@ -102,7 +140,7 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 {
   "schemaVersion": 1,
   "command": "scherzo-cloud",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "executablePath": "/resolved/path/to/scherzo-cloud",
   "buildIdentity": "unknown"
 }
@@ -225,10 +263,12 @@ a normalized numeric version in its report.
 The Pi check canonicalizes only the configured executable and invokes that absolute path
 with one version probe and one capability-help probe. The probes use a cleared child
 environment, fresh temporary Pi state and working directory, and project/resource
-discovery disable flags. It admits only exact version 0.82.1 with the JSON event,
-ephemeral-session, extension, system-prompt append, and invocation-scoped `--approve`
-capabilities required by `PiJsonV1`. It does not search `PATH`, inspect model metadata or
-credentials, execute the caller's project, or read or write saved Pi project-trust
+discovery disable flags. It admits canonical stable versions in the range
+`>=0.83.0 <0.84.0` with the JSON event, ephemeral-session, extension,
+system-prompt append, and invocation-scoped `--approve` capabilities required by
+`PiJsonV1`. It retains the exact observed release and does not search `PATH`, inspect
+model metadata or credentials, execute the caller's project, or read or write saved Pi
+project-trust
 decisions. Missing, unexecutable, malformed, unsupported-version, and missing-capability
 outcomes have distinct report codes. The JSON report has no `ready` field.
 
@@ -247,8 +287,9 @@ scherzo-cloud runner serve \
 ```
 
 Agent-capable startup additionally takes an explicit installation. Runner initialization
-validates it once and retains the resulting absolute path, exact 0.82.1 version,
-`PiJsonV1` profile, and required non-model capabilities for later admission; it does not
+validates it once and retains the resulting absolute path, exact observed version
+in `>=0.83.0 <0.84.0`, `PiJsonV1` profile, and required non-model capabilities
+for later admission; it does not
 repeat the probes while serving.
 
 ```sh
@@ -348,7 +389,7 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.8`. Planning takes the highest fragment impact since the latest stable tag:
+`0.9`. Planning takes the highest fragment impact since the latest stable tag:
 `internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
 and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
 fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact

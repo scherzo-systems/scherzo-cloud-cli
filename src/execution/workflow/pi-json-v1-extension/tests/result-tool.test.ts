@@ -76,19 +76,21 @@ function loadResultExtension(
   return { gate, tool };
 }
 
-function toolCallContext(content: readonly Record<string, unknown>[]): {
+function branchContext(messages: readonly Record<string, unknown>[]): {
   sessionManager: { getBranch(): readonly unknown[] };
 } {
   return {
     sessionManager: {
-      getBranch: () => [
-        {
-          type: "message",
-          message: { role: "assistant", content },
-        },
-      ],
+      getBranch: () =>
+        messages.map((message) => ({ type: "message", message })),
     },
   };
+}
+
+function toolCallContext(content: readonly Record<string, unknown>[]): {
+  sessionManager: { getBranch(): readonly unknown[] };
+} {
+  return branchContext([{ role: "assistant", content }]);
 }
 
 function resultToolContext(abort: () => void): ResultToolContext {
@@ -197,36 +199,205 @@ test("validation sends the assistant's uncoerced candidate to Rust", async () =>
   assert.deepEqual(capturedRequest?.arguments, assistantArguments);
 });
 
-test("the extension blocks a result call with a sibling tool call", () => {
-  const { gate, tool } = loadResultExtension(fixedConfig, async () => ({
-    kind: "Valid",
-  }));
-  const toolCallId = "tool-call-with-sibling-fixed";
+test("a sibling result is blocked without affecting ordinary work or correction", async () => {
+  let validations = 0;
+  const { gate, tool } = loadResultExtension(fixedConfig, async () => {
+    validations += 1;
+    return { kind: "Valid" };
+  });
+  const blockedCallId = "tool-call-with-sibling-fixed";
+  const siblingCallId = "sibling-tool-call-fixed";
 
   assert.equal(tool.name, fixedConfig.toolName);
+  const siblingContext = toolCallContext([
+    {
+      type: "toolCall",
+      id: blockedCallId,
+      name: fixedConfig.toolName,
+      arguments: { result: fixedPayload },
+    },
+    {
+      type: "toolCall",
+      id: siblingCallId,
+      name: "read",
+      arguments: { path: "fixed-input.txt" },
+    },
+  ]);
   const gateResult = gate(
     {
+      toolCallId: blockedCallId,
+      toolName: fixedConfig.toolName,
+      input: { result: fixedPayload },
+    },
+    siblingContext,
+  );
+  assert.ok(gateResult !== null && typeof gateResult === "object");
+  assert.deepEqual(gateResult, {
+    block: true,
+    reason:
+      "No result was accepted. Call the workflow result tool by itself, without sibling tool calls.",
+  });
+  assert.equal(
+    gate(
+      { toolCallId: siblingCallId, toolName: "read", input: {} },
+      siblingContext,
+    ),
+    undefined,
+  );
+  assert.equal(validations, 0);
+
+  const correctedCallId = "tool-call-corrected-fixed";
+  const correctedArguments = { result: fixedPayload };
+  assert.equal(
+    gate(
+      {
+        toolCallId: correctedCallId,
+        toolName: fixedConfig.toolName,
+        input: correctedArguments,
+      },
+      toolCallContext([
+        {
+          type: "toolCall",
+          id: correctedCallId,
+          name: fixedConfig.toolName,
+          arguments: correctedArguments,
+        },
+      ]),
+    ),
+    undefined,
+  );
+  assert.equal(
+    (
+      await tool.execute(
+        correctedCallId,
+        correctedArguments,
+        undefined,
+        undefined,
+        { abort() {} },
+      )
+    ).terminate,
+    true,
+  );
+  assert.equal(validations, 1);
+});
+
+test("reused call identities and ambiguous argument objects are blocked", () => {
+  const { gate } = loadResultExtension(fixedConfig, async () => ({
+    kind: "Valid",
+  }));
+  const toolCallId = "tool-call-reused-fixed";
+  const validContext = toolCallContext([
+    {
+      type: "toolCall",
+      id: toolCallId,
+      name: fixedConfig.toolName,
+      arguments: { result: fixedPayload },
+    },
+  ]);
+
+  assert.equal(
+    gate(
+      {
+        toolCallId,
+        toolName: fixedConfig.toolName,
+        input: { result: fixedPayload },
+      },
+      validContext,
+    ),
+    undefined,
+  );
+  const reused = gate(
+    {
       toolCallId,
+      toolName: fixedConfig.toolName,
+      input: { result: fixedPayload },
+    },
+    validContext,
+  );
+  assert.equal((reused as { block?: unknown }).block, true);
+
+  const ambiguous = gate(
+    {
+      toolCallId: "tool-call-extra-fixed",
       toolName: fixedConfig.toolName,
       input: { result: fixedPayload },
     },
     toolCallContext([
       {
         type: "toolCall",
-        id: toolCallId,
+        id: "tool-call-extra-fixed",
         name: fixedConfig.toolName,
-        arguments: { result: fixedPayload },
-      },
-      {
-        type: "toolCall",
-        id: "sibling-tool-call-fixed",
-        name: "read",
-        arguments: { path: "fixed-input.txt" },
+        arguments: { result: fixedPayload, extra: true },
       },
     ]),
   );
-  assert.ok(gateResult !== null && typeof gateResult === "object");
-  assert.equal((gateResult as { block?: unknown }).block, true);
+  assert.equal((ambiguous as { block?: unknown }).block, true);
+
+  const duplicatedAcrossMessages = gate(
+    {
+      toolCallId: "tool-call-duplicated-fixed",
+      toolName: fixedConfig.toolName,
+      input: { result: fixedPayload },
+    },
+    branchContext([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "tool-call-duplicated-fixed",
+            name: "read",
+            arguments: { path: "old.txt" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "tool-call-duplicated-fixed",
+            name: fixedConfig.toolName,
+            arguments: { result: fixedPayload },
+          },
+        ],
+      },
+    ]),
+  );
+  assert.deepEqual(duplicatedAcrossMessages, {
+    block: true,
+    reason:
+      "No result was accepted. The workflow result call could not be correlated.",
+  });
+});
+
+test("a validator transport failure aborts Pi instead of becoming recoverable", async () => {
+  let aborted = false;
+  const tool = createResultTool(
+    fixedConfig,
+    async () => {
+      throw new Error("The validation socket closed unexpectedly.");
+    },
+    () => ({ result: fixedPayload }),
+  );
+
+  await assert.rejects(
+    tool.execute(
+      "tool-call-transport-failure-fixed",
+      { result: fixedPayload },
+      undefined,
+      undefined,
+      resultToolContext(() => {
+        aborted = true;
+      }),
+    ),
+  );
+
+  assert.equal(
+    aborted,
+    true,
+    "validation-channel failures must abort rather than become correctable tool errors",
+  );
 });
 
 test("a fatal validator response aborts Pi before surfacing the failure", async () => {

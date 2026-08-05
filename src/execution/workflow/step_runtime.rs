@@ -3,6 +3,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,24 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::admission::{AdmittedWorkflow, EnvironmentSnapshot};
+use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot};
+use super::agent::{
+    AgentAdapter, AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope,
+    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentStartReceiveError,
+    AgentTerminalReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
+    agent_terminal_channel, invoke_agent_adapter,
+};
+use super::agent_input::{
+    AgentInputMaterializationError, AgentInputStaging, AgentInputStagingLease,
+    AgentInputStartFailure, MaterializedAgentInvocation, materialize_agent_invocation,
+};
 #[cfg(test)]
 use super::artifact::CaptureBoundaryObserver;
 use super::artifact::{
     ArtifactStaging, CaptureAttemptFailure, CaptureCancellation, CaptureCandidateSet,
     CaptureDeclaration, CaptureFailure,
 };
+use super::child_guard::StoppedChildGuard;
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
     CoordinatorClock, DriverOccurrence, DriverOccurrenceAcceptance, DriverOccurrenceClaim,
@@ -32,18 +44,19 @@ use super::execution_root::{
     WorkingDirectorySelectionFailure,
 };
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
-use super::observation::{ExecutionObserver, NoopExecutionObserver};
+use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionObserver};
+use super::pi::PiConfig;
+use super::pi_json_v1::PiJsonV1ProtocolLimits;
+use super::process_group::{
+    AuthenticatedProcessGroup, ProcessGuardRegistration, ProcessGuardRegistry,
+    capture_process_group_identity, interrupt_authenticated_process_group,
+};
 use super::runtime::{Action, ActionId, ActionInput, RequestedAction};
 use super::validated::{
-    ResolvedValueSource, ValidatedCommandStep, ValidatedCommonStep, ValidatedStep, WorkflowImport,
+    ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
+    ValidatedCommonStep, ValidatedMessageSource, ValidatedStep, WorkflowImport,
 };
 use super::value::CapturedValue;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StepBodyKind {
-    Command,
-    Agent,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkingDirectoryFailure {
@@ -75,9 +88,11 @@ pub(crate) enum StepStartFailure {
     PreparationTaskUnavailable,
     InputsUnavailable,
     InputPreparation(InputPreparationFailure),
+    AgentInput(Box<AgentInputStartFailure>),
+    Agent(AgentFailureCause),
+    AgentRuntimeUnavailable,
     OutputsUnsupported,
     WorkingDirectory(WorkingDirectoryFailure),
-    UnsupportedBody(StepBodyKind),
     CommandPreparation(CommandPreparationFailure),
     CommandLaunch(CommandLaunchFailure),
 }
@@ -88,9 +103,10 @@ pub(crate) enum CommandExecutionFailure {
     Wait,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StepExecutionFailure {
     Command(CommandExecutionFailure),
+    Agent(AgentFailureCause),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +127,164 @@ pub(crate) enum StepFailureCause {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StepRuntimeError {
     OccurrenceReceiverClosed,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProvisionalStepOutputs {
+    values: BTreeMap<String, CapturedValue>,
+    agent_staging: Option<Arc<AgentInputStagingLease>>,
+}
+
+impl ProvisionalStepOutputs {
+    fn command() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            agent_staging: None,
+        }
+    }
+
+    fn agent(values: BTreeMap<String, CapturedValue>, staging: AgentInputStagingLease) -> Self {
+        Self {
+            values,
+            agent_staging: Some(Arc::new(staging)),
+        }
+    }
+
+    fn value_names(&self) -> BTreeSet<String> {
+        self.values.keys().cloned().collect()
+    }
+}
+
+impl Default for ProvisionalStepOutputs {
+    fn default() -> Self {
+        Self::command()
+    }
+}
+
+impl std::fmt::Debug for ProvisionalStepOutputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProvisionalStepOutputs")
+            .field("values", &self.values)
+            .field("has_agent_staging", &self.agent_staging.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ProvisionalStepOutputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values && self.agent_staging.is_some() == other.agent_staging.is_some()
+    }
+}
+
+impl Eq for ProvisionalStepOutputs {}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NoAgentAdapter;
+
+impl<Sink> AgentAdapter<Sink> for NoAgentAdapter
+where
+    Sink: AgentObservationSink,
+{
+    type NativeConfiguration = PiConfig;
+    type ProtocolLimits = PiJsonV1ProtocolLimits;
+
+    async fn invoke(
+        &self,
+        _invocation: super::agent::AgentInvocation<
+            Self::NativeConfiguration,
+            Self::ProtocolLimits,
+            Sink,
+        >,
+        _started: super::agent::AgentStartCallback,
+        terminal: super::agent::AgentTerminalCallback,
+    ) {
+        let _ = terminal.report(AgentOutcome::Failed {
+            cause: AgentFailureCause::HarnessProtocolFailed,
+        });
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum AgentExecution<Adapter> {
+    Disabled,
+    Enabled {
+        run: WorkflowRunId,
+        staging: AgentInputStaging,
+        adapter: Adapter,
+    },
+}
+
+impl AgentExecution<NoAgentAdapter> {
+    pub(crate) fn disabled() -> Self {
+        Self::Disabled
+    }
+}
+
+impl<Adapter> AgentExecution<Adapter> {
+    pub(crate) fn enabled(
+        run: WorkflowRunId,
+        staging: AgentInputStaging,
+        adapter: Adapter,
+    ) -> Self {
+        Self::Enabled {
+            run,
+            staging,
+            adapter,
+        }
+    }
+}
+
+pub(crate) struct AgentExecutionObservationSink<Deadline, Observer> {
+    observer: Observer,
+    deadline: PhantomData<fn() -> Deadline>,
+}
+
+impl<Deadline, Observer> Clone for AgentExecutionObservationSink<Deadline, Observer>
+where
+    Observer: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            observer: self.observer.clone(),
+            deadline: PhantomData,
+        }
+    }
+}
+
+impl<Deadline, Observer> AgentObservationSink for AgentExecutionObservationSink<Deadline, Observer>
+where
+    Deadline: Send + Sync + 'static,
+    Observer: ExecutionObserver<Deadline>,
+{
+    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
+        self.observer
+            .observe(ExecutionObservation::Agent(observation))
+    }
+}
+
+pub(crate) trait WorkflowAgentAdapter<Deadline, Observer>:
+    AgentAdapter<
+        AgentExecutionObservationSink<Deadline, Observer>,
+        NativeConfiguration = PiConfig,
+        ProtocolLimits = PiJsonV1ProtocolLimits,
+    >
+where
+    Deadline: Send + Sync + 'static,
+    Observer: ExecutionObserver<Deadline>,
+{
+}
+
+impl<Deadline, Observer, Adapter> WorkflowAgentAdapter<Deadline, Observer> for Adapter
+where
+    Deadline: Send + Sync + 'static,
+    Observer: ExecutionObserver<Deadline>,
+    Adapter: AgentAdapter<
+            AgentExecutionObservationSink<Deadline, Observer>,
+            NativeConfiguration = PiConfig,
+            ProtocolLimits = PiJsonV1ProtocolLimits,
+        >,
+{
 }
 
 #[derive(Clone)]
@@ -155,27 +329,31 @@ impl OwnedTasks {
 }
 
 #[derive(Clone)]
-pub(crate) struct StepRuntime<Clock, Observer = NoopExecutionObserver>
+pub(crate) struct StepRuntime<Clock, Observer = NoopExecutionObserver, Adapter = NoAgentAdapter>
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: Clone,
 {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
     diagnostics: StepDiagnosticLog,
-    occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+    occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     inputs: InputStaging,
+    agents: AgentExecution<Adapter>,
     clock: Clock,
     observer: Observer,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
     capture_work: Arc<Mutex<CaptureWorkRegistry>>,
     capture_requests: mpsc::UnboundedSender<CaptureWorkerMessage>,
     tasks: OwnedTasks,
+    process_guards: ProcessGuardRegistry,
 }
 
 struct CaptureRequest {
     step: String,
     action: ActionId,
+    provisional: ProvisionalStepOutputs,
 }
 
 enum CaptureWorkerMessage {
@@ -187,7 +365,7 @@ enum CaptureWorkerMessage {
 struct CaptureWorker {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
-    occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+    occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     work: Arc<Mutex<CaptureWorkRegistry>>,
 }
 
@@ -199,13 +377,14 @@ enum CaptureWorkerFailure {
 impl<Clock> StepRuntime<Clock>
 where
     Clock: CoordinatorClock,
+    Clock::Instant: Sync,
 {
     #[cfg(test)]
     fn new(
         admitted: AdmittedWorkflow,
         artifacts: ArtifactStaging,
         inputs: InputStaging,
-        occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+        occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
         clock: Clock,
     ) -> Self {
         Self::with_diagnostics(
@@ -223,7 +402,7 @@ where
         artifacts: ArtifactStaging,
         inputs: InputStaging,
         diagnostics: StepDiagnosticLog,
-        occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+        occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
         clock: Clock,
     ) -> Self {
         Self::with_observer(
@@ -234,23 +413,33 @@ where
             occurrences,
             clock,
             NoopExecutionObserver,
+            AgentExecution::disabled(),
+            ProcessGuardRegistry::default(),
         )
     }
 }
 
-impl<Clock, Observer> StepRuntime<Clock, Observer>
+impl<Clock, Observer, Adapter> StepRuntime<Clock, Observer, Adapter>
 where
     Clock: CoordinatorClock,
+    Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "construction keeps every execution-owned resource and adapter explicit"
+    )]
     fn with_observer(
         admitted: AdmittedWorkflow,
         artifacts: ArtifactStaging,
         inputs: InputStaging,
         diagnostics: StepDiagnosticLog,
-        occurrences: OccurrenceSender<(), StepFailureCause, CapturedValue>,
+        occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
         clock: Clock,
         observer: Observer,
+        agents: AgentExecution<Adapter>,
+        process_guards: ProcessGuardRegistry,
     ) -> Self {
         let capture_work = Arc::new(Mutex::new(CaptureWorkRegistry::new()));
         let (capture_requests, mut queued_captures) =
@@ -277,8 +466,13 @@ where
                     BeginCapture::Capture(cancellation) => {
                         let blocking_worker = capture_worker.clone();
                         let step = request.step.clone();
+                        let provisional_values = request.provisional.value_names();
                         let result = tokio::task::spawn_blocking(move || {
-                            blocking_worker.capture_outputs_blocking(&step, &cancellation)
+                            blocking_worker.capture_outputs_blocking(
+                                &step,
+                                &provisional_values,
+                                &cancellation,
+                            )
                         })
                         .await
                         .unwrap_or(Err(CaptureWorkerFailure::Failed(
@@ -311,12 +505,14 @@ where
             diagnostics,
             occurrences,
             inputs,
+            agents,
             clock,
             observer,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
             capture_work,
             capture_requests,
             tasks,
+            process_guards,
         }
     }
 
@@ -337,12 +533,12 @@ where
         step: String,
         action: ActionId,
         inputs: BTreeMap<String, ActionInput<CapturedValue>>,
-        mut cancellation: oneshot::Receiver<()>,
+        cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
         let preparation_runtime = self.clone();
         let preparation_step = step.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            preparation_runtime.prepare_step(&preparation_step, &inputs)
+            preparation_runtime.prepare_step(&preparation_step, action, &inputs)
         })
         .await
         .unwrap_or(Err(StepStartFailure::PreparationTaskUnavailable));
@@ -363,22 +559,61 @@ where
             }
         }
 
-        let launched = match prepared.body {
-            PreparedStepBody::Command(command) => command.launch::<Clock::Instant, _>(
-                step.clone(),
-                action,
-                &self.diagnostics,
-                self.admitted.execution().limits().maximum_step_log_bytes(),
-                self.observer.clone(),
-            ),
-            PreparedStepBody::Agent => Err(StepStartFailure::UnsupportedBody(StepBodyKind::Agent)),
-        };
-        let mut launched = match launched {
+        match prepared.body {
+            PreparedStepBody::Command(command) => {
+                self.execute_prepared_command(step, action, command, cancellation)
+                    .await
+            }
+            PreparedStepBody::Agent(agent) => {
+                self.execute_prepared_agent(step, action, *agent, cancellation)
+                    .await
+            }
+        }
+    }
+
+    async fn report_step_started(
+        &self,
+        step: &str,
+        action: ActionId,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<StartDelivery<Clock::Instant>, StepRuntimeError> {
+        let send = self.send(DriverOccurrence::step_started(step.to_owned(), action));
+        tokio::pin!(send);
+        tokio::select! {
+            biased;
+            _ = cancellation => Ok(self
+                .cancellation_for(action)
+                .map_or(StartDelivery::Gone, StartDelivery::Cancelled)),
+            result = &mut send => result.map(|()| StartDelivery::Published),
+        }
+    }
+
+    async fn abandon_launched(&self, action: ActionId, launched: &mut LaunchedStepBody) {
+        let _ = launched.force_stop().await;
+        launched.finish_resources().await;
+        self.with_work(|work| work.abandon(action));
+    }
+
+    async fn execute_prepared_command(
+        &self,
+        step: String,
+        action: ActionId,
+        command: PreparedCommand,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        let mut launched = match command.launch::<Clock::Instant, _>(
+            self.process_guards.is_durable(),
+            step.clone(),
+            action,
+            &self.diagnostics,
+            self.admitted.execution().limits().maximum_step_log_bytes(),
+            self.observer.clone(),
+        ) {
             Ok(launched) => launched,
             Err(failure) => return self.settle_start_failure(step, action, failure).await,
         };
-        let Some(process_group) = launched.process_group() else {
-            launched.force_stop().await;
+        let Some(process_group) = launched.process_group().cloned() else {
+            let _ = launched.force_stop().await;
             launched.finish_resources().await;
             return self
                 .settle_start_failure(
@@ -388,6 +623,32 @@ where
                 )
                 .await;
         };
+        let registration = match self.process_guards.register(
+            &step,
+            action.transition_sequence.get(),
+            &process_group,
+        ) {
+            Ok(registration) => registration,
+            Err(()) => {
+                let _ = launched.force_stop().await;
+                launched.finish_resources().await;
+                return self
+                    .settle_start_failure(
+                        step,
+                        action,
+                        StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                    )
+                    .await;
+            }
+        };
+        launched.install_registration(registration);
+        if let Err(failure) = launched.release() {
+            let _ = launched.force_stop().await;
+            launched.finish_resources().await;
+            return self
+                .settle_start_failure(step, action, StepStartFailure::CommandLaunch(failure))
+                .await;
+        }
 
         match self.with_work(|work| work.record_launch(action, process_group)) {
             RecordLaunch::Running => {}
@@ -396,43 +657,37 @@ where
                 interrupt,
             } => {
                 if let Some(group) = interrupt {
-                    interrupt_process_group(group);
+                    let _ = interrupt_authenticated_process_group(&group);
                 }
                 return self
                     .cancel_launched(action, &mut launched, cancellation)
                     .await;
             }
             RecordLaunch::Gone => {
-                launched.force_stop().await;
+                let _ = launched.force_stop().await;
                 launched.finish_resources().await;
                 return Ok(());
             }
         }
 
-        let started = {
-            let send = self.send(DriverOccurrence::step_started(step.clone(), action));
-            tokio::pin!(send);
-            tokio::select! {
-                biased;
-                _ = &mut cancellation => None,
-                result = &mut send => Some(result),
+        let start_delivery = self
+            .report_step_started(&step, action, &mut cancellation)
+            .await;
+        match start_delivery {
+            Ok(StartDelivery::Published) => {}
+            Ok(StartDelivery::Cancelled(cancellation)) => {
+                return self
+                    .cancel_launched(action, &mut launched, cancellation)
+                    .await;
             }
-        };
-        match started {
-            None => {
-                if let Some(cancellation) = self.cancellation_for(action) {
-                    return self
-                        .cancel_launched(action, &mut launched, cancellation)
-                        .await;
-                }
+            Ok(StartDelivery::Gone) => {
+                self.abandon_launched(action, &mut launched).await;
+                return Ok(());
             }
-            Some(Err(failure)) => {
-                launched.force_stop().await;
-                launched.finish_resources().await;
-                self.with_work(|work| work.abandon(action));
+            Err(failure) => {
+                self.abandon_launched(action, &mut launched).await;
                 return Err(failure);
             }
-            Some(Ok(())) => {}
         }
 
         let waited = tokio::select! {
@@ -452,6 +707,257 @@ where
             .await
     }
 
+    async fn execute_prepared_agent(
+        &self,
+        step: String,
+        action: ActionId,
+        agent: PreparedAgent<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        let process_control = agent.materialized.invocation().process_control().clone();
+        match self.with_work(|work| work.record_agent_launch(action, process_control)) {
+            RecordLaunch::Running => {}
+            RecordLaunch::Cancelled { cancellation, .. } => {
+                drop(agent);
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            RecordLaunch::Gone => return Ok(()),
+        }
+
+        let PreparedAgent { materialized } = agent;
+        let output = materialized
+            .invocation()
+            .value_mode()
+            .output()
+            .map(str::to_owned);
+        let (invocation, staging) = materialized.into_parts();
+        let (started_callback, started) = agent_start_channel();
+        let (terminal, outcome) = agent_terminal_channel(invocation.value_mode());
+        let adapter = match &self.agents {
+            AgentExecution::Enabled { adapter, .. } => adapter.clone(),
+            AgentExecution::Disabled => {
+                drop(staging);
+                return self
+                    .settle_start_failure(
+                        step,
+                        action,
+                        StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed),
+                    )
+                    .await;
+            }
+        };
+        let mut invocation_task = tokio::spawn(async move {
+            invoke_agent_adapter(&adapter, invocation, started_callback, terminal).await;
+        });
+        let started = started.receive();
+        tokio::pin!(started);
+        let outcome = outcome.receive();
+        tokio::pin!(outcome);
+
+        let boundary = tokio::select! {
+            biased;
+            result = &mut started => AgentLifecycleBoundary::Started(result),
+            result = &mut outcome => AgentLifecycleBoundary::Terminal(result),
+        };
+
+        let (lifecycle_started, outcome) = match boundary {
+            AgentLifecycleBoundary::Started(Ok(())) => {
+                match self
+                    .report_step_started(&step, action, &mut cancellation)
+                    .await
+                {
+                    Ok(StartDelivery::Published) => {}
+                    Ok(StartDelivery::Cancelled(cancellation)) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        return self.finish_cancellation(action, cancellation).await;
+                    }
+                    Ok(StartDelivery::Gone) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        self.with_work(|work| work.abandon(action));
+                        return Ok(());
+                    }
+                    Err(failure) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        self.with_work(|work| work.abandon(action));
+                        return Err(failure);
+                    }
+                }
+                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                (true, outcome)
+            }
+            AgentLifecycleBoundary::Started(Err(_)) => {
+                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                (false, outcome)
+            }
+            AgentLifecycleBoundary::Terminal(outcome) => {
+                let _ = invocation_task.await;
+                (false, outcome)
+            }
+        };
+        let outcome = outcome.unwrap_or(AgentOutcome::Failed {
+            cause: AgentFailureCause::HarnessProtocolFailed,
+        });
+
+        if matches!(outcome, AgentOutcome::Cancelled { .. }) {
+            drop(staging);
+            return self
+                .settle_agent_cancellation(step, action, lifecycle_started, &mut cancellation)
+                .await;
+        }
+
+        if !lifecycle_started {
+            drop(staging);
+            let cause = match outcome {
+                AgentOutcome::Failed { cause } => cause,
+                AgentOutcome::Completed(_) | AgentOutcome::Cancelled { .. } => {
+                    AgentFailureCause::HarnessProtocolFailed
+                }
+            };
+            return self
+                .settle_start_failure(step, action, StepStartFailure::Agent(cause))
+                .await;
+        }
+
+        let occurrence = match outcome {
+            AgentOutcome::Completed(completed) => {
+                let values = match completed_agent_outputs(output, completed) {
+                    Ok(values) => values,
+                    Err(cause) => {
+                        drop(staging);
+                        return self.settle_execution_failure(step, action, cause).await;
+                    }
+                };
+                DriverOccurrence::step_execution_completed(
+                    step,
+                    action,
+                    ProvisionalStepOutputs::agent(values, staging),
+                )
+            }
+            AgentOutcome::Failed { cause } => {
+                drop(staging);
+                DriverOccurrence::step_execution_failed(
+                    step,
+                    action,
+                    StepFailureCause::Execution(StepExecutionFailure::Agent(cause)),
+                )
+            }
+            AgentOutcome::Cancelled { .. } => unreachable!("cancelled outcomes settle above"),
+        };
+        self.settle_agent_occurrence(action, occurrence).await
+    }
+
+    async fn settle_agent_cancellation(
+        &self,
+        step: String,
+        action: ActionId,
+        lifecycle_started: bool,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        if self
+            .admitted
+            .execution()
+            .cancellation()
+            .source()
+            .cancellation_reason()
+            .is_some()
+        {
+            if self.cancellation_for(action).is_none() {
+                let _ = cancellation.await;
+            }
+            if let Some(cancellation) = self.cancellation_for(action) {
+                return self.finish_cancellation(action, cancellation).await;
+            }
+        }
+
+        if lifecycle_started {
+            self.settle_execution_failure(step, action, AgentFailureCause::HarnessProtocolFailed)
+                .await
+        } else {
+            self.settle_start_failure(
+                step,
+                action,
+                StepStartFailure::Agent(AgentFailureCause::HarnessProtocolFailed),
+            )
+            .await
+        }
+    }
+
+    async fn settle_execution_failure(
+        &self,
+        step: String,
+        action: ActionId,
+        cause: AgentFailureCause,
+    ) -> Result<(), StepRuntimeError> {
+        self.settle_agent_occurrence(
+            action,
+            DriverOccurrence::step_execution_failed(
+                step,
+                action,
+                StepFailureCause::Execution(StepExecutionFailure::Agent(cause)),
+            ),
+        )
+        .await
+    }
+
+    async fn claim_completion_occurrence(
+        &self,
+        action: ActionId,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
+    ) -> Result<ClaimedCompletion<Clock::Instant>, StepRuntimeError> {
+        match self.with_work(|work| work.begin_completion(action)) {
+            CompletionClaim::Lifecycle => match self.claim(occurrence).await {
+                Ok(claim) => Ok(ClaimedCompletion::Lifecycle(claim)),
+                Err(failure) => {
+                    self.with_work(|work| work.abandon(action));
+                    Err(failure)
+                }
+            },
+            CompletionClaim::Cancelled(cancellation) => {
+                Ok(ClaimedCompletion::Cancelled(cancellation))
+            }
+            CompletionClaim::Gone => Ok(ClaimedCompletion::Gone),
+        }
+    }
+
+    async fn finalize_claimed_completion(
+        &self,
+        action: ActionId,
+        completion: ClaimedCompletion<Clock::Instant>,
+    ) -> Result<(), StepRuntimeError> {
+        let claim = match completion {
+            ClaimedCompletion::Lifecycle(claim) => claim,
+            ClaimedCompletion::Cancelled(cancellation) => {
+                return self.finish_cancellation(action, cancellation).await;
+            }
+            ClaimedCompletion::Gone => return Ok(()),
+        };
+        match self.with_work(|work| work.finish_completion(action)) {
+            CompletionClaim::Lifecycle => claim
+                .publish()
+                .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed),
+            CompletionClaim::Cancelled(cancellation) => {
+                claim.discard();
+                self.finish_cancellation(action, cancellation).await
+            }
+            CompletionClaim::Gone => {
+                claim.discard();
+                Ok(())
+            }
+        }
+    }
+
+    async fn settle_agent_occurrence(
+        &self,
+        action: ActionId,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
+    ) -> Result<(), StepRuntimeError> {
+        let completion = self.claim_completion_occurrence(action, occurrence).await?;
+        self.finalize_claimed_completion(action, completion).await
+    }
+
     async fn settle_start_failure(
         &self,
         step: String,
@@ -468,7 +974,7 @@ where
     async fn settle_unlaunched(
         &self,
         action: ActionId,
-        occurrence: DriverOccurrence<(), StepFailureCause, CapturedValue>,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     ) -> Result<(), StepRuntimeError> {
         match self.with_work(|work| work.claim_completion(action)) {
             CompletionClaim::Lifecycle => self.send(occurrence).await,
@@ -491,13 +997,15 @@ where
             None => launched.wait().await,
         };
         if waited.is_err() {
-            launched.force_stop().await;
+            let _ = launched.force_stop().await;
         }
         launched.force_process_group();
         let occurrence = match waited {
-            Ok(status) if status.success() => {
-                DriverOccurrence::step_execution_completed(step, action, ())
-            }
+            Ok(status) if status.success() => DriverOccurrence::step_execution_completed(
+                step,
+                action,
+                ProvisionalStepOutputs::command(),
+            ),
             Ok(status) => DriverOccurrence::step_execution_failed(
                 step,
                 action,
@@ -513,40 +1021,9 @@ where
                 )),
             ),
         };
-        match self.with_work(|work| work.begin_completion(action)) {
-            CompletionClaim::Lifecycle => {}
-            CompletionClaim::Cancelled(cancellation) => {
-                launched.finish_resources().await;
-                return self.finish_cancellation(action, cancellation).await;
-            }
-            CompletionClaim::Gone => {
-                launched.finish_resources().await;
-                return Ok(());
-            }
-        }
-        let claim = match self.claim(occurrence).await {
-            Ok(claim) => claim,
-            Err(failure) => {
-                launched.finish_resources().await;
-                self.with_work(|work| work.abandon(action));
-                return Err(failure);
-            }
-        };
+        let completion = self.claim_completion_occurrence(action, occurrence).await;
         launched.finish_resources().await;
-
-        match self.with_work(|work| work.finish_completion(action)) {
-            CompletionClaim::Lifecycle => claim
-                .publish()
-                .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed),
-            CompletionClaim::Cancelled(cancellation) => {
-                claim.discard();
-                self.finish_cancellation(action, cancellation).await
-            }
-            CompletionClaim::Gone => {
-                claim.discard();
-                Ok(())
-            }
-        }
+        self.finalize_claimed_completion(action, completion?).await
     }
 
     async fn cancel_launched(
@@ -556,17 +1033,19 @@ where
         cancellation: CommandCancellation<Clock::Instant>,
     ) -> Result<(), StepRuntimeError> {
         if let Some(group) = self.with_work(|work| work.ensure_interrupt(action)) {
-            interrupt_process_group(group);
+            let _ = interrupt_authenticated_process_group(&group);
         }
 
         let deadline = self.clock.wait_until(cancellation.deadline.clone());
         tokio::pin!(deadline);
         tokio::select! {
             biased;
-            () = &mut deadline => launched.force_stop().await,
+            () = &mut deadline => {
+                let _ = launched.force_stop().await;
+            }
             waited = launched.wait() => {
                 if waited.is_err() {
-                    launched.force_stop().await;
+                    let _ = launched.force_stop().await;
                 } else {
                     launched.force_process_group();
                 }
@@ -589,7 +1068,10 @@ where
         action: ActionId,
         cancellation: CommandCancellation<Clock::Instant>,
     ) -> Result<(), StepRuntimeError> {
-        self.with_work(|work| work.finish_cancellation(action));
+        let deadline_finished = self.with_work(|work| work.finish_cancellation(action));
+        if let Some(deadline_finished) = deadline_finished {
+            let _ = deadline_finished.await;
+        }
         self.send(DriverOccurrence::step_quiesced(
             cancellation.step,
             cancellation.action,
@@ -600,8 +1082,12 @@ where
     fn prepare_step(
         &self,
         step: &str,
+        action: ActionId,
         action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
-    ) -> Result<PreparedStep, StepStartFailure> {
+    ) -> Result<
+        PreparedStep<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        StepStartFailure,
+    > {
         let definition = self
             .admitted
             .workflow()
@@ -609,23 +1095,21 @@ where
             .steps
             .get(step)
             .ok_or(StepStartFailure::StepUnavailable)?;
-        let body = StepBody::from(definition);
-        let common = body.common();
-        if common
-            .outputs
-            .values()
-            .any(|output| !matches!(&output.definition, Output::File { .. }))
-        {
-            return Err(StepStartFailure::OutputsUnsupported);
-        }
-
-        let cwd = resolve_working_directory(
-            self.admitted.execution().root_identity(),
-            common.cwd.as_deref(),
-        )
-        .map_err(StepStartFailure::WorkingDirectory)?;
-        let body = match body {
+        let body = match StepBody::from(definition) {
             StepBody::Command(command) => {
+                if command
+                    .common
+                    .outputs
+                    .values()
+                    .any(|output| !matches!(&output.definition, Output::File { .. }))
+                {
+                    return Err(StepStartFailure::OutputsUnsupported);
+                }
+                let cwd = resolve_working_directory(
+                    self.admitted.execution().root_identity(),
+                    command.common.cwd.as_deref(),
+                )
+                .map_err(StepStartFailure::WorkingDirectory)?;
                 let mut prepared = prepare_command(
                     command.argv.as_slice(),
                     cwd,
@@ -648,11 +1132,33 @@ where
                 }
                 PreparedStepBody::Command(prepared)
             }
-            StepBody::Agent(_) => {
-                if !action_inputs.is_empty() {
-                    return Err(StepStartFailure::InputsUnavailable);
-                }
-                PreparedStepBody::Agent
+            StepBody::Agent(agent) => {
+                let AgentExecution::Enabled { run, staging, .. } = &self.agents else {
+                    return Err(StepStartFailure::AgentRuntimeUnavailable);
+                };
+                let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
+                let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
+                let materialized = materialize_agent_invocation(
+                    &self.admitted,
+                    &self.artifacts,
+                    staging,
+                    identity,
+                    &upstream,
+                    self.admitted.execution().cancellation().source().clone(),
+                    AgentExecutionObservationSink {
+                        observer: self.observer.clone(),
+                        deadline: PhantomData,
+                    },
+                )
+                .map_err(|failure| match failure {
+                    AgentInputMaterializationError::Start(failure) => {
+                        StepStartFailure::AgentInput(Box::new(failure))
+                    }
+                    AgentInputMaterializationError::Cancelled { .. } => {
+                        StepStartFailure::InputsUnavailable
+                    }
+                })?;
+                PreparedStepBody::Agent(Box::new(PreparedAgent { materialized }))
             }
         };
         Ok(PreparedStep { body })
@@ -710,7 +1216,7 @@ where
         step: String,
         action: ActionId,
         deadline: Clock::Instant,
-    ) -> CancellationRegistration {
+    ) -> CancellationRegistration<Clock::Instant> {
         self.with_work(|work| work.cancel(step, action, deadline))
     }
 
@@ -725,7 +1231,12 @@ where
         operation(&mut lock_registry(&self.work))
     }
 
-    fn register_capture(&self, step: String, action: ActionId) {
+    fn register_capture(
+        &self,
+        step: String,
+        action: ActionId,
+        provisional: ProvisionalStepOutputs,
+    ) {
         if !self.with_capture_work(|work| work.register(step.clone(), action)) {
             return;
         }
@@ -734,6 +1245,7 @@ where
             .send(CaptureWorkerMessage::Capture(CaptureRequest {
                 step,
                 action,
+                provisional,
             }))
             .is_err()
         {
@@ -756,6 +1268,27 @@ where
         operation(&mut lock_registry(&self.capture_work))
     }
 
+    async fn quiesce_after_commit_failure(&self) {
+        self.admitted
+            .execution()
+            .cancellation()
+            .source()
+            .request_cancellation(CancellationReason::RunnerShutdown);
+        let mut clock = self.clock.clone();
+        let deadline = clock.now();
+        let revocations = self.with_work(|work| work.revoke_all_for_commit_failure(deadline));
+        self.with_capture_work(CaptureWorkRegistry::revoke_all_for_commit_failure);
+        for (wake, interrupt) in revocations {
+            if let Some(group) = interrupt {
+                let _ = interrupt_authenticated_process_group(&group);
+            }
+            if let Some(wake) = wake {
+                let _ = wake.send(());
+            }
+        }
+        self.shutdown().await;
+    }
+
     async fn shutdown(&self) {
         let (finished, completion) = oneshot::channel();
         if self
@@ -774,7 +1307,7 @@ where
         step: String,
         action: ActionId,
     ) -> Result<(), StepRuntimeError> {
-        self.register_capture(step, action);
+        self.register_capture(step, action, ProvisionalStepOutputs::command());
         Ok(())
     }
 
@@ -785,7 +1318,7 @@ where
 
     async fn send(
         &self,
-        occurrence: DriverOccurrence<(), StepFailureCause, CapturedValue>,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     ) -> Result<(), StepRuntimeError> {
         self.occurrences
             .send(occurrence)
@@ -795,7 +1328,7 @@ where
 
     async fn claim(
         &self,
-        occurrence: DriverOccurrence<(), StepFailureCause, CapturedValue>,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     ) -> Result<DriverOccurrenceClaim, StepRuntimeError> {
         self.occurrences
             .claim(occurrence)
@@ -820,6 +1353,7 @@ impl CaptureWorker {
     fn capture_outputs_blocking(
         &self,
         step: &str,
+        provisional_values: &BTreeSet<String>,
         cancellation: &CaptureCancellation,
     ) -> Result<CaptureCandidateSet, CaptureWorkerFailure> {
         let definition = self.admitted.workflow().definition.steps.get(step).ok_or(
@@ -827,22 +1361,34 @@ impl CaptureWorker {
         )?;
         let body = StepBody::from(definition);
         let common = body.common();
+        let expected_values = common
+            .outputs
+            .iter()
+            .filter(|(_, output)| {
+                matches!(
+                    output.definition,
+                    Output::AgentResponse | Output::AgentResult { .. }
+                )
+            })
+            .map(|(output_identity, _)| output_identity.clone())
+            .collect::<BTreeSet<_>>();
+        if &expected_values != provisional_values {
+            return Err(CaptureWorkerFailure::Failed(
+                OutputCaptureFailure::UnsupportedOutput,
+            ));
+        }
         let declarations = common
             .outputs
             .iter()
-            .map(|(output_identity, output)| {
-                let Output::File { path, media_type } = &output.definition else {
-                    return Err(CaptureWorkerFailure::Failed(
-                        OutputCaptureFailure::UnsupportedOutput,
-                    ));
-                };
-                Ok(CaptureDeclaration::new(
+            .filter_map(|(output_identity, output)| match &output.definition {
+                Output::File { path, media_type } => Some(Ok(CaptureDeclaration::new(
                     output_identity,
                     Path::new(path),
                     media_type,
-                ))
+                ))),
+                Output::AgentResponse | Output::AgentResult { .. } => None,
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, CaptureWorkerFailure>>()?;
         self.artifacts
             .capture_file_candidates(&declarations, cancellation)
             .map_err(|failure| match failure {
@@ -862,7 +1408,9 @@ impl CaptureWorker {
         match result {
             Ok(candidates) => self.settle_candidates(request, candidates, started).await,
             Err(CaptureWorkerFailure::Cancelled) => {
-                self.settle_cancelled(request.action, started).await;
+                let action = request.action;
+                drop(request.provisional);
+                self.settle_cancelled(action, started).await;
             }
             Err(CaptureWorkerFailure::Failed(failure)) => {
                 self.settle_failure(request, failure, started).await;
@@ -876,28 +1424,41 @@ impl CaptureWorker {
         candidates: CaptureCandidateSet,
         started: oneshot::Sender<()>,
     ) {
-        if self.with_work(|work| work.is_cancelled(request.action)) {
+        let CaptureRequest {
+            step,
+            action,
+            provisional,
+        } = request;
+        let ProvisionalStepOutputs {
+            mut values,
+            agent_staging,
+        } = provisional;
+        if self.with_work(|work| work.is_cancelled(action)) {
             candidates.abort();
-            self.settle_cancelled(request.action, started).await;
+            drop(agent_staging);
+            self.settle_cancelled(action, started).await;
             return;
         }
-        self.with_work(|work| work.begin_delivery(request.action));
-        let outputs = candidates
-            .outputs()
-            .iter()
-            .map(|(name, output)| (name.clone(), CapturedValue::file(output.clone())))
-            .collect();
-        let occurrence = DriverOccurrence::outputs_captured(request.step, request.action, outputs);
+        self.with_work(|work| work.begin_delivery(action));
+        values.extend(
+            candidates
+                .outputs()
+                .iter()
+                .map(|(name, output)| (name.clone(), CapturedValue::file(output.clone()))),
+        );
+        let occurrence = DriverOccurrence::outputs_captured(step, action, values);
         let _ = started.send(());
         match self.occurrences.send_acknowledged(occurrence).await {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
                 drop(candidates.commit());
-                self.with_work(|work| work.finish(request.action));
+                self.with_work(|work| work.finish(action));
+                drop(agent_staging);
                 commit.finalize();
             }
             Ok(DriverOccurrenceAcceptance::Rejected(finalization)) => {
                 candidates.abort();
-                let cancellation = self.with_work(|work| work.finish(request.action));
+                let cancellation = self.with_work(|work| work.finish(action));
+                drop(agent_staging);
                 finalization.finalize();
                 if let Some(cancellation) = cancellation {
                     self.send_quiesced(cancellation).await;
@@ -905,7 +1466,8 @@ impl CaptureWorker {
             }
             Err(_) => {
                 candidates.abort();
-                self.with_work(|work| work.finish(request.action));
+                self.with_work(|work| work.finish(action));
+                drop(agent_staging);
             }
         }
     }
@@ -916,31 +1478,40 @@ impl CaptureWorker {
         failure: OutputCaptureFailure,
         started: oneshot::Sender<()>,
     ) {
-        if self.with_work(|work| work.is_cancelled(request.action)) {
-            self.settle_cancelled(request.action, started).await;
+        let CaptureRequest {
+            step,
+            action,
+            provisional,
+        } = request;
+        if self.with_work(|work| work.is_cancelled(action)) {
+            drop(provisional);
+            self.settle_cancelled(action, started).await;
             return;
         }
-        self.with_work(|work| work.begin_delivery(request.action));
+        self.with_work(|work| work.begin_delivery(action));
         let occurrence = DriverOccurrence::output_capture_failed(
-            request.step,
-            request.action,
+            step,
+            action,
             StepFailureCause::OutputCapture(failure),
         );
         let _ = started.send(());
         match self.occurrences.send_acknowledged(occurrence).await {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
-                self.with_work(|work| work.finish(request.action));
+                self.with_work(|work| work.finish(action));
+                drop(provisional);
                 commit.finalize();
             }
             Ok(DriverOccurrenceAcceptance::Rejected(finalization)) => {
-                let cancellation = self.with_work(|work| work.finish(request.action));
+                let cancellation = self.with_work(|work| work.finish(action));
+                drop(provisional);
                 finalization.finalize();
                 if let Some(cancellation) = cancellation {
                     self.send_quiesced(cancellation).await;
                 }
             }
             Err(_) => {
-                self.with_work(|work| work.finish(request.action));
+                self.with_work(|work| work.finish(action));
+                drop(provisional);
             }
         }
     }
@@ -1076,6 +1647,18 @@ impl CaptureWorkRegistry {
             .is_some_and(|work| work.revocation.is_some())
     }
 
+    fn revoke_all_for_commit_failure(&mut self) {
+        for (&action, work) in &mut self.active {
+            if work.revocation.is_none() {
+                work.revocation = Some(CaptureRevocation {
+                    step: work.step.clone(),
+                    action,
+                });
+            }
+            work.cancellation.cancel();
+        }
+    }
+
     fn finish(&mut self, action: ActionId) -> Option<CaptureRevocation> {
         let work = self.active.remove(&action)?;
         if self.active_by_step.get(&work.step) == Some(&action) {
@@ -1115,7 +1698,10 @@ enum WorkPhase {
 struct CommandWork<Deadline> {
     step: String,
     phase: WorkPhase,
-    process_group: Option<Pid>,
+    process_group: Option<AuthenticatedProcessGroup>,
+    agent_process_control: Option<AgentProcessControl>,
+    agent_deadline_shutdown: Option<oneshot::Sender<()>>,
+    agent_deadline_finished: Option<oneshot::Receiver<()>>,
     cancellation: Option<CommandCancellation<Deadline>>,
     cancellation_wake: Option<oneshot::Sender<()>>,
     interrupt_sent: bool,
@@ -1157,6 +1743,9 @@ where
                 step,
                 phase: WorkPhase::Prelaunch,
                 process_group: None,
+                agent_process_control: None,
+                agent_deadline_shutdown: None,
+                agent_deadline_finished: None,
                 cancellation: None,
                 cancellation_wake: Some(cancellation_wake),
                 interrupt_sent: false,
@@ -1176,12 +1765,16 @@ where
         BeginLaunch::Launch
     }
 
-    fn record_launch(&mut self, action: ActionId, process_group: Pid) -> RecordLaunch<Deadline> {
+    fn record_launch(
+        &mut self,
+        action: ActionId,
+        process_group: AuthenticatedProcessGroup,
+    ) -> RecordLaunch<Deadline> {
         let Some(work) = self.active.get_mut(&action) else {
             return RecordLaunch::Gone;
         };
         work.phase = WorkPhase::Running;
-        work.process_group = Some(process_group);
+        work.process_group = Some(process_group.clone());
         let Some(cancellation) = work.cancellation.clone() else {
             return RecordLaunch::Running;
         };
@@ -1193,12 +1786,31 @@ where
         }
     }
 
+    fn record_agent_launch(
+        &mut self,
+        action: ActionId,
+        process_control: AgentProcessControl,
+    ) -> RecordLaunch<Deadline> {
+        let Some(work) = self.active.get_mut(&action) else {
+            return RecordLaunch::Gone;
+        };
+        work.phase = WorkPhase::Running;
+        work.agent_process_control = Some(process_control);
+        match work.cancellation.clone() {
+            Some(cancellation) => RecordLaunch::Cancelled {
+                cancellation,
+                interrupt: None,
+            },
+            None => RecordLaunch::Running,
+        }
+    }
+
     fn cancel(
         &mut self,
         step: String,
         action: ActionId,
         deadline: Deadline,
-    ) -> CancellationRegistration {
+    ) -> CancellationRegistration<Deadline> {
         if !self.known_actions.insert(action) {
             return CancellationRegistration::Duplicate;
         }
@@ -1216,18 +1828,32 @@ where
         work.cancellation = Some(CommandCancellation {
             step,
             action,
-            deadline,
+            deadline: deadline.clone(),
         });
-        let interrupt = match (work.phase, work.process_group) {
+        let interrupt = match (work.phase, work.process_group.clone()) {
             (WorkPhase::Running, Some(process_group)) if !work.interrupt_sent => {
                 work.interrupt_sent = true;
                 Some(process_group)
             }
             _ => None,
         };
+        let agent_deadline = work.agent_process_control.clone().map(|process_control| {
+            process_control.interrupt();
+            let (shutdown, deadline_shutdown) = oneshot::channel();
+            let (deadline_finished, finished) = oneshot::channel();
+            work.agent_deadline_shutdown = Some(shutdown);
+            work.agent_deadline_finished = Some(finished);
+            AgentCancellationDeadline {
+                process_control,
+                deadline,
+                shutdown: deadline_shutdown,
+                finished: deadline_finished,
+            }
+        });
         CancellationRegistration::Active {
             wake: work.cancellation_wake.take(),
             interrupt,
+            agent_deadline,
         }
     }
 
@@ -1235,12 +1861,43 @@ where
         self.active.get(&action)?.cancellation.clone()
     }
 
-    fn ensure_interrupt(&mut self, action: ActionId) -> Option<Pid> {
+    fn revoke_all_for_commit_failure(
+        &mut self,
+        deadline: Deadline,
+    ) -> Vec<(
+        Option<oneshot::Sender<()>>,
+        Option<AuthenticatedProcessGroup>,
+    )> {
+        let mut revocations = Vec::with_capacity(self.active.len());
+        for (&start_action, work) in &mut self.active {
+            self.cancelled_steps.insert(work.step.clone());
+            let action = work
+                .cancellation
+                .as_ref()
+                .map_or(start_action, |cancellation| cancellation.action);
+            work.cancellation = Some(CommandCancellation {
+                step: work.step.clone(),
+                action,
+                deadline: deadline.clone(),
+            });
+            let interrupt = match (work.phase, work.process_group.clone()) {
+                (WorkPhase::Running, Some(process_group)) if !work.interrupt_sent => {
+                    work.interrupt_sent = true;
+                    Some(process_group)
+                }
+                _ => None,
+            };
+            revocations.push((work.cancellation_wake.take(), interrupt));
+        }
+        revocations
+    }
+
+    fn ensure_interrupt(&mut self, action: ActionId) -> Option<AuthenticatedProcessGroup> {
         let work = self.active.get_mut(&action)?;
         if work.interrupt_sent {
             return None;
         }
-        let process_group = work.process_group?;
+        let process_group = work.process_group.clone()?;
         work.interrupt_sent = true;
         Some(process_group)
     }
@@ -1248,7 +1905,7 @@ where
     fn claim_completion(&mut self, action: ActionId) -> CompletionClaim<Deadline> {
         let claim = self.completion_status(action);
         if matches!(claim, CompletionClaim::Lifecycle) {
-            self.remove_active(action);
+            let _ = self.remove_active(action);
         }
         claim
     }
@@ -1278,22 +1935,35 @@ where
         }
     }
 
-    fn finish_cancellation(&mut self, action: ActionId) {
-        self.remove_active(action);
+    fn finish_cancellation(&mut self, action: ActionId) -> Option<oneshot::Receiver<()>> {
+        self.remove_active(action)
     }
 
     fn abandon(&mut self, action: ActionId) {
-        self.remove_active(action);
+        let _ = self.remove_active(action);
     }
 
-    fn remove_active(&mut self, action: ActionId) {
-        let Some(work) = self.active.remove(&action) else {
-            return;
-        };
+    fn remove_active(&mut self, action: ActionId) -> Option<oneshot::Receiver<()>> {
+        let mut work = self.active.remove(&action)?;
+        if let Some(shutdown) = work.agent_deadline_shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if self.active_by_step.get(&work.step) == Some(&action) {
             self.active_by_step.remove(&work.step);
         }
+        work.agent_deadline_finished.take()
     }
+}
+
+enum StartDelivery<Deadline> {
+    Published,
+    Cancelled(CommandCancellation<Deadline>),
+    Gone,
+}
+
+enum AgentLifecycleBoundary {
+    Started(Result<(), AgentStartReceiveError>),
+    Terminal(Result<AgentOutcome, AgentTerminalReceiveError>),
 }
 
 enum BeginLaunch<Deadline> {
@@ -1306,8 +1976,14 @@ enum RecordLaunch<Deadline> {
     Running,
     Cancelled {
         cancellation: CommandCancellation<Deadline>,
-        interrupt: Option<Pid>,
+        interrupt: Option<AuthenticatedProcessGroup>,
     },
+    Gone,
+}
+
+enum ClaimedCompletion<Deadline> {
+    Lifecycle(DriverOccurrenceClaim),
+    Cancelled(CommandCancellation<Deadline>),
     Gone,
 }
 
@@ -1317,10 +1993,18 @@ enum CompletionClaim<Deadline> {
     Gone,
 }
 
-enum CancellationRegistration {
+struct AgentCancellationDeadline<Deadline> {
+    process_control: AgentProcessControl,
+    deadline: Deadline,
+    shutdown: oneshot::Receiver<()>,
+    finished: oneshot::Sender<()>,
+}
+
+enum CancellationRegistration<Deadline> {
     Active {
         wake: Option<oneshot::Sender<()>>,
-        interrupt: Option<Pid>,
+        interrupt: Option<AuthenticatedProcessGroup>,
+        agent_deadline: Option<AgentCancellationDeadline<Deadline>>,
     },
     Quiesced,
     Duplicate,
@@ -1333,16 +2017,24 @@ fn lock_registry<Registry>(registry: &Mutex<Registry>) -> MutexGuard<'_, Registr
     }
 }
 
-impl<Clock, Observer>
-    ActionPort<RequestedAction<(), StepFailureCause, CapturedValue, Clock::Instant>>
-    for StepRuntime<Clock, Observer>
+impl<Clock, Observer, Adapter>
+    ActionPort<
+        RequestedAction<ProvisionalStepOutputs, StepFailureCause, CapturedValue, Clock::Instant>,
+    > for StepRuntime<Clock, Observer, Adapter>
 where
     Clock: CoordinatorClock,
+    Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
 {
     fn release(
         &mut self,
-        requested: RequestedAction<(), StepFailureCause, CapturedValue, Clock::Instant>,
+        requested: RequestedAction<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            Clock::Instant,
+        >,
     ) -> impl Future<Output = ()> {
         let runtime = self.clone();
         async move {
@@ -1366,9 +2058,33 @@ where
                         CaptureCancellationRegistration::NotFound => {
                             match runtime.request_cancellation(step.clone(), requested.id, deadline)
                             {
-                                CancellationRegistration::Active { wake, interrupt } => {
+                                CancellationRegistration::Active {
+                                    wake,
+                                    interrupt,
+                                    agent_deadline,
+                                } => {
                                     if let Some(group) = interrupt {
-                                        interrupt_process_group(group);
+                                        let _ = interrupt_authenticated_process_group(&group);
+                                    }
+                                    if let Some(agent_deadline) = agent_deadline {
+                                        let clock = runtime.clock.clone();
+                                        let tasks = runtime.tasks.clone();
+                                        tasks.spawn(async move {
+                                            let AgentCancellationDeadline {
+                                                process_control,
+                                                deadline,
+                                                mut shutdown,
+                                                finished,
+                                            } = agent_deadline;
+                                            let deadline = clock.wait_until(deadline);
+                                            tokio::pin!(deadline);
+                                            tokio::select! {
+                                                biased;
+                                                () = &mut deadline => process_control.force(),
+                                                _ = &mut shutdown => {}
+                                            }
+                                            let _ = finished.send(());
+                                        });
                                     }
                                     if let Some(wake) = wake {
                                         let _ = wake.send(());
@@ -1390,15 +2106,29 @@ where
                         }
                     }
                 }
-                Action::CaptureOutputs { step, .. } => {
+                Action::CaptureOutputs { step, provisional } => {
                     // Registration preserves reducer action order while the queue remains
                     // independently revocable and occurrence delivery waits for acceptance.
-                    runtime.register_capture(step, requested.id);
+                    runtime.register_capture(step, requested.id, provisional);
                 }
                 Action::FinishRun { .. } => {}
             }
         }
     }
+}
+
+pub(crate) trait WorkflowCommitPort<Clock>:
+    CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>
+where
+    Clock: CoordinatorClock,
+{
+}
+
+impl<Clock, Commits> WorkflowCommitPort<Clock> for Commits
+where
+    Clock: CoordinatorClock,
+    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>,
+{
 }
 
 pub(crate) async fn execute_workflow<Clock, Commits>(
@@ -1411,7 +2141,8 @@ pub(crate) async fn execute_workflow<Clock, Commits>(
 ) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
 where
     Clock: CoordinatorClock,
-    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
 {
     execute_workflow_observed(
         admitted,
@@ -1421,11 +2152,17 @@ where
         clock,
         commits,
         NoopExecutionObserver,
+        AgentExecution::disabled(),
+        ProcessGuardRegistry::default(),
     )
     .await
 }
 
-pub(super) async fn execute_workflow_observed<Clock, Commits, Observer>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared operation receives each adapter-owned resource explicitly"
+)]
+pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Adapter>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     inputs: &InputStaging,
@@ -1433,17 +2170,30 @@ pub(super) async fn execute_workflow_observed<Clock, Commits, Observer>(
     clock: Clock,
     commits: Commits,
     observer: Observer,
+    agents: AgentExecution<Adapter>,
+    process_guards: ProcessGuardRegistry,
 ) -> Result<CoordinationResult<StepFailureCause, CapturedValue>, CoordinationError>
 where
     Clock: CoordinatorClock,
-    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
 {
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);
     }
     if !inputs.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::InputStagingMismatch);
+    }
+    match &agents {
+        AgentExecution::Disabled if !admitted.agent_steps().is_empty() => {
+            return Err(CoordinationError::AgentRuntimeUnavailable);
+        }
+        AgentExecution::Enabled { staging, .. } if !staging.is_bound_to(admitted.execution()) => {
+            return Err(CoordinationError::AgentInputStagingMismatch);
+        }
+        AgentExecution::Disabled | AgentExecution::Enabled { .. } => {}
     }
     let channel_capacity = admitted.execution().limits().maximum_parallel_steps();
     let (sender, receiver) = occurrence_channel(channel_capacity);
@@ -1455,12 +2205,18 @@ where
         sender,
         clock.clone(),
         observer,
+        agents,
+        process_guards,
     );
     let lifecycle = actions.clone();
     let result = Coordinator::new(admitted, receiver, clock, commits, actions)
         .run()
         .await;
-    lifecycle.shutdown().await;
+    if matches!(result, Err(CoordinationError::CommitFailed)) {
+        lifecycle.quiesce_after_commit_failure().await;
+    } else {
+        lifecycle.shutdown().await;
+    }
     result
 }
 
@@ -1487,13 +2243,85 @@ impl StepBody<'_> {
     }
 }
 
-struct PreparedStep {
-    body: PreparedStepBody,
+fn resolve_agent_upstream_outputs(
+    agent: &ValidatedAgentStep,
+    action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+) -> Result<BTreeMap<ResolvedOutputSource, CapturedValue>, StepStartFailure> {
+    let sources = agent
+        .agent
+        .message
+        .text
+        .iter()
+        .chain(&agent.agent.message.attachments)
+        .filter_map(|source| match source {
+            ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Output(source),
+                ..
+            } => Some(source.clone()),
+            ValidatedMessageSource::File { .. }
+            | ValidatedMessageSource::Reference {
+                source: ResolvedValueSource::Import(_),
+                ..
+            } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if sources.len() != action_inputs.len() {
+        return Err(StepStartFailure::InputsUnavailable);
+    }
+    sources
+        .into_iter()
+        .map(|source| {
+            let value = match action_inputs.get(&source.reference()) {
+                Some(ActionInput::Output(value)) => value.clone(),
+                Some(ActionInput::Import | ActionInput::Unavailable) | None => {
+                    return Err(StepStartFailure::InputsUnavailable);
+                }
+            };
+            Ok((source, value))
+        })
+        .collect()
 }
 
-enum PreparedStepBody {
+fn completed_agent_outputs(
+    output: Option<String>,
+    completed: CompletedAgentInvocation,
+) -> Result<BTreeMap<String, CapturedValue>, AgentFailureCause> {
+    let output = match (output, completed) {
+        (None, CompletedAgentInvocation::NoValue) => return Ok(BTreeMap::new()),
+        (Some(output), CompletedAgentInvocation::Response(response)) => {
+            (output, CapturedValue::Text(response.into_text()))
+        }
+        (Some(output), CompletedAgentInvocation::Result(result)) => {
+            (output, CapturedValue::Json(result.into_value()))
+        }
+        (None, CompletedAgentInvocation::Response(_) | CompletedAgentInvocation::Result(_))
+        | (Some(_), CompletedAgentInvocation::NoValue) => {
+            return Err(AgentFailureCause::HarnessProtocolFailed);
+        }
+    };
+    Ok(BTreeMap::from([output]))
+}
+
+struct PreparedStep<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    body: PreparedStepBody<Sink>,
+}
+
+enum PreparedStepBody<Sink>
+where
+    Sink: AgentObservationSink,
+{
     Command(PreparedCommand),
-    Agent,
+    Agent(Box<PreparedAgent<Sink>>),
+}
+
+struct PreparedAgent<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    materialized: MaterializedAgentInvocation<Sink>,
 }
 
 struct PreparedCommand {
@@ -1507,6 +2335,7 @@ struct PreparedCommand {
 impl PreparedCommand {
     fn launch<Deadline, Observer>(
         self,
+        guarded: bool,
         step: String,
         invocation: ActionId,
         diagnostic_log: &StepDiagnosticLog,
@@ -1529,19 +2358,36 @@ impl PreparedCommand {
                 WorkingDirectoryFailure::ExecutionRootRebound,
             ));
         }
-        let mut command = Command::new(program);
-        command
-            .args(arguments)
-            .env_clear()
-            .envs(environment.variables())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command.as_std_mut().process_group(0);
-        cwd.bind_command(command.as_std_mut());
-        let child = command.spawn().map_err(|failure| {
-            StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
-        })?;
+        let environment = environment
+            .variables()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let child = if guarded {
+            CommandChild::Guarded(
+                StoppedChildGuard::spawn(&program, &arguments, &environment, |command| {
+                    cwd.bind_command(command)
+                })
+                .map_err(|failure| {
+                    StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
+                })?,
+            )
+        } else {
+            let mut command = Command::new(program);
+            command
+                .args(arguments)
+                .env_clear()
+                .envs(environment)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command.as_std_mut().process_group(0);
+            cwd.bind_command(command.as_std_mut());
+            let child = command.spawn().map_err(|failure| {
+                StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
+            })?;
+            CommandChild::direct(child)?
+        };
         LaunchedStepBody::command(
             child,
             step,
@@ -1554,10 +2400,53 @@ impl PreparedCommand {
     }
 }
 
+enum CommandChild {
+    Guarded(StoppedChildGuard),
+    Direct {
+        child: Child,
+        identity: Option<AuthenticatedProcessGroup>,
+    },
+}
+
+impl CommandChild {
+    fn direct(mut child: Child) -> Result<Self, StepStartFailure> {
+        let process_group = child
+            .id()
+            .and_then(|process_id| i32::try_from(process_id).ok())
+            .and_then(Pid::from_raw);
+        let Some(identity) = process_group.and_then(capture_process_group_identity) else {
+            if let Some(process_group) = process_group {
+                let _ = kill_process_group(process_group, Signal::KILL);
+            }
+            let _ = child.start_kill();
+            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+        };
+        Ok(Self::Direct {
+            child,
+            identity: Some(identity),
+        })
+    }
+
+    fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        match self {
+            Self::Guarded(child) => child.take_stdout(),
+            Self::Direct { child, .. } => child.stdout.take(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        match self {
+            Self::Guarded(child) => child.take_stderr(),
+            Self::Direct { child, .. } => child.stderr.take(),
+        }
+    }
+}
+
 enum LaunchedStepBody {
     Command {
-        child: Child,
-        process_group: Option<Pid>,
+        child: CommandChild,
+        registration: Option<ProcessGuardRegistration>,
+        guard_quiesced: bool,
         diagnostic: Option<PendingStepDiagnostic>,
         inputs: Option<InputView>,
     },
@@ -1565,7 +2454,7 @@ enum LaunchedStepBody {
 
 impl LaunchedStepBody {
     fn command<Deadline, Observer>(
-        mut child: Child,
+        mut child: CommandChild,
         step: String,
         invocation: ActionId,
         diagnostic_log: &StepDiagnosticLog,
@@ -1577,17 +2466,9 @@ impl LaunchedStepBody {
         Deadline: Send + 'static,
         Observer: ExecutionObserver<Deadline>,
     {
-        let process_group = child
-            .id()
-            .and_then(|process_id| i32::try_from(process_id).ok())
-            .and_then(Pid::from_raw);
         let (Some(standard_output), Some(standard_error)) =
-            (child.stdout.take(), child.stderr.take())
+            (child.take_stdout(), child.take_stderr())
         else {
-            if let Some(process_group) = process_group {
-                terminate_process_group(process_group);
-            }
-            let _ = child.start_kill();
             return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
         };
         let diagnostic = diagnostic_log.start_capture(
@@ -1600,36 +2481,141 @@ impl LaunchedStepBody {
         );
         Ok(Self::Command {
             child,
-            process_group,
+            registration: None,
+            guard_quiesced: false,
             diagnostic: Some(diagnostic),
             inputs,
         })
     }
 
-    fn process_group(&self) -> Option<Pid> {
+    #[cfg(test)]
+    fn fixture(child: Child, diagnostic: PendingStepDiagnostic) -> Self {
+        Self::Command {
+            child: CommandChild::Direct {
+                child,
+                identity: None,
+            },
+            registration: None,
+            guard_quiesced: false,
+            diagnostic: Some(diagnostic),
+            inputs: None,
+        }
+    }
+
+    fn process_group(&self) -> Option<&AuthenticatedProcessGroup> {
         match self {
-            Self::Command { process_group, .. } => *process_group,
+            Self::Command {
+                child: CommandChild::Guarded(child),
+                ..
+            } => Some(child.identity()),
+            Self::Command {
+                child: CommandChild::Direct { identity, .. },
+                ..
+            } => identity.as_ref(),
+        }
+    }
+
+    fn install_registration(&mut self, registration: ProcessGuardRegistration) {
+        match self {
+            Self::Command {
+                registration: current,
+                ..
+            } => *current = Some(registration),
+        }
+    }
+
+    fn release(&mut self) -> Result<(), CommandLaunchFailure> {
+        match self {
+            Self::Command {
+                child,
+                registration: Some(registration),
+                ..
+            } => {
+                if let CommandChild::Guarded(child) = child {
+                    child
+                        .continue_execution()
+                        .map_err(|failure| classify_launch_failure(&failure))?;
+                }
+                registration
+                    .mark_released()
+                    .map_err(|()| CommandLaunchFailure::Other)
+            }
+            Self::Command { .. } => Err(CommandLaunchFailure::Other),
         }
     }
 
     async fn wait(&mut self) -> Result<ExitStatus, ()> {
-        match self {
-            Self::Command { child, .. } => child.wait().await.map_err(|_| ()),
-        }
+        let status = match self {
+            Self::Command {
+                child: CommandChild::Guarded(child),
+                ..
+            } => child.wait().await.map_err(|_| ()),
+            Self::Command {
+                child: CommandChild::Direct { child, .. },
+                ..
+            } => child.wait().await.map_err(|_| ()),
+        }?;
+        self.mark_quiesced()?;
+        Ok(status)
     }
 
     fn force_process_group(&self) {
-        if let Some(process_group) = self.process_group() {
-            terminate_process_group(process_group);
+        match self {
+            Self::Command {
+                child: CommandChild::Guarded(child),
+                ..
+            } => {
+                let _ =
+                    super::process_group::terminate_authenticated_process_group(child.identity());
+            }
+            Self::Command {
+                child:
+                    CommandChild::Direct {
+                        identity: Some(identity),
+                        ..
+                    },
+                ..
+            } => {
+                // Non-durable adapters retain their legacy direct-child lifecycle;
+                // local durable execution always uses the authenticated guard branch.
+                let _ = kill_process_group(identity.process_group(), Signal::KILL);
+            }
+            Self::Command { .. } => {}
         }
     }
 
-    async fn force_stop(&mut self) {
+    async fn force_stop(&mut self) -> Result<(), ()> {
         self.force_process_group();
         match self {
-            Self::Command { child, .. } => {
+            Self::Command {
+                child: CommandChild::Guarded(child),
+                ..
+            } => child.force_stop().await.map_err(|_| ())?,
+            Self::Command {
+                child: CommandChild::Direct { child, .. },
+                ..
+            } => {
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                child.wait().await.map_err(|_| ())?;
+            }
+        }
+        self.mark_quiesced()
+    }
+
+    fn mark_quiesced(&mut self) -> Result<(), ()> {
+        match self {
+            Self::Command {
+                registration,
+                guard_quiesced,
+                ..
+            } => {
+                if !*guard_quiesced {
+                    if let Some(registration) = registration {
+                        registration.mark_quiesced()?;
+                    }
+                    *guard_quiesced = true;
+                }
+                Ok(())
             }
         }
     }
@@ -1645,14 +2631,6 @@ impl LaunchedStepBody {
         }
         drop(inputs);
     }
-}
-
-fn interrupt_process_group(process_group: Pid) {
-    let _ = kill_process_group(process_group, Signal::INT);
-}
-
-fn terminate_process_group(process_group: Pid) {
-    let _ = kill_process_group(process_group, Signal::KILL);
 }
 
 pub(super) fn resolve_working_directory(

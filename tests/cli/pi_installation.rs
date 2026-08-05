@@ -93,8 +93,8 @@ fn report_code(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn doctor_validates_the_absolute_installation_with_only_the_two_closed_probes() {
-    let fixture = PiFixture::new("0.82.1", COMPLETE_HELP, true);
+fn doctor_retains_an_accepted_patch_release_with_only_the_two_closed_probes() {
+    let fixture = PiFixture::new("0.83.7", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"never"}"#;
@@ -139,8 +139,12 @@ fn doctor_validates_the_absolute_installation_with_only_the_two_closed_probes() 
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[0]["checks"][0]["id"], PI_CHECK_ID);
     assert_eq!(reports[0]["checks"][0]["status"], "pass");
-    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.82.1");
+    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.83.7");
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
+    assert_eq!(
+        reports[0]["checks"][0]["details"]["supportedRange"],
+        ">=0.83.0 <0.84.0"
+    );
     assert_eq!(
         reports[0]["checks"][0]["details"]["capabilities"],
         REQUIRED_CAPABILITIES
@@ -190,7 +194,7 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
 
     let cases = [
         (
-            "0.82.1",
+            "0.83.0",
             COMPLETE_HELP,
             false,
             "unexecutable_pi_installation",
@@ -204,28 +208,35 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
             b"--version\n".as_slice(),
         ),
         (
-            "0.82.0",
-            COMPLETE_HELP,
-            true,
-            "unsupported_pi_version",
-            b"--version\n".as_slice(),
-        ),
-        (
-            "9.9.9",
-            COMPLETE_HELP,
-            true,
-            "unsupported_pi_version",
-            b"--version\n".as_slice(),
-        ),
-        (
             "0.82.1",
+            COMPLETE_HELP,
+            true,
+            "unsupported_pi_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "0.84.0",
+            COMPLETE_HELP,
+            true,
+            "unsupported_pi_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "0.83.0-rc.1",
+            COMPLETE_HELP,
+            true,
+            "malformed_pi_version",
+            b"--version\n".as_slice(),
+        ),
+        (
+            "0.83.0",
             "not Pi help\n",
             true,
             "malformed_pi_capabilities",
             CLOSED_PROBES,
         ),
         (
-            "0.82.1",
+            "0.83.0",
             "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n",
             true,
             "unsupported_pi_capability",
@@ -254,7 +265,7 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
 
 #[test]
 fn agent_capable_runner_initialization_uses_the_same_validator_once() {
-    let fixture = PiFixture::new("0.82.1", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.83.0", COMPLETE_HELP, true);
     let credential_directory = private_credential_directory();
     let credential_path = write_runner_credential(&credential_directory);
     let output = run_with_env(
@@ -280,7 +291,7 @@ fn agent_capable_runner_initialization_uses_the_same_validator_once() {
     );
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 
-    let incompatible = PiFixture::new("0.82.2", COMPLETE_HELP, true);
+    let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
     let output = run_with_env(
         &[
             "runner",
@@ -298,7 +309,7 @@ fn agent_capable_runner_initialization_uses_the_same_validator_once() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
-        b"Error: configured Pi version 0.82.2 is unsupported; install Pi 0.82.1 exactly\n"
+        b"Error: configured Pi version 0.84.0 is unsupported; install a stable Pi release in range >=0.83.0 <0.84.0\n"
     );
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
 }
@@ -428,8 +439,9 @@ fn pinned_conformance_executable_is_exact_and_independent_of_path_and_saved_trus
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "0.82.1");
+    assert_eq!(details["version"], "0.83.0");
     assert_eq!(details["profile"], "PiJsonV1");
+    assert_eq!(details["supportedRange"], ">=0.83.0 <0.84.0");
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
         Path::new(details["executablePath"].as_str().unwrap()),

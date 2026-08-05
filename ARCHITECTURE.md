@@ -68,10 +68,11 @@ without adding a central check-name enum, but it must keep those boundaries inta
 
 The Pi validator lives at the execution boundary and is shared by doctor and optional
 agent-capable Runner Serve initialization. It canonicalizes the configured path, invokes
-only that absolute executable's native version and help probes, and maps exact version
-0.82.1 plus its required non-model flags into an immutable
-`ValidatedPiInstallation`. The value carries the absolute path, closed version and
-profile enums, and a closed capability set. Neither run admission nor later execution
+only that absolute executable's native version and help probes, and maps canonical
+stable versions in `>=0.83.0 <0.84.0` plus their required non-model flags into an
+immutable `ValidatedPiInstallation`. The value carries the absolute path, ordered
+numeric and exact observed version, closed profile enum, and closed capability set.
+Neither run admission nor later execution
 needs executable discovery or native probing. Runner Serve keeps command-only startup
 available when no Pi path is configured; when one is configured, startup must validate
 and retain it before entering the service runtime.

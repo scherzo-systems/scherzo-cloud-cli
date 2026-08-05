@@ -73,13 +73,15 @@ struct RecordingCommitPort {
 }
 
 impl CommitPort<TestCommit> for RecordingCommitPort {
-    fn commit(&mut self, commit: TestCommit) -> impl Future<Output = ()> {
+    type Error = std::convert::Infallible;
+
+    fn commit(&mut self, commit: TestCommit) -> impl Future<Output = Result<(), Self::Error>> {
         self.timeline
             .lock()
             .unwrap()
             .push(TimelineEntry::Commit(commit.occurrence_ordinal));
         let _ = self.commits.send(commit);
-        ready(())
+        ready(Ok(()))
     }
 }
 
@@ -289,6 +291,44 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
         timeline: timeline.lock().unwrap().clone(),
         result: result.unwrap(),
     }
+}
+
+struct FailingCommitPort;
+
+impl CommitPort<TestCommit> for FailingCommitPort {
+    type Error = ();
+
+    fn commit(&mut self, _commit: TestCommit) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Err(()))
+    }
+}
+
+#[tokio::test]
+async fn failed_commit_prevents_initial_action_release() {
+    let fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    let (_sender, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        FailingCommitPort,
+        ControlledActionPort {
+            actions: action_sender,
+            timeline: Arc::clone(&timeline),
+        },
+    );
+
+    assert_eq!(
+        coordinator.run().await,
+        Err(CoordinationError::CommitFailed)
+    );
+    assert!(actions.try_recv().is_err());
+    assert!(timeline.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

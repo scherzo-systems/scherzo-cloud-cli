@@ -6,9 +6,10 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 // cargo-typify emits public declarations; keep its output reproducible and contain
 // the binary crate's visibility exception to this generated module.
 #[allow(
+    dead_code,
     unreachable_pub,
     clippy::unwrap_used,
-    reason = "cargo-typify emits public types and infallible static regex initialization"
+    reason = "cargo-typify emits reusable schema definitions, public types, and infallible static regex initialization"
 )]
 pub(crate) mod generated;
 
@@ -37,6 +38,25 @@ pub(crate) enum RunnerFrame {
         envelope: RunnerEnvelope,
         effect_id: String,
     },
+    AssignmentRejected {
+        envelope: RunnerEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        decline_type: String,
+        decline_reason: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionLeasePolicy {
+    pub(crate) schema_version: u64,
+    pub(crate) max_clock_uncertainty_milliseconds: i64,
+    pub(crate) force_stop_and_reap_budget_milliseconds: i64,
+    pub(crate) terminal_report_delivery_budget_milliseconds: i64,
+    pub(crate) start_delivery_budget_milliseconds: i64,
+    pub(crate) renewal_delivery_budget_milliseconds: i64,
+    pub(crate) lease_duration_milliseconds: u64,
+    pub(crate) fencing_margin_milliseconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +72,7 @@ pub(crate) enum CloudFrame {
         session_id: String,
         ping_interval_seconds: u64,
         pong_timeout_seconds: u64,
+        lease_policy: ExecutionLeasePolicy,
     },
     ObservationAck {
         envelope: CloudEnvelope,
@@ -63,7 +84,24 @@ pub(crate) enum CloudFrame {
         effect_id: String,
         assignment_id: String,
         run_id: String,
+        execution_spec_id: String,
+        registered_workflow_id: String,
+        offer_expires_at: String,
+    },
+    AssignmentStart {
+        envelope: CloudEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        run_id: String,
+        execution_spec_id: String,
         lease_expires_at: String,
+    },
+    AssignmentRelease {
+        envelope: CloudEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        run_id: String,
+        reason: String,
     },
 }
 
@@ -138,6 +176,27 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
             "effect_acknowledged",
             json!({ "effectId": effect_id }),
         ),
+        RunnerFrame::AssignmentRejected {
+            envelope,
+            effect_id,
+            assignment_id,
+            decline_type,
+            decline_reason,
+        } => {
+            let mut decline = json!({ "type": decline_type });
+            if let Some(reason) = decline_reason {
+                decline["reason"] = json!(reason);
+            }
+            runner_frame_value(
+                envelope,
+                "assignment_rejected",
+                json!({
+                    "effectId": effect_id,
+                    "assignmentId": assignment_id,
+                    "decline": decline,
+                }),
+            )
+        }
     };
     let encoded = serde_json::to_vec(&value).map_err(|_| EncodeError::Serialization)?;
 
@@ -171,69 +230,100 @@ enum ValidatedFrame {
     Cloud(CloudFrame),
 }
 
+// cargo-typify generates distinct cloud structs with the same envelope fields.
+// This macro keeps their validation and projection on one shared path without
+// introducing wrappers around generated types.
+macro_rules! validated_cloud_envelope {
+    ($frame:expr) => {
+        cloud_envelope(
+            &$frame.protocol_version,
+            &$frame.payload_version,
+            &$frame.direction,
+            $frame.message_id,
+            $frame.sent_at,
+        )
+    };
+}
+
 fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
-    let generated = serde_json::from_slice(bytes).map_err(|_| DecodeError::InvalidJson)?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| DecodeError::InvalidJson)?;
+    validate_closed_shape(&value)?;
+    let generated = serde_json::from_value(value).map_err(|_| DecodeError::InvalidJson)?;
 
     match generated {
-        generated::RunnerProtocolVersion1::RunnerHello(frame) => {
-            validate_runner_frame(
-                RunnerFrameMetadata {
-                    protocol_version: &frame.protocol_version,
-                    payload_version: &frame.payload_version,
-                    direction: &frame.direction,
-                    frame_type: &frame.type_,
-                    expected_type: "hello",
-                },
-                frame.sent_at,
-            )?;
-            Ok(ValidatedFrame::Runner)
-        }
+        generated::RunnerProtocolVersion1::RunnerHello(frame) => validate_runner_frame(
+            &frame.protocol_version,
+            &frame.payload_version,
+            &frame.direction,
+            frame.sent_at,
+        ),
         generated::RunnerProtocolVersion1::RunnerEffectAcknowledged(frame) => {
             validate_runner_frame(
-                RunnerFrameMetadata {
-                    protocol_version: &frame.protocol_version,
-                    payload_version: &frame.payload_version,
-                    direction: &frame.direction,
-                    frame_type: &frame.type_,
-                    expected_type: "effect_acknowledged",
-                },
-                frame.sent_at,
-            )?;
-            Ok(ValidatedFrame::Runner)
-        }
-        generated::RunnerProtocolVersion1::CloudWelcome(frame) => {
-            validate_constants(
                 &frame.protocol_version,
                 &frame.payload_version,
                 &frame.direction,
-                &frame.type_,
-                CLOUD_TO_RUNNER,
-                "welcome",
-            )?;
-            let envelope = cloud_envelope(frame.message_id, frame.sent_at)?;
+                frame.sent_at,
+            )
+        }
+        generated::RunnerProtocolVersion1::RunnerAssignmentAccepted(frame) => {
+            validate_runner_frame(
+                &frame.protocol_version,
+                &frame.payload_version,
+                &frame.direction,
+                frame.sent_at,
+            )
+        }
+        generated::RunnerProtocolVersion1::RunnerAssignmentRejected(frame) => {
+            validate_runner_frame(
+                &frame.protocol_version,
+                &frame.payload_version,
+                &frame.direction,
+                frame.sent_at,
+            )
+        }
+        generated::RunnerProtocolVersion1::RunnerAssignmentInterrupted(frame) => {
+            validate_runner_frame(
+                &frame.protocol_version,
+                &frame.payload_version,
+                &frame.direction,
+                frame.sent_at,
+            )
+        }
+        generated::RunnerProtocolVersion1::CloudWelcome(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
             let ping_interval_seconds = frame.payload.ping_interval_seconds.get();
             let pong_timeout_seconds = u64::try_from(frame.payload.pong_timeout_seconds)
                 .map_err(|_| DecodeError::InvalidFrame("pongTimeoutSeconds"))?;
             if pong_timeout_seconds < ping_interval_seconds.saturating_mul(2) {
                 return Err(DecodeError::InvalidFrame("pongTimeoutSeconds"));
             }
+            let session_id = frame.payload.session_id.to_string();
+            let policy = frame.payload.lease_policy;
             Ok(ValidatedFrame::Cloud(CloudFrame::Welcome {
                 envelope,
-                session_id: frame.payload.session_id.to_string(),
+                session_id,
                 ping_interval_seconds,
                 pong_timeout_seconds,
+                lease_policy: ExecutionLeasePolicy {
+                    schema_version: 1,
+                    max_clock_uncertainty_milliseconds: policy.max_clock_uncertainty_milliseconds.0,
+                    force_stop_and_reap_budget_milliseconds: policy
+                        .force_stop_and_reap_budget_milliseconds
+                        .0,
+                    terminal_report_delivery_budget_milliseconds: policy
+                        .terminal_report_delivery_budget_milliseconds
+                        .0,
+                    start_delivery_budget_milliseconds: policy.start_delivery_budget_milliseconds.0,
+                    renewal_delivery_budget_milliseconds: policy
+                        .renewal_delivery_budget_milliseconds
+                        .0,
+                    lease_duration_milliseconds: policy.lease_duration_milliseconds.0.get(),
+                    fencing_margin_milliseconds: policy.fencing_margin_milliseconds.0.get(),
+                },
             }))
         }
         generated::RunnerProtocolVersion1::CloudObservationAck(frame) => {
-            validate_constants(
-                &frame.protocol_version,
-                &frame.payload_version,
-                &frame.direction,
-                &frame.type_,
-                CLOUD_TO_RUNNER,
-                "observation_ack",
-            )?;
-            let envelope = cloud_envelope(frame.message_id, frame.sent_at)?;
+            let envelope = validated_cloud_envelope!(frame)?;
             Ok(ValidatedFrame::Cloud(CloudFrame::ObservationAck {
                 envelope,
                 acknowledged_message_id: frame.payload.acknowledged_message_id.to_string(),
@@ -241,55 +331,159 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
-            validate_constants(
-                &frame.protocol_version,
-                &frame.payload_version,
-                &frame.direction,
-                &frame.type_,
-                CLOUD_TO_RUNNER,
-                "assignment_offer",
-            )?;
-            let envelope = cloud_envelope(frame.message_id, frame.sent_at)?;
-            let lease_expires_at = validate_timestamp(&frame.payload.lease_expires_at)?;
+            let envelope = validated_cloud_envelope!(frame)?;
+            let offer_expires_at = validate_timestamp(&frame.payload.offer_expires_at)?;
             Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
+                execution_spec_id: frame.payload.execution_spec.execution_spec_id.to_string(),
+                registered_workflow_id: frame
+                    .payload
+                    .execution_spec
+                    .registered_workflow_id
+                    .to_string(),
+                offer_expires_at,
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudAssignmentStart(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            let lease_expires_at = validate_timestamp(&frame.payload.lease.lease_expires_at)?;
+            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentStart {
+                envelope,
+                effect_id: frame.payload.effect_id.to_string(),
+                assignment_id: frame.payload.assignment_id.to_string(),
+                run_id: frame.payload.run_id.to_string(),
+                execution_spec_id: frame.payload.execution_spec_id.to_string(),
                 lease_expires_at,
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudAssignmentRelease(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentRelease {
+                envelope,
+                effect_id: frame.payload.effect_id.to_string(),
+                assignment_id: frame.payload.assignment_id.to_string(),
+                run_id: frame.payload.run_id.to_string(),
+                reason: frame.payload.reason.to_string(),
             }))
         }
     }
 }
 
-struct RunnerFrameMetadata<'a> {
-    protocol_version: &'a Value,
-    payload_version: &'a Value,
-    direction: &'a Value,
-    frame_type: &'a Value,
-    expected_type: &'a str,
-}
-
-fn validate_runner_frame(
-    metadata: RunnerFrameMetadata<'_>,
-    sent_at: generated::UtcTimestamp,
-) -> Result<(), DecodeError> {
-    validate_constants(
-        metadata.protocol_version,
-        metadata.payload_version,
-        metadata.direction,
-        metadata.frame_type,
-        RUNNER_TO_CLOUD,
-        metadata.expected_type,
-    )?;
-    validate_timestamp(&sent_at)?;
+fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
+    let object = value
+        .as_object()
+        .ok_or(DecodeError::InvalidFrame("envelope"))?;
+    let direction = object
+        .get("direction")
+        .and_then(Value::as_str)
+        .ok_or(DecodeError::InvalidFrame("direction"))?;
+    let frame_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(DecodeError::InvalidFrame("type"))?;
+    let envelope_keys: &[&str] = if direction == RUNNER_TO_CLOUD {
+        &[
+            "protocolVersion",
+            "direction",
+            "messageId",
+            "runnerId",
+            "bootId",
+            "sequence",
+            "sentAt",
+            "type",
+            "payloadVersion",
+            "payload",
+        ]
+    } else {
+        &[
+            "protocolVersion",
+            "direction",
+            "messageId",
+            "sentAt",
+            "type",
+            "payloadVersion",
+            "payload",
+        ]
+    };
+    if object.len() != envelope_keys.len()
+        || !envelope_keys.iter().all(|key| object.contains_key(*key))
+    {
+        return Err(DecodeError::InvalidFrame("envelope"));
+    }
+    let payload = object
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or(DecodeError::InvalidFrame("payload"))?;
+    let payload_keys: &[&str] = match frame_type {
+        "hello" => &["runnerVersion", "maxConcurrentRuns"],
+        "effect_acknowledged" => &["effectId"],
+        "assignment_accepted" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
+        "assignment_rejected" => &["effectId", "assignmentId", "decline"],
+        "assignment_interrupted" => &["assignmentId", "attemptId", "reason"],
+        "welcome" => &[
+            "sessionId",
+            "pingIntervalSeconds",
+            "pongTimeoutSeconds",
+            "leasePolicy",
+        ],
+        "observation_ack" => &["acknowledgedMessageId", "acknowledgedSequence"],
+        "assignment_offer" => &[
+            "effectId",
+            "assignmentId",
+            "runId",
+            "executionSpec",
+            "offerExpiresAt",
+        ],
+        "assignment_start" => &[
+            "effectId",
+            "assignmentId",
+            "runId",
+            "executionSpecId",
+            "lease",
+        ],
+        "assignment_release" => &["effectId", "assignmentId", "runId", "reason"],
+        _ => return Err(DecodeError::InvalidFrame("type")),
+    };
+    if payload.len() != payload_keys.len()
+        || !payload_keys.iter().all(|key| payload.contains_key(*key))
+    {
+        return Err(DecodeError::InvalidFrame("payload"));
+    }
     Ok(())
 }
 
+fn validate_runner_frame(
+    protocol_version: &Value,
+    payload_version: &Value,
+    direction: &Value,
+    sent_at: generated::UtcTimestamp,
+) -> Result<ValidatedFrame, DecodeError> {
+    validate_constants(
+        protocol_version,
+        payload_version,
+        direction,
+        RUNNER_TO_CLOUD,
+    )?;
+    validate_timestamp(&sent_at)?;
+    Ok(ValidatedFrame::Runner)
+}
+
 fn cloud_envelope(
+    protocol_version: &Value,
+    payload_version: &Value,
+    direction: &Value,
     message_id: generated::CloudMessageId,
     sent_at: generated::UtcTimestamp,
 ) -> Result<CloudEnvelope, DecodeError> {
+    validate_constants(
+        protocol_version,
+        payload_version,
+        direction,
+        CLOUD_TO_RUNNER,
+    )?;
     Ok(CloudEnvelope {
         message_id: message_id.to_string(),
         sent_at: validate_timestamp(&sent_at)?,
@@ -300,9 +494,7 @@ fn validate_constants(
     protocol_version: &Value,
     payload_version: &Value,
     direction: &Value,
-    frame_type: &Value,
     expected_direction: &str,
-    expected_type: &str,
 ) -> Result<(), DecodeError> {
     if protocol_version.as_i64() != Some(PROTOCOL_VERSION) {
         return Err(DecodeError::InvalidFrame("protocolVersion"));
@@ -312,9 +504,6 @@ fn validate_constants(
     }
     if direction.as_str() != Some(expected_direction) {
         return Err(DecodeError::InvalidFrame("direction"));
-    }
-    if frame_type.as_str() != Some(expected_type) {
-        return Err(DecodeError::InvalidFrame("type"));
     }
     Ok(())
 }
@@ -357,6 +546,26 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/runner-fresh-hello.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-assignment-accepted.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-assignment-rejected.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-assignment-interrupted.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-start.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-release.json"
         )),
     ];
 
@@ -409,11 +618,11 @@ mod tests {
 
     #[test]
     fn generated_types_and_handwritten_validation_reject_every_invalid_fixture() {
-        for fixture in INVALID_FIXTURES {
+        for (index, fixture) in INVALID_FIXTURES.iter().enumerate() {
             let result = serde_json::from_slice::<generated::RunnerProtocolVersion1>(fixture)
                 .ok()
                 .and_then(|frame| decode_frame(fixture).ok().map(|_| frame));
-            assert!(result.is_none(), "invalid fixture was accepted");
+            assert!(result.is_none(), "invalid fixture {index} was accepted");
         }
     }
 
@@ -455,7 +664,17 @@ mod tests {
           "payload": {
             "sessionId": "rsn_01k0z6r1w8f4jy2m7q9v3x5abj",
             "pingIntervalSeconds": 10,
-            "pongTimeoutSeconds": 19
+            "pongTimeoutSeconds": 19,
+            "leasePolicy": {
+              "schemaVersion": 1,
+              "maxClockUncertaintyMilliseconds": 1000,
+              "forceStopAndReapBudgetMilliseconds": 5000,
+              "terminalReportDeliveryBudgetMilliseconds": 5000,
+              "startDeliveryBudgetMilliseconds": 5000,
+              "renewalDeliveryBudgetMilliseconds": 5000,
+              "leaseDurationMilliseconds": 30000,
+              "fencingMarginMilliseconds": 11000
+            }
           }
         }"#;
 

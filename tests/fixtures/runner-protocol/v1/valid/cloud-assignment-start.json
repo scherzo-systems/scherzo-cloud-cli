@@ -1,0 +1,19 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abn",
+  "sentAt": "2026-07-23T00:00:03Z",
+  "type": "assignment_start",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abq",
+    "lease": {
+      "leaseSequence": 1,
+      "leaseExpiresAt": "2026-07-23T00:05:00Z",
+      "runnerStopBefore": "2026-07-23T00:04:49Z"
+    }
+  }
+}

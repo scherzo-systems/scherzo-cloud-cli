@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "command": "scherzo-cloud workflow status",
+  "outcome": "error",
+  "exitStatus": 1,
+  "error": {
+    "code": "run_directory_unavailable",
+    "message": "Schema 2 is not supported by this command."
+  }
+}

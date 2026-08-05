@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     AgentAdapter, AgentFailureCause, AgentInvocation, AgentInvocationIdentity, AgentObservation,
-    AgentObservationEmissionError, AgentObservationSink, AgentOutcome, AgentTerminalCallback,
-    AgentTerminalReportError, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
-    CompletedAgentInvocation,
+    AgentObservationEmissionError, AgentObservationSink, AgentOutcome, AgentStartCallback,
+    AgentStartReportError, AgentTerminalCallback, AgentTerminalReportError, AgentValueKind,
+    BoundedAgentResponse, BoundedSchemaValidAgentResult, CompletedAgentInvocation,
 };
+use crate::execution::workflow::pi::PiConfig;
+use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScriptedAgentValue {
@@ -25,10 +27,13 @@ impl ScriptedAgentValue {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ScriptedInvocationStarted {
     identity: AgentInvocationIdentity,
+    message: Arc<str>,
+    attachments: Arc<[super::StagedAgentAttachment]>,
     value_kind: AgentValueKind,
+    control: ScriptedInvocationControl,
 }
 
 impl ScriptedInvocationStarted {
@@ -36,25 +41,44 @@ impl ScriptedInvocationStarted {
         &self.identity
     }
 
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn attachments(&self) -> &[super::StagedAgentAttachment] {
+        &self.attachments
+    }
+
     pub(crate) fn value_kind(&self) -> AgentValueKind {
         self.value_kind
+    }
+
+    pub(crate) fn control(&self) -> &ScriptedInvocationControl {
+        &self.control
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct ScriptedAgentAdapter {
-    commands: Arc<Mutex<Option<mpsc::UnboundedReceiver<ScriptedCommand>>>>,
     started: mpsc::UnboundedSender<ScriptedInvocationStarted>,
 }
 
 pub(crate) struct ScriptedAgentControl {
-    commands: mpsc::UnboundedSender<ScriptedCommand>,
+    current: Option<ScriptedInvocationControl>,
     started: mpsc::UnboundedReceiver<ScriptedInvocationStarted>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptedInvocationControl {
+    commands: mpsc::UnboundedSender<ScriptedCommand>,
 }
 
 type CommandAcknowledgement = oneshot::Sender<Result<(), ScriptedAgentError>>;
 
 enum ScriptedCommand {
+    Start {
+        acknowledged: CommandAcknowledgement,
+    },
     Barrier {
         reached: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -102,7 +126,9 @@ pub(crate) enum ScriptedAgentError {
     AdapterStopped,
     BarrierAlreadyReleased,
     CompletionModeMismatch,
+    InvocationAlreadyStarted,
     InvocationCancelled,
+    InvocationNotStarted,
     ObservationSequenceExhausted,
     TerminalAlreadyReported,
     TerminalReceiverClosed,
@@ -113,15 +139,13 @@ pub(crate) enum ScriptedAgentError {
 
 impl ScriptedAgentAdapter {
     pub(crate) fn new() -> (Self, ScriptedAgentControl) {
-        let (command_sender, commands) = mpsc::unbounded_channel();
         let (started_sender, started) = mpsc::unbounded_channel();
         (
             Self {
-                commands: Arc::new(Mutex::new(Some(commands))),
                 started: started_sender,
             },
             ScriptedAgentControl {
-                commands: command_sender,
+                current: None,
                 started,
             },
         )
@@ -132,10 +156,59 @@ impl ScriptedAgentControl {
     pub(crate) async fn wait_until_started(
         &mut self,
     ) -> Result<ScriptedInvocationStarted, ScriptedAgentError> {
-        self.started
+        let started = self
+            .started
             .recv()
             .await
+            .ok_or(ScriptedAgentError::AdapterStopped)?;
+        self.current = Some(started.control.clone());
+        Ok(started)
+    }
+
+    fn current(&self) -> Result<&ScriptedInvocationControl, ScriptedAgentError> {
+        self.current
+            .as_ref()
             .ok_or(ScriptedAgentError::AdapterStopped)
+    }
+
+    pub(crate) async fn start(&self) -> Result<(), ScriptedAgentError> {
+        self.current()?.start().await
+    }
+
+    pub(crate) fn block(&self) -> Result<ScriptedBarrier, ScriptedAgentError> {
+        self.current()?.block()
+    }
+
+    pub(crate) async fn observe(
+        &self,
+        observation: AgentObservation,
+    ) -> Result<(), ScriptedAgentError> {
+        self.current()?.observe(observation).await
+    }
+
+    pub(crate) async fn propose(
+        &self,
+        value: ScriptedAgentValue,
+    ) -> Result<(), ScriptedAgentError> {
+        self.current()?.propose(value).await
+    }
+
+    pub(crate) async fn complete(&self) -> Result<(), ScriptedAgentError> {
+        self.current()?.complete().await
+    }
+
+    pub(crate) async fn fail(&self, cause: AgentFailureCause) -> Result<(), ScriptedAgentError> {
+        self.current()?.fail(cause).await
+    }
+}
+
+impl ScriptedInvocationControl {
+    pub(crate) async fn start(&self) -> Result<(), ScriptedAgentError> {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.commands
+            .send(ScriptedCommand::Start { acknowledged })
+            .map_err(|_| ScriptedAgentError::AdapterStopped)?;
+        receive_acknowledgement(acknowledgement).await
     }
 
     pub(crate) fn block(&self) -> Result<ScriptedBarrier, ScriptedAgentError> {
@@ -213,20 +286,16 @@ impl<Sink> AgentAdapter<Sink> for ScriptedAgentAdapter
 where
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = ();
-    type ProtocolLimits = ();
+    type NativeConfiguration = PiConfig;
+    type ProtocolLimits = PiJsonV1ProtocolLimits;
 
     async fn invoke(
         &self,
         invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
+        started: AgentStartCallback,
         terminal: AgentTerminalCallback,
     ) {
-        let Some(mut commands) = self.commands.lock().await.take() else {
-            let _ = terminal.report(AgentOutcome::Failed {
-                cause: AgentFailureCause::HarnessProtocolFailed,
-            });
-            return;
-        };
+        let (command_sender, mut commands) = mpsc::unbounded_channel();
         let mut cancellation = invocation.cancellation().subscribe();
         if let Some(reason) = *cancellation.borrow_and_update() {
             let _ = terminal.report(AgentOutcome::Cancelled { reason });
@@ -236,7 +305,12 @@ where
             .started
             .send(ScriptedInvocationStarted {
                 identity: invocation.identity().clone(),
+                message: Arc::from(invocation.prompt().message()),
+                attachments: Arc::from(invocation.attachments()),
                 value_kind: invocation.value_mode().kind(),
+                control: ScriptedInvocationControl {
+                    commands: command_sender,
+                },
             })
             .is_err()
         {
@@ -246,6 +320,7 @@ where
             return;
         }
 
+        let mut lifecycle_started = false;
         let mut provisional = None;
         loop {
             if let Some(reason) = invocation.cancellation().cancellation_reason() {
@@ -274,6 +349,17 @@ where
                         break;
                     };
                     match command {
+                        ScriptedCommand::Start { acknowledged } => {
+                            let result = if lifecycle_started {
+                                Err(ScriptedAgentError::InvocationAlreadyStarted)
+                            } else {
+                                started.report().map_err(ScriptedAgentError::from)
+                            };
+                            if result.is_ok() {
+                                lifecycle_started = true;
+                            }
+                            let _ = acknowledged.send(result);
+                        }
                         ScriptedCommand::Barrier { reached, release } => {
                             let _ = reached.send(());
                             let _ = release.await;
@@ -282,21 +368,35 @@ where
                             observation,
                             acknowledged,
                         } => {
-                            let result = invocation
-                                .observations()
-                                .emit(observation)
-                                .await
-                                .map_err(ScriptedAgentError::from);
+                            let result = if lifecycle_started {
+                                invocation
+                                    .observations()
+                                    .emit(observation)
+                                    .await
+                                    .map_err(ScriptedAgentError::from)
+                            } else {
+                                Err(ScriptedAgentError::InvocationNotStarted)
+                            };
                             let _ = acknowledged.send(result);
                         }
                         ScriptedCommand::Propose {
                             value,
                             acknowledged,
                         } => {
-                            let result = propose_value(&invocation, &mut provisional, value);
+                            let result = if lifecycle_started {
+                                propose_value(&invocation, &mut provisional, value)
+                            } else {
+                                Err(ScriptedAgentError::InvocationNotStarted)
+                            };
                             let _ = acknowledged.send(result);
                         }
                         ScriptedCommand::Complete { acknowledged } => {
+                            if !lifecycle_started {
+                                let _ = acknowledged.send(Err(
+                                    ScriptedAgentError::InvocationNotStarted,
+                                ));
+                                continue;
+                            }
                             let outcome = cancellation_outcome(&invocation).unwrap_or_else(|| {
                                 completed_outcome(&invocation, provisional.take())
                             });
@@ -327,7 +427,7 @@ where
 }
 
 fn propose_value<Sink>(
-    invocation: &AgentInvocation<(), (), Sink>,
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     provisional: &mut Option<CompletedAgentInvocation>,
     value: ScriptedAgentValue,
 ) -> Result<(), ScriptedAgentError>
@@ -372,7 +472,7 @@ where
 }
 
 fn completed_outcome<Sink>(
-    invocation: &AgentInvocation<(), (), Sink>,
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     provisional: Option<CompletedAgentInvocation>,
 ) -> AgentOutcome
 where
@@ -398,7 +498,9 @@ where
     }
 }
 
-fn cancellation_outcome<Sink>(invocation: &AgentInvocation<(), (), Sink>) -> Option<AgentOutcome>
+fn cancellation_outcome<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+) -> Option<AgentOutcome>
 where
     Sink: AgentObservationSink,
 {
@@ -412,6 +514,15 @@ impl From<AgentObservationEmissionError> for ScriptedAgentError {
     fn from(value: AgentObservationEmissionError) -> Self {
         match value {
             AgentObservationEmissionError::SequenceExhausted => Self::ObservationSequenceExhausted,
+        }
+    }
+}
+
+impl From<AgentStartReportError> for ScriptedAgentError {
+    fn from(value: AgentStartReportError) -> Self {
+        match value {
+            AgentStartReportError::AlreadyReported => Self::InvocationAlreadyStarted,
+            AgentStartReportError::ReceiverClosed => Self::AdapterStopped,
         }
     }
 }

@@ -9,6 +9,7 @@ use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
 use super::result_validation::{ResultSchemaSupportFailure, RetainedResultSchema};
+use super::schema_common::lowercase_hex;
 use super::validated::{RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow};
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use super::{DecodeFailureKind, decode, validation};
@@ -671,16 +672,6 @@ fn digest_too_large() -> ResolutionFailure {
         ResolutionFailureKind::DigestInputTooLarge,
         ResolutionLocation::ContentDigest,
     )
-}
-
-fn lowercase_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 #[cfg(test)]

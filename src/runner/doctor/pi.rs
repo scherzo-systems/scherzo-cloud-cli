@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use crate::execution::pi::{
-    PiIncompatibility, PiInstallationFailure, PiProbe, validate_pi_installation,
+    PI_JSON_V1_SUPPORTED_RANGE, PiIncompatibility, PiInstallationFailure, PiProbe,
+    validate_pi_installation,
 };
 
 pub(super) struct PiCheck {
@@ -54,6 +55,10 @@ impl DoctorCheck for PiCheck {
                         installation.profile().as_str().to_owned(),
                     ),
                     (
+                        "supportedRange".to_owned(),
+                        PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
+                    ),
+                    (
                         "version".to_owned(),
                         installation.version().as_str().to_owned(),
                     ),
@@ -81,13 +86,13 @@ fn failure_outcome(failure: PiInstallationFailure) -> Outcome {
     match failure {
         PiInstallationFailure::Missing => Outcome::fail(
             "missing_pi_installation",
-            "The configured Pi executable was not found; install Pi 0.82.1 or correct --pi-executable.",
-            BTreeMap::new(),
+            "The configured Pi executable was not found; install a stable Pi release in the supported range or correct --pi-executable.",
+            supported_range_details(),
         ),
         PiInstallationFailure::Unexecutable => Outcome::fail(
             "unexecutable_pi_installation",
             "The configured Pi executable could not complete its validation probes.",
-            BTreeMap::new(),
+            supported_range_details(),
         ),
         PiInstallationFailure::Malformed(probe) => {
             let (code, message) = match probe {
@@ -103,20 +108,45 @@ fn failure_outcome(failure: PiInstallationFailure) -> Outcome {
             Outcome::fail(
                 code,
                 message,
-                BTreeMap::from([("probe".to_owned(), probe.as_str().to_owned())]),
+                BTreeMap::from([
+                    (
+                        "supportedRange".to_owned(),
+                        PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
+                    ),
+                    ("probe".to_owned(), probe.as_str().to_owned()),
+                ]),
             )
         }
         PiInstallationFailure::Unsupported(PiIncompatibility::Version(version)) => Outcome::fail(
             "unsupported_pi_version",
-            "The configured Pi version is not supported; install Pi 0.82.1 exactly.",
-            BTreeMap::from([("version".to_owned(), version)]),
+            "The configured Pi version is not supported; install a stable Pi release in the supported range.",
+            BTreeMap::from([
+                (
+                    "supportedRange".to_owned(),
+                    PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
+                ),
+                ("version".to_owned(), version),
+            ]),
         ),
         PiInstallationFailure::Unsupported(PiIncompatibility::Capability(capability)) => {
             Outcome::fail(
                 "unsupported_pi_capability",
                 "The configured Pi executable does not provide every capability required by PiJsonV1.",
-                BTreeMap::from([("capability".to_owned(), capability.as_str().to_owned())]),
+                BTreeMap::from([
+                    (
+                        "supportedRange".to_owned(),
+                        PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
+                    ),
+                    ("capability".to_owned(), capability.as_str().to_owned()),
+                ]),
             )
         }
     }
+}
+
+fn supported_range_details() -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "supportedRange".to_owned(),
+        PI_JSON_V1_SUPPORTED_RANGE.to_owned(),
+    )])
 }

@@ -15,13 +15,18 @@ use crate::execution::workflow::admission::{
     ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::artifact::ArtifactStaging;
-use crate::execution::workflow::observation::{SourceSequence, TransitionObservation};
+use crate::execution::workflow::observation::{
+    CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource, SourceSequence,
+    TransitionObservation,
+};
 use crate::execution::workflow::publication::{
     WorkflowRunCancellation, WorkflowRunTiming, WorkflowStepTiming, publish_workflow_result,
 };
 use crate::execution::workflow::resolution::{self, WorkflowContentDigest};
 use crate::execution::workflow::runtime::{ActionId, StepFailure, TransitionSequence};
 use crate::execution::workflow::value::CapturedValue;
+
+const TEST_CHILD_FRAGMENT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Default)]
 struct SharedWriter {
@@ -162,6 +167,7 @@ fn capabilities(
     no_color: Option<&str>,
 ) -> TerminalCapabilities {
     TerminalCapabilities {
+        stdin_is_terminal: stdout,
         stdout_is_terminal: stdout,
         stderr_is_terminal: stderr,
         stdout_width: None,
@@ -176,6 +182,7 @@ fn config(mode: RequestedPresentationMode, color: ColorChoice) -> PresentationCo
         requested_mode: mode,
         color,
         capabilities: capabilities(false, false, Some("xterm-256color"), None),
+        standard_input_reserved: false,
     }
 }
 
@@ -239,6 +246,8 @@ impl Fixture {
     fn succeeded_run(&self) -> WorkflowRunResult {
         let started_at = timestamp("2026-08-02T12:01:44Z");
         WorkflowRunResult {
+            run_directory: self.result_parent.clone(),
+            attempt_number: 1,
             workflow_path: "workflow.yaml".to_owned(),
             source_root: self.source_root.clone(),
             content_digest: self.digest.clone(),
@@ -367,6 +376,71 @@ fn step_transition(
 }
 
 #[test]
+fn automatic_tui_requires_usable_unreserved_input_and_output_terminals() {
+    for (stdin, stdout, term, reserved, expected) in [
+        (
+            true,
+            true,
+            Some("xterm-256color"),
+            false,
+            PresentationMode::Tui,
+        ),
+        (
+            false,
+            true,
+            Some("xterm-256color"),
+            false,
+            PresentationMode::Plain,
+        ),
+        (
+            true,
+            false,
+            Some("xterm-256color"),
+            false,
+            PresentationMode::Plain,
+        ),
+        (true, true, None, false, PresentationMode::Plain),
+        (true, true, Some(""), false, PresentationMode::Plain),
+        (true, true, Some("dumb"), false, PresentationMode::Plain),
+        (
+            true,
+            true,
+            Some("xterm-256color"),
+            true,
+            PresentationMode::Plain,
+        ),
+    ] {
+        let mut terminal = capabilities(stdout, false, term, None);
+        terminal.stdin_is_terminal = stdin;
+        let selected = PresentationConfig {
+            requested_mode: RequestedPresentationMode::Automatic,
+            color: ColorChoice::Auto,
+            capabilities: terminal,
+            standard_input_reserved: reserved,
+        };
+        assert_eq!(selected.mode(), expected);
+    }
+
+    let mut terminal = capabilities(true, true, Some("xterm"), None);
+    terminal.stdin_is_terminal = true;
+    for (requested_mode, expected) in [
+        (RequestedPresentationMode::Plain, PresentationMode::Plain),
+        (RequestedPresentationMode::Json, PresentationMode::Json),
+    ] {
+        assert_eq!(
+            PresentationConfig {
+                requested_mode,
+                color: ColorChoice::Auto,
+                capabilities: terminal.clone(),
+                standard_input_reserved: false,
+            }
+            .mode(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn color_selection_uses_the_human_destination_and_environment_matrix() {
     for (mode, stdout_terminal, stderr_terminal, expected) in [
         (RequestedPresentationMode::Automatic, true, false, true),
@@ -383,6 +457,7 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
                 Some("xterm-256color"),
                 None,
             ),
+            standard_input_reserved: false,
         };
         assert_eq!(selected.color_enabled(), expected);
     }
@@ -392,6 +467,7 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
             requested_mode: RequestedPresentationMode::Plain,
             color: ColorChoice::Auto,
             capabilities: capabilities(true, true, term, None),
+            standard_input_reserved: false,
         };
         assert!(!selected.color_enabled());
     }
@@ -399,6 +475,7 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
         requested_mode: RequestedPresentationMode::Plain,
         color: ColorChoice::Auto,
         capabilities: capabilities(true, true, Some("xterm"), Some("1")),
+        standard_input_reserved: false,
     };
     assert!(!no_color.color_enabled());
     assert!(
@@ -415,70 +492,6 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
         }
         .color_enabled()
     );
-}
-
-#[test]
-fn child_normalization_preserves_framing_and_exposes_untrusted_bytes() {
-    let mut stream = ChildStream::default();
-    let mut records = stream
-        .push(b"a\r\n\rB\rC\tD\x1b[31mred\x1b[0m\x1b]title\x07\x1bPsecret\x1b\\\x1b7\xff\xe2");
-    records.extend(stream.push(b"\x80\xae\x1b]incomplete"));
-    records.extend(stream.close());
-    let payloads = records
-        .iter()
-        .map(|record| record.payload.as_str())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        payloads,
-        ["a", "", "B", "C       Dred\\xff\\u{202e}\\x1b]incomplete",]
-    );
-    assert!(
-        records
-            .iter()
-            .all(|record| !record.payload.contains('\u{1b}'))
-    );
-}
-
-#[test]
-fn child_normalization_resets_utf8_after_abandoning_a_control_candidate() {
-    let mut stream = ChildStream::default();
-    let mut records = stream.push(b"\x1b[\xc2\xa2");
-    records.extend(stream.close());
-
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload, "\\x1b[\\xc2\\xa2");
-}
-
-#[test]
-fn child_normalization_bounds_long_lines_and_control_candidates() {
-    let long = vec![b'x'; CHILD_FRAGMENT_BYTES + 19];
-    let mut stream = ChildStream::default();
-    let mut records = stream.push(&long);
-    records.extend(stream.close());
-    assert_eq!(records.len(), 2);
-    assert!(!records[0].continuation);
-    assert!(records[1].continuation);
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.payload.as_str())
-            .collect::<String>(),
-        String::from_utf8(long).unwrap()
-    );
-
-    let mut candidate = Vec::from(b"\x1b]".as_slice());
-    candidate.extend(std::iter::repeat_n(b'a', CONTROL_SEQUENCE_BYTES - 2));
-    candidate.push(b'z');
-    let mut stream = ChildStream::default();
-    let mut records = stream.push(&candidate);
-    records.extend(stream.close());
-    let exposed = records
-        .iter()
-        .map(|record| record.payload.as_str())
-        .collect::<String>();
-    assert!(exposed.starts_with("\\x1b]"));
-    assert!(exposed.ends_with('z'));
 }
 
 #[test]
@@ -775,7 +788,7 @@ async fn safety_fragmentation_keeps_its_own_prefixed_records_when_redirected() {
                 invocation: action(),
                 source: CommandOutputSource::StandardOutput,
                 sequence: SourceSequence::first(),
-                bytes: Arc::from(vec![b'x'; CHILD_FRAGMENT_BYTES + 1]),
+                bytes: Arc::from(vec![b'x'; TEST_CHILD_FRAGMENT_BYTES + 1]),
             },
         ))
         .await;
@@ -946,8 +959,8 @@ steps:
     assert_eq!(summary_detail, "result captured · 1 output");
 }
 
-#[test]
-fn plain_and_json_route_complete_summaries_and_terminal_json() {
+#[tokio::test]
+async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     let fixture = Fixture::new(workflow_source());
     let run = fixture.succeeded_run();
     let plain_terminal =
@@ -968,6 +981,20 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
     .unwrap();
+    plain
+        .observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    plain
+        .observe(ExecutionObservation::<OffsetDateTime>::CommandOutput(
+            CommandOutputObservation {
+                step: "a".to_owned(),
+                invocation: action(),
+                source: CommandOutputSource::StandardOutput,
+                sequence: SourceSequence::first(),
+                bytes: Arc::from(b"plain child\n".as_slice()),
+            },
+        ))
+        .await;
     assert!(matches!(
         plain.finish(&run, PublicationPresentation::Published(&plain_terminal)),
         WorkflowRunPresentationResult::Published { exit_status: 0, .. }
@@ -986,12 +1013,25 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
     .unwrap();
+    json.observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    json.observe(ExecutionObservation::<OffsetDateTime>::CommandOutput(
+        CommandOutputObservation {
+            step: "a".to_owned(),
+            invocation: action(),
+            source: CommandOutputSource::StandardOutput,
+            sequence: SourceSequence::first(),
+            bytes: Arc::from(b"json child\n".as_slice()),
+        },
+    ))
+    .await;
     assert!(matches!(
         json.finish(&run, PublicationPresentation::Published(&json_terminal)),
         WorkflowRunPresentationResult::Published { exit_status: 0, .. }
     ));
 
     let plain_view = plain_stdout.text();
+    assert!(plain_view.contains("a          stdout      plain child"));
     assert!(plain_view.contains("── summary ─"));
     assert!(plain_view.contains("step  kind  state"));
     assert!(plain_view.find("a     cmd").unwrap() < plain_view.find("b     cmd").unwrap());
@@ -1003,6 +1043,7 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
     assert!(plain_stderr.text().is_empty());
 
     let json_view = json_stderr.text();
+    assert!(json_view.contains("a          stdout      json child"));
     assert!(json_view.contains("step  kind  state"));
     assert!(json_view.contains("succeeded · exit 0 · 3 succeeded · 1.2s total"));
     let terminal_bytes = json_stdout.text();
@@ -1055,6 +1096,40 @@ fn plain_and_json_route_complete_summaries_and_terminal_json() {
             .text()
             .contains(cleanup_terminal.result_directory())
     );
+}
+
+#[test]
+fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
+    let fixture = Fixture::new(workflow_source());
+    let run = fixture.succeeded_run();
+    let terminal = publish_workflow_result(
+        &fixture.destination("tui-summary"),
+        &fixture.artifacts,
+        &run,
+    )
+    .unwrap();
+    let stdout = SharedWriter::default();
+    let mut tui_config = config(RequestedPresentationMode::Automatic, ColorChoice::Never);
+    tui_config.capabilities.stdin_is_terminal = true;
+    tui_config.capabilities.stdout_is_terminal = true;
+    assert_eq!(tui_config.mode(), PresentationMode::Tui);
+
+    let presented = WorkflowRunOutput::new(tui_config, stdout.clone(), SharedWriter::default())
+        .render_standard_summary(
+            &fixture.workflow,
+            &run,
+            PublicationPresentation::Published(&terminal),
+        );
+
+    assert!(matches!(
+        presented,
+        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+    ));
+    let summary = stdout.text();
+    assert!(summary.starts_with("\n── summary ─"));
+    assert!(summary.contains("step  kind  state"));
+    assert!(summary.contains("succeeded · exit 0 · 3 succeeded"));
+    assert!(!summary.contains("started 2026"));
 }
 
 #[test]

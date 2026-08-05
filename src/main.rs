@@ -27,6 +27,9 @@ use std::env;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if execution::workflow::child_guard::internal_worker_requested() {
+        return execution::workflow::child_guard::run_internal_worker();
+    }
     if execution::workflow::result_validation::internal_worker_requested() {
         return execution::workflow::result_validation::run_internal_worker();
     }

@@ -141,6 +141,29 @@ impl StepDiagnosticLog {
         }
     }
 
+    pub(super) fn start_standard_error_capture<Deadline, Observer, StandardError>(
+        &self,
+        step: String,
+        invocation: ActionId,
+        maximum_stream_bytes: NonZeroU64,
+        standard_error: StandardError,
+        observer: Observer,
+    ) -> PendingStepDiagnostic
+    where
+        Deadline: Send + 'static,
+        Observer: ExecutionObserver<Deadline>,
+        StandardError: AsyncRead + Unpin + Send + 'static,
+    {
+        self.start_capture::<Deadline, _, _, _>(
+            step,
+            invocation,
+            maximum_stream_bytes,
+            tokio::io::empty(),
+            standard_error,
+            observer,
+        )
+    }
+
     pub(super) fn record(
         &self,
         step: String,
@@ -203,6 +226,11 @@ pub(super) struct PendingStepDiagnostic {
 }
 
 impl PendingStepDiagnostic {
+    pub(super) fn abort(&self) {
+        self.standard_output.abort();
+        self.standard_error.abort();
+    }
+
     pub(super) async fn finish(self) {
         let (standard_output, standard_error) =
             tokio::join!(self.standard_output, self.standard_error);

@@ -199,6 +199,7 @@ mod tests {
             "version",
             "workflow",
             "workflow run",
+            "workflow status",
             "workflow validate",
         ];
 
@@ -214,7 +215,9 @@ mod tests {
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
         assert!(help.contains("runner        Run and manage the Scherzo Cloud runner"));
-        assert!(help.contains("workflow      Validate and run local Workflow V1 definitions"));
+        assert!(
+            help.contains("workflow      Validate, run, and inspect local Workflow V1 definitions")
+        );
         assert!(!help.contains("--allow-insecure-http"));
     }
 
@@ -278,13 +281,16 @@ mod tests {
 
         assert!(help.contains("run       Execute a local command-only Workflow V1 bundle"));
         assert!(
+            help.contains("status    Inspect one durable local workflow run without changing it")
+        );
+        assert!(
             help.contains("validate  Validate a local Workflow V1 bundle without executing it")
         );
         let run = command_help(&["workflow", "run"]);
         for option in [
             "--source-root <ROOT>",
             "--execution-root <PATH>",
-            "--result-dir <PATH>",
+            "--run-dir <PATH>",
             "--prompt-file <PATH|->",
             "--attachment <MEDIA_TYPE> <PATH>",
             "--max-parallel <COUNT>",
@@ -295,6 +301,20 @@ mod tests {
         ] {
             assert!(run.contains(option), "run help should contain {option}");
         }
+        let status = command_help(&["workflow", "status"]);
+        for option in [
+            "--run-dir <PATH>",
+            "--plain",
+            "--json",
+            "--color <auto|always|never>",
+        ] {
+            assert!(
+                status.contains(option),
+                "status help should contain {option}"
+            );
+        }
+        assert!(!status.contains("--source-root"));
+        assert!(!status.contains("--execution-root"));
         assert!(validate.contains("--source-root <ROOT>"));
         assert!(validate.contains("<WORKFLOW_PATH>"));
         assert!(validate.contains("--json"));

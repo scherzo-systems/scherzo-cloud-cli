@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::future::Future;
+use std::convert::Infallible;
+use std::future::{Future, ready};
 
 use super::admission::AdmittedWorkflow;
 use super::artifact::ArtifactStaging;
@@ -9,11 +10,15 @@ use super::input::InputStaging;
 use super::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
 };
+use super::process_group::ProcessGuardRegistry;
 use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
 use super::runtime::{
     ExportSet, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
-use super::step_runtime::{StepFailureCause, execute_workflow_observed};
+use super::step_runtime::{
+    AgentExecution, StepFailureCause, WorkflowAgentAdapter, WorkflowCommitPort,
+    execute_workflow_observed,
+};
 use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,25 +30,43 @@ pub(crate) struct WorkflowExecutionResult {
     pub(crate) content_digest: WorkflowContentDigest,
 }
 
-#[derive(Clone)]
-struct ObserverCommitPort<Observer> {
+pub(crate) struct NoopCommitPort;
+
+impl<Commit> CommitPort<Commit> for NoopCommitPort {
+    type Error = Infallible;
+
+    fn commit(&mut self, _commit: Commit) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+}
+
+struct DurableObserverCommitPort<Commits, Observer> {
+    commits: Commits,
     observer: Observer,
 }
 
-impl<Deadline, Observer> CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>
-    for ObserverCommitPort<Observer>
+impl<Deadline, Commits, Observer>
+    CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>
+    for DurableObserverCommitPort<Commits, Observer>
 where
-    Deadline: Send + 'static,
+    Deadline: Clone + Send + 'static,
+    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>,
     Observer: ExecutionObserver<Deadline>,
 {
+    type Error = Commits::Error;
+
     fn commit(
         &mut self,
         commit: CommittedReduction<StepFailureCause, CapturedValue, Deadline>,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        let state = commit.state.clone();
+        let events = commit.events.clone();
+        let committed = self.commits.commit(commit);
         let observer = self.observer.clone();
         async move {
-            for event in commit.events {
-                let step = observed_step_transition(&event, &commit.state);
+            committed.await?;
+            for event in events {
+                let step = observed_step_transition(&event, &state);
                 observer
                     .observe(ExecutionObservation::Transition(TransitionObservation {
                         event,
@@ -51,6 +74,7 @@ where
                     }))
                     .await;
             }
+            Ok(())
         }
     }
 }
@@ -93,17 +117,31 @@ fn observed_step_transition<Deadline>(
     }
 }
 
-pub(crate) async fn execute_workflow<Clock, Observer>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the local adapter additionally supplies durable process-guard registration"
+)]
+pub(crate) async fn execute_workflow<Clock, Commits, Observer, Adapter>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,
     inputs: &InputStaging,
     diagnostics: &StepDiagnosticLog,
+    agents: AgentExecution<Adapter>,
     clock: Clock,
+    commits: Commits,
     observer: Observer,
+    process_guards: ProcessGuardRegistry,
 ) -> Result<WorkflowExecutionResult, CoordinationError>
+// This result projection intentionally repeats the shared runtime's generic port
+// constraints so it can preserve its distinct domain result.
+// jscpd:ignore-start
 where
     Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
+    Adapter: WorkflowAgentAdapter<Clock::Instant, Observer>,
+    // jscpd:ignore-end
 {
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
@@ -113,10 +151,13 @@ where
         inputs,
         diagnostics,
         clock,
-        ObserverCommitPort {
+        DurableObserverCommitPort {
+            commits,
             observer: observer.clone(),
         },
         observer,
+        agents,
+        process_guards,
     )
     .await?;
     let outcome = match coordinated.state.workflow {

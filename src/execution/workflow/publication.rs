@@ -12,28 +12,28 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ring::digest::{Context as DigestContext, SHA256};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, openat, renameat_with,
-    statat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, openat, renameat_with, statat,
+    unlinkat,
 };
 use rustix::io::Errno;
-use serde::Serialize;
-use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, UtcOffset};
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind};
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::execution_root::open_directory;
 use super::input::InputPreparationFailureKind;
+use super::private_staging::{directory_entry_names, same_file};
 use super::resolution::WorkflowContentDigest;
 use super::runtime::{
     ExportSet, ExportUnavailableReason, ExportValue, FailurePhase, NotRunReason, RunOutcome,
     StepFailure, StepState,
 };
+use super::schema_common::{lowercase_hex, utc_timestamp};
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
-    StepBodyKind, StepExecutionFailure, StepFailureCause, StepStartFailure,
-    WorkingDirectoryFailure,
+    StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
 use super::value::CapturedValue;
 
@@ -72,6 +72,8 @@ pub(crate) struct WorkflowRunStep {
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkflowRunResult {
+    pub(crate) run_directory: PathBuf,
+    pub(crate) attempt_number: u64,
     pub(crate) workflow_path: String,
     pub(crate) source_root: PathBuf,
     pub(crate) content_digest: WorkflowContentDigest,
@@ -90,6 +92,7 @@ pub(crate) enum LocalPublicationPhase {
     Staging,
     ExportCopy,
     Serialization,
+    Close,
     Verification,
     Commit,
 }
@@ -181,6 +184,8 @@ pub(crate) struct WorkflowRunTerminalResultV1 {
     command: &'static str,
     outcome: WorkflowOutcomeV1,
     exit_status: u16,
+    run_directory: String,
+    attempt_number: u64,
     result_directory: String,
     result: WorkflowResultV1,
 }
@@ -192,6 +197,14 @@ impl WorkflowRunTerminalResultV1 {
 
     pub(crate) fn exit_status(&self) -> u16 {
         self.exit_status
+    }
+
+    pub(crate) fn run_directory(&self) -> &str {
+        &self.run_directory
+    }
+
+    pub(crate) fn attempt_number(&self) -> u64 {
+        self.attempt_number
     }
 
     pub(crate) fn result_directory(&self) -> &str {
@@ -207,7 +220,7 @@ impl WorkflowRunTerminalResultV1 {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkflowResultV1 {
     schema_version: u8,
-    command: &'static str,
+    attempt_number: u64,
     workflow: WorkflowIdentityV1,
     execution: WorkflowExecutionV1,
     command_output_policy: CommandOutputPolicyV1,
@@ -264,9 +277,9 @@ struct CancellationV1 {
     force_stop_deadline: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum CancellationReasonV1 {
+pub(super) enum CancellationReasonV1 {
     UserRequest,
     TerminationRequest,
     CallerOutputFailure,
@@ -450,7 +463,16 @@ impl PreparedResultDestination {
 pub(crate) fn prepare_result_destination(
     destination: &Path,
 ) -> Result<PreparedResultDestination, LocalPublicationError> {
-    PublicationTarget::validate(destination).map(|target| PreparedResultDestination { target })
+    PublicationTarget::validate(destination, None)
+        .map(|target| PreparedResultDestination { target })
+}
+
+pub(crate) fn prepare_attempt_result_destination(
+    destination: &Path,
+    private_staging: &Path,
+) -> Result<PreparedResultDestination, LocalPublicationError> {
+    PublicationTarget::validate(destination, Some(private_staging))
+        .map(|target| PreparedResultDestination { target })
 }
 
 pub(crate) fn publish_prepared_workflow_result(
@@ -569,7 +591,7 @@ fn publish_prepared_with_observer(
                     )
                     .map_err(|_| {
                         LocalPublicationError::for_export(
-                            LocalPublicationPhase::ExportCopy,
+                            LocalPublicationPhase::Close,
                             LocalPublicationFailureKind::ExportWriteUnavailable,
                             name,
                         )
@@ -584,7 +606,7 @@ fn publish_prepared_with_observer(
                         size_bytes: copied,
                         digest: DigestV1 {
                             algorithm: "sha256",
-                            value: hex_digest(digest.finish().as_ref()),
+                            value: lowercase_hex(digest.finish().as_ref()),
                         },
                     },
                 );
@@ -629,7 +651,7 @@ fn publish_prepared_with_observer(
         .close_staged_file(result_file, &StagedFile::Result)
         .map_err(|_| {
             LocalPublicationError::new(
-                LocalPublicationPhase::Serialization,
+                LocalPublicationPhase::Close,
                 LocalPublicationFailureKind::SerializationUnavailable,
             )
         })?;
@@ -663,6 +685,8 @@ fn publish_prepared_with_observer(
         command: COMMAND,
         outcome,
         exit_status: exit_status(run, outcome),
+        run_directory: retained_path(&run.run_directory)?,
+        attempt_number: run.attempt_number,
         result_directory: target.normalized.clone(),
         result,
     };
@@ -732,9 +756,12 @@ fn build_result(
         .map(step_v1)
         .collect::<Result<Vec<_>, _>>()?;
 
+    if run.attempt_number == 0 {
+        return Err(invalid_run_result());
+    }
     Ok(WorkflowResultV1 {
         schema_version: 1,
-        command: COMMAND,
+        attempt_number: run.attempt_number,
         workflow: WorkflowIdentityV1 {
             path: run.workflow_path.clone(),
             provenance: WorkflowProvenanceV1 {
@@ -886,7 +913,7 @@ fn failure_v1(
             (FailurePhaseV1::Start, start_failure_cause(cause)?)
         }
         (FailurePhase::Execution, StepFailureCause::Execution(cause)) => {
-            (FailurePhaseV1::Execution, execution_failure_cause(*cause))
+            (FailurePhaseV1::Execution, execution_failure_cause(cause))
         }
         (FailurePhase::OutputCapture, StepFailureCause::OutputCapture(cause)) => (
             FailurePhaseV1::OutputCapture,
@@ -925,6 +952,10 @@ fn start_failure_cause(
             cause.collection_index = failure.collection_index();
             cause
         }
+        StepStartFailure::AgentInput(_) | StepStartFailure::AgentRuntimeUnavailable => {
+            return Err(invalid_run_result());
+        }
+        StepStartFailure::Agent(failure) => FailureCauseV1::code(failure.code()),
         StepStartFailure::OutputsUnsupported => FailureCauseV1::code("outputs_unsupported"),
         StepStartFailure::WorkingDirectory(failure) => FailureCauseV1::code(match failure {
             WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
@@ -932,9 +963,6 @@ fn start_failure_cause(
             WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
             WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",
         }),
-        StepStartFailure::UnsupportedBody(StepBodyKind::Command | StepBodyKind::Agent) => {
-            return Err(invalid_run_result());
-        }
         StepStartFailure::CommandPreparation(failure) => FailureCauseV1::code(match failure {
             CommandPreparationFailure::InvalidArgv => "command_argv_invalid",
             CommandPreparationFailure::PathNotConfigured => "command_path_unconfigured",
@@ -951,16 +979,17 @@ fn start_failure_cause(
     Ok(cause)
 }
 
-fn execution_failure_cause(failure: StepExecutionFailure) -> FailureCauseV1 {
+fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
     match failure {
         StepExecutionFailure::Command(CommandExecutionFailure::UnsuccessfulExit { code }) => {
             let mut cause = FailureCauseV1::code("command_exit");
-            cause.exit_code = code;
+            cause.exit_code = *code;
             cause
         }
         StepExecutionFailure::Command(CommandExecutionFailure::Wait) => {
             FailureCauseV1::code("command_wait_failed")
         }
+        StepExecutionFailure::Agent(failure) => FailureCauseV1::code(failure.code()),
     }
 }
 
@@ -1001,10 +1030,7 @@ fn retained_path(path: &Path) -> Result<String, LocalPublicationError> {
 }
 
 fn timestamp(value: OffsetDateTime) -> Result<String, LocalPublicationError> {
-    value
-        .to_offset(UtcOffset::UTC)
-        .format(&Rfc3339)
-        .map_err(|_| invalid_run_result())
+    utc_timestamp(value).map_err(|_| invalid_run_result())
 }
 
 fn duration_milliseconds(duration: Duration) -> Result<u64, LocalPublicationError> {
@@ -1018,7 +1044,7 @@ fn invalid_run_result() -> LocalPublicationError {
     )
 }
 
-fn cancellation_reason(reason: CancellationReason) -> CancellationReasonV1 {
+pub(super) fn cancellation_reason(reason: CancellationReason) -> CancellationReasonV1 {
     match reason {
         CancellationReason::UserRequest => CancellationReasonV1::UserRequest,
         CancellationReason::TerminationRequest => CancellationReasonV1::TerminationRequest,
@@ -1072,16 +1098,6 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
     }
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 struct HashingWriter<'a> {
     destination: &'a mut File,
     digest: &'a mut DigestContext,
@@ -1102,12 +1118,16 @@ impl Write for HashingWriter<'_> {
 struct PublicationTarget {
     supplied_parent: PathBuf,
     parent: OwnedFd,
+    staging_parent: OwnedFd,
     name: OsString,
     normalized: String,
 }
 
 impl PublicationTarget {
-    fn validate(destination: &Path) -> Result<Self, LocalPublicationError> {
+    fn validate(
+        destination: &Path,
+        private_staging: Option<&Path>,
+    ) -> Result<Self, LocalPublicationError> {
         let name = destination.file_name().ok_or_else(|| {
             LocalPublicationError::new(
                 LocalPublicationPhase::TargetValidation,
@@ -1161,10 +1181,33 @@ impl PublicationTarget {
                     LocalPublicationFailureKind::InvalidResultPath,
                 )
             })?;
-        verify_publication_capability(&parent)?;
+        let staging_parent = match private_staging {
+            Some(path) => {
+                let canonical = std::fs::canonicalize(path).map_err(|_| {
+                    LocalPublicationError::new(
+                        LocalPublicationPhase::TargetValidation,
+                        LocalPublicationFailureKind::ParentUnavailable,
+                    )
+                })?;
+                open_directory(&canonical).map_err(|_| {
+                    LocalPublicationError::new(
+                        LocalPublicationPhase::TargetValidation,
+                        LocalPublicationFailureKind::ParentUnavailable,
+                    )
+                })?
+            }
+            None => rustix::io::dup(&parent).map_err(|_| {
+                LocalPublicationError::new(
+                    LocalPublicationPhase::TargetValidation,
+                    LocalPublicationFailureKind::ParentUnavailable,
+                )
+            })?,
+        };
+        verify_publication_capability(&staging_parent, &parent)?;
         Ok(Self {
             supplied_parent,
             parent,
+            staging_parent,
             name: name.to_owned(),
             normalized,
         })
@@ -1211,9 +1254,9 @@ struct StagingDirectory<'a> {
 
 impl<'a> StagingDirectory<'a> {
     fn create(target: &'a PublicationTarget) -> Result<Self, LocalPublicationError> {
-        let (identity, root) = create_staging_root(&target.parent)?;
+        let (identity, root) = create_staging_root(&target.staging_parent)?;
         let mut staging = Self {
-            parent: &target.parent,
+            parent: &target.staging_parent,
             identity,
             root,
             exports: None,
@@ -1338,7 +1381,7 @@ impl<'a> StagingDirectory<'a> {
         renameat_with(
             self.parent,
             &self.identity,
-            self.parent,
+            &target.parent,
             &target.name,
             RenameFlags::NOREPLACE,
         )
@@ -1386,22 +1429,25 @@ impl Drop for StagingDirectory<'_> {
     }
 }
 
-fn verify_publication_capability(parent: &OwnedFd) -> Result<(), LocalPublicationError> {
-    let source = create_validation_directory(parent)?;
+fn verify_publication_capability(
+    staging_parent: &OwnedFd,
+    target_parent: &OwnedFd,
+) -> Result<(), LocalPublicationError> {
+    let source = create_validation_directory(staging_parent)?;
     for _ in 0..STAGING_ATTEMPTS {
         let destination = format!(
             ".result-preflight-{}",
             ulid::Ulid::generate().to_string().to_ascii_lowercase()
         );
         match renameat_with(
-            parent,
+            staging_parent,
             &source,
-            parent,
+            target_parent,
             &destination,
             RenameFlags::NOREPLACE,
         ) {
             Ok(()) => {
-                return unlinkat(parent, destination, AtFlags::REMOVEDIR).map_err(|_| {
+                return unlinkat(target_parent, destination, AtFlags::REMOVEDIR).map_err(|_| {
                     LocalPublicationError::new(
                         LocalPublicationPhase::TargetValidation,
                         LocalPublicationFailureKind::ParentUnavailable,
@@ -1410,7 +1456,7 @@ fn verify_publication_capability(parent: &OwnedFd) -> Result<(), LocalPublicatio
             }
             Err(Errno::EXIST | Errno::NOTEMPTY) => {}
             Err(_) => {
-                let _ = unlinkat(parent, &source, AtFlags::REMOVEDIR);
+                let _ = unlinkat(staging_parent, &source, AtFlags::REMOVEDIR);
                 return Err(LocalPublicationError::new(
                     LocalPublicationPhase::TargetValidation,
                     LocalPublicationFailureKind::AtomicPublicationUnavailable,
@@ -1418,7 +1464,7 @@ fn verify_publication_capability(parent: &OwnedFd) -> Result<(), LocalPublicatio
             }
         }
     }
-    let _ = unlinkat(parent, source, AtFlags::REMOVEDIR);
+    let _ = unlinkat(staging_parent, source, AtFlags::REMOVEDIR);
     Err(LocalPublicationError::new(
         LocalPublicationPhase::TargetValidation,
         LocalPublicationFailureKind::AtomicPublicationUnavailable,
@@ -1492,15 +1538,7 @@ fn close_file(file: File) -> io::Result<()> {
 }
 
 fn directory_entries(directory: &OwnedFd) -> Result<BTreeSet<Vec<u8>>, Errno> {
-    let mut entries = BTreeSet::new();
-    for entry in Dir::read_from(directory)? {
-        let entry = entry?;
-        let name = entry.file_name().to_bytes();
-        if name != b"." && name != b".." {
-            entries.insert(name.to_vec());
-        }
-    }
-    Ok(entries)
+    directory_entry_names(directory)
 }
 
 fn ensure_absent(parent: &OwnedFd, name: &OsStr) -> Result<(), LocalPublicationFailureKind> {
@@ -1509,12 +1547,6 @@ fn ensure_absent(parent: &OwnedFd, name: &OsStr) -> Result<(), LocalPublicationF
         Err(Errno::NOENT) => Ok(()),
         Err(_) => Err(LocalPublicationFailureKind::ParentUnavailable),
     }
-}
-
-fn same_file(left: &OwnedFd, right: &OwnedFd) -> Result<bool, Errno> {
-    let left = fstat(left)?;
-    let right = fstat(right)?;
-    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
 }
 
 #[cfg(test)]

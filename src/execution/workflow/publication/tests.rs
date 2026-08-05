@@ -150,6 +150,8 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
         ),
     ]);
     WorkflowRunResult {
+        run_directory: fixture.results_parent.clone(),
+        attempt_number: 1,
         workflow_path: "workflow.yaml".to_owned(),
         source_root: fixture.source_root.clone(),
         content_digest: fixture.content_digest.clone(),
@@ -309,7 +311,7 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
         assert_eq!(result_value["exports"]["reportA"]["sizeBytes"], 18);
         assert_eq!(
             result_value["exports"]["reportA"]["digest"]["value"],
-            hex_digest(ring::digest::digest(&SHA256, b"upper report bytes").as_ref())
+            lowercase_hex(ring::digest::digest(&SHA256, b"upper report bytes").as_ref())
         );
         assert_eq!(
             result_value["steps"][0]["commandOutput"]["stdout"]["data"],
@@ -494,7 +496,7 @@ impl PublicationObserver for CloseFailureObserver {
 }
 
 #[test]
-fn export_and_result_close_failures_remove_private_staging() {
+fn close_failures_retain_a_distinct_publication_phase_and_remove_staging() {
     let fixture = PublicationFixture::new();
     let run = run_fixture(&fixture);
 
@@ -502,14 +504,14 @@ fn export_and_result_close_failures_remove_private_staging() {
         (
             "export-close-failure",
             InjectedCloseFailure::Export,
-            LocalPublicationPhase::ExportCopy,
+            LocalPublicationPhase::Close,
             LocalPublicationFailureKind::ExportWriteUnavailable,
             Some("reportA"),
         ),
         (
             "result-close-failure",
             InjectedCloseFailure::Result,
-            LocalPublicationPhase::Serialization,
+            LocalPublicationPhase::Close,
             LocalPublicationFailureKind::SerializationUnavailable,
             None,
         ),

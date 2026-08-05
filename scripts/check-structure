@@ -12,6 +12,7 @@ required_files=(
   LICENSE
   changes/README.md
   release.toml
+  schemas/workflow-status-result-v1.schema.json
   schemas/workflow-v1.schema.json
   .github/workflows/check.yml
   Cargo.toml

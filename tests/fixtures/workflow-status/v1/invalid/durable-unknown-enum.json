@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow status",
+  "outcome": "status",
+  "exitStatus": 0,
+  "runDirectory": "/tmp/runs/example",
+  "run": {
+    "schemaVersion": 1,
+    "localRunId": "52a51f00-96f1-4d6a-aa28-43f0cce8d16f",
+    "createdAt": "2026-08-03T12:00:00Z",
+    "workflowDigest": {
+      "algorithm": "sha256",
+      "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "workflowManifestDigest": {
+      "algorithm": "sha256",
+      "value": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    }
+  },
+  "state": {
+    "schemaVersion": 1,
+    "localRunId": "52a51f00-96f1-4d6a-aa28-43f0cce8d16f",
+    "revision": 3,
+    "currentAttemptNumber": 1,
+    "attempts": [
+      {
+        "attemptId": "f77ecf09-28cd-435f-a567-82f0e59876b4",
+        "attemptNumber": 1,
+        "trigger": "initial",
+        "state": "future_state",
+        "executionRoot": "/tmp/execution",
+        "createdAt": "2026-08-03T12:00:00Z",
+        "settledAt": "2026-08-03T12:00:01Z",
+        "owner": {
+          "ownerNonce": "622c7ab4-7d32-4c57-81d4-953bd9d79d63",
+          "executionHost": {
+            "kind": "host_boot",
+            "value": "2133364d-1c26-469c-821e-9c8099b74692"
+          }
+        },
+        "interruption": {
+          "cause": "execution_owner_lost",
+          "executionMayHaveStarted": false,
+          "cancellationRequested": false
+        },
+        "progress": {
+          "acceptedOccurrenceOrdinal": 0,
+          "lastTransitionSequence": 0,
+          "steps": [
+            {
+              "id": "check",
+              "state": "pending"
+            }
+          ],
+          "outstandingActions": []
+        },
+        "processGuards": [],
+        "result": {
+          "status": "not_published",
+          "reason": "interrupted"
+        }
+      }
+    ],
+    "diagnostics": []
+  },
+  "recovery": {
+    "status": "settled"
+  },
+  "retry": {
+    "eligible": true
+  }
+}

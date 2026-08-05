@@ -1,3 +1,7 @@
+pub(crate) mod adapter;
+mod result_bridge;
+
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -90,6 +94,10 @@ pub(crate) struct PiJsonV1Parser {
     frame: Vec<u8>,
     protocol: ProtocolState,
     observations: Vec<AgentObservation>,
+    expected_result_tool_name: Option<Arc<str>>,
+    seen_tool_call_ids: HashMap<String, bool>,
+    retained_tool_call_id_bytes: u64,
+    active_validation_request: Option<(Arc<str>, Arc<str>)>,
     accepted_result: Option<AcceptedResultState>,
     failure: Option<AgentFailureCause>,
 }
@@ -104,6 +112,7 @@ impl PiJsonV1Parser {
             value_kind,
             maximum_response_bytes,
             PiJsonV1ProtocolLimits::profile(),
+            None,
         )
     }
 
@@ -112,6 +121,7 @@ impl PiJsonV1Parser {
         value_kind: AgentValueKind,
         maximum_response_bytes: NonZeroU64,
         limits: PiJsonV1ProtocolLimits,
+        expected_result_tool_name: Option<Arc<str>>,
     ) -> Self {
         Self {
             expected_cwd,
@@ -121,6 +131,10 @@ impl PiJsonV1Parser {
             frame: Vec::new(),
             protocol: ProtocolState::default(),
             observations: Vec::new(),
+            expected_result_tool_name,
+            seen_tool_call_ids: HashMap::new(),
+            retained_tool_call_id_bytes: 0,
+            active_validation_request: None,
             accepted_result: None,
             failure: None,
         }
@@ -164,6 +178,52 @@ impl PiJsonV1Parser {
 
     /// Records the one result already bounded and validated by the authoritative result bridge.
     /// Native completion remains provisional until the matching transcript, EOF, and exit validate.
+    pub(crate) fn correlate_result_request(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        arguments: &Value,
+    ) -> Result<(), AgentFailureCause> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
+        if self.value_kind != AgentValueKind::Result
+            || self.accepted_result.is_some()
+            || self.active_validation_request.is_some()
+        {
+            return self.fail_protocol();
+        }
+
+        let Some(turn) = self
+            .protocol
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.turn.as_ref())
+        else {
+            return self.fail_protocol();
+        };
+        let Some(call) = turn
+            .assistant
+            .as_ref()
+            .and_then(AssistantMessage::only_tool_call)
+        else {
+            return self.fail_protocol();
+        };
+        let Some(call_state) = turn.calls.first() else {
+            return self.fail_protocol();
+        };
+        if !call_state.started
+            || call_state.ended.is_some()
+            || call.id != call_id
+            || call.name != tool_name
+            || !semantically_equal_json(&call.arguments, arguments)
+        {
+            return self.fail_protocol();
+        }
+        self.active_validation_request = Some((Arc::from(call_id), Arc::from(tool_name)));
+        Ok(())
+    }
+
     pub(crate) fn accept_result(
         &mut self,
         accepted: AcceptedPiJsonV1Result,
@@ -190,11 +250,18 @@ impl PiJsonV1Parser {
         let Some(call_state) = turn.calls.first() else {
             return self.fail_protocol();
         };
-        if !call_state.started
+        let validation_request_matches =
+            self.active_validation_request
+                .as_ref()
+                .is_some_and(|(call_id, tool_name)| {
+                    call_id == &accepted.call_id && tool_name == &accepted.tool_name
+                });
+        if !validation_request_matches
+            || !call_state.started
             || call_state.ended.is_some()
             || call.id.as_str() != accepted.call_id.as_ref()
             || call.name.as_str() != accepted.tool_name.as_ref()
-            || &call.arguments != accepted.arguments.as_ref()
+            || !semantically_equal_json(&call.arguments, accepted.arguments.as_ref())
         {
             return self.fail_protocol();
         }
@@ -206,19 +273,25 @@ impl PiJsonV1Parser {
         Ok(())
     }
 
+    pub(crate) fn accepted_result_ready_for_settlement(&self) -> bool {
+        self.accepted_result
+            .as_ref()
+            .is_some_and(|accepted| accepted.native_execution_completed)
+    }
+
     pub(crate) fn finish(
         mut self,
         completion: PiJsonV1ProcessCompletion,
     ) -> super::agent::AgentOutcome {
+        if let Some(reason) = completion.cancellation {
+            return super::agent::AgentOutcome::Cancelled { reason };
+        }
         if self.failure.is_none() && !self.frame.is_empty() {
             self.failure = Some(self.protocol_failure());
         }
 
         if let Some(failure) = self.failure {
             return super::agent::AgentOutcome::Failed { cause: failure };
-        }
-        if let Some(reason) = completion.cancellation {
-            return super::agent::AgentOutcome::Cancelled { reason };
         }
         if let Err(failure) = self.protocol.validate_eof() {
             return super::agent::AgentOutcome::Failed { cause: failure };
@@ -249,7 +322,20 @@ impl PiJsonV1Parser {
         }
 
         let event_type = required_string(object, "type").ok_or_else(|| self.protocol_failure())?;
-        if event_type == "session" || (self.protocol.settled && known_event_type(event_type)) {
+        if event_type == "session"
+            || (self.protocol.settled && known_event_type(event_type))
+            || (self.accepted_result.is_some()
+                && known_event_type(event_type)
+                && !matches!(
+                    event_type,
+                    "tool_execution_end"
+                        | "message_start"
+                        | "message_end"
+                        | "turn_end"
+                        | "agent_end"
+                        | "agent_settled"
+                ))
+        {
             return Err(self.protocol_failure());
         }
 
@@ -532,6 +618,7 @@ impl PiJsonV1Parser {
         let message = parse_message(value, true).ok_or_else(|| self.protocol_failure())?;
         if let ParsedMessage::Assistant(assistant) = &message {
             self.check_response_bound(assistant)?;
+            self.retain_result_identity_context(assistant)?;
         }
         let retained_message_bytes = self
             .protocol
@@ -628,6 +715,33 @@ impl PiJsonV1Parser {
         Ok(())
     }
 
+    fn retain_result_identity_context(
+        &mut self,
+        assistant: &AssistantMessage,
+    ) -> Result<(), AgentFailureCause> {
+        let Some(expected_result_tool_name) = self.expected_result_tool_name.as_ref() else {
+            return Ok(());
+        };
+        for call in assistant.tool_calls() {
+            let is_result_tool = call.name == expected_result_tool_name.as_ref();
+            if let Some(previous_was_result_tool) = self.seen_tool_call_ids.get(&call.id) {
+                if *previous_was_result_tool || is_result_tool {
+                    return Err(self.protocol_failure());
+                }
+                continue;
+            }
+            let retained_bytes = self
+                .retained_tool_call_id_bytes
+                .checked_add(u64::try_from(call.id.len()).unwrap_or(u64::MAX))
+                .filter(|bytes| *bytes <= self.limits.maximum_frame_bytes().get())
+                .ok_or_else(|| self.protocol_failure())?;
+            self.seen_tool_call_ids
+                .insert(call.id.clone(), is_result_tool);
+            self.retained_tool_call_id_bytes = retained_bytes;
+        }
+        Ok(())
+    }
+
     fn tool_execution_start(
         &mut self,
         object: &Map<String, Value>,
@@ -690,6 +804,10 @@ impl PiJsonV1Parser {
         let result =
             parse_tool_execution_result(result_value).ok_or_else(|| self.protocol_failure())?;
         let is_error = required_bool(object, "isError").ok_or_else(|| self.protocol_failure())?;
+        let is_expected_result_tool = self
+            .expected_result_tool_name
+            .as_ref()
+            .is_some_and(|expected| expected.as_ref() == name);
         let retained_tool_bytes = self
             .protocol
             .active_attempt
@@ -708,6 +826,29 @@ impl PiJsonV1Parser {
             return Err(self.protocol_failure());
         }
         turn.retained_tool_bytes = retained_tool_bytes;
+
+        let active_validation_matches = match self.active_validation_request.as_ref() {
+            Some((active_id, active_name)) => {
+                if active_id.as_ref() != call_id || active_name.as_ref() != name {
+                    return Err(self.protocol_failure());
+                }
+                true
+            }
+            None => false,
+        };
+        if active_validation_matches {
+            let accepted_validation_matches =
+                self.accepted_result.as_ref().is_some_and(|accepted| {
+                    accepted.accepted.call_id.as_ref() == call_id
+                        && accepted.accepted.tool_name.as_ref() == name
+                });
+            if !accepted_validation_matches && (!is_error || result.terminate == Some(true)) {
+                return Err(self.protocol_failure());
+            }
+            self.active_validation_request = None;
+        } else if is_expected_result_tool && (!is_error || result.terminate == Some(true)) {
+            return Err(self.protocol_failure());
+        }
 
         if let Some(accepted) = self.accepted_result.as_mut()
             && accepted.accepted.call_id.as_ref() == call_id
@@ -1047,7 +1188,10 @@ impl PiJsonV1Parser {
                     if !accepted.native_execution_completed
                         || call.id.as_str() != accepted.accepted.call_id.as_ref()
                         || call.name.as_str() != accepted.accepted.tool_name.as_ref()
-                        || &call.arguments != accepted.accepted.arguments.as_ref()
+                        || !semantically_equal_json(
+                            &call.arguments,
+                            accepted.accepted.arguments.as_ref(),
+                        )
                     {
                         return super::agent::AgentOutcome::Failed {
                             cause: AgentFailureCause::HarnessProtocolFailed,
@@ -1060,6 +1204,9 @@ impl PiJsonV1Parser {
             },
             StopReason::Error => harness_failure(AgentHarnessFailureDetail::ModelError),
             StopReason::Aborted => harness_failure(AgentHarnessFailureDetail::ModelAborted),
+            StopReason::Pending => super::agent::AgentOutcome::Failed {
+                cause: AgentFailureCause::HarnessProtocolFailed,
+            },
         }
     }
 
@@ -1145,7 +1292,10 @@ impl ActiveTurn {
         let Some(call) = self.calls.iter_mut().find(|call| !call.started) else {
             return false;
         };
-        if call.call.id != id || call.call.name != name || &call.call.arguments != arguments {
+        if call.call.id != id
+            || call.call.name != name
+            || !semantically_equal_json(&call.call.arguments, arguments)
+        {
             return false;
         }
         call.started = true;
@@ -1158,7 +1308,7 @@ impl ActiveTurn {
                 && call.ended.is_none()
                 && call.call.id == id
                 && call.call.name == name
-                && &call.call.arguments == arguments
+                && semantically_equal_json(&call.call.arguments, arguments)
         })
     }
 
@@ -1345,6 +1495,7 @@ struct Cost {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StopReason {
+    Pending,
     Stop,
     Length,
     ToolUse,
@@ -1713,7 +1864,7 @@ fn parse_assistant_message(
         response_id: optional_string(object, "responseId")?.map(str::to_owned),
         diagnostics: parse_diagnostics(object)?,
         usage: required_object(object, "usage").and_then(parse_usage)?,
-        stop_reason: parse_stop_reason(required_string(object, "stopReason")?)?,
+        stop_reason: parse_stop_reason(required_string(object, "stopReason")?, complete)?,
         error_message: optional_string(object, "errorMessage")?.map(str::to_owned),
         timestamp: object.get("timestamp")?.as_number()?.clone(),
     })
@@ -1821,8 +1972,9 @@ fn parse_cost(object: &Map<String, Value>) -> Option<Cost> {
     })
 }
 
-fn parse_stop_reason(value: &str) -> Option<StopReason> {
+fn parse_stop_reason(value: &str, complete: bool) -> Option<StopReason> {
     match value {
+        "pending" if !complete => Some(StopReason::Pending),
         "stop" => Some(StopReason::Stop),
         "length" => Some(StopReason::Length),
         "toolUse" => Some(StopReason::ToolUse),
@@ -2003,6 +2155,78 @@ fn json_bytes(value: &Value) -> Option<u64> {
         .and_then(|bytes| u64::try_from(bytes.len()).ok())
 }
 
+fn semantically_equal_json(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => {
+            normalized_json_number(left) == normalized_json_number(right)
+        }
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| semantically_equal_json(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| semantically_equal_json(left, right))
+                })
+        }
+        (Value::Null, _)
+        | (Value::Bool(_), _)
+        | (Value::Number(_), _)
+        | (Value::String(_), _)
+        | (Value::Array(_), _)
+        | (Value::Object(_), _) => false,
+    }
+}
+
+fn normalized_json_number(number: &Number) -> Option<(bool, String, i64)> {
+    let rendered = number.to_string();
+    let (negative, unsigned) = rendered
+        .strip_prefix('-')
+        .map_or((false, rendered.as_str()), |unsigned| (true, unsigned));
+    let (coefficient, exponent) =
+        unsigned
+            .split_once(['e', 'E'])
+            .map_or((unsigned, 0_i64), |(coefficient, exponent)| {
+                exponent
+                    .parse::<i64>()
+                    .map(|exponent| (coefficient, exponent))
+                    .unwrap_or((coefficient, i64::MIN))
+            });
+    if exponent == i64::MIN {
+        return None;
+    }
+    let (whole, fraction) = coefficient
+        .split_once('.')
+        .map_or((coefficient, ""), |parts| parts);
+    let mut digits = String::with_capacity(whole.len().saturating_add(fraction.len()));
+    digits.push_str(whole);
+    digits.push_str(fraction);
+    let first_nonzero = digits.find(|digit| digit != '0').unwrap_or(digits.len());
+    digits.drain(..first_nonzero);
+    if digits.is_empty() {
+        return Some((false, "0".to_owned(), 0));
+    }
+    let trailing_zeroes = digits
+        .len()
+        .saturating_sub(digits.trim_end_matches('0').len());
+    digits.truncate(digits.len().saturating_sub(trailing_zeroes));
+    let fraction_digits = i64::try_from(fraction.len()).ok()?;
+    let trailing_zeroes = i64::try_from(trailing_zeroes).ok()?;
+    let power = exponent
+        .checked_sub(fraction_digits)?
+        .checked_add(trailing_zeroes)?;
+    Some((negative, digits, power))
+}
+
 fn retry_schedule(object: &Map<String, Value>) -> Option<(u64, u64, u64, &str)> {
     Some((
         required_positive_u64(object, "attempt")?,
@@ -2170,5 +2394,7 @@ fn parse_optional_usage(object: &Map<String, Value>) -> Option<Option<Usage>> {
     }
 }
 
+#[cfg(test)]
+mod adapter_tests;
 #[cfg(test)]
 mod tests;

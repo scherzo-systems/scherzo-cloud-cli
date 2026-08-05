@@ -18,6 +18,20 @@ pub(crate) enum Thinking {
     Max,
 }
 
+impl Thinking {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PiConfigDto {

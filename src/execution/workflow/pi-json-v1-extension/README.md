@@ -20,7 +20,7 @@ From the exported CLI root, run the canonical package check:
 ```
 
 The script installs exactly `package-lock.json` with lifecycle scripts disabled, then
-runs formatting, linting, TypeScript checking against Pi 0.82.1, generated-fixture
+runs formatting, linting, TypeScript checking against Pi 0.83.0, generated-fixture
 checking, and Node's built-in test runner.
 
 The pinned Devenv environment supplies Node 24. After the locked install, the script

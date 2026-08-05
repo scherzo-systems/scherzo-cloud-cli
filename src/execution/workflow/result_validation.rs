@@ -110,6 +110,10 @@ impl BoundedSchemaValidAgentResult {
         &self.value
     }
 
+    pub(crate) fn into_value(self) -> Arc<Value> {
+        self.value
+    }
+
     pub(crate) fn canonical_json(&self) -> &[u8] {
         &self.canonical_json
     }
@@ -335,6 +339,17 @@ pub(crate) struct ValidationWorkerRequest {
     candidate: Arc<Value>,
     canonical_json: Arc<[u8]>,
     maximum_feedback_bytes: NonZeroU64,
+}
+
+impl ValidationWorkerRequest {
+    #[cfg(test)]
+    pub(crate) fn evaluate(self) -> Result<ValidationWorkerDecision, ()> {
+        evaluate_candidate(
+            &self.schema,
+            &self.candidate,
+            self.maximum_feedback_bytes.get(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

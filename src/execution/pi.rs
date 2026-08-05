@@ -11,6 +11,9 @@ use crate::process::{CommandOutput, CommandRequest, CommandRunner, SystemCommand
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_VERSION_OUTPUT_BYTES: usize = 128;
 const MAXIMUM_CAPABILITY_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.83.0 <0.84.0";
+const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 83, 0);
+const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 84, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
     "--no-approve",
     "--no-extensions",
@@ -42,16 +45,37 @@ impl PiCompatibilityProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PiVersion {
-    V0_82_1,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PiVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    observed: Box<str>,
 }
 
 impl PiVersion {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::V0_82_1 => "0.82.1",
+    fn parse(observed: String) -> Option<Self> {
+        let mut components = observed.split('.');
+        let major = parse_numeric_component(components.next()?)?;
+        let minor = parse_numeric_component(components.next()?)?;
+        let patch = parse_numeric_component(components.next()?)?;
+        if components.next().is_some() {
+            return None;
         }
+        Some(Self {
+            major,
+            minor,
+            patch,
+            observed: observed.into_boxed_str(),
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.observed
+    }
+
+    const fn numeric(&self) -> (u64, u64, u64) {
+        (self.major, self.minor, self.patch)
     }
 }
 
@@ -110,7 +134,7 @@ impl ValidatedPiInstallation {
     pub(crate) fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: PiVersion::V0_82_1,
+            version: PiVersion::parse("0.83.0".to_owned()).unwrap(),
             profile: PiCompatibilityProfile::PiJsonV1,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
@@ -122,8 +146,8 @@ impl ValidatedPiInstallation {
         &self.executable
     }
 
-    pub(crate) const fn version(&self) -> PiVersion {
-        self.version
+    pub(crate) const fn version(&self) -> &PiVersion {
+        &self.version
     }
 
     pub(crate) const fn profile(&self) -> PiCompatibilityProfile {
@@ -167,21 +191,21 @@ pub(crate) enum PiInstallationFailure {
 impl fmt::Display for PiInstallationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing => formatter.write_str(
-                "configured Pi executable was not found; install Pi 0.82.1 or correct --pi-executable",
+            Self::Missing => write!(
+                formatter,
+                "configured Pi executable was not found; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE} or correct --pi-executable"
             ),
-            Self::Unexecutable => formatter.write_str(
-                "configured Pi executable could not complete its validation probes",
-            ),
+            Self::Unexecutable => formatter
+                .write_str("configured Pi executable could not complete its validation probes"),
             Self::Malformed(PiProbe::Version) => {
                 formatter.write_str("configured Pi executable returned a malformed version")
             }
-            Self::Malformed(PiProbe::Capabilities) => formatter.write_str(
-                "configured Pi executable returned malformed capability help",
-            ),
+            Self::Malformed(PiProbe::Capabilities) => {
+                formatter.write_str("configured Pi executable returned malformed capability help")
+            }
             Self::Unsupported(PiIncompatibility::Version(version)) => write!(
                 formatter,
-                "configured Pi version {version} is unsupported; install Pi 0.82.1 exactly"
+                "configured Pi version {version} is unsupported; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
             ),
             Self::Unsupported(PiIncompatibility::Capability(capability)) => write!(
                 formatter,
@@ -214,10 +238,12 @@ fn validate_pi_installation_with(
             MAXIMUM_VERSION_OUTPUT_BYTES,
             &isolation,
         )?;
-        let version_text = parse_version_output(&version_output)?;
-        let version = compatible_version(&version_text).ok_or(
-            PiInstallationFailure::Unsupported(PiIncompatibility::Version(version_text)),
-        )?;
+        let version = parse_version_output(&version_output)?;
+        let profile = compatibility_profile(&version).ok_or_else(|| {
+            PiInstallationFailure::Unsupported(PiIncompatibility::Version(
+                version.as_str().to_owned(),
+            ))
+        })?;
 
         let capability_output = run_probe(
             runner,
@@ -231,7 +257,7 @@ fn validate_pi_installation_with(
         Ok(ValidatedPiInstallation {
             executable,
             version,
-            profile: PiCompatibilityProfile::PiJsonV1,
+            profile,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -355,7 +381,7 @@ fn run_probe(
     Ok(output)
 }
 
-fn parse_version_output(output: &CommandOutput) -> Result<String, PiInstallationFailure> {
+fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallationFailure> {
     if output.truncated {
         return Err(PiInstallationFailure::Malformed(PiProbe::Version));
     }
@@ -364,24 +390,27 @@ fn parse_version_output(output: &CommandOutput) -> Result<String, PiInstallation
     let version = text
         .strip_suffix('\n')
         .ok_or(PiInstallationFailure::Malformed(PiProbe::Version))?;
-    let mut components = version.split('.');
-    if components.clone().count() != 3
-        || components.any(|component| {
-            component.is_empty()
-                || !component.bytes().all(|byte| byte.is_ascii_digit())
-                || component.parse::<u64>().is_err()
-        })
-    {
-        return Err(PiInstallationFailure::Malformed(PiProbe::Version));
-    }
-    Ok(version.to_owned())
+    PiVersion::parse(version.to_owned()).ok_or(PiInstallationFailure::Malformed(PiProbe::Version))
 }
 
-fn compatible_version(version: &str) -> Option<PiVersion> {
-    match version.as_bytes() {
-        b"0.82.1" => Some(PiVersion::V0_82_1),
-        _ => None,
+fn parse_numeric_component(component: &str) -> Option<u64> {
+    if component.is_empty()
+        || !component.bytes().all(|byte| byte.is_ascii_digit())
+        || (component.len() > 1 && component.starts_with('0'))
+    {
+        return None;
     }
+    component.parse().ok()
+}
+
+fn compatibility_profile(version: &PiVersion) -> Option<PiCompatibilityProfile> {
+    (version.numeric() >= PI_JSON_V1_MINIMUM_VERSION
+        && version.numeric() < PI_JSON_V1_MAXIMUM_VERSION)
+        .then_some(PiCompatibilityProfile::PiJsonV1)
+}
+
+pub(crate) fn compatibility_profile_for_version(observed: &str) -> Option<PiCompatibilityProfile> {
+    compatibility_profile(&PiVersion::parse(observed.to_owned())?)
 }
 
 fn validate_capability_output(output: &CommandOutput) -> Result<(), PiInstallationFailure> {
@@ -496,11 +525,11 @@ mod tests {
     }
 
     #[test]
-    fn closed_compatibility_table_constructs_the_complete_validated_value() {
+    fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
         let executable = std::env::current_exe().unwrap();
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
-            version: output(b"0.82.1\n"),
+            version: output(b"0.83.7\n"),
             capabilities: output(COMPLETE_HELP.as_bytes()),
         };
 
@@ -510,7 +539,7 @@ mod tests {
             installation.executable(),
             fs::canonicalize(executable).unwrap()
         );
-        assert_eq!(installation.version().as_str(), "0.82.1");
+        assert_eq!(installation.version().as_str(), "0.83.7");
         assert_eq!(installation.profile().as_str(), "PiJsonV1");
         assert_eq!(
             installation.capabilities().required(),
@@ -526,27 +555,41 @@ mod tests {
     }
 
     #[test]
-    fn nearby_versions_and_missing_capabilities_do_not_construct_an_installation() {
+    fn version_range_and_capabilities_are_both_required() {
         let executable = std::env::current_exe().unwrap();
-        let unsupported_version = FakeRunner {
-            invocations: Mutex::new(Vec::new()),
-            version: output(b"0.82.2\n"),
-            capabilities: output(COMPLETE_HELP.as_bytes()),
-        };
-        assert_eq!(
-            validate_pi_installation_with(&executable, &unsupported_version),
-            Err(PiInstallationFailure::Unsupported(
-                PiIncompatibility::Version("0.82.2".to_owned())
-            ))
-        );
-        assert_eq!(
-            *unsupported_version.invocations.lock().unwrap(),
-            [vec!["--version".to_owned()]]
-        );
+        for unsupported in ["0.82.1", "0.84.0"] {
+            let runner = FakeRunner {
+                invocations: Mutex::new(Vec::new()),
+                version: output(format!("{unsupported}\n").as_bytes()),
+                capabilities: output(COMPLETE_HELP.as_bytes()),
+            };
+            assert_eq!(
+                validate_pi_installation_with(&executable, &runner),
+                Err(PiInstallationFailure::Unsupported(
+                    PiIncompatibility::Version(unsupported.to_owned())
+                ))
+            );
+            assert_eq!(
+                *runner.invocations.lock().unwrap(),
+                [vec!["--version".to_owned()]]
+            );
+        }
+
+        for malformed in ["0.83.0-rc.1", "0.083.0", "0.83"] {
+            let runner = FakeRunner {
+                invocations: Mutex::new(Vec::new()),
+                version: output(format!("{malformed}\n").as_bytes()),
+                capabilities: output(COMPLETE_HELP.as_bytes()),
+            };
+            assert_eq!(
+                validate_pi_installation_with(&executable, &runner),
+                Err(PiInstallationFailure::Malformed(PiProbe::Version))
+            );
+        }
 
         let missing_trust = FakeRunner {
             invocations: Mutex::new(Vec::new()),
-            version: output(b"0.82.1\n"),
+            version: output(b"0.83.0\n"),
             capabilities: output(
                 COMPLETE_HELP
                     .replace("--approve, -a", "--permit, -p")

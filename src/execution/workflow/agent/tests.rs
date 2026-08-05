@@ -14,6 +14,8 @@ use super::scripted::{
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, EnvironmentSnapshot};
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
+use crate::execution::workflow::pi::{PiConfig, Thinking};
+use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 use crate::execution::workflow::runtime::TransitionSequence;
 
 #[derive(Clone)]
@@ -43,16 +45,22 @@ impl AgentObservationSink for RecordingObservationSink {
     }
 }
 
-type TestInvocation = AgentInvocation<(), (), RecordingObservationSink>;
+type TestInvocation = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, RecordingObservationSink>;
 
 #[derive(Clone, Copy)]
 struct ReturningWithoutTerminalAdapter;
 
 impl AgentAdapter<RecordingObservationSink> for ReturningWithoutTerminalAdapter {
-    type NativeConfiguration = ();
-    type ProtocolLimits = ();
+    type NativeConfiguration = PiConfig;
+    type ProtocolLimits = PiJsonV1ProtocolLimits;
 
-    async fn invoke(&self, _invocation: TestInvocation, _terminal: AgentTerminalCallback) {}
+    async fn invoke(
+        &self,
+        _invocation: TestInvocation,
+        _started: AgentStartCallback,
+        _terminal: AgentTerminalCallback,
+    ) {
+    }
 }
 
 struct InvocationFixture {
@@ -60,6 +68,8 @@ struct InvocationFixture {
     invocation: TestInvocation,
     cancellation: CancellationSource,
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
+    start_callback: AgentStartCallback,
+    started: AgentStartReceiver,
     terminal_callback: AgentTerminalCallback,
     terminal: AgentTerminalReceiver,
 }
@@ -91,15 +101,18 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         NonZeroU64::new(8 * 1024).unwrap(),
         PositiveDuration::new(Duration::from_secs(5)).unwrap(),
         PositiveDuration::new(Duration::from_secs(30)).unwrap(),
-        (),
+        PiJsonV1ProtocolLimits::profile(),
     );
     let invocation = AgentInvocation::new(
         identity,
         AdmittedAgentAdapter::new(
             AgentCompatibilityProfile::PiJsonV1,
             "/validated/pi".into(),
-            Arc::from("0.82.1"),
-            (),
+            Arc::from("0.83.0"),
+            PiConfig {
+                model: "openai/gpt-5".to_owned(),
+                thinking: Thinking::XHigh,
+            },
         ),
         AgentProcessContext::new(cwd, EnvironmentSnapshot::new([("PATH", "/runner/bin")])),
         AgentInvocationStaging::new("/staging/invocation/result-endpoint".into()),
@@ -116,12 +129,15 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
             observations: observation_sender,
         },
     );
+    let (start_callback, started) = agent_start_channel();
     let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
     InvocationFixture {
         _temporary: temporary,
         invocation,
         cancellation,
         observations,
+        start_callback,
+        started,
         terminal_callback,
         terminal,
     }
@@ -159,11 +175,19 @@ async fn start_script(
     let terminal_probe = fixture.terminal_callback.clone();
     let (adapter, mut control) = ScriptedAgentAdapter::new();
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, fixture.invocation, fixture.terminal_callback).await;
+        invoke_agent_adapter(
+            &adapter,
+            fixture.invocation,
+            fixture.start_callback,
+            fixture.terminal_callback,
+        )
+        .await;
     });
-    let started = control.wait_until_started().await.unwrap();
-    assert_eq!(started.identity().run().as_ref(), "run-fixed");
-    assert_eq!(started.value_kind(), expected_value_kind);
+    let invocation = control.wait_until_started().await.unwrap();
+    assert_eq!(invocation.identity().run().as_ref(), "run-fixed");
+    assert_eq!(invocation.value_kind(), expected_value_kind);
+    invocation.control().start().await.unwrap();
+    fixture.started.receive().await.unwrap();
     (
         control,
         task,
@@ -195,8 +219,14 @@ fn invocation_retains_the_complete_immutable_engine_input() {
         invocation.adapter().executable(),
         Path::new("/validated/pi")
     );
-    assert_eq!(invocation.adapter().version(), "0.82.1");
-    assert_eq!(invocation.adapter().native_configuration(), &());
+    assert_eq!(invocation.adapter().version(), "0.83.0");
+    assert_eq!(
+        invocation.adapter().native_configuration(),
+        &PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::XHigh,
+        }
+    );
     assert_eq!(
         invocation.process().cwd(),
         std::fs::canonicalize(fixture._temporary.path().join("execution/worktree")).unwrap()
@@ -261,7 +291,10 @@ fn invocation_retains_the_complete_immutable_engine_input() {
         invocation.limits().result_settlement_grace().get(),
         Duration::from_secs(30)
     );
-    assert_eq!(invocation.limits().adapter_protocol(), &());
+    assert_eq!(
+        invocation.limits().adapter_protocol(),
+        &PiJsonV1ProtocolLimits::profile()
+    );
     assert!(!invocation.cancellation().is_cancelled());
 }
 
@@ -272,6 +305,7 @@ async fn adapter_return_without_terminal_report_becomes_protocol_failure() {
     invoke_agent_adapter(
         &ReturningWithoutTerminalAdapter,
         fixture.invocation,
+        fixture.start_callback,
         fixture.terminal_callback,
     )
     .await;
@@ -540,7 +574,13 @@ async fn scripted_adapter_observes_initial_and_idle_cancellation() {
     );
     let (adapter, mut initial_control) = ScriptedAgentAdapter::new();
     let initial_task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, initial.invocation, initial.terminal_callback).await;
+        invoke_agent_adapter(
+            &adapter,
+            initial.invocation,
+            initial.start_callback,
+            initial.terminal_callback,
+        )
+        .await;
     });
     assert_eq!(
         initial.terminal.receive().await.unwrap(),
@@ -549,10 +589,10 @@ async fn scripted_adapter_observes_initial_and_idle_cancellation() {
         }
     );
     initial_task.await.unwrap();
-    assert_eq!(
+    assert!(matches!(
         initial_control.wait_until_started().await,
         Err(ScriptedAgentError::AdapterStopped)
-    );
+    ));
 
     let (_control, task, cancellation, _observations, terminal, _terminal_probe) =
         start_script(invocation_fixture(AgentValueMode::None)).await;
@@ -635,6 +675,23 @@ async fn explicit_barriers_make_cancellation_close_races_deterministic() {
         }
     );
     task.await.unwrap();
+}
+
+#[test]
+fn start_callback_accepts_one_acknowledgement() {
+    let (started, receiver) = agent_start_channel();
+    let competing_callback = started.clone();
+
+    assert_eq!(started.report(), Ok(()));
+    assert_eq!(
+        competing_callback.report(),
+        Err(AgentStartReportError::AlreadyReported)
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(runtime.block_on(receiver.receive()), Ok(()));
 }
 
 #[test]

@@ -141,7 +141,7 @@ impl AdmittedExecutionRoot {
         })
     }
 
-    fn contains_directory(&self, directory: &OwnedFd) -> Result<bool, Errno> {
+    pub(super) fn contains_directory(&self, directory: &OwnedFd) -> Result<bool, Errno> {
         let mut current = dup(directory)?;
         loop {
             let current_identity = directory_identity(&current)?;
@@ -202,6 +202,24 @@ impl AdmittedWorkingDirectory {
 
     pub(super) fn validate_execution_root(&self) -> bool {
         self.execution_root.pathname_is_bound()
+    }
+
+    pub(super) fn protocol_path(&self) -> Result<PathBuf, WorkingDirectorySelectionFailure> {
+        if !self.validate_execution_root() {
+            return Err(WorkingDirectorySelectionFailure::ExecutionRootRebound);
+        }
+        let path = fs::canonicalize(&self.provenance_path)
+            .map_err(|_| WorkingDirectorySelectionFailure::Unavailable)?;
+        let candidate = open_working_directory(&path)
+            .map_err(|_| WorkingDirectorySelectionFailure::Unavailable)?;
+        let selected_identity = directory_identity(&self.directory)
+            .map_err(|_| WorkingDirectorySelectionFailure::Unavailable)?;
+        let candidate_identity = directory_identity(&candidate)
+            .map_err(|_| WorkingDirectorySelectionFailure::Unavailable)?;
+        if candidate_identity != selected_identity {
+            return Err(WorkingDirectorySelectionFailure::Unavailable);
+        }
+        Ok(path)
     }
 
     pub(super) fn executable_candidate(&self, candidate: &Path) -> ExecutableCandidate {

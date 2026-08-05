@@ -1,6 +1,6 @@
 [package]
 name = "scherzo-cloud"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Command-line interface and runner for Scherzo Cloud"
@@ -33,16 +33,18 @@ unwrap_used = "deny"
 base64 = "0.22.1"
 clap = { version = "4.6.3", features = ["derive"] }
 ctrlc = "3.5.1"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 fs4 = "1.1.0"
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
 jsonschema = { version = "0.49.2", default-features = false }
 libc = "0.2.189"
-nix = { version = "0.31.3", default-features = false, features = ["fs"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal"] }
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 prost = "0.14"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "query", "rustls-no-provider"] }
 regress = "=0.10.4"
 ring = "0.17.14"
@@ -55,6 +57,7 @@ time = { version = "0.3.45", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 ulid = "3.0.0"
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 url = { version = "2.5.8", features = ["serde"] }
 yaml-rust2 = { version = "0.11.0", default-features = false }

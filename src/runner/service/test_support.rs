@@ -448,7 +448,17 @@ pub(crate) fn welcome() -> Message {
             "payload": {
                 "sessionId": "rsn_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "pingIntervalSeconds": 1,
-                "pongTimeoutSeconds": 2
+                "pongTimeoutSeconds": 2,
+                "leasePolicy": {
+                    "schemaVersion": 1,
+                    "maxClockUncertaintyMilliseconds": 1000,
+                    "forceStopAndReapBudgetMilliseconds": 5000,
+                    "terminalReportDeliveryBudgetMilliseconds": 5000,
+                    "startDeliveryBudgetMilliseconds": 5000,
+                    "renewalDeliveryBudgetMilliseconds": 5000,
+                    "leaseDurationMilliseconds": 30000,
+                    "fencingMarginMilliseconds": 11000
+                }
             }
         })
         .to_string()
@@ -511,7 +521,16 @@ pub(crate) fn assignment_offer() -> Message {
                 "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
                 "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
                 "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
-                "leaseExpiresAt": "2026-07-23T01:00:00Z"
+                "executionSpec": {
+                    "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "schemaVersion": 1,
+                    "registeredWorkflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "executionLimits": {
+                        "maximumParallelSteps": 1,
+                        "cancellationGraceSeconds": 1
+                    }
+                },
+                "offerExpiresAt": "2026-07-23T01:00:00Z"
             }
         })
         .to_string()

@@ -31,6 +31,16 @@
         "direction": "cloud_to_runner",
         "messageId": "cmsg_01ky7dhjg00000000000000002",
         "payload": {
+          "leasePolicy": {
+            "fencingMarginMilliseconds": 11000,
+            "forceStopAndReapBudgetMilliseconds": 5000,
+            "leaseDurationMilliseconds": 30000,
+            "maxClockUncertaintyMilliseconds": 1000,
+            "renewalDeliveryBudgetMilliseconds": 5000,
+            "schemaVersion": 1,
+            "startDeliveryBudgetMilliseconds": 5000,
+            "terminalReportDeliveryBudgetMilliseconds": 5000
+          },
           "pingIntervalSeconds": 60,
           "pongTimeoutSeconds": 120,
           "sessionId": "rsn_01ky7dhjg00000000000000001"
@@ -68,7 +78,16 @@
         "payload": {
           "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
           "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
-          "leaseExpiresAt": "2026-07-23T13:00:00Z",
+          "executionSpec": {
+            "executionLimits": {
+              "cancellationGraceSeconds": 1,
+              "maximumParallelSteps": 1
+            },
+            "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "registeredWorkflowId": "wfl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "schemaVersion": 1
+          },
+          "offerExpiresAt": "2026-07-23T13:00:00Z",
           "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj"
         },
         "payloadVersion": 1,
@@ -106,6 +125,47 @@
         "payload": {
           "acknowledgedMessageId": "«mid-2»",
           "acknowledgedSequence": 2
+        },
+        "payloadVersion": 1,
+        "protocolVersion": 1,
+        "sentAt": "2026-07-23T12:00:02Z",
+        "type": "observation_ack"
+      }
+    },
+    {
+      "advanceMs": 0,
+      "from": "runner",
+      "kind": "text",
+      "payload": {
+        "bootId": "«boot-1»",
+        "direction": "runner_to_cloud",
+        "messageId": "«mid-3»",
+        "payload": {
+          "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+          "decline": {
+            "reason": "workflow_mapping_unavailable",
+            "type": "runner_unable"
+          },
+          "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+        },
+        "payloadVersion": 1,
+        "protocolVersion": 1,
+        "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "sentAt": "«ts-1»",
+        "sequence": 3,
+        "type": "assignment_rejected"
+      }
+    },
+    {
+      "advanceMs": 0,
+      "from": "gateway",
+      "kind": "text",
+      "payload": {
+        "direction": "cloud_to_runner",
+        "messageId": "cmsg_01ky7dhmeg0000000000000007",
+        "payload": {
+          "acknowledgedMessageId": "«mid-3»",
+          "acknowledgedSequence": 3
         },
         "payloadVersion": 1,
         "protocolVersion": 1,

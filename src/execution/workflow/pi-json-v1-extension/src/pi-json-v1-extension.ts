@@ -49,6 +49,11 @@ type ResultArgumentsConsumer = (
   toolCallId: string,
 ) => ResultArguments | undefined;
 
+type ResultToolCallGroup =
+  | { kind: "singleton"; arguments: ResultArguments }
+  | { kind: "sibling" }
+  | { kind: "uncorrelated" };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -65,15 +70,28 @@ function isToolCallBlock(
 }
 
 function isResultArguments(value: unknown): value is ResultArguments {
-  return isRecord(value) && "result" in value;
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 1 &&
+    Object.hasOwn(value, "result")
+  );
 }
 
-function findSingletonToolCallArguments(
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => key in value);
+}
+
+function classifyResultToolCallGroup(
   ctx: ExtensionContext,
   toolCallId: string,
   toolName: string,
-): ResultArguments | undefined {
+): ResultToolCallGroup {
   const entries: readonly unknown[] = ctx.sessionManager.getBranch();
+  let candidate: ResultToolCallGroup | undefined;
 
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
@@ -91,22 +109,30 @@ function findSingletonToolCallArguments(
     }
 
     const toolCalls = message.content.filter(isToolCallBlock);
-    const toolCall = toolCalls.find((call) => call.id === toolCallId);
-    if (toolCall === undefined) {
+    const matchingCalls = toolCalls.filter((call) => call.id === toolCallId);
+    if (matchingCalls.length === 0) {
       continue;
     }
-    if (
-      toolCalls.length !== 1 ||
-      toolCall.name !== toolName ||
-      !isResultArguments(toolCall.arguments)
-    ) {
-      return undefined;
+    if (candidate !== undefined || matchingCalls.length !== 1) {
+      return { kind: "uncorrelated" };
     }
 
-    return toolCall.arguments;
+    const toolCall = matchingCalls[0];
+    if (toolCall === undefined || toolCall.name !== toolName) {
+      return { kind: "uncorrelated" };
+    }
+    if (toolCalls.length !== 1) {
+      candidate = { kind: "sibling" };
+      continue;
+    }
+    if (!isResultArguments(toolCall.arguments)) {
+      return { kind: "uncorrelated" };
+    }
+
+    candidate = { kind: "singleton", arguments: toolCall.arguments };
   }
 
-  return undefined;
+  return candidate ?? { kind: "uncorrelated" };
 }
 
 function parseValidationResponse(payload: Buffer): ValidatePiResultV1Response {
@@ -115,13 +141,21 @@ function parseValidationResponse(payload: Buffer): ValidatePiResultV1Response {
     throw new Error("The result validator returned an invalid response.");
   }
 
-  if (parsed.kind === "Valid") {
+  if (parsed.kind === "Valid" && hasOnlyKeys(parsed, ["kind"])) {
     return { kind: "Valid" };
   }
-  if (parsed.kind === "Rejected" && typeof parsed.feedback === "string") {
+  if (
+    parsed.kind === "Rejected" &&
+    hasOnlyKeys(parsed, ["kind", "feedback"]) &&
+    typeof parsed.feedback === "string"
+  ) {
     return { kind: "Rejected", feedback: parsed.feedback };
   }
-  if (parsed.kind === "Fatal" && typeof parsed.cause === "string") {
+  if (
+    parsed.kind === "Fatal" &&
+    hasOnlyKeys(parsed, ["kind", "cause"]) &&
+    typeof parsed.cause === "string"
+  ) {
     return { kind: "Fatal", cause: parsed.cause };
   }
 
@@ -189,7 +223,7 @@ const validateOverSocket: ResultValidator = (socketPath, request, signal) =>
 
     socket.once("connect", () => {
       try {
-        socket.write(encodeFrame(request));
+        socket.end(encodeFrame(request));
       } catch (error: unknown) {
         fail(
           error instanceof Error
@@ -259,16 +293,25 @@ export function createResultTool(
         );
       }
 
-      const response = await validate(
-        config.socketPath,
-        {
-          kind: "ValidatePiResultV1",
-          toolCallId,
-          toolName: config.toolName,
-          arguments: resultArguments,
-        },
-        signal,
-      );
+      let response: ValidatePiResultV1Response;
+      try {
+        response = await validate(
+          config.socketPath,
+          {
+            kind: "ValidatePiResultV1",
+            toolCallId,
+            toolName: config.toolName,
+            arguments: resultArguments,
+          },
+          signal,
+        );
+      } catch (cause: unknown) {
+        ctx.abort();
+        throw new Error(
+          "Fatal result-validation failure: the validation channel failed.",
+          { cause },
+        );
+      }
 
       if (response.kind === "Rejected") {
         throw new Error(response.feedback);
@@ -295,6 +338,7 @@ export function createPiJsonV1Extension(
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
     const resultArgumentsByToolCallId = new Map<string, ResultArguments>();
+    const seenResultToolCallIds = new Set<string>();
     const consumeResultArguments = (
       toolCallId: string,
     ): ResultArguments | undefined => {
@@ -308,13 +352,23 @@ export function createPiJsonV1Extension(
         return;
       }
 
-      const resultArguments = findSingletonToolCallArguments(
+      if (seenResultToolCallIds.has(event.toolCallId)) {
+        resultArgumentsByToolCallId.delete(event.toolCallId);
+        return {
+          block: true,
+          reason:
+            "No result was accepted. The workflow result call identity was reused.",
+        };
+      }
+      seenResultToolCallIds.add(event.toolCallId);
+
+      const group = classifyResultToolCallGroup(
         ctx,
         event.toolCallId,
         config.toolName,
       );
-      if (resultArguments !== undefined) {
-        resultArgumentsByToolCallId.set(event.toolCallId, resultArguments);
+      if (group.kind === "singleton") {
+        resultArgumentsByToolCallId.set(event.toolCallId, group.arguments);
         return;
       }
 
@@ -322,7 +376,9 @@ export function createPiJsonV1Extension(
       return {
         block: true,
         reason:
-          "No result was accepted. Call the workflow result tool by itself, without sibling tool calls.",
+          group.kind === "sibling"
+            ? "No result was accepted. Call the workflow result tool by itself, without sibling tool calls."
+            : "No result was accepted. The workflow result call could not be correlated.",
       };
     });
 

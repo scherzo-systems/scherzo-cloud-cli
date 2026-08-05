@@ -28,6 +28,8 @@ mod organization;
 mod pi_installation;
 #[path = "cli/workflow_run.rs"]
 mod workflow_run;
+#[path = "cli/workflow_status.rs"]
+mod workflow_status;
 #[path = "cli/workflow_validate.rs"]
 mod workflow_validate;
 
@@ -434,7 +436,9 @@ fn no_arguments_print_composed_root_help() {
     assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
     assert!(stdout.contains("version       Print version information"));
     assert!(stdout.contains("runner        Run and manage the Scherzo Cloud runner"));
-    assert!(stdout.contains("workflow      Validate and run local Workflow V1 definitions"));
+    assert!(
+        stdout.contains("workflow      Validate, run, and inspect local Workflow V1 definitions")
+    );
     assert!(!stdout.contains("--allow-insecure-http"));
     assert!(output.stderr.is_empty());
 }
@@ -475,6 +479,9 @@ fn workflow_without_a_subcommand_prints_composed_help() {
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud workflow [COMMAND]"));
     assert!(stdout.contains("run       Execute a local command-only Workflow V1 bundle"));
+    assert!(
+        stdout.contains("status    Inspect one durable local workflow run without changing it")
+    );
     assert!(stdout.contains("validate  Validate a local Workflow V1 bundle without executing it"));
     assert!(output.stderr.is_empty());
 }
@@ -486,6 +493,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     let runner = run(&["runner", "--help"]);
     let doctor = run(&["runner", "doctor", "--help"]);
     let serve = run(&["runner", "serve", "--help"]);
+    let workflow_status = run(&["workflow", "status", "--help"]);
     let workflow_validate = run(&["workflow", "validate", "--help"]);
 
     assert!(auth.status.success());
@@ -523,6 +531,15 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(serve_stdout.contains("Usage: scherzo-cloud runner serve"));
     assert!(serve_stdout.contains("--pi-executable <PATH>"));
     assert!(serve.stderr.is_empty());
+
+    assert!(workflow_status.status.success());
+    let workflow_status_stdout = String::from_utf8_lossy(&workflow_status.stdout);
+    assert!(workflow_status_stdout.contains("Usage: scherzo-cloud workflow status [OPTIONS]"));
+    assert!(workflow_status_stdout.contains("--run-dir <PATH>"));
+    assert!(workflow_status_stdout.contains("--plain"));
+    assert!(workflow_status_stdout.contains("--json"));
+    assert!(workflow_status_stdout.contains("--color <auto|always|never>"));
+    assert!(workflow_status.stderr.is_empty());
 
     assert!(workflow_validate.status.success());
     let workflow_validate_stdout = String::from_utf8_lossy(&workflow_validate.stdout);

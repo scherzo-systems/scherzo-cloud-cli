@@ -2,6 +2,7 @@ use std::future::{Future, ready};
 use std::sync::Arc;
 
 use super::admission::CancellationReason;
+use super::agent::AgentObservationEnvelope;
 use super::runtime::{ActionId, FailurePhase, NotRunReason, TransitionEvent};
 use super::step_runtime::StepFailureCause;
 
@@ -79,6 +80,7 @@ pub(crate) enum ExecutionObservation<Deadline> {
     Transition(TransitionObservation<Deadline>),
     CommandOutput(CommandOutputObservation),
     CommandOutputClosed(CommandOutputClosedObservation),
+    Agent(AgentObservationEnvelope),
 }
 
 pub(crate) trait ExecutionObserver<Deadline>: Clone + Send + Sync + 'static {

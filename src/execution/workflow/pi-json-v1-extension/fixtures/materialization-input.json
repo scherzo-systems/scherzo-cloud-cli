@@ -2,33 +2,33 @@
   "toolName": "scherzo_result_8f3c2a1d",
   "socketPath": "/tmp/scherzo/invocation-fixed/result-validation.sock",
   "parameters": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$defs": {
       "workflowResult": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://schemas.scherzo.invalid/workflow-result/d9925fc96e15d98f45c13b1f9c14b30482dd085671195c4d01461b165f5dd296",
         "$defs": {
           "Change": {
-            "type": "object",
+            "additionalProperties": false,
             "properties": {
               "summary": {
                 "type": "string"
               }
             },
             "required": ["summary"],
-            "additionalProperties": false
+            "type": "object"
           }
         },
-        "$ref": "#/$defs/Change"
+        "$id": "https://schemas.scherzo.invalid/workflow-result/d9925fc96e15d98f45c13b1f9c14b30482dd085671195c4d01461b165f5dd296",
+        "$ref": "#/$defs/Change",
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       }
     },
-    "type": "object",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
     "properties": {
       "result": {
         "$ref": "https://schemas.scherzo.invalid/workflow-result/d9925fc96e15d98f45c13b1f9c14b30482dd085671195c4d01461b165f5dd296"
       }
     },
     "required": ["result"],
-    "additionalProperties": false
+    "type": "object"
   }
 }

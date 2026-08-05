@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "command": "scherzo-cloud workflow status",
+  "outcome": "error",
+  "exitStatus": 1,
+  "error": {
+    "code": "run_directory_invalid",
+    "message": "The run directory is invalid.",
+    "detail": "not contracted"
+  }
+}
