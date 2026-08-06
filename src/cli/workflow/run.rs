@@ -32,7 +32,8 @@ use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{WorkflowExecutionResult, execute_workflow};
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::local_run::{
-    DurableDeadline, InitialLocalRun, LocalAttemptOwner, PublicationFailurePhaseV1,
+    DurableDeadline, InitialLocalRun, LocalAttemptOwner, LocalAttemptOwnershipReleased,
+    PublicationFailurePhaseV1,
 };
 use crate::execution::workflow::observation::{ExecutionObservation, ExecutionObserver};
 use crate::execution::workflow::pi_json_v1::adapter::PiJsonV1Adapter;
@@ -542,7 +543,10 @@ pub(super) async fn execute_owned_attempt(
     };
     host.complete_publication(&publication);
     host.begin_cleanup();
-    let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+    let execution_staging_failed =
+        release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+    let private_staging_failed = private_staging.release().is_err();
+    let cleanup_failed = execution_staging_failed || private_staging_failed;
     let cleanup_state = if cleanup_failed {
         owned_run.record_private_cleanup_failure()
     } else {
@@ -551,8 +555,8 @@ pub(super) async fn execute_owned_attempt(
     host.complete_cleanup(cleanup_failed);
     let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
 
-    drop(owned_run);
-    host.mark_execution_ownership_released();
+    let released_ownership = owned_run.release();
+    host.mark_adapter_lifecycle_completed(released_ownership);
     host.finish(
         &workflow,
         &run,
@@ -1047,9 +1051,9 @@ impl ActiveRunHost {
         }
     }
 
-    fn mark_execution_ownership_released(&self) {
+    fn mark_adapter_lifecycle_completed(&self, _released_ownership: LocalAttemptOwnershipReleased) {
         if let Self::Tui { view, .. } = self {
-            view.mark_execution_ownership_released();
+            view.mark_adapter_lifecycle_completed();
         }
     }
 
@@ -1463,9 +1467,11 @@ fn write_diagnostic(message: fmt::Arguments<'_>) {
 mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
+    use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use rustix::fs::{FlockOperation, fcntl_lock};
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
@@ -1621,6 +1627,110 @@ mod tests {
         observer.await.unwrap();
         assert!(interrupt_sender.send(()).is_err());
         assert!(!cancellation.request_cancellation(CancellationReason::UserRequest));
+    }
+
+    #[test]
+    fn adapter_completion_follows_attempt_ownership_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("source");
+        let execution_root = temporary.path().join("execution");
+        let run_parent = temporary.path().join("runs");
+        for directory in [&source_root, &execution_root, &run_parent] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(
+            source_root.join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  task:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        )
+        .unwrap();
+        let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+        let admitted = admit_workflow(
+            workflow.clone(),
+            ResolvedImports::default(),
+            execution_context_for_workflow(&workflow, execution_root, 1, CancellationSource::new())
+                .unwrap(),
+        )
+        .unwrap();
+        let run_directory = run_parent.join("owned");
+        let owned_run = InitialLocalRun::create(&run_directory, &admitted).unwrap();
+        let lock_path = run_directory.join("run.lock");
+        assert_run_lock_available(&lock_path, false);
+
+        let clock = SystemObservationClock;
+        let view = WorkflowRunViewModel::new(
+            &workflow,
+            1,
+            RunTimingObservation::new(clock.sample()),
+            clock,
+            StepLogCapacity::default(),
+        );
+        let host = ActiveRunHost::Tui {
+            view: view.clone(),
+            terminal: None,
+            failure: None,
+            config: Box::new(PresentationConfig {
+                requested_mode: RequestedPresentationMode::Automatic,
+                color: ColorChoice::Never,
+                capabilities: TerminalCapabilities {
+                    stdin_is_terminal: true,
+                    stdout_is_terminal: true,
+                    stderr_is_terminal: true,
+                    stdout_width: Some(80),
+                    stderr_width: Some(80),
+                    term: Some("xterm".into()),
+                    no_color: None,
+                },
+                standard_input_reserved: false,
+            }),
+            leaf: ExecutionLeaf::Run,
+        };
+        assert!(!view.snapshot().quit_eligible);
+
+        let released_ownership = owned_run.release();
+        assert_run_lock_available(&lock_path, true);
+        assert!(!view.snapshot().quit_eligible);
+
+        host.mark_adapter_lifecycle_completed(released_ownership);
+        assert!(view.snapshot().quit_eligible);
+    }
+
+    fn assert_run_lock_available(path: &Path, expected: bool) {
+        let output = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "cli::workflow::run::tests::run_lock_probe_fixture",
+            ])
+            .env("SCHERZO_TEST_RUN_LOCK_PATH", path)
+            .env(
+                "SCHERZO_TEST_RUN_LOCK_AVAILABLE",
+                if expected { "true" } else { "false" },
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "run.lock probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "launched as a run.lock ownership probe"]
+    fn run_lock_probe_fixture() {
+        let Some(path) = std::env::var_os("SCHERZO_TEST_RUN_LOCK_PATH") else {
+            return;
+        };
+        let expected = std::env::var("SCHERZO_TEST_RUN_LOCK_AVAILABLE").unwrap() == "true";
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let available = fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok();
+        assert_eq!(available, expected);
     }
 
     #[test]

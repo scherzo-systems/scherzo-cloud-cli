@@ -13,10 +13,10 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use futures_util::StreamExt as _;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use time::UtcOffset;
@@ -26,13 +26,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use self::dag_layout::DagLayout;
 use super::admission::{CancellationReason, CancellationSource};
+use super::document::Output as WorkflowOutput;
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
     header_timestamp, human_duration, shell_quote, step_kind, visible_text,
 };
 use super::presentation_feed::{
-    AcceptedRecordOrder, AgentPresentationObservationKind, WorkflowPresentationStep,
+    AcceptedRecordOrder, AgentPresentationHarness, AgentPresentationObservationKind,
+    WorkflowPresentationStep,
 };
 use super::run_view_model::{
     WorkflowRunCleanupResult, WorkflowRunCleanupState, WorkflowRunLogRecord, WorkflowRunLogSource,
@@ -46,12 +48,20 @@ use super::step_runtime::StepFailureCause;
 const MINIMUM_WIDTH: u16 = 64;
 const MINIMUM_HEIGHT: u16 = 20;
 const WIDE_LAYOUT_WIDTH: u16 = 100;
-const TWO_COLUMN_INSPECTOR_WIDTH: u16 = 72;
+const SPLIT_WORKFLOW_PERCENTAGE: u16 = 52;
+const WORKFLOW_SUMMARY_HEIGHT: u16 = 3;
+const FOOTER_HEIGHT: u16 = 2;
 const MINIMUM_INSPECTOR_HEIGHT: u16 = 8;
+const INSPECTOR_HEADER_HEIGHT: u16 = 3;
+const INSPECTOR_PANEL_PADDING: u16 = 2;
+const MINIMUM_OUTPUT_PANEL_HEIGHT: u16 = 2;
 const MINIMUM_LOG_HEIGHT: u16 = 4;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const RUNNING_INDICATOR_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const KIND_COLUMN_WIDTH: usize = 5;
 const MINIMUM_DETAIL_WIDTH: usize = 12;
+const INSPECTOR_LABEL_WIDTH: usize = 14;
+const LOG_HEADER_HEIGHT: u16 = 2;
 const LOG_TIMESTAMP_WIDTH: usize = 12;
 const LOG_SOURCE_WIDTH: usize = 6;
 const LOG_SEPARATOR_WIDTH: usize = 3;
@@ -654,6 +664,7 @@ enum TerminalInputEvent {
     PanLeft,
     PanRight,
     Follow,
+    ToggleLogChannel(char),
     Help,
     Enter,
     Escape,
@@ -674,6 +685,18 @@ fn terminal_input_event(event: Event) -> TerminalInputEvent {
                 KeyCode::Char('c') => TerminalInputEvent::Cancel,
                 KeyCode::Char('u') => TerminalInputEvent::HalfPageUp,
                 KeyCode::Char('d') => TerminalInputEvent::HalfPageDown,
+                _ => TerminalInputEvent::Other,
+            }
+        }
+        Event::Key(key)
+            if key.kind == KeyEventKind::Press
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('1'..='9')) =>
+        {
+            match key.code {
+                KeyCode::Char(channel @ '1'..='9') => TerminalInputEvent::ToggleLogChannel(channel),
                 _ => TerminalInputEvent::Other,
             }
         }
@@ -811,6 +834,168 @@ enum HostSurface {
     FullLog,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogChannel {
+    StandardOutput,
+    StandardError,
+    Agent,
+    Reasoning,
+    Tools,
+    System,
+}
+
+impl LogChannel {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::StandardOutput => 1 << 0,
+            Self::StandardError => 1 << 1,
+            Self::Agent => 1 << 2,
+            Self::Reasoning => 1 << 3,
+            Self::Tools => 1 << 4,
+            Self::System => 1 << 5,
+        }
+    }
+
+    const fn for_source(source: WorkflowRunLogSource) -> Self {
+        match source {
+            WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput) => {
+                Self::StandardOutput
+            }
+            WorkflowRunLogSource::Command(CommandOutputSource::StandardError) => {
+                Self::StandardError
+            }
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Assistant) => Self::Agent,
+            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Reasoning) => {
+                Self::Reasoning
+            }
+            WorkflowRunLogSource::Agent(
+                AgentPresentationObservationKind::ToolCall
+                | AgentPresentationObservationKind::ToolResult,
+            ) => Self::Tools,
+            WorkflowRunLogSource::Agent(
+                AgentPresentationObservationKind::Diagnostic
+                | AgentPresentationObservationKind::Usage
+                | AgentPresentationObservationKind::Model
+                | AgentPresentationObservationKind::Lifecycle
+                | AgentPresentationObservationKind::ValueRejected
+                | AgentPresentationObservationKind::HarnessEvent,
+            ) => Self::System,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogChannelOption {
+    key: char,
+    channel: LogChannel,
+    label: &'static str,
+    compact_label: &'static str,
+}
+
+const COMMAND_LOG_CHANNELS: [LogChannelOption; 2] = [
+    LogChannelOption {
+        key: '1',
+        channel: LogChannel::StandardOutput,
+        label: "stdout",
+        compact_label: "out",
+    },
+    LogChannelOption {
+        key: '2',
+        channel: LogChannel::StandardError,
+        label: "stderr",
+        compact_label: "err",
+    },
+];
+
+const AGENT_LOG_CHANNELS: [LogChannelOption; 4] = [
+    LogChannelOption {
+        key: '1',
+        channel: LogChannel::Agent,
+        label: "agent",
+        compact_label: "agt",
+    },
+    LogChannelOption {
+        key: '2',
+        channel: LogChannel::Reasoning,
+        label: "reasoning",
+        compact_label: "rsn",
+    },
+    LogChannelOption {
+        key: '3',
+        channel: LogChannel::Tools,
+        label: "tools",
+        compact_label: "tool",
+    },
+    LogChannelOption {
+        key: '4',
+        channel: LogChannel::System,
+        label: "system",
+        compact_label: "sys",
+    },
+];
+
+fn log_channel_options(step: &WorkflowRunStepView) -> &'static [LogChannelOption] {
+    match &step.definition {
+        WorkflowPresentationStep::Command { .. } => &COMMAND_LOG_CHANNELS,
+        WorkflowPresentationStep::Agent { .. } => &AGENT_LOG_CHANNELS,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogFilterState {
+    enabled: u8,
+}
+
+impl Default for LogFilterState {
+    fn default() -> Self {
+        Self {
+            enabled: LogChannel::StandardOutput.bit()
+                | LogChannel::StandardError.bit()
+                | LogChannel::Agent.bit()
+                | LogChannel::Reasoning.bit()
+                | LogChannel::Tools.bit()
+                | LogChannel::System.bit(),
+        }
+    }
+}
+
+impl LogFilterState {
+    const fn includes(self, channel: LogChannel) -> bool {
+        self.enabled & channel.bit() != 0
+    }
+
+    fn toggle(&mut self, step: &WorkflowRunStepView, key: char) -> bool {
+        let Some(option) = log_channel_options(step)
+            .iter()
+            .find(|option| option.key == key)
+        else {
+            return false;
+        };
+        self.enabled ^= option.channel.bit();
+        true
+    }
+}
+
+struct FilteredLog<'a> {
+    records: Vec<&'a WorkflowRunLogRecord>,
+    hidden_records: usize,
+}
+
+impl<'a> FilteredLog<'a> {
+    fn new(log: &'a WorkflowRunStepLog, filters: LogFilterState) -> Self {
+        let records = log
+            .records
+            .iter()
+            .filter(|record| filters.includes(LogChannel::for_source(record.source)))
+            .collect::<Vec<_>>();
+        let hidden_records = log.records.len().saturating_sub(records.len());
+        Self {
+            records,
+            hidden_records,
+        }
+    }
+}
+
 #[derive(Default)]
 struct HostInteraction {
     selected: usize,
@@ -818,6 +1003,7 @@ struct HostInteraction {
     help_visible: bool,
     terminal_area: Rect,
     full_log: FullLogInteraction,
+    log_filters: LogFilterState,
 }
 
 struct FullLogInteraction {
@@ -855,7 +1041,7 @@ enum VerticalNavigation {
 }
 
 impl FullLogInteraction {
-    fn synchronize(&mut self, log: &WorkflowRunStepLog, available_width: usize, rows: usize) {
+    fn synchronize(&mut self, log: &FilteredLog<'_>, available_width: usize, rows: usize) {
         self.available_width = available_width;
         self.available_rows = rows;
         if self.follow {
@@ -864,12 +1050,15 @@ impl FullLogInteraction {
         } else if log.records.is_empty() {
             self.anchor = None;
         } else if let Some(anchor) = self.anchor {
-            if log
+            if let Err(insertion) = log
                 .records
                 .binary_search_by_key(&anchor, |record| record.accepted_order)
-                .is_err()
             {
-                self.anchor = log.records.first().map(|record| record.accepted_order);
+                self.anchor = log
+                    .records
+                    .get(insertion)
+                    .or_else(|| log.records.last())
+                    .map(|record| record.accepted_order);
                 self.anchor_clamped = true;
             }
         } else {
@@ -877,10 +1066,10 @@ impl FullLogInteraction {
         }
         self.horizontal_offset = self
             .horizontal_offset
-            .min(maximum_horizontal_offset(log, available_width));
+            .min(maximum_horizontal_offset(&log.records, available_width));
     }
 
-    fn navigate(&mut self, log: &WorkflowRunStepLog, navigation: VerticalNavigation) {
+    fn navigate(&mut self, log: &FilteredLog<'_>, navigation: VerticalNavigation) {
         self.synchronize(log, self.available_width, self.available_rows);
         let current = self.top_index(log);
         let viewport_rows = self.available_rows.max(1);
@@ -920,13 +1109,16 @@ impl FullLogInteraction {
         self.anchor_clamped = false;
     }
 
-    fn pan(&mut self, log: &WorkflowRunStepLog, right: bool) {
+    fn pan(&mut self, log: &FilteredLog<'_>, right: bool) {
         self.synchronize(log, self.available_width, self.available_rows);
         if right {
-            self.horizontal_offset = self
-                .horizontal_offset
-                .saturating_add(1)
-                .min(maximum_horizontal_offset(log, self.available_width));
+            self.horizontal_offset =
+                self.horizontal_offset
+                    .saturating_add(1)
+                    .min(maximum_horizontal_offset(
+                        &log.records,
+                        self.available_width,
+                    ));
         } else {
             self.horizontal_offset = self.horizontal_offset.saturating_sub(1);
         }
@@ -938,7 +1130,7 @@ impl FullLogInteraction {
         self.anchor_clamped = false;
     }
 
-    fn top_index(&self, log: &WorkflowRunStepLog) -> usize {
+    fn top_index(&self, log: &FilteredLog<'_>) -> usize {
         if self.follow {
             return log.records.len().saturating_sub(self.available_rows);
         }
@@ -951,20 +1143,20 @@ impl FullLogInteraction {
             .unwrap_or(0)
     }
 
-    fn lines_behind(&self, log: &WorkflowRunStepLog) -> usize {
+    fn lines_behind(&self, log: &FilteredLog<'_>) -> usize {
         self.lines_behind_from(log, self.top_index(log))
     }
 
-    fn lines_behind_from(&self, log: &WorkflowRunStepLog, top: usize) -> usize {
+    fn lines_behind_from(&self, log: &FilteredLog<'_>, top: usize) -> usize {
         log.records
             .len()
             .saturating_sub(top.saturating_add(self.available_rows))
     }
 }
 
-fn maximum_horizontal_offset(log: &WorkflowRunStepLog, available_width: usize) -> usize {
+fn maximum_horizontal_offset(records: &[&WorkflowRunLogRecord], available_width: usize) -> usize {
     let gutter = LogGutter::for_width(available_width);
-    log.records
+    records
         .iter()
         .map(|record| {
             let line_width = gutter
@@ -1038,11 +1230,24 @@ impl HostInteraction {
             return HostControl::Continue;
         }
 
+        if let TerminalInputEvent::ToggleLogChannel(key) = event {
+            if let Some(step) = snapshot.steps.get(self.selected)
+                && self.log_filters.toggle(step, key)
+                && self.surface == HostSurface::FullLog
+            {
+                let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
+                let log = FilteredLog::new(&step.log, self.log_filters);
+                self.full_log.synchronize(&log, width, rows);
+            }
+            return HostControl::Continue;
+        }
+
         if self.surface == HostSurface::FullLog
             && let Some(step) = snapshot.steps.get(self.selected)
         {
-            let (width, rows) = full_log_record_dimensions(self.terminal_area, &step.log);
-            self.full_log.synchronize(&step.log, width, rows);
+            let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
+            let log = FilteredLog::new(&step.log, self.log_filters);
+            self.full_log.synchronize(&log, width, rows);
         }
 
         if self.surface == HostSurface::FullLog
@@ -1051,7 +1256,8 @@ impl HostInteraction {
                 vertical_navigation(event),
             )
         {
-            self.full_log.navigate(&step.log, navigation);
+            let log = FilteredLog::new(&step.log, self.log_filters);
+            self.full_log.navigate(&log, navigation);
             return HostControl::Continue;
         }
 
@@ -1062,8 +1268,9 @@ impl HostInteraction {
                 self.surface = HostSurface::FullLog;
                 self.full_log = FullLogInteraction::default();
                 if let Some(step) = snapshot.steps.get(self.selected) {
-                    let (width, rows) = full_log_record_dimensions(self.terminal_area, &step.log);
-                    self.full_log.synchronize(&step.log, width, rows);
+                    let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
+                    let log = FilteredLog::new(&step.log, self.log_filters);
+                    self.full_log.synchronize(&log, width, rows);
                 }
             }
             TerminalInputEvent::Escape => {
@@ -1081,8 +1288,9 @@ impl HostInteraction {
                 if self.surface == HostSurface::FullLog =>
             {
                 if let Some(step) = snapshot.steps.get(self.selected) {
+                    let log = FilteredLog::new(&step.log, self.log_filters);
                     self.full_log
-                        .pan(&step.log, event == TerminalInputEvent::PanRight);
+                        .pan(&log, event == TerminalInputEvent::PanRight);
                 }
             }
             TerminalInputEvent::Follow if self.surface == HostSurface::FullLog => {
@@ -1107,6 +1315,7 @@ fn vertical_navigation(event: TerminalInputEvent) -> Option<VerticalNavigation> 
         TerminalInputEvent::PanLeft
         | TerminalInputEvent::PanRight
         | TerminalInputEvent::Follow
+        | TerminalInputEvent::ToggleLogChannel(_)
         | TerminalInputEvent::Help
         | TerminalInputEvent::Enter
         | TerminalInputEvent::Escape
@@ -1121,13 +1330,20 @@ fn operational_area(area: Rect) -> bool {
     area.width >= MINIMUM_WIDTH && area.height >= MINIMUM_HEIGHT
 }
 
-fn full_log_record_dimensions(area: Rect, log: &WorkflowRunStepLog) -> (usize, usize) {
-    let log_height = area.height.saturating_sub(5);
-    let inner_rows = usize::from(log_height.saturating_sub(2));
-    let marker_rows = usize::from(log.discarded_records != 0);
+fn full_log_record_dimensions(area: Rect, step: &WorkflowRunStepView) -> (usize, usize) {
+    let content_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(FOOTER_HEIGHT),
+    );
+    let sections = inspector_and_log_areas(content_area, inspector_desired_height(Some(step)));
+    let log_content = log_block(Borders::TOP, false).inner(sections[1]);
+    let records_area = log_content_areas(log_content)[1];
+    let marker_rows = usize::from(step.log.discarded_records != 0);
     (
-        usize::from(area.width.saturating_sub(2)),
-        inner_rows.saturating_sub(marker_rows),
+        usize::from(records_area.width),
+        usize::from(records_area.height).saturating_sub(marker_rows),
     )
 }
 
@@ -1146,41 +1362,66 @@ fn render(
         return;
     }
 
-    let sections = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    render_header(frame, sections[0], snapshot, color);
+    let sections =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(FOOTER_HEIGHT)]).split(area);
     if interaction.surface == HostSurface::FullLog {
-        if let Some(step) = snapshot.steps.get(interaction.selected) {
-            let (width, rows) = full_log_record_dimensions(area, &step.log);
-            interaction.full_log.synchronize(&step.log, width, rows);
+        let selected_step = snapshot.steps.get(interaction.selected);
+        if let Some(step) = selected_step {
+            let (width, rows) = full_log_record_dimensions(area, step);
+            let log = FilteredLog::new(&step.log, interaction.log_filters);
+            interaction.full_log.synchronize(&log, width, rows);
         }
+        let full_log_sections =
+            inspector_and_log_areas(sections[0], inspector_desired_height(selected_step));
+        render_inspector(
+            frame,
+            full_log_sections[0],
+            selected_step,
+            color,
+            Borders::NONE,
+        );
         render_full_log(
             frame,
-            sections[1],
-            snapshot.steps.get(interaction.selected),
+            full_log_sections[1],
+            selected_step,
             &interaction.full_log,
+            interaction.log_filters,
             color,
         );
         render_contextual_footer(
             frame,
-            sections[2],
+            sections[1],
             snapshot,
             color,
+            "LOG",
             &FULL_LOG_FOOTER_OPTIONS,
         );
     } else {
-        render_split_body(frame, sections[1], snapshot, graph, interaction, color);
-        render_contextual_footer(frame, sections[2], snapshot, color, &SPLIT_FOOTER_OPTIONS);
+        render_split_body(frame, sections[0], snapshot, graph, interaction, color);
+        render_contextual_footer(
+            frame,
+            sections[1],
+            snapshot,
+            color,
+            "DAG",
+            &SPLIT_FOOTER_OPTIONS,
+        );
+        if sections[0].width >= WIDE_LAYOUT_WIDTH && !interaction.help_visible {
+            let columns = wide_split_columns(sections[0]);
+            render_junction(
+                frame,
+                columns[1].x.saturating_sub(1),
+                sections[1].y,
+                "┴",
+                color,
+            );
+        }
     }
 
     if interaction.help_visible {
         render_help_overlay(
             frame,
-            area,
+            sections[0],
             interaction.surface,
             lifecycle_control(snapshot),
             color,
@@ -1202,32 +1443,89 @@ fn render_split_body(
     // jscpd:ignore-end
     let selected_step = snapshot.steps.get(interaction.selected);
     if area.width >= WIDE_LAYOUT_WIDTH {
-        let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(area);
-        let right = inspector_and_log_areas(
-            columns[1],
-            inspector_desired_height(selected_step, columns[1].width),
+        let columns = wide_split_columns(area);
+        let left = Layout::vertical([
+            Constraint::Length(WORKFLOW_SUMMARY_HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(columns[0]);
+        let right = inspector_and_log_areas(columns[1], inspector_desired_height(selected_step));
+        render_workflow_summary(
+            frame,
+            left[0],
+            snapshot,
+            color,
+            Borders::BOTTOM | Borders::RIGHT,
         );
-        render_steps(frame, columns[0], snapshot, graph, interaction, color);
-        render_inspector(frame, right[0], selected_step, color);
-        render_log(frame, right[1], snapshot, interaction, color);
+        render_steps(
+            frame,
+            left[1],
+            snapshot,
+            graph,
+            interaction,
+            color,
+            StepPanel {
+                borders: Borders::RIGHT,
+                show_title: false,
+            },
+        );
+        render_inspector(frame, right[0], selected_step, color, Borders::NONE);
+        render_log(frame, right[1], snapshot, interaction, color, Borders::TOP);
+
+        let divider_x = columns[1].x.saturating_sub(1);
+        render_junction(
+            frame,
+            divider_x,
+            left[0].y.saturating_add(left[0].height).saturating_sub(1),
+            "┼",
+            color,
+        );
+        render_junction(frame, divider_x, right[1].y, "├", color);
     } else {
-        let dag_height = (area.height / 5).clamp(3, 8);
-        let remaining_height = area.height.saturating_sub(dag_height);
-        let inspector_height = bounded_inspector_height(
-            remaining_height,
-            inspector_desired_height(selected_step, area.width),
-        );
+        let body_height = area.height.saturating_sub(WORKFLOW_SUMMARY_HEIGHT);
+        let dag_height = (body_height / 3).clamp(5, 10);
+        let remaining_height = body_height.saturating_sub(dag_height);
+        let inspector_height =
+            bounded_inspector_height(remaining_height, inspector_desired_height(selected_step));
         let rows = Layout::vertical([
+            Constraint::Length(WORKFLOW_SUMMARY_HEIGHT),
             Constraint::Length(dag_height),
             Constraint::Length(inspector_height),
             Constraint::Min(MINIMUM_LOG_HEIGHT),
         ])
         .split(area);
-        render_steps(frame, rows[0], snapshot, graph, interaction, color);
-        render_inspector(frame, rows[1], selected_step, color);
-        render_log(frame, rows[2], snapshot, interaction, color);
+        render_workflow_summary(frame, rows[0], snapshot, color, Borders::BOTTOM);
+        render_steps(
+            frame,
+            rows[1],
+            snapshot,
+            graph,
+            interaction,
+            color,
+            StepPanel {
+                borders: Borders::NONE,
+                show_title: false,
+            },
+        );
+        render_inspector(frame, rows[2], selected_step, color, Borders::TOP);
+        render_log(frame, rows[3], snapshot, interaction, color, Borders::TOP);
     }
+}
+
+fn wide_split_columns(area: Rect) -> [Rect; 2] {
+    let columns = Layout::horizontal([
+        Constraint::Percentage(SPLIT_WORKFLOW_PERCENTAGE),
+        Constraint::Percentage(100 - SPLIT_WORKFLOW_PERCENTAGE),
+    ])
+    .split(area);
+    [columns[0], columns[1]]
+}
+
+fn render_junction(frame: &mut Frame<'_>, x: u16, y: u16, symbol: &'static str, color: bool) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(symbol, separator_style(color))),
+        Rect::new(x, y, 1, 1),
+    );
 }
 
 fn inspector_and_log_areas(area: Rect, desired_inspector_height: u16) -> [Rect; 2] {
@@ -1246,11 +1544,32 @@ fn bounded_inspector_height(available_height: u16, desired_height: u16) -> u16 {
     desired_height.clamp(minimum_height, maximum_height)
 }
 
-fn inspector_desired_height(step: Option<&WorkflowRunStepView>, width: u16) -> u16 {
-    let row_count = step.map_or(1, |step| inspector_row_count(step, width));
-    u16::try_from(row_count)
+fn inspector_desired_height(step: Option<&WorkflowRunStepView>) -> u16 {
+    let body_height = step.map_or(1, |step| {
+        inspector_detail_row_count(step)
+            .saturating_add(1)
+            .saturating_add(inspector_outputs_desired_height(step))
+    });
+    u16::try_from(body_height)
         .unwrap_or(u16::MAX)
-        .saturating_add(2)
+        .saturating_add(INSPECTOR_HEADER_HEIGHT)
+}
+
+fn inspector_outputs_desired_height(step: &WorkflowRunStepView) -> usize {
+    if step.outputs.is_empty() {
+        4
+    } else {
+        inspector_outputs_desired_height_for_count(step.outputs.len())
+    }
+}
+
+fn section_block(borders: Borders, color: bool) -> Block<'static> {
+    let has_side_border = borders.contains(Borders::LEFT) || borders.contains(Borders::RIGHT);
+    let padding = u16::from(!has_side_border);
+    Block::default()
+        .borders(borders)
+        .border_style(separator_style(color))
+        .padding(Padding::horizontal(padding))
 }
 
 fn render_too_small(
@@ -1277,49 +1596,91 @@ fn render_too_small(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(separator_style(color))
                 .title(" Scherzo workflow run "),
         ),
         area,
     );
 }
 
-fn render_header(
+fn render_workflow_summary(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &WorkflowRunViewSnapshot,
     color: bool,
+    borders: Borders,
 ) {
-    let counts = step_counts(snapshot);
-    let status = workflow_status(&snapshot.workflow);
-    let first = Line::from(vec![
-        Span::styled(
-            visible_text(&snapshot.workflow_path),
-            tone_style(color, Tone::Primary),
-        ),
-        Span::raw("  "),
-        Span::styled(status, tone_style(color, workflow_tone(&snapshot.workflow))),
-        Span::raw(format!(
-            "  {}  concurrency {}  {}",
-            human_duration(snapshot.timing.duration),
-            snapshot.maximum_parallel_steps,
-            publication_status(snapshot),
-        )),
-    ]);
-    let second = Line::from(format!(
-        "pending {} | active {} | succeeded {} | failed {} | blocked {} | not-run {} | cancelled {}",
-        counts.pending,
-        counts.active,
-        counts.succeeded,
-        counts.failed,
-        counts.blocked,
-        counts.not_run,
-        counts.cancelled,
-    ));
+    let block = Block::default()
+        .borders(borders)
+        .border_style(separator_style(color))
+        .padding(Padding::horizontal(2));
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+
+    let duration = human_duration(snapshot.timing.duration);
+    let (status, status_tone) = workflow_header_status(snapshot);
+    let status_width = display_width(status)
+        .saturating_add(2)
+        .saturating_add(display_width(&duration));
+    let status_width = status_width.min(usize::from(content.width));
+    let title_width = usize::from(content.width)
+        .saturating_sub(status_width)
+        .saturating_sub(2);
+    let title = ellipsize(&workflow_display_name(&snapshot.workflow_path), title_width);
+
+    if !title.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                title,
+                tone_style(color, Tone::Primary).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(
+                content.x,
+                content.y,
+                u16::try_from(title_width).unwrap_or(u16::MAX),
+                1,
+            ),
+        );
+    }
+
+    let status_width = u16::try_from(status_width).unwrap_or(content.width);
     frame.render_widget(
-        Paragraph::new(vec![first, second])
-            .block(Block::default().borders(Borders::ALL).title(" Workflow ")),
-        area,
+        Paragraph::new(Line::from(vec![
+            Span::styled(status, tone_style(color, status_tone)),
+            Span::raw("  "),
+            Span::styled(duration, tone_style(color, Tone::Muted)),
+        ])),
+        Rect::new(
+            content.right().saturating_sub(status_width),
+            content.y,
+            status_width,
+            1,
+        ),
     );
+
+    let counts = step_count_summary(&step_counts(snapshot), snapshot.steps.len());
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            ellipsize(&counts, usize::from(content.width)),
+            tone_style(color, Tone::Muted),
+        )),
+        Rect::new(content.x, content.y.saturating_add(1), content.width, 1),
+    );
+}
+
+fn workflow_display_name(workflow_path: &str) -> String {
+    std::path::Path::new(workflow_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(visible_text)
+        .unwrap_or_else(|| visible_text(workflow_path))
+}
+
+#[derive(Clone, Copy)]
+struct StepPanel {
+    borders: Borders,
+    show_title: bool,
 }
 
 fn render_steps(
@@ -1329,8 +1690,15 @@ fn render_steps(
     graph: &DagLayout,
     interaction: &HostInteraction,
     color: bool,
+    panel: StepPanel,
 ) {
-    let available_width = usize::from(area.width.saturating_sub(2));
+    let mut block = Block::default()
+        .borders(panel.borders)
+        .border_style(separator_style(color));
+    if panel.show_title {
+        block = block.title(format!(" Steps ({}) ", snapshot.steps.len()));
+    }
+    let available_width = usize::from(block.inner(area).width);
     let columns = StepColumns::for_steps(available_width, graph.gutter_width(), &snapshot.steps);
     let connector_style = graph_connector_style(color);
     let items =
@@ -1341,7 +1709,7 @@ fn render_steps(
             .enumerate()
             .map(|(index, (step, graph_row))| {
                 let selected = index == interaction.selected;
-                let marker = if selected { "> " } else { "  " };
+                let marker = if selected { "▏ " } else { "  " };
                 let id = padded_text(&visible_text(&step.id), columns.id_width);
                 let duration = step
                     .timing
@@ -1349,15 +1717,12 @@ fn render_steps(
                     .map(|timing| human_duration(timing.duration))
                     .unwrap_or_else(|| "-".to_owned());
                 let mut spans = vec![
-                    Span::raw(marker),
+                    Span::styled(marker, selection_marker_style(color)),
                     Span::styled(graph_row.before_node.clone(), connector_style),
-                    Span::styled(
-                        step_state_glyph(step.state),
-                        step_state_style(step.state, color),
-                    ),
+                    Span::styled(step_state_glyph(step), step_state_style(step.state, color)),
                     Span::styled(graph_row.after_node.clone(), connector_style),
                     Span::raw(" "),
-                    Span::styled(id, tone_style(color, Tone::Primary)),
+                    Span::styled(id, step_identity_style(step.state, color)),
                 ];
                 if columns.kind {
                     spans.push(Span::raw("  "));
@@ -1369,7 +1734,7 @@ fn render_steps(
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     padded_text(&duration, columns.duration_width),
-                    tone_style(color, Tone::Muted),
+                    step_duration_style(step.state, color),
                 ));
                 if columns.detail {
                     spans.push(Span::raw("  "));
@@ -1380,18 +1745,17 @@ fn render_steps(
                         ));
                     }
                 }
-                let item = ListItem::new(Line::from(spans));
+                let mut node_line = Line::from(spans);
                 if selected {
-                    item.style(Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    item
+                    node_line = node_line.style(step_selection_style(color));
                 }
+                let connector_line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(graph_row.below_node.clone(), connector_style),
+                ]);
+                ListItem::new(vec![node_line, connector_line])
             });
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Steps ({}) ", snapshot.steps.len())),
-    );
+    let list = List::new(items).block(block);
     let mut state = ListState::default();
     if !snapshot.steps.is_empty() {
         state.select(Some(interaction.selected));
@@ -1416,19 +1780,14 @@ impl InspectorField {
     }
 }
 
-#[derive(Clone)]
-enum InspectorRow {
-    Fields(Vec<InspectorField>),
-    Section(&'static str),
-}
-
-impl InspectorRow {
-    fn item_count(&self) -> usize {
-        match self {
-            Self::Fields(fields) => fields.len(),
-            Self::Section(_) => 0,
-        }
-    }
+struct InspectorOutput {
+    marker: &'static str,
+    marker_tone: Tone,
+    name: String,
+    kind: &'static str,
+    detail: String,
+    disposition: String,
+    tone: Tone,
 }
 
 fn render_inspector(
@@ -1436,33 +1795,133 @@ fn render_inspector(
     area: Rect,
     step: Option<&WorkflowRunStepView>,
     color: bool,
+    borders: Borders,
 ) {
-    let Some(step) = step else {
+    let sections = Layout::vertical([
+        Constraint::Length(INSPECTOR_HEADER_HEIGHT),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    let mut header_borders = Borders::BOTTOM;
+    for border in [Borders::TOP, Borders::LEFT, Borders::RIGHT] {
+        if borders.contains(border) {
+            header_borders |= border;
+        }
+    }
+
+    let header =
+        section_block(header_borders, color).padding(Padding::horizontal(INSPECTOR_PANEL_PADDING));
+    let header_content = header.inner(sections[0]);
+    frame.render_widget(header, sections[0]);
+    if let Some(step) = step {
+        render_selected_step_header(frame, header_content, step, color);
+    } else {
         frame.render_widget(
-            Paragraph::new("No workflow steps.").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Selected step "),
-            ),
-            area,
+            Paragraph::new(Span::styled(
+                "Selected step",
+                tone_style(color, Tone::Primary).add_modifier(Modifier::BOLD),
+            )),
+            header_content,
+        );
+    }
+
+    let mut output_borders = Borders::NONE;
+    for border in [Borders::LEFT, Borders::RIGHT, Borders::BOTTOM] {
+        if borders.contains(border) {
+            output_borders |= border;
+        }
+    }
+    let Some(step) = step else {
+        let block = section_block(output_borders, color)
+            .padding(Padding::horizontal(INSPECTOR_PANEL_PADDING));
+        frame.render_widget(
+            Paragraph::new("No workflow steps.").block(block),
+            sections[1],
         );
         return;
     };
 
-    let total_rows = inspector_row_count(step, area.width);
-    let total_items = inspector_item_count(step);
-    let available_rows = usize::from(area.height.saturating_sub(2));
+    let available_body_height = sections[1].height;
+    let desired_detail_height = u16::try_from(inspector_detail_row_count(step))
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    let maximum_detail_height = available_body_height
+        .saturating_sub(MINIMUM_OUTPUT_PANEL_HEIGHT.min(available_body_height));
+    let detail_height = desired_detail_height.min(maximum_detail_height);
+    let body_sections = Layout::vertical([Constraint::Length(detail_height), Constraint::Min(0)])
+        .split(sections[1]);
+
+    if detail_height != 0 {
+        let mut detail_borders = Borders::BOTTOM;
+        for border in [Borders::LEFT, Borders::RIGHT] {
+            if borders.contains(border) {
+                detail_borders |= border;
+            }
+        }
+        render_inspector_panel(
+            frame,
+            body_sections[0],
+            color,
+            detail_borders,
+            |content_area| inspector_detail_lines(step, content_area, color),
+        );
+        if body_sections[0].x != 0 && !borders.contains(Borders::LEFT) {
+            render_junction(
+                frame,
+                body_sections[0].x.saturating_sub(1),
+                body_sections[0].bottom().saturating_sub(1),
+                "├",
+                color,
+            );
+        }
+    }
+    render_inspector_panel(
+        frame,
+        body_sections[1],
+        color,
+        output_borders,
+        |content_area| {
+            inspector_output_lines(
+                &inspector_outputs(step),
+                content_area.width,
+                content_area.height,
+                color,
+            )
+        },
+    );
+}
+
+fn render_inspector_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    color: bool,
+    borders: Borders,
+    content: impl FnOnce(Rect) -> Vec<Line<'static>>,
+) {
+    let block = section_block(borders, color).padding(Padding::horizontal(INSPECTOR_PANEL_PADDING));
+    let content_area = block.inner(area);
+    frame.render_widget(Paragraph::new(content(content_area)).block(block), area);
+}
+
+fn inspector_detail_lines(
+    step: &WorkflowRunStepView,
+    content_area: Rect,
+    color: bool,
+) -> Vec<Line<'static>> {
+    let total_rows = inspector_detail_row_count(step);
+    let total_items = inspector_fixed_field_count(step);
+    let available_rows = usize::from(content_area.height);
     let overflowing = total_rows > available_rows;
     let regular_row_limit = if overflowing {
         available_rows.saturating_sub(1)
     } else {
         total_rows
     };
-    let rows = inspector_rows(step, area.width, regular_row_limit);
-    let rendered_items = rows.iter().map(InspectorRow::item_count).sum::<usize>();
-    let mut lines = rows
+    let fields = inspector_fields_for_rows(step, content_area.width, regular_row_limit);
+    let rendered_items = fields.len();
+    let mut lines = fields
         .iter()
-        .map(|row| inspector_row_line(row, area.width, color))
+        .map(|field| inspector_field_line(field, content_area.width, color))
         .collect::<Vec<_>>();
     if overflowing && available_rows != 0 {
         let omitted = total_items.saturating_sub(rendered_items);
@@ -1471,43 +1930,98 @@ fn render_inspector(
             tone_style(color, Tone::Muted),
         )));
     }
+    lines
+}
 
+fn render_selected_step_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    step: &WorkflowRunStepView,
+    color: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let status = selected_step_status_title(step, color);
+    let status_width = u16::try_from(status.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let title_width = area.width.saturating_sub(status_width.saturating_add(2));
+    if title_width != 0 {
+        frame.render_widget(
+            Paragraph::new(selected_step_title(step, color, usize::from(title_width))),
+            Rect::new(area.x, area.y, title_width, 1),
+        );
+    }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Selected step "),
+        Paragraph::new(status).alignment(Alignment::Right),
+        Rect::new(
+            area.right().saturating_sub(status_width),
+            area.y,
+            status_width,
+            1,
         ),
-        area,
     );
 }
 
-fn inspector_row_count(step: &WorkflowRunStepView, width: u16) -> usize {
-    let column_count = inspector_column_count(width);
-    let field_rows = inspector_fixed_field_count(step).div_ceil(column_count);
-    if step.outputs.is_empty() {
-        field_rows
+fn selected_step_title(
+    step: &WorkflowRunStepView,
+    color: bool,
+    maximum_width: usize,
+) -> Line<'static> {
+    let badge = format!(" {} ", step_kind(&step.definition));
+    let fixed_width = 5_usize.saturating_add(display_width(&badge));
+    let id = ellipsize(
+        &visible_text(&step.id),
+        maximum_width.saturating_sub(fixed_width),
+    );
+    Line::from(vec![
+        Span::styled(step_state_glyph(step), step_state_style(step.state, color)),
+        Span::raw("  "),
+        Span::styled(
+            id,
+            tone_style(color, Tone::Primary).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(badge, step_kind_badge_style(color)),
+    ])
+}
+
+fn step_kind_badge_style(color: bool) -> Style {
+    let style = tone_style(color, Tone::Muted);
+    if color {
+        style.bg(Color::Rgb(49, 50, 68))
     } else {
-        field_rows
-            .saturating_add(1)
-            .saturating_add(step.outputs.len().div_ceil(column_count))
+        style
     }
 }
 
-fn inspector_item_count(step: &WorkflowRunStepView) -> usize {
-    inspector_fixed_field_count(step).saturating_add(step.outputs.len())
+fn selected_step_status_title(step: &WorkflowRunStepView, color: bool) -> Line<'static> {
+    let style = tone_style(color, step_state_tone(step.state));
+    let mut spans = vec![Span::styled(step_state_label(step.state), style)];
+    if let Some(timing) = &step.timing {
+        let duration = if timing.frozen && step_state_is_active(step.state) {
+            format!("{} interrupted", human_duration(timing.duration))
+        } else {
+            human_duration(timing.duration)
+        };
+        spans.push(Span::styled(" · ", style));
+        spans.push(Span::styled(duration, style));
+    }
+    Line::from(spans)
+}
+
+fn inspector_detail_row_count(step: &WorkflowRunStepView) -> usize {
+    inspector_fixed_field_count(step)
 }
 
 fn inspector_fixed_field_count(step: &WorkflowRunStepView) -> usize {
     let mut count = 3;
     if inspector_timing(step).is_some() {
-        count += 2;
+        count += 1;
     }
     if inspector_fact_is_visible(step.fact.as_ref()) {
         count += 1;
-    }
-    if matches!(step.definition, WorkflowPresentationStep::Command { .. }) {
-        count += 3;
     }
     count
 }
@@ -1525,126 +2039,112 @@ fn inspector_fact_is_visible(fact: Option<&ObservedStepTransition>) -> bool {
     )
 }
 
-fn inspector_rows(
+fn inspector_fields_for_rows(
     step: &WorkflowRunStepView,
     width: u16,
     maximum_rows: usize,
-) -> Vec<InspectorRow> {
-    let column_count = inspector_column_count(width);
-    let column_width = inspector_column_width(width, column_count);
-    let fixed_field_count = inspector_fixed_field_count(step);
-    let fixed_row_count = fixed_field_count.div_ceil(column_count);
-    let fixed_rows_to_render = fixed_row_count.min(maximum_rows);
-    let maximum_fields = fixed_rows_to_render
-        .saturating_mul(column_count)
-        .min(fixed_field_count);
-    let fields = inspector_fields(step, column_width, maximum_fields);
-    let mut rows = fields
-        .chunks(column_count)
-        .map(|fields| InspectorRow::Fields(fields.to_vec()))
-        .collect::<Vec<_>>();
-    if rows.len() >= maximum_rows || step.outputs.is_empty() {
-        return rows;
-    }
+) -> Vec<InspectorField> {
+    let maximum_fields = maximum_rows.min(inspector_fixed_field_count(step));
+    inspector_fields(step, usize::from(width), maximum_fields)
+}
 
-    rows.push(InspectorRow::Section("Outputs"));
-    if rows.len() >= maximum_rows {
-        return rows;
-    }
-
-    let maximum_output_fields = maximum_rows
-        .saturating_sub(rows.len())
-        .saturating_mul(column_count);
-    let output_fields = step
-        .outputs
+fn inspector_outputs(step: &WorkflowRunStepView) -> Vec<InspectorOutput> {
+    let declarations = step.definition.outputs();
+    step.outputs
         .iter()
-        .take(maximum_output_fields)
         .map(|(name, disposition)| {
-            let (disposition, tone) = output_disposition(*disposition);
-            InspectorField::new("Output", format!("{name} · {disposition}"), tone)
+            let (disposition, tone, marker, marker_tone) = output_disposition(*disposition);
+            let (kind, detail) = declarations
+                .get(name)
+                .map_or(("output", "—".to_owned()), output_description);
+            InspectorOutput {
+                marker,
+                marker_tone,
+                name: visible_text(name),
+                kind,
+                detail,
+                disposition,
+                tone,
+            }
         })
-        .collect::<Vec<_>>();
-    rows.extend(
-        output_fields
-            .chunks(column_count)
-            .map(|fields| InspectorRow::Fields(fields.to_vec())),
-    );
-    rows
+        .collect()
 }
 
 fn inspector_fields(
     step: &WorkflowRunStepView,
-    column_width: usize,
+    content_width: usize,
     maximum_fields: usize,
 ) -> Vec<InspectorField> {
     let mut fields = Vec::with_capacity(maximum_fields);
-    push_inspector_field(&mut fields, maximum_fields, || {
-        InspectorField::new("ID", &step.id, Tone::Primary)
-    });
-    push_inspector_field(&mut fields, maximum_fields, || {
-        InspectorField::new("Kind", step_kind(&step.definition), Tone::Neutral)
-    });
-    push_inspector_field(&mut fields, maximum_fields, || {
-        InspectorField::new(
-            "State",
-            step_state_label(step.state),
-            step_state_tone(step.state),
-        )
-    });
+    let direct_dependencies = match &step.definition {
+        WorkflowPresentationStep::Command {
+            argv,
+            cwd,
+            direct_dependencies,
+            ..
+        } => {
+            push_inspector_field(&mut fields, maximum_fields, || {
+                let command = argv
+                    .iter()
+                    .map(|argument| shell_quote(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                InspectorField::new("command", command, Tone::Neutral)
+            });
+            push_inspector_field(&mut fields, maximum_fields, || {
+                InspectorField::new("cwd", cwd.as_deref().unwrap_or("."), Tone::Neutral)
+            });
+            direct_dependencies
+        }
+        WorkflowPresentationStep::Agent {
+            profile,
+            harness,
+            direct_dependencies,
+            ..
+        } => {
+            push_inspector_field(&mut fields, maximum_fields, || {
+                InspectorField::new("profile", profile, Tone::Neutral)
+            });
+            push_inspector_field(&mut fields, maximum_fields, || {
+                InspectorField::new("harness", harness_description(harness), Tone::Neutral)
+            });
+            direct_dependencies
+        }
+    };
 
     let timing = inspector_timing(step);
     if let Some(timing) = timing {
         push_inspector_field(&mut fields, maximum_fields, || {
-            let duration = if timing.frozen && step_state_is_active(step.state) {
-                format!("{} (interrupted)", human_duration(timing.duration))
-            } else {
-                human_duration(timing.duration)
-            };
-            InspectorField::new("Duration", duration, Tone::Neutral)
-        });
-    }
-    if fields.len() < maximum_fields
-        && let Some(fact) = inspector_fact(step.fact.as_ref())
-    {
-        fields.push(fact);
-    }
-    if let Some(timing) = timing {
-        push_inspector_field(&mut fields, maximum_fields, || {
             InspectorField::new(
-                "Started",
+                "started",
                 header_timestamp(timing.started_at),
                 Tone::Neutral,
             )
         });
     }
-    if let WorkflowPresentationStep::Command {
-        argv,
-        cwd,
-        direct_dependencies,
-        ..
-    } = &step.definition
+    push_inspector_field(&mut fields, maximum_fields, || {
+        let dependency_width = content_width.saturating_sub(INSPECTOR_LABEL_WIDTH);
+        InspectorField::new(
+            "depends on",
+            summarize_repeated_values(direct_dependencies, dependency_width),
+            Tone::Neutral,
+        )
+    });
+    if fields.len() < maximum_fields
+        && let Some(fact) = inspector_fact(step.fact.as_ref())
     {
-        push_inspector_field(&mut fields, maximum_fields, || {
-            let command = argv
-                .iter()
-                .map(|argument| shell_quote(argument))
-                .collect::<Vec<_>>()
-                .join(" ");
-            InspectorField::new("Command", command, Tone::Neutral)
-        });
-        push_inspector_field(&mut fields, maximum_fields, || {
-            InspectorField::new("Directory", cwd.as_deref().unwrap_or("."), Tone::Neutral)
-        });
-        push_inspector_field(&mut fields, maximum_fields, || {
-            let dependency_width = column_width.saturating_sub(14);
-            InspectorField::new(
-                "Dependencies",
-                summarize_repeated_values(direct_dependencies, dependency_width),
-                Tone::Neutral,
-            )
-        });
+        fields.push(fact);
     }
     fields
+}
+
+fn harness_description(harness: &AgentPresentationHarness) -> String {
+    match harness {
+        AgentPresentationHarness::Pi { model, thinking } => {
+            let thinking = format!("{thinking:?}").to_ascii_lowercase();
+            format!("pi · {} · thinking={thinking}", visible_text(model))
+        }
+    }
 }
 
 fn push_inspector_field(
@@ -1654,23 +2154,6 @@ fn push_inspector_field(
 ) {
     if fields.len() < maximum_fields {
         fields.push(field());
-    }
-}
-
-fn inspector_column_count(width: u16) -> usize {
-    if width >= TWO_COLUMN_INSPECTOR_WIDTH {
-        2
-    } else {
-        1
-    }
-}
-
-fn inspector_column_width(width: u16, column_count: usize) -> usize {
-    let inner_width = usize::from(width.saturating_sub(2));
-    if column_count == 2 {
-        inner_width.saturating_sub(2) / 2
-    } else {
-        inner_width
     }
 }
 
@@ -1690,19 +2173,19 @@ fn inspector_timing(
 fn inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<InspectorField> {
     match fact? {
         ObservedStepTransition::Failed { phase, cause } => Some(InspectorField::new(
-            "Failure",
+            "failure",
             failure_detail(*phase, cause),
             Tone::Failure,
         )),
         ObservedStepTransition::Blocked { dependency } => {
-            Some(InspectorField::new("Blocked by", dependency, Tone::Blocked))
+            Some(InspectorField::new("blocked by", dependency, Tone::Blocked))
         }
         ObservedStepTransition::NotRun { .. } => {
-            Some(InspectorField::new("Not run", "failure_stop", Tone::Muted))
+            Some(InspectorField::new("not run", "failure_stop", Tone::Muted))
         }
         ObservedStepTransition::Cancelling { reason }
         | ObservedStepTransition::Cancelled { reason } => Some(InspectorField::new(
-            "Cancellation",
+            "cancellation",
             cancellation_reason(*reason),
             Tone::Blocked,
         )),
@@ -1710,10 +2193,16 @@ fn inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<InspectorFiel
     }
 }
 
-fn output_disposition(disposition: WorkflowRunOutputDisposition) -> (String, Tone) {
+fn output_disposition(
+    disposition: WorkflowRunOutputDisposition,
+) -> (String, Tone, &'static str, Tone) {
     match disposition {
-        WorkflowRunOutputDisposition::Pending => ("pending".to_owned(), Tone::Muted),
-        WorkflowRunOutputDisposition::Committed => ("committed".to_owned(), Tone::Output),
+        WorkflowRunOutputDisposition::Pending => {
+            ("pending".to_owned(), Tone::Muted, "○", Tone::Muted)
+        }
+        WorkflowRunOutputDisposition::Committed => {
+            ("captured".to_owned(), Tone::Success, "✓", Tone::Success)
+        }
         WorkflowRunOutputDisposition::Unavailable(reason) => {
             let reason = match reason {
                 WorkflowRunOutputUnavailableReason::Failed => "failed",
@@ -1721,8 +2210,21 @@ fn output_disposition(disposition: WorkflowRunOutputDisposition) -> (String, Ton
                 WorkflowRunOutputUnavailableReason::NotRun => "not-run",
                 WorkflowRunOutputUnavailableReason::Cancelled => "cancelled",
             };
-            (format!("unavailable ({reason})"), Tone::Blocked)
+            (
+                format!("unavailable ({reason})"),
+                Tone::Blocked,
+                "–",
+                Tone::Blocked,
+            )
         }
+    }
+}
+
+fn output_description(output: &WorkflowOutput) -> (&'static str, String) {
+    match output {
+        WorkflowOutput::AgentResponse => ("agent_response", "—".to_owned()),
+        WorkflowOutput::AgentResult { schema } => ("agent_result", visible_text(schema)),
+        WorkflowOutput::File { path, .. } => ("file", visible_text(path)),
     }
 }
 
@@ -1770,55 +2272,176 @@ fn summarize_repeated_values(values: &[String], maximum_width: usize) -> String 
     format!("{}{suffix}", ellipsize(&first, prefix_width))
 }
 
-fn inspector_row_line(row: &InspectorRow, width: u16, color: bool) -> Line<'static> {
-    match row {
-        InspectorRow::Section(title) => Line::from(Span::styled(
-            (*title).to_owned(),
-            tone_style(color, Tone::Primary),
-        )),
-        InspectorRow::Fields(fields) => {
-            let column_count = inspector_column_count(width);
-            let column_width = inspector_column_width(width, column_count);
-            let mut spans = Vec::new();
-            for (index, field) in fields.iter().enumerate() {
-                spans.extend(inspector_field_spans(
-                    field,
-                    column_width,
-                    index + 1 < fields.len(),
-                    color,
-                ));
-                if index + 1 < fields.len() {
-                    spans.push(Span::raw("  "));
-                }
-            }
-            Line::from(spans)
-        }
-    }
+fn inspector_field_line(field: &InspectorField, width: u16, color: bool) -> Line<'static> {
+    Line::from(inspector_field_spans(field, usize::from(width), color))
 }
 
 fn inspector_field_spans(
     field: &InspectorField,
     maximum_width: usize,
-    pad: bool,
     color: bool,
 ) -> Vec<Span<'static>> {
-    let raw_label = format!("{}: ", field.label);
-    let label = ellipsize(&raw_label, maximum_width);
-    let label_width = display_width(&label);
+    let label_width = INSPECTOR_LABEL_WIDTH.min(maximum_width);
+    let label = padded_text(field.label, label_width);
     let value = if label_width < maximum_width {
         ellipsize(&field.value, maximum_width - label_width)
     } else {
         String::new()
     };
-    let used_width = label_width.saturating_add(display_width(&value));
     let mut spans = vec![Span::styled(label, tone_style(color, Tone::Muted))];
     if !value.is_empty() {
         spans.push(Span::styled(value, tone_style(color, field.tone)));
     }
-    if pad && used_width < maximum_width {
-        spans.push(Span::raw(" ".repeat(maximum_width - used_width)));
-    }
     spans
+}
+
+fn inspector_output_lines(
+    outputs: &[InspectorOutput],
+    width: u16,
+    height: u16,
+    color: bool,
+) -> Vec<Line<'static>> {
+    let available_rows = usize::from(height);
+    if available_rows == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        "OUTPUTS",
+        tone_style(color, Tone::Muted),
+    ))];
+    if outputs.is_empty() {
+        if available_rows >= 3 {
+            lines.push(Line::default());
+        }
+        if lines.len() < available_rows {
+            lines.push(Line::from(Span::styled(
+                "·  —  none declared",
+                tone_style(color, Tone::Muted),
+            )));
+        }
+        if lines.len() < available_rows {
+            lines.push(Line::default());
+        }
+        return lines;
+    }
+
+    if available_rows >= 4 {
+        lines.push(Line::default());
+    }
+    let remaining_rows = available_rows.saturating_sub(lines.len());
+    if remaining_rows == 1 {
+        if outputs.len() == 1 {
+            lines.push(inspector_output_summary_line(&outputs[0], width, color));
+        } else {
+            lines.push(inspector_outputs_omitted_line(outputs.len(), color));
+        }
+        return lines;
+    }
+
+    let include_gaps = inspector_outputs_desired_height_for_count(outputs.len()) <= available_rows;
+    let all_fit = include_gaps || outputs.len().saturating_mul(2) <= remaining_rows;
+    let rendered_count = if all_fit {
+        outputs.len()
+    } else {
+        remaining_rows.saturating_sub(1) / 2
+    };
+    for (index, output) in outputs.iter().take(rendered_count).enumerate() {
+        if include_gaps && index != 0 {
+            lines.push(Line::default());
+        }
+        lines.push(inspector_output_summary_line(output, width, color));
+        lines.push(inspector_output_detail_line(output, width, color));
+    }
+    if rendered_count < outputs.len() && lines.len() < available_rows {
+        lines.push(inspector_outputs_omitted_line(
+            outputs.len() - rendered_count,
+            color,
+        ));
+    } else if lines.len() < available_rows {
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn inspector_outputs_desired_height_for_count(output_count: usize) -> usize {
+    3_usize
+        .saturating_add(output_count.saturating_mul(2))
+        .saturating_add(output_count.saturating_sub(1))
+}
+
+fn inspector_outputs_omitted_line(omitted: usize, color: bool) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("+{omitted} more outputs"),
+        tone_style(color, Tone::Muted),
+    ))
+}
+
+fn inspector_output_summary_line(
+    output: &InspectorOutput,
+    width: u16,
+    color: bool,
+) -> Line<'static> {
+    let available_width = usize::from(width);
+    let disposition_width = display_width(&output.disposition);
+    if available_width <= disposition_width {
+        return Line::from(Span::styled(
+            ellipsize(&output.disposition, available_width),
+            tone_style(color, output.tone),
+        ));
+    }
+
+    let gap_width = 2_usize.min(available_width - disposition_width);
+    let summary_width = available_width.saturating_sub(disposition_width + gap_width);
+    let marker = format!("{}  ", output.marker);
+    let marker_width = display_width(&marker).min(summary_width);
+    let mut spans = vec![Span::styled(
+        ellipsize(&marker, marker_width),
+        tone_style(color, output.marker_tone),
+    )];
+    let mut used_width = marker_width;
+    if used_width < summary_width {
+        let kind_width = display_width(output.kind);
+        let remaining_width = summary_width - used_width;
+        let name_width = if remaining_width > kind_width.saturating_add(2) {
+            remaining_width.saturating_sub(kind_width.saturating_add(2))
+        } else {
+            remaining_width
+        };
+        let name = ellipsize(&output.name, name_width);
+        used_width = used_width.saturating_add(display_width(&name));
+        spans.push(Span::styled(name, tone_style(color, Tone::Primary)));
+        if summary_width.saturating_sub(used_width) > kind_width.saturating_add(1) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(output.kind, tone_style(color, Tone::Muted)));
+            used_width = used_width.saturating_add(kind_width.saturating_add(2));
+        }
+    }
+    if used_width < summary_width {
+        spans.push(Span::raw(" ".repeat(summary_width - used_width)));
+    }
+    spans.push(Span::raw(" ".repeat(gap_width)));
+    spans.push(Span::styled(
+        output.disposition.clone(),
+        tone_style(color, output.tone),
+    ));
+    Line::from(spans)
+}
+
+fn inspector_output_detail_line(
+    output: &InspectorOutput,
+    width: u16,
+    color: bool,
+) -> Line<'static> {
+    let prefix = "   ";
+    let detail_width = usize::from(width).saturating_sub(display_width(prefix));
+    Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(
+            ellipsize(&output.detail, detail_width),
+            tone_style(color, Tone::Muted),
+        ),
+    ])
 }
 
 fn ellipsize(value: &str, maximum_width: usize) -> String {
@@ -2015,41 +2638,80 @@ fn graph_connector_style(color: bool) -> Style {
     style.add_modifier(Modifier::DIM)
 }
 
+fn selection_marker_style(color: bool) -> Style {
+    if color {
+        tone_style(true, Tone::Active)
+    } else {
+        Style::default()
+    }
+}
+
+fn step_selection_style(color: bool) -> Style {
+    if color {
+        Style::default().bg(Color::Rgb(49, 50, 68))
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+}
+
+fn step_identity_style(state: StepStateKind, color: bool) -> Style {
+    let tone = match state {
+        StepStateKind::Pending
+        | StepStateKind::Blocked
+        | StepStateKind::NotRun
+        | StepStateKind::Cancelled => Tone::Muted,
+        _ => Tone::Primary,
+    };
+    tone_style(color, tone)
+}
+
+fn step_duration_style(state: StepStateKind, color: bool) -> Style {
+    let tone = if step_state_is_active(state) {
+        Tone::Active
+    } else {
+        Tone::Muted
+    };
+    tone_style(color, tone)
+}
+
 fn render_log(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &WorkflowRunViewSnapshot,
     interaction: &HostInteraction,
     color: bool,
+    borders: Borders,
 ) {
     let Some(step) = snapshot.steps.get(interaction.selected) else {
-        render_missing_step_log(frame, area);
+        render_missing_step_log(frame, area, borders, color);
         return;
     };
-    let available_width = usize::from(area.width.saturating_sub(2));
-    let available_rows = usize::from(area.height.saturating_sub(2));
-    let lines = log_tail_lines(step, available_width, available_rows, color);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default().borders(Borders::ALL).title(log_title(
-                step,
-                LogTitleStatus::Following,
-                color,
-            )),
-        ),
+    let log = FilteredLog::new(&step.log, interaction.log_filters);
+    let records_area = render_log_surface(
+        frame,
         area,
+        borders,
+        Some(LogHeaderState {
+            step,
+            status: LogTitleStatus::Following,
+            filters: interaction.log_filters,
+            hidden_records: log.hidden_records,
+        }),
+        color,
     );
+    let lines = log_tail_lines(
+        step,
+        &log,
+        usize::from(records_area.width),
+        usize::from(records_area.height),
+        color,
+    );
+    frame.render_widget(Paragraph::new(Text::from(lines)), records_area);
 }
 
-fn render_missing_step_log(frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(
-        Paragraph::new("No workflow steps.").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Selected step log "),
-        ),
-        area,
-    );
+fn render_missing_step_log(frame: &mut Frame<'_>, area: Rect, borders: Borders, color: bool) {
+    let records_area = render_log_surface(frame, area, borders, None, color);
+    frame.render_widget(Paragraph::new("No workflow steps."), records_area);
 }
 
 fn render_full_log(
@@ -2057,24 +2719,33 @@ fn render_full_log(
     area: Rect,
     step: Option<&WorkflowRunStepView>,
     interaction: &FullLogInteraction,
+    filters: LogFilterState,
     color: bool,
 ) {
     let Some(step) = step else {
-        render_missing_step_log(frame, area);
+        render_missing_step_log(frame, area, Borders::ALL, color);
         return;
     };
+    let log = FilteredLog::new(&step.log, filters);
     let status = if interaction.follow {
         LogTitleStatus::Following
     } else {
         LogTitleStatus::Paused {
-            lines_behind: interaction.lines_behind(&step.log),
+            lines_behind: interaction.lines_behind(&log),
         }
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(log_title(step, status, color));
-    let mut records_area = block.inner(area);
-    frame.render_widget(block, area);
+    let mut records_area = render_log_surface(
+        frame,
+        area,
+        Borders::TOP,
+        Some(LogHeaderState {
+            step,
+            status,
+            filters,
+            hidden_records: log.hidden_records,
+        }),
+        color,
+    );
 
     if step.log.discarded_records != 0 && records_area.height != 0 {
         let marker_area = Rect::new(records_area.x, records_area.y, records_area.width, 1);
@@ -2092,10 +2763,10 @@ fn render_full_log(
     if records_area.is_empty() {
         return;
     }
-    if step.log.records.is_empty() {
+    if log.records.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                empty_log_message(step.state),
+                filtered_empty_log_message(step, log.hidden_records),
                 tone_style(color, Tone::Muted),
             ))),
             records_area,
@@ -2104,9 +2775,8 @@ fn render_full_log(
     }
 
     let available_width = usize::from(records_area.width);
-    let top = interaction.top_index(&step.log);
-    let lines = step
-        .log
+    let top = interaction.top_index(&log);
+    let lines = log
         .records
         .iter()
         .skip(top)
@@ -2126,36 +2796,199 @@ enum LogTitleStatus {
     Paused { lines_behind: usize },
 }
 
-fn log_title(step: &WorkflowRunStepView, status: LogTitleStatus, color: bool) -> Line<'static> {
-    let (status, tone) = match status {
-        LogTitleStatus::Following => ("following".to_owned(), Tone::Active),
-        LogTitleStatus::Paused { lines_behind } => {
-            let line_label = if lines_behind == 1 { "line" } else { "lines" };
-            (
-                format!("paused | {lines_behind} {line_label} behind"),
-                Tone::Blocked,
-            )
-        }
+#[derive(Clone, Copy)]
+struct LogHeaderState<'a> {
+    step: &'a WorkflowRunStepView,
+    status: LogTitleStatus,
+    filters: LogFilterState,
+    hidden_records: usize,
+}
+
+fn render_log_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    borders: Borders,
+    header: Option<LogHeaderState<'_>>,
+    color: bool,
+) -> Rect {
+    let block = log_block(borders, color);
+    let content_area = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = log_content_areas(content_area);
+    render_log_header(frame, sections[0], header, color);
+    sections[1]
+}
+
+fn log_block(borders: Borders, color: bool) -> Block<'static> {
+    section_block(borders, color).padding(Padding::horizontal(INSPECTOR_PANEL_PADDING))
+}
+
+fn log_content_areas(area: Rect) -> [Rect; 2] {
+    let rows =
+        Layout::vertical([Constraint::Length(LOG_HEADER_HEIGHT), Constraint::Min(0)]).split(area);
+    [rows[0], rows[1]]
+}
+
+fn render_log_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    header: Option<LogHeaderState<'_>>,
+    color: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let Some(LogHeaderState {
+        step,
+        status,
+        filters,
+        hidden_records,
+    }) = header
+    else {
+        frame.render_widget(
+            Paragraph::new(Span::styled("LOG", tone_style(color, Tone::Muted))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        return;
     };
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(status, tone_style(color, tone)),
-        Span::styled(
+
+    let full_channels = log_channel_title(step, filters, false, color);
+    let compact_channels = log_channel_title(step, filters, true, color);
+    let full_status = log_status_title(step, status, hidden_records, false, color);
+    let compact_status = log_status_title(step, status, hidden_records, true, color);
+    let available_width = usize::from(area.width);
+    let fits = |channels: &Line<'_>, status: &Line<'_>| {
+        channels
+            .width()
+            .saturating_add(2)
+            .saturating_add(status.width())
+            <= available_width
+    };
+    let (channels, status) = if fits(&full_channels, &full_status) {
+        (full_channels, full_status)
+    } else if fits(&compact_channels, &full_status) {
+        (compact_channels, full_status)
+    } else {
+        (compact_channels, compact_status)
+    };
+
+    let status_width = u16::try_from(status.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let channel_width = area.width.saturating_sub(status_width.saturating_add(2));
+    if channel_width >= 3 {
+        frame.render_widget(
+            Paragraph::new(channels),
+            Rect::new(area.x, area.y, channel_width, 1),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(status),
+        Rect::new(
+            area.right().saturating_sub(status_width),
+            area.y,
+            status_width,
+            1,
+        ),
+    );
+}
+
+fn log_channel_title(
+    step: &WorkflowRunStepView,
+    filters: LogFilterState,
+    compact: bool,
+    color: bool,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled("LOG", tone_style(color, Tone::Muted))];
+    let separator = if compact { " " } else { "  " };
+    for option in log_channel_options(step) {
+        let enabled = filters.includes(option.channel);
+        let style = if enabled {
+            tone_style(color, Tone::Neutral).add_modifier(Modifier::UNDERLINED)
+        } else {
+            tone_style(color, Tone::Muted).add_modifier(Modifier::DIM)
+        };
+        let label = if compact {
+            option.compact_label
+        } else {
+            option.label
+        };
+        spans.push(Span::raw(separator));
+        spans.push(Span::styled(format!("{} {label}", option.key), style));
+    }
+    Line::from(spans)
+}
+
+fn log_status_title(
+    step: &WorkflowRunStepView,
+    status: LogTitleStatus,
+    hidden_records: usize,
+    compact: bool,
+    color: bool,
+) -> Line<'static> {
+    let tone = match status {
+        LogTitleStatus::Following => Tone::Active,
+        LogTitleStatus::Paused { .. } => Tone::Blocked,
+    };
+    let text = if compact {
+        if hidden_records != 0 {
+            match status {
+                LogTitleStatus::Following => format!("● {hidden_records} hidden"),
+                LogTitleStatus::Paused { lines_behind } => {
+                    format!("● {lines_behind} back · {hidden_records} hidden")
+                }
+            }
+        } else if step.log.retained_records != step.log.observed_records {
             format!(
-                " | lines: {} retained / {} total | ",
+                "● {}/{} kept",
                 step.log.retained_records, step.log.observed_records
-            ),
-            tone_style(color, Tone::Muted),
-        ),
-        Span::styled(
-            format!("{} log ", visible_text(&step.id)),
-            tone_style(color, Tone::Primary),
-        ),
-    ])
+            )
+        } else {
+            match status {
+                LogTitleStatus::Following => {
+                    let line_label = if step.log.observed_records == 1 {
+                        "line"
+                    } else {
+                        "lines"
+                    };
+                    format!("● {} {line_label}", step.log.observed_records)
+                }
+                LogTitleStatus::Paused { lines_behind } => {
+                    format!("● {lines_behind} behind")
+                }
+            }
+        }
+    } else {
+        let status = match status {
+            LogTitleStatus::Following => "following".to_owned(),
+            LogTitleStatus::Paused { lines_behind } => {
+                let line_label = if lines_behind == 1 { "line" } else { "lines" };
+                format!("paused · {lines_behind} {line_label} behind")
+            }
+        };
+        let count = if hidden_records != 0 {
+            format!("{hidden_records} hidden")
+        } else if step.log.retained_records == step.log.observed_records {
+            let line_label = if step.log.observed_records == 1 {
+                "line"
+            } else {
+                "lines"
+            };
+            format!("{} {line_label}", step.log.observed_records)
+        } else {
+            format!(
+                "{} retained / {} total",
+                step.log.retained_records, step.log.observed_records
+            )
+        };
+        format!("● {status} · {count}")
+    };
+    Line::from(Span::styled(text, tone_style(color, tone)))
 }
 
 fn log_tail_lines(
     step: &WorkflowRunStepView,
+    log: &FilteredLog<'_>,
     available_width: usize,
     available_rows: usize,
     color: bool,
@@ -2175,16 +3008,15 @@ fn log_tail_lines(
         return lines;
     }
 
-    if step.log.records.is_empty() {
+    if log.records.is_empty() {
         lines.push(Line::from(Span::styled(
-            empty_log_message(step.state),
+            filtered_empty_log_message(step, log.hidden_records),
             tone_style(color, Tone::Muted),
         )));
         return lines;
     }
 
-    let record_lines = step
-        .log
+    let record_lines = log
         .records
         .iter()
         .flat_map(|record| log_record_lines(record, available_width, color))
@@ -2209,6 +3041,14 @@ fn log_eviction_line(discarded_records: u64, anchor_clamped: bool, color: bool) 
         format!("↑ {discarded_records} older {line_label} discarded{clamp_notice}"),
         tone_style(color, Tone::Muted),
     ))
+}
+
+fn filtered_empty_log_message(step: &WorkflowRunStepView, hidden_records: usize) -> &'static str {
+    if hidden_records != 0 {
+        "All log channels hidden."
+    } else {
+        empty_log_message(step.state)
+    }
 }
 
 fn empty_log_message(state: StepStateKind) -> &'static str {
@@ -2269,7 +3109,10 @@ fn log_line(
     color: bool,
 ) -> Line<'static> {
     let mut spans = gutter.spans(record, row_kind, color);
-    spans.push(Span::styled(payload, tone_style(color, Tone::Neutral)));
+    spans.push(Span::styled(
+        payload,
+        log_payload_style(record.source, color),
+    ));
     Line::from(spans)
 }
 
@@ -2314,6 +3157,75 @@ impl LogRowKind {
 }
 
 #[derive(Clone, Copy)]
+struct LogSourcePresentation {
+    label: &'static str,
+    source_tone: Tone,
+    payload_tone: Tone,
+    dim_payload: bool,
+}
+
+const fn log_source_presentation(source: WorkflowRunLogSource) -> LogSourcePresentation {
+    let (label, source_tone, payload_tone, dim_payload) = match source {
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput) => {
+            ("stdout", Tone::Muted, Tone::Neutral, false)
+        }
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardError) => {
+            ("stderr", Tone::Blocked, Tone::Neutral, false)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Assistant) => {
+            ("agent", Tone::Active, Tone::Primary, false)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Reasoning) => {
+            ("reason", Tone::Muted, Tone::Muted, true)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolCall) => {
+            ("tool", Tone::Active, Tone::Neutral, false)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolResult) => {
+            ("result", Tone::Muted, Tone::Muted, true)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Diagnostic) => {
+            ("diag", Tone::Blocked, Tone::Neutral, false)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Usage) => {
+            ("usage", Tone::Muted, Tone::Muted, true)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Model) => {
+            ("model", Tone::Muted, Tone::Muted, true)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Lifecycle) => {
+            ("life", Tone::Muted, Tone::Muted, true)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ValueRejected) => {
+            ("reject", Tone::Failure, Tone::Neutral, false)
+        }
+        WorkflowRunLogSource::Agent(AgentPresentationObservationKind::HarnessEvent) => {
+            ("event", Tone::Muted, Tone::Muted, true)
+        }
+    };
+    LogSourcePresentation {
+        label,
+        source_tone,
+        payload_tone,
+        dim_payload,
+    }
+}
+
+fn log_payload_style(source: WorkflowRunLogSource, color: bool) -> Style {
+    let presentation = log_source_presentation(source);
+    let style = tone_style(color, presentation.payload_tone);
+    if presentation.dim_payload {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
+fn log_source_style(source: WorkflowRunLogSource, color: bool) -> Style {
+    tone_style(color, log_source_presentation(source).source_tone)
+}
+
+#[derive(Clone, Copy)]
 struct LogGutter {
     timestamp: bool,
 }
@@ -2350,32 +3262,18 @@ impl LogGutter {
             spans.push(Span::styled(timestamp, tone_style(color, Tone::Muted)));
             spans.push(Span::raw(" "));
         }
-        let source = match record.source {
-            WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput) => "stdout",
-            WorkflowRunLogSource::Command(CommandOutputSource::StandardError) => "stderr",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Assistant) => "assist",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Reasoning) => "reason",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolCall) => "tool",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolResult) => "result",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Diagnostic) => "diag",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Usage) => "usage",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Model) => "model",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Lifecycle) => "life",
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ValueRejected) => {
-                "reject"
-            }
-            WorkflowRunLogSource::Agent(AgentPresentationObservationKind::HarnessEvent) => "event",
-        };
+        let source = log_source_presentation(record.source);
+        let source_style = log_source_style(record.source, color);
         spans.push(Span::styled(
-            format!("{source:<LOG_SOURCE_WIDTH$}"),
-            tone_style(color, Tone::Muted),
+            format!("{:<LOG_SOURCE_WIDTH$}", source.label),
+            source_style,
         ));
         let marker = match row_kind {
             LogRowKind::Record => " │ ",
             LogRowKind::SafetyContinuation => " ↪ ",
             LogRowKind::VisualContinuation => " ↳ ",
         };
-        spans.push(Span::styled(marker, tone_style(color, Tone::Muted)));
+        spans.push(Span::styled(marker, source_style));
         spans
     }
 }
@@ -2418,23 +3316,24 @@ fn lifecycle_control(snapshot: &WorkflowRunViewSnapshot) -> LifecycleControl {
 }
 
 const SPLIT_FOOTER_OPTIONS: [&[&str]; 3] = [
-    &["↑/k previous", "↓/j next", "Enter inspect log"],
-    &["↑/k up", "↓/j down", "Enter log"],
-    &["↑/k", "↓/j", "Enter"],
+    &["↑/k up", "↓/j down", "↵ open"],
+    &["↑/k up", "↓/j down", "↵ open"],
+    &["↑/k", "↓/j", "↵"],
 ];
 
 const FULL_LOG_FOOTER_OPTIONS: [&[&str]; 3] = [
     &[
         "Esc back",
-        "↑↓/jk move",
-        "PgUp/b PgDn/f/Space",
-        "u/Ctrl-U d/Ctrl-D half",
-        "g/G ends",
-        "←→/hl pan",
+        "↑/k up",
+        "↓/j down",
+        "PgUp/b page-up",
+        "PgDn/f page-down",
+        "←/h left",
+        "→/l right",
         "F follow",
     ],
-    &["Esc back", "↑↓/jk", "PgUp/PgDn", "←→/hl pan", "F follow"],
-    &["Esc back", "↑↓/jk", "F follow"],
+    &["Esc back", "↑/k", "↓/j", "PgUp/b", "PgDn/f", "F follow"],
+    &["Esc", "↑/k", "↓/j", "F"],
 ];
 
 fn render_contextual_footer(
@@ -2442,6 +3341,7 @@ fn render_contextual_footer(
     area: Rect,
     snapshot: &WorkflowRunViewSnapshot,
     color: bool,
+    label: &'static str,
     command_options: &[&[&str]],
 ) {
     let lifecycle = lifecycle_control(snapshot);
@@ -2456,7 +3356,9 @@ fn render_contextual_footer(
             )
         })
         .collect();
-    render_footer_text(frame, area, fitting_footer(options, area.width), color);
+    let reserved_width = u16::try_from(display_width(label).saturating_add(4)).unwrap_or(u16::MAX);
+    let text = fitting_footer(options, area.width.saturating_sub(reserved_width));
+    render_footer_text(frame, area, label, text, color);
 }
 
 fn footer_option(
@@ -2469,8 +3371,8 @@ fn footer_option(
         .map(|command| (*command).to_owned())
         .collect::<Vec<_>>();
     let lifecycle = match (lifecycle, abbreviate_lifecycle) {
-        (LifecycleControl::Cancel, false) => Some("Ctrl-C cancel"),
-        (LifecycleControl::Cancel, true) => Some("Ctrl-C"),
+        (LifecycleControl::Cancel, false) => Some("^C cancel run"),
+        (LifecycleControl::Cancel, true) => Some("^C"),
         (LifecycleControl::Quit, _) => Some("q quit"),
         (LifecycleControl::None, _) => None,
     };
@@ -2478,7 +3380,7 @@ fn footer_option(
         parts.push(lifecycle.to_owned());
     }
     parts.push("? help".to_owned());
-    parts.join(" | ")
+    parts.join("  ")
 }
 
 fn fitting_footer(options: Vec<String>, width: u16) -> String {
@@ -2490,14 +3392,58 @@ fn fitting_footer(options: Vec<String>, width: u16) -> String {
         .unwrap_or_else(|| ellipsize(options.last().map_or("? help", String::as_str), available))
 }
 
-fn render_footer_text(frame: &mut Frame<'_>, area: Rect, text: String, color: bool) {
+fn render_footer_text(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &'static str,
+    text: String,
+    color: bool,
+) {
+    let mut spans = vec![
+        Span::styled(
+            label,
+            command_accent_style(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    for (index, command) in text.split("  ").enumerate() {
+        if index != 0 {
+            spans.push(Span::raw("  "));
+        }
+        if let Some((keys, description)) = command.split_once(' ') {
+            let key_style = if keys == "?" {
+                command_accent_style(color)
+            } else {
+                footer_key_style(color)
+            };
+            spans.push(Span::styled(keys.to_owned(), key_style));
+            spans.push(Span::styled(
+                format!(" {description}"),
+                tone_style(color, Tone::Muted),
+            ));
+        } else {
+            spans.push(Span::styled(command.to_owned(), footer_key_style(color)));
+        }
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            tone_style(color, Tone::Muted),
-        ))),
+        Paragraph::new(Line::from(spans)).block(
+            section_block(Borders::TOP, color)
+                .border_style(footer_separator_style(color))
+                .padding(Padding::horizontal(INSPECTOR_PANEL_PADDING)),
+        ),
         area,
     );
+}
+
+#[derive(Clone, Copy)]
+struct HelpCommand {
+    keys: &'static str,
+    description: &'static str,
+}
+
+struct HelpGroup {
+    title: &'static str,
+    commands: Vec<HelpCommand>,
 }
 
 fn render_help_overlay(
@@ -2507,68 +3453,295 @@ fn render_help_overlay(
     lifecycle: LifecycleControl,
     color: bool,
 ) {
-    let area = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
+    let groups = help_groups(surface, lifecycle);
+    let column_count = help_column_count(area.width);
+    let grid_height = help_grid_height(&groups, column_count);
+    let desired_height = u16::try_from(grid_height)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    let panel_height = desired_height.min(area.height);
+    let panel_area = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(panel_height),
+        area.width,
+        panel_height,
     );
-    let (title, mut lines) = match surface {
-        HostSurface::Split => (
-            " Split view help · Esc closes ",
-            vec![
-                help_line("↑ / k", "Select previous step", color),
-                help_line("↓ / j", "Select next step", color),
-                help_line("Enter", "Inspect selected step log", color),
-                help_line("?", "Open this help", color),
-                help_line("Esc", "Close help; otherwise no action", color),
-            ],
-        ),
-        HostSurface::FullLog => (
-            " Full-screen log help · Esc closes ",
-            vec![
-                help_line("↑ / k, ↓ / j", "Move one record up / down", color),
-                help_line("Page Up / b", "Move one viewport up", color),
-                help_line("Page Down / f / Space", "Move one viewport down", color),
-                help_line("u / Ctrl-U", "Move half viewport up", color),
-                help_line("d / Ctrl-D", "Move half viewport down", color),
-                help_line("g", "Go to first retained record", color),
-                help_line("G", "Go to retained bottom (paused)", color),
-                help_line("← / h, → / l", "Pan one column left / right", color),
-                help_line("F", "Follow current retained bottom", color),
-                help_line("Esc", "Close help; then return to split", color),
-                help_line("?", "Open this help", color),
-            ],
-        ),
-    };
-    match lifecycle {
-        LifecycleControl::Cancel => {
-            lines.push(help_line("Ctrl-C", "Cancel the running workflow", color))
-        }
-        LifecycleControl::Quit => lines.push(help_line("q", "Quit the completed workflow", color)),
-        LifecycleControl::None => {}
-    }
+    let block =
+        section_block(Borders::TOP, color).padding(Padding::horizontal(INSPECTOR_PANEL_PADDING));
+    let content_area = block.inner(panel_area);
 
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, panel_area);
+    frame.render_widget(block, panel_area);
+    if content_area.is_empty() {
+        return;
+    }
+    render_help_heading(frame, content_area, color);
+    let grid_area = Rect::new(
+        content_area.x,
+        content_area.y.saturating_add(2),
+        content_area.width,
+        content_area.height.saturating_sub(2),
+    );
+    render_help_groups(frame, grid_area, &groups, column_count, color);
+}
+
+fn help_groups(surface: HostSurface, lifecycle: LifecycleControl) -> Vec<HelpGroup> {
+    let mut groups = match surface {
+        HostSurface::Split => vec![
+            HelpGroup {
+                title: "MOVE",
+                commands: vec![
+                    HelpCommand {
+                        keys: "↑/k",
+                        description: "previous step",
+                    },
+                    HelpCommand {
+                        keys: "↓/j",
+                        description: "next step",
+                    },
+                ],
+            },
+            HelpGroup {
+                title: "OPEN",
+                commands: vec![HelpCommand {
+                    keys: "↵",
+                    description: "open step log",
+                }],
+            },
+            HelpGroup {
+                title: "VIEW",
+                commands: vec![
+                    HelpCommand {
+                        keys: "?",
+                        description: "this help",
+                    },
+                    HelpCommand {
+                        keys: "Esc",
+                        description: "dismiss",
+                    },
+                ],
+            },
+        ],
+        HostSurface::FullLog => vec![
+            HelpGroup {
+                title: "MOVE",
+                commands: vec![
+                    HelpCommand {
+                        keys: "↑/k",
+                        description: "one record up",
+                    },
+                    HelpCommand {
+                        keys: "↓/j",
+                        description: "one record down",
+                    },
+                    HelpCommand {
+                        keys: "PgUp/b",
+                        description: "one page up",
+                    },
+                    HelpCommand {
+                        keys: "PgDn/f/Space",
+                        description: "one page down",
+                    },
+                    HelpCommand {
+                        keys: "u/^U",
+                        description: "half page up",
+                    },
+                    HelpCommand {
+                        keys: "d/^D",
+                        description: "half page down",
+                    },
+                ],
+            },
+            HelpGroup {
+                title: "JUMP",
+                commands: vec![
+                    HelpCommand {
+                        keys: "g",
+                        description: "first record",
+                    },
+                    HelpCommand {
+                        keys: "G",
+                        description: "retained bottom",
+                    },
+                    HelpCommand {
+                        keys: "←/h",
+                        description: "pan left",
+                    },
+                    HelpCommand {
+                        keys: "→/l",
+                        description: "pan right",
+                    },
+                ],
+            },
+            HelpGroup {
+                title: "VIEW",
+                commands: vec![
+                    HelpCommand {
+                        keys: "F",
+                        description: "follow latest",
+                    },
+                    HelpCommand {
+                        keys: "Esc",
+                        description: "back / dismiss",
+                    },
+                    HelpCommand {
+                        keys: "?",
+                        description: "this help",
+                    },
+                ],
+            },
+        ],
+    };
+    groups.push(HelpGroup {
+        title: "FILTER",
+        commands: vec![HelpCommand {
+            keys: "1…n",
+            description: "toggle log channels",
+        }],
+    });
+    let command = match lifecycle {
+        LifecycleControl::Cancel => Some(HelpCommand {
+            keys: "^C",
+            description: "cancel run",
+        }),
+        LifecycleControl::Quit => Some(HelpCommand {
+            keys: "q",
+            description: "quit",
+        }),
+        LifecycleControl::None => None,
+    };
+    if let Some(command) = command {
+        groups.push(HelpGroup {
+            title: "RUN",
+            commands: vec![command],
+        });
+    }
+    groups
+}
+
+fn help_column_count(width: u16) -> usize {
+    if width >= WIDE_LAYOUT_WIDTH { 4 } else { 2 }
+}
+
+fn help_grid_height(groups: &[HelpGroup], column_count: usize) -> usize {
+    groups
+        .chunks(column_count)
+        .enumerate()
+        .map(|(index, groups)| {
+            usize::from(index != 0).saturating_add(1).saturating_add(
+                groups
+                    .iter()
+                    .map(|group| group.commands.len())
+                    .max()
+                    .unwrap_or(0),
+            )
+        })
+        .sum()
+}
+
+fn render_help_heading(frame: &mut Frame<'_>, area: Rect, color: bool) {
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(tone_style(color, Tone::Primary))
-                .title(title),
+        Paragraph::new(Line::from(vec![
+            Span::styled("?", command_accent_style(color)),
+            Span::styled(" — all commands", tone_style(color, Tone::Muted)),
+        ])),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let dismissal = "esc to dismiss";
+    let dismissal_width = u16::try_from(display_width(dismissal))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    frame.render_widget(
+        Paragraph::new(Span::styled(dismissal, tone_style(color, Tone::Muted))),
+        Rect::new(
+            area.right().saturating_sub(dismissal_width),
+            area.y,
+            dismissal_width,
+            1,
         ),
-        area,
     );
 }
 
-fn help_line(keys: &str, description: &str, color: bool) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            padded_text(keys, 22),
-            tone_style(color, Tone::Primary).add_modifier(Modifier::BOLD),
+fn render_help_groups(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    groups: &[HelpGroup],
+    column_count: usize,
+    color: bool,
+) {
+    let mut y = area.y;
+    for (band_index, band) in groups.chunks(column_count).enumerate() {
+        if band_index != 0 {
+            y = y.saturating_add(1);
+        }
+        let row_count = band
+            .iter()
+            .map(|group| group.commands.len())
+            .max()
+            .unwrap_or(0);
+        let height = u16::try_from(row_count.saturating_add(1)).unwrap_or(u16::MAX);
+        let band_area = Rect::new(
+            area.x,
+            y,
+            area.width,
+            height.min(area.bottom().saturating_sub(y)),
+        );
+        for (group, column) in band.iter().zip(help_column_areas(band_area, column_count)) {
+            render_help_group(frame, column, group, color);
+        }
+        y = y.saturating_add(height);
+        if y >= area.bottom() {
+            break;
+        }
+    }
+}
+
+fn help_column_areas(area: Rect, column_count: usize) -> Vec<Rect> {
+    let gap_width = 2_u16;
+    let gap_count = u16::try_from(column_count.saturating_sub(1)).unwrap_or(u16::MAX);
+    let content_width = area
+        .width
+        .saturating_sub(gap_width.saturating_mul(gap_count));
+    let column_count = u16::try_from(column_count).unwrap_or(1).max(1);
+    let base_width = content_width / column_count;
+    let mut remainder = content_width % column_count;
+    let mut x = area.x;
+    (0..column_count)
+        .map(|_| {
+            let width = base_width.saturating_add(u16::from(remainder != 0));
+            remainder = remainder.saturating_sub(1);
+            let column = Rect::new(x, area.y, width, area.height);
+            x = x.saturating_add(width).saturating_add(gap_width);
+            column
+        })
+        .collect()
+}
+
+fn render_help_group(frame: &mut Frame<'_>, area: Rect, group: &HelpGroup, color: bool) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(group.title, tone_style(color, Tone::Muted))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let key_width = usize::from(area.width / 2).min(14);
+    let lines = group.commands.iter().map(|command| {
+        Line::from(vec![
+            Span::styled(padded_text(command.keys, key_width), help_key_style(color)),
+            Span::styled("→ ", tone_style(color, Tone::Muted)),
+            Span::styled(command.description, tone_style(color, Tone::Neutral)),
+        ])
+    });
+    frame.render_widget(
+        Paragraph::new(Text::from_iter(lines)),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
         ),
-        Span::styled(description.to_owned(), tone_style(color, Tone::Neutral)),
-    ])
+    );
 }
 
 #[derive(Default)]
@@ -2601,6 +3774,50 @@ fn step_counts(snapshot: &WorkflowRunViewSnapshot) -> StepCounts {
     counts
 }
 
+fn step_count_summary(counts: &StepCounts, total: usize) -> String {
+    let step_label = if total == 1 { "step" } else { "steps" };
+    let mut parts = vec![format!("{total} {step_label}")];
+    for (count, label) in [
+        (counts.succeeded, "ok"),
+        (counts.active, "running"),
+        (counts.failed, "failed"),
+        (counts.blocked, "blocked"),
+        (counts.pending, "pending"),
+        (counts.not_run, "not-run"),
+        (counts.cancelled, "cancelled"),
+    ] {
+        if count != 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn workflow_header_status(snapshot: &WorkflowRunViewSnapshot) -> (&'static str, Tone) {
+    match (&snapshot.publication, snapshot.cleanup) {
+        (WorkflowRunPublicationState::Publishing, _) => ("publishing", Tone::Active),
+        (WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Failed(_)), _) => {
+            ("publication failed", Tone::Failure)
+        }
+        (
+            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+                ..
+            }),
+            WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Failed),
+        ) => ("cleanup failed", Tone::Failure),
+        (
+            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+                ..
+            }),
+            WorkflowRunCleanupState::NotStarted | WorkflowRunCleanupState::Cleaning,
+        ) => ("cleaning", Tone::Active),
+        _ => (
+            workflow_status(&snapshot.workflow),
+            workflow_tone(&snapshot.workflow),
+        ),
+    }
+}
+
 fn workflow_status(workflow: &WorkflowState<StepFailureCause>) -> &'static str {
     match workflow {
         WorkflowState::Executing {
@@ -2608,7 +3825,7 @@ fn workflow_status(workflow: &WorkflowState<StepFailureCause>) -> &'static str {
         } => "running",
         WorkflowState::Executing {
             gate: SchedulingGate::FailureStopped { .. },
-        } => "stopping after failure",
+        } => "failing",
         WorkflowState::Executing {
             gate: SchedulingGate::Cancelling { .. },
         } => "cancelling",
@@ -2621,25 +3838,38 @@ fn workflow_status(workflow: &WorkflowState<StepFailureCause>) -> &'static str {
 fn workflow_tone(workflow: &WorkflowState<StepFailureCause>) -> Tone {
     match workflow {
         WorkflowState::Succeeded => Tone::Success,
-        WorkflowState::Failed { .. } => Tone::Failure,
+        WorkflowState::Failed { .. }
+        | WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped { .. },
+        } => Tone::Failure,
         WorkflowState::Cancelled { .. }
         | WorkflowState::Executing {
             gate: SchedulingGate::Cancelling { .. },
         } => Tone::Blocked,
-        WorkflowState::Executing { .. } => Tone::Active,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        } => Tone::Active,
     }
 }
 
-fn step_state_glyph(state: StepStateKind) -> &'static str {
-    match state {
+fn step_state_glyph(step: &WorkflowRunStepView) -> &'static str {
+    match step.state {
         StepStateKind::Pending => "○",
         StepStateKind::Starting => "◔",
-        StepStateKind::Running => "●",
+        StepStateKind::Running => {
+            let elapsed = step
+                .timing
+                .as_ref()
+                .map_or(Duration::ZERO, |timing| timing.duration);
+            let frame = elapsed.as_millis() / REDRAW_INTERVAL.as_millis();
+            let index = usize::try_from(frame).unwrap_or(0) % RUNNING_INDICATOR_FRAMES.len();
+            RUNNING_INDICATOR_FRAMES[index]
+        }
         StepStateKind::CapturingOutputs => "◕",
         StepStateKind::Cancelling => "◒",
         StepStateKind::Succeeded => "✓",
         StepStateKind::Failed => "×",
-        StepStateKind::Blocked => "!",
+        StepStateKind::Blocked => "◐",
         StepStateKind::NotRun => "–",
         StepStateKind::Cancelled => "⊘",
     }
@@ -2661,7 +3891,7 @@ fn step_state_label(state: StepStateKind) -> &'static str {
 }
 
 fn step_state_style(state: StepStateKind, color: bool) -> Style {
-    tone_style(color, step_state_tone(state))
+    tone_style(color, step_state_tone(state)).add_modifier(Modifier::BOLD)
 }
 
 fn step_state_tone(state: StepStateKind) -> Tone {
@@ -2684,7 +3914,6 @@ enum Tone {
     Neutral,
     Muted,
     Active,
-    Output,
     Success,
     Failure,
     Blocked,
@@ -2696,42 +3925,41 @@ fn tone_style(color: bool, tone: Tone) -> Style {
     }
     let foreground = match tone {
         Tone::Primary => Color::Rgb(205, 214, 244),
-        Tone::Neutral => return Style::default(),
-        Tone::Muted => Color::Rgb(127, 132, 156),
+        Tone::Neutral => Color::Rgb(186, 194, 222),
+        Tone::Muted => Color::Rgb(108, 112, 134),
         Tone::Active => Color::Rgb(137, 180, 250),
-        Tone::Output => Color::Rgb(148, 226, 213),
         Tone::Success => Color::Rgb(166, 227, 161),
         Tone::Failure => Color::Rgb(243, 139, 168),
         Tone::Blocked => Color::Rgb(250, 179, 135),
     };
-    Style::default().fg(foreground).add_modifier(Modifier::BOLD)
+    Style::default().fg(foreground)
 }
 
-fn publication_status(snapshot: &WorkflowRunViewSnapshot) -> &'static str {
-    match (&snapshot.publication, snapshot.cleanup) {
-        (WorkflowRunPublicationState::NotStarted, _) => "not published",
-        (WorkflowRunPublicationState::Publishing, _) => "publishing",
-        (
-            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
-                ..
-            }),
-            WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Succeeded),
-        ) => "published",
-        (
-            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
-                ..
-            }),
-            WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Failed),
-        ) => "cleanup failed",
-        (
-            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
-                ..
-            }),
-            _,
-        ) => "cleaning",
-        (WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Failed(_)), _) => {
-            "publication failed"
-        }
+fn command_accent_style(color: bool) -> Style {
+    fixed_color_style(color, Color::Rgb(203, 166, 247))
+}
+
+fn footer_key_style(color: bool) -> Style {
+    fixed_color_style(color, Color::Rgb(180, 190, 254))
+}
+
+fn help_key_style(color: bool) -> Style {
+    fixed_color_style(color, Color::Rgb(249, 226, 175))
+}
+
+fn footer_separator_style(color: bool) -> Style {
+    fixed_color_style(color, Color::Rgb(49, 50, 68))
+}
+
+fn separator_style(color: bool) -> Style {
+    fixed_color_style(color, Color::Rgb(69, 71, 90))
+}
+
+fn fixed_color_style(color: bool, foreground: Color) -> Style {
+    if color {
+        Style::default().fg(foreground)
+    } else {
+        Style::default()
     }
 }
 
@@ -2748,6 +3976,7 @@ mod tests {
     use crate::execution::workflow::observation::{
         CommandOutputObservation, ExecutionObservation, ExecutionObserver, SourceSequence,
     };
+    use crate::execution::workflow::pi::Thinking;
     use crate::execution::workflow::presentation_feed::AcceptedRecordOrder;
     use crate::execution::workflow::publication::{
         WorkflowRunCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
@@ -2759,7 +3988,7 @@ mod tests {
     };
     use crate::execution::workflow::run_view_model::{WorkflowRunElapsed, WorkflowRunStepLog};
     use crate::execution::workflow::runtime::{
-        ActionId, FailurePhase, RunOutcome, StepState, TransitionSequence,
+        ActionId, FailurePhase, RunOutcome, StepFailure, StepState, TransitionSequence,
     };
     use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
 
@@ -2927,6 +4156,13 @@ mod tests {
             ),
             (
                 Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('3'),
+                    KeyModifiers::NONE,
+                )),
+                TerminalInputEvent::ToggleLogChannel('3'),
+            ),
+            (
+                Event::Key(crossterm::event::KeyEvent::new(
                     KeyCode::Char('?'),
                     KeyModifiers::SHIFT,
                 )),
@@ -2995,8 +4231,16 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
 
-        assert!(rendered.contains("selected-command log"));
-        assert!(!rendered.contains("Steps (1)"));
+        assert!(rendered.contains("○  selected-command   cmd"));
+        assert!(rendered.contains("pending"));
+        assert!(rendered.contains("LOG"));
+        assert!(rendered.contains("● following · 0 lines"));
+        assert!(!rendered.contains("stdout + stderr"));
+        assert!(!rendered.contains("workflow.yaml"));
+        let inspector = buffer_position(terminal.backend().buffer(), "○  selected-command   cmd");
+        let log = buffer_position(terminal.backend().buffer(), "LOG");
+        assert_eq!(inspector.1, 0);
+        assert!(log.1 > inspector.1);
 
         press_key(
             &mut interaction,
@@ -3010,7 +4254,8 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
         assert_eq!(interaction.selected, 0);
-        assert!(rendered.contains("Steps (1)"));
+        assert!(rendered.contains("workflow"));
+        assert!(rendered.contains("▏ ○ selected-command"));
     }
 
     #[test]
@@ -3046,19 +4291,19 @@ mod tests {
         for code in [KeyCode::Up, KeyCode::Char('k')] {
             let (interaction, _) =
                 run_full_log_keys(&snapshot, 80, 20, &[(code, KeyModifiers::NONE)]);
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(37));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(47));
             assert!(!interaction.full_log.follow);
         }
         for code in [KeyCode::Down, KeyCode::Char('j')] {
             let (interaction, _) =
                 run_full_log_keys(&snapshot, 80, 20, &[(code, KeyModifiers::NONE)]);
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(38));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(48));
             assert!(!interaction.full_log.follow);
         }
         for code in [KeyCode::PageUp, KeyCode::Char('b')] {
             let (interaction, _) =
                 run_full_log_keys(&snapshot, 80, 20, &[(code, KeyModifiers::NONE)]);
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(25));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(45));
         }
         for code in [KeyCode::PageDown, KeyCode::Char('f'), KeyCode::Char(' ')] {
             let (interaction, _) = run_full_log_keys(
@@ -3070,14 +4315,14 @@ mod tests {
                     (code, KeyModifiers::NONE),
                 ],
             );
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(14));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(4));
         }
         for (code, modifiers) in [
             (KeyCode::Char('u'), KeyModifiers::NONE),
             (KeyCode::Char('u'), KeyModifiers::CONTROL),
         ] {
             let (interaction, _) = run_full_log_keys(&snapshot, 80, 20, &[(code, modifiers)]);
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(32));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(47));
         }
         for (code, modifiers) in [
             (KeyCode::Char('d'), KeyModifiers::NONE),
@@ -3089,11 +4334,11 @@ mod tests {
                 20,
                 &[(KeyCode::Char('g'), KeyModifiers::NONE), (code, modifiers)],
             );
-            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(7));
+            assert_eq!(full_log_top_order(&interaction, &snapshot), Some(2));
         }
         for (code, modifiers, expected) in [
             (KeyCode::Char('g'), KeyModifiers::NONE, 1),
-            (KeyCode::Char('G'), KeyModifiers::SHIFT, 38),
+            (KeyCode::Char('G'), KeyModifiers::SHIFT, 48),
         ] {
             let (interaction, _) = run_full_log_keys(&snapshot, 80, 20, &[(code, modifiers)]);
             assert_eq!(full_log_top_order(&interaction, &snapshot), Some(expected));
@@ -3126,7 +4371,7 @@ mod tests {
             ],
         );
         assert!(interaction.full_log.follow);
-        assert_eq!(full_log_top_order(&interaction, &snapshot), Some(38));
+        assert_eq!(full_log_top_order(&interaction, &snapshot), Some(48));
     }
 
     #[test]
@@ -3145,27 +4390,27 @@ mod tests {
         );
         let anchor = full_log_top_order(&interaction, &snapshot);
         let horizontal_offset = interaction.full_log.horizontal_offset;
-        assert_eq!(anchor, Some(17));
-        assert_eq!(interaction.full_log.lines_behind(&snapshot.steps[0].log), 1);
+        assert_eq!(anchor, Some(27));
+        let log = FilteredLog::new(&snapshot.steps[0].log, interaction.log_filters);
+        assert_eq!(interaction.full_log.lines_behind(&log), 1);
 
         append_log_record(&mut snapshot.steps[0].log, 31, "new output one");
         append_log_record(&mut snapshot.steps[0].log, 32, "new output two");
         let (width, rows) =
-            full_log_record_dimensions(interaction.terminal_area, &snapshot.steps[0].log);
-        interaction
-            .full_log
-            .synchronize(&snapshot.steps[0].log, width, rows);
+            full_log_record_dimensions(interaction.terminal_area, &snapshot.steps[0]);
+        let log = FilteredLog::new(&snapshot.steps[0].log, interaction.log_filters);
+        interaction.full_log.synchronize(&log, width, rows);
 
         assert_eq!(full_log_top_order(&interaction, &snapshot), anchor);
         assert_eq!(interaction.full_log.horizontal_offset, horizontal_offset);
-        assert_eq!(interaction.full_log.lines_behind(&snapshot.steps[0].log), 3);
+        assert_eq!(interaction.full_log.lines_behind(&log), 3);
         let rendered = buffer_text(&render_full_log_snapshot(
             &snapshot,
             &mut interaction,
             120,
             20,
         ));
-        assert!(rendered.contains("paused | 3 lines behind"));
+        assert!(rendered.contains("paused · 3 lines behind"));
 
         press_key(
             &mut interaction,
@@ -3175,8 +4420,9 @@ mod tests {
             &cancellation,
         );
         assert!(interaction.full_log.follow);
-        assert_eq!(full_log_top_order(&interaction, &snapshot), Some(20));
-        assert_eq!(interaction.full_log.lines_behind(&snapshot.steps[0].log), 0);
+        assert_eq!(full_log_top_order(&interaction, &snapshot), Some(30));
+        let log = FilteredLog::new(&snapshot.steps[0].log, interaction.log_filters);
+        assert_eq!(interaction.full_log.lines_behind(&log), 0);
         assert_eq!(interaction.full_log.horizontal_offset, horizontal_offset);
     }
 
@@ -3186,15 +4432,15 @@ mod tests {
         let (mut interaction, _) =
             run_full_log_keys(&snapshot, 80, 20, &[(KeyCode::Up, KeyModifiers::NONE)]);
         let anchor = full_log_top_order(&interaction, &snapshot);
-        assert_eq!(anchor, Some(27));
+        assert_eq!(anchor, Some(37));
 
         let _ = render_full_log_snapshot(&snapshot, &mut interaction, 100, 24);
         assert_eq!(full_log_top_order(&interaction, &snapshot), anchor);
-        assert_eq!(interaction.full_log.available_rows, 17);
+        assert_eq!(interaction.full_log.available_rows, 7);
 
         let _ = render_full_log_snapshot(&snapshot, &mut interaction, 64, 20);
         assert_eq!(full_log_top_order(&interaction, &snapshot), anchor);
-        assert_eq!(interaction.full_log.available_rows, 13);
+        assert_eq!(interaction.full_log.available_rows, 3);
     }
 
     #[test]
@@ -3208,7 +4454,7 @@ mod tests {
             MINIMUM_HEIGHT,
         ));
         assert!(
-            rendered.contains("30 retained / 38 total"),
+            rendered.contains("30/38 kept"),
             "counts disappeared after clamping: {rendered:?}"
         );
     }
@@ -3290,7 +4536,10 @@ mod tests {
                 &cancellation,
             );
         }
-        let maximum = maximum_horizontal_offset(&snapshot.steps[0].log, 62);
+        let (available_width, _) =
+            full_log_record_dimensions(interaction.terminal_area, &snapshot.steps[0]);
+        let log = FilteredLog::new(&snapshot.steps[0].log, interaction.log_filters);
+        let maximum = maximum_horizontal_offset(&log.records, available_width);
         assert_eq!(interaction.full_log.horizontal_offset, maximum);
         let rendered = buffer_text(&render_full_log_snapshot(
             &snapshot,
@@ -3313,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn log_preview_preserves_merged_source_order_and_neutral_process_content() {
+    fn log_preview_preserves_merged_order_and_accents_stderr_without_tinting_content() {
         let step = direct_log_step(
             StepStateKind::Running,
             vec![
@@ -3342,7 +4591,7 @@ mod tests {
             3,
             0,
         );
-        let buffer = render_direct_log(&step, 80, 6, true);
+        let buffer = render_direct_log(&step, 80, 7, true);
         let rows = buffer_rows(&buffer);
         let first = row_containing(&rows, "first from stdout");
         let second = row_containing(&rows, "then from stderr");
@@ -3355,15 +4604,214 @@ mod tests {
 
         let payload_column = column_of(&rows[second], "then from stderr");
         let second = u16::try_from(second).unwrap();
-        assert_eq!(buffer[(payload_column, second)].fg, Color::Reset);
+        assert_eq!(
+            buffer[(payload_column, second)].fg,
+            tone_style(true, Tone::Neutral).fg.unwrap()
+        );
         let source_column = column_of(&rows[usize::from(second)], "stderr");
         assert_eq!(
             buffer[(source_column, second)].fg,
-            tone_style(true, Tone::Muted).fg.unwrap()
+            tone_style(true, Tone::Blocked).fg.unwrap()
         );
         assert_ne!(
             buffer[(source_column, second)].fg,
             tone_style(true, Tone::Failure).fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn numbered_channels_filter_command_logs_and_report_hidden_records() {
+        let step = direct_log_step(
+            StepStateKind::Running,
+            vec![
+                direct_log_record(
+                    1,
+                    CommandOutputSource::StandardOutput,
+                    "2026-08-04T12:34:56Z",
+                    "visible stdout payload",
+                    false,
+                ),
+                direct_log_record(
+                    2,
+                    CommandOutputSource::StandardError,
+                    "2026-08-04T12:34:57Z",
+                    "hidden stderr payload",
+                    false,
+                ),
+            ],
+            2,
+            0,
+        );
+        let snapshot = direct_snapshot(step);
+        let cancellation = CancellationSource::new();
+        let mut interaction = HostInteraction {
+            terminal_area: Rect::new(0, 0, 120, 24),
+            ..HostInteraction::default()
+        };
+
+        press_key(
+            &mut interaction,
+            &snapshot,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+            &cancellation,
+        );
+        let filtered = render_snapshot(&snapshot, &mut interaction, 120, 24, true);
+        let rendered = buffer_text(&filtered);
+        assert!(rendered.contains("visible stdout payload"));
+        assert!(!rendered.contains("hidden stderr payload"));
+        assert!(rendered.contains("● following · 1 hidden"));
+        let (stdout_x, stdout_y) = buffer_position(&filtered, "1 stdout");
+        assert!(
+            filtered[(stdout_x, stdout_y)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        let (stderr_x, stderr_y) = buffer_position(&filtered, "2 stderr");
+        assert!(
+            filtered[(stderr_x, stderr_y)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+
+        press_key(
+            &mut interaction,
+            &snapshot,
+            KeyCode::Char('1'),
+            KeyModifiers::NONE,
+            &cancellation,
+        );
+        let all_hidden = buffer_text(&render_snapshot(&snapshot, &mut interaction, 120, 24, true));
+        assert!(all_hidden.contains("● following · 2 hidden"));
+        assert!(all_hidden.contains("All log channels hidden."));
+    }
+
+    #[test]
+    fn full_log_navigation_skips_filtered_records() {
+        let snapshot = direct_snapshot(numbered_log_step(30, 20));
+        let (mut interaction, _) = run_full_log_keys(
+            &snapshot,
+            120,
+            24,
+            &[
+                (KeyCode::Char('2'), KeyModifiers::NONE),
+                (KeyCode::Char('g'), KeyModifiers::NONE),
+                (KeyCode::Down, KeyModifiers::NONE),
+            ],
+        );
+
+        assert_eq!(full_log_top_order(&interaction, &snapshot), Some(4));
+        let rendered = buffer_text(&render_full_log_snapshot(
+            &snapshot,
+            &mut interaction,
+            120,
+            24,
+        ));
+        assert!(rendered.contains("15 hidden"));
+    }
+
+    #[test]
+    fn agent_channels_group_observations_and_dim_secondary_rows() {
+        let step = direct_agent_log_step(vec![
+            direct_agent_log_record(
+                1,
+                AgentPresentationObservationKind::Assistant,
+                "agent message",
+            ),
+            direct_agent_log_record(
+                2,
+                AgentPresentationObservationKind::Reasoning,
+                "reasoning message",
+            ),
+            direct_agent_log_record(3, AgentPresentationObservationKind::ToolCall, "tool call"),
+            direct_agent_log_record(
+                4,
+                AgentPresentationObservationKind::ToolResult,
+                "tool result",
+            ),
+            direct_agent_log_record(
+                5,
+                AgentPresentationObservationKind::Diagnostic,
+                "diagnostic message",
+            ),
+            direct_agent_log_record(6, AgentPresentationObservationKind::Usage, "usage message"),
+        ]);
+        let snapshot = direct_snapshot(step.clone());
+        let cancellation = CancellationSource::new();
+        let mut interaction = HostInteraction {
+            terminal_area: Rect::new(0, 0, 180, 24),
+            ..HostInteraction::default()
+        };
+        press_key(
+            &mut interaction,
+            &snapshot,
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+            &cancellation,
+        );
+        let rendered = render_snapshot(&snapshot, &mut interaction, 180, 24, true);
+        let text = buffer_text(&rendered);
+        for channel in ["1 agent", "2 reasoning", "3 tools", "4 system"] {
+            assert!(text.contains(channel), "missing channel {channel:?}");
+        }
+        assert!(!text.contains("tool call"));
+        assert!(!text.contains("tool result"));
+        assert!(text.contains("2 hidden"));
+        let (tools_x, tools_y) = buffer_position(&rendered, "3 tools");
+        assert!(
+            rendered[(tools_x, tools_y)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+
+        let mut filters = LogFilterState::default();
+        assert!(filters.toggle(&step, '3'));
+        let without_tools = FilteredLog::new(&step.log, filters);
+        assert_eq!(without_tools.hidden_records, 2);
+        assert!(
+            without_tools
+                .records
+                .iter()
+                .all(|record| !matches!(LogChannel::for_source(record.source), LogChannel::Tools))
+        );
+
+        assert!(filters.toggle(&step, '4'));
+        let without_tools_or_system = FilteredLog::new(&step.log, filters);
+        assert_eq!(without_tools_or_system.hidden_records, 4);
+        assert_eq!(
+            without_tools_or_system
+                .records
+                .iter()
+                .map(|record| record.payload.as_ref())
+                .collect::<Vec<_>>(),
+            ["agent message", "reasoning message"]
+        );
+        assert!(filters.includes(LogChannel::StandardOutput));
+        assert!(filters.includes(LogChannel::StandardError));
+
+        assert!(
+            log_payload_style(
+                WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Reasoning),
+                false,
+            )
+            .add_modifier
+            .contains(Modifier::DIM)
+        );
+        assert!(
+            log_payload_style(
+                WorkflowRunLogSource::Agent(AgentPresentationObservationKind::ToolResult),
+                false,
+            )
+            .add_modifier
+            .contains(Modifier::DIM)
+        );
+        assert_eq!(
+            log_source_style(
+                WorkflowRunLogSource::Agent(AgentPresentationObservationKind::Diagnostic),
+                true,
+            )
+            .fg,
+            tone_style(true, Tone::Blocked).fg
         );
     }
 
@@ -3382,20 +4830,20 @@ mod tests {
             0,
         );
 
-        let wide = buffer_rows(&render_direct_log(&step, 50, 4, false));
+        let wide = buffer_rows(&render_direct_log(&step, 50, 5, false));
         assert!(
             wide.iter()
                 .any(|row| row.contains("10:34:56.789 stderr │ message"))
         );
 
-        let timestamp_boundary = buffer_rows(&render_direct_log(&step, 36, 4, false));
+        let timestamp_boundary = buffer_rows(&render_direct_log(&step, 40, 5, false));
         assert!(
             timestamp_boundary
                 .iter()
                 .any(|row| row.contains("10:34:56.789 stderr │ message"))
         );
 
-        let narrow = buffer_rows(&render_direct_log(&step, 35, 4, false));
+        let narrow = buffer_rows(&render_direct_log(&step, 39, 5, false));
         assert!(narrow.iter().any(|row| row.contains("stderr │ message")));
         assert!(narrow.iter().all(|row| !row.contains("10:34:56.789")));
     }
@@ -3424,7 +4872,7 @@ mod tests {
             0,
         );
 
-        let rows = buffer_rows(&render_direct_log(&step, 80, 4, false));
+        let rows = buffer_rows(&render_direct_log(&step, 80, 5, false));
         assert!(
             rows.iter()
                 .any(|row| row.contains("12:34:56.200 stderr ↪ continued fragment")),
@@ -3436,27 +4884,29 @@ mod tests {
     fn log_preview_rewraps_deterministically_and_keeps_the_visual_tail() {
         let step = long_log_step();
 
-        let wide = inner_buffer_rows(&render_direct_log(&step, 34, 5, false));
+        let wide = inner_buffer_rows(&render_direct_log(&step, 34, 7, false));
+        assert!(wide[0].trim_start().starts_with("LOG"));
         assert_eq!(
-            wide,
+            wide[2..],
             [
-                "stdout │ abcdefghijklmnopqrstuvw",
-                "stdout ↳ xyzABCDEFGHIJKLMNOPQRST",
-                "stdout ↳ UVWXYZ0123456789",
+                "  stdout ↳ tuvwxyzABCDEFGHIJKL",
+                "  stdout ↳ MNOPQRSTUVWXYZ01234",
+                "  stdout ↳ 56789",
             ]
         );
 
-        let narrow = inner_buffer_rows(&render_direct_log(&step, 27, 5, false));
+        let narrow = inner_buffer_rows(&render_direct_log(&step, 27, 7, false));
+        assert!(narrow[0].contains("● 1 line"));
         assert_eq!(
-            narrow,
+            narrow[2..],
             [
-                "stdout ↳ qrstuvwxyzABCDEF",
-                "stdout ↳ GHIJKLMNOPQRSTUV",
-                "stdout ↳ WXYZ0123456789",
+                "  stdout ↳ KLMNOPQRSTUV",
+                "  stdout ↳ WXYZ01234567",
+                "  stdout ↳ 89",
             ]
         );
         assert_eq!(
-            inner_buffer_rows(&render_direct_log(&step, 27, 5, false)),
+            inner_buffer_rows(&render_direct_log(&step, 27, 7, false)),
             narrow
         );
     }
@@ -3491,19 +4941,24 @@ mod tests {
             5,
             2,
         );
-        let buffer = render_direct_log(&step, 100, 6, false);
+        let buffer = render_direct_log(&step, 100, 8, false);
         let rendered = buffer_text(&buffer);
         let rows = inner_buffer_rows(&buffer);
 
-        assert!(rendered.contains("following | lines: 3 retained / 5 total"));
-        assert_eq!(rows[0], "↑ 2 older lines discarded");
-        assert!(rows[1].ends_with("retained one"));
-        assert!(rows[2].ends_with("retained two"));
-        assert!(rows[3].ends_with("retained three"));
+        assert!(rendered.contains("● following · 3 retained / 5 total"));
+        assert!(rows[0].trim_start().starts_with("LOG"));
+        assert!(rows[0].contains("● following · 3 retained / 5 total"));
+        assert!(rows[1].trim().is_empty());
+        assert_eq!(rows[2].trim(), "↑ 2 older lines discarded");
+        assert!(rows[3].ends_with("retained one"));
+        assert!(rows[4].ends_with("retained two"));
+        assert!(rows[5].ends_with("retained three"));
 
-        let minimum_height = inner_buffer_rows(&render_direct_log(&step, 100, 4, false));
-        assert_eq!(minimum_height[0], "↑ 2 older lines discarded");
-        assert!(minimum_height[1].ends_with("retained three"));
+        let minimum_height = inner_buffer_rows(&render_direct_log(&step, 100, 6, false));
+        assert!(minimum_height[0].trim_start().starts_with("LOG"));
+        assert!(minimum_height[1].trim().is_empty());
+        assert_eq!(minimum_height[2].trim(), "↑ 2 older lines discarded");
+        assert!(minimum_height[3].ends_with("retained three"));
         assert!(
             !minimum_height
                 .iter()
@@ -3519,8 +4974,10 @@ mod tests {
             (StepStateKind::Succeeded, "No output received."),
         ] {
             let step = direct_log_step(state, Vec::new(), 0, 0);
-            let rows = inner_buffer_rows(&render_direct_log(&step, 70, 4, false));
-            assert_eq!(rows[0], expected);
+            let rows = inner_buffer_rows(&render_direct_log(&step, 70, 5, false));
+            assert!(rows[0].trim_start().starts_with("LOG"));
+            assert!(rows[1].trim().is_empty());
+            assert_eq!(rows[2].trim_start(), expected);
         }
     }
 
@@ -3558,40 +5015,63 @@ mod tests {
     }
 
     #[test]
-    fn quit_is_ignored_until_the_workflow_is_terminal() {
+    fn quit_requires_adapter_completion_on_every_surface() {
         let cancellation = CancellationSource::new();
-        let mut interaction = HostInteraction::default();
         let mut snapshot = direct_snapshot(long_log_step());
-        assert_eq!(
-            press_key(
-                &mut interaction,
-                &snapshot,
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-                &cancellation,
-            ),
-            HostControl::Continue
-        );
         snapshot.workflow = WorkflowState::Succeeded;
-        snapshot.quit_eligible = true;
+        snapshot.authoritative_result = true;
+        snapshot.quiescent = true;
+        snapshot.publication =
+            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+                result_directory: "results".to_owned(),
+            });
+        snapshot.cleanup = WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Succeeded);
+
+        let operational = Rect::new(0, 0, MINIMUM_WIDTH, MINIMUM_HEIGHT);
+        let mut interactions = [
+            HostInteraction {
+                terminal_area: operational,
+                ..HostInteraction::default()
+            },
+            HostInteraction {
+                surface: HostSurface::FullLog,
+                terminal_area: operational,
+                ..HostInteraction::default()
+            },
+            HostInteraction {
+                help_visible: true,
+                terminal_area: operational,
+                ..HostInteraction::default()
+            },
+            HostInteraction {
+                surface: HostSurface::FullLog,
+                help_visible: true,
+                terminal_area: operational,
+                ..HostInteraction::default()
+            },
+            HostInteraction {
+                terminal_area: Rect::new(0, 0, 40, 8),
+                ..HostInteraction::default()
+            },
+        ];
+
+        for interaction in &mut interactions {
+            assert_quit_control(interaction, &snapshot, &cancellation, HostControl::Continue);
+        }
+
         press_key(
-            &mut interaction,
+            &mut interactions[0],
             &snapshot,
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
             &cancellation,
         );
         assert_eq!(cancellation.cancellation_reason(), None);
-        assert_eq!(
-            press_key(
-                &mut interaction,
-                &snapshot,
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-                &cancellation,
-            ),
-            HostControl::Quit
-        );
+
+        snapshot.quit_eligible = true;
+        for interaction in &mut interactions {
+            assert_quit_control(interaction, &snapshot, &cancellation, HostControl::Quit);
+        }
     }
 
     #[test]
@@ -3868,7 +5348,7 @@ mod tests {
                     None,
                     WorkflowRunOutputDisposition::Pending,
                 ),
-                ["State: pending", "Output: report · pending"].as_slice(),
+                ["pending", "file", "report.txt"].as_slice(),
             ),
             (
                 direct_command_step(
@@ -3880,7 +5360,7 @@ mod tests {
                     }),
                     WorkflowRunOutputDisposition::Pending,
                 ),
-                ["State: running", "Duration: 1.2s", "1970-01-01 00:00:00Z"].as_slice(),
+                ["running", "1.2s", "1970-01-01 00:00:00Z"].as_slice(),
             ),
             (
                 direct_command_step(
@@ -3889,7 +5369,7 @@ mod tests {
                     Some(timing.clone()),
                     WorkflowRunOutputDisposition::Committed,
                 ),
-                ["State: succeeded", "Output: report · committed"].as_slice(),
+                ["succeeded", "captured"].as_slice(),
             ),
             (
                 direct_command_step(
@@ -3906,8 +5386,8 @@ mod tests {
                     ),
                 ),
                 [
-                    "State: failed",
-                    "Failure: execution · exit 17",
+                    "failed",
+                    "failure       execution · exit 17",
                     "unavailable (failed)",
                 ]
                 .as_slice(),
@@ -3923,12 +5403,7 @@ mod tests {
                         WorkflowRunOutputUnavailableReason::Blocked,
                     ),
                 ),
-                [
-                    "State: blocked",
-                    "Blocked by: prepare",
-                    "unavailable (blocked)",
-                ]
-                .as_slice(),
+                ["blocked", "blocked by    prepare", "unavailable (blocked)"].as_slice(),
             ),
             (
                 direct_command_step(
@@ -3942,8 +5417,8 @@ mod tests {
                     ),
                 ),
                 [
-                    "State: not-run",
-                    "Not run: failure_stop",
+                    "not-run",
+                    "not run       failure_stop",
                     "unavailable (not-run)",
                 ]
                 .as_slice(),
@@ -3960,8 +5435,8 @@ mod tests {
                     ),
                 ),
                 [
-                    "State: cancelled",
-                    "Cancellation: user_request",
+                    "cancelled",
+                    "cancellation  user_request",
                     "unavailable (cancelled)",
                 ]
                 .as_slice(),
@@ -3970,12 +5445,16 @@ mod tests {
 
         for (step, expected) in cases {
             let rendered = render_direct_inspector(&step, 120, 14);
-            assert!(rendered.contains("ID: selected-command"));
-            assert!(rendered.contains("Kind: cmd"));
-            assert!(rendered.contains("Command: build 'héllo world'"));
-            assert!(rendered.contains("Directory: work"));
-            assert!(rendered.contains("Dependencies: prepare"));
-            assert!(rendered.contains("Outputs"));
+            assert!(rendered.contains("selected-command   cmd"));
+            assert!(rendered.contains("command       build 'héllo world'"));
+            assert!(rendered.contains("cwd           work"));
+            assert!(rendered.contains("depends on    prepare"));
+            assert!(rendered.contains("OUTPUTS"));
+            assert!(rendered.contains("report"));
+            assert!(!rendered.contains("ID:"));
+            assert!(!rendered.contains("Kind:"));
+            assert!(!rendered.contains("State:"));
+            assert!(!rendered.contains("Duration:"));
             for value in expected {
                 assert!(
                     rendered.contains(value),
@@ -3986,8 +5465,7 @@ mod tests {
                 step.state,
                 StepStateKind::Pending | StepStateKind::Blocked | StepStateKind::NotRun
             ) {
-                assert!(!rendered.contains("Duration:"));
-                assert!(!rendered.contains("Started:"));
+                assert!(!rendered.contains("started"));
             }
         }
     }
@@ -4064,7 +5542,50 @@ mod tests {
     }
 
     #[test]
-    fn inspector_omits_outputs_section_for_steps_without_declarations() {
+    fn inspector_renders_outputs_in_a_dedicated_structured_panel() {
+        let step = direct_command_step(
+            StepStateKind::Succeeded,
+            None,
+            Some(WorkflowRunElapsed {
+                started_at: time::OffsetDateTime::UNIX_EPOCH,
+                duration: Duration::from_secs(3),
+                frozen: true,
+            }),
+            WorkflowRunOutputDisposition::Committed,
+        );
+        let buffer = render_direct_inspector_buffer(&step, 120, 14, true);
+        let rows = buffer_rows(&buffer);
+        let command_y = row_containing(&rows, "command       build");
+        let cwd_y = row_containing(&rows, "cwd");
+        let started_y = row_containing(&rows, "started");
+        let dependencies_y = row_containing(&rows, "depends on");
+        let outputs_y = row_containing(&rows, "OUTPUTS");
+        let summary_y = row_containing(&rows, "✓  report  file");
+        let detail_y = row_containing(&rows, "report.txt");
+
+        assert_eq!(cwd_y, command_y + 1);
+        assert_eq!(started_y, cwd_y + 1);
+        assert_eq!(dependencies_y, started_y + 1);
+        assert!(dependencies_y < outputs_y);
+        assert!(rows[outputs_y - 1].contains('─'));
+        assert_eq!(summary_y, outputs_y + 2);
+        assert_eq!(detail_y, summary_y + 1);
+        assert!(rows[detail_y + 1].replace('│', "").trim().is_empty());
+        assert!(rows[summary_y].contains("captured"));
+        let (marker_x, marker_y) = buffer_position(&buffer, "✓  report");
+        let (status_x, status_y) = buffer_position(&buffer, "captured");
+        assert_eq!(
+            buffer[(marker_x, marker_y)].fg,
+            tone_style(true, Tone::Success).fg.unwrap()
+        );
+        assert_eq!(
+            buffer[(status_x, status_y)].fg,
+            tone_style(true, Tone::Success).fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn inspector_reports_when_a_step_declares_no_outputs() {
         let mut step = direct_command_step(
             StepStateKind::Pending,
             None,
@@ -4077,10 +5598,14 @@ mod tests {
         outputs.clear();
         step.outputs.clear();
 
-        let rendered = render_direct_inspector(&step, 80, 12);
+        let buffer = render_direct_inspector_buffer(&step, 80, 12, false);
+        let rows = buffer_rows(&buffer);
+        let outputs_y = row_containing(&rows, "OUTPUTS");
+        let empty_y = row_containing(&rows, "·  —  none declared");
 
-        assert!(!rendered.contains("Outputs"));
-        assert!(!rendered.contains("Output:"));
+        assert_eq!(empty_y, outputs_y + 2);
+        assert!(rows[empty_y + 1].replace('│', "").trim().is_empty());
+        assert!(!buffer_text(&buffer).contains("report"));
     }
 
     #[tokio::test]
@@ -4134,11 +5659,12 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
 
-        assert!(rendered.contains("workflow.yaml"));
-        assert!(rendered.contains("Steps (1)"));
+        assert!(rendered.contains("workflow"));
+        assert!(!rendered.contains("workflow.yaml"));
+        assert!(rendered.contains("▏ ○ build"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("compiling workflow host"));
-        assert!(rendered.contains("Ctrl-C cancel"));
+        assert!(rendered.contains("^C cancel run"));
     }
 
     #[test]
@@ -4154,37 +5680,124 @@ mod tests {
         };
 
         let wide = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
-        let steps = buffer_position(&wide, "Steps (2)");
-        let inspector = buffer_position(&wide, "Selected step");
-        let log = buffer_position(&wide, "following | lines");
-        assert_eq!(steps.1, inspector.1);
-        assert!(steps.0 < inspector.0 && inspector.0 == log.0);
-        assert!(log.1 > inspector.1);
+        let workflow = buffer_position(&wide, "workflow");
+        let steps = buffer_position(&wide, "▏ ⠋ selected-second-step");
+        let inspector = buffer_position(&wide, "⠋  selected-second-step   cmd");
+        let outputs = buffer_position(&wide, "OUTPUTS");
+        let log = buffer_position(&wide, "LOG");
+        assert_eq!(workflow.1, inspector.1);
+        assert!(steps.1 > workflow.1);
+        assert!(steps.0 < inspector.0);
+        assert_eq!(inspector.0, log.0);
+        assert!(inspector.1 < outputs.1 && outputs.1 < log.1);
+        assert!((60..=66).contains(&inspector.0));
+        assert_eq!(wide[(61, 0)].symbol(), "│");
+        assert_eq!(wide[(61, 1)].symbol(), "│");
+        assert_eq!(wide[(61, 2)].symbol(), "┼");
+        assert_eq!(wide[(61, outputs.1.saturating_sub(1))].symbol(), "├");
+        assert_eq!(wide[(61, log.1.saturating_sub(1))].symbol(), "├");
+        assert_eq!(wide[(61, 22)].symbol(), "┴");
+        assert_ne!(wide[(62, 1)].symbol(), "│");
+        assert!(wide[(60, steps.1)].modifier.contains(Modifier::REVERSED));
+        assert!(
+            !wide[(60, steps.1 + 1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
         assert!(buffer_text(&wide).contains("selected-second-step"));
+        assert!(buffer_text(&wide).contains("2 steps · 2 running"));
+        assert!(!buffer_text(&wide).contains("pending 0"));
 
         let stacked = render_snapshot(&snapshot, &mut interaction, 90, 24, false);
-        let steps = buffer_position(&stacked, "Steps (2)");
-        let inspector = buffer_position(&stacked, "Selected step");
-        let log = buffer_position(&stacked, "following | lines");
-        assert!(steps.1 < inspector.1 && inspector.1 < log.1);
-        assert_eq!(steps.0, inspector.0);
-        assert_eq!(inspector.0, log.0);
+        let steps = buffer_position(&stacked, "▏ ⠋ selected-second-step");
+        let inspector_body = buffer_position(&stacked, "command       build");
+        let outputs = buffer_position(&stacked, "OUTPUTS");
+        let log = buffer_position(&stacked, "LOG");
+        assert!(steps.1 < inspector_body.1 && inspector_body.1 < outputs.1 && outputs.1 < log.1);
+        assert!(steps.0 < inspector_body.0);
+        assert_eq!(inspector_body.0, log.0);
 
         let too_small = render_snapshot(&snapshot, &mut interaction, 50, 12, false);
         let too_small = buffer_text(&too_small);
         assert!(too_small.contains("Terminal too small"));
         assert!(too_small.contains("64x20"));
-        assert!(!too_small.contains("Steps (2)"));
+        assert!(!too_small.contains("selected-second-step"));
         assert_eq!(interaction.selected, 1);
         assert_eq!(interaction.surface, HostSurface::Split);
 
         let recovered = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
         let selected_row = buffer_rows(&recovered)
             .into_iter()
-            .find(|row| row.contains("> ") && row.contains("selected-second-step"))
+            .find(|row| row.contains("▏ ") && row.contains("selected-second-step"))
             .unwrap();
-        assert!(selected_row.contains('>'));
+        assert!(selected_row.contains('▏'));
         assert_eq!(interaction.selected, 1);
+    }
+
+    #[test]
+    fn workflow_header_separates_identity_status_duration_and_counts() {
+        let mut snapshot = direct_snapshot(long_log_step());
+        snapshot.workflow_path = "plans/plan-implement-test.yaml".to_owned();
+        snapshot.timing.duration = Duration::from_secs(20_065);
+        let mut interaction = HostInteraction::default();
+
+        let buffer = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
+        let rows = buffer_rows(&buffer);
+        let name = buffer_position(&buffer, "plan-implement-test");
+        let status = buffer_position(&buffer, "running");
+        let duration = buffer_position(&buffer, "5h34m25s");
+        let divider_x = wide_split_columns(Rect::new(0, 0, 120, 22))[1]
+            .x
+            .saturating_sub(1);
+
+        assert_eq!(name, (2, 0));
+        assert_eq!(status.1, name.1);
+        assert_eq!(duration.1, name.1);
+        assert!(name.0 < status.0 && status.0 < duration.0);
+        assert_eq!(
+            duration
+                .0
+                .saturating_add(u16::try_from(display_width("5h34m25s")).unwrap()),
+            divider_x.saturating_sub(2)
+        );
+        assert!(rows[1].starts_with("  1 step · 1 running"));
+        assert!(!rows[0].contains(".yaml"));
+        assert!(!rows[0].contains("concurrency"));
+        assert!(!rows[0].contains("published"));
+    }
+
+    #[test]
+    fn workflow_header_status_tracks_failure_and_publication_lifecycle() {
+        let mut snapshot = direct_snapshot(long_log_step());
+        snapshot.workflow = WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped {
+                primary_failure: StepFailure {
+                    step: "selected-command".to_owned(),
+                    phase: FailurePhase::Execution,
+                    cause: StepFailureCause::Execution(StepExecutionFailure::Command(
+                        CommandExecutionFailure::UnsuccessfulExit { code: Some(17) },
+                    )),
+                },
+            },
+        };
+        assert_eq!(workflow_header_status(&snapshot).0, "failing");
+
+        snapshot.workflow = WorkflowState::Succeeded;
+        snapshot.publication = WorkflowRunPublicationState::Publishing;
+        assert_eq!(workflow_header_status(&snapshot).0, "publishing");
+
+        snapshot.publication =
+            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+                result_directory: "result".to_owned(),
+            });
+        snapshot.cleanup = WorkflowRunCleanupState::Cleaning;
+        assert_eq!(workflow_header_status(&snapshot).0, "cleaning");
+
+        snapshot.cleanup = WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Failed);
+        assert_eq!(workflow_header_status(&snapshot).0, "cleanup failed");
+
+        snapshot.cleanup = WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Succeeded);
+        assert_eq!(workflow_header_status(&snapshot).0, "succeeded");
     }
 
     #[test]
@@ -4235,13 +5848,13 @@ mod tests {
         let offset = interaction.full_log.horizontal_offset;
 
         let stacked = render_snapshot(&snapshot, &mut interaction, 90, 20, false);
-        assert!(buffer_text(&stacked).contains("Full-screen log help"));
+        assert!(buffer_text(&stacked).contains("? — all commands"));
         assert_eq!(interaction.full_log.anchor, anchor);
         assert_eq!(interaction.full_log.horizontal_offset, offset);
 
         let too_small = render_snapshot(&snapshot, &mut interaction, 40, 8, false);
         assert!(buffer_text(&too_small).contains("Terminal too small"));
-        assert!(!buffer_text(&too_small).contains("Full-screen log help"));
+        assert!(!buffer_text(&too_small).contains("? — all commands"));
         press_key(
             &mut interaction,
             &snapshot,
@@ -4253,7 +5866,7 @@ mod tests {
         assert_eq!(interaction.full_log.horizontal_offset, offset);
 
         let recovered = render_snapshot(&snapshot, &mut interaction, 120, 24, false);
-        assert!(buffer_text(&recovered).contains("Full-screen log help"));
+        assert!(buffer_text(&recovered).contains("? — all commands"));
         assert_eq!(interaction.selected, 1);
         assert_eq!(interaction.surface, HostSurface::FullLog);
         assert!(interaction.help_visible);
@@ -4272,8 +5885,10 @@ mod tests {
         let log = buffer_text(&log);
         assert!(!interaction.help_visible);
         assert_eq!(interaction.surface, HostSurface::FullLog);
-        assert!(log.contains("selected-second-step log"));
-        assert!(!log.contains("Steps (2)"));
+        assert!(log.contains("selected-second-step"));
+        assert!(log.contains("● paused"));
+        assert!(!log.contains("stdout + stderr"));
+        assert!(!log.contains("workflow.yaml"));
     }
 
     #[test]
@@ -4361,10 +5976,10 @@ mod tests {
 
         let wide = render_snapshot(&snapshot, &mut interaction, 140, 24, false);
         let wide_footer = buffer_rows(&wide).pop().unwrap();
-        assert!(wide_footer.contains("↑/k previous"));
-        assert!(wide_footer.contains("↓/j next"));
-        assert!(wide_footer.contains("Enter inspect log"));
-        assert!(wide_footer.contains("Ctrl-C cancel"));
+        assert!(wide_footer.contains("↑/k up"));
+        assert!(wide_footer.contains("↓/j down"));
+        assert!(wide_footer.contains("↵ open"));
+        assert!(wide_footer.contains("^C cancel run"));
         assert!(wide_footer.contains("? help"));
 
         let minimum = render_snapshot(
@@ -4377,8 +5992,8 @@ mod tests {
         let minimum_footer = buffer_rows(&minimum).pop().unwrap();
         assert!(minimum_footer.contains("↑/k up"));
         assert!(minimum_footer.contains("↓/j down"));
-        assert!(minimum_footer.contains("Enter log"));
-        assert!(minimum_footer.contains("Ctrl-C cancel"));
+        assert!(minimum_footer.contains("↵ open"));
+        assert!(minimum_footer.contains("^C cancel run"));
         assert!(minimum_footer.contains("? help"));
 
         press_key(
@@ -4402,19 +6017,28 @@ mod tests {
             MINIMUM_HEIGHT,
             false,
         );
+        let split_help_rows = buffer_rows(&split_help);
         let split_help = buffer_text(&split_help);
         assert_eq!(interaction.selected, 0);
         for expected in [
-            "Split view help",
-            "↑ / k",
-            "↓ / j",
-            "Enter",
-            "Ctrl-C",
-            "?",
-            "Esc",
+            "? — all commands",
+            "esc to dismiss",
+            "MOVE",
+            "OPEN",
+            "VIEW",
+            "FILTER",
+            "RUN",
+            "↑/k",
+            "↓/j",
+            "↵",
+            "1…n",
+            "^C",
         ] {
             assert!(split_help.contains(expected), "missing {expected:?}");
         }
+        assert!(split_help.contains("toggle log"));
+        assert!(split_help_rows.last().unwrap().contains("DAG"));
+        assert!(split_help_rows.last().unwrap().contains("? help"));
 
         press_key(
             &mut interaction,
@@ -4444,24 +6068,31 @@ mod tests {
             MINIMUM_HEIGHT,
             false,
         );
+        let log_help_rows = buffer_rows(&log_help);
         let log_help = buffer_text(&log_help);
         for expected in [
-            "Full-screen log help",
-            "↑ / k, ↓ / j",
-            "Page Up / b",
-            "Page Down / f / Space",
-            "u / Ctrl-U",
-            "d / Ctrl-D",
-            "first retained record",
-            "retained bottom (paused)",
-            "← / h, → / l",
-            "Follow current retained bottom",
-            "Ctrl-C",
-            "?",
-            "Esc",
+            "? — all commands",
+            "MOVE",
+            "JUMP",
+            "VIEW",
+            "FILTER",
+            "RUN",
+            "↑/k",
+            "↓/j",
+            "PgUp/b",
+            "PgDn/f/Space",
+            "u/^U",
+            "d/^D",
+            "←/h",
+            "→/l",
+            "F",
+            "1…n",
+            "^C",
         ] {
             assert!(log_help.contains(expected), "missing {expected:?}");
         }
+        assert!(log_help_rows.last().unwrap().contains("LOG"));
+        assert!(log_help_rows.last().unwrap().contains("? help"));
 
         press_key(
             &mut interaction,
@@ -4478,7 +6109,7 @@ mod tests {
             false,
         );
         let log_footer = buffer_rows(&log).pop().unwrap();
-        for expected in ["Esc back", "↑↓/jk", "F follow", "Ctrl-C", "? help"] {
+        for expected in ["Esc", "↑/k", "↓/j", "F", "^C", "? help"] {
             assert!(log_footer.contains(expected), "missing {expected:?}");
         }
 
@@ -4501,7 +6132,7 @@ mod tests {
         let completed_footer = buffer_rows(&completed).pop().unwrap();
         assert!(completed_footer.contains("q quit"));
         assert!(completed_footer.contains("? help"));
-        assert!(!completed_footer.contains("Ctrl-C"));
+        assert!(!completed_footer.contains("^C"));
 
         press_key(
             &mut interaction,
@@ -4518,8 +6149,112 @@ mod tests {
             false,
         );
         let completed_help = buffer_text(&completed_help);
-        assert!(completed_help.contains("Quit the completed workflow"));
-        assert!(!completed_help.contains("Ctrl-C"));
+        assert!(completed_help.contains("q"));
+        assert!(completed_help.contains("quit"));
+        assert!(!completed_help.contains("^C"));
+    }
+
+    #[test]
+    fn contextual_footer_and_help_use_the_command_palette() {
+        let snapshot = direct_snapshot(long_log_step());
+        let cancellation = CancellationSource::new();
+        let mut interaction = HostInteraction::default();
+        let _ = render_snapshot(&snapshot, &mut interaction, 140, 24, true);
+        press_key(
+            &mut interaction,
+            &snapshot,
+            KeyCode::Char('?'),
+            KeyModifiers::SHIFT,
+            &cancellation,
+        );
+
+        let buffer = render_snapshot(&snapshot, &mut interaction, 140, 24, true);
+        let rows = buffer_rows(&buffer);
+        for (needle, expected) in [
+            ("? — all commands", Color::Rgb(203, 166, 247)),
+            ("MOVE", Color::Rgb(108, 112, 134)),
+            ("↑/k", Color::Rgb(249, 226, 175)),
+            ("previous step", Color::Rgb(186, 194, 222)),
+        ] {
+            let y = rows
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {}", rows.join("\n")));
+            let x = column_of(&rows[y], needle);
+            assert_eq!(
+                buffer[(x, u16::try_from(y).unwrap())].fg,
+                expected,
+                "wrong color for {needle:?}"
+            );
+        }
+
+        let footer_y = buffer.area.height.saturating_sub(1);
+        let footer = &rows[usize::from(footer_y)];
+        for (needle, expected) in [
+            ("DAG", Color::Rgb(203, 166, 247)),
+            ("↑/k", Color::Rgb(180, 190, 254)),
+            ("? help", Color::Rgb(203, 166, 247)),
+        ] {
+            let x = column_of(footer, needle);
+            assert_eq!(
+                buffer[(x, footer_y)].fg,
+                expected,
+                "wrong footer color for {needle:?}"
+            );
+        }
+        let separator_y = footer_y.saturating_sub(1);
+        assert_eq!(buffer[(0, separator_y)].fg, Color::Rgb(49, 50, 68));
+        assert!(
+            !rows[usize::from(separator_y)].contains('┴'),
+            "the covered split junction must not protrude through the help menu"
+        );
+    }
+
+    #[test]
+    fn terminal_lifecycle_hides_quit_until_adapter_completion() {
+        let mut snapshot = direct_snapshot(long_log_step());
+        snapshot.workflow = WorkflowState::Succeeded;
+        snapshot.authoritative_result = true;
+        snapshot.quiescent = true;
+        snapshot.publication = WorkflowRunPublicationState::Publishing;
+        let cancellation = CancellationSource::new();
+        let mut interaction = HostInteraction::default();
+
+        let publishing = render_minimum_snapshot_text(&snapshot, &mut interaction);
+        assert!(publishing.contains("publishing"));
+        assert!(!minimum_footer(&snapshot, &mut interaction).contains("q quit"));
+
+        assert_help_omits_quit(&mut interaction, &snapshot, &cancellation);
+
+        press_unmodified_key(&mut interaction, &snapshot, KeyCode::Esc, &cancellation);
+        press_unmodified_key(&mut interaction, &snapshot, KeyCode::Enter, &cancellation);
+        assert!(!minimum_footer(&snapshot, &mut interaction).contains("q quit"));
+
+        assert_help_omits_quit(&mut interaction, &snapshot, &cancellation);
+        assert!(!render_too_small_text(&snapshot).contains("q to quit"));
+
+        snapshot.publication =
+            WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+                result_directory: "results".to_owned(),
+            });
+        snapshot.cleanup = WorkflowRunCleanupState::Cleaning;
+        interaction.surface = HostSurface::Split;
+        interaction.help_visible = false;
+        assert!(render_minimum_snapshot_text(&snapshot, &mut interaction).contains("cleaning"));
+        assert!(!minimum_footer(&snapshot, &mut interaction).contains("q quit"));
+
+        snapshot.cleanup = WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Succeeded);
+        snapshot.quit_eligible = true;
+        assert!(minimum_footer(&snapshot, &mut interaction).contains("q quit"));
+
+        press_unmodified_key(&mut interaction, &snapshot, KeyCode::Enter, &cancellation);
+        assert!(minimum_footer(&snapshot, &mut interaction).contains("q quit"));
+
+        open_help(&mut interaction, &snapshot, &cancellation);
+        let completed_help = render_minimum_snapshot_text(&snapshot, &mut interaction);
+        assert!(completed_help.contains("RUN"));
+        assert!(completed_help.contains("→ quit"));
+        assert!(render_too_small_text(&snapshot).contains("q to quit"));
     }
 
     #[test]
@@ -4550,7 +6285,7 @@ mod tests {
         assert!(buffer_text(&buffer).contains("cancelling"));
         let footer = buffer_rows(&buffer).pop().unwrap();
         assert!(
-            !footer.contains("Ctrl-C"),
+            !footer.contains("^C"),
             "an already-cancelling workflow must not advertise a no-op cancel command: {footer:?}"
         );
     }
@@ -4563,11 +6298,11 @@ mod tests {
         let rendered = buffer_text(&buffer);
 
         for expected in [
-            ">",
-            "State: running",
+            "▏",
+            "command",
             "following",
             "stdout",
-            "Ctrl-C cancel",
+            "^C cancel run",
             "? help",
         ] {
             assert!(rendered.contains(expected), "missing {expected:?}");
@@ -4580,6 +6315,81 @@ mod tests {
         );
         let (x, y) = buffer_position(&buffer, "selected-command");
         assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(x, y + 1)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn color_enabled_rendering_separates_structure_content_and_focus() {
+        let mut step = long_log_step();
+        step.timing = Some(WorkflowRunElapsed {
+            started_at: time::OffsetDateTime::UNIX_EPOCH,
+            duration: Duration::from_secs(3),
+            frozen: false,
+        });
+        let snapshot = direct_snapshot(step);
+        let mut interaction = HostInteraction::default();
+        let buffer = render_snapshot(&snapshot, &mut interaction, 120, 24, true);
+
+        assert_eq!(buffer[(61, 1)].fg, separator_style(true).fg.unwrap());
+        let (title_x, title_y) = buffer_position(&buffer, "selected-command");
+        assert_eq!(
+            buffer[(title_x, title_y)].fg,
+            tone_style(true, Tone::Primary).fg.unwrap()
+        );
+        assert!(buffer[(title_x, title_y)].modifier.contains(Modifier::BOLD));
+        let (badge_x, badge_y) = buffer_position(&buffer, " cmd ");
+        assert_eq!(buffer[(badge_x, badge_y)].bg, Color::Rgb(49, 50, 68));
+        assert_eq!(
+            buffer[(badge_x, badge_y)].fg,
+            tone_style(true, Tone::Muted).fg.unwrap()
+        );
+        let rows = buffer_rows(&buffer);
+        let header_row = &rows[usize::from(title_y)];
+        let duration_byte = header_row.rfind("3.0s").unwrap();
+        let duration_x = u16::try_from(display_width(&header_row[..duration_byte])).unwrap();
+        assert_eq!(
+            buffer[(duration_x, title_y)].fg,
+            tone_style(true, Tone::Active).fg.unwrap()
+        );
+        let (payload_x, payload_y) = buffer_position(&buffer, "abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(
+            buffer[(payload_x, payload_y)].fg,
+            tone_style(true, Tone::Neutral).fg.unwrap()
+        );
+        let (footer_x, footer_y) = buffer_position(&buffer, "DAG");
+        assert_eq!(
+            buffer[(footer_x, footer_y)].fg,
+            command_accent_style(true).fg.unwrap()
+        );
+        let selected_y = buffer_position(&buffer, "▏ ⠋ selected-command").1;
+        assert_eq!(
+            buffer[(60, selected_y)].bg,
+            step_selection_style(true).bg.unwrap()
+        );
+        let step_row = &rows[usize::from(selected_y)];
+        let duration_byte = step_row.find("3.0s").unwrap();
+        let duration_x = u16::try_from(display_width(&step_row[..duration_byte])).unwrap();
+        assert_eq!(
+            buffer[(duration_x, selected_y)].fg,
+            tone_style(true, Tone::Active).fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn running_step_indicator_advances_with_elapsed_time() {
+        let mut step = long_log_step();
+        step.timing = Some(WorkflowRunElapsed {
+            started_at: time::OffsetDateTime::UNIX_EPOCH,
+            duration: Duration::ZERO,
+            frozen: false,
+        });
+        assert_eq!(step_state_glyph(&step), "⠋");
+
+        step.timing.as_mut().unwrap().duration = REDRAW_INTERVAL;
+        assert_eq!(step_state_glyph(&step), "⠙");
+
+        step.timing.as_mut().unwrap().duration = REDRAW_INTERVAL * 10;
+        assert_eq!(step_state_glyph(&step), "⠋");
     }
 
     #[test]
@@ -4654,18 +6464,21 @@ mod tests {
             .unwrap();
         let top = compact
             .iter()
-            .find(|line| line.contains("middlefive"))
+            .find(|line| line.contains("middleseven"))
             .unwrap();
-        assert!(selected.contains("> │"));
+        assert!(selected.contains("▏ │"));
         assert!(top.contains("│"));
-        assert_eq!(selected.find("middleeight"), top.find("middlefive"));
+        assert_eq!(
+            display_width(&selected[..selected.find("middleeight").unwrap()]),
+            display_width(&top[..top.find("middleseven").unwrap()]),
+        );
         assert!(!compact.iter().any(|line| line.contains("branch")));
 
         let resized = render_steps_lines(&snapshot, &interaction, 64, 8);
         assert!(
             resized
                 .iter()
-                .any(|line| line.contains("> │") && line.contains("middleeight"))
+                .any(|line| line.contains("▏ │") && line.contains("middleeight"))
         );
         assert!(!resized.iter().any(|line| line.contains("branch")));
     }
@@ -4832,7 +6645,7 @@ mod tests {
         });
         view.begin_cleanup();
         view.complete_cleanup(WorkflowRunCleanupResult::Succeeded);
-        view.mark_execution_ownership_released();
+        view.mark_adapter_lifecycle_completed();
         assert!(view.snapshot().quit_eligible);
     }
 
@@ -4854,6 +6667,36 @@ mod tests {
         payload: &str,
         continuation: bool,
     ) -> WorkflowRunLogRecord {
+        direct_source_log_record(
+            order,
+            WorkflowRunLogSource::Command(source),
+            observed_at,
+            payload,
+            continuation,
+        )
+    }
+
+    fn direct_agent_log_record(
+        order: u64,
+        source: AgentPresentationObservationKind,
+        payload: &str,
+    ) -> WorkflowRunLogRecord {
+        direct_source_log_record(
+            order,
+            WorkflowRunLogSource::Agent(source),
+            "2026-08-04T12:34:56Z",
+            payload,
+            false,
+        )
+    }
+
+    fn direct_source_log_record(
+        order: u64,
+        source: WorkflowRunLogSource,
+        observed_at: &str,
+        payload: &str,
+        continuation: bool,
+    ) -> WorkflowRunLogRecord {
         WorkflowRunLogRecord {
             accepted_order: AcceptedRecordOrder::for_test(order),
             observed_at: time::OffsetDateTime::parse(
@@ -4864,7 +6707,7 @@ mod tests {
             invocation: ActionId {
                 transition_sequence: TransitionSequence::default(),
             },
-            source: WorkflowRunLogSource::Command(source),
+            source,
             source_sequence: SourceSequence::first().get(),
             payload: Arc::from(payload),
             continuation,
@@ -4965,6 +6808,59 @@ mod tests {
         (interaction, cancellation)
     }
 
+    fn assert_quit_control(
+        interaction: &mut HostInteraction,
+        snapshot: &WorkflowRunViewSnapshot,
+        cancellation: &CancellationSource,
+        expected: HostControl,
+    ) {
+        assert_eq!(
+            press_unmodified_key(interaction, snapshot, KeyCode::Char('q'), cancellation),
+            expected
+        );
+    }
+
+    fn assert_help_omits_quit(
+        interaction: &mut HostInteraction,
+        snapshot: &WorkflowRunViewSnapshot,
+        cancellation: &CancellationSource,
+    ) {
+        open_help(interaction, snapshot, cancellation);
+        assert!(
+            !render_minimum_snapshot_text(snapshot, interaction)
+                .contains("Quit the completed workflow")
+        );
+    }
+
+    fn open_help(
+        interaction: &mut HostInteraction,
+        snapshot: &WorkflowRunViewSnapshot,
+        cancellation: &CancellationSource,
+    ) {
+        press_key(
+            interaction,
+            snapshot,
+            KeyCode::Char('?'),
+            KeyModifiers::SHIFT,
+            cancellation,
+        );
+    }
+
+    fn press_unmodified_key(
+        interaction: &mut HostInteraction,
+        snapshot: &WorkflowRunViewSnapshot,
+        code: KeyCode,
+        cancellation: &CancellationSource,
+    ) -> HostControl {
+        press_key(
+            interaction,
+            snapshot,
+            code,
+            KeyModifiers::NONE,
+            cancellation,
+        )
+    }
+
     fn press_key(
         interaction: &mut HostInteraction,
         snapshot: &WorkflowRunViewSnapshot,
@@ -4983,9 +6879,10 @@ mod tests {
         interaction: &HostInteraction,
         snapshot: &WorkflowRunViewSnapshot,
     ) -> Option<u64> {
-        let log = &snapshot.steps[interaction.selected].log;
+        let step = &snapshot.steps[interaction.selected];
+        let log = FilteredLog::new(&step.log, interaction.log_filters);
         log.records
-            .get(interaction.full_log.top_index(log))
+            .get(interaction.full_log.top_index(&log))
             .map(|record| record.accepted_order.get())
     }
 
@@ -4996,6 +6893,43 @@ mod tests {
         height: u16,
     ) -> ratatui::buffer::Buffer {
         render_snapshot(snapshot, interaction, width, height, false)
+    }
+
+    fn render_minimum_snapshot_text(
+        snapshot: &WorkflowRunViewSnapshot,
+        interaction: &mut HostInteraction,
+    ) -> String {
+        buffer_text(&render_snapshot(
+            snapshot,
+            interaction,
+            MINIMUM_WIDTH,
+            MINIMUM_HEIGHT,
+            false,
+        ))
+    }
+
+    fn minimum_footer(
+        snapshot: &WorkflowRunViewSnapshot,
+        interaction: &mut HostInteraction,
+    ) -> String {
+        buffer_rows(&render_snapshot(
+            snapshot,
+            interaction,
+            MINIMUM_WIDTH,
+            MINIMUM_HEIGHT,
+            false,
+        ))
+        .pop()
+        .unwrap()
+    }
+
+    fn render_too_small_text(snapshot: &WorkflowRunViewSnapshot) -> String {
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_too_small(frame, frame.area(), snapshot, false))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     fn render_snapshot(
@@ -5027,6 +6961,22 @@ mod tests {
             1,
             0,
         )
+    }
+
+    fn direct_agent_log_step(records: Vec<WorkflowRunLogRecord>) -> WorkflowRunStepView {
+        let observed_records = u64::try_from(records.len()).unwrap();
+        let mut step = direct_log_step(StepStateKind::Running, records, observed_records, 0);
+        step.definition = WorkflowPresentationStep::Agent {
+            profile: "test".to_owned(),
+            harness: AgentPresentationHarness::Pi {
+                model: "test-model".to_owned(),
+                thinking: Thinking::Medium,
+            },
+            direct_dependencies: Vec::new(),
+            outputs: BTreeMap::new(),
+        };
+        step.outputs.clear();
+        step
     }
 
     fn direct_log_step(
@@ -5109,12 +7059,23 @@ mod tests {
     }
 
     fn render_direct_inspector(step: &WorkflowRunStepView, width: u16, height: u16) -> String {
+        buffer_text(&render_direct_inspector_buffer(step, width, height, false))
+    }
+
+    fn render_direct_inspector_buffer(
+        step: &WorkflowRunStepView,
+        width: u16,
+        height: u16,
+        color: bool,
+    ) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_inspector(frame, frame.area(), Some(step), false))
+            .draw(|frame| {
+                render_inspector(frame, frame.area(), Some(step), color, Borders::ALL);
+            })
             .unwrap();
-        buffer_text(terminal.backend().buffer())
+        terminal.backend().buffer().clone()
     }
 
     fn render_direct_log(
@@ -5134,6 +7095,7 @@ mod tests {
                     &snapshot,
                     &HostInteraction::default(),
                     color,
+                    Borders::ALL,
                 );
             })
             .unwrap();
@@ -5200,7 +7162,18 @@ mod tests {
         let graph = DagLayout::for_steps(&snapshot.steps);
         terminal
             .draw(|frame| {
-                render_steps(frame, frame.area(), snapshot, &graph, interaction, false);
+                render_steps(
+                    frame,
+                    frame.area(),
+                    snapshot,
+                    &graph,
+                    interaction,
+                    false,
+                    StepPanel {
+                        borders: Borders::ALL,
+                        show_title: true,
+                    },
+                );
             })
             .unwrap();
         buffer_rows(terminal.backend().buffer())

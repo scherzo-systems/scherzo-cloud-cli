@@ -261,7 +261,7 @@ where
                 quiescent: false,
                 publication: WorkflowRunPublicationState::NotStarted,
                 cleanup: WorkflowRunCleanupState::NotStarted,
-                execution_ownership_released: false,
+                adapter_lifecycle_completed: false,
                 log_capacity,
                 last_accepted_order: None,
                 generation: 0,
@@ -313,11 +313,6 @@ where
                 )
             })
             .collect();
-        let quit_eligible = state.authoritative_result
-            && state.quiescent
-            && matches!(state.publication, WorkflowRunPublicationState::Completed(_))
-            && matches!(state.cleanup, WorkflowRunCleanupState::Completed(_))
-            && state.execution_ownership_released;
         WorkflowRunViewSnapshot {
             generation: state.generation,
             workflow_path: state.workflow_path.clone(),
@@ -330,7 +325,7 @@ where
             quiescent: state.quiescent,
             publication: state.publication.clone(),
             cleanup: state.cleanup,
-            quit_eligible,
+            quit_eligible: state.adapter_lifecycle_completed,
         }
     }
 
@@ -422,12 +417,12 @@ where
         });
     }
 
-    pub(crate) fn mark_execution_ownership_released(&self) {
+    pub(crate) fn mark_adapter_lifecycle_completed(&self) {
         self.update(|state| {
-            if state.execution_ownership_released {
+            if state.adapter_lifecycle_completed {
                 return false;
             }
-            state.execution_ownership_released = true;
+            state.adapter_lifecycle_completed = true;
             true
         });
     }
@@ -486,7 +481,7 @@ struct WorkflowRunViewState {
     quiescent: bool,
     publication: WorkflowRunPublicationState,
     cleanup: WorkflowRunCleanupState,
-    execution_ownership_released: bool,
+    adapter_lifecycle_completed: bool,
     log_capacity: StepLogCapacity,
     last_accepted_order: Option<AcceptedRecordOrder>,
     generation: u64,

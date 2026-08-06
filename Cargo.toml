@@ -63,6 +63,7 @@ url = { version = "2.5.8", features = ["serde"] }
 yaml-rust2 = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
+rustix = { version = "1.1.4", features = ["pty"] }
 tokio = { version = "1.53.1", features = ["sync"] }
 
 # Opaque dot-only path segments are valid API inputs but do not round-trip through

@@ -35,6 +35,7 @@ use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::observation::NoopExecutionObserver;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
+use crate::execution::workflow::process_group::process_group_is_quiescent;
 use crate::execution::workflow::result_validation::{
     ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
     ValidationWorkerRequest,
@@ -1443,9 +1444,8 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
         now_seconds.store(130, Ordering::SeqCst);
         deadline_release.send_replace(true);
         read_signal(running.descendant_ready.clone()).await;
-        assert_eq!(
-            getpgid(Some(descendant)).unwrap(),
-            process,
+        assert!(
+            !process_group_is_quiescent(process),
             "the unreaped descendant must keep the process group observable"
         );
         assert!(
@@ -1460,7 +1460,7 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
                 cause: AgentFailureCause::ResultSettlementFailed
             }
         );
-        assert!(getpgid(Some(descendant)).is_err());
+        assert!(process_group_is_quiescent(process));
     })
     .await;
 }

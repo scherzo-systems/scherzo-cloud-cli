@@ -31,6 +31,7 @@ pub(super) struct DagLayout {
 pub(super) struct DagRow {
     pub(super) before_node: String,
     pub(super) after_node: String,
+    pub(super) below_node: String,
 }
 
 #[derive(Clone, Copy)]
@@ -262,24 +263,44 @@ fn project_row(row: LogicalRow, physical_lane_count: usize, overflow: bool) -> D
         }
     };
     let gutter_width = physical_lane_count.saturating_mul(2).saturating_sub(1);
-    let mut cells = vec![0_u8; gutter_width];
+    let mut upper_cells = vec![0_u8; gutter_width];
+    let mut lower_cells = vec![0_u8; gutter_width];
     let overflow_boundary = physical_lane_count.saturating_sub(1);
-    let mut overflow_active = overflow && row.node_lane >= overflow_boundary;
+    let mut upper_overflow_active = overflow && row.node_lane >= overflow_boundary;
+    let mut lower_overflow_active = false;
     for segment in row.segments {
         let (from, to) = match segment {
             Segment::Upper { from, to } | Segment::Lower { from, to } => (from, to),
         };
-        overflow_active |= overflow && (from >= overflow_boundary || to >= overflow_boundary);
+        let overflow_segment = overflow && (from >= overflow_boundary || to >= overflow_boundary);
         let from = physical_lane(from);
         let to = physical_lane(to);
         match segment {
-            Segment::Upper { .. } => draw_upper(&mut cells, from, to),
-            Segment::Lower { .. } => draw_lower(&mut cells, from, to),
+            Segment::Upper { .. } => {
+                upper_overflow_active |= overflow_segment;
+                draw_upper(&mut upper_cells, from, to);
+            }
+            Segment::Lower { .. } => {
+                lower_overflow_active |= overflow_segment;
+                draw_lower(&mut lower_cells, from, to);
+            }
         }
     }
 
-    let mut connectors = cells.into_iter().map(connector_glyph).collect::<Vec<_>>();
+    let upper_connectors = connector_row(upper_cells, physical_lane_count, upper_overflow_active);
+    let lower_connectors = connector_row(lower_cells, physical_lane_count, lower_overflow_active);
     let node_column = physical_lane(row.node_lane).saturating_mul(2);
+    DagRow {
+        before_node: upper_connectors[..node_column].iter().collect(),
+        after_node: upper_connectors[node_column.saturating_add(1)..]
+            .iter()
+            .collect(),
+        below_node: lower_connectors.iter().collect(),
+    }
+}
+
+fn connector_row(cells: Vec<u8>, physical_lane_count: usize, overflow_active: bool) -> Vec<char> {
+    let mut connectors = cells.into_iter().map(connector_glyph).collect::<Vec<_>>();
     if overflow_active {
         let overflow_column = physical_lane_count.saturating_sub(1).saturating_mul(2);
         connectors[overflow_column] = '┊';
@@ -287,10 +308,7 @@ fn project_row(row: LogicalRow, physical_lane_count: usize, overflow: bool) -> D
             connectors[overflow_column - 1] = '…';
         }
     }
-    DagRow {
-        before_node: connectors[..node_column].iter().collect(),
-        after_node: connectors[node_column.saturating_add(1)..].iter().collect(),
-    }
+    connectors
 }
 
 fn draw_upper(cells: &mut [u8], from_lane: usize, to_lane: usize) {
@@ -367,9 +385,13 @@ mod tests {
         )
     }
 
-    fn row(layout: &DagLayout, index: usize) -> String {
+    fn node_row(layout: &DagLayout, index: usize) -> String {
         let row = &layout.rows[index];
         format!("{}●{}", row.before_node, row.after_node)
+    }
+
+    fn connector_row(layout: &DagLayout, index: usize) -> &str {
+        &layout.rows[index].below_node
     }
 
     #[test]
@@ -377,14 +399,20 @@ mod tests {
         let chain = layout(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
         assert_eq!(chain.gutter_width, 1);
         assert_eq!(
-            (0..3).map(|index| row(&chain, index)).collect::<Vec<_>>(),
+            (0..3)
+                .map(|index| node_row(&chain, index))
+                .collect::<Vec<_>>(),
             ["●", "●", "●"]
         );
+        assert_eq!(connector_row(&chain, 0), "│");
+        assert_eq!(connector_row(&chain, 1), "│");
+        assert_eq!(connector_row(&chain, 2), " ");
 
         let independent = layout(&[("root", &[]), ("other", &[]), ("child", &["root"])]);
         assert_eq!(independent.gutter_width, 3);
-        assert_eq!(row(&independent, 1), "│ ●");
-        assert_eq!(row(&independent, 2), "●  ");
+        assert_eq!(node_row(&independent, 1), "│ ●");
+        assert_eq!(connector_row(&independent, 1), "│  ");
+        assert_eq!(node_row(&independent, 2), "●  ");
     }
 
     #[test]
@@ -396,18 +424,21 @@ mod tests {
             ("third", &["root"]),
         ]);
 
-        assert_eq!(row(&layout, 0), "●─┬─┐");
-        assert_eq!(row(&layout, 1), "● │ │");
-        assert_eq!(row(&layout, 2), "  ● │");
-        assert_eq!(row(&layout, 3), "    ●");
+        assert_eq!(node_row(&layout, 0), "●    ");
+        assert_eq!(connector_row(&layout, 0), "┌─┬─┐");
+        assert_eq!(node_row(&layout, 1), "● │ │");
+        assert_eq!(connector_row(&layout, 1), "  │ │");
+        assert_eq!(node_row(&layout, 2), "  ● │");
+        assert_eq!(connector_row(&layout, 2), "    │");
+        assert_eq!(node_row(&layout, 3), "    ●");
     }
 
     #[test]
     fn fan_in_and_diamond_close_into_the_dependent_lane() {
         let fan_in = layout(&[("left", &[]), ("right", &[]), ("join", &["right", "left"])]);
-        assert_eq!(row(&fan_in, 0), "●  ");
-        assert_eq!(row(&fan_in, 1), "│ ●");
-        assert_eq!(row(&fan_in, 2), "●─┘");
+        assert_eq!(node_row(&fan_in, 0), "●  ");
+        assert_eq!(node_row(&fan_in, 1), "│ ●");
+        assert_eq!(node_row(&fan_in, 2), "●─┘");
 
         let diamond = layout(&[
             ("root", &[]),
@@ -415,10 +446,12 @@ mod tests {
             ("right", &["root"]),
             ("join", &["right", "left"]),
         ]);
-        assert_eq!(row(&diamond, 0), "●─┐");
-        assert_eq!(row(&diamond, 1), "● │");
-        assert_eq!(row(&diamond, 2), "│ ●");
-        assert_eq!(row(&diamond, 3), "●─┘");
+        assert_eq!(node_row(&diamond, 0), "●  ");
+        assert_eq!(connector_row(&diamond, 0), "┌─┐");
+        assert_eq!(node_row(&diamond, 1), "● │");
+        assert_eq!(connector_row(&diamond, 1), "│ │");
+        assert_eq!(node_row(&diamond, 2), "│ ●");
+        assert_eq!(node_row(&diamond, 3), "●─┘");
     }
 
     #[test]
@@ -435,10 +468,10 @@ mod tests {
         ]);
 
         assert_eq!(layout.gutter_width, MAX_GRAPH_LANES * 2 - 1);
-        assert!(row(&layout, 0).contains("…┊"));
-        assert_eq!(row(&layout, 6).chars().count(), layout.gutter_width);
-        assert!(row(&layout, 6).ends_with('●'));
-        assert!(row(&layout, 7).ends_with('●'));
+        assert!(connector_row(&layout, 0).contains("…┊"));
+        assert_eq!(node_row(&layout, 6).chars().count(), layout.gutter_width);
+        assert!(node_row(&layout, 6).ends_with('●'));
+        assert!(node_row(&layout, 7).ends_with('●'));
     }
 
     #[test]
@@ -466,7 +499,9 @@ mod tests {
         assert!(layout.rows.iter().all(|graph_row| {
             graph_row.before_node.chars().count() + 1 + graph_row.after_node.chars().count()
                 == layout.gutter_width
+                && graph_row.below_node.chars().count() == layout.gutter_width
         }));
-        assert!(row(&layout, STEP_COUNT / 2).contains("…"));
+        let middle = &layout.rows[STEP_COUNT / 2];
+        assert!(node_row(&layout, STEP_COUNT / 2).contains("…") || middle.below_node.contains("…"));
     }
 }

@@ -34,6 +34,91 @@ fn wait_for_process_poll() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn process_state(process: Pid) -> Option<u8> {
+    fs::read(
+        Path::new("/proc")
+            .join(process.as_raw_pid().to_string())
+            .join("stat"),
+    )
+    .ok()
+    .and_then(|stat| {
+        stat.windows(2)
+            .rposition(|bytes| bytes == b") ")
+            .and_then(|end| stat.get(end + 2).copied())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_tui_pty() -> (OwnedFd, OwnedFd) {
+    let master = rustix::pty::openpt(
+        rustix::pty::OpenptFlags::RDWR
+            | rustix::pty::OpenptFlags::NOCTTY
+            | rustix::pty::OpenptFlags::CLOEXEC,
+    )
+    .unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    let slave = rustix::pty::ioctl_tiocgptpeer(
+        &master,
+        rustix::pty::OpenptFlags::RDWR
+            | rustix::pty::OpenptFlags::NOCTTY
+            | rustix::pty::OpenptFlags::CLOEXEC,
+    )
+    .unwrap();
+    rustix::termios::tcsetwinsize(
+        &slave,
+        rustix::termios::Winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    (master, slave)
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_tui_run(
+    args: &[String],
+    master: OwnedFd,
+    slave: &OwnedFd,
+) -> (
+    std::process::Child,
+    std::fs::File,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    let master_reader = rustix::io::dup(&master).unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut master_reader = std::fs::File::from(master_reader);
+        let mut transcript = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match master_reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => transcript.extend_from_slice(&buffer[..count]),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("read TUI pseudoterminal: {error}"),
+            }
+        }
+        transcript
+    });
+
+    let child_stdin = rustix::io::dup(slave).unwrap();
+    let child_stdout = rustix::io::dup(slave).unwrap();
+    let child_stderr = rustix::io::dup(slave).unwrap();
+    let child = isolated_command(args)
+        .env("TERM", "xterm")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::from(child_stdin))
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
+        .spawn()
+        .unwrap();
+    (child, std::fs::File::from(master), reader)
+}
+
 pub(super) struct RunBundle {
     _temporary: TempDir,
     source_root: PathBuf,
@@ -926,6 +1011,164 @@ fn json_run_executes_imports_closed_stdin_publication_and_offline_boundaries() {
     assert!(bundle.execution_root.exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn tui_releases_ownership_and_restores_before_summary_handoff() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("tui-handoff");
+    let (master, slave) = open_tui_pty();
+    let original_input_mode = rustix::termios::tcgetattr(&slave).unwrap();
+    let (mut child, mut master_writer, reader) =
+        spawn_tui_run(&bundle.args(&destination), master, &slave);
+
+    let status_args = vec![
+        "workflow".to_owned(),
+        "status".to_owned(),
+        "--run-dir".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ];
+    let mut last_status_error = String::new();
+    let status = (0..500).find_map(|_| {
+        let output = isolated_command(&status_args).output().unwrap();
+        if output.status.success() {
+            let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if status["recovery"] == serde_json::json!({"status": "settled"}) {
+                return Some(status);
+            }
+            last_status_error = format!("latest recovery status: {}", status["recovery"]);
+        } else {
+            last_status_error = String::from_utf8_lossy(&output.stderr).into_owned();
+        }
+        wait_for_process_poll();
+        None
+    });
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(slave);
+        drop(master_writer);
+        let transcript = reader.join().unwrap();
+        panic!(
+            "status did not observe released ownership: {last_status_error}; transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
+        );
+    };
+    assert_eq!(status["recovery"], serde_json::json!({"status": "settled"}));
+    assert_eq!(
+        status["retry"],
+        serde_json::json!({
+            "eligible": false,
+            "reason": "latest_attempt_succeeded"
+        })
+    );
+
+    master_writer.write_all(b"q").unwrap();
+    master_writer.flush().unwrap();
+    let process_status = (0..200)
+        .find_map(|_| {
+            let status = child.try_wait().unwrap();
+            if status.is_none() {
+                wait_for_process_poll();
+            }
+            status
+        })
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("TUI did not exit after eligible q")
+        });
+    assert!(process_status.success());
+    let restored_input_mode = rustix::termios::tcgetattr(&slave).unwrap();
+    assert_eq!(
+        restored_input_mode.input_modes,
+        original_input_mode.input_modes
+    );
+    assert_eq!(
+        restored_input_mode.output_modes,
+        original_input_mode.output_modes
+    );
+    assert_eq!(
+        restored_input_mode.control_modes,
+        original_input_mode.control_modes
+    );
+    assert_eq!(
+        restored_input_mode.local_modes,
+        original_input_mode.local_modes
+    );
+    assert_eq!(
+        restored_input_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN],
+        original_input_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN]
+    );
+    assert_eq!(
+        restored_input_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME],
+        original_input_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
+    );
+
+    drop(slave);
+    drop(master_writer);
+    let transcript = reader.join().unwrap();
+    let transcript = String::from_utf8_lossy(&transcript);
+    let restored = transcript
+        .rfind("\u{1b}[?1049l")
+        .expect("TUI must leave the alternate screen");
+    let summary = transcript[restored..]
+        .find("── summary")
+        .map(|offset| restored + offset)
+        .expect("standard summary must follow TUI restoration");
+    assert!(restored < summary);
+    assert!(!transcript[restored + "\u{1b}[?1049l".len()..].contains("\u{1b}[?1049h"));
+    assert!(transcript[summary..].contains("result succeeded · exit 0"));
+    assert!(transcript[summary..].contains("attempts/000001/result"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tui_releases_outer_private_staging_before_run_lock() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("tui-private-cleanup-order");
+    let (master, slave) = open_tui_pty();
+    let (mut child, master_writer, reader) =
+        spawn_tui_run(&bundle.args(&destination), master, &slave);
+    drop(master_writer);
+
+    let lock_released = (0..500).any(|_| {
+        let available = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(destination.join("run.lock"))
+            .ok()
+            .is_some_and(|lock| {
+                rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok()
+            });
+        if !available {
+            wait_for_process_poll();
+        }
+        available
+    });
+    let private_entries = lock_released.then(|| {
+        fs::read_dir(destination.join(".private"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>()
+    });
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(slave);
+    reader.join().unwrap();
+
+    assert!(lock_released, "TUI never released run.lock");
+    assert!(
+        private_entries.as_ref().unwrap().is_empty(),
+        "run.lock was released before private staging cleanup: {private_entries:?}"
+    );
+}
+
 #[test]
 fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch() {
     for cwd in [None, Some("nested")] {
@@ -1325,6 +1568,10 @@ steps:
 
     assert_eq!(output.status.code(), Some(1));
     assert!(attempt_result(&destination).join("result.json").is_file());
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(summary.contains("result succeeded · exit 0"));
+    assert!(summary.contains("attempts/000001/result"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("release private workflow staging"));
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["diagnostics"][0]["code"], "private_cleanup_failure");
@@ -1464,6 +1711,11 @@ fn run_real_pty_boundary_smoke(
     let master_reader = rustix::io::dup(&pty.master)?;
     let mut master_writer = File::from(pty.master);
     let mut master_reader = File::from(master_reader);
+    let terminal_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        read_pty_to_end(&mut master_reader, &mut output)?;
+        Ok::<_, std::io::Error>(output)
+    });
 
     let mut child = isolated_command(&bundle.args(&destination))
         .env("TERM", "xterm-256color")
@@ -1495,7 +1747,6 @@ fn run_real_pty_boundary_smoke(
     *progress
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = "active q acknowledgement";
-    let mut terminal_output = Vec::new();
     master_writer.write_all(b"q?")?;
     master_writer.flush()?;
     read_terminal_handshake(&mut handshake, "help-open")?;
@@ -1532,7 +1783,9 @@ fn run_real_pty_boundary_smoke(
         original_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
     );
     drop(pty.slave);
-    read_pty_to_end(&mut master_reader, &mut terminal_output)?;
+    let terminal_output = terminal_reader
+        .join()
+        .map_err(|_| std::io::Error::other("PTY reader panicked"))??;
 
     let mut stderr = String::new();
     if let Some(mut child_stderr) = child.stderr.take() {
@@ -1955,18 +2208,19 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
     let descendant = read_pid(&descendant_file);
 
     kill_process(owner, Signal::STOP).unwrap();
+    for _ in 0..500 {
+        if matches!(process_state(owner), Some(b'T' | b't')) {
+            break;
+        }
+        wait_for_process_poll();
+    }
+    assert!(
+        matches!(process_state(owner), Some(b'T' | b't')),
+        "the execution owner must stop before the guard is killed"
+    );
+
     kill_process(guardian, Signal::KILL).unwrap();
-    let leader_stat = Path::new("/proc")
-        .join(leader.as_raw_pid().to_string())
-        .join("stat");
-    let leader_is_zombie = || {
-        fs::read_to_string(&leader_stat)
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
-            .and_then(|fields| fields.split_ascii_whitespace().next().map(str::to_owned))
-            .as_deref()
-            == Some("Z")
-    };
+    let leader_is_zombie = || process_state(leader) == Some(b'Z');
     for _ in 0..500 {
         if leader_is_zombie() {
             break;

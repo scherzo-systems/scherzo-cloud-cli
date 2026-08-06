@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(not(target_vendor = "apple"))]
 use nix::errno::Errno;
+#[cfg(not(target_vendor = "apple"))]
 use nix::sys::signal::killpg;
+#[cfg(not(target_vendor = "apple"))]
 use nix::unistd::Pid as NixPid;
 use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpgid};
 
@@ -209,6 +212,7 @@ pub(super) fn reap_process_group_children(process_group: Pid) {
     while matches!(waitpgid(process_group, WaitOptions::NOHANG), Ok(Some(_))) {}
 }
 
+#[cfg(not(target_vendor = "apple"))]
 pub(super) fn process_group_is_quiescent(process_group: Pid) -> bool {
     matches!(
         killpg(
@@ -216,6 +220,14 @@ pub(super) fn process_group_is_quiescent(process_group: Pid) -> bool {
             None::<nix::sys::signal::Signal>,
         ),
         Err(Errno::ESRCH)
+    )
+}
+
+#[cfg(target_vendor = "apple")]
+pub(super) fn process_group_is_quiescent(process_group: Pid) -> bool {
+    matches!(
+        apple_process_group_exists(process_group.as_raw_pid()),
+        Ok(false)
     )
 }
 

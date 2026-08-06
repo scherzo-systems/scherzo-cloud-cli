@@ -397,7 +397,6 @@ fn lifecycle_completion_requires_matching_started_phase() {
         result_directory: "results".to_owned(),
     });
     view.complete_cleanup(WorkflowRunCleanupResult::Succeeded);
-    view.mark_execution_ownership_released();
 
     let snapshot = view.snapshot();
     assert_eq!(
@@ -408,8 +407,42 @@ fn lifecycle_completion_requires_matching_started_phase() {
     assert!(!snapshot.quit_eligible);
 }
 
+#[test]
+fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
+    let (_temporary, workflow) = resolved_workflow();
+    let base = crate::timing::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock, StepLogCapacity::default());
+
+    view.reconcile_terminal_result(&succeeded_run_result(&workflow, base))
+        .unwrap();
+    view.mark_quiescent();
+    view.begin_publication();
+    view.complete_publication(WorkflowRunPublicationResult::Succeeded {
+        result_directory: "results".to_owned(),
+    });
+    view.begin_cleanup();
+    view.complete_cleanup(WorkflowRunCleanupResult::Succeeded);
+
+    let lifecycle_completed = view.snapshot();
+    assert_eq!(
+        lifecycle_completed.publication,
+        WorkflowRunPublicationState::Completed(WorkflowRunPublicationResult::Succeeded {
+            result_directory: "results".to_owned(),
+        })
+    );
+    assert_eq!(
+        lifecycle_completed.cleanup,
+        WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Succeeded)
+    );
+    assert!(!lifecycle_completed.quit_eligible);
+
+    view.mark_adapter_lifecycle_completed();
+    assert!(view.snapshot().quit_eligible);
+}
+
 #[tokio::test]
-async fn terminal_result_requires_the_complete_local_lifecycle_before_quit() {
+async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
@@ -464,6 +497,7 @@ async fn terminal_result_requires_the_complete_local_lifecycle_before_quit() {
     view.mark_quiescent();
     assert!(!view.snapshot().quit_eligible);
     view.begin_publication();
+    assert!(!view.snapshot().quit_eligible);
     view.complete_publication(WorkflowRunPublicationResult::Failed(
         WorkflowRunPublicationFailure {
             phase: LocalPublicationPhase::Commit,
@@ -473,12 +507,11 @@ async fn terminal_result_requires_the_complete_local_lifecycle_before_quit() {
     ));
     assert!(!view.snapshot().quit_eligible);
     view.begin_cleanup();
-    view.complete_cleanup(WorkflowRunCleanupResult::Failed);
     assert!(!view.snapshot().quit_eligible);
-    view.mark_execution_ownership_released();
+    view.complete_cleanup(WorkflowRunCleanupResult::Failed);
 
     let completed = view.snapshot();
-    assert!(completed.quit_eligible);
+    assert!(!completed.quit_eligible);
     assert!(matches!(completed.workflow, WorkflowState::Succeeded));
     assert_eq!(
         completed.publication,
@@ -494,6 +527,11 @@ async fn terminal_result_requires_the_complete_local_lifecycle_before_quit() {
         completed.cleanup,
         WorkflowRunCleanupState::Completed(WorkflowRunCleanupResult::Failed)
     );
+
+    view.mark_adapter_lifecycle_completed();
+    assert!(view.snapshot().quit_eligible);
+    view.mark_adapter_lifecycle_completed();
+    assert!(view.snapshot().quit_eligible);
 }
 
 fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowRunResult {

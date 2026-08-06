@@ -665,7 +665,7 @@ pub(crate) trait DurableDeadline {
 pub(crate) struct LocalAttemptOwner {
     normalized: PathBuf,
     root: Arc<OwnedFd>,
-    _lock: File,
+    lock: Option<File>,
     private_directory: PathBuf,
     attempt_directory: OwnedFd,
     result_directory: PathBuf,
@@ -674,6 +674,10 @@ pub(crate) struct LocalAttemptOwner {
 }
 
 pub(crate) type InitialLocalRun = LocalAttemptOwner;
+
+pub(crate) struct LocalAttemptOwnershipReleased {
+    _private: (),
+}
 
 impl LocalAttemptOwner {
     pub(crate) fn create(
@@ -714,11 +718,17 @@ impl LocalAttemptOwner {
             path: self.private_directory.join(identity.as_ref()),
             identity,
             root,
+            released: false,
         })
     }
 
     pub(crate) const fn attempt_number(&self) -> u64 {
         self.attempt_number
+    }
+
+    pub(crate) fn release(mut self) -> LocalAttemptOwnershipReleased {
+        self.release_lock();
+        LocalAttemptOwnershipReleased { _private: () }
     }
 
     pub(crate) fn commit_port(&self) -> LocalRunCommitPort {
@@ -812,6 +822,14 @@ impl LocalAttemptOwner {
     pub(crate) fn root_handle(&self) -> &OwnedFd {
         &self.root
     }
+
+    fn release_lock(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            // Closing normally releases the process-associated lock. Unlock explicitly so
+            // an orderly owner release is immediately visible to status and retry queries.
+            let _ = fcntl_lock(&lock, FlockOperation::Unlock);
+        }
+    }
 }
 
 pub(crate) struct AttemptPrivateStaging {
@@ -819,6 +837,7 @@ pub(crate) struct AttemptPrivateStaging {
     path: PathBuf,
     identity: Arc<str>,
     root: OwnedFd,
+    released: bool,
 }
 
 impl AttemptPrivateStaging {
@@ -829,19 +848,26 @@ impl AttemptPrivateStaging {
     pub(crate) fn root_handle(&self) -> &OwnedFd {
         &self.root
     }
+
+    pub(crate) fn release(mut self) -> Result<(), LocalRunDirectoryError> {
+        remove_staging_root(&self.parent, &self.identity, &self.root)
+            .map_err(|_| LocalRunDirectoryError::StagingUnavailable)?;
+        self.released = true;
+        Ok(())
+    }
 }
 
 impl Drop for AttemptPrivateStaging {
     fn drop(&mut self) {
-        let _ = remove_staging_root(&self.parent, &self.identity, &self.root);
+        if !self.released {
+            let _ = remove_staging_root(&self.parent, &self.identity, &self.root);
+        }
     }
 }
 
 impl Drop for LocalAttemptOwner {
     fn drop(&mut self) {
-        // Closing normally releases the process-associated lock. Unlock explicitly so
-        // an orderly owner release is immediately visible to status and retry queries.
-        let _ = fcntl_lock(&self._lock, FlockOperation::Unlock);
+        self.release_lock();
     }
 }
 
@@ -1180,7 +1206,7 @@ fn create_with_observer(
     Ok(LocalAttemptOwner {
         normalized: target.normalized,
         root,
-        _lock: lock,
+        lock: Some(lock),
         private_directory,
         attempt_directory,
         result_directory,
@@ -2237,7 +2263,7 @@ fn begin_local_retry(
     Ok(LocalAttemptOwner {
         normalized: pending.normalized,
         root: pending.root,
-        _lock: pending.lock,
+        lock: Some(pending.lock),
         private_directory,
         attempt_directory,
         result_directory,
