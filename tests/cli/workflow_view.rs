@@ -1,8 +1,15 @@
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::io::{Read as _, Write as _};
+#[cfg(target_os = "linux")]
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::{Output, Stdio};
 
 #[cfg(target_os = "linux")]
@@ -18,9 +25,10 @@ use rustix::process::{Pid, Signal, kill_process};
 #[cfg(target_os = "linux")]
 use rustix::termios::Termios;
 
+use super::workflow_run::isolated_command;
+#[cfg(target_os = "linux")]
 use super::workflow_run::{
-    RunBundle, isolated_command, open_tui_pty, run, signal_bundle, spawn_tui_run,
-    wait_for_process_poll,
+    RunBundle, open_tui_pty, run, signal_bundle, spawn_tui_run, wait_for_process_poll,
 };
 
 fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
@@ -34,6 +42,7 @@ fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     args
 }
 
+#[cfg(target_os = "linux")]
 fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
@@ -48,6 +57,7 @@ fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
     ]
 }
 
+#[cfg(target_os = "linux")]
 fn status_args(run_directory: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
@@ -58,6 +68,7 @@ fn status_args(run_directory: &Path) -> Vec<String> {
     ]
 }
 
+#[cfg(target_os = "linux")]
 fn durable_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let mut children = fs::read_dir(directory)
@@ -82,6 +93,7 @@ fn durable_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
+#[cfg(target_os = "linux")]
 fn successful_run(name: &str) -> (RunBundle, PathBuf) {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
