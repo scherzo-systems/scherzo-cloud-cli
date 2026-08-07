@@ -202,6 +202,7 @@ mod tests {
             "workflow run",
             "workflow status",
             "workflow validate",
+            "workflow view",
         ];
 
         assert_eq!(actual, expected);
@@ -290,6 +291,9 @@ mod tests {
         assert!(
             help.contains("validate  Validate a local Workflow V1 bundle without executing it")
         );
+        assert!(
+            help.contains("view      Inspect one published local workflow attempt interactively")
+        );
         let run = command_help(&["workflow", "run"]);
         for option in [
             "--source-root <ROOT>",
@@ -332,6 +336,18 @@ mod tests {
         }
         assert!(!status.contains("--source-root"));
         assert!(!status.contains("--execution-root"));
+        let view = command_help(&["workflow", "view"]);
+        for option in [
+            "--run-dir <PATH>",
+            "--attempt <NUMBER>",
+            "--color <auto|always|never>",
+        ] {
+            assert!(view.contains(option), "view help should contain {option}");
+        }
+        assert!(!view.contains("--plain"));
+        assert!(!view.contains("--json"));
+        assert!(!view.contains("--source-root"));
+        assert!(!view.contains("--execution-root"));
         assert!(validate.contains("--source-root <ROOT>"));
         assert!(validate.contains("<WORKFLOW_PATH>"));
         assert!(validate.contains("--json"));

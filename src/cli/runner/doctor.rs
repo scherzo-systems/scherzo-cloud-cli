@@ -25,18 +25,11 @@ pub(super) struct Command {
 
     #[arg(long, help = "Print the report as JSON")]
     json: bool,
-
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Validate this configured Pi executable for PiJsonV1"
-    )]
-    pi_executable: Option<std::path::PathBuf>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        let registry = match built_in_registry(self.pi_executable) {
+        let registry = match built_in_registry() {
             Ok(registry) => registry,
             Err(error) => return report_error(error),
         };

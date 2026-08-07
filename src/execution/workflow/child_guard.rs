@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -43,6 +43,8 @@ const EXEC_BOUNDARY_SOCKET: &str = "exec.sock";
 const EXEC_FAILURE_FILE: &str = "exec.failure";
 const STATUS_FILE: &str = "status";
 const WORKER_FAILURE_FILE: &str = "worker.failure";
+const ACTIVITY_LOCK_FILE: &str = ".activity.lock";
+const TEMPORARY_DIRECTORY_PREFIX: &str = "scherzo-child-guard-v1-";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WORKER_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -98,6 +100,7 @@ pub(crate) struct StoppedChildGuard {
     identity: AuthenticatedProcessGroup,
     owner_control: Option<File>,
     staging: tempfile::TempDir,
+    _activity_lease: File,
 }
 
 impl StoppedChildGuard {
@@ -115,8 +118,9 @@ impl StoppedChildGuard {
         }
         enable_child_subreaper()?;
         let staging = tempfile::Builder::new()
-            .prefix("scherzo-child-guard-")
+            .prefix(TEMPORARY_DIRECTORY_PREFIX)
             .tempdir_in("/tmp")?;
+        let activity_lease = create_activity_lease(staging.path())?;
         let manifest = LaunchManifest::new(program, arguments, environment);
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
         fs::write(staging.path().join(MANIFEST_FILE), manifest_bytes)?;
@@ -170,6 +174,7 @@ impl StoppedChildGuard {
             identity,
             owner_control: Some(owner_control),
             staging,
+            _activity_lease: activity_lease,
         })
     }
 
@@ -242,6 +247,16 @@ impl Drop for StoppedChildGuard {
         // enough to terminate and reap the stopped or released process group.
         self.owner_control.take();
     }
+}
+
+fn create_activity_lease(root: &Path) -> io::Result<File> {
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(root.join(ACTIVITY_LOCK_FILE))?;
+    fs4::FileExt::lock_shared(&lease)?;
+    Ok(lease)
 }
 
 pub(crate) async fn force_stop_direct_child(child: &mut Child) -> Result<(), ()> {
@@ -816,6 +831,25 @@ mod tests {
         fn observe(&self, _identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
             ProcessIdentityObservation::Unavailable
         }
+    }
+
+    #[test]
+    fn activity_lease_blocks_an_exclusive_cleanup_lock() {
+        let staging = tempfile::tempdir().unwrap();
+        let lease = create_activity_lease(staging.path()).unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(staging.path().join(ACTIVITY_LOCK_FILE))
+            .unwrap();
+
+        assert!(matches!(
+            fs4::FileExt::try_lock(&contender),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+
+        drop(lease);
+        fs4::FileExt::try_lock(&contender).unwrap();
     }
 
     #[test]

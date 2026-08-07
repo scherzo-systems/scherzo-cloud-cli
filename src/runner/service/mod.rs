@@ -6,6 +6,7 @@ mod connection;
 mod conversation;
 #[cfg(test)]
 mod determinism_spike;
+mod execution;
 #[cfg(test)]
 mod test_support;
 
@@ -33,6 +34,7 @@ type ConnectionFuture<'a> =
 type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub(crate) trait Sleeper: Send + Sync {
+    fn now(&self) -> std::time::Instant;
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_>;
 }
 
@@ -66,6 +68,14 @@ impl Shutdown for ProcessShutdown {
 struct TokioSleeper;
 
 impl Sleeper for TokioSleeper {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "TokioSleeper is the production boundary for monotonic runner time"
+    )]
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "TokioSleeper is the production boundary for wall-clock sleeps"
@@ -129,6 +139,8 @@ impl ConnectionLoopDependencies {
 #[derive(Debug)]
 pub(crate) enum ServiceError {
     BuildRuntime,
+    AssignmentShutdown,
+    ShutdownDeadlineExceeded,
     Connection(ConnectionError),
 }
 
@@ -136,6 +148,10 @@ impl fmt::Display for ServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BuildRuntime => formatter.write_str("start runner service"),
+            Self::AssignmentShutdown => formatter.write_str("prepare runner assignment shutdown"),
+            Self::ShutdownDeadlineExceeded => {
+                formatter.write_str("runner graceful shutdown deadline exceeded")
+            }
             Self::Connection(error) => {
                 write!(formatter, "runner service stopped unexpectedly: {error}")
             }
@@ -146,7 +162,7 @@ impl fmt::Display for ServiceError {
 impl std::error::Error for ServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::BuildRuntime => None,
+            Self::BuildRuntime | Self::AssignmentShutdown | Self::ShutdownDeadlineExceeded => None,
             Self::Connection(error) => Some(error),
         }
     }
@@ -243,8 +259,12 @@ where
         wall_clock,
         boot_id,
     } = dependencies;
-    let assignment_manager =
-        Mutex::new(AssignmentManager::new(&config, boot_id.clone(), wall_clock));
+    let assignment_manager = Mutex::new(AssignmentManager::new_with_sleeper(
+        &config,
+        boot_id.clone(),
+        wall_clock,
+        Arc::clone(&sleeper),
+    ));
     tokio::pin!(cancellation);
     let mut opening_sequence = 1;
     let mut sequence = opening_sequence;
@@ -262,16 +282,22 @@ where
         .checked_add(1)
         .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
     let mut attempt = 1_u64;
+    let mut shutting_down = false;
+    let mut shutdown_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
+        if shutting_down
+            && assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown_complete()
+        {
+            return Ok(());
+        }
         let connection_event = connection_event(&recorder, &config, &boot_id, attempt);
         let active_effect_event = ActiveEffectEvent::new();
-        tokio::select! {
-            _ = &mut cancellation => {
-                cancel_attempt(&connection_event, &active_effect_event);
-                return Ok(());
-            },
-            result = connector.connect(ConnectionAttempt {
+        let result = {
+            let connection = connector.connect(ConnectionAttempt {
                 dependencies: ConnectionDependencies::new(
                     &config,
                     frame_source.as_ref(),
@@ -289,63 +315,139 @@ where
                     sequence: opening_sequence,
                 },
                 next_sequence: &mut sequence,
-            }) => {
-                let (progress, cause, kind) = match result {
-                    Ok(progress) => (
-                        progress,
-                        ConnectionCause::GatewayClosedConnection,
-                        FailureKind::Retryable,
-                    ),
-                    Err(error) if error.is_terminal() => {
-                        finish_connection_event(
-                            &connection_event,
-                            error.progress,
-                            error.kind(),
-                            error.connection_cause(),
-                            None,
-                            Outcome::Failure,
-                        );
-                        return Err(ServiceError::Connection(error));
-                    }
-                    Err(error) => (error.progress, error.connection_cause(), error.kind()),
-                };
-                if progress.handshake_completed {
-                    backoff.reset();
+            });
+            tokio::pin!(connection);
+            loop {
+                if shutting_down
+                    && assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .shutdown_complete()
+                {
+                    cancel_attempt(&connection_event, &active_effect_event);
+                    return Ok(());
                 }
-                let delay = backoff.next_delay();
-                let outcome = if cause.is_timeout() {
-                    Outcome::Timeout
+                let notification = assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .notification();
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                if shutting_down {
+                    let Some(deadline) = shutdown_deadline.as_mut() else {
+                        return Err(ServiceError::AssignmentShutdown);
+                    };
+                    tokio::select! {
+                        biased;
+                        result = &mut connection => break result,
+                        () = &mut notified => continue,
+                        () = deadline => {
+                            cancel_attempt(&connection_event, &active_effect_event);
+                            return Err(ServiceError::ShutdownDeadlineExceeded);
+                        }
+                    }
                 } else {
-                    Outcome::Disconnected
-                };
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancellation => {
+                            assignment_manager
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .begin_shutdown()
+                                .map_err(|_| ServiceError::AssignmentShutdown)?;
+                            shutting_down = true;
+                            let deadline_sleeper = Arc::clone(&sleeper);
+                            shutdown_deadline = Some(Box::pin(async move {
+                                deadline_sleeper.sleep(std::time::Duration::from_secs(25)).await;
+                            }));
+                        }
+                        result = &mut connection => break result,
+                    }
+                }
+            }
+        };
+        let (progress, cause, kind) = match result {
+            Ok(progress) => (
+                progress,
+                ConnectionCause::GatewayClosedConnection,
+                FailureKind::Retryable,
+            ),
+            Err(error) if error.is_terminal() => {
                 finish_connection_event(
                     &connection_event,
-                    progress,
-                    kind,
-                    cause,
-                    Some(delay),
-                    outcome,
+                    error.progress,
+                    error.kind(),
+                    error.connection_cause(),
+                    None,
+                    Outcome::Failure,
                 );
-                if progress.opening_acknowledged {
-                    opening_message_id = frame_source.public_id("rmsg_");
-                    opening_sequence = sequence;
-                    opening = opening_hello(
-                        frame_source.as_ref(),
-                        config.credential().runner_id(),
-                        &boot_id,
-                        opening_message_id.clone(),
-                        opening_sequence,
-                        crate::build_info::VERSION,
-                    ).map_err(ServiceError::Connection)?;
-                    sequence = sequence
-                        .checked_add(1)
-                        .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
+                return Err(ServiceError::Connection(error));
+            }
+            Err(error) => (error.progress, error.connection_cause(), error.kind()),
+        };
+        if progress.handshake_completed {
+            backoff.reset();
+        }
+        let delay = backoff.next_delay();
+        let outcome = if cause.is_timeout() {
+            Outcome::Timeout
+        } else {
+            Outcome::Disconnected
+        };
+        finish_connection_event(
+            &connection_event,
+            progress,
+            kind,
+            cause,
+            Some(delay),
+            outcome,
+        );
+        if progress.opening_acknowledged {
+            opening_message_id = frame_source.public_id("rmsg_");
+            opening_sequence = sequence;
+            opening = opening_hello(
+                frame_source.as_ref(),
+                config.credential().runner_id(),
+                &boot_id,
+                opening_message_id.clone(),
+                opening_sequence,
+                crate::build_info::VERSION,
+            )
+            .map_err(ServiceError::Connection)?;
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| ServiceError::Connection(sequence_overflow()))?;
+        }
+        attempt = attempt.saturating_add(1);
+        if shutting_down {
+            let notification = assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .notification();
+            let Some(deadline) = shutdown_deadline.as_mut() else {
+                return Err(ServiceError::AssignmentShutdown);
+            };
+            tokio::select! {
+                biased;
+                () = deadline => return Err(ServiceError::ShutdownDeadlineExceeded),
+                () = notification.notified() => {}
+                () = sleeper.sleep(delay) => {}
+            }
+        } else {
+            tokio::select! {
+                _ = &mut cancellation => {
+                    assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .begin_shutdown()
+                        .map_err(|_| ServiceError::AssignmentShutdown)?;
+                    shutting_down = true;
+                    let deadline_sleeper = Arc::clone(&sleeper);
+                    shutdown_deadline = Some(Box::pin(async move {
+                        deadline_sleeper.sleep(std::time::Duration::from_secs(25)).await;
+                    }));
                 }
-                attempt = attempt.saturating_add(1);
-                tokio::select! {
-                    _ = &mut cancellation => return Ok(()),
-                    _ = sleeper.sleep(delay) => {}
-                }
+                _ = sleeper.sleep(delay) => {}
             }
         }
     }
@@ -424,6 +526,8 @@ const fn sequence_overflow() -> ConnectionError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -439,12 +543,13 @@ mod tests {
     use super::test_support::{
         SleepRelease, accept_fixture_socket, accept_fixture_socket_with_headers,
         accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
-        deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
-        offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
+        deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
+        expect_close_frame, expect_opening_hello, fixture_listener, healthy_wall_clock,
+        observation_acknowledgement, offer_assignment_after_handshake, sleep_request,
+        terminal_observation_acknowledgement, welcome, with_watchdog,
     };
     use super::{
-        Config, ServiceError, Shutdown, ShutdownFuture, Sleeper,
+        AssignmentConfig, Config, ServiceError, Shutdown, ShutdownFuture, Sleeper,
         run_until_cancelled_with_dependencies,
     };
     use crate::runner::credential::test_credential;
@@ -479,6 +584,29 @@ mod tests {
         )
     }
 
+    fn accepted_assignment_config(endpoint: &str) -> (tempfile::TempDir, Config) {
+        let temporary = tempfile::tempdir().expect("create service fixture root");
+        let source = temporary.path().join("source");
+        let work = temporary.path().join("work");
+        fs::create_dir(&source).expect("create workflow source");
+        fs::create_dir(&work).expect("create runner work root");
+        fs::write(
+            source.join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        )
+        .expect("write workflow fixture");
+        let assignment = AssignmentConfig::new(
+            "wfl_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            &source,
+            Path::new("workflow.yaml"),
+            &work,
+        )
+        .expect("configure assignment");
+        let config =
+            Config::new(endpoint, test_credential(), true, assignment).expect("configure gateway");
+        (temporary, config)
+    }
+
     fn spawn_fixture_service(
         endpoint: &str,
         sleeper: Arc<dyn Sleeper>,
@@ -488,6 +616,17 @@ mod tests {
         Arc<Notify>,
     ) {
         let config = Config::fixture(endpoint, test_credential(), true).expect("configure gateway");
+        spawn_configured_service(config, sleeper)
+    }
+
+    fn spawn_configured_service(
+        config: Config,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        TestCapture,
+        Arc<Notify>,
+    ) {
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, shutdown_trigger) = controlled_shutdown();
         let service = tokio::spawn(run_until_cancelled_with_dependencies(
@@ -682,9 +821,9 @@ mod tests {
             };
             let second_hello: serde_json::Value =
                 serde_json::from_str(&second_hello).expect("decode replacement opening hello");
-            assert_eq!(second_hello["messageId"], "rmsg_00000000000000000000000004");
+            assert_eq!(second_hello["messageId"], "rmsg_00000000000000000000000005");
             assert_ne!(second_hello["messageId"], first_message_id);
-            assert_eq!(second_hello["sequence"], 3);
+            assert_eq!(second_hello["sequence"], 4);
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
                 second_hello["payload"]["runnerVersion"],
@@ -724,7 +863,7 @@ mod tests {
         assert_eq!(event["scherzo.runner.opening_acknowledged"], true);
         assert_eq!(event["scherzo.runner.handshake_completed"], true);
         assert_eq!(event["scherzo.cloud.text_frames_received"], 3);
-        assert_eq!(event["scherzo.runner.text_frames_sent"], 2);
+        assert_eq!(event["scherzo.runner.text_frames_sent"], 3);
         assert_eq!(event["scherzo.runner.effects_received"], 1);
         assert_eq!(event["scherzo.runner.effect_acknowledgements_confirmed"], 0);
         assert!(
@@ -870,6 +1009,77 @@ mod tests {
 
         abort_service(service).await;
         drop(release_backoff);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_and_waits_for_an_accepted_assignment_interruption() {
+        let (listener, endpoint) = fixture_listener().await;
+        let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_opened_fixture_socket(&listener).await;
+            let effect =
+                offer_assignment_after_handshake(&mut socket, "rmsg_00000000000000000000000002", 1)
+                    .await;
+            socket
+                .send(effect_observation_acknowledgement(
+                    effect["messageId"].as_str().unwrap(),
+                    effect["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .expect("acknowledge offer receipt");
+            let Some(Ok(Message::Text(accepted))) = socket.next().await else {
+                panic!("fixture did not receive assignment acceptance");
+            };
+            let accepted: serde_json::Value =
+                serde_json::from_str(&accepted).expect("decode assignment acceptance");
+            assert_eq!(accepted["type"], "assignment_accepted");
+            accepted_sent
+                .send(())
+                .expect("report assignment acceptance");
+
+            let Some(Ok(Message::Text(interrupted))) = socket.next().await else {
+                panic!("fixture did not receive shutdown interruption");
+            };
+            let interrupted: serde_json::Value =
+                serde_json::from_str(&interrupted).expect("decode shutdown interruption");
+            assert_eq!(interrupted["type"], "assignment_interrupted");
+            assert_eq!(interrupted["payload"]["reason"], "graceful_shutdown");
+            socket
+                .send(observation_acknowledgement(
+                    accepted["messageId"].as_str().unwrap(),
+                    accepted["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .expect("acknowledge assignment acceptance");
+            socket
+                .send(terminal_observation_acknowledgement(
+                    interrupted["messageId"].as_str().unwrap(),
+                    interrupted["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .expect("acknowledge shutdown interruption");
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (_temporary, config) = accepted_assignment_config(&endpoint);
+        let (service, _capture, shutdown_trigger) = spawn_configured_service(config, sleeper);
+        with_watchdog(accepted_received)
+            .await
+            .expect("runner did not accept assignment")
+            .expect("fixture dropped acceptance signal");
+
+        shutdown_trigger.notify_one();
+
+        with_watchdog(service)
+            .await
+            .expect("runner ignored shutdown acknowledgement")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        with_watchdog(server)
+            .await
+            .expect("gateway fixture did not observe service exit")
+            .expect("gateway fixture failed");
     }
 
     #[tokio::test]

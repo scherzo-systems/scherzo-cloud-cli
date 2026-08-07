@@ -68,12 +68,12 @@ fn environment_selects_override_or_normal_home_path() {
     assert_eq!(override_store.path, PathBuf::from(override_path));
     assert_eq!(
         home_store.path,
-        PathBuf::from("/private/home/.scherzo-cloud/credentials.json")
+        PathBuf::from("/private/home/.scherzo/credentials.json")
     );
 }
 
 #[test]
-fn normal_home_store_creates_the_private_credential_directory() {
+fn normal_home_store_writes_and_reads_private_credentials() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     fs::set_permissions(home.path(), Permissions::from_mode(0o700)).unwrap();
     let store = CredentialStore::from_lookup(|name| match name {
@@ -81,14 +81,27 @@ fn normal_home_store_creates_the_private_credential_directory() {
         _ => None,
     })
     .expect("home credential path should resolve");
+    let deployment = fingerprint("primary");
+    let expiration = timestamp("2026-07-22T12:00:00Z");
 
-    assert!(!store.remove(&fingerprint("primary")).unwrap());
+    store
+        .replace(&deployment, "synthetic-access-token", expiration)
+        .expect("credential should be stored");
+    let selected = store
+        .selected(&deployment, timestamp("2026-07-22T11:00:00Z"))
+        .expect("credential should load")
+        .expect("credential should match");
 
-    let directory = home.path().join(NORMAL_DIRECTORY_NAME);
-    assert!(directory.is_dir());
+    let application_home = home.path().join(APPLICATION_HOME_DIRECTORY_NAME);
+    assert_eq!(store.path, application_home.join(NORMAL_FILE_NAME));
+    assert_eq!(selected.access_token(), "synthetic-access-token");
     assert_eq!(
-        fs::metadata(directory).unwrap().mode() & 0o7777,
+        fs::metadata(&application_home).unwrap().mode() & 0o7777,
         DIRECTORY_MODE
+    );
+    assert_eq!(
+        fs::metadata(&store.path).unwrap().mode() & 0o7777,
+        FILE_MODE
     );
 }
 

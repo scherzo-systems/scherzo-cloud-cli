@@ -11,7 +11,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use super::agent::{AgentInvocationLimits, PositiveDuration};
-use super::command_contract::ResolvedCommandWorkflow;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
@@ -46,6 +45,19 @@ pub(crate) enum CancellationReason {
     TerminationRequest,
     CallerOutputFailure,
     RunnerShutdown,
+    ExecutionLeaseExpired,
+}
+
+impl CancellationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserRequest => "user_request",
+            Self::TerminationRequest => "termination_request",
+            Self::CallerOutputFailure => "caller_output_failure",
+            Self::RunnerShutdown => "runner_shutdown",
+            Self::ExecutionLeaseExpired => "execution_lease_expired",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -563,25 +575,6 @@ impl AdmittedWorkflow {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct AdmittedCommandWorkflow {
-    admitted: AdmittedWorkflow,
-}
-
-impl AdmittedCommandWorkflow {
-    pub(crate) fn workflow(&self) -> &ResolvedWorkflow {
-        self.admitted.workflow()
-    }
-
-    pub(crate) fn execution(&self) -> &AdmittedExecutionContext {
-        self.admitted.execution()
-    }
-
-    pub(crate) fn into_workflow(self) -> AdmittedWorkflow {
-        self.admitted
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionFailureKind {
     MissingRequiredPrompt,
@@ -669,15 +662,6 @@ impl fmt::Display for AdmissionFailure {
 }
 
 impl std::error::Error for AdmissionFailure {}
-
-pub(crate) fn admit_command_workflow(
-    workflow: ResolvedCommandWorkflow,
-    imports: ResolvedImports,
-    context: ExecutionContext,
-) -> Result<AdmittedCommandWorkflow, AdmissionFailure> {
-    admit_workflow(workflow.into_workflow(), imports, context)
-        .map(|admitted| AdmittedCommandWorkflow { admitted })
-}
 
 pub(crate) fn admit_workflow(
     workflow: ResolvedWorkflow,

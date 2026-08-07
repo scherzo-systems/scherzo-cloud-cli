@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,9 +109,17 @@ fn timestamp_fixture(value: &str) -> OffsetDateTime {
 
 fn diagnostic(fully_drained: bool) -> StepDiagnostic {
     StepDiagnostic::from_streams(
-        CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from(*b"ok\n"), 7, fully_drained),
+        CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from(*b"ok\n"), 0, fully_drained),
         CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from(*b"warn"), 0, true),
     )
+}
+
+fn export_source(step: &str, output: &str, value_type: WorkflowValueType) -> ResolvedOutputSource {
+    ResolvedOutputSource {
+        step: step.to_owned(),
+        output: output.to_owned(),
+        value_type,
+    }
 }
 
 fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunStep {
@@ -183,6 +191,16 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
                 },
             ),
         ]),
+        export_sources: BTreeMap::from([
+            (
+                "reportA".to_owned(),
+                export_source("produce", "upper", WorkflowValueType::File),
+            ),
+            (
+                "reporta".to_owned(),
+                export_source("produce", "lower", WorkflowValueType::File),
+            ),
+        ]),
     }
 }
 
@@ -214,6 +232,14 @@ fn make_failed(run: &mut WorkflowRunResult) {
             reason: ExportUnavailableReason::Failed,
         },
     );
+    run.export_sources.insert(
+        "reportZ".to_owned(),
+        export_source("terminal", "blocked", WorkflowValueType::File),
+    );
+    run.export_sources.insert(
+        "sourceFailed".to_owned(),
+        export_source("terminal", "failed", WorkflowValueType::File),
+    );
 }
 
 fn make_cancelled(run: &mut WorkflowRunResult) {
@@ -232,6 +258,10 @@ fn make_cancelled(run: &mut WorkflowRunResult) {
         ExportValue::Unavailable {
             reason: ExportUnavailableReason::Cancelled,
         },
+    );
+    run.export_sources.insert(
+        "sourceCancelled".to_owned(),
+        export_source("terminal", "cancelled", WorkflowValueType::File),
     );
 }
 
@@ -320,7 +350,7 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
         );
         assert_eq!(
             result_value["steps"][0]["commandOutput"]["stdout"]["discardedBytes"],
-            7
+            0
         );
     }
 
@@ -360,6 +390,20 @@ fn publishes_text_json_and_file_exports_with_typed_canonical_metadata() {
             },
         ),
     ]);
+    run.export_sources = BTreeMap::from([
+        (
+            "file".to_owned(),
+            export_source("produce", "upper", WorkflowValueType::File),
+        ),
+        (
+            "response".to_owned(),
+            export_source("produce", "response", WorkflowValueType::Text),
+        ),
+        (
+            "result".to_owned(),
+            export_source("produce", "result", WorkflowValueType::Json),
+        ),
+    ]);
     let destination = fixture.destination("typed-exports");
 
     publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
@@ -389,6 +433,183 @@ fn publishes_text_json_and_file_exports_with_typed_canonical_metadata() {
     );
     assert_eq!(result["exports"]["result"]["kind"], "json");
     assert_eq!(result["exports"]["result"]["mediaType"], "application/json");
+}
+
+#[test]
+fn aliases_share_one_carrier_for_each_existing_kind() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let ExportValue::Available { output: file } = run.exports.remove("reportA").unwrap() else {
+        panic!("reportA must be available");
+    };
+    let text = Arc::<str>::from("shared response\n");
+    let json = Arc::new(serde_json::json!({"answer": 42}));
+    run.exports = BTreeMap::from([
+        (
+            "aFile".to_owned(),
+            ExportValue::Available {
+                output: file.clone(),
+            },
+        ),
+        ("bFile".to_owned(), ExportValue::Available { output: file }),
+        (
+            "cUnavailable".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Failed,
+            },
+        ),
+        (
+            "cUnavailableCopy".to_owned(),
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Failed,
+            },
+        ),
+        (
+            "dText".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Text(Arc::clone(&text)),
+            },
+        ),
+        (
+            "eText".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Text(text),
+            },
+        ),
+        (
+            "fJson".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Json(Arc::clone(&json)),
+            },
+        ),
+        (
+            "gJson".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::Json(json),
+            },
+        ),
+    ]);
+    run.export_sources = BTreeMap::from([
+        (
+            "aFile".to_owned(),
+            export_source("produce", "upper", WorkflowValueType::File),
+        ),
+        (
+            "bFile".to_owned(),
+            export_source("produce", "upper", WorkflowValueType::File),
+        ),
+        (
+            "cUnavailable".to_owned(),
+            export_source("terminal", "failed", WorkflowValueType::File),
+        ),
+        (
+            "cUnavailableCopy".to_owned(),
+            export_source("terminal", "failed", WorkflowValueType::File),
+        ),
+        (
+            "dText".to_owned(),
+            export_source("produce", "response", WorkflowValueType::Text),
+        ),
+        (
+            "eText".to_owned(),
+            export_source("produce", "response", WorkflowValueType::Text),
+        ),
+        (
+            "fJson".to_owned(),
+            export_source("produce", "result", WorkflowValueType::Json),
+        ),
+        (
+            "gJson".to_owned(),
+            export_source("produce", "result", WorkflowValueType::Json),
+        ),
+    ]);
+    let destination = fixture.destination("aliases");
+
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let (_, result) = read_result(&destination);
+
+    assert_eq!(result["exports"]["aFile"], result["exports"]["bFile"]);
+    assert_eq!(result["exports"]["dText"], result["exports"]["eText"]);
+    assert_eq!(result["exports"]["fJson"], result["exports"]["gJson"]);
+    assert_eq!(result["exports"]["aFile"]["path"], "exports/0001");
+    assert_eq!(
+        result["exports"]["cUnavailable"],
+        result["exports"]["cUnavailableCopy"]
+    );
+    assert_eq!(result["exports"]["dText"]["path"], "exports/0005");
+    assert_eq!(result["exports"]["fJson"]["path"], "exports/0007");
+    assert_eq!(
+        fs::read_dir(destination.join(EXPORT_DIRECTORY))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["0001".into(), "0005".into(), "0007".into()])
+    );
+}
+
+#[test]
+fn conflicting_values_for_one_captured_identity_are_rejected() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    run.export_sources.insert(
+        "reporta".to_owned(),
+        export_source("produce", "upper", WorkflowValueType::File),
+    );
+    let destination = fixture.destination("conflicting-alias");
+
+    let failure = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap_err();
+
+    assert_eq!(failure.phase(), LocalPublicationPhase::Serialization);
+    assert_eq!(
+        failure.kind(),
+        LocalPublicationFailureKind::InvalidRunResult
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn distinct_equal_captures_keep_distinct_carriers() {
+    let fixture = PublicationFixture::new();
+    let first = fixture.capture("first", "first.bin", "application/octet-stream", b"same");
+    let second = fixture.capture("second", "second.bin", "application/octet-stream", b"same");
+    let mut run = run_fixture(&fixture);
+    run.exports = BTreeMap::from([
+        (
+            "first".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::file(first),
+            },
+        ),
+        (
+            "second".to_owned(),
+            ExportValue::Available {
+                output: CapturedValue::file(second),
+            },
+        ),
+    ]);
+    run.export_sources = BTreeMap::from([
+        (
+            "first".to_owned(),
+            export_source("produce", "first", WorkflowValueType::File),
+        ),
+        (
+            "second".to_owned(),
+            export_source("produce", "second", WorkflowValueType::File),
+        ),
+    ]);
+    let destination = fixture.destination("equal-captures");
+
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let (_, result) = read_result(&destination);
+
+    assert_eq!(result["exports"]["first"]["path"], "exports/0001");
+    assert_eq!(result["exports"]["second"]["path"], "exports/0002");
+    assert_eq!(
+        result["exports"]["first"]["digest"],
+        result["exports"]["second"]["digest"]
+    );
+    assert_eq!(fs::read(destination.join("exports/0001")).unwrap(), b"same");
+    assert_eq!(fs::read(destination.join("exports/0002")).unwrap(), b"same");
 }
 
 #[test]
@@ -612,6 +833,41 @@ impl PublicationObserver for ExportDirectorySwapObserver {
         }
         Ok(())
     }
+}
+
+struct UnreferencedCarrierObserver {
+    parent: PathBuf,
+}
+
+impl PublicationObserver for UnreferencedCarrierObserver {
+    fn observe(&mut self, boundary: &PublicationBoundary) -> Result<(), ()> {
+        if matches!(boundary, PublicationBoundary::StagingComplete) {
+            let stages = staging_paths(&self.parent);
+            assert_eq!(stages.len(), 1);
+            fs::write(stages[0].join("exports/9999"), b"unreferenced").unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn unreferenced_staged_carriers_are_rejected() {
+    let fixture = PublicationFixture::new();
+    let run = run_fixture(&fixture);
+    let destination = fixture.destination("unreferenced-carrier");
+    let mut observer = UnreferencedCarrierObserver {
+        parent: fixture.results_parent.clone(),
+    };
+
+    let failure = publish_with_observer(&destination, &fixture.artifacts, &run, &mut observer)
+        .expect_err("publication must reject a carrier absent from result metadata");
+
+    assert_eq!(failure.phase(), LocalPublicationPhase::Verification);
+    assert_eq!(
+        failure.kind(),
+        LocalPublicationFailureKind::VerificationUnavailable
+    );
+    assert!(!destination.exists());
 }
 
 #[test]

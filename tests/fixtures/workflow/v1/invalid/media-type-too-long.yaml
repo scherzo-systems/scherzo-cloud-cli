@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  s:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.bin
+        mediaType: application/x;a=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

@@ -26,7 +26,7 @@ const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
 const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
 #[cfg(target_os = "linux")]
-fn wait_for_process_poll() {
+pub(super) fn wait_for_process_poll() {
     let (_sender, receiver) = std::sync::mpsc::channel::<()>();
     assert_eq!(
         receiver.recv_timeout(std::time::Duration::from_millis(10)),
@@ -50,7 +50,7 @@ fn process_state(process: Pid) -> Option<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_tui_pty() -> (OwnedFd, OwnedFd) {
+pub(super) fn open_tui_pty() -> (OwnedFd, OwnedFd) {
     let master = rustix::pty::openpt(
         rustix::pty::OpenptFlags::RDWR
             | rustix::pty::OpenptFlags::NOCTTY
@@ -80,7 +80,7 @@ fn open_tui_pty() -> (OwnedFd, OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_tui_run(
+pub(super) fn spawn_tui_run(
     args: &[String],
     master: OwnedFd,
     slave: &OwnedFd,
@@ -403,6 +403,73 @@ fn command_only_run_and_help_remain_pi_independent() {
 }
 
 #[test]
+fn export_aliases_share_carriers_without_collapsing_equal_captures() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf same > first.bin; printf same > second.bin"]
+    outputs:
+      first:
+        kind: file
+        path: first.bin
+        mediaType: application/octet-stream
+      second:
+        kind: file
+        path: second.bin
+        mediaType: application/octet-stream
+exports:
+  firstCopy:
+    ref: outputs.produce.first
+  firstPrimary:
+    ref: outputs.produce.first
+  second:
+    ref: outputs.produce.second
+"#,
+    );
+    let destination = bundle.result("aliases");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &terminal["result"];
+    assert_eq!(
+        result["exports"]["firstCopy"],
+        result["exports"]["firstPrimary"]
+    );
+    assert_eq!(result["exports"]["firstCopy"]["path"], "exports/0001");
+    assert_eq!(result["exports"]["second"]["path"], "exports/0003");
+    assert_eq!(
+        result["exports"]["firstCopy"]["digest"],
+        result["exports"]["second"]["digest"]
+    );
+    assert!(result["steps"][0].get("committedOutputCount").is_none());
+    let result_root = attempt_result(&destination);
+    for name in ["firstCopy", "firstPrimary", "second"] {
+        let relative = result["exports"][name]["path"].as_str().unwrap();
+        assert_eq!(fs::read(result_root.join(relative)).unwrap(), b"same");
+    }
+    let files = fs::read_dir(result_root.join("exports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        files,
+        std::collections::BTreeSet::from(["0001".into(), "0003".into()])
+    );
+}
+
+#[test]
 fn agent_installation_rejections_use_inherited_path_order_without_publication() {
     let missing_bundle = RunBundle::new(response_agent_source());
     missing_bundle.write_source("system.md", "system");
@@ -453,18 +520,43 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
 }
 
 #[test]
-fn compatible_path_pi_is_validated_once_pinned_and_executes_an_agent() {
-    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &response_pi_execution());
+fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
+    let replacement = PiFixture::new("0.83.0", COMPLETE_HELP, false);
+    let mut probe_barrier = AgentBarrierFixture::new();
+    let capability_hook = format!(
+        "printf '\\001' > {}; IFS= read -r _ < {}",
+        quote(probe_barrier.ready_path.to_str().unwrap()),
+        quote(probe_barrier.release_path.to_str().unwrap()),
+    );
+    let pi = PiFixture::with_execution_and_capability_hook(
+        "0.83.0",
+        COMPLETE_HELP,
+        true,
+        &response_pi_execution(),
+        &capability_hook,
+    );
+    let ordered_path =
+        std::env::join_paths([replacement.path_directory(), pi.path_directory()]).unwrap();
     let bundle = RunBundle::new(response_agent_source());
     bundle.write_source("system.md", "system");
     bundle.write_source("message.md", "prompt");
     let destination = bundle.result("agent-response");
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
-    let output = isolated_command(&args)
-        .env("PATH", pi.path_directory())
-        .output()
+    let child = isolated_command(&args)
+        .env("PATH", ordered_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    probe_barrier.wait_until_started();
+    fs::set_permissions(
+        Path::new(replacement.executable()),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    probe_barrier.release_observation();
+    let output = child.wait_with_output().unwrap();
 
     assert!(
         output.status.success(),
@@ -483,6 +575,7 @@ fn compatible_path_pi_is_validated_once_pinned_and_executes_an_agent() {
         "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help"
     );
     assert!(lines[2].starts_with("--mode json --approve --no-session"));
+    assert!(replacement.recorded_probes().is_empty());
 
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["outcome"], "succeeded");

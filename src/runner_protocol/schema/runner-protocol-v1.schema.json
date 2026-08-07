@@ -624,6 +624,9 @@
                 "runId": {
                   "$ref": "#/$defs/runId"
                 },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
                 "executionSpec": {
                   "$ref": "#/$defs/ExecutionSpec"
                 },
@@ -635,6 +638,7 @@
                 "effectId",
                 "assignmentId",
                 "runId",
+                "attemptId",
                 "executionSpec",
                 "offerExpiresAt"
               ]
@@ -667,6 +671,9 @@
                 "runId": {
                   "$ref": "#/$defs/runId"
                 },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
                 "executionSpecId": {
                   "$ref": "#/$defs/executionSpecId"
                 },
@@ -689,6 +696,7 @@
                 "effectId",
                 "assignmentId",
                 "runId",
+                "attemptId",
                 "executionSpecId",
                 "lease"
               ]
@@ -721,6 +729,9 @@
                 "runId": {
                   "$ref": "#/$defs/runId"
                 },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
                 "reason": {
                   "enum": [
                     "stale_or_invalid_acceptance",
@@ -732,6 +743,7 @@
                 "effectId",
                 "assignmentId",
                 "runId",
+                "attemptId",
                 "reason"
               ]
             }
@@ -776,6 +788,9 @@
         },
         {
           "$ref": "#/$defs/ExecutionStepFailureEvidence"
+        },
+        {
+          "$ref": "#/$defs/OutputCaptureStepFailureEvidence"
         }
       ]
     },
@@ -1031,6 +1046,42 @@
             },
             "failure": {
               "$ref": "#/$defs/ExecutionStepFailureEvidence"
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "from",
+            "to",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
+              "const": "capturing_outputs"
+            },
+            "to": {
+              "const": "failed"
+            },
+            "failure": {
+              "$ref": "#/$defs/OutputCaptureStepFailureEvidence"
             }
           },
           "required": [
@@ -1859,6 +1910,9 @@
                 "runId": {
                   "$ref": "#/$defs/runId"
                 },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
                 "lease": {
                   "allOf": [
                     {
@@ -1880,6 +1934,7 @@
                 "effectId",
                 "assignmentId",
                 "runId",
+                "attemptId",
                 "lease"
               ]
             }
@@ -1910,7 +1965,47 @@
             "command_not_found",
             "command_permission_denied",
             "command_invalid_input",
-            "command_launch_failed"
+            "command_launch_failed",
+            "inputs_unavailable",
+            "input_invalid_name",
+            "input_value_count_limit_exceeded",
+            "input_value_size_limit_exceeded",
+            "input_total_size_limit_exceeded",
+            "input_collection_ordinal_limit_exceeded",
+            "input_value_type_mismatch",
+            "input_source_unavailable",
+            "input_staging_unavailable",
+            "input_live_limit_exceeded",
+            "agent_input_step_unavailable",
+            "agent_admission_unavailable",
+            "agent_inputs_unavailable",
+            "agent_missing_upstream_value",
+            "agent_value_type_mismatch",
+            "agent_retained_source_unavailable",
+            "agent_invalid_retained_text",
+            "agent_result_schema_unavailable",
+            "agent_invalid_value_mode",
+            "agent_attachment_count_limit_exceeded",
+            "agent_attachment_bytes_limit_exceeded",
+            "agent_artifact_staging_mismatch",
+            "agent_staging_mismatch",
+            "agent_staging_unavailable",
+            "agent_runtime_unavailable",
+            "outputs_unsupported",
+            "agent_harness_start_failed",
+            "agent_system_prompt_too_large",
+            "agent_message_too_large",
+            "agent_harness_model_output_truncated",
+            "agent_harness_unexpected_terminal_tool_use",
+            "agent_harness_model_error",
+            "agent_harness_model_aborted",
+            "agent_harness_unsuccessful_exit",
+            "agent_harness_protocol_failed",
+            "agent_missing_response",
+            "agent_missing_result",
+            "agent_result_validation_limit_exceeded",
+            "agent_captured_value_too_large",
+            "agent_result_settlement_failed"
           ]
         }
       },
@@ -1931,7 +2026,21 @@
             "cause": {
               "enum": [
                 "command_terminated",
-                "command_wait_failed"
+                "command_wait_failed",
+                "agent_harness_start_failed",
+                "agent_system_prompt_too_large",
+                "agent_message_too_large",
+                "agent_harness_model_output_truncated",
+                "agent_harness_unexpected_terminal_tool_use",
+                "agent_harness_model_error",
+                "agent_harness_model_aborted",
+                "agent_harness_unsuccessful_exit",
+                "agent_harness_protocol_failed",
+                "agent_missing_response",
+                "agent_missing_result",
+                "agent_result_validation_limit_exceeded",
+                "agent_captured_value_too_large",
+                "agent_result_settlement_failed"
               ]
             }
           },
@@ -2106,6 +2215,38 @@
       "required": [
         "state",
         "reason"
+      ]
+    },
+    "OutputCaptureStepFailureEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "const": "output_capture"
+        },
+        "cause": {
+          "enum": [
+            "output_step_unavailable",
+            "output_unsupported",
+            "output_absolute_path",
+            "output_lexical_escape",
+            "output_empty_path",
+            "output_missing",
+            "output_symbolic_link",
+            "output_not_directory",
+            "output_not_regular_file",
+            "output_source_unavailable",
+            "output_file_count_limit_exceeded",
+            "output_file_size_limit_exceeded",
+            "output_total_size_limit_exceeded",
+            "output_staging_unavailable",
+            "output_task_unavailable"
+          ]
+        }
+      },
+      "required": [
+        "phase",
+        "cause"
       ]
     }
   }

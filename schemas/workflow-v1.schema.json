@@ -41,6 +41,7 @@
     },
     "MediaType": {
       "type": "string",
+      "maxLength": 128,
       "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(\\s*;\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=[^\\r\\n\\t;]+)*$"
     },
     "ImportOrOutputReferenceString": {
@@ -251,6 +252,7 @@
     },
     "Exports": {
       "type": "object",
+      "maxProperties": 4096,
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": { "$ref": "#/$defs/OutputReference" }
     },
@@ -264,6 +266,7 @@
         "steps": {
           "type": "object",
           "minProperties": 1,
+          "maxProperties": 256,
           "propertyNames": { "$ref": "#/$defs/Identifier" },
           "additionalProperties": { "$ref": "#/$defs/Step" }
         },

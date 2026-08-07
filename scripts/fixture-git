@@ -63,7 +63,7 @@ reject_source_overlap() {
 
 new_root() {
   local root
-  root=$(mktemp -d /tmp/scherzo-fixture-git.XXXXXX)
+  root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-fixture-git.XXXXXX")
   root=$(cd "$root" && pwd -P)
   reject_source_overlap "$root"
   chmod 700 "$root"

@@ -34,6 +34,8 @@ mod workflow_run;
 mod workflow_status;
 #[path = "cli/workflow_validate.rs"]
 mod workflow_validate;
+#[path = "cli/workflow_view.rs"]
+mod workflow_view;
 
 const BUILD_VERSION: &str = match option_env!("SCHERZO_CLOUD_VERSION") {
     Some(version) => version,
@@ -74,6 +76,7 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     fs::set_permissions(credential_directory.path(), Permissions::from_mode(0o700))
         .expect("temporary credential directory should be private");
     let default_credential_path = credential_directory.path().join("credentials.json");
+    let default_path = tempfile::tempdir().expect("temporary empty PATH should be created");
     let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
     command.args(args).env_remove(CREDENTIALS_FILE_VARIABLE);
     for variable in DEPLOYMENT_VARIABLES
@@ -87,6 +90,9 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
         .any(|(name, _)| *name == CREDENTIALS_FILE_VARIABLE)
     {
         command.env(CREDENTIALS_FILE_VARIABLE, default_credential_path);
+    }
+    if !environment.iter().any(|(name, _)| *name == "PATH") {
+        command.env("PATH", default_path.path());
     }
     for (name, value) in environment {
         command.env(name, value);
@@ -487,6 +493,9 @@ fn workflow_without_a_subcommand_prints_composed_help() {
         stdout.contains("status    Inspect one durable local workflow run without changing it")
     );
     assert!(stdout.contains("validate  Validate a local Workflow V1 bundle without executing it"));
+    assert!(
+        stdout.contains("view      Inspect one published local workflow attempt interactively")
+    );
     assert!(output.stderr.is_empty());
 }
 
@@ -499,6 +508,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     let serve = run(&["runner", "serve", "--help"]);
     let workflow_status = run(&["workflow", "status", "--help"]);
     let workflow_validate = run(&["workflow", "validate", "--help"]);
+    let workflow_view = run(&["workflow", "view", "--help"]);
 
     assert!(auth.status.success());
     assert!(
@@ -527,7 +537,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(doctor_stdout.contains("--check <ID>"));
     assert!(doctor_stdout.contains("--list-checks"));
     assert!(doctor_stdout.contains("--json"));
-    assert!(doctor_stdout.contains("--pi-executable <PATH>"));
+    assert!(!doctor_stdout.contains("--pi-executable"));
     assert!(doctor.stderr.is_empty());
 
     assert!(serve.status.success());
@@ -541,7 +551,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     ] {
         assert!(serve_stdout.contains(required));
     }
-    assert!(serve_stdout.contains("--pi-executable <PATH>"));
+    assert!(!serve_stdout.contains("--pi-executable"));
     assert!(serve.stderr.is_empty());
 
     assert!(workflow_status.status.success());
@@ -562,6 +572,19 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(workflow_validate_stdout.contains("--json"));
     assert!(workflow_validate_stdout.contains("without executing it"));
     assert!(workflow_validate.stderr.is_empty());
+
+    assert!(workflow_view.status.success());
+    let workflow_view_stdout = String::from_utf8_lossy(&workflow_view.stdout);
+    assert!(
+        workflow_view_stdout
+            .contains("Usage: scherzo-cloud workflow view [OPTIONS] --run-dir <PATH>")
+    );
+    assert!(workflow_view_stdout.contains("--run-dir <PATH>"));
+    assert!(workflow_view_stdout.contains("--attempt <NUMBER>"));
+    assert!(workflow_view_stdout.contains("--color <auto|always|never>"));
+    assert!(!workflow_view_stdout.contains("--plain"));
+    assert!(!workflow_view_stdout.contains("--json"));
+    assert!(workflow_view.stderr.is_empty());
 }
 
 #[test]

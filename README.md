@@ -81,8 +81,10 @@ scherzo-cloud workflow run \
 
 The run directory must not exist and must be disjoint from the execution root. The CLI
 normalizes it from its nearest existing parent and creates any missing parent suffix.
-The CLI retains immutable workflow and import bytes, durable
-closed run and attempt state, and attempt 1's atomic result beneath
+First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable state root
+by default; retained runs are application state and do not belong under `~/.config`.
+The CLI retains immutable workflow and import bytes, durable closed run and attempt
+state, and attempt 1's atomic result beneath
 `attempts/000001/result`. The run-directory path is the local run handle. Add `--json`
 for one terminal schema-version-1 object on stdout while the live presentation remains
 on stderr, or `--plain` to force the line presentation on stdout.
@@ -115,9 +117,11 @@ durable run later with `workflow status --run-dir <PATH>`; retry is always expli
 
 Local execution snapshots the inherited environment after resolution and removes
 `SCHERZO_` variables before launching commands or agents. When the resolved workflow has
-an agent step, the adapter selects the first executable `pi` in inherited `PATH`,
-validates it once for PiJsonV1, and pins its canonical path for the run. Command-only
-workflows do not resolve or probe Pi. The adapter does not read Scherzo human or runner
+an agent step, the adapter selects the first executable `pi` in the launching process's
+inherited `PATH`, validates it once for PiJsonV1, and pins its canonical absolute path for
+the run. Later `PATH` changes cannot switch that executable. Command-only workflows do
+not resolve or probe Pi. Workflow definitions, imports, and remote values cannot supply
+an executable or alter selection. The adapter does not read Scherzo human or runner
 credentials and does not contact Scherzo Cloud; an admitted agent harness may use the
 provider and other host authority selected by its closed profile and inherited
 environment.
@@ -157,6 +161,24 @@ or retry disposition, an operational or output failure returns 1, and a command-
 usage error returns 2. SIGINT or SIGTERM before completed output returns 130 or 143,
 respectively.
 
+## Local workflow archived view
+
+Inspect a successfully published terminal attempt in the read-only terminal viewer:
+
+```sh
+scherzo-cloud workflow view --run-dir ./runs/check-001 [--attempt 1]
+```
+
+Omitting `--attempt` selects the current attempt from one stable durable snapshot. The
+viewer requires terminal stdin, terminal stdout, and a usable `TERM`; it has no plain or
+JSON fallback. It loads the immutable retained workflow and selected published result,
+then displays a frozen DAG, inspector, and separate retained stdout and stderr prefixes.
+It does not acquire run ownership, resume execution, retry work, or follow later state.
+
+Use `q` to restore the terminal and return 0 without a workflow-run summary. `Ctrl-C`
+and SIGTERM restore the terminal and return 130 or 143, respectively. Terminal and
+durable-read failures return 1.
+
 ## Version inspection
 
 Use `scherzo-cloud --version` or `scherzo-cloud version` for conventional one-line
@@ -166,7 +188,7 @@ output. Use `scherzo-cloud version --json` for the schema-version-1 structured c
 {
   "schemaVersion": 1,
   "command": "scherzo-cloud",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "executablePath": "/resolved/path/to/scherzo-cloud",
   "buildIdentity": "unknown"
 }
@@ -192,8 +214,8 @@ Status always contacts the public API, including when no local credential exists
 
 Use `scherzo-cloud auth logout` to remove the human credential for the active deployment
 without making a network request. Normal operation stores short-lived human access
-tokens in `~/.scherzo-cloud/credentials.json`; this store is separate from all future
-runner credentials.
+tokens in `~/.scherzo/credentials.json`; this store is separate from workflow-run state
+and all runner credentials.
 
 Development deployments that use HTTP require `--allow-insecure-http` on the networked
 leaf command: `auth login`, `auth status`, `account signup`, `organization create`,
@@ -253,13 +275,13 @@ a trusted external guide owns action selection, explanation, and approval.
 ## Runner doctor
 
 Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to
-the runner. Without an agent configuration, the default set contains only
-`environment.command.git`. It executes the `git` resolved from the runner process's
-`PATH`, requires a parseable version at least `0.0.1`, and reports a pass or failure for
-that check. Supplying `--pi-executable <PATH>` also makes
-`execution.harness.pi-json-v1` a default check. A successful result does not mean the
-runner is ready to serve assignments: runner configuration, machine identity,
-connectivity, and other execution requirements are not all checked yet.
+the runner. The default set contains only `environment.command.git`. It executes the
+`git` resolved from the runner process's `PATH`, requires a parseable version at least
+`0.0.1`, and reports a pass or failure for that check. Select
+`execution.harness.pi-json-v1` explicitly to check the `pi` inherited through the same
+operator-controlled `PATH`. A successful result does not mean the runner is ready to
+serve assignments: runner configuration, machine identity, connectivity, and other
+execution requirements are not all checked yet.
 
 ```sh
 # Run the default checks.
@@ -268,10 +290,9 @@ scherzo-cloud runner doctor
 # Run a named check. Repeat --check to select more than one registered check.
 scherzo-cloud runner doctor --check environment.command.git
 
-# Validate an explicitly configured Pi installation only.
+# Validate the Pi installation selected from inherited PATH only.
 scherzo-cloud runner doctor \
-  --check execution.harness.pi-json-v1 \
-  --pi-executable /absolute/path/to/pi
+  --check execution.harness.pi-json-v1
 
 # List IDs without running any checks.
 scherzo-cloud runner doctor --list-checks
@@ -286,15 +307,17 @@ runner configuration. It executes `git --version` with a five-second deadline, b
 captured standard output, drains standard error without reporting it, and exposes only
 a normalized numeric version in its report.
 
-The Pi check canonicalizes only the configured executable and invokes that absolute path
-with one version probe and one capability-help probe. The probes use a cleared child
-environment, fresh temporary Pi state and working directory, and project/resource
-discovery disable flags. It admits canonical stable versions in the range
-`>=0.83.0 <0.84.0` with the JSON event, ephemeral-session, extension,
-system-prompt append, and invocation-scoped `--approve` capabilities required by
-`PiJsonV1`. It retains the exact observed release and does not search `PATH`, inspect
-model metadata or credentials, execute the caller's project, or read or write saved Pi
-project-trust
+The Pi check searches inherited `PATH` in order, canonicalizes the first candidate named
+`pi` that the current process can execute, and invokes that absolute path with one version
+probe and one capability-help probe. The probes clear the child environment except for
+the captured inherited `PATH`, fresh temporary Pi state and working-directory paths, and
+the required isolation controls. Retaining `PATH` lets an environment-based launcher
+resolve its interpreter without allowing another `pi` selection. It admits
+canonical stable versions in the range `>=0.83.0 <0.84.0` with the JSON event,
+ephemeral-session, extension, system-prompt append, and invocation-scoped `--approve`
+capabilities required by `PiJsonV1`. It retains the exact observed release, never falls
+through to another candidate after selection, and does not inspect model metadata or
+credentials, execute the caller's project, or read or write saved Pi project-trust
 decisions. Missing, unexecutable, malformed, unsupported-version, and missing-capability
 outcomes have distinct report codes. The JSON report has no `ready` field.
 
@@ -304,34 +327,26 @@ outcomes have distinct report codes. The JSON report has no `ready` field.
 credentials. The credential file contains exactly one private line in the form
 `rnr_<ulid>.<43-character-base64url-secret>`, must be owned by the current user, and
 must not grant group or other permissions. The command does not search for, read, or
-reuse `~/.scherzo-cloud/credentials.json`.
+reuse `~/.scherzo/credentials.json`.
 
 ```sh
 scherzo-cloud runner serve \
   --gateway-url wss://runners.example.test/v1/connect \
-  --credential-file ~/.scherzo-cloud/runner.credential \
+  --credential-file ~/.scherzo/runner.credential \
   --workflow-id wfl_01k0z6r1w8f4jy2m7q9v3x5abr \
   --workflow-source-root ./repository \
   --workflow-path .scherzo/workflows/check.yaml \
   --work-root ./runner-work
 ```
 
-Agent-capable startup additionally takes an explicit installation. Runner initialization
-validates it once and retains the resulting absolute path, exact observed version
-in `>=0.83.0 <0.84.0`, `PiJsonV1` profile, and required non-model capabilities
-for later admission; it does not
-repeat the probes while serving.
+Runner startup selects `pi` from its inherited operator-controlled `PATH`. When present,
+initialization validates it once and retains the resulting absolute path, exact observed
+version in `>=0.83.0 <0.84.0`, `PiJsonV1` profile, and required non-model capabilities
+for the process lifetime; admission and invocation never repeat the lookup or probes.
+When `pi` is absent, Runner Serve remains available for command-only assignments. A
+selected incompatible installation fails initialization rather than falling through to
+another executable. Assignments and workflow data cannot influence selection.
 
-```sh
-scherzo-cloud runner serve \
-  --gateway-url wss://runners.example.test/v1/connect \
-  --credential-file ~/.scherzo-cloud/runner.credential \
-  --workflow-id wfl_01k0z6r1w8f4jy2m7q9v3x5abr \
-  --workflow-source-root ./repository \
-  --workflow-path .scherzo/workflows/check.yaml \
-  --work-root ./runner-work \
-  --pi-executable /absolute/path/to/pi
-```
 
 For local development only, use a loopback `ws://` URL with the explicit opt-in:
 
@@ -396,7 +411,7 @@ OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
 OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
   scherzo-cloud runner serve \
     --gateway-url wss://runners.example.test/v1/connect \
-    --credential-file ~/.scherzo-cloud/runner.credential
+    --credential-file ~/.scherzo/runner.credential
 ```
 
 `OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`
@@ -430,7 +445,7 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.9`. Planning takes the highest fragment impact since the latest stable tag:
+`0.10`. Planning takes the highest fragment impact since the latest stable tag:
 `internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
 and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
 fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact

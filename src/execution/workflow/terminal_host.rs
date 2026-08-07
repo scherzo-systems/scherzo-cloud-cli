@@ -1,3 +1,4 @@
+pub(crate) mod archived;
 mod dag_layout;
 
 use std::future::Future;
@@ -30,7 +31,8 @@ use super::document::Output as WorkflowOutput;
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
-    header_timestamp, human_duration, shell_quote, step_kind, visible_text,
+    header_timestamp, human_duration, shell_quote, shell_quote_visible_argument, step_kind,
+    visible_text,
 };
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, AgentPresentationObservationKind,
@@ -105,7 +107,7 @@ impl WorkflowTerminalHost {
     ) -> Result<Self, PresentationFailure>
     where
         Clock: super::run_timing::ObservationClock,
-        Boundary: TerminalBoundary,
+        Boundary: WorkflowTerminalBoundary,
     {
         let mut terminal = RestoringTerminal::new(boundary);
         let area = terminal.boundary.setup().map_err(|error| {
@@ -115,7 +117,7 @@ impl WorkflowTerminalHost {
             terminal_area: area,
             ..HostInteraction::default()
         };
-        if let Err(error) = terminal.boundary.draw(
+        if let Err(error) = terminal.boundary.draw_workflow(
             &view.snapshot_for_render(interaction.selected),
             &mut interaction,
             color,
@@ -236,13 +238,6 @@ enum TerminalLifecycleEvent {
 trait TerminalBoundary: Send + 'static {
     fn setup(&mut self) -> io::Result<Rect>;
 
-    fn draw(
-        &mut self,
-        snapshot: &WorkflowRunViewSnapshot,
-        interaction: &mut HostInteraction,
-        color: bool,
-    ) -> io::Result<()>;
-
     fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send;
 
     fn resize(&mut self) -> io::Result<Rect>;
@@ -252,6 +247,15 @@ trait TerminalBoundary: Send + 'static {
     fn notify_lifecycle(&mut self, _event: TerminalLifecycleEvent) -> io::Result<()> {
         Ok(())
     }
+}
+
+trait WorkflowTerminalBoundary: TerminalBoundary {
+    fn draw_workflow(
+        &mut self,
+        snapshot: &WorkflowRunViewSnapshot,
+        interaction: &mut HostInteraction,
+        color: bool,
+    ) -> io::Result<()>;
 }
 
 struct TerminalTaskUnwindGuard {
@@ -321,7 +325,7 @@ async fn run_terminal<Clock, Boundary>(
 ) -> Result<TerminalHostExit, PresentationFailure>
 where
     Clock: super::run_timing::ObservationClock,
-    Boundary: TerminalBoundary,
+    Boundary: WorkflowTerminalBoundary,
 {
     let mut changes = view.subscribe();
     let mut redraw = redraw_interval();
@@ -395,7 +399,10 @@ where
                 notify_quit_eligibility(&mut terminal.boundary, &snapshot);
                 let active = workflow_is_executing(&snapshot);
                 execution_active.store(active, Ordering::SeqCst);
-                if let Err(error) = terminal.boundary.draw(&snapshot, &mut interaction, color) {
+                if let Err(error) = terminal
+                    .boundary
+                    .draw_workflow(&snapshot, &mut interaction, color)
+                {
                     return fail_terminal(
                         &mut terminal,
                         PresentationFailureOperation::TerminalDraw,
@@ -421,7 +428,10 @@ where
                 let active = workflow_is_executing(&snapshot);
                 execution_active.store(active, Ordering::SeqCst);
                 if dirty || !snapshot.timing.frozen {
-                    if let Err(error) = terminal.boundary.draw(&snapshot, &mut interaction, color) {
+                    if let Err(error) = terminal
+                        .boundary
+                        .draw_workflow(&snapshot, &mut interaction, color)
+                    {
                         return fail_terminal(
                             &mut terminal,
                             PresentationFailureOperation::TerminalDraw,
@@ -559,15 +569,6 @@ impl TerminalBoundary for SystemTerminalBoundary {
         Ok(area)
     }
 
-    fn draw(
-        &mut self,
-        snapshot: &WorkflowRunViewSnapshot,
-        interaction: &mut HostInteraction,
-        color: bool,
-    ) -> io::Result<()> {
-        self.surface_mut()?.draw(snapshot, interaction, color)
-    }
-
     fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send {
         self.input.next_event()
     }
@@ -600,6 +601,17 @@ impl TerminalBoundary for SystemTerminalBoundary {
     }
 }
 
+impl WorkflowTerminalBoundary for SystemTerminalBoundary {
+    fn draw_workflow(
+        &mut self,
+        snapshot: &WorkflowRunViewSnapshot,
+        interaction: &mut HostInteraction,
+        color: bool,
+    ) -> io::Result<()> {
+        self.surface_mut()?.draw(snapshot, interaction, color)
+    }
+}
+
 struct TerminalSurface {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     graph: Option<DagLayout>,
@@ -612,7 +624,7 @@ impl TerminalSurface {
         interaction: &mut HostInteraction,
         color: bool,
     ) -> io::Result<()> {
-        interaction.clamp_selection(snapshot.steps.len());
+        clamp_step_selection(&mut interaction.selected, snapshot.steps.len());
         let graph = self
             .graph
             .get_or_insert_with(|| DagLayout::for_steps(&snapshot.steps));
@@ -1190,22 +1202,22 @@ enum HostControl {
     Quit,
 }
 
-impl HostInteraction {
-    fn clamp_selection(&mut self, step_count: usize) {
-        if step_count == 0 {
-            self.selected = 0;
-        } else if self.selected >= step_count {
-            self.selected = step_count - 1;
-        }
+fn clamp_step_selection(selected: &mut usize, step_count: usize) {
+    if step_count == 0 {
+        *selected = 0;
+    } else if *selected >= step_count {
+        *selected = step_count - 1;
     }
+}
 
+impl HostInteraction {
     fn handle_key(
         &mut self,
         event: TerminalInputEvent,
         snapshot: &WorkflowRunViewSnapshot,
         cancellation: &CancellationSource,
     ) -> HostControl {
-        self.clamp_selection(snapshot.steps.len());
+        clamp_step_selection(&mut self.selected, snapshot.steps.len());
 
         if event == TerminalInputEvent::Cancel {
             if cancellation_available(snapshot) {
@@ -1330,15 +1342,18 @@ fn operational_area(area: Rect) -> bool {
     area.width >= MINIMUM_WIDTH && area.height >= MINIMUM_HEIGHT
 }
 
-fn full_log_record_dimensions(area: Rect, step: &WorkflowRunStepView) -> (usize, usize) {
+fn selected_lower_panel_area<Step: StepProjection>(area: Rect, step: &Step) -> Rect {
     let content_area = Rect::new(
         area.x,
         area.y,
         area.width,
         area.height.saturating_sub(FOOTER_HEIGHT),
     );
-    let sections = inspector_and_log_areas(content_area, inspector_desired_height(Some(step)));
-    let log_content = log_block(Borders::TOP, false).inner(sections[1]);
+    inspector_and_log_areas(content_area, inspector_desired_height(Some(step)))[1]
+}
+
+fn full_log_record_dimensions(area: Rect, step: &WorkflowRunStepView) -> (usize, usize) {
+    let log_content = log_block(Borders::TOP, false).inner(selected_lower_panel_area(area, step));
     let records_area = log_content_areas(log_content)[1];
     let marker_rows = usize::from(step.log.discarded_records != 0);
     (
@@ -1406,16 +1421,13 @@ fn render(
             "DAG",
             &SPLIT_FOOTER_OPTIONS,
         );
-        if sections[0].width >= WIDE_LAYOUT_WIDTH && !interaction.help_visible {
-            let columns = wide_split_columns(sections[0]);
-            render_junction(
-                frame,
-                columns[1].x.saturating_sub(1),
-                sections[1].y,
-                "┴",
-                color,
-            );
-        }
+        render_split_footer_junction(
+            frame,
+            sections[0],
+            sections[1].y,
+            interaction.help_visible,
+            color,
+        );
     }
 
     if interaction.help_visible {
@@ -1429,9 +1441,80 @@ fn render(
     }
 }
 
-// Split-body composition and step-list rendering are distinct UI stages; sharing their
-// identical render inputs would couple layout orchestration to widget rendering.
-// jscpd:ignore-start
+#[derive(Clone, Copy)]
+struct SplitBodyLayout {
+    summary: Rect,
+    dag: Rect,
+    inspector: Rect,
+    output: Rect,
+    wide: bool,
+}
+
+impl SplitBodyLayout {
+    fn summary_borders(self) -> Borders {
+        if self.wide {
+            Borders::BOTTOM | Borders::RIGHT
+        } else {
+            Borders::BOTTOM
+        }
+    }
+
+    fn dag_borders(self) -> Borders {
+        if self.wide {
+            Borders::RIGHT
+        } else {
+            Borders::NONE
+        }
+    }
+
+    fn inspector_borders(self) -> Borders {
+        if self.wide {
+            Borders::NONE
+        } else {
+            Borders::TOP
+        }
+    }
+}
+
+fn split_body_layout(
+    area: Rect,
+    summary_height: u16,
+    desired_inspector_height: u16,
+) -> SplitBodyLayout {
+    if area.width >= WIDE_LAYOUT_WIDTH {
+        let columns = wide_split_columns(area);
+        let left = Layout::vertical([Constraint::Length(summary_height), Constraint::Min(0)])
+            .split(columns[0]);
+        let right = inspector_and_log_areas(columns[1], desired_inspector_height);
+        SplitBodyLayout {
+            summary: left[0],
+            dag: left[1],
+            inspector: right[0],
+            output: right[1],
+            wide: true,
+        }
+    } else {
+        let body_height = area.height.saturating_sub(summary_height);
+        let dag_height = (body_height / 3).clamp(5, 10);
+        let remaining_height = body_height.saturating_sub(dag_height);
+        let inspector_height = bounded_inspector_height(remaining_height, desired_inspector_height);
+        let rows = Layout::vertical([
+            Constraint::Length(summary_height),
+            Constraint::Length(dag_height),
+            Constraint::Length(inspector_height),
+            Constraint::Min(MINIMUM_LOG_HEIGHT),
+        ])
+        .split(area);
+        SplitBodyLayout {
+            summary: rows[0],
+            dag: rows[1],
+            inspector: rows[2],
+            output: rows[3],
+            wide: false,
+        }
+    }
+}
+
 fn render_split_body(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1440,75 +1523,69 @@ fn render_split_body(
     interaction: &HostInteraction,
     color: bool,
 ) {
-    // jscpd:ignore-end
     let selected_step = snapshot.steps.get(interaction.selected);
-    if area.width >= WIDE_LAYOUT_WIDTH {
-        let columns = wide_split_columns(area);
-        let left = Layout::vertical([
-            Constraint::Length(WORKFLOW_SUMMARY_HEIGHT),
-            Constraint::Min(0),
-        ])
-        .split(columns[0]);
-        let right = inspector_and_log_areas(columns[1], inspector_desired_height(selected_step));
-        render_workflow_summary(
-            frame,
-            left[0],
-            snapshot,
-            color,
-            Borders::BOTTOM | Borders::RIGHT,
-        );
-        render_steps(
-            frame,
-            left[1],
-            snapshot,
-            graph,
-            interaction,
-            color,
-            StepPanel {
-                borders: Borders::RIGHT,
-                show_title: false,
-            },
-        );
-        render_inspector(frame, right[0], selected_step, color, Borders::NONE);
-        render_log(frame, right[1], snapshot, interaction, color, Borders::TOP);
+    let layout = split_body_layout(
+        area,
+        WORKFLOW_SUMMARY_HEIGHT,
+        inspector_desired_height(selected_step),
+    );
+    render_workflow_summary(
+        frame,
+        layout.summary,
+        snapshot,
+        color,
+        layout.summary_borders(),
+    );
+    render_split_steps(
+        frame,
+        layout,
+        &snapshot.steps,
+        graph,
+        interaction.selected,
+        color,
+    );
+    render_inspector(
+        frame,
+        layout.inspector,
+        selected_step,
+        color,
+        layout.inspector_borders(),
+    );
+    render_log(
+        frame,
+        layout.output,
+        snapshot,
+        interaction,
+        color,
+        Borders::TOP,
+    );
+    render_split_body_junctions(frame, layout, color);
+}
 
-        let divider_x = columns[1].x.saturating_sub(1);
+fn render_split_body_junctions(frame: &mut Frame<'_>, layout: SplitBodyLayout, color: bool) {
+    if layout.wide {
+        let divider_x = layout.inspector.x.saturating_sub(1);
         render_junction(
             frame,
             divider_x,
-            left[0].y.saturating_add(left[0].height).saturating_sub(1),
+            layout.summary.bottom().saturating_sub(1),
             "┼",
             color,
         );
-        render_junction(frame, divider_x, right[1].y, "├", color);
-    } else {
-        let body_height = area.height.saturating_sub(WORKFLOW_SUMMARY_HEIGHT);
-        let dag_height = (body_height / 3).clamp(5, 10);
-        let remaining_height = body_height.saturating_sub(dag_height);
-        let inspector_height =
-            bounded_inspector_height(remaining_height, inspector_desired_height(selected_step));
-        let rows = Layout::vertical([
-            Constraint::Length(WORKFLOW_SUMMARY_HEIGHT),
-            Constraint::Length(dag_height),
-            Constraint::Length(inspector_height),
-            Constraint::Min(MINIMUM_LOG_HEIGHT),
-        ])
-        .split(area);
-        render_workflow_summary(frame, rows[0], snapshot, color, Borders::BOTTOM);
-        render_steps(
-            frame,
-            rows[1],
-            snapshot,
-            graph,
-            interaction,
-            color,
-            StepPanel {
-                borders: Borders::NONE,
-                show_title: false,
-            },
-        );
-        render_inspector(frame, rows[2], selected_step, color, Borders::TOP);
-        render_log(frame, rows[3], snapshot, interaction, color, Borders::TOP);
+        render_junction(frame, divider_x, layout.output.y, "├", color);
+    }
+}
+
+fn render_split_footer_junction(
+    frame: &mut Frame<'_>,
+    body: Rect,
+    footer_y: u16,
+    help_visible: bool,
+    color: bool,
+) {
+    if body.width >= WIDE_LAYOUT_WIDTH && !help_visible {
+        let columns = wide_split_columns(body);
+        render_junction(frame, columns[1].x.saturating_sub(1), footer_y, "┴", color);
     }
 }
 
@@ -1544,7 +1621,7 @@ fn bounded_inspector_height(available_height: u16, desired_height: u16) -> u16 {
     desired_height.clamp(minimum_height, maximum_height)
 }
 
-fn inspector_desired_height(step: Option<&WorkflowRunStepView>) -> u16 {
+pub(super) fn inspector_desired_height<Step: StepProjection>(step: Option<&Step>) -> u16 {
     let body_height = step.map_or(1, |step| {
         inspector_detail_row_count(step)
             .saturating_add(1)
@@ -1555,11 +1632,12 @@ fn inspector_desired_height(step: Option<&WorkflowRunStepView>) -> u16 {
         .saturating_add(INSPECTOR_HEADER_HEIGHT)
 }
 
-fn inspector_outputs_desired_height(step: &WorkflowRunStepView) -> usize {
-    if step.outputs.is_empty() {
-        4
+fn inspector_outputs_desired_height<Step: StepProjection>(step: &Step) -> usize {
+    let outputs = step.inspector_outputs();
+    if outputs.is_empty() {
+        usize::from(step.show_empty_outputs()) * 4
     } else {
-        inspector_outputs_desired_height_for_count(step.outputs.len())
+        inspector_outputs_desired_height_for_count(outputs.len())
     }
 }
 
@@ -1610,10 +1688,7 @@ fn render_workflow_summary(
     color: bool,
     borders: Borders,
 ) {
-    let block = Block::default()
-        .borders(borders)
-        .border_style(separator_style(color))
-        .padding(Padding::horizontal(2));
+    let block = summary_block(borders, color);
     let content = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1668,6 +1743,13 @@ fn render_workflow_summary(
     );
 }
 
+fn summary_block(borders: Borders, color: bool) -> Block<'static> {
+    Block::default()
+        .borders(borders)
+        .border_style(separator_style(color))
+        .padding(Padding::horizontal(2))
+}
+
 fn workflow_display_name(workflow_path: &str) -> String {
     std::path::Path::new(workflow_path)
         .file_stem()
@@ -1677,10 +1759,52 @@ fn workflow_display_name(workflow_path: &str) -> String {
         .unwrap_or_else(|| visible_text(workflow_path))
 }
 
+pub(super) trait StepProjection {
+    fn id(&self) -> &str;
+
+    fn definition(&self) -> &WorkflowPresentationStep;
+
+    fn state(&self) -> StepStateKind;
+
+    fn timing(&self) -> Option<&super::run_view_model::WorkflowRunElapsed>;
+
+    fn dag_detail(&self) -> Option<String>;
+
+    fn inspector_command(&self) -> Option<String>;
+
+    fn inspector_fact(&self) -> Option<InspectorField>;
+
+    fn inspector_outputs(&self) -> Vec<InspectorOutput>;
+
+    fn show_empty_outputs(&self) -> bool;
+}
+
 #[derive(Clone, Copy)]
-struct StepPanel {
-    borders: Borders,
-    show_title: bool,
+pub(super) struct StepPanel {
+    pub(super) borders: Borders,
+    pub(super) show_title: bool,
+}
+
+fn render_split_steps<Step: StepProjection>(
+    frame: &mut Frame<'_>,
+    layout: SplitBodyLayout,
+    steps: &[Step],
+    graph: &DagLayout,
+    selected: usize,
+    color: bool,
+) {
+    render_projected_steps(
+        frame,
+        layout.dag,
+        steps,
+        graph,
+        selected,
+        color,
+        StepPanel {
+            borders: layout.dag_borders(),
+            show_title: false,
+        },
+    );
 }
 
 fn render_steps(
@@ -1692,86 +1816,106 @@ fn render_steps(
     color: bool,
     panel: StepPanel,
 ) {
+    render_projected_steps(
+        frame,
+        area,
+        &snapshot.steps,
+        graph,
+        interaction.selected,
+        color,
+        panel,
+    );
+}
+
+fn render_projected_steps<Step: StepProjection>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    steps: &[Step],
+    graph: &DagLayout,
+    selected_step: usize,
+    color: bool,
+    panel: StepPanel,
+) {
     let mut block = Block::default()
         .borders(panel.borders)
         .border_style(separator_style(color));
     if panel.show_title {
-        block = block.title(format!(" Steps ({}) ", snapshot.steps.len()));
+        block = block.title(format!(" Steps ({}) ", steps.len()));
     }
     let available_width = usize::from(block.inner(area).width);
-    let columns = StepColumns::for_steps(available_width, graph.gutter_width(), &snapshot.steps);
+    let columns = StepColumns::for_steps(available_width, graph.gutter_width(), steps);
     let connector_style = graph_connector_style(color);
-    let items =
-        snapshot
-            .steps
-            .iter()
-            .zip(graph.rows())
-            .enumerate()
-            .map(|(index, (step, graph_row))| {
-                let selected = index == interaction.selected;
-                let marker = if selected { "▏ " } else { "  " };
-                let id = padded_text(&visible_text(&step.id), columns.id_width);
-                let duration = step
-                    .timing
-                    .as_ref()
-                    .map(|timing| human_duration(timing.duration))
-                    .unwrap_or_else(|| "-".to_owned());
-                let mut spans = vec![
-                    Span::styled(marker, selection_marker_style(color)),
-                    Span::styled(graph_row.before_node.clone(), connector_style),
-                    Span::styled(step_state_glyph(step), step_state_style(step.state, color)),
-                    Span::styled(graph_row.after_node.clone(), connector_style),
-                    Span::raw(" "),
-                    Span::styled(id, step_identity_style(step.state, color)),
-                ];
-                if columns.kind {
-                    spans.push(Span::raw("  "));
+    let items = steps
+        .iter()
+        .zip(graph.rows())
+        .enumerate()
+        .map(|(index, (step, graph_row))| {
+            let selected = index == selected_step;
+            let marker = if selected { "▏ " } else { "  " };
+            let id = padded_text(&visible_text(step.id()), columns.id_width);
+            let duration = step
+                .timing()
+                .map(|timing| human_duration(timing.duration))
+                .unwrap_or_else(|| "-".to_owned());
+            let mut spans = vec![
+                Span::styled(marker, selection_marker_style(color)),
+                Span::styled(graph_row.before_node.clone(), connector_style),
+                Span::styled(
+                    step_state_glyph(step),
+                    step_state_style(step.state(), color),
+                ),
+                Span::styled(graph_row.after_node.clone(), connector_style),
+                Span::raw(" "),
+                Span::styled(id, step_identity_style(step.state(), color)),
+            ];
+            if columns.kind {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{:<KIND_COLUMN_WIDTH$}", step_kind(step.definition())),
+                    tone_style(color, Tone::Muted),
+                ));
+            }
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                padded_text(&duration, columns.duration_width),
+                step_duration_style(step.state(), color),
+            ));
+            if columns.detail {
+                spans.push(Span::raw("  "));
+                if let Some(detail) = step.dag_detail() {
                     spans.push(Span::styled(
-                        format!("{:<KIND_COLUMN_WIDTH$}", step_kind(&step.definition)),
+                        fit_text(&visible_text(&detail), columns.detail_width),
                         tone_style(color, Tone::Muted),
                     ));
                 }
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    padded_text(&duration, columns.duration_width),
-                    step_duration_style(step.state, color),
-                ));
-                if columns.detail {
-                    spans.push(Span::raw("  "));
-                    if let Some(detail) = step_detail(step) {
-                        spans.push(Span::styled(
-                            fit_text(&visible_text(&detail), columns.detail_width),
-                            tone_style(color, Tone::Muted),
-                        ));
-                    }
-                }
-                let mut node_line = Line::from(spans);
-                if selected {
-                    node_line = node_line.style(step_selection_style(color));
-                }
-                let connector_line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(graph_row.below_node.clone(), connector_style),
-                ]);
-                ListItem::new(vec![node_line, connector_line])
-            });
+            }
+            let mut node_line = Line::from(spans);
+            if selected {
+                node_line = node_line.style(step_selection_style(color));
+            }
+            let connector_line = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(graph_row.below_node.clone(), connector_style),
+            ]);
+            ListItem::new(vec![node_line, connector_line])
+        });
     let list = List::new(items).block(block);
     let mut state = ListState::default();
-    if !snapshot.steps.is_empty() {
-        state.select(Some(interaction.selected));
+    if !steps.is_empty() {
+        state.select(Some(selected_step));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 #[derive(Clone)]
-struct InspectorField {
+pub(super) struct InspectorField {
     label: &'static str,
     value: String,
     tone: Tone,
 }
 
 impl InspectorField {
-    fn new(label: &'static str, value: impl AsRef<str>, tone: Tone) -> Self {
+    pub(super) fn new(label: &'static str, value: impl AsRef<str>, tone: Tone) -> Self {
         Self {
             label,
             value: visible_text(value.as_ref()),
@@ -1780,20 +1924,80 @@ impl InspectorField {
     }
 }
 
-struct InspectorOutput {
+pub(super) struct InspectorOutput {
     marker: &'static str,
     marker_tone: Tone,
     name: String,
     kind: &'static str,
     detail: String,
-    disposition: String,
+    disposition: Option<String>,
     tone: Tone,
 }
 
-fn render_inspector(
+impl InspectorOutput {
+    pub(super) fn declaration(name: String, kind: &'static str, detail: String) -> Self {
+        Self {
+            marker: "·",
+            marker_tone: Tone::Muted,
+            name,
+            kind,
+            detail,
+            disposition: None,
+            tone: Tone::Muted,
+        }
+    }
+}
+
+impl StepProjection for WorkflowRunStepView {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn definition(&self) -> &WorkflowPresentationStep {
+        &self.definition
+    }
+
+    fn state(&self) -> StepStateKind {
+        self.state
+    }
+
+    fn timing(&self) -> Option<&super::run_view_model::WorkflowRunElapsed> {
+        self.timing.as_ref()
+    }
+
+    fn dag_detail(&self) -> Option<String> {
+        live_step_detail(self)
+    }
+
+    fn inspector_command(&self) -> Option<String> {
+        let WorkflowPresentationStep::Command { argv, .. } = &self.definition else {
+            return None;
+        };
+        Some(
+            argv.iter()
+                .map(|argument| shell_quote(argument))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    fn inspector_fact(&self) -> Option<InspectorField> {
+        live_inspector_fact(self.fact.as_ref())
+    }
+
+    fn inspector_outputs(&self) -> Vec<InspectorOutput> {
+        live_inspector_outputs(self)
+    }
+
+    fn show_empty_outputs(&self) -> bool {
+        true
+    }
+}
+
+pub(super) fn render_inspector<Step: StepProjection>(
     frame: &mut Frame<'_>,
     area: Rect,
-    step: Option<&WorkflowRunStepView>,
+    step: Option<&Step>,
     color: bool,
     borders: Borders,
 ) {
@@ -1841,18 +2045,28 @@ fn render_inspector(
         return;
     };
 
+    let outputs = step.inspector_outputs();
+    let output_panel_visible = !outputs.is_empty() || step.show_empty_outputs();
     let available_body_height = sections[1].height;
     let desired_detail_height = u16::try_from(inspector_detail_row_count(step))
         .unwrap_or(u16::MAX)
-        .saturating_add(1);
-    let maximum_detail_height = available_body_height
-        .saturating_sub(MINIMUM_OUTPUT_PANEL_HEIGHT.min(available_body_height));
+        .saturating_add(u16::from(output_panel_visible));
+    let reserved_output_height = if output_panel_visible {
+        MINIMUM_OUTPUT_PANEL_HEIGHT.min(available_body_height)
+    } else {
+        0
+    };
+    let maximum_detail_height = available_body_height.saturating_sub(reserved_output_height);
     let detail_height = desired_detail_height.min(maximum_detail_height);
     let body_sections = Layout::vertical([Constraint::Length(detail_height), Constraint::Min(0)])
         .split(sections[1]);
 
     if detail_height != 0 {
-        let mut detail_borders = Borders::BOTTOM;
+        let mut detail_borders = if output_panel_visible {
+            Borders::BOTTOM
+        } else {
+            Borders::NONE
+        };
         for border in [Borders::LEFT, Borders::RIGHT] {
             if borders.contains(border) {
                 detail_borders |= border;
@@ -1865,7 +2079,7 @@ fn render_inspector(
             detail_borders,
             |content_area| inspector_detail_lines(step, content_area, color),
         );
-        if body_sections[0].x != 0 && !borders.contains(Borders::LEFT) {
+        if output_panel_visible && body_sections[0].x != 0 && !borders.contains(Borders::LEFT) {
             render_junction(
                 frame,
                 body_sections[0].x.saturating_sub(1),
@@ -1875,20 +2089,17 @@ fn render_inspector(
             );
         }
     }
-    render_inspector_panel(
-        frame,
-        body_sections[1],
-        color,
-        output_borders,
-        |content_area| {
-            inspector_output_lines(
-                &inspector_outputs(step),
-                content_area.width,
-                content_area.height,
-                color,
-            )
-        },
-    );
+    if output_panel_visible {
+        render_inspector_panel(
+            frame,
+            body_sections[1],
+            color,
+            output_borders,
+            |content_area| {
+                inspector_output_lines(&outputs, content_area.width, content_area.height, color)
+            },
+        );
+    }
 }
 
 fn render_inspector_panel(
@@ -1903,8 +2114,8 @@ fn render_inspector_panel(
     frame.render_widget(Paragraph::new(content(content_area)).block(block), area);
 }
 
-fn inspector_detail_lines(
-    step: &WorkflowRunStepView,
+fn inspector_detail_lines<Step: StepProjection>(
+    step: &Step,
     content_area: Rect,
     color: bool,
 ) -> Vec<Line<'static>> {
@@ -1933,10 +2144,10 @@ fn inspector_detail_lines(
     lines
 }
 
-fn render_selected_step_header(
+fn render_selected_step_header<Step: StepProjection>(
     frame: &mut Frame<'_>,
     area: Rect,
-    step: &WorkflowRunStepView,
+    step: &Step,
     color: bool,
 ) {
     if area.is_empty() {
@@ -1964,19 +2175,22 @@ fn render_selected_step_header(
     );
 }
 
-fn selected_step_title(
-    step: &WorkflowRunStepView,
+fn selected_step_title<Step: StepProjection>(
+    step: &Step,
     color: bool,
     maximum_width: usize,
 ) -> Line<'static> {
-    let badge = format!(" {} ", step_kind(&step.definition));
+    let badge = format!(" {} ", step_kind(step.definition()));
     let fixed_width = 5_usize.saturating_add(display_width(&badge));
     let id = ellipsize(
-        &visible_text(&step.id),
+        &visible_text(step.id()),
         maximum_width.saturating_sub(fixed_width),
     );
     Line::from(vec![
-        Span::styled(step_state_glyph(step), step_state_style(step.state, color)),
+        Span::styled(
+            step_state_glyph(step),
+            step_state_style(step.state(), color),
+        ),
         Span::raw("  "),
         Span::styled(
             id,
@@ -1996,11 +2210,11 @@ fn step_kind_badge_style(color: bool) -> Style {
     }
 }
 
-fn selected_step_status_title(step: &WorkflowRunStepView, color: bool) -> Line<'static> {
-    let style = tone_style(color, step_state_tone(step.state));
-    let mut spans = vec![Span::styled(step_state_label(step.state), style)];
-    if let Some(timing) = &step.timing {
-        let duration = if timing.frozen && step_state_is_active(step.state) {
+fn selected_step_status_title<Step: StepProjection>(step: &Step, color: bool) -> Line<'static> {
+    let style = tone_style(color, step_state_tone(step.state()));
+    let mut spans = vec![Span::styled(step_state_label(step.state()), style)];
+    if let Some(timing) = step.timing() {
+        let duration = if timing.frozen && step_state_is_active(step.state()) {
             format!("{} interrupted", human_duration(timing.duration))
         } else {
             human_duration(timing.duration)
@@ -2011,36 +2225,23 @@ fn selected_step_status_title(step: &WorkflowRunStepView, color: bool) -> Line<'
     Line::from(spans)
 }
 
-fn inspector_detail_row_count(step: &WorkflowRunStepView) -> usize {
+fn inspector_detail_row_count<Step: StepProjection>(step: &Step) -> usize {
     inspector_fixed_field_count(step)
 }
 
-fn inspector_fixed_field_count(step: &WorkflowRunStepView) -> usize {
+fn inspector_fixed_field_count<Step: StepProjection>(step: &Step) -> usize {
     let mut count = 3;
     if inspector_timing(step).is_some() {
         count += 1;
     }
-    if inspector_fact_is_visible(step.fact.as_ref()) {
+    if step.inspector_fact().is_some() {
         count += 1;
     }
     count
 }
 
-fn inspector_fact_is_visible(fact: Option<&ObservedStepTransition>) -> bool {
-    matches!(
-        fact,
-        Some(
-            ObservedStepTransition::Failed { .. }
-                | ObservedStepTransition::Blocked { .. }
-                | ObservedStepTransition::NotRun { .. }
-                | ObservedStepTransition::Cancelling { .. }
-                | ObservedStepTransition::Cancelled { .. }
-        )
-    )
-}
-
-fn inspector_fields_for_rows(
-    step: &WorkflowRunStepView,
+fn inspector_fields_for_rows<Step: StepProjection>(
+    step: &Step,
     width: u16,
     maximum_rows: usize,
 ) -> Vec<InspectorField> {
@@ -2048,7 +2249,7 @@ fn inspector_fields_for_rows(
     inspector_fields(step, usize::from(width), maximum_fields)
 }
 
-fn inspector_outputs(step: &WorkflowRunStepView) -> Vec<InspectorOutput> {
+fn live_inspector_outputs(step: &WorkflowRunStepView) -> Vec<InspectorOutput> {
     let declarations = step.definition.outputs();
     step.outputs
         .iter()
@@ -2063,34 +2264,30 @@ fn inspector_outputs(step: &WorkflowRunStepView) -> Vec<InspectorOutput> {
                 name: visible_text(name),
                 kind,
                 detail,
-                disposition,
+                disposition: Some(disposition),
                 tone,
             }
         })
         .collect()
 }
 
-fn inspector_fields(
-    step: &WorkflowRunStepView,
+fn inspector_fields<Step: StepProjection>(
+    step: &Step,
     content_width: usize,
     maximum_fields: usize,
 ) -> Vec<InspectorField> {
     let mut fields = Vec::with_capacity(maximum_fields);
-    let direct_dependencies = match &step.definition {
+    let direct_dependencies = match step.definition() {
         WorkflowPresentationStep::Command {
-            argv,
             cwd,
             direct_dependencies,
             ..
         } => {
-            push_inspector_field(&mut fields, maximum_fields, || {
-                let command = argv
-                    .iter()
-                    .map(|argument| shell_quote(argument))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                InspectorField::new("command", command, Tone::Neutral)
-            });
+            if let Some(command) = step.inspector_command() {
+                push_inspector_field(&mut fields, maximum_fields, || {
+                    InspectorField::new("command", command, Tone::Neutral)
+                });
+            }
             push_inspector_field(&mut fields, maximum_fields, || {
                 InspectorField::new("cwd", cwd.as_deref().unwrap_or("."), Tone::Neutral)
             });
@@ -2131,7 +2328,7 @@ fn inspector_fields(
         )
     });
     if fields.len() < maximum_fields
-        && let Some(fact) = inspector_fact(step.fact.as_ref())
+        && let Some(fact) = step.inspector_fact()
     {
         fields.push(fact);
     }
@@ -2157,20 +2354,20 @@ fn push_inspector_field(
     }
 }
 
-fn inspector_timing(
-    step: &WorkflowRunStepView,
+fn inspector_timing<Step: StepProjection>(
+    step: &Step,
 ) -> Option<&super::run_view_model::WorkflowRunElapsed> {
     if matches!(
-        step.state,
+        step.state(),
         StepStateKind::Pending | StepStateKind::Blocked | StepStateKind::NotRun
     ) {
         None
     } else {
-        step.timing.as_ref()
+        step.timing()
     }
 }
 
-fn inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<InspectorField> {
+fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<InspectorField> {
     match fact? {
         ObservedStepTransition::Failed { phase, cause } => Some(InspectorField::new(
             "failure",
@@ -2383,15 +2580,20 @@ fn inspector_output_summary_line(
     color: bool,
 ) -> Line<'static> {
     let available_width = usize::from(width);
-    let disposition_width = display_width(&output.disposition);
-    if available_width <= disposition_width {
+    let disposition_width = output.disposition.as_deref().map_or(0, display_width);
+    if disposition_width != 0 && available_width <= disposition_width {
         return Line::from(Span::styled(
-            ellipsize(&output.disposition, available_width),
+            ellipsize(
+                output.disposition.as_deref().unwrap_or_default(),
+                available_width,
+            ),
             tone_style(color, output.tone),
         ));
     }
 
-    let gap_width = 2_usize.min(available_width - disposition_width);
+    let gap_width = usize::from(disposition_width != 0)
+        .saturating_mul(2)
+        .min(available_width.saturating_sub(disposition_width));
     let summary_width = available_width.saturating_sub(disposition_width + gap_width);
     let marker = format!("{}  ", output.marker);
     let marker_width = display_width(&marker).min(summary_width);
@@ -2420,11 +2622,13 @@ fn inspector_output_summary_line(
     if used_width < summary_width {
         spans.push(Span::raw(" ".repeat(summary_width - used_width)));
     }
-    spans.push(Span::raw(" ".repeat(gap_width)));
-    spans.push(Span::styled(
-        output.disposition.clone(),
-        tone_style(color, output.tone),
-    ));
+    if let Some(disposition) = &output.disposition {
+        spans.push(Span::raw(" ".repeat(gap_width)));
+        spans.push(Span::styled(
+            disposition.clone(),
+            tone_style(color, output.tone),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -2494,17 +2698,20 @@ struct StepColumns {
 }
 
 impl StepColumns {
-    fn for_steps(available: usize, gutter_width: usize, steps: &[WorkflowRunStepView]) -> Self {
+    fn for_steps<Step: StepProjection>(
+        available: usize,
+        gutter_width: usize,
+        steps: &[Step],
+    ) -> Self {
         let id_width = steps
             .iter()
-            .map(|step| display_width(&visible_text(&step.id)))
+            .map(|step| display_width(&visible_text(step.id())))
             .max()
             .unwrap_or(0);
         let duration_width = steps
             .iter()
             .map(|step| {
-                step.timing
-                    .as_ref()
+                step.timing()
                     .map_or(1, |timing| display_width(&human_duration(timing.duration)))
             })
             .max()
@@ -2551,7 +2758,7 @@ impl StepColumns {
     }
 }
 
-fn step_detail(step: &WorkflowRunStepView) -> Option<String> {
+fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
     match &step.fact {
         Some(ObservedStepTransition::OutputsCommitted { outputs }) => {
             Some(output_count_detail(outputs.len()))
@@ -2593,7 +2800,12 @@ fn step_detail(step: &WorkflowRunStepView) -> Option<String> {
     }
 }
 
-fn output_count_detail(count: usize) -> String {
+#[cfg(test)]
+fn step_detail(step: &WorkflowRunStepView) -> Option<String> {
+    live_step_detail(step)
+}
+
+pub(super) fn output_count_detail(count: usize) -> String {
     if count == 1 {
         "1 output committed".to_owned()
     } else {
@@ -3436,14 +3648,14 @@ fn render_footer_text(
 }
 
 #[derive(Clone, Copy)]
-struct HelpCommand {
-    keys: &'static str,
-    description: &'static str,
+pub(super) struct HelpCommand {
+    pub(super) keys: &'static str,
+    pub(super) description: &'static str,
 }
 
-struct HelpGroup {
-    title: &'static str,
-    commands: Vec<HelpCommand>,
+pub(super) struct HelpGroup {
+    pub(super) title: &'static str,
+    pub(super) commands: Vec<HelpCommand>,
 }
 
 fn render_help_overlay(
@@ -3453,7 +3665,15 @@ fn render_help_overlay(
     lifecycle: LifecycleControl,
     color: bool,
 ) {
-    let groups = help_groups(surface, lifecycle);
+    render_help_overlay_groups(frame, area, help_groups(surface, lifecycle), color);
+}
+
+pub(super) fn render_help_overlay_groups(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    groups: Vec<HelpGroup>,
+    color: bool,
+) {
     let column_count = help_column_count(area.width);
     let grid_height = help_grid_height(&groups, column_count);
     let desired_height = u16::try_from(grid_height)
@@ -3485,8 +3705,14 @@ fn render_help_overlay(
     render_help_groups(frame, grid_area, &groups, column_count, color);
 }
 
-fn help_groups(surface: HostSurface, lifecycle: LifecycleControl) -> Vec<HelpGroup> {
-    let mut groups = match surface {
+#[derive(Clone, Copy)]
+enum OutputHelpMode {
+    Live,
+    Archived,
+}
+
+fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) -> Vec<HelpGroup> {
+    match surface {
         HostSurface::Split => vec![
             HelpGroup {
                 title: "MOVE",
@@ -3505,7 +3731,10 @@ fn help_groups(surface: HostSurface, lifecycle: LifecycleControl) -> Vec<HelpGro
                 title: "OPEN",
                 commands: vec![HelpCommand {
                     keys: "↵",
-                    description: "open step log",
+                    description: match mode {
+                        OutputHelpMode::Live => "open step log",
+                        OutputHelpMode::Archived => "open retained output",
+                    },
                 }],
             },
             HelpGroup {
@@ -3522,76 +3751,104 @@ fn help_groups(surface: HostSurface, lifecycle: LifecycleControl) -> Vec<HelpGro
                 ],
             },
         ],
-        HostSurface::FullLog => vec![
-            HelpGroup {
-                title: "MOVE",
-                commands: vec![
-                    HelpCommand {
-                        keys: "↑/k",
-                        description: "one record up",
-                    },
-                    HelpCommand {
-                        keys: "↓/j",
-                        description: "one record down",
-                    },
-                    HelpCommand {
-                        keys: "PgUp/b",
-                        description: "one page up",
-                    },
-                    HelpCommand {
-                        keys: "PgDn/f/Space",
-                        description: "one page down",
-                    },
-                    HelpCommand {
-                        keys: "u/^U",
-                        description: "half page up",
-                    },
-                    HelpCommand {
-                        keys: "d/^D",
-                        description: "half page down",
-                    },
-                ],
-            },
-            HelpGroup {
-                title: "JUMP",
-                commands: vec![
-                    HelpCommand {
-                        keys: "g",
-                        description: "first record",
-                    },
-                    HelpCommand {
-                        keys: "G",
-                        description: "retained bottom",
-                    },
-                    HelpCommand {
-                        keys: "←/h",
-                        description: "pan left",
-                    },
-                    HelpCommand {
-                        keys: "→/l",
-                        description: "pan right",
-                    },
-                ],
-            },
-            HelpGroup {
-                title: "VIEW",
-                commands: vec![
-                    HelpCommand {
-                        keys: "F",
-                        description: "follow latest",
-                    },
-                    HelpCommand {
-                        keys: "Esc",
-                        description: "back / dismiss",
-                    },
-                    HelpCommand {
-                        keys: "?",
-                        description: "this help",
-                    },
-                ],
-            },
-        ],
-    };
+        HostSurface::FullLog => {
+            let noun = match mode {
+                OutputHelpMode::Live => "record",
+                OutputHelpMode::Archived => "row",
+            };
+            let mut view_commands = Vec::new();
+            if matches!(mode, OutputHelpMode::Live) {
+                view_commands.push(HelpCommand {
+                    keys: "F",
+                    description: "follow latest",
+                });
+            }
+            view_commands.extend([
+                HelpCommand {
+                    keys: "Esc",
+                    description: "back / dismiss",
+                },
+                HelpCommand {
+                    keys: "?",
+                    description: "this help",
+                },
+            ]);
+            vec![
+                HelpGroup {
+                    title: "MOVE",
+                    commands: vec![
+                        HelpCommand {
+                            keys: "↑/k",
+                            description: if noun == "record" {
+                                "one record up"
+                            } else {
+                                "one row up"
+                            },
+                        },
+                        HelpCommand {
+                            keys: "↓/j",
+                            description: if noun == "record" {
+                                "one record down"
+                            } else {
+                                "one row down"
+                            },
+                        },
+                        HelpCommand {
+                            keys: "PgUp/b",
+                            description: "one page up",
+                        },
+                        HelpCommand {
+                            keys: "PgDn/f/Space",
+                            description: "one page down",
+                        },
+                        HelpCommand {
+                            keys: "u/^U",
+                            description: "half page up",
+                        },
+                        HelpCommand {
+                            keys: "d/^D",
+                            description: "half page down",
+                        },
+                    ],
+                },
+                HelpGroup {
+                    title: "JUMP",
+                    commands: vec![
+                        HelpCommand {
+                            keys: "g",
+                            description: match mode {
+                                OutputHelpMode::Live => "first record",
+                                OutputHelpMode::Archived => "top",
+                            },
+                        },
+                        HelpCommand {
+                            keys: "G",
+                            description: match mode {
+                                OutputHelpMode::Live => "retained bottom",
+                                OutputHelpMode::Archived => "bottom",
+                            },
+                        },
+                        HelpCommand {
+                            keys: "←/h",
+                            description: "pan left",
+                        },
+                        HelpCommand {
+                            keys: "→/l",
+                            description: "pan right",
+                        },
+                    ],
+                },
+                HelpGroup {
+                    title: "VIEW",
+                    commands: view_commands,
+                },
+            ]
+        }
+    }
+}
+
+fn help_groups(surface: HostSurface, lifecycle: LifecycleControl) -> Vec<HelpGroup> {
+    let mut groups = surface_help_groups(surface, OutputHelpMode::Live);
     groups.push(HelpGroup {
         title: "FILTER",
         commands: vec![HelpCommand {
@@ -3852,14 +4109,13 @@ fn workflow_tone(workflow: &WorkflowState<StepFailureCause>) -> Tone {
     }
 }
 
-fn step_state_glyph(step: &WorkflowRunStepView) -> &'static str {
-    match step.state {
+fn step_state_glyph<Step: StepProjection>(step: &Step) -> &'static str {
+    match step.state() {
         StepStateKind::Pending => "○",
         StepStateKind::Starting => "◔",
         StepStateKind::Running => {
             let elapsed = step
-                .timing
-                .as_ref()
+                .timing()
                 .map_or(Duration::ZERO, |timing| timing.duration);
             let frame = elapsed.as_millis() / REDRAW_INTERVAL.as_millis();
             let index = usize::try_from(frame).unwrap_or(0) % RUNNING_INDICATOR_FRAMES.len();
@@ -3909,7 +4165,7 @@ fn step_state_tone(state: StepStateKind) -> Tone {
 }
 
 #[derive(Clone, Copy)]
-enum Tone {
+pub(super) enum Tone {
     Primary,
     Neutral,
     Muted,
@@ -4067,23 +4323,6 @@ mod tests {
             Ok(self.area)
         }
 
-        fn draw(
-            &mut self,
-            _snapshot: &WorkflowRunViewSnapshot,
-            interaction: &mut HostInteraction,
-            _color: bool,
-        ) -> io::Result<()> {
-            self.draw_count = self.draw_count.saturating_add(1);
-            self.record(BoundaryAction::Draw(interaction.terminal_area));
-            if self.failures.draw_at == Some(self.draw_count) {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "injected draw failure",
-                ));
-            }
-            Ok(())
-        }
-
         fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send {
             let actions = self.actions.clone();
             async move {
@@ -4124,6 +4363,25 @@ mod tests {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "injected restore failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl WorkflowTerminalBoundary for ScriptedTerminalBoundary {
+        fn draw_workflow(
+            &mut self,
+            _snapshot: &WorkflowRunViewSnapshot,
+            interaction: &mut HostInteraction,
+            _color: bool,
+        ) -> io::Result<()> {
+            self.draw_count = self.draw_count.saturating_add(1);
+            self.record(BoundaryAction::Draw(interaction.terminal_area));
+            if self.failures.draw_at == Some(self.draw_count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected draw failure",
                 ));
             }
             Ok(())
@@ -6636,6 +6894,7 @@ mod tests {
                 command_output: None,
             }],
             exports: BTreeMap::new(),
+            export_sources: BTreeMap::new(),
         };
         view.reconcile_terminal_result(&run).unwrap();
         view.mark_quiescent();

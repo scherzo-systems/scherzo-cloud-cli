@@ -12,9 +12,9 @@ definition validation, and an outbound, development-only runner transport.
 acknowledges received assignment effects, and uses the shared workflow resolver and
 admission boundary to accept one configured local command workflow. Execution remains
 separately authorized by a later start effect and is not part of the current service.
-`scherzo-cloud runner doctor` performs one default local Git check and can validate an
-explicitly configured Pi installation for the closed `PiJsonV1` profile;
-it does not claim that the runner is ready to execute assignments.
+`scherzo-cloud runner doctor` performs one default local Git check and can explicitly
+check the `pi` installation selected from inherited `PATH` for the closed `PiJsonV1`
+profile; it does not claim that the runner is ready to execute assignments.
 
 ## One executable with separate roles
 
@@ -60,25 +60,28 @@ is crate-private and accepts boxed checks from components assembled into this ex
 it is not a dynamic plugin API, does not discover libraries or scripts, and is not a
 third-party extension contract.
 
-The first registry entry is `environment.command.git`. It remains the sole default when
-no Pi executable is configured. The second entry,
-`execution.harness.pi-json-v1`, becomes a default check only when doctor receives
-`--pi-executable`; operators can also select it explicitly. Doctor does not construct
+The first registry entry is `environment.command.git` and is the sole default. The
+second entry, `execution.harness.pi-json-v1`, runs only when an operator selects it with
+`--check`; it resolves `pi` from the doctor's inherited `PATH`. Doctor does not construct
 human deployment state, read the human credential store, or make a network request.
 Future runner bootstrap code can add compiled-in checks through the same registry
 without adding a central check-name enum, but it must keep those boundaries intact.
 
 The Pi validator lives at the execution boundary and is shared by doctor, the local
-Workflow Run adapter, and optional agent-capable Runner Serve initialization. For an
-agent workflow, the local adapter selects the first executable `pi` in inherited `PATH`;
-doctor and Runner Serve retain their explicit executable configuration. Validation
-canonicalizes the selected path, invokes only that absolute executable's native version
-and help probes, and maps canonical stable versions in `>=0.83.0 <0.84.0` plus their
-required non-model flags into an immutable `ValidatedPiInstallation`. The value carries
-the absolute path, ordered numeric and exact observed version, closed profile enum, and
-closed capability set. Shared admission and later execution need no executable discovery
-or native probing. Command-only local runs and Runner Serve startup remain available
-without Pi.
+Workflow Run adapter, and agent-capable Runner Serve initialization. Each boundary
+selects the first `pi` in the launching process's inherited `PATH` that the process can
+execute and never accepts an executable path from a workflow, assignment, import, remote
+value, dedicated environment variable, or CLI option. Validation canonicalizes the
+selected path and invokes only that absolute executable's native version and help probes.
+Those isolated probes retain the captured inherited `PATH` so an environment-based
+launcher can resolve its interpreter; they never use it to select another `pi`.
+Validation maps canonical stable versions in `>=0.83.0 <0.84.0` plus their required
+non-model flags into an immutable
+`ValidatedPiInstallation`. The value carries the absolute path, ordered numeric and exact
+observed version, closed profile enum, and closed capability set. Shared admission and
+later execution use that pinned value without another `PATH` lookup or native probe, so
+later `PATH` changes cannot switch an active operation's executable. Command-only local
+runs and Runner Serve startup remain available when `pi` is absent.
 
 
 ## Runner service observability

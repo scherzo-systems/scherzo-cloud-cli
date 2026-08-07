@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::super::run_view_model::WorkflowRunStepView;
+use super::StepProjection;
 
 pub(super) const MAX_GRAPH_LANES: usize = 6;
 
@@ -51,11 +51,11 @@ struct LogicalRow {
 }
 
 impl DagLayout {
-    pub(super) fn for_steps(steps: &[WorkflowRunStepView]) -> Self {
+    pub(super) fn for_steps<Step: StepProjection>(steps: &[Step]) -> Self {
         Self::new(
             steps
                 .iter()
-                .map(|step| (step.id.as_str(), step.definition.direct_dependencies())),
+                .map(|step| (step.id(), step.definition().direct_dependencies())),
         )
     }
 

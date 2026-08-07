@@ -1,10 +1,11 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 use crate::process::{CommandOutput, CommandRequest, CommandRunner, SystemCommandRunner};
 
@@ -194,23 +195,23 @@ impl fmt::Display for PiInstallationFailure {
         match self {
             Self::Missing => write!(
                 formatter,
-                "configured Pi executable was not found; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE} or correct --pi-executable"
+                "Pi was not found in inherited PATH; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
             ),
-            Self::Unexecutable => formatter
-                .write_str("configured Pi executable could not complete its validation probes"),
+            Self::Unexecutable => formatter.write_str(
+                "Pi selected from inherited PATH could not complete its validation probes",
+            ),
             Self::Malformed(PiProbe::Version) => {
-                formatter.write_str("configured Pi executable returned a malformed version")
+                formatter.write_str("Pi selected from inherited PATH returned a malformed version")
             }
-            Self::Malformed(PiProbe::Capabilities) => {
-                formatter.write_str("configured Pi executable returned malformed capability help")
-            }
+            Self::Malformed(PiProbe::Capabilities) => formatter
+                .write_str("Pi selected from inherited PATH returned malformed capability help"),
             Self::Unsupported(PiIncompatibility::Version(version)) => write!(
                 formatter,
-                "configured Pi version {version} is unsupported; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
+                "Pi version {version} selected from inherited PATH is unsupported; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
             ),
             Self::Unsupported(PiIncompatibility::Capability(capability)) => write!(
                 formatter,
-                "configured Pi executable lacks the required {} capability",
+                "Pi selected from inherited PATH lacks the required {} capability",
                 capability.as_str()
             ),
         }
@@ -219,36 +220,39 @@ impl fmt::Display for PiInstallationFailure {
 
 impl std::error::Error for PiInstallationFailure {}
 
-pub(crate) fn discover_and_validate_pi_installation(
-    search_path: Option<&OsStr>,
-) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
-    let executable =
-        discover_executable(OsStr::new("pi"), search_path).ok_or(PiInstallationFailure::Missing)?;
-    validate_pi_installation(&executable)
+pub(crate) fn discover_and_validate_pi_installation()
+-> Result<ValidatedPiInstallation, PiInstallationFailure> {
+    let search_path = std::env::var_os("PATH").ok_or(PiInstallationFailure::Missing)?;
+    let executable = discover_executable(OsStr::new("pi"), Some(&search_path))
+        .ok_or(PiInstallationFailure::Missing)?;
+    validate_pi_installation_with(&executable, &search_path, &SystemCommandRunner)
 }
 
 pub(crate) fn validate_pi_installation(
-    configured_executable: &Path,
+    selected_executable: &Path,
 ) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
-    validate_pi_installation_with(configured_executable, &SystemCommandRunner)
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    validate_pi_installation_with(selected_executable, &search_path, &SystemCommandRunner)
 }
 
 fn discover_executable(name: &OsStr, search_path: Option<&OsStr>) -> Option<PathBuf> {
     std::env::split_paths(search_path?)
         .map(|directory| directory.join(name))
-        .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(candidate: &Path) -> bool {
+    fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
+        && accessat(CWD, candidate, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
 }
 
 fn validate_pi_installation_with(
-    configured_executable: &Path,
+    selected_executable: &Path,
+    search_path: &OsStr,
     runner: &dyn CommandRunner,
 ) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
-    let executable = normalize_executable(configured_executable)?;
-    let isolation = PiProbeIsolation::create()?;
+    let executable = normalize_executable(selected_executable)?;
+    let isolation = PiProbeIsolation::create(search_path)?;
     let validation = (|| {
         let version_output = run_probe(
             runner,
@@ -286,13 +290,12 @@ fn validate_pi_installation_with(
     validation
 }
 
-fn normalize_executable(configured: &Path) -> Result<PathBuf, PiInstallationFailure> {
-    let executable = fs::canonicalize(configured).map_err(|error| match error.kind() {
+fn normalize_executable(selected: &Path) -> Result<PathBuf, PiInstallationFailure> {
+    let executable = fs::canonicalize(selected).map_err(|error| match error.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => PiInstallationFailure::Missing,
         _ => PiInstallationFailure::Unexecutable,
     })?;
-    let metadata = fs::metadata(&executable).map_err(|_| PiInstallationFailure::Unexecutable)?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+    if !is_executable_file(&executable) {
         return Err(PiInstallationFailure::Unexecutable);
     }
     Ok(executable)
@@ -300,6 +303,7 @@ fn normalize_executable(configured: &Path) -> Result<PathBuf, PiInstallationFail
 
 struct PiProbeIsolation {
     _temporary: tempfile::TempDir,
+    search_path: OsString,
     current_directory: PathBuf,
     home: PathBuf,
     agent_directory: PathBuf,
@@ -310,13 +314,14 @@ struct PiProbeIsolation {
 }
 
 impl PiProbeIsolation {
-    fn create() -> Result<Self, PiInstallationFailure> {
+    fn create(search_path: &OsStr) -> Result<Self, PiInstallationFailure> {
         let temporary = tempfile::Builder::new()
             .prefix("scherzo-pi-validation-")
             .tempdir()
             .map_err(|_| PiInstallationFailure::Unexecutable)?;
         let root = temporary.path().to_owned();
         let isolation = Self {
+            search_path: search_path.to_owned(),
             current_directory: root.join("project"),
             home: root.join("home"),
             agent_directory: root.join("agent"),
@@ -346,8 +351,9 @@ impl PiProbeIsolation {
             .map_err(|_| PiInstallationFailure::Unexecutable)
     }
 
-    fn environment(&self) -> [(&OsStr, &OsStr); 11] {
+    fn environment(&self) -> [(&OsStr, &OsStr); 12] {
         [
+            (OsStr::new("PATH"), self.search_path.as_os_str()),
             (OsStr::new("HOME"), self.home.as_os_str()),
             (
                 OsStr::new("PI_CODING_AGENT_DIR"),
@@ -501,7 +507,14 @@ mod tests {
         let current_directory = current_directory.unwrap();
         let root = current_directory.parent().unwrap();
         assert_eq!(current_directory, root.join("project"));
-        assert_eq!(environment.len(), 11);
+        assert_eq!(environment.len(), 12);
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(candidate, _)| *candidate == OsStr::new("PATH"))
+                .map(|(_, value)| *value),
+            Some(OsStr::new("/controlled/bin"))
+        );
         for (name, expected) in [
             ("HOME", root.join("home")),
             ("PI_CODING_AGENT_DIR", root.join("agent")),
@@ -552,7 +565,9 @@ mod tests {
             capabilities: output(COMPLETE_HELP.as_bytes()),
         };
 
-        let installation = validate_pi_installation_with(&executable, &runner).unwrap();
+        let installation =
+            validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner)
+                .unwrap();
 
         assert_eq!(
             installation.executable(),
@@ -583,7 +598,7 @@ mod tests {
                 capabilities: output(COMPLETE_HELP.as_bytes()),
             };
             assert_eq!(
-                validate_pi_installation_with(&executable, &runner),
+                validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner,),
                 Err(PiInstallationFailure::Unsupported(
                     PiIncompatibility::Version(unsupported.to_owned())
                 ))
@@ -601,7 +616,7 @@ mod tests {
                 capabilities: output(COMPLETE_HELP.as_bytes()),
             };
             assert_eq!(
-                validate_pi_installation_with(&executable, &runner),
+                validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner,),
                 Err(PiInstallationFailure::Malformed(PiProbe::Version))
             );
         }
@@ -616,7 +631,11 @@ mod tests {
             ),
         };
         assert_eq!(
-            validate_pi_installation_with(&executable, &missing_trust),
+            validate_pi_installation_with(
+                &executable,
+                OsStr::new("/controlled/bin"),
+                &missing_trust,
+            ),
             Err(PiInstallationFailure::Unsupported(
                 PiIncompatibility::Capability(PiCapability::InvocationScopedProjectTrust)
             ))

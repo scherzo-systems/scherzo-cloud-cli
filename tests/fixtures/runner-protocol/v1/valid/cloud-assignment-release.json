@@ -9,6 +9,7 @@
     "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abj",
     "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
     "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
-    "reason": "stale_or_invalid_acceptance"
+    "reason": "stale_or_invalid_acceptance",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
   }
 }

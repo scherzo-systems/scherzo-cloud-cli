@@ -17,6 +17,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 pub(crate) mod generated;
 
 const PROTOCOL_SCHEMA: &str = include_str!("schema/runner-protocol-v1.schema.json");
+pub(crate) const MAXIMUM_ENCODED_FRAME_BYTES: usize = 65_536;
 const PROTOCOL_VERSION: i64 = 1;
 const PAYLOAD_VERSION: i64 = 1;
 const RUNNER_TO_CLOUD: &str = "runner_to_cloud";
@@ -55,6 +56,52 @@ pub(crate) enum RunnerFrame {
         effect_id: String,
         assignment_id: String,
         decline: AssignmentDecline,
+    },
+    AssignmentInterrupted {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        reason: String,
+    },
+    ExecutionLeaseRenewalRequested {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        current_lease_sequence: u64,
+    },
+    ExecutionStarted {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+    },
+    ExecutionTransition {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        execution_event_sequence: u64,
+        workflow_event: Value,
+    },
+    ExecutionFinished {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        final_execution_event_sequence: u64,
+        outcome: Value,
+    },
+    ExecutionInterrupted {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        final_execution_event_sequence: u64,
+        reason: String,
+        terminal_outcome: Value,
+    },
+    ExecutionAborted {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        last_execution_event_sequence: u64,
+        reason: String,
     },
 }
 
@@ -128,6 +175,13 @@ pub(crate) struct ExecutionLeasePolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionLeaseGrant {
+    pub(crate) sequence: u64,
+    pub(crate) expires_at: String,
+    pub(crate) runner_stop_before: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CloudEnvelope {
     pub(crate) message_id: String,
     pub(crate) sent_at: String,
@@ -152,6 +206,7 @@ pub(crate) enum CloudFrame {
         effect_id: String,
         assignment_id: String,
         run_id: String,
+        attempt_id: String,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
         offer_expires_at: String,
     },
@@ -160,21 +215,24 @@ pub(crate) enum CloudFrame {
         effect_id: String,
         assignment_id: String,
         run_id: String,
+        attempt_id: String,
         execution_spec_id: String,
-        lease_expires_at: String,
+        lease: ExecutionLeaseGrant,
     },
     AssignmentLeaseRenewed {
         envelope: CloudEnvelope,
         effect_id: String,
         assignment_id: String,
         run_id: String,
-        lease_expires_at: String,
+        attempt_id: String,
+        lease: ExecutionLeaseGrant,
     },
     AssignmentRelease {
         envelope: CloudEnvelope,
         effect_id: String,
         assignment_id: String,
         run_id: String,
+        attempt_id: String,
         reason: String,
     },
 }
@@ -223,7 +281,7 @@ impl std::error::Error for EncodeError {}
 
 pub(crate) fn decode_cloud_frame(bytes: &[u8]) -> Result<CloudFrame, DecodeError> {
     match decode_frame(bytes)? {
-        ValidatedFrame::Cloud(frame) => Ok(frame),
+        ValidatedFrame::Cloud(frame) => Ok(*frame),
         ValidatedFrame::Runner => Err(DecodeError::RunnerDirectedFrame),
     }
 }
@@ -293,6 +351,109 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
                 }),
             )
         }
+        RunnerFrame::AssignmentInterrupted {
+            envelope,
+            assignment_id,
+            attempt_id,
+            reason,
+        } => runner_frame_value(
+            envelope,
+            "assignment_interrupted",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "reason": reason,
+            }),
+        ),
+        RunnerFrame::ExecutionLeaseRenewalRequested {
+            envelope,
+            assignment_id,
+            attempt_id,
+            current_lease_sequence,
+        } => runner_frame_value(
+            envelope,
+            "execution_lease_renewal_requested",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "currentLeaseSequence": current_lease_sequence,
+            }),
+        ),
+        RunnerFrame::ExecutionStarted {
+            envelope,
+            assignment_id,
+            attempt_id,
+        } => runner_frame_value(
+            envelope,
+            "execution_started",
+            json!({ "assignmentId": assignment_id, "attemptId": attempt_id }),
+        ),
+        RunnerFrame::ExecutionTransition {
+            envelope,
+            assignment_id,
+            attempt_id,
+            execution_event_sequence,
+            workflow_event,
+        } => runner_frame_value(
+            envelope,
+            "execution_transition",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "executionEventSequence": execution_event_sequence,
+                "workflowEvent": workflow_event,
+            }),
+        ),
+        RunnerFrame::ExecutionFinished {
+            envelope,
+            assignment_id,
+            attempt_id,
+            final_execution_event_sequence,
+            outcome,
+        } => runner_frame_value(
+            envelope,
+            "execution_finished",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "finalExecutionEventSequence": final_execution_event_sequence,
+                "outcome": outcome,
+            }),
+        ),
+        RunnerFrame::ExecutionInterrupted {
+            envelope,
+            assignment_id,
+            attempt_id,
+            final_execution_event_sequence,
+            reason,
+            terminal_outcome,
+        } => runner_frame_value(
+            envelope,
+            "execution_interrupted",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "finalExecutionEventSequence": final_execution_event_sequence,
+                "reason": reason,
+                "terminalOutcome": terminal_outcome,
+            }),
+        ),
+        RunnerFrame::ExecutionAborted {
+            envelope,
+            assignment_id,
+            attempt_id,
+            last_execution_event_sequence,
+            reason,
+        } => runner_frame_value(
+            envelope,
+            "execution_aborted",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "lastExecutionEventSequence": last_execution_event_sequence,
+                "reason": reason,
+            }),
+        ),
     };
     let encoded = serde_json::to_vec(&value).map_err(|_| EncodeError::Serialization)?;
 
@@ -323,7 +484,11 @@ fn runner_frame_value(envelope: &RunnerEnvelope, frame_type: &str, payload: Valu
 
 enum ValidatedFrame {
     Runner,
-    Cloud(CloudFrame),
+    Cloud(Box<CloudFrame>),
+}
+
+fn cloud(frame: CloudFrame) -> ValidatedFrame {
+    ValidatedFrame::Cloud(Box::new(frame))
 }
 
 // cargo-typify generates distinct cloud structs with the same envelope fields.
@@ -424,7 +589,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 .schema_version
                 .as_u64()
                 .ok_or(DecodeError::InvalidFrame("schemaVersion"))?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::Welcome {
+            Ok(cloud(CloudFrame::Welcome {
                 envelope,
                 session_id,
                 ping_interval_seconds,
@@ -449,7 +614,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         }
         generated::RunnerProtocolVersion1::CloudObservationAck(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::ObservationAck {
+            Ok(cloud(CloudFrame::ObservationAck {
                 envelope,
                 acknowledged_message_id: frame.payload.acknowledged_message_id.to_string(),
                 acknowledged_sequence: frame.payload.acknowledged_sequence.0.get(),
@@ -469,11 +634,12 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let cancellation_grace_seconds =
                 u64::try_from(execution_spec.execution_limits.cancellation_grace_seconds.0)
                     .map_err(|_| DecodeError::InvalidFrame("cancellationGraceSeconds"))?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentOffer {
+            Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
                 execution_spec: Box::new(ExecutionSpecV1RunnerProjection {
                     execution_spec_id: execution_spec.execution_spec_id.to_string(),
                     schema_version,
@@ -488,34 +654,47 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         }
         generated::RunnerProtocolVersion1::CloudAssignmentStart(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
-            let lease_expires_at = validate_timestamp(&frame.payload.lease.lease_expires_at)?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentStart {
+            let lease = frame.payload.lease;
+            Ok(cloud(CloudFrame::AssignmentStart {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
                 execution_spec_id: frame.payload.execution_spec_id.to_string(),
-                lease_expires_at,
+                lease: ExecutionLeaseGrant {
+                    sequence: lease.lease_sequence.get(),
+                    expires_at: validate_timestamp(&lease.lease_expires_at)?,
+                    runner_stop_before: validate_timestamp(&lease.runner_stop_before)?,
+                },
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentLeaseRenewed(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
-            let lease_expires_at = validate_timestamp(&frame.payload.lease.lease_expires_at)?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentLeaseRenewed {
+            let lease = frame.payload.lease;
+            let sequence = u64::try_from(lease.lease_sequence)
+                .map_err(|_| DecodeError::InvalidFrame("leaseSequence"))?;
+            Ok(cloud(CloudFrame::AssignmentLeaseRenewed {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
-                lease_expires_at,
+                attempt_id: frame.payload.attempt_id.to_string(),
+                lease: ExecutionLeaseGrant {
+                    sequence,
+                    expires_at: validate_timestamp(&lease.lease_expires_at)?,
+                    runner_stop_before: validate_timestamp(&lease.runner_stop_before)?,
+                },
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentRelease(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
-            Ok(ValidatedFrame::Cloud(CloudFrame::AssignmentRelease {
+            Ok(cloud(CloudFrame::AssignmentRelease {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
                 assignment_id: frame.payload.assignment_id.to_string(),
                 run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
                 reason: frame.payload.reason.to_string(),
             }))
         }
@@ -628,6 +807,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "effectId",
             "assignmentId",
             "runId",
+            "attemptId",
             "executionSpec",
             "offerExpiresAt",
         ],
@@ -635,11 +815,12 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "effectId",
             "assignmentId",
             "runId",
+            "attemptId",
             "executionSpecId",
             "lease",
         ],
-        "assignment_lease_renewed" => &["effectId", "assignmentId", "runId", "lease"],
-        "assignment_release" => &["effectId", "assignmentId", "runId", "reason"],
+        "assignment_lease_renewed" => &["effectId", "assignmentId", "runId", "attemptId", "lease"],
+        "assignment_release" => &["effectId", "assignmentId", "runId", "attemptId", "reason"],
         _ => return Err(DecodeError::InvalidFrame("type")),
     };
     if payload.len() != payload_keys.len()
@@ -769,6 +950,14 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/runner-execution-transition.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-transition-agent-failure.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-transition-output-failure.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

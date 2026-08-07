@@ -18,6 +18,7 @@
         "cancellationGraceSeconds": 1
       }
     },
-    "offerExpiresAt": "2026-07-23T00:05:00Z"
+    "offerExpiresAt": "2026-07-23T00:05:00Z",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
   }
 }

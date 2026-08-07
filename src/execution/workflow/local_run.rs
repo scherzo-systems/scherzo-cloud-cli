@@ -35,7 +35,10 @@ use super::process_group::{
 use super::publication::{CancellationReasonV1, cancellation_reason};
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::runtime::{StepState, WorkflowState};
-use super::schema_common::{lowercase_hex, utc_timestamp};
+use super::schema_common::{
+    is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex, lowercase_hex,
+    utc_timestamp,
+};
 
 const RUN_FILE: &str = "run.json";
 const STATE_FILE: &str = "state.json";
@@ -50,7 +53,7 @@ const INITIAL_ATTEMPT_DIRECTORY: &str = "000001";
 const STAGING_ATTEMPTS: usize = 16;
 const PRIVATE_STAGING_ATTEMPTS: usize = 16;
 const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
-const MAXIMUM_DURABLE_JSON_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = 321 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTICS: usize = 256;
@@ -86,9 +89,9 @@ impl std::error::Error for LocalRunDirectoryError {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DigestV1 {
-    algorithm: String,
-    value: String,
+pub(super) struct DigestV1 {
+    pub(super) algorithm: String,
+    pub(super) value: String,
 }
 
 impl DigestV1 {
@@ -106,12 +109,12 @@ impl DigestV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalRunV1 {
-    schema_version: u8,
-    local_run_id: String,
-    created_at: String,
-    workflow_digest: DigestV1,
-    workflow_manifest_digest: DigestV1,
+pub(super) struct LocalRunV1 {
+    pub(super) schema_version: u8,
+    pub(super) local_run_id: String,
+    pub(super) created_at: String,
+    pub(super) workflow_digest: DigestV1,
+    pub(super) workflow_manifest_digest: DigestV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,52 +163,52 @@ struct ManifestAttachmentV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalRunStateV1 {
-    schema_version: u8,
-    local_run_id: String,
-    revision: u64,
-    current_attempt_number: u64,
-    attempts: Vec<LocalAttemptV1>,
+pub(super) struct LocalRunStateV1 {
+    pub(super) schema_version: u8,
+    pub(super) local_run_id: String,
+    pub(super) revision: u64,
+    pub(super) current_attempt_number: u64,
+    pub(super) attempts: Vec<LocalAttemptV1>,
     diagnostics: Vec<LocalDiagnosticV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalAttemptV1 {
+pub(super) struct LocalAttemptV1 {
     attempt_id: String,
-    attempt_number: u64,
-    trigger: AttemptTriggerV1,
+    pub(super) attempt_number: u64,
+    pub(super) trigger: AttemptTriggerV1,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prior_attempt_number: Option<u64>,
-    state: AttemptStateV1,
-    execution_root: String,
-    created_at: String,
+    pub(super) prior_attempt_number: Option<u64>,
+    pub(super) state: AttemptStateV1,
+    pub(super) execution_root: String,
+    pub(super) created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
+    pub(super) started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    settled_at: Option<String>,
+    pub(super) settled_at: Option<String>,
     owner: AttemptOwnerV1,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cancellation: Option<AttemptCancellationV1>,
+    pub(super) cancellation: Option<AttemptCancellationV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     interruption: Option<AttemptInterruptionV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection: Option<AttemptRejectionV1>,
-    progress: AttemptProgressV1,
+    pub(super) progress: AttemptProgressV1,
     process_guards: Vec<ProcessGuardV1>,
-    result: AttemptResultV1,
+    pub(super) result: AttemptResultV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AttemptTriggerV1 {
+pub(super) enum AttemptTriggerV1 {
     Initial,
     ExplicitRetry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AttemptStateV1 {
+pub(super) enum AttemptStateV1 {
     Created,
     Running,
     Cancelling,
@@ -252,10 +255,10 @@ enum ExecutionHostKindV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AttemptCancellationV1 {
-    reason: CancellationReasonV1,
-    requested_at: String,
-    force_stop_deadline: String,
+pub(super) struct AttemptCancellationV1 {
+    pub(super) reason: CancellationReasonV1,
+    pub(super) requested_at: String,
+    pub(super) force_stop_deadline: String,
     workflow_confirmed: bool,
 }
 
@@ -291,23 +294,23 @@ enum RejectionCodeV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AttemptProgressV1 {
+pub(super) struct AttemptProgressV1 {
     accepted_occurrence_ordinal: u64,
     last_transition_sequence: u64,
-    steps: Vec<AttemptStepV1>,
+    pub(super) steps: Vec<AttemptStepV1>,
     outstanding_actions: Vec<OutstandingActionV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AttemptStepV1 {
-    id: String,
-    state: AttemptStepStateV1,
+pub(super) struct AttemptStepV1 {
+    pub(super) id: String,
+    pub(super) state: AttemptStepStateV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AttemptStepStateV1 {
+pub(super) enum AttemptStepStateV1 {
     Pending,
     Starting,
     Running,
@@ -374,7 +377,7 @@ enum ProcessLivenessKindV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-enum AttemptResultV1 {
+pub(super) enum AttemptResultV1 {
     NotPublished {
         reason: ResultAbsentReasonV1,
     },
@@ -389,7 +392,7 @@ enum AttemptResultV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ResultAbsentReasonV1 {
+pub(super) enum ResultAbsentReasonV1 {
     AttemptNonterminal,
     PublicationPending,
     Interrupted,
@@ -1850,7 +1853,7 @@ fn run_root_entries() -> BTreeSet<Vec<u8>> {
     ])
 }
 
-fn load_retained_execution(
+pub(super) fn load_retained_execution(
     root: &OwnedFd,
     run: &LocalRunV1,
 ) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
@@ -1999,9 +2002,17 @@ fn retry_rejection(
     }
 }
 
-pub(crate) fn read_local_run_status(
+pub(super) struct StableLocalRunSnapshot {
+    pub(super) run_directory: PathBuf,
+    pub(super) root: OwnedFd,
+    pub(super) run: LocalRunV1,
+    pub(super) state: LocalRunStateV1,
+    pub(super) lock_held: bool,
+}
+
+pub(super) fn read_stable_local_run_snapshot(
     requested: &Path,
-) -> Result<LocalRunStatusSnapshot, LocalStatusError> {
+) -> Result<StableLocalRunSnapshot, LocalStatusError> {
     let normalized = std::fs::canonicalize(requested).map_err(|_| LocalStatusError {
         code: LocalStatusErrorCode::RunDirectoryUnavailable,
         run_directory: None,
@@ -2018,8 +2029,6 @@ pub(crate) fn read_local_run_status(
         run_directory: reported_directory.clone(),
     })?;
     let run = read_run(&root).map_err(|_| invalid_status_error(&reported_directory))?;
-    let run_value =
-        serde_json::to_value(&run).map_err(|_| invalid_status_error(&reported_directory))?;
     let lock = open_status_lock(&root, &reported_directory)?;
 
     for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
@@ -2039,14 +2048,35 @@ pub(crate) fn read_local_run_status(
         if before.revision != after.revision {
             continue;
         }
-        return status_snapshot(normalized, run_value, after, lock_held)
-            .map_err(|_| invalid_status_error(&reported_directory));
+        return Ok(StableLocalRunSnapshot {
+            run_directory: normalized,
+            root,
+            run,
+            state: after,
+            lock_held,
+        });
     }
 
     Err(LocalStatusError {
         code: LocalStatusErrorCode::StatusSnapshotUnstable,
         run_directory: reported_directory,
     })
+}
+
+pub(crate) fn read_local_run_status(
+    requested: &Path,
+) -> Result<LocalRunStatusSnapshot, LocalStatusError> {
+    let snapshot = read_stable_local_run_snapshot(requested)?;
+    let reported_directory = Some(snapshot.run_directory.clone());
+    let run_value = serde_json::to_value(&snapshot.run)
+        .map_err(|_| invalid_status_error(&reported_directory))?;
+    status_snapshot(
+        snapshot.run_directory,
+        run_value,
+        snapshot.state,
+        snapshot.lock_held,
+    )
+    .map_err(|_| invalid_status_error(&reported_directory))
 }
 
 fn invalid_status_error(run_directory: &Option<PathBuf>) -> LocalStatusError {
@@ -2663,10 +2693,18 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
         return Err(LocalRunDirectoryError::SerializationUnavailable);
     }
     let mut source_paths = BTreeSet::new();
+    let mut previous_source_path: Option<&[u8]> = None;
     for source in &manifest.source_files {
-        if !is_canonical_relative_path(&source.path) || !source_paths.insert(source.path.as_str()) {
+        if !is_canonical_relative_path(&source.path) {
             return Err(LocalRunDirectoryError::SerializationUnavailable);
         }
+        if !source_paths.insert(source.path.as_str()) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        if previous_source_path.is_some_and(|path| path >= source.path.as_bytes()) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        previous_source_path = Some(source.path.as_bytes());
     }
     if !source_paths.contains(manifest.workflow_path.as_str()) {
         return Err(LocalRunDirectoryError::SerializationUnavailable);
@@ -2899,33 +2937,6 @@ fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirec
     }
 }
 
-fn is_canonical_relative_path(value: &str) -> bool {
-    let path = Path::new(value);
-    !value.is_empty()
-        && !path.is_absolute()
-        && path.components().all(|component| {
-            matches!(component, std::path::Component::Normal(_))
-                && component.as_os_str().to_str().is_some()
-        })
-        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
-}
-
-fn is_canonical_absolute_path(value: &str) -> bool {
-    let path = Path::new(value);
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        return false;
-    }
-    let normalized = path.components().collect::<PathBuf>();
-    normalized.as_os_str() == path.as_os_str()
-}
-
 fn validate_owner(owner: &AttemptOwnerV1) -> bool {
     is_canonical_uuid(&owner.owner_nonce) && validate_execution_host(&owner.execution_host)
 }
@@ -3025,7 +3036,7 @@ fn open_directory_path(path: &Path) -> Result<OwnedFd, Errno> {
     )
 }
 
-fn open_directory_at(
+pub(super) fn open_directory_at(
     parent: &OwnedFd,
     name: impl rustix::path::Arg,
 ) -> Result<OwnedFd, LocalRunDirectoryError> {
@@ -3113,13 +3124,6 @@ fn is_canonical_uuid(value: &str) -> bool {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
         })
-}
-
-fn is_lowercase_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

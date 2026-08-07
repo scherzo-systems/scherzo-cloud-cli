@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -139,6 +139,7 @@ impl FrameSource for ReplayFrameSource {
 
 #[derive(Clone)]
 struct LogicalSleeper {
+    origin: Instant,
     state: Arc<Mutex<LogicalSleepState>>,
     changed: Arc<Notify>,
 }
@@ -157,8 +158,13 @@ struct LogicalSleep {
 }
 
 impl LogicalSleeper {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "logical sleepers need an opaque monotonic origin"
+    )]
     fn new() -> Self {
         Self {
+            origin: Instant::now(),
             state: Arc::new(Mutex::new(LogicalSleepState {
                 now: Duration::ZERO,
                 next_registration: 0,
@@ -213,6 +219,15 @@ impl LogicalSleeper {
 }
 
 impl Sleeper for LogicalSleeper {
+    fn now(&self) -> Instant {
+        let elapsed = self
+            .state
+            .lock()
+            .expect("conversation logical sleeper mutex poisoned")
+            .now;
+        self.origin + elapsed
+    }
+
     fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
         let notification = Arc::new(Notify::new());
         let mut state = self

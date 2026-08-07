@@ -3,10 +3,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -64,6 +65,10 @@ impl WallClockHealth for HealthyWallClock {
     fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure> {
         Ok(Duration::ZERO)
     }
+
+    fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure> {
+        OffsetDateTime::parse("2026-07-23T00:00:00Z", &Rfc3339).map_err(|_| WallClockHealthFailure)
+    }
 }
 
 pub(crate) fn healthy_wall_clock() -> Arc<dyn WallClockHealth> {
@@ -94,6 +99,8 @@ impl DeterminismTranscript {
 pub(crate) struct SleepRelease {
     notification: Arc<Notify>,
     duration: Duration,
+    deadline: Instant,
+    clock: Arc<Mutex<Instant>>,
     transcript: Option<DeterminismTranscript>,
 }
 
@@ -102,16 +109,26 @@ impl SleepRelease {
         if let Some(transcript) = &self.transcript {
             transcript.record(format!("sleep.released:{}ms", self.duration.as_millis()));
         }
+        let mut now = self.clock.lock().expect("controlled clock mutex poisoned");
+        if *now < self.deadline {
+            *now = self.deadline;
+        }
+        drop(now);
         self.notification.notify_one();
     }
 }
 
 struct ControlledSleeper {
     requests: mpsc::UnboundedSender<(Duration, SleepRelease)>,
+    clock: Arc<Mutex<Instant>>,
     transcript: Option<DeterminismTranscript>,
 }
 
 impl Sleeper for ControlledSleeper {
+    fn now(&self) -> Instant {
+        *self.clock.lock().expect("controlled clock mutex poisoned")
+    }
+
     fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
         let requests = self.requests.clone();
         Box::pin(async move {
@@ -119,12 +136,18 @@ impl Sleeper for ControlledSleeper {
             if let Some(transcript) = &self.transcript {
                 transcript.record(format!("sleep.requested:{}ms", duration.as_millis()));
             }
+            let deadline = self
+                .now()
+                .checked_add(duration)
+                .expect("controlled sleep deadline overflowed");
             requests
                 .send((
                     duration,
                     SleepRelease {
                         notification: Arc::clone(&notification),
                         duration,
+                        deadline,
+                        clock: Arc::clone(&self.clock),
                         transcript: self.transcript.clone(),
                     },
                 ))
@@ -160,10 +183,19 @@ fn controlled_sleeper_with_optional_transcript(
     (
         Arc::new(ControlledSleeper {
             requests,
+            clock: Arc::new(Mutex::new(monotonic_test_origin())),
             transcript,
         }),
         receiver,
     )
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "controlled sleepers need an opaque monotonic origin"
+)]
+fn monotonic_test_origin() -> Instant {
+    Instant::now()
 }
 
 struct ScriptedDuplexState {
@@ -497,6 +529,15 @@ pub(crate) fn effect_observation_acknowledgement(message_id: &str, sequence: u64
     )
 }
 
+pub(crate) fn terminal_observation_acknowledgement(message_id: &str, sequence: u64) -> Message {
+    observation_acknowledgement_with_cloud_id(
+        "cmsg_01k0z6r1w8f4jy2m7q9v3x5abg",
+        "2026-07-23T00:00:04Z",
+        message_id,
+        sequence,
+    )
+}
+
 fn observation_acknowledgement_with_cloud_id(
     cloud_message_id: &str,
     sent_at: &str,
@@ -534,6 +575,7 @@ pub(crate) fn assignment_offer() -> Message {
                 "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
                 "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
                 "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+                "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "executionSpec": {
                     "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
                     "schemaVersion": 1,

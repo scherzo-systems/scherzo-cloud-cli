@@ -21,10 +21,11 @@ boundary, mirror contents, CI workflow, or implementation are welcome.
 ## Human credentials
 
 The initial human credential store contains short-lived OAuth access tokens without
-application-level encryption. Normal operation protects `~/.scherzo-cloud` with mode
-`0700` and `credentials.json` with mode `0600`. The CLI refuses unsafe ownership,
-permissions, symbolic links, malformed schemas, and unbounded token values rather than
-silently repairing or replacing them. Human credentials are never runner credentials.
+application-level encryption. Normal operation protects the `~/.scherzo/` application
+home with mode `0700` and `credentials.json` with mode `0600`. The CLI refuses unsafe
+ownership, permissions, symbolic links, malformed schemas, and unbounded token values
+rather than silently repairing or replacing them. Human credentials are never runner
+credentials.
 
 Treat the credential file as a secret. Do not copy it into bug reports, command output,
 logs, repositories, or runner configuration. Use `scherzo-cloud auth logout` to remove
@@ -116,14 +117,18 @@ human credential store, contact a network service, or create persistent state. T
 check executes the `git` resolved from the runner process's `PATH` with the fixed
 `--version` argument.
 
-When an operator supplies `--pi-executable`, the PiJsonV1 check canonicalizes that
-configured path without searching `PATH`, then invokes only the resulting absolute path
-for a `--version` probe and a capability-help probe. The latter combines `--help` with
-Pi's invocation-scoped project rejection and resource-discovery disable flags. Both
-probes run from a fresh private temporary working directory with fresh home, Pi agent,
-and XDG directories. Their child environment is cleared before Scherzo supplies only
-those paths, deterministic no-color controls, and Pi's offline, no-update-check, and
-no-install-telemetry controls. Temporary state is removed after validation.
+When an operator explicitly selects the PiJsonV1 check, doctor searches its inherited
+`PATH` in order for executable name `pi`, canonicalizes the first candidate that the
+current process can execute, and invokes only the resulting absolute path for a
+`--version` probe and a capability-help probe. It never falls through to a later
+candidate after selecting an incompatible installation. The latter probe combines
+`--help` with Pi's invocation-scoped project rejection and resource-discovery disable
+flags. Both probes run from a fresh private temporary working directory with fresh home,
+Pi agent, and XDG directories. Their child environment is cleared before Scherzo
+restores the captured inherited `PATH` for environment-based launcher interpreter
+resolution and supplies only those temporary paths, deterministic no-color controls,
+and Pi's offline, no-update-check, and no-install-telemetry controls. The absolute Pi
+path remains fixed throughout both probes. Temporary state is removed after validation.
 
 The validator does not request provider or model data, check authentication, execute a
 workflow or caller project, install or update Pi, or substitute another executable. The
@@ -135,4 +140,8 @@ output streams so a child cannot block on a full pipe, bounds retained standard 
 and terminates and reaps the group before joining those streams. Truncated output is
 rejected. Reports never copy raw standard output, standard error, operating-system error
 text, or process exit text. They expose only strictly parsed versions, closed capability
-identifiers, and the normalized path of a compatible installation.
+identifiers, and the normalized path of a compatible installation. Workflow data,
+assignments, imports, and
+remote values cannot supply or alter the search path. Once validation succeeds,
+admission and execution retain the absolute installation identity and never search
+`PATH` again, so a later `PATH` change cannot redirect an admitted invocation.

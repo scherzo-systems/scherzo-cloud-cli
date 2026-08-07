@@ -16,18 +16,21 @@ use rustix::fs::{
     unlinkat,
 };
 use rustix::io::Errno;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
+use super::agent::AgentFailureCause;
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CaptureFailureKind};
+use super::artifact_set;
 use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::execution_root::open_directory;
 use super::input::InputPreparationFailureKind;
 use super::private_staging::{directory_entry_names, same_file};
 use super::resolution::WorkflowContentDigest;
+use super::result_metadata;
 use super::runtime::{
     ExportSet, ExportUnavailableReason, ExportValue, FailurePhase, NotRunReason, RunOutcome,
     StepFailure, StepState,
@@ -37,6 +40,7 @@ use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
+use super::validated::{ResolvedOutputSource, WorkflowValueType};
 use super::value::CapturedValue;
 
 const COMMAND: &str = "scherzo-cloud workflow run";
@@ -94,6 +98,7 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) cancellation: Option<WorkflowRunCancellation>,
     pub(crate) steps: Vec<WorkflowRunStep>,
     pub(crate) exports: ExportSet<CapturedValue>,
+    pub(crate) export_sources: BTreeMap<String, ResolvedOutputSource>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,7 +184,7 @@ impl fmt::Display for LocalPublicationError {
 
 impl std::error::Error for LocalPublicationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkflowOutcomeV1 {
     Succeeded,
@@ -230,148 +235,281 @@ impl WorkflowRunTerminalResultV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowResultV1 {
-    schema_version: u8,
-    attempt_number: u64,
-    workflow: WorkflowIdentityV1,
-    execution: WorkflowExecutionV1,
-    command_output_policy: CommandOutputPolicyV1,
-    outcome: WorkflowOutcomeV1,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    primary_failure: Option<PrimaryFailureV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cancellation: Option<CancellationV1>,
-    steps: Vec<WorkflowStepV1>,
-    exports: BTreeMap<String, ExportV1>,
+    pub(crate) schema_version: u8,
+    pub(crate) attempt_number: u64,
+    pub(crate) workflow: WorkflowIdentityV1,
+    pub(crate) execution: WorkflowExecutionV1,
+    pub(crate) command_output_policy: CommandOutputPolicyV1,
+    pub(crate) outcome: WorkflowOutcomeV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) primary_failure: Option<PrimaryFailureV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) cancellation: Option<CancellationV1>,
+    pub(crate) steps: Vec<WorkflowStepV1>,
+    pub(crate) exports: BTreeMap<String, ExportV1>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct WorkflowIdentityV1 {
-    path: String,
-    provenance: WorkflowProvenanceV1,
-    digest: DigestV1,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowIdentityV1 {
+    pub(crate) path: String,
+    pub(crate) provenance: WorkflowProvenanceV1,
+    pub(crate) digest: DigestV1,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowProvenanceV1 {
-    kind: &'static str,
-    source_root: String,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WorkflowProvenanceV1 {
+    pub(crate) kind: String,
+    pub(crate) source_root: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowExecutionV1 {
-    execution_root: String,
-    maximum_parallel_steps: usize,
-    started_at: String,
-    finished_at: String,
-    duration_milliseconds: u64,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WorkflowExecutionV1 {
+    pub(crate) execution_root: String,
+    pub(crate) maximum_parallel_steps: usize,
+    pub(crate) started_at: String,
+    pub(crate) finished_at: String,
+    pub(crate) duration_milliseconds: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CommandOutputPolicyV1 {
-    encoding: &'static str,
-    maximum_retained_bytes_per_stream: u64,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CommandOutputPolicyV1 {
+    pub(crate) encoding: String,
+    pub(crate) maximum_retained_bytes_per_stream: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct DigestV1 {
-    algorithm: &'static str,
-    value: String,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DigestV1 {
+    pub(crate) algorithm: String,
+    pub(crate) value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CancellationV1 {
-    reason: CancellationReasonV1,
-    force_stop_deadline: String,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CancellationV1 {
+    pub(crate) reason: CancellationReasonV1,
+    pub(crate) force_stop_deadline: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum CancellationReasonV1 {
+pub(crate) enum CancellationReasonV1 {
     UserRequest,
     TerminationRequest,
     CallerOutputFailure,
     RunnerShutdown,
+    ExecutionLeaseExpired,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+// The published result's terminal-only enum must remain closed independently of the
+// durable attempt projection, which also admits live states.
+// jscpd:ignore-start
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum WorkflowStepStateV1 {
+pub(crate) enum WorkflowStepStateV1 {
     Succeeded,
     Failed,
     Blocked,
     NotRun,
     Cancelled,
 }
+// jscpd:ignore-end
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowStepV1 {
-    id: String,
-    kind: &'static str,
-    state: WorkflowStepStateV1,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration_milliseconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    committed_output_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failure: Option<FailureV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dependency: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<StepReasonV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    command_output: Option<CommandOutputV1>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WorkflowStepV1 {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) state: WorkflowStepStateV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) started_at: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) duration_milliseconds: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) failure: Option<FailureV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) dependency: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reason: Option<StepReasonV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) command_output: Option<CommandOutputV1>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum StepReasonV1 {
+pub(crate) enum StepReasonV1 {
     FailureStop,
     UserRequest,
     TerminationRequest,
     CallerOutputFailure,
     RunnerShutdown,
+    ExecutionLeaseExpired,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct FailureV1 {
-    phase: FailurePhaseV1,
-    cause: FailureCauseV1,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailureV1 {
+    pub(crate) phase: FailurePhaseV1,
+    pub(crate) cause: FailureCauseV1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum FailurePhaseV1 {
+pub(crate) enum FailurePhaseV1 {
     Start,
     Execution,
     OutputCapture,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FailureCauseV1 {
-    code: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    collection_index: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureCodeV1 {
+    StepUnavailable,
+    PreparationTaskUnavailable,
+    InputsUnavailable,
+    OutputsUnsupported,
+    AgentRuntimeUnavailable,
+    AgentStepUnavailable,
+    AgentAdmissionUnavailable,
+    AgentInputsUnavailable,
+    AgentInputMissingUpstream,
+    AgentInputTypeMismatch,
+    AgentSourceUnavailable,
+    AgentSourceTextInvalid,
+    AgentResultSchemaUnavailable,
+    AgentValueModeInvalid,
+    AgentAttachmentCountLimit,
+    AgentAttachmentBytesLimit,
+    ArtifactStagingMismatch,
+    AgentStagingMismatch,
+    AgentInputStagingUnavailable,
+    HarnessStartFailed,
+    HarnessInputTooLarge,
+    HarnessFailed,
+    HarnessProtocolFailed,
+    MissingResponse,
+    MissingResult,
+    ResultValidationLimitExceeded,
+    CapturedValueTooLarge,
+    ResultSettlementFailed,
+    InputInvalidName,
+    InputValueCountLimit,
+    InputValueSizeLimit,
+    InputTotalSizeLimit,
+    InputCollectionOrdinalLimit,
+    InputTypeMismatch,
+    InputSourceUnavailable,
+    InputStagingUnavailable,
+    InputLiveLimit,
+    ExecutionRootRebound,
+    WorkingDirectoryUnavailable,
+    WorkingDirectoryEscape,
+    WorkingDirectoryNotDirectory,
+    CommandArgvInvalid,
+    CommandPathUnconfigured,
+    ExecutableNotFound,
+    ExecutableUnavailable,
+    CommandLaunchNotFound,
+    CommandLaunchPermissionDenied,
+    CommandLaunchInvalidInput,
+    CommandLaunchFailed,
+    CommandExit,
+    CommandWaitFailed,
+    OutputUnsupported,
+    CaptureTaskUnavailable,
+    OutputPathAbsolute,
+    OutputPathEscape,
+    OutputPathEmpty,
+    OutputMissing,
+    OutputSymbolicLink,
+    OutputParentNotDirectory,
+    OutputNotRegularFile,
+    OutputSourceUnavailable,
+    CapturedFileCountLimit,
+    CapturedFileSizeLimit,
+    CapturedTotalSizeLimit,
+    OutputStagingUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FailureCauseV1 {
+    pub(crate) code: FailureCodeV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) input: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) collection_index: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) output: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) exit_code: Option<i32>,
+}
+
+fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl FailureCauseV1 {
-    fn code(code: &'static str) -> Self {
+    fn code(code: FailureCodeV1) -> Self {
         Self {
             code,
             input: None,
@@ -382,35 +520,37 @@ impl FailureCauseV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct PrimaryFailureV1 {
-    step: String,
-    phase: FailurePhaseV1,
-    cause: FailureCauseV1,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrimaryFailureV1 {
+    pub(crate) step: String,
+    pub(crate) phase: FailurePhaseV1,
+    pub(crate) cause: FailureCauseV1,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct CommandOutputV1 {
-    stdout: DiagnosticStreamV1,
-    stderr: DiagnosticStreamV1,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommandOutputV1 {
+    pub(crate) stdout: DiagnosticStreamV1,
+    pub(crate) stderr: DiagnosticStreamV1,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticStreamV1 {
-    encoding: &'static str,
-    data: String,
-    retained_bytes: u64,
-    discarded_bytes: u64,
-    truncated: bool,
-    fully_drained: bool,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DiagnosticStreamV1 {
+    pub(crate) encoding: String,
+    pub(crate) data: String,
+    pub(crate) retained_bytes: u64,
+    pub(crate) discarded_bytes: u64,
+    pub(crate) truncated: bool,
+    pub(crate) fully_drained: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum ExportV1 {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ExportV1 {
     Available {
-        kind: &'static str,
+        kind: String,
         #[serde(rename = "mediaType")]
         media_type: String,
         path: String,
@@ -423,8 +563,8 @@ enum ExportV1 {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-enum ExportUnavailableReasonV1 {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum ExportUnavailableReasonV1 {
     #[serde(rename = "source_failed")]
     Failed,
     #[serde(rename = "source_blocked")]
@@ -539,7 +679,11 @@ fn publish_prepared_with_observer(
         None,
     )?;
 
+    if !run.exports.keys().eq(run.export_sources.keys()) {
+        return Err(invalid_run_result());
+    }
     let mut exports = BTreeMap::new();
+    let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
     for (index, (name, export)) in run.exports.iter().enumerate() {
         let ordinal = index.checked_add(1).ok_or_else(|| {
             LocalPublicationError::for_export(
@@ -548,127 +692,76 @@ fn publish_prepared_with_observer(
                 name,
             )
         })?;
-        match export {
+        let source = run
+            .export_sources
+            .get(name)
+            .ok_or_else(invalid_run_result)?;
+        let identity = (source.step.clone(), source.output.clone());
+        let metadata = match export {
             ExportValue::Available { output } => {
-                observe(
-                    observer,
-                    &PublicationBoundary::BeforeExportCopy {
-                        export: name.clone(),
-                    },
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::ArtifactUnavailable,
-                    Some(name),
-                )?;
-                let file_name = format!("{ordinal:04}");
-                let (kind, media_type, expected_size) = match output {
-                    CapturedValue::File(file) => {
-                        ("file", file.media_type().to_owned(), file.size())
-                    }
-                    CapturedValue::Text(text) => (
-                        "text",
-                        "text/plain; charset=utf-8".to_owned(),
-                        u64::try_from(text.len()).map_err(|_| {
-                            LocalPublicationError::for_export(
-                                LocalPublicationPhase::ExportCopy,
-                                LocalPublicationFailureKind::UnsupportedExport,
-                                name,
-                            )
-                        })?,
-                    ),
-                    CapturedValue::Json(value) => (
-                        "json",
-                        "application/json".to_owned(),
-                        canonical_json::encoded_size(value, u64::MAX).map_err(|_| {
-                            LocalPublicationError::for_export(
-                                LocalPublicationPhase::ExportCopy,
-                                LocalPublicationFailureKind::UnsupportedExport,
-                                name,
-                            )
-                        })?,
-                    ),
-                };
-                let mut destination = staging.create_export(&file_name).map_err(|kind| {
-                    LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
-                })?;
-                let mut digest = DigestContext::new(&SHA256);
-                let copied = {
-                    let mut hashing = HashingWriter {
-                        destination: &mut destination,
-                        digest: &mut digest,
-                        bytes: 0,
-                    };
-                    match output {
-                        CapturedValue::File(file) => {
-                            artifacts
-                                .copy_to(file.handle(), &mut hashing)
-                                .map_err(|failure| copy_error(name, failure))?;
-                        }
-                        CapturedValue::Text(text) => hashing
-                            .write_all(text.as_bytes())
-                            .map_err(|_| export_write_error(name))?,
-                        CapturedValue::Json(value) => {
-                            canonical_json::to_writer(&mut hashing, value)
-                                .map_err(|_| export_write_error(name))?
-                        }
-                    }
-                    hashing.flush().map_err(|_| export_write_error(name))?;
-                    hashing.bytes
-                };
-                destination.flush().map_err(|_| export_write_error(name))?;
-                if copied != expected_size {
-                    return Err(LocalPublicationError::for_export(
-                        LocalPublicationPhase::ExportCopy,
-                        LocalPublicationFailureKind::ArtifactUnavailable,
-                        name,
-                    ));
+                if !captured_type_matches(source.value_type, output) {
+                    return Err(invalid_run_result());
                 }
-                observer
-                    .close_staged_file(
-                        destination,
-                        &StagedFile::Export {
-                            export: name.clone(),
-                        },
-                    )
-                    .map_err(|_| {
-                        LocalPublicationError::for_export(
-                            LocalPublicationPhase::Close,
-                            LocalPublicationFailureKind::ExportWriteUnavailable,
+                match sources.entry(identity) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let metadata = write_available_export(
+                            &mut staging,
+                            observer,
+                            artifacts,
                             name,
-                        )
-                    })?;
-
-                exports.insert(
-                    name.clone(),
-                    ExportV1::Available {
-                        kind,
-                        media_type,
-                        path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-                        size_bytes: copied,
-                        digest: DigestV1 {
-                            algorithm: "sha256",
-                            value: lowercase_hex(digest.finish().as_ref()),
-                        },
-                    },
-                );
-                observe(
-                    observer,
-                    &PublicationBoundary::AfterExportCopy {
-                        export: name.clone(),
-                    },
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::ArtifactUnavailable,
-                    Some(name),
-                )?;
+                            ordinal,
+                            output,
+                        )?;
+                        entry.insert(SourcePublication::Available {
+                            source: source.clone(),
+                            output: output.clone(),
+                            metadata: Box::new(metadata.clone()),
+                        });
+                        metadata
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        let SourcePublication::Available {
+                            source: owner_source,
+                            output: owner_output,
+                            metadata,
+                        } = entry.get()
+                        else {
+                            return Err(invalid_run_result());
+                        };
+                        if owner_source != source || owner_output != output {
+                            return Err(invalid_run_result());
+                        }
+                        metadata.as_ref().clone()
+                    }
+                }
             }
             ExportValue::Unavailable { reason } => {
-                exports.insert(
-                    name.clone(),
-                    ExportV1::Unavailable {
-                        reason: export_unavailable_reason(*reason),
-                    },
-                );
+                match sources.entry(identity) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(SourcePublication::Unavailable {
+                            source: source.clone(),
+                            reason: *reason,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        let SourcePublication::Unavailable {
+                            source: retained_source,
+                            reason: retained_reason,
+                        } = entry.get()
+                        else {
+                            return Err(invalid_run_result());
+                        };
+                        if retained_source != source || retained_reason != reason {
+                            return Err(invalid_run_result());
+                        }
+                    }
+                }
+                ExportV1::Unavailable {
+                    reason: export_unavailable_reason(*reason),
+                }
             }
-        }
+        };
+        exports.insert(name.clone(), metadata);
     }
 
     observe(
@@ -679,6 +772,7 @@ fn publish_prepared_with_observer(
         None,
     )?;
     let result = build_result(run, exports)?;
+    result_metadata::validate(&result).map_err(|_| invalid_run_result())?;
     let mut result_bytes = serde_json::to_vec_pretty(&result).map_err(|_| {
         LocalPublicationError::new(
             LocalPublicationPhase::Serialization,
@@ -686,6 +780,15 @@ fn publish_prepared_with_observer(
         )
     })?;
     result_bytes.push(b'\n');
+    if u64::try_from(result_bytes.len())
+        .ok()
+        .is_none_or(|size| size > result_metadata::MAXIMUM_RESULT_JSON_BYTES)
+    {
+        return Err(LocalPublicationError::new(
+            LocalPublicationPhase::Serialization,
+            LocalPublicationFailureKind::SerializationUnavailable,
+        ));
+    }
     let result_file = staging.write_result(&result_bytes)?;
     observer
         .close_staged_file(result_file, &StagedFile::Result)
@@ -695,7 +798,7 @@ fn publish_prepared_with_observer(
                 LocalPublicationFailureKind::SerializationUnavailable,
             )
         })?;
-    staging.verify().map_err(|_| {
+    staging.verify(&result).map_err(|_| {
         LocalPublicationError::new(
             LocalPublicationPhase::Verification,
             LocalPublicationFailureKind::VerificationUnavailable,
@@ -710,7 +813,7 @@ fn publish_prepared_with_observer(
         None,
     )?;
     target.verify_parent_and_absence()?;
-    staging.verify().map_err(|_| {
+    staging.verify(&result).map_err(|_| {
         LocalPublicationError::new(
             LocalPublicationPhase::Verification,
             LocalPublicationFailureKind::VerificationUnavailable,
@@ -731,6 +834,141 @@ fn publish_prepared_with_observer(
         result,
     };
     Ok(terminal)
+}
+
+enum SourcePublication {
+    Available {
+        source: ResolvedOutputSource,
+        output: CapturedValue,
+        metadata: Box<ExportV1>,
+    },
+    Unavailable {
+        source: ResolvedOutputSource,
+        reason: ExportUnavailableReason,
+    },
+}
+
+fn captured_type_matches(value_type: WorkflowValueType, output: &CapturedValue) -> bool {
+    matches!(
+        (value_type, output),
+        (WorkflowValueType::File, CapturedValue::File(_))
+            | (WorkflowValueType::Text, CapturedValue::Text(_))
+            | (WorkflowValueType::Json, CapturedValue::Json(_))
+    )
+}
+
+fn write_available_export(
+    staging: &mut StagingDirectory<'_>,
+    observer: &mut impl PublicationObserver,
+    artifacts: &ArtifactStaging,
+    name: &str,
+    ordinal: usize,
+    output: &CapturedValue,
+) -> Result<ExportV1, LocalPublicationError> {
+    observe(
+        observer,
+        &PublicationBoundary::BeforeExportCopy {
+            export: name.to_owned(),
+        },
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::ArtifactUnavailable,
+        Some(name),
+    )?;
+    let file_name = format!("{ordinal:04}");
+    let (kind, media_type, expected_size) = match output {
+        CapturedValue::File(file) => ("file", file.media_type().to_owned(), file.size()),
+        CapturedValue::Text(text) => (
+            "text",
+            "text/plain; charset=utf-8".to_owned(),
+            u64::try_from(text.len()).map_err(|_| {
+                LocalPublicationError::for_export(
+                    LocalPublicationPhase::ExportCopy,
+                    LocalPublicationFailureKind::UnsupportedExport,
+                    name,
+                )
+            })?,
+        ),
+        CapturedValue::Json(value) => (
+            "json",
+            "application/json".to_owned(),
+            canonical_json::encoded_size(value, u64::MAX).map_err(|_| {
+                LocalPublicationError::for_export(
+                    LocalPublicationPhase::ExportCopy,
+                    LocalPublicationFailureKind::UnsupportedExport,
+                    name,
+                )
+            })?,
+        ),
+    };
+    let mut destination = staging.create_export(&file_name).map_err(|kind| {
+        LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
+    })?;
+    let mut digest = DigestContext::new(&SHA256);
+    let copied = {
+        let mut hashing = HashingWriter {
+            destination: &mut destination,
+            digest: &mut digest,
+            bytes: 0,
+        };
+        match output {
+            CapturedValue::File(file) => {
+                artifacts
+                    .copy_to(file.handle(), &mut hashing)
+                    .map_err(|failure| copy_error(name, failure))?;
+            }
+            CapturedValue::Text(text) => hashing
+                .write_all(text.as_bytes())
+                .map_err(|_| export_write_error(name))?,
+            CapturedValue::Json(value) => {
+                canonical_json::to_writer(&mut hashing, value)
+                    .map_err(|_| export_write_error(name))?;
+            }
+        }
+        hashing.flush().map_err(|_| export_write_error(name))?;
+        hashing.bytes
+    };
+    destination.flush().map_err(|_| export_write_error(name))?;
+    if copied != expected_size {
+        return Err(LocalPublicationError::for_export(
+            LocalPublicationPhase::ExportCopy,
+            LocalPublicationFailureKind::ArtifactUnavailable,
+            name,
+        ));
+    }
+    observer
+        .close_staged_file(
+            destination,
+            &StagedFile::Export {
+                export: name.to_owned(),
+            },
+        )
+        .map_err(|_| {
+            LocalPublicationError::for_export(
+                LocalPublicationPhase::Close,
+                LocalPublicationFailureKind::ExportWriteUnavailable,
+                name,
+            )
+        })?;
+    let metadata = ExportV1::Available {
+        kind: kind.to_owned(),
+        media_type,
+        path: format!("{EXPORT_DIRECTORY}/{file_name}"),
+        size_bytes: copied,
+        digest: DigestV1 {
+            algorithm: "sha256".to_owned(),
+            value: lowercase_hex(digest.finish().as_ref()),
+        },
+    };
+    observe(
+        observer,
+        &PublicationBoundary::AfterExportCopy {
+            export: name.to_owned(),
+        },
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::ArtifactUnavailable,
+        Some(name),
+    )?;
+    Ok(metadata)
 }
 
 fn observe(
@@ -813,11 +1051,11 @@ fn build_result(
         workflow: WorkflowIdentityV1 {
             path: run.workflow_path.clone(),
             provenance: WorkflowProvenanceV1 {
-                kind: "local",
+                kind: "local".to_owned(),
                 source_root,
             },
             digest: DigestV1 {
-                algorithm: run.content_digest.algorithm.as_str(),
+                algorithm: run.content_digest.algorithm.as_str().to_owned(),
                 value: run.content_digest.value.clone(),
             },
         },
@@ -829,7 +1067,7 @@ fn build_result(
             duration_milliseconds: duration_milliseconds(run.timing.duration)?,
         },
         command_output_policy: CommandOutputPolicyV1 {
-            encoding: "base64",
+            encoding: "base64".to_owned(),
             maximum_retained_bytes_per_stream: MAXIMUM_RETAINED_BYTES_PER_STREAM,
         },
         outcome,
@@ -848,24 +1086,16 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         ),
         None => (None, None),
     };
-    let (state, committed_output_count, failure, dependency, reason) = match &step.state {
-        StepState::Succeeded { outputs } => (
-            WorkflowStepStateV1::Succeeded,
-            Some(outputs.len()),
-            None,
-            None,
-            None,
-        ),
+    let (state, failure, dependency, reason) = match &step.state {
+        StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None, None, None),
         StepState::Failed { phase, cause } => (
             WorkflowStepStateV1::Failed,
-            None,
             Some(failure_v1(*phase, cause)?),
             None,
             None,
         ),
         StepState::Blocked { dependency } => (
             WorkflowStepStateV1::Blocked,
-            None,
             None,
             Some(dependency.clone()),
             None,
@@ -876,12 +1106,10 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             WorkflowStepStateV1::NotRun,
             None,
             None,
-            None,
             Some(StepReasonV1::FailureStop),
         ),
         StepState::Cancelled { reason } => (
             WorkflowStepStateV1::Cancelled,
-            None,
             None,
             None,
             Some(cancellation_step_reason(*reason)),
@@ -907,11 +1135,11 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         kind: match step.kind {
             WorkflowRunStepKind::Command => "cmd",
             WorkflowRunStepKind::Agent => "agent",
-        },
+        }
+        .to_owned(),
         state,
         started_at,
         duration_milliseconds,
-        committed_output_count,
         failure,
         dependency,
         reason,
@@ -939,7 +1167,7 @@ fn diagnostic_stream_v1(
         .truncation()
         .map_or(0, |truncation| truncation.discarded_bytes());
     Ok(DiagnosticStreamV1 {
-        encoding: "base64",
+        encoding: "base64".to_owned(),
         data: BASE64_STANDARD.encode(stream.bytes()),
         retained_bytes,
         discarded_bytes,
@@ -983,24 +1211,36 @@ fn start_failure_cause(
     failure: &StepStartFailure,
 ) -> Result<FailureCauseV1, LocalPublicationError> {
     let cause = match failure {
-        StepStartFailure::StepUnavailable => FailureCauseV1::code("step_unavailable"),
+        StepStartFailure::StepUnavailable => FailureCauseV1::code(FailureCodeV1::StepUnavailable),
         StepStartFailure::PreparationTaskUnavailable => {
-            FailureCauseV1::code("preparation_task_unavailable")
+            FailureCauseV1::code(FailureCodeV1::PreparationTaskUnavailable)
         }
-        StepStartFailure::InputsUnavailable => FailureCauseV1::code("inputs_unavailable"),
+        StepStartFailure::InputsUnavailable => {
+            FailureCauseV1::code(FailureCodeV1::InputsUnavailable)
+        }
         StepStartFailure::InputPreparation(failure) => {
             let code = match failure.kind() {
-                InputPreparationFailureKind::InvalidInputName => "input_invalid_name",
-                InputPreparationFailureKind::ValueCountLimitExceeded => "input_value_count_limit",
-                InputPreparationFailureKind::ValueSizeLimitExceeded => "input_value_size_limit",
-                InputPreparationFailureKind::TotalSizeLimitExceeded => "input_total_size_limit",
-                InputPreparationFailureKind::CollectionOrdinalLimitExceeded => {
-                    "input_collection_ordinal_limit"
+                InputPreparationFailureKind::InvalidInputName => FailureCodeV1::InputInvalidName,
+                InputPreparationFailureKind::ValueCountLimitExceeded => {
+                    FailureCodeV1::InputValueCountLimit
                 }
-                InputPreparationFailureKind::ValueTypeMismatch => "input_type_mismatch",
-                InputPreparationFailureKind::SourceUnavailable => "input_source_unavailable",
-                InputPreparationFailureKind::StagingUnavailable => "input_staging_unavailable",
-                InputPreparationFailureKind::LiveLimitExceeded => "input_live_limit",
+                InputPreparationFailureKind::ValueSizeLimitExceeded => {
+                    FailureCodeV1::InputValueSizeLimit
+                }
+                InputPreparationFailureKind::TotalSizeLimitExceeded => {
+                    FailureCodeV1::InputTotalSizeLimit
+                }
+                InputPreparationFailureKind::CollectionOrdinalLimitExceeded => {
+                    FailureCodeV1::InputCollectionOrdinalLimit
+                }
+                InputPreparationFailureKind::ValueTypeMismatch => FailureCodeV1::InputTypeMismatch,
+                InputPreparationFailureKind::SourceUnavailable => {
+                    FailureCodeV1::InputSourceUnavailable
+                }
+                InputPreparationFailureKind::StagingUnavailable => {
+                    FailureCodeV1::InputStagingUnavailable
+                }
+                InputPreparationFailureKind::LiveLimitExceeded => FailureCodeV1::InputLiveLimit,
             };
             let mut cause = FailureCauseV1::code(code);
             cause.input = failure.input_identity().map(str::to_owned);
@@ -1009,27 +1249,31 @@ fn start_failure_cause(
         }
         StepStartFailure::AgentInput(failure) => agent_input_failure_cause(failure),
         StepStartFailure::AgentRuntimeUnavailable => {
-            FailureCauseV1::code("agent_runtime_unavailable")
+            FailureCauseV1::code(FailureCodeV1::AgentRuntimeUnavailable)
         }
-        StepStartFailure::Agent(failure) => FailureCauseV1::code(failure.code()),
-        StepStartFailure::OutputsUnsupported => FailureCauseV1::code("outputs_unsupported"),
+        StepStartFailure::Agent(failure) => FailureCauseV1::code(agent_failure_code(failure)),
+        StepStartFailure::OutputsUnsupported => {
+            FailureCauseV1::code(FailureCodeV1::OutputsUnsupported)
+        }
         StepStartFailure::WorkingDirectory(failure) => FailureCauseV1::code(match failure {
-            WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
-            WorkingDirectoryFailure::Unavailable => "working_directory_unavailable",
-            WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
-            WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",
+            WorkingDirectoryFailure::ExecutionRootRebound => FailureCodeV1::ExecutionRootRebound,
+            WorkingDirectoryFailure::Unavailable => FailureCodeV1::WorkingDirectoryUnavailable,
+            WorkingDirectoryFailure::EscapesExecutionRoot => FailureCodeV1::WorkingDirectoryEscape,
+            WorkingDirectoryFailure::NotDirectory => FailureCodeV1::WorkingDirectoryNotDirectory,
         }),
         StepStartFailure::CommandPreparation(failure) => FailureCauseV1::code(match failure {
-            CommandPreparationFailure::InvalidArgv => "command_argv_invalid",
-            CommandPreparationFailure::PathNotConfigured => "command_path_unconfigured",
-            CommandPreparationFailure::ExecutableNotFound => "executable_not_found",
-            CommandPreparationFailure::ExecutableUnavailable => "executable_unavailable",
+            CommandPreparationFailure::InvalidArgv => FailureCodeV1::CommandArgvInvalid,
+            CommandPreparationFailure::PathNotConfigured => FailureCodeV1::CommandPathUnconfigured,
+            CommandPreparationFailure::ExecutableNotFound => FailureCodeV1::ExecutableNotFound,
+            CommandPreparationFailure::ExecutableUnavailable => {
+                FailureCodeV1::ExecutableUnavailable
+            }
         }),
         StepStartFailure::CommandLaunch(failure) => FailureCauseV1::code(match failure {
-            CommandLaunchFailure::NotFound => "command_launch_not_found",
-            CommandLaunchFailure::PermissionDenied => "command_launch_permission_denied",
-            CommandLaunchFailure::InvalidInput => "command_launch_invalid_input",
-            CommandLaunchFailure::Other => "command_launch_failed",
+            CommandLaunchFailure::NotFound => FailureCodeV1::CommandLaunchNotFound,
+            CommandLaunchFailure::PermissionDenied => FailureCodeV1::CommandLaunchPermissionDenied,
+            CommandLaunchFailure::InvalidInput => FailureCodeV1::CommandLaunchInvalidInput,
+            CommandLaunchFailure::Other => FailureCodeV1::CommandLaunchFailed,
         }),
     };
     Ok(cause)
@@ -1037,66 +1281,96 @@ fn start_failure_cause(
 
 fn agent_input_failure_cause(failure: &AgentInputStartFailure) -> FailureCauseV1 {
     FailureCauseV1::code(match failure {
-        AgentInputStartFailure::StepUnavailable => "agent_step_unavailable",
-        AgentInputStartFailure::AgentAdmissionUnavailable => "agent_admission_unavailable",
-        AgentInputStartFailure::InputsUnavailable => "agent_inputs_unavailable",
-        AgentInputStartFailure::MissingUpstreamValue { .. } => "agent_input_missing_upstream",
-        AgentInputStartFailure::ValueTypeMismatch { .. } => "agent_input_type_mismatch",
-        AgentInputStartFailure::RetainedSourceUnavailable { .. } => "agent_source_unavailable",
-        AgentInputStartFailure::InvalidRetainedText { .. } => "agent_source_text_invalid",
-        AgentInputStartFailure::ResultSchemaUnavailable { .. } => "agent_result_schema_unavailable",
-        AgentInputStartFailure::InvalidValueMode => "agent_value_mode_invalid",
+        AgentInputStartFailure::StepUnavailable => FailureCodeV1::AgentStepUnavailable,
+        AgentInputStartFailure::AgentAdmissionUnavailable => {
+            FailureCodeV1::AgentAdmissionUnavailable
+        }
+        AgentInputStartFailure::InputsUnavailable => FailureCodeV1::AgentInputsUnavailable,
+        AgentInputStartFailure::MissingUpstreamValue { .. } => {
+            FailureCodeV1::AgentInputMissingUpstream
+        }
+        AgentInputStartFailure::ValueTypeMismatch { .. } => FailureCodeV1::AgentInputTypeMismatch,
+        AgentInputStartFailure::RetainedSourceUnavailable { .. } => {
+            FailureCodeV1::AgentSourceUnavailable
+        }
+        AgentInputStartFailure::InvalidRetainedText { .. } => FailureCodeV1::AgentSourceTextInvalid,
+        AgentInputStartFailure::ResultSchemaUnavailable { .. } => {
+            FailureCodeV1::AgentResultSchemaUnavailable
+        }
+        AgentInputStartFailure::InvalidValueMode => FailureCodeV1::AgentValueModeInvalid,
         AgentInputStartFailure::AttachmentCountLimitExceeded { .. } => {
-            "agent_attachment_count_limit"
+            FailureCodeV1::AgentAttachmentCountLimit
         }
         AgentInputStartFailure::AttachmentBytesLimitExceeded { .. } => {
-            "agent_attachment_bytes_limit"
+            FailureCodeV1::AgentAttachmentBytesLimit
         }
         AgentInputStartFailure::WorkingDirectory(failure) => match failure {
-            WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
-            WorkingDirectoryFailure::Unavailable => "working_directory_unavailable",
-            WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
-            WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",
+            WorkingDirectoryFailure::ExecutionRootRebound => FailureCodeV1::ExecutionRootRebound,
+            WorkingDirectoryFailure::Unavailable => FailureCodeV1::WorkingDirectoryUnavailable,
+            WorkingDirectoryFailure::EscapesExecutionRoot => FailureCodeV1::WorkingDirectoryEscape,
+            WorkingDirectoryFailure::NotDirectory => FailureCodeV1::WorkingDirectoryNotDirectory,
         },
-        AgentInputStartFailure::ArtifactStagingMismatch => "artifact_staging_mismatch",
-        AgentInputStartFailure::AgentStagingMismatch => "agent_staging_mismatch",
-        AgentInputStartFailure::StagingUnavailable => "agent_input_staging_unavailable",
+        AgentInputStartFailure::ArtifactStagingMismatch => FailureCodeV1::ArtifactStagingMismatch,
+        AgentInputStartFailure::AgentStagingMismatch => FailureCodeV1::AgentStagingMismatch,
+        AgentInputStartFailure::StagingUnavailable => FailureCodeV1::AgentInputStagingUnavailable,
     })
+}
+
+fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
+    match failure {
+        AgentFailureCause::HarnessStartFailed => FailureCodeV1::HarnessStartFailed,
+        AgentFailureCause::HarnessInputTooLarge { .. } => FailureCodeV1::HarnessInputTooLarge,
+        AgentFailureCause::HarnessFailed { .. } => FailureCodeV1::HarnessFailed,
+        AgentFailureCause::HarnessProtocolFailed => FailureCodeV1::HarnessProtocolFailed,
+        AgentFailureCause::MissingResponse => FailureCodeV1::MissingResponse,
+        AgentFailureCause::MissingResult => FailureCodeV1::MissingResult,
+        AgentFailureCause::ResultValidationLimitExceeded { .. } => {
+            FailureCodeV1::ResultValidationLimitExceeded
+        }
+        AgentFailureCause::CapturedValueTooLarge => FailureCodeV1::CapturedValueTooLarge,
+        AgentFailureCause::ResultSettlementFailed => FailureCodeV1::ResultSettlementFailed,
+    }
 }
 
 fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
     match failure {
         StepExecutionFailure::Command(CommandExecutionFailure::UnsuccessfulExit { code }) => {
-            let mut cause = FailureCauseV1::code("command_exit");
+            let mut cause = FailureCauseV1::code(FailureCodeV1::CommandExit);
             cause.exit_code = *code;
             cause
         }
         StepExecutionFailure::Command(CommandExecutionFailure::Wait) => {
-            FailureCauseV1::code("command_wait_failed")
+            FailureCauseV1::code(FailureCodeV1::CommandWaitFailed)
         }
-        StepExecutionFailure::Agent(failure) => FailureCauseV1::code(failure.code()),
+        StepExecutionFailure::Agent(failure) => FailureCauseV1::code(agent_failure_code(failure)),
     }
 }
 
 fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV1 {
     match failure {
-        OutputCaptureFailure::StepUnavailable => FailureCauseV1::code("step_unavailable"),
-        OutputCaptureFailure::UnsupportedOutput => FailureCauseV1::code("output_unsupported"),
-        OutputCaptureFailure::TaskUnavailable => FailureCauseV1::code("capture_task_unavailable"),
+        OutputCaptureFailure::StepUnavailable => {
+            FailureCauseV1::code(FailureCodeV1::StepUnavailable)
+        }
+        OutputCaptureFailure::UnsupportedOutput => {
+            FailureCauseV1::code(FailureCodeV1::OutputUnsupported)
+        }
+        OutputCaptureFailure::TaskUnavailable => {
+            FailureCauseV1::code(FailureCodeV1::CaptureTaskUnavailable)
+        }
         OutputCaptureFailure::Capture(failure) => {
             let code = match failure.kind() {
-                CaptureFailureKind::AbsolutePath => "output_path_absolute",
-                CaptureFailureKind::LexicalEscape => "output_path_escape",
-                CaptureFailureKind::EmptyPath => "output_path_empty",
-                CaptureFailureKind::Missing => "output_missing",
-                CaptureFailureKind::SymbolicLink => "output_symbolic_link",
-                CaptureFailureKind::NotDirectory => "output_parent_not_directory",
-                CaptureFailureKind::NotRegularFile => "output_not_regular_file",
-                CaptureFailureKind::SourceUnavailable => "output_source_unavailable",
-                CaptureFailureKind::FileCountLimitExceeded => "captured_file_count_limit",
-                CaptureFailureKind::FileSizeLimitExceeded => "captured_file_size_limit",
-                CaptureFailureKind::TotalSizeLimitExceeded => "captured_total_size_limit",
-                CaptureFailureKind::StagingUnavailable => "output_staging_unavailable",
+                CaptureFailureKind::AbsolutePath => FailureCodeV1::OutputPathAbsolute,
+                CaptureFailureKind::LexicalEscape => FailureCodeV1::OutputPathEscape,
+                CaptureFailureKind::EmptyPath => FailureCodeV1::OutputPathEmpty,
+                CaptureFailureKind::Missing => FailureCodeV1::OutputMissing,
+                CaptureFailureKind::SymbolicLink => FailureCodeV1::OutputSymbolicLink,
+                CaptureFailureKind::NotDirectory => FailureCodeV1::OutputParentNotDirectory,
+                CaptureFailureKind::NotRegularFile => FailureCodeV1::OutputNotRegularFile,
+                CaptureFailureKind::SourceUnavailable => FailureCodeV1::OutputSourceUnavailable,
+                CaptureFailureKind::FileCountLimitExceeded => FailureCodeV1::CapturedFileCountLimit,
+                CaptureFailureKind::FileSizeLimitExceeded => FailureCodeV1::CapturedFileSizeLimit,
+                CaptureFailureKind::TotalSizeLimitExceeded => FailureCodeV1::CapturedTotalSizeLimit,
+                CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
             };
             let mut cause = FailureCauseV1::code(code);
             cause.output = Some(failure.output_identity().to_owned());
@@ -1134,7 +1408,10 @@ pub(super) fn cancellation_reason(reason: CancellationReason) -> CancellationRea
         CancellationReason::UserRequest => CancellationReasonV1::UserRequest,
         CancellationReason::TerminationRequest => CancellationReasonV1::TerminationRequest,
         CancellationReason::CallerOutputFailure => CancellationReasonV1::CallerOutputFailure,
-        CancellationReason::RunnerShutdown => CancellationReasonV1::RunnerShutdown,
+        CancellationReason::RunnerShutdown | CancellationReason::ExecutionLeaseExpired => {
+            // ExecutionLeaseExpired is Runner Serve-only and never reaches local publication.
+            CancellationReasonV1::RunnerShutdown
+        }
     }
 }
 
@@ -1143,7 +1420,10 @@ fn cancellation_step_reason(reason: CancellationReason) -> StepReasonV1 {
         CancellationReason::UserRequest => StepReasonV1::UserRequest,
         CancellationReason::TerminationRequest => StepReasonV1::TerminationRequest,
         CancellationReason::CallerOutputFailure => StepReasonV1::CallerOutputFailure,
-        CancellationReason::RunnerShutdown => StepReasonV1::RunnerShutdown,
+        CancellationReason::RunnerShutdown | CancellationReason::ExecutionLeaseExpired => {
+            // ExecutionLeaseExpired is Runner Serve-only and never reaches local publication.
+            StepReasonV1::RunnerShutdown
+        }
     }
 }
 
@@ -1175,7 +1455,10 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                 reason: CancellationReason::TerminationRequest,
             } => 143,
             RunOutcome::Cancelled {
-                reason: CancellationReason::CallerOutputFailure | CancellationReason::RunnerShutdown,
+                reason:
+                    CancellationReason::CallerOutputFailure
+                    | CancellationReason::RunnerShutdown
+                    | CancellationReason::ExecutionLeaseExpired,
             }
             | RunOutcome::Succeeded
             | RunOutcome::Failed { .. } => 1,
@@ -1434,7 +1717,7 @@ impl<'a> StagingDirectory<'a> {
         Ok(result)
     }
 
-    fn verify(&self) -> Result<(), Errno> {
+    fn verify(&self, result: &WorkflowResultV1) -> Result<(), Errno> {
         let named = statat(self.parent, &self.identity, AtFlags::SYMLINK_NOFOLLOW)?;
         let opened = fstat(&self.root)?;
         if named.st_dev != opened.st_dev
@@ -1479,7 +1762,10 @@ impl<'a> StagingDirectory<'a> {
                 return Err(Errno::IO);
             }
         }
-        Ok(())
+        let staged =
+            artifact_set::read_and_validate(&self.root, result_metadata::MAXIMUM_RESULT_JSON_BYTES)
+                .map_err(|_| Errno::IO)?;
+        (staged == *result).then_some(()).ok_or(Errno::IO)
     }
 
     fn commit(&mut self, target: &PublicationTarget) -> Result<(), LocalPublicationError> {

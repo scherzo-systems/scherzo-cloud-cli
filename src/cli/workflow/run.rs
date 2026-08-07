@@ -649,9 +649,7 @@ pub(super) fn execution_context_for_workflow(
             crate::execution::workflow::validated::ValidatedStep::Agent(_)
         )
     }) {
-        let installation = discover_and_validate_pi_installation(
-            environment.variable(std::ffi::OsStr::new("PATH")),
-        )?;
+        let installation = discover_and_validate_pi_installation()?;
         Ok(context.with_pi_installation(installation))
     } else {
         Ok(context)
@@ -1379,6 +1377,7 @@ fn build_run_result(
         cancellation,
         steps,
         exports: execution.exports,
+        export_sources: workflow.definition.exports.clone(),
     })
 }
 

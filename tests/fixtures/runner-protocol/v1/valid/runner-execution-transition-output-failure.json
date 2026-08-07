@@ -1,0 +1,28 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abh",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sequence": 9,
+  "sentAt": "2026-07-23T00:00:08Z",
+  "type": "execution_transition",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "executionEventSequence": 3,
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "step_state_changed",
+      "transitionSequence": 12,
+      "stepId": "capture",
+      "from": "capturing_outputs",
+      "to": "failed",
+      "failure": {
+        "phase": "output_capture",
+        "cause": "output_file_size_limit_exceeded"
+      }
+    }
+  }
+}

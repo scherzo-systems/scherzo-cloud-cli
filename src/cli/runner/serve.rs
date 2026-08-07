@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 
-use crate::execution::pi::validate_pi_installation;
+use crate::execution::pi::discover_and_validate_pi_installation;
 use crate::runner::credential::Credential;
 use crate::runner::service::{AssignmentConfig, Config};
 
@@ -38,26 +38,11 @@ pub(super) struct Command {
     /// Existing directory under which runner-owned execution roots are created.
     #[arg(long, value_name = "ROOT")]
     work_root: PathBuf,
-
-    /// Validate and retain this Pi executable for agent-capable assignments.
-    #[arg(long, value_name = "PATH")]
-    pi_executable: Option<PathBuf>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        let pi_installation = match self
-            .pi_executable
-            .as_deref()
-            .map(validate_pi_installation)
-            .transpose()
-        {
-            Ok(installation) => installation,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
+        let pi_installation = discover_and_validate_pi_installation().ok();
         let credential = match Credential::load(&self.credential_file) {
             Ok(credential) => credential,
             Err(error) => {

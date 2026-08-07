@@ -1,0 +1,144 @@
+use serde_json::{Value, json};
+
+use super::*;
+
+fn result_fixture() -> Value {
+    let export = json!({
+        "state": "available",
+        "kind": "file",
+        "mediaType": "application/octet-stream",
+        "path": "exports/0001",
+        "sizeBytes": 4,
+        "digest": {
+            "algorithm": "sha256",
+            "value": "0".repeat(64)
+        }
+    });
+    json!({
+        "schemaVersion": 1,
+        "attemptNumber": 1,
+        "workflow": {
+            "path": "workflow.yaml",
+            "provenance": {
+                "kind": "local",
+                "sourceRoot": "/tmp/source"
+            },
+            "digest": {
+                "algorithm": "sha256",
+                "value": "1".repeat(64)
+            }
+        },
+        "execution": {
+            "executionRoot": "/tmp/execution",
+            "maximumParallelSteps": 1,
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 1000
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 65536
+        },
+        "outcome": "succeeded",
+        "steps": [{
+            "id": "produce",
+            "kind": "agent",
+            "state": "succeeded",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000
+        }],
+        "exports": {
+            "first": export.clone(),
+            "second": export
+        }
+    })
+}
+
+fn failed_result_fixture(phase: &str, cause: Value) -> Value {
+    let mut result = result_fixture();
+    let failure = json!({
+        "phase": phase,
+        "cause": cause
+    });
+    result["outcome"] = Value::String("failed".to_owned());
+    result["primaryFailure"] = json!({
+        "step": "produce",
+        "phase": phase,
+        "cause": failure["cause"].clone()
+    });
+    result["steps"][0]["state"] = Value::String("failed".to_owned());
+    result["steps"][0]["failure"] = failure;
+    result
+}
+
+fn encode(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[test]
+fn accepts_consistent_alias_metadata_owned_by_the_lowest_ordinal() {
+    let decoded = decode(&encode(&result_fixture())).unwrap();
+
+    assert_eq!(decoded.exports["first"], decoded.exports["second"]);
+}
+
+#[test]
+fn rejects_removed_step_fields_and_duplicate_object_members() {
+    let mut removed_field = result_fixture();
+    removed_field["steps"][0]["committedOutputCount"] = Value::from(0);
+    assert_eq!(decode(&encode(&removed_field)), Err(ResultMetadataError));
+
+    let duplicate = String::from_utf8(encode(&result_fixture()))
+        .unwrap()
+        .replacen(
+            "\"schemaVersion\": 1,",
+            "\"schemaVersion\": 1,\n  \"schemaVersion\": 1,",
+            1,
+        );
+    assert_eq!(decode(duplicate.as_bytes()), Err(ResultMetadataError));
+}
+
+#[test]
+fn rejects_failures_with_impossible_phases_or_cause_fields() {
+    let valid = failed_result_fixture(
+        "execution",
+        json!({ "code": "command_exit", "exitCode": 23 }),
+    );
+    assert!(decode(&encode(&valid)).is_ok());
+
+    for invalid in [
+        failed_result_fixture("start", json!({ "code": "command_exit", "exitCode": 23 })),
+        failed_result_fixture(
+            "execution",
+            json!({ "code": "command_exit", "exitCode": 0 }),
+        ),
+        failed_result_fixture(
+            "execution",
+            json!({ "code": "command_exit", "input": "payload" }),
+        ),
+        failed_result_fixture(
+            "start",
+            json!({ "code": "input_invalid_name", "input": "payload" }),
+        ),
+        failed_result_fixture(
+            "output_capture",
+            json!({ "code": "output_missing", "output": "../payload" }),
+        ),
+    ] {
+        assert_eq!(decode(&encode(&invalid)), Err(ResultMetadataError));
+    }
+}
+
+#[test]
+fn rejects_inconsistent_or_multiply_owned_alias_metadata() {
+    let mut mismatch = result_fixture();
+    mismatch["exports"]["second"]["digest"]["value"] = Value::String("2".repeat(64));
+    assert_eq!(decode(&encode(&mismatch)), Err(ResultMetadataError));
+
+    let mut non_owner = result_fixture();
+    non_owner["exports"]["first"]["path"] = Value::String("exports/0002".to_owned());
+    non_owner["exports"]["second"]["path"] = Value::String("exports/0002".to_owned());
+    assert_eq!(decode(&encode(&non_owner)), Err(ResultMetadataError));
+}

@@ -3,7 +3,6 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use clap::Args;
 use serde::Serialize;
@@ -34,43 +33,15 @@ pub(super) struct Command {
     presentation: super::PresentationOptions,
 }
 
-// Status deliberately owns a distinct current-thread runtime lifecycle: unlike run,
-// it must abandon a blocked read-only worker immediately after observing a signal.
-// jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => return diagnose(format_args!("start workflow status runtime: {error}")),
-        };
-        let result = runtime.block_on(self.execute_async());
-        runtime.shutdown_timeout(Duration::ZERO);
-        result
+        super::execute_with_abandonable_runtime("status", self.execute_async())
     }
-    // jscpd:ignore-end
 
     async fn execute_async(self) -> ExitCode {
-        let mut interrupt =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    return diagnose(format_args!(
-                        "install workflow status signal observation: {error}"
-                    ));
-                }
-            };
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    return diagnose(format_args!(
-                        "install workflow status signal observation: {error}"
-                    ));
-                }
-            };
+        let Some((mut interrupt, mut terminate)) = super::observe_workflow_signals("status") else {
+            return ExitCode::FAILURE;
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let operation_cancelled = Arc::clone(&cancelled);

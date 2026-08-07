@@ -19,7 +19,7 @@ use super::deployment::DeploymentFingerprint;
 
 const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
 const HOME_VARIABLE: &str = "HOME";
-const NORMAL_DIRECTORY_NAME: &str = ".scherzo-cloud";
+const APPLICATION_HOME_DIRECTORY_NAME: &str = ".scherzo";
 const NORMAL_FILE_NAME: &str = "credentials.json";
 const SCHEMA_VERSION: u64 = 1;
 const DIRECTORY_MODE: u32 = 0o700;
@@ -198,7 +198,7 @@ impl CredentialStore {
                     });
                 }
                 PathBuf::from(home)
-                    .join(NORMAL_DIRECTORY_NAME)
+                    .join(APPLICATION_HOME_DIRECTORY_NAME)
                     .join(NORMAL_FILE_NAME)
             }
         };

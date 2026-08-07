@@ -1724,7 +1724,10 @@ pub(crate) fn step_kind(step: &WorkflowPresentationStep) -> &'static str {
 }
 
 pub(crate) fn shell_quote(argument: &str) -> String {
-    let argument = visible_argument_text(argument);
+    shell_quote_visible_argument(&visible_argument_text(argument))
+}
+
+pub(crate) fn shell_quote_visible_argument(argument: &str) -> String {
     if !argument.is_empty()
         && argument.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
@@ -1734,7 +1737,7 @@ pub(crate) fn shell_quote(argument: &str) -> String {
                 )
         })
     {
-        return argument;
+        return argument.to_owned();
     }
     format!("'{}'", argument.replace('\'', "'\\''"))
 }
@@ -1765,12 +1768,7 @@ fn visible_text_with_backslash(value: &str, escape_backslash: bool) -> String {
 }
 
 pub(crate) fn cancellation_reason(reason: CancellationReason) -> &'static str {
-    match reason {
-        CancellationReason::UserRequest => "user_request",
-        CancellationReason::TerminationRequest => "termination_request",
-        CancellationReason::CallerOutputFailure => "caller_output_failure",
-        CancellationReason::RunnerShutdown => "runner_shutdown",
-    }
+    reason.as_str()
 }
 
 fn failure_phase(phase: FailurePhase) -> &'static str {

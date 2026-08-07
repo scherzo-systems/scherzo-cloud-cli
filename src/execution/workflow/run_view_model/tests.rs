@@ -583,5 +583,6 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
             },
         ],
         exports: BTreeMap::new(),
+        export_sources: BTreeMap::new(),
     }
 }

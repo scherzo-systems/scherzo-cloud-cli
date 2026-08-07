@@ -19,6 +19,64 @@ use super::validated::{ValidatedHarness, ValidatedStep};
 pub(crate) const MAX_NORMALIZED_CHILD_RECORD_BYTES: usize = 16 * 1024;
 const CONTROL_SEQUENCE_BYTES: usize = 4096;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizedRetainedPrefix {
+    pub(crate) records: Vec<NormalizedRetainedRecord>,
+    pub(crate) unterminated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizedRetainedRecord {
+    pub(crate) payload: String,
+    pub(crate) continuation: bool,
+}
+
+pub(crate) fn normalize_retained_prefix(bytes: &[u8]) -> NormalizedRetainedPrefix {
+    let mut stream = ChildStream::default();
+    let mut records = stream.push(bytes);
+    records.extend(stream.close());
+    NormalizedRetainedPrefix {
+        records: records
+            .into_iter()
+            .map(|record| NormalizedRetainedRecord {
+                payload: record.payload,
+                continuation: record.continuation,
+            })
+            .collect(),
+        unterminated: bytes
+            .last()
+            .is_some_and(|byte| !matches!(byte, b'\r' | b'\n')),
+    }
+}
+
+pub(crate) fn normalize_terminal_scalar(bytes: &[u8]) -> String {
+    normalize_terminal_scalar_bytes(bytes.iter().copied())
+}
+
+pub(crate) fn normalize_terminal_shell_argument(bytes: &[u8]) -> String {
+    normalize_terminal_scalar_bytes(bytes.iter().flat_map(|&byte| {
+        [byte, byte]
+            .into_iter()
+            .take(if byte == b'\\' { 2 } else { 1 })
+    }))
+}
+
+fn normalize_terminal_scalar_bytes(bytes: impl IntoIterator<Item = u8>) -> String {
+    let mut normalizer = ChildNormalizer::for_scalar();
+    let mut records = Vec::new();
+    let mut has_record = false;
+    for byte in bytes {
+        normalizer.push(byte, &mut records, &mut has_record);
+    }
+    normalizer.finish(&mut records, &mut has_record);
+    let mut normalized = records
+        .into_iter()
+        .map(|record| record.payload)
+        .collect::<String>();
+    normalized.push_str(&normalizer.payload);
+    normalized
+}
+
 pub(crate) trait DisplayDeadline: Clone + Send + 'static {
     fn deadline_utc(&self) -> OffsetDateTime;
 }
@@ -79,7 +137,7 @@ pub(crate) enum AgentPresentationHarness {
 }
 
 impl WorkflowPresentationDefinition {
-    fn from_workflow(workflow: &ResolvedWorkflow) -> Self {
+    pub(crate) fn from_workflow(workflow: &ResolvedWorkflow) -> Self {
         let steps = workflow
             .definition
             .steps
@@ -626,12 +684,24 @@ impl ChildStream {
     }
 }
 
-#[derive(Default)]
 struct ChildNormalizer {
     payload: String,
     column: usize,
     utf8: Vec<u8>,
     control: Option<ControlCandidate>,
+    expand_tabs: bool,
+}
+
+impl Default for ChildNormalizer {
+    fn default() -> Self {
+        Self {
+            payload: String::new(),
+            column: 0,
+            utf8: Vec::new(),
+            control: None,
+            expand_tabs: true,
+        }
+    }
 }
 
 struct ControlCandidate {
@@ -648,6 +718,13 @@ enum ControlKind {
 }
 
 impl ChildNormalizer {
+    fn for_scalar() -> Self {
+        Self {
+            expand_tabs: false,
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, byte: u8, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
         if self.control.is_some() {
             self.push_control(byte, records, line_has_record);
@@ -772,7 +849,7 @@ impl ChildNormalizer {
 
     fn emit_ascii(&mut self, byte: u8, records: &mut Vec<ChildRecord>, line_has_record: &mut bool) {
         match byte {
-            b'\t' => {
+            b'\t' if self.expand_tabs => {
                 let spaces = 8 - self.column % 8;
                 self.emit_text(&" ".repeat(spaces), records, line_has_record);
                 self.column += spaces;

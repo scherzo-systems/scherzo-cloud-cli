@@ -280,6 +280,7 @@ impl Fixture {
                 })
                 .collect(),
             exports: BTreeMap::new(),
+            export_sources: BTreeMap::new(),
         }
     }
 }

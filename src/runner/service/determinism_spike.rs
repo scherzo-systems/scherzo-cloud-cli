@@ -335,9 +335,9 @@ async fn run_reconnect_scenario() -> Vec<String> {
         let third_hello = next_hello(&mut third).await;
         assert_hello(
             &third_hello,
-            "rmsg_00000000000000000000000004",
+            "rmsg_00000000000000000000000005",
             "rbt_00000000000000000000000001",
-            3,
+            4,
         );
         assert_ne!(third_hello, second_hello, "acknowledged hello was replayed");
         let third_welcome_timer = sleep_request(&mut sleep_requests, Duration::from_secs(5)).await;

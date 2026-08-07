@@ -3,7 +3,6 @@ mod pi;
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
 
 use git::GitCheck;
 use pi::PiCheck;
@@ -160,10 +159,10 @@ impl Registry {
     }
 }
 
-pub(crate) fn built_in_registry(pi_executable: Option<PathBuf>) -> Result<Registry, RegistryError> {
+pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
-    registry.register(Box::new(PiCheck::new(pi_executable)))?;
+    registry.register(Box::new(PiCheck))?;
     Ok(registry)
 }
 
@@ -518,7 +517,7 @@ mod tests {
 
     #[test]
     fn built_in_registry_contains_the_default_git_check() {
-        let registry = built_in_registry(None).unwrap();
+        let registry = built_in_registry().unwrap();
 
         assert_eq!(
             registry.descriptors(),

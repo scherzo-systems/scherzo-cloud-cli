@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
 use super::{private_credential_directory, run_with_env, write_runner_credential};
@@ -28,34 +28,56 @@ impl PiFixture {
         executable: bool,
         execution: &str,
     ) -> Self {
+        Self::with_execution_and_capability_hook(version, help, executable, execution, ":")
+    }
+
+    pub(super) fn with_execution_and_capability_hook(
+        version: &str,
+        help: &str,
+        executable: bool,
+        execution: &str,
+        capability_hook: &str,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary Pi directory should be created");
         let executable_path = directory.path().join("pi");
         let probe_log = directory.path().join("probes.log");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(if executable { 0o755 } else { 0o644 })
-            .open(&executable_path)
-            .expect("fake Pi should be created");
+        let mut file = create_executable(&executable_path, executable);
         writeln!(file, "#!/bin/sh").unwrap();
-        writeln!(
-            file,
-            "printf '%s\\n' \"$*\" >> {}",
-            quote(probe_log.to_str().expect("probe log path should be UTF-8"))
-        )
-        .unwrap();
-        writeln!(file, "case \"$*\" in").unwrap();
-        writeln!(file, "  --version) printf '%s\\n' {} ;;", quote(version)).unwrap();
-        writeln!(
-            file,
-            "  {}) printf '%s' {} ;;",
-            quote(CAPABILITY_PROBE),
-            quote(help)
-        )
-        .unwrap();
-        writeln!(file, "  *) {execution} ;;").unwrap();
-        writeln!(file, "esac").unwrap();
-        drop(file);
+        write_fixture_behavior(
+            &mut file,
+            &probe_log,
+            version,
+            help,
+            execution,
+            capability_hook,
+        );
+
+        Self {
+            _directory: directory,
+            executable: executable_path,
+            probe_log,
+        }
+    }
+
+    fn with_env_node_interpreter(version: &str, help: &str) -> Self {
+        let directory = tempfile::tempdir().expect("temporary Pi directory should be created");
+        let executable_path = directory.path().join("pi");
+        let probe_log = directory.path().join("probes.log");
+        let env_executable = std::env::var_os("PATH")
+            .and_then(|search_path| {
+                std::env::split_paths(&search_path)
+                    .map(|directory| directory.join("env"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .expect("env should be available on the inherited PATH");
+        let mut executable = create_executable(&executable_path, true);
+        writeln!(executable, "#!{} node", env_executable.display()).unwrap();
+        drop(executable);
+
+        let mut node = create_executable(&directory.path().join("node"), true);
+        writeln!(node, "#!/bin/sh").unwrap();
+        writeln!(node, "shift").unwrap();
+        write_fixture_behavior(&mut node, &probe_log, version, help, "exit 97", ":");
 
         Self {
             _directory: directory,
@@ -79,23 +101,61 @@ impl PiFixture {
     }
 }
 
+fn create_executable(path: &Path, executable: bool) -> fs::File {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if executable { 0o755 } else { 0o644 })
+        .open(path)
+        .expect("fake executable should be created")
+}
+
+fn write_fixture_behavior(
+    file: &mut fs::File,
+    probe_log: &Path,
+    version: &str,
+    help: &str,
+    execution: &str,
+    capability_hook: &str,
+) {
+    writeln!(
+        file,
+        "printf '%s\\n' \"$*\" >> {}",
+        quote(probe_log.to_str().expect("probe log path should be UTF-8"))
+    )
+    .unwrap();
+    writeln!(file, "case \"$*\" in").unwrap();
+    writeln!(file, "  --version) printf '%s\\n' {} ;;", quote(version)).unwrap();
+    writeln!(
+        file,
+        "  {}) printf '%s' {}; {capability_hook} ;;",
+        quote(CAPABILITY_PROBE),
+        quote(help)
+    )
+    .unwrap();
+    writeln!(file, "  *) {execution} ;;").unwrap();
+    writeln!(file, "esac").unwrap();
+}
+
 pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn pi_doctor_json(executable: &str, environment: &[(&str, &str)]) -> std::process::Output {
+fn pi_doctor_json(path: &Path, environment: &[(&str, &str)]) -> std::process::Output {
+    let path = path.to_str().expect("controlled PATH should be UTF-8");
+    let mut environment = Vec::from(environment);
+    environment.push(("PATH", path));
     run_with_env(
-        &[
-            "runner",
-            "doctor",
-            "--check",
-            PI_CHECK_ID,
-            "--pi-executable",
-            executable,
-            "--json",
-        ],
-        environment,
+        &["runner", "doctor", "--check", PI_CHECK_ID, "--json"],
+        &environment,
     )
+}
+
+fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("controlled Pi PATH should be created");
+    symlink(executable, directory.path().join("pi"))
+        .expect("controlled Pi PATH should link its selected executable");
+    directory
 }
 
 fn report_code(output: &std::process::Output) -> String {
@@ -106,7 +166,7 @@ fn report_code(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn doctor_retains_an_accepted_patch_release_with_only_the_two_closed_probes() {
+fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     let fixture = PiFixture::new("0.83.7", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
@@ -129,8 +189,8 @@ fn doctor_retains_an_accepted_patch_release_with_only_the_two_closed_probes() {
         fs::write(directory.path().join("settings.json"), settings).unwrap();
         fs::write(directory.path().join("trust.json"), trust).unwrap();
     }
-    let first_path = tempfile::tempdir().expect("first ambient PATH");
-    let second_path = tempfile::tempdir().expect("second ambient PATH");
+    let first_path = controlled_path_for(Path::new(fixture.executable()));
+    let second_path = controlled_path_for(Path::new(fixture.executable()));
 
     let mut reports = Vec::new();
     for (path, agent_directory) in [
@@ -138,11 +198,8 @@ fn doctor_retains_an_accepted_patch_release_with_only_the_two_closed_probes() {
         (second_path.path(), second_agent_directory.path()),
     ] {
         let output = pi_doctor_json(
-            fixture.executable(),
-            &[
-                ("PATH", path.to_str().unwrap()),
-                ("PI_CODING_AGENT_DIR", agent_directory.to_str().unwrap()),
-            ],
+            path,
+            &[("PI_CODING_AGENT_DIR", agent_directory.to_str().unwrap())],
         );
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
@@ -198,68 +255,100 @@ fn doctor_retains_an_accepted_patch_release_with_only_the_two_closed_probes() {
 }
 
 #[test]
+fn doctor_path_lookup_skips_candidates_not_executable_by_current_user() {
+    let inaccessible = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    fs::set_permissions(inaccessible.executable(), fs::Permissions::from_mode(0o001)).unwrap();
+    let compatible = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let ordered_path =
+        std::env::join_paths([inaccessible.path_directory(), compatible.path_directory()]).unwrap();
+
+    let output = pi_doctor_json(Path::new(&ordered_path), &[]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(inaccessible.recorded_probes().is_empty());
+    assert_eq!(compatible.recorded_probes(), CLOSED_PROBES);
+}
+
+#[test]
+fn doctor_preserves_selected_path_for_env_interpreter_resolution() {
+    let fixture = PiFixture::with_env_node_interpreter("0.83.0", COMPLETE_HELP);
+
+    let output = pi_doctor_json(fixture.path_directory(), &[]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
+}
+
+#[test]
 fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries() {
     let missing_directory = tempfile::tempdir().expect("missing Pi directory");
-    let missing = missing_directory.path().join("missing-pi");
-    let missing_output = pi_doctor_json(missing.to_str().unwrap(), &[]);
+    let missing_output = pi_doctor_json(missing_directory.path(), &[]);
     assert_eq!(missing_output.status.code(), Some(1));
     assert_eq!(report_code(&missing_output), "missing_pi_installation");
 
+    let unexecutable_directory = tempfile::tempdir().expect("unexecutable Pi directory");
+    let unexecutable = unexecutable_directory.path().join("pi");
+    fs::write(&unexecutable, "#!/definitely/missing/interpreter\n").unwrap();
+    fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o755)).unwrap();
+    let unexecutable_output = pi_doctor_json(unexecutable_directory.path(), &[]);
+    assert_eq!(unexecutable_output.status.code(), Some(1));
+    assert_eq!(
+        report_code(&unexecutable_output),
+        "unexecutable_pi_installation"
+    );
+
     let cases = [
-        (
-            "0.83.0",
-            COMPLETE_HELP,
-            false,
-            "unexecutable_pi_installation",
-            b"".as_slice(),
-        ),
         (
             "not-a-version",
             COMPLETE_HELP,
-            true,
             "malformed_pi_version",
             b"--version\n".as_slice(),
         ),
         (
             "0.82.1",
             COMPLETE_HELP,
-            true,
             "unsupported_pi_version",
             b"--version\n".as_slice(),
         ),
         (
             "0.84.0",
             COMPLETE_HELP,
-            true,
             "unsupported_pi_version",
             b"--version\n".as_slice(),
         ),
         (
             "0.83.0-rc.1",
             COMPLETE_HELP,
-            true,
             "malformed_pi_version",
             b"--version\n".as_slice(),
         ),
         (
             "0.83.0",
             "not Pi help\n",
-            true,
             "malformed_pi_capabilities",
             CLOSED_PROBES,
         ),
         (
             "0.83.0",
             "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --no-session Do not save session\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n",
-            true,
             "unsupported_pi_capability",
             CLOSED_PROBES,
         ),
     ];
 
-    for (version, help, executable, expected_code, expected_probes) in cases {
-        let fixture = PiFixture::new(version, help, executable);
-        let output = pi_doctor_json(fixture.executable(), &[]);
+    for (version, help, expected_code, expected_probes) in cases {
+        let fixture = PiFixture::new(version, help, true);
+        let output = pi_doctor_json(fixture.path_directory(), &[]);
 
         assert_eq!(output.status.code(), Some(1), "{expected_code}");
         assert!(output.stderr.is_empty(), "{expected_code}");
@@ -270,41 +359,47 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
             "{expected_code}"
         );
     }
-
-    let unconfigured = run_with_env(&["runner", "doctor", "--check", PI_CHECK_ID, "--json"], &[]);
-    assert_eq!(unconfigured.status.code(), Some(1));
-    assert_eq!(report_code(&unconfigured), "pi_not_configured");
 }
 
 #[test]
-fn agent_capable_runner_initialization_uses_the_same_validator_once() {
-    let fixture = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+fn runner_initialization_probes_path_once_and_remains_command_capable_without_compatible_pi() {
     let credential_directory = private_credential_directory();
     let credential_path = write_runner_credential(&credential_directory);
+    let empty_path = tempfile::tempdir().expect("empty runner PATH");
+    let serve_args = [
+        "runner",
+        "serve",
+        "--gateway-url",
+        "https://not-a-websocket.example.test",
+        "--credential-file",
+        &credential_path,
+        "--workflow-id",
+        "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
+        "--workflow-source-root",
+        "schemas",
+        "--workflow-path",
+        "workflow-v1.schema.json",
+        "--work-root",
+        "tests",
+    ];
     let output = run_with_env(
-        &[
-            "runner",
-            "serve",
-            "--gateway-url",
-            "https://not-a-websocket.example.test",
-            "--credential-file",
-            &credential_path,
-            "--workflow-id",
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-            "--workflow-source-root",
-            "schemas",
-            "--workflow-path",
-            "workflow-v1.schema.json",
-            "--work-root",
-            "tests",
-            "--pi-executable",
-            fixture.executable(),
-        ],
-        &[],
+        &serve_args,
+        &[("PATH", empty_path.path().to_str().unwrap())],
     );
-
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    assert!(
+        output
+            .stderr
+            .starts_with(b"Error: invalid runner gateway URL\n")
+    );
+
+    let fixture = PiFixture::new("0.83.0", COMPLETE_HELP, true);
+    let output = run_with_env(
+        &serve_args,
+        &[("PATH", fixture.path_directory().to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         output
             .stderr
@@ -314,31 +409,15 @@ fn agent_capable_runner_initialization_uses_the_same_validator_once() {
 
     let incompatible = PiFixture::new("0.84.0", COMPLETE_HELP, true);
     let output = run_with_env(
-        &[
-            "runner",
-            "serve",
-            "--gateway-url",
-            "wss://gateway.example.test/v1/connect",
-            "--credential-file",
-            "/credential/must-not-be-read",
-            "--workflow-id",
-            "wfl_01k0z6r1w8f4jy2m7q9v3x5abr",
-            "--workflow-source-root",
-            "schemas",
-            "--workflow-path",
-            "workflow-v1.schema.json",
-            "--work-root",
-            "tests",
-            "--pi-executable",
-            incompatible.executable(),
-        ],
-        &[],
+        &serve_args,
+        &[("PATH", incompatible.path_directory().to_str().unwrap())],
     );
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"Error: configured Pi version 0.84.0 is unsupported; install a stable Pi release in range >=0.83.0 <0.84.0\n"
+    assert!(
+        output
+            .stderr
+            .starts_with(b"Error: invalid runner gateway URL\n")
     );
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
 }
@@ -349,8 +428,9 @@ fn pinned_conformance_validation_ignores_ambient_force_color() {
         return;
     };
 
-    let baseline = pi_doctor_json(executable, &[]);
-    let force_color = pi_doctor_json(executable, &[("FORCE_COLOR", "1")]);
+    let path = controlled_path_for(Path::new(executable));
+    let baseline = pi_doctor_json(path.path(), &[]);
+    let force_color = pi_doctor_json(path.path(), &[("FORCE_COLOR", "1")]);
 
     assert!(baseline.status.success());
     assert_eq!(
@@ -398,17 +478,11 @@ fn validation_does_not_read_trust_or_execute_project_extensions() {
     )
     .expect("saved trust should be written");
 
+    let path = controlled_path_for(Path::new(executable));
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
-        .args([
-            "runner",
-            "doctor",
-            "--check",
-            PI_CHECK_ID,
-            "--pi-executable",
-            executable,
-            "--json",
-        ])
+        .args(["runner", "doctor", "--check", PI_CHECK_ID, "--json"])
         .current_dir(project_directory.path())
+        .env("PATH", path.path())
         .env("PI_CODING_AGENT_DIR", agent_directory.path())
         .output()
         .expect("runner doctor should run");
@@ -421,7 +495,7 @@ fn validation_does_not_read_trust_or_execute_project_extensions() {
 }
 
 #[test]
-fn pinned_conformance_executable_is_exact_and_independent_of_path_and_saved_trust() {
+fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
     let Some(executable) = option_env!("SCHERZO_PI_CONFORMANCE_EXECUTABLE") else {
         return;
     };
@@ -446,8 +520,8 @@ fn pinned_conformance_executable_is_exact_and_independent_of_path_and_saved_trus
         fs::write(directory.path().join("settings.json"), settings).unwrap();
         fs::write(directory.path().join("trust.json"), trust).unwrap();
     }
-    let first_path = tempfile::tempdir().expect("first pinned ambient PATH");
-    let second_path = tempfile::tempdir().expect("second pinned ambient PATH");
+    let first_path = controlled_path_for(Path::new(executable));
+    let second_path = controlled_path_for(Path::new(executable));
 
     let reports = [
         (first_path.path(), first_agent_directory.path()),
@@ -455,11 +529,8 @@ fn pinned_conformance_executable_is_exact_and_independent_of_path_and_saved_trus
     ]
     .map(|(path, agent_directory)| {
         let output = pi_doctor_json(
-            executable,
-            &[
-                ("PATH", path.to_str().unwrap()),
-                ("PI_CODING_AGENT_DIR", agent_directory.to_str().unwrap()),
-            ],
+            path,
+            &[("PI_CODING_AGENT_DIR", agent_directory.to_str().unwrap())],
         );
         assert!(output.status.success());
         assert!(output.stderr.is_empty());

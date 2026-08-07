@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,17 +18,20 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use crate::runner::service::Sleeper;
 use crate::runner::service::assignment::{
-    AssignmentDecision, AssignmentManager, AssignmentManagerFailure, AssignmentOffer,
-    WelcomePolicyFailure,
+    AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentRenewal,
+    AssignmentStart, PendingAssignmentObservation, WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use crate::runner_protocol::{
-    CloudFrame, RunnerEnvelope, RunnerFrame, decode_cloud_frame, encode_runner_frame,
+    CloudFrame, MAXIMUM_ENCODED_FRAME_BYTES, RunnerEnvelope, RunnerFrame, decode_cloud_frame,
+    encode_runner_frame,
 };
 
 const SUBPROTOCOL: &str = "scherzo.runner.v1";
-const MAX_INBOUND_MESSAGE_BYTES: usize = 65_536;
+const MAX_INBOUND_MESSAGE_BYTES: usize = MAXIMUM_ENCODED_FRAME_BYTES;
+const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAXIMUM_ENCODED_FRAME_BYTES;
+const OBSERVATION_WINDOW: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -146,7 +150,7 @@ impl<'a> ProtocolLog<'a> {
             RunnerFrame::EffectAcknowledged {
                 envelope,
                 effect_id,
-            } => (envelope, "effect_acknowledged", effect_id, None),
+            } => (envelope, "effect_acknowledged", Some(effect_id), None),
             RunnerFrame::AssignmentAccepted {
                 envelope,
                 effect_id,
@@ -155,7 +159,7 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_accepted",
-                effect_id,
+                Some(effect_id),
                 Some(assignment_id),
             ),
             RunnerFrame::AssignmentRejected {
@@ -166,9 +170,54 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_rejected",
-                effect_id,
+                Some(effect_id),
                 Some(assignment_id),
             ),
+            RunnerFrame::AssignmentInterrupted {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "assignment_interrupted",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::ExecutionLeaseRenewalRequested {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "execution_lease_renewal_requested",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::ExecutionStarted {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "execution_started", None, Some(assignment_id)),
+            RunnerFrame::ExecutionTransition {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "execution_transition", None, Some(assignment_id)),
+            RunnerFrame::ExecutionFinished {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "execution_finished", None, Some(assignment_id)),
+            RunnerFrame::ExecutionInterrupted {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "execution_interrupted", None, Some(assignment_id)),
+            RunnerFrame::ExecutionAborted {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "execution_aborted", None, Some(assignment_id)),
             RunnerFrame::Hello { .. } => return,
         };
         let mut attributes = protocol_text_attributes(
@@ -177,13 +226,16 @@ impl<'a> ProtocolLog<'a> {
             &envelope.message_id,
             Some(&envelope.sent_at),
         );
-        attributes.extend([
-            KeyValue::new(
-                telemetry::attribute::RUNNER_SEQUENCE,
-                telemetry::integer(envelope.sequence),
-            ),
-            KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
-        ]);
+        attributes.push(KeyValue::new(
+            telemetry::attribute::RUNNER_SEQUENCE,
+            telemetry::integer(envelope.sequence),
+        ));
+        if let Some(effect_id) = effect_id {
+            attributes.push(KeyValue::new(
+                telemetry::attribute::EFFECT_ID,
+                effect_id.clone(),
+            ));
+        }
         if let Some(assignment_id) = assignment_id {
             attributes.push(KeyValue::new(
                 telemetry::attribute::ASSIGNMENT_ID,
@@ -256,7 +308,7 @@ impl<'a> ProtocolLog<'a> {
                 effect_id,
                 assignment_id,
                 run_id,
-                lease_expires_at,
+                lease,
                 ..
             } => (
                 envelope,
@@ -265,7 +317,7 @@ impl<'a> ProtocolLog<'a> {
                     effect_id,
                     assignment_id,
                     run_id,
-                    lease_expires_at,
+                    &lease.expires_at,
                 ),
             ),
             CloudFrame::AssignmentLeaseRenewed {
@@ -273,7 +325,8 @@ impl<'a> ProtocolLog<'a> {
                 effect_id,
                 assignment_id,
                 run_id,
-                lease_expires_at,
+                lease,
+                ..
             } => (
                 envelope,
                 "assignment_lease_renewed",
@@ -281,7 +334,7 @@ impl<'a> ProtocolLog<'a> {
                     effect_id,
                     assignment_id,
                     run_id,
-                    lease_expires_at,
+                    &lease.expires_at,
                 ),
             ),
             CloudFrame::AssignmentRelease {
@@ -858,10 +911,10 @@ pub(crate) async fn run(
     result
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingObservationKind {
     EffectReceipt,
-    AssignmentDecision { assignment_id: String },
+    AssignmentObservation { id: u64 },
 }
 
 struct PendingObservation {
@@ -870,13 +923,29 @@ struct PendingObservation {
     kind: PendingObservationKind,
 }
 
+struct ObservationTransport<'a> {
+    assignment_manager: &'a Mutex<AssignmentManager>,
+}
+
+impl Drop for ObservationTransport<'_> {
+    fn drop(&mut self) {
+        self.assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish_transport();
+    }
+}
+
 enum AssignmentManagerEffect {
     Offer(AssignmentOffer),
+    Start(AssignmentStart),
+    Renewal(AssignmentRenewal),
     Release {
         assignment_id: String,
         run_id: String,
+        attempt_id: String,
+        reason: String,
     },
-    None,
 }
 
 pub(super) struct ActiveEffectEvent {
@@ -1035,6 +1104,7 @@ where
         assignment_manager,
         connection_attempt,
     } = dependencies;
+    let _observation_transport = ObservationTransport { assignment_manager };
     let mut protocol = ProtocolLog::new(
         recorder,
         config.credential().runner_id(),
@@ -1058,20 +1128,50 @@ where
     let mut progress = ConnectionProgress::unacknowledged();
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
     record_progress(connection_event, progress);
-    let mut pending_observation: Option<PendingObservation> = None;
-    // The gateway may deliver one next effect after acknowledging the current
-    // effect while the runner's resulting semantic response is still pending.
+    let mut in_flight = VecDeque::<PendingObservation>::new();
     let mut buffered_effect: Option<CloudFrame> = None;
+    let assignment_notification = assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .notification();
 
     loop {
-        if pending_observation.is_none() && progress.handshake_completed {
-            let decision = assignment_manager
+        if progress.handshake_completed && in_flight.len() < OBSERVATION_WINDOW {
+            if let Some(effect) = buffered_effect.take() {
+                let pending = send_effect_receipt(
+                    &mut writer,
+                    config,
+                    frame_source,
+                    opening.boot_id,
+                    next_sequence,
+                    &mut protocol,
+                    &mut progress,
+                    connection_event,
+                    active_effect_event,
+                    assignment_manager,
+                    recorder,
+                    effect,
+                )
+                .await?;
+                in_flight.push_back(pending);
+                continue;
+            }
+
+            let in_flight_ids: BTreeSet<_> = in_flight
+                .iter()
+                .filter_map(|pending| match pending.kind {
+                    PendingObservationKind::AssignmentObservation { id } => Some(id),
+                    PendingObservationKind::EffectReceipt => None,
+                })
+                .collect();
+            let available = OBSERVATION_WINDOW - in_flight.len();
+            let pending = assignment_manager
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_decision();
-            if let Some(decision) = decision {
-                pending_observation = Some(
-                    send_assignment_decision(
+                .pending_observations(&in_flight_ids, available);
+            if !pending.is_empty() {
+                for observation in pending {
+                    let pending = send_assignment_observation(
                         &mut writer,
                         config,
                         frame_source,
@@ -1080,137 +1180,136 @@ where
                         &mut protocol,
                         &mut progress,
                         connection_event,
-                        decision,
+                        assignment_manager,
+                        observation,
                     )
-                    .await?,
-                );
+                    .await?;
+                    in_flight.push_back(pending);
+                }
                 continue;
             }
         }
-        let ready_effect = if pending_observation.is_none() {
-            buffered_effect.take()
-        } else {
-            None
-        };
-        let frame = if let Some(frame) = ready_effect {
-            frame
-        } else {
-            let message = if let Some(timeout) = inbound_silence_timeout {
-                tokio::select! {
-                    biased;
-                    message = reader.next() => message,
-                    _ = sleeper.sleep(timeout) => {
-                        protocol.timer_expired("inbound_silence");
-                        close_locally(
-                            &mut writer,
-                            sleeper,
-                            &mut protocol,
-                            CloseCode::Away,
-                            ConnectionCause::GatewayLivenessTimeout.message(),
-                        ).await;
-                        return Err(ConnectionError::retryable(
-                            progress,
-                            ConnectionCause::GatewayLivenessTimeout,
-                        ));
-                    }
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    message = reader.next() => message,
-                    _ = &mut welcome_timer => {
-                        protocol.timer_expired("welcome");
-                        return Err(ConnectionError::retryable(
-                            progress,
-                            ConnectionCause::GatewayWelcomeTimeout,
-                        ));
-                    }
-                }
-            };
-            let Some(message) = message else {
-                protocol.transport_ended();
-                return Ok(progress);
-            };
-            let message = match message {
-                Ok(message) => message,
-                Err(WebSocketError::Capacity(_)) => {
-                    return Err(protocol_violation(
+
+        let notified = assignment_notification.notified();
+        tokio::pin!(notified);
+        let message = if let Some(timeout) = inbound_silence_timeout {
+            tokio::select! {
+                biased;
+                message = reader.next() => message,
+                () = &mut notified => continue,
+                _ = sleeper.sleep(timeout) => {
+                    protocol.timer_expired("inbound_silence");
+                    close_locally(
                         &mut writer,
                         sleeper,
                         &mut protocol,
-                        progress,
-                        ConnectionCause::OversizedGatewayFrame,
-                    )
-                    .await);
-                }
-                Err(_) => {
-                    protocol.read_failed();
+                        CloseCode::Away,
+                        ConnectionCause::GatewayLivenessTimeout.message(),
+                    ).await;
                     return Err(ConnectionError::retryable(
                         progress,
-                        ConnectionCause::ReadGatewayFrame,
+                        ConnectionCause::GatewayLivenessTimeout,
                     ));
                 }
-            };
-            match message {
-                Message::Text(text) => {
-                    let Ok(frame) = decode_cloud_frame(text.as_bytes()) else {
-                        return Err(protocol_violation(
-                            &mut writer,
-                            sleeper,
-                            &mut protocol,
-                            progress,
-                            ConnectionCause::UndecodableGatewayFrame,
-                        )
-                        .await);
-                    };
-                    protocol.cloud_text(&frame);
-                    progress.cloud_text_frames_received =
-                        progress.incremented(progress.cloud_text_frames_received)?;
-                    record_progress(connection_event, progress);
-                    frame
-                }
-                Message::Ping(_) => {
-                    protocol.control("cloud_to_runner", "ping");
-                    writer.flush().await.map_err(|_| {
-                        ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
-                    })?;
-                    protocol.control("runner_to_cloud", "pong");
-                    continue;
-                }
-                Message::Pong(_) => {
-                    protocol.control("cloud_to_runner", "pong");
-                    continue;
-                }
-                Message::Close(close) => {
-                    protocol.close(
-                        "cloud_to_runner",
-                        "gateway",
-                        close.as_ref().map(|frame| u16::from(frame.code)),
-                    );
-                    return close_outcome(progress, close);
-                }
-                Message::Binary(_) => {
-                    return Err(protocol_violation(
-                        &mut writer,
-                        sleeper,
-                        &mut protocol,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                message = reader.next() => message,
+                () = &mut notified => continue,
+                _ = &mut welcome_timer => {
+                    protocol.timer_expired("welcome");
+                    return Err(ConnectionError::retryable(
                         progress,
-                        ConnectionCause::BinaryGatewayFrame,
-                    )
-                    .await);
-                }
-                Message::Frame(_) => {
-                    return Err(protocol_violation(
-                        &mut writer,
-                        sleeper,
-                        &mut protocol,
-                        progress,
-                        ConnectionCause::UnexpectedRawGatewayFrame,
-                    )
-                    .await);
+                        ConnectionCause::GatewayWelcomeTimeout,
+                    ));
                 }
             }
         };
+        let Some(message) = message else {
+            protocol.transport_ended();
+            return Ok(progress);
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(WebSocketError::Capacity(_)) => {
+                return Err(protocol_violation(
+                    &mut writer,
+                    sleeper,
+                    &mut protocol,
+                    progress,
+                    ConnectionCause::OversizedGatewayFrame,
+                )
+                .await);
+            }
+            Err(_) => {
+                protocol.read_failed();
+                return Err(ConnectionError::retryable(
+                    progress,
+                    ConnectionCause::ReadGatewayFrame,
+                ));
+            }
+        };
+        let frame = match message {
+            Message::Text(text) => {
+                let Ok(frame) = decode_cloud_frame(text.as_bytes()) else {
+                    return Err(protocol_violation(
+                        &mut writer,
+                        sleeper,
+                        &mut protocol,
+                        progress,
+                        ConnectionCause::UndecodableGatewayFrame,
+                    )
+                    .await);
+                };
+                protocol.cloud_text(&frame);
+                progress.cloud_text_frames_received =
+                    progress.incremented(progress.cloud_text_frames_received)?;
+                record_progress(connection_event, progress);
+                frame
+            }
+            Message::Ping(_) => {
+                protocol.control("cloud_to_runner", "ping");
+                writer.flush().await.map_err(|_| {
+                    ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
+                })?;
+                protocol.control("runner_to_cloud", "pong");
+                continue;
+            }
+            Message::Pong(_) => {
+                protocol.control("cloud_to_runner", "pong");
+                continue;
+            }
+            Message::Close(close) => {
+                protocol.close(
+                    "cloud_to_runner",
+                    "gateway",
+                    close.as_ref().map(|frame| u16::from(frame.code)),
+                );
+                return close_outcome(progress, close);
+            }
+            Message::Binary(_) => {
+                return Err(protocol_violation(
+                    &mut writer,
+                    sleeper,
+                    &mut protocol,
+                    progress,
+                    ConnectionCause::BinaryGatewayFrame,
+                )
+                .await);
+            }
+            Message::Frame(_) => {
+                return Err(protocol_violation(
+                    &mut writer,
+                    sleeper,
+                    &mut protocol,
+                    progress,
+                    ConnectionCause::UnexpectedRawGatewayFrame,
+                )
+                .await);
+            }
+        };
+
         match frame {
             CloudFrame::Welcome {
                 ping_interval_seconds,
@@ -1259,7 +1358,7 @@ where
                 acknowledged_sequence,
                 ..
             } => {
-                let Some(pending) = pending_observation.take() else {
+                let Some(pending) = in_flight.front() else {
                     return Err(protocol_violation(
                         &mut writer,
                         sleeper,
@@ -1281,7 +1380,9 @@ where
                     )
                     .await);
                 }
-                match pending.kind {
+                let kind = pending.kind;
+                in_flight.pop_front();
+                match kind {
                     PendingObservationKind::EffectReceipt => {
                         progress.effect_acknowledgements_confirmed = match progress
                             .incremented(progress.effect_acknowledgements_confirmed)
@@ -1298,11 +1399,11 @@ where
                         record_progress(connection_event, progress);
                         active_effect_event.finish(Outcome::Success, None);
                     }
-                    PendingObservationKind::AssignmentDecision { assignment_id } => {
+                    PendingObservationKind::AssignmentObservation { id } => {
                         assignment_manager
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .acknowledge_decision(&assignment_id);
+                            .acknowledge_observation(id);
                     }
                 }
             }
@@ -1310,224 +1411,9 @@ where
             | effect @ CloudFrame::AssignmentStart { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
-                if progress.handshake_completed
-                    && pending_observation.as_ref().is_some_and(|pending| {
-                        matches!(
-                            pending.kind,
-                            PendingObservationKind::AssignmentDecision { .. }
-                        )
-                    })
-                    && buffered_effect.is_none() =>
+                if progress.handshake_completed && buffered_effect.is_none() =>
             {
                 buffered_effect = Some(effect);
-            }
-            effect @ CloudFrame::AssignmentOffer { .. }
-            | effect @ CloudFrame::AssignmentStart { .. }
-            | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
-            | effect @ CloudFrame::AssignmentRelease { .. }
-                if progress.handshake_completed && pending_observation.is_none() =>
-            {
-                let (effect_id, assignment_id, run_id, manager_effect) = match effect {
-                    CloudFrame::AssignmentOffer {
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        execution_spec,
-                        ..
-                    } => {
-                        let offer = AssignmentOffer {
-                            effect_id: effect_id.clone(),
-                            assignment_id: assignment_id.clone(),
-                            run_id: run_id.clone(),
-                            execution_spec: *execution_spec,
-                        };
-                        (
-                            effect_id,
-                            assignment_id,
-                            run_id,
-                            AssignmentManagerEffect::Offer(offer),
-                        )
-                    }
-                    CloudFrame::AssignmentStart {
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        ..
-                    } => (
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        AssignmentManagerEffect::None,
-                    ),
-                    CloudFrame::AssignmentLeaseRenewed {
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        ..
-                    } => (
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        AssignmentManagerEffect::None,
-                    ),
-                    CloudFrame::AssignmentRelease {
-                        effect_id,
-                        assignment_id,
-                        run_id,
-                        ..
-                    } => {
-                        let release_assignment_id = assignment_id.clone();
-                        let release_run_id = run_id.clone();
-                        (
-                            effect_id,
-                            assignment_id,
-                            run_id,
-                            AssignmentManagerEffect::Release {
-                                assignment_id: release_assignment_id,
-                                run_id: release_run_id,
-                            },
-                        )
-                    }
-                    _ => {
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::UnexpectedGatewayFrame,
-                        ));
-                    }
-                };
-                let sequence = *next_sequence;
-                let event = recorder.start(
-                    "runner.effect_acknowledgement",
-                    [
-                        KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
-                        KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
-                        KeyValue::new(telemetry::attribute::RUN_ID, run_id),
-                        KeyValue::new(
-                            telemetry::attribute::RUNNER_ID,
-                            config.credential().runner_id().to_owned(),
-                        ),
-                        KeyValue::new(
-                            telemetry::attribute::RUNNER_BOOT_ID,
-                            opening.boot_id.to_owned(),
-                        ),
-                        KeyValue::new(
-                            telemetry::attribute::RUNNER_SEQUENCE,
-                            telemetry::integer(sequence),
-                        ),
-                    ],
-                );
-                active_effect_event.start(event.clone());
-                progress.effects_received = match progress.incremented(progress.effects_received) {
-                    Ok(count) => count,
-                    Err(error) => {
-                        finish_effect_failure(&event, ConnectionCause::ConnectionCounterOverflow);
-                        return Err(error);
-                    }
-                };
-                record_progress(connection_event, progress);
-                let Some(incremented_sequence) = next_sequence.checked_add(1) else {
-                    finish_effect_failure(&event, ConnectionCause::ObservationSequenceOverflow);
-                    return Err(ConnectionError::terminal(
-                        progress,
-                        ConnectionCause::ObservationSequenceOverflow,
-                    ));
-                };
-                *next_sequence = incremented_sequence;
-                let message_id = frame_source.public_id("rmsg_");
-                let sent_at = match frame_source.utc_timestamp() {
-                    Ok(timestamp) => timestamp,
-                    Err(_) => {
-                        finish_effect_failure(
-                            &event,
-                            ConnectionCause::FormatEffectAcknowledgementTimestamp,
-                        );
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::FormatEffectAcknowledgementTimestamp,
-                        ));
-                    }
-                };
-                let frame = RunnerFrame::EffectAcknowledged {
-                    envelope: RunnerEnvelope {
-                        message_id: message_id.clone(),
-                        runner_id: config.credential().runner_id().to_owned(),
-                        boot_id: opening.boot_id.to_owned(),
-                        sequence,
-                        sent_at,
-                    },
-                    effect_id: effect_id.clone(),
-                };
-                let encoded = match encode_runner_frame(&frame) {
-                    Ok(encoded) => encoded,
-                    Err(_) => {
-                        finish_effect_failure(&event, ConnectionCause::EncodeEffectAcknowledgement);
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::EncodeEffectAcknowledgement,
-                        ));
-                    }
-                };
-                let encoded = match std::str::from_utf8(&encoded) {
-                    Ok(encoded) => encoded,
-                    Err(_) => {
-                        finish_effect_failure(
-                            &event,
-                            ConnectionCause::EncodeEffectAcknowledgementUtf8,
-                        );
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::EncodeEffectAcknowledgementUtf8,
-                        ));
-                    }
-                };
-                if writer.send(Message::Text(encoded.into())).await.is_err() {
-                    finish_effect_failure(&event, ConnectionCause::SendEffectAcknowledgement);
-                    return Err(ConnectionError::retryable(
-                        progress,
-                        ConnectionCause::SendEffectAcknowledgement,
-                    ));
-                }
-                protocol.runner_text(&frame);
-                progress.runner_text_frames_sent =
-                    progress.incremented(progress.runner_text_frames_sent)?;
-                record_progress(connection_event, progress);
-                pending_observation = Some(PendingObservation {
-                    message_id,
-                    sequence,
-                    kind: PendingObservationKind::EffectReceipt,
-                });
-
-                let manager_result = {
-                    let mut manager = assignment_manager
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match manager_effect {
-                        AssignmentManagerEffect::Offer(offer) => manager.handle_offer(offer),
-                        AssignmentManagerEffect::Release {
-                            assignment_id,
-                            run_id,
-                        } => manager.handle_release(&assignment_id, &run_id),
-                        AssignmentManagerEffect::None => Ok(()),
-                    }
-                };
-                if let Err(failure) = manager_result {
-                    let cause = match failure {
-                        AssignmentManagerFailure::ConflictingOffer => {
-                            ConnectionCause::ConflictingAssignmentOffer
-                        }
-                        AssignmentManagerFailure::DecisionCapacity => {
-                            ConnectionCause::AssignmentDecisionCapacity
-                        }
-                    };
-                    return Err(protocol_violation(
-                        &mut writer,
-                        sleeper,
-                        &mut protocol,
-                        progress,
-                        cause,
-                    )
-                    .await);
-                }
             }
             _ => {
                 return Err(protocol_violation(
@@ -1550,11 +1436,14 @@ where
     }
 }
 
+// Effect receipts and semantic observations have different telemetry and state effects;
+// explicit sender boundaries are clearer than one mode-switched transport operation.
+// jscpd:ignore-start
 #[expect(
     clippy::too_many_arguments,
-    reason = "the connection adapter owns the complete transport envelope and progress projection"
+    reason = "effect receipt binds transport, telemetry, and service-scope assignment state"
 )]
-async fn send_assignment_decision<W>(
+async fn send_effect_receipt<W>(
     writer: &mut W,
     config: &Config,
     frame_source: &dyn FrameSource,
@@ -1563,33 +1452,262 @@ async fn send_assignment_decision<W>(
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
-    decision: AssignmentDecision,
+    active_effect_event: &ActiveEffectEvent,
+    assignment_manager: &Mutex<AssignmentManager>,
+    recorder: &Recorder,
+    effect: CloudFrame,
 ) -> Result<PendingObservation, ConnectionError>
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
+    // jscpd:ignore-end
+    let (effect_id, assignment_id, run_id, manager_effect) = match effect {
+        CloudFrame::AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            execution_spec,
+            ..
+        } => {
+            let offer = AssignmentOffer {
+                effect_id: effect_id.clone(),
+                assignment_id: assignment_id.clone(),
+                run_id: run_id.clone(),
+                attempt_id,
+                execution_spec: *execution_spec,
+            };
+            (
+                effect_id,
+                assignment_id,
+                run_id,
+                AssignmentManagerEffect::Offer(offer),
+            )
+        }
+        CloudFrame::AssignmentStart {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            execution_spec_id,
+            lease,
+            ..
+        } => {
+            let start = AssignmentStart {
+                effect_id: effect_id.clone(),
+                assignment_id: assignment_id.clone(),
+                run_id: run_id.clone(),
+                attempt_id,
+                execution_spec_id,
+                lease,
+            };
+            (
+                effect_id,
+                assignment_id,
+                run_id,
+                AssignmentManagerEffect::Start(start),
+            )
+        }
+        CloudFrame::AssignmentLeaseRenewed {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            lease,
+            ..
+        } => {
+            let renewal = AssignmentRenewal {
+                effect_id: effect_id.clone(),
+                assignment_id: assignment_id.clone(),
+                run_id: run_id.clone(),
+                attempt_id,
+                lease,
+            };
+            (
+                effect_id,
+                assignment_id,
+                run_id,
+                AssignmentManagerEffect::Renewal(renewal),
+            )
+        }
+        CloudFrame::AssignmentRelease {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            reason,
+            ..
+        } => {
+            let release_assignment_id = assignment_id.clone();
+            let release_run_id = run_id.clone();
+            (
+                effect_id,
+                assignment_id,
+                run_id,
+                AssignmentManagerEffect::Release {
+                    assignment_id: release_assignment_id,
+                    run_id: release_run_id,
+                    attempt_id,
+                    reason,
+                },
+            )
+        }
+        _ => {
+            return Err(ConnectionError::terminal(
+                *progress,
+                ConnectionCause::UnexpectedGatewayFrame,
+            ));
+        }
+    };
+
+    let sequence = *next_sequence;
+    let event = recorder.start(
+        "runner.effect_acknowledgement",
+        [
+            KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+            KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+            KeyValue::new(telemetry::attribute::RUN_ID, run_id),
+            KeyValue::new(
+                telemetry::attribute::RUNNER_ID,
+                config.credential().runner_id().to_owned(),
+            ),
+            KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
+            KeyValue::new(
+                telemetry::attribute::RUNNER_SEQUENCE,
+                telemetry::integer(sequence),
+            ),
+        ],
+    );
+    active_effect_event.start(event.clone());
+    progress.effects_received = match progress.incremented(progress.effects_received) {
+        Ok(count) => count,
+        Err(error) => {
+            finish_effect_failure(&event, ConnectionCause::ConnectionCounterOverflow);
+            return Err(error);
+        }
+    };
+    record_progress(connection_event, *progress);
+    let envelope = match next_envelope(config, frame_source, boot_id, next_sequence, progress) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            finish_effect_failure(&event, error.connection_cause());
+            return Err(error);
+        }
+    };
+    let frame = RunnerFrame::EffectAcknowledged {
+        envelope,
+        effect_id,
+    };
+    let pending = send_runner_frame(
+        writer,
+        protocol,
+        progress,
+        connection_event,
+        &event,
+        frame,
+        PendingObservationKind::EffectReceipt,
+    )
+    .await?;
+
+    let manager_result = {
+        let mut manager = assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match manager_effect {
+            AssignmentManagerEffect::Offer(offer) => manager.handle_offer(offer).map(|_| None),
+            AssignmentManagerEffect::Start(start) => manager.handle_start(start),
+            AssignmentManagerEffect::Renewal(renewal) => {
+                manager.handle_renewal(renewal).map(|_| None)
+            }
+            AssignmentManagerEffect::Release {
+                assignment_id,
+                run_id,
+                attempt_id,
+                reason,
+            } => manager
+                .handle_release(&assignment_id, &run_id, &attempt_id, &reason)
+                .map(|_| None),
+        }
+    };
+    match manager_result {
+        Ok(Some(job)) => job.spawn(),
+        Ok(None) => {}
+        Err(failure) => {
+            let cause = match failure {
+                AssignmentManagerFailure::ConflictingOffer => {
+                    ConnectionCause::ConflictingAssignmentOffer
+                }
+                AssignmentManagerFailure::DecisionCapacity => {
+                    ConnectionCause::AssignmentDecisionCapacity
+                }
+            };
+            return Err(ConnectionError::retryable(*progress, cause));
+        }
+    }
+    Ok(pending)
+}
+
+fn next_envelope(
+    config: &Config,
+    frame_source: &dyn FrameSource,
+    boot_id: &str,
+    next_sequence: &mut u64,
+    progress: &ConnectionProgress,
+) -> Result<RunnerEnvelope, ConnectionError> {
     let sequence = *next_sequence;
     *next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
         ConnectionError::terminal(*progress, ConnectionCause::ObservationSequenceOverflow)
     })?;
-    let message_id = frame_source.public_id("rmsg_");
     let sent_at = frame_source.utc_timestamp().map_err(|_| {
         ConnectionError::terminal(
             *progress,
             ConnectionCause::FormatEffectAcknowledgementTimestamp,
         )
     })?;
-    let assignment_id = decision.assignment_id().to_owned();
-    let frame = decision.runner_frame(RunnerEnvelope {
-        message_id: message_id.clone(),
+    Ok(RunnerEnvelope {
+        message_id: frame_source.public_id("rmsg_"),
         runner_id: config.credential().runner_id().to_owned(),
         boot_id: boot_id.to_owned(),
         sequence,
         sent_at,
-    });
+    })
+}
+
+// This boundary intentionally remains separate from effect-receipt delivery above.
+// jscpd:ignore-start
+#[expect(
+    clippy::too_many_arguments,
+    reason = "semantic observation delivery owns the complete transport envelope"
+)]
+async fn send_assignment_observation<W>(
+    writer: &mut W,
+    config: &Config,
+    frame_source: &dyn FrameSource,
+    boot_id: &str,
+    next_sequence: &mut u64,
+    protocol: &mut ProtocolLog<'_>,
+    progress: &mut ConnectionProgress,
+    connection_event: &Event,
+    assignment_manager: &Mutex<AssignmentManager>,
+    pending: PendingAssignmentObservation,
+) -> Result<PendingObservation, ConnectionError>
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    // jscpd:ignore-end
+    let envelope = next_envelope(config, frame_source, boot_id, next_sequence, progress)?;
+    let sequence = envelope.sequence;
+    let message_id = envelope.message_id.clone();
+    let frame = pending.observation.runner_frame(envelope);
     let encoded = encode_runner_frame(&frame).map_err(|_| {
         ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
     })?;
+    if encoded.len() > MAX_OUTBOUND_MESSAGE_BYTES {
+        return Err(ConnectionError::terminal(
+            *progress,
+            ConnectionCause::EncodeEffectAcknowledgement,
+        ));
+    }
     let encoded = std::str::from_utf8(&encoded).map_err(|_| {
         ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgementUtf8)
     })?;
@@ -1602,10 +1720,64 @@ where
     protocol.runner_text(&frame);
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
     record_progress(connection_event, *progress);
+    assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mark_observation_encoded(pending.id);
     Ok(PendingObservation {
         message_id,
         sequence,
-        kind: PendingObservationKind::AssignmentDecision { assignment_id },
+        kind: PendingObservationKind::AssignmentObservation { id: pending.id },
+    })
+}
+
+async fn send_runner_frame<W>(
+    writer: &mut W,
+    protocol: &mut ProtocolLog<'_>,
+    progress: &mut ConnectionProgress,
+    connection_event: &Event,
+    event: &Event,
+    frame: RunnerFrame,
+    kind: PendingObservationKind,
+) -> Result<PendingObservation, ConnectionError>
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    let envelope = match &frame {
+        RunnerFrame::EffectAcknowledged { envelope, .. } => envelope,
+        _ => unreachable!("effect sender received a semantic frame"),
+    };
+    let message_id = envelope.message_id.clone();
+    let sequence = envelope.sequence;
+    let encoded = encode_runner_frame(&frame).map_err(|_| {
+        finish_effect_failure(event, ConnectionCause::EncodeEffectAcknowledgement);
+        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
+    })?;
+    if encoded.len() > MAX_OUTBOUND_MESSAGE_BYTES {
+        finish_effect_failure(event, ConnectionCause::EncodeEffectAcknowledgement);
+        return Err(ConnectionError::terminal(
+            *progress,
+            ConnectionCause::EncodeEffectAcknowledgement,
+        ));
+    }
+    let encoded = std::str::from_utf8(&encoded).map_err(|_| {
+        finish_effect_failure(event, ConnectionCause::EncodeEffectAcknowledgementUtf8);
+        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgementUtf8)
+    })?;
+    if writer.send(Message::Text(encoded.into())).await.is_err() {
+        finish_effect_failure(event, ConnectionCause::SendEffectAcknowledgement);
+        return Err(ConnectionError::retryable(
+            *progress,
+            ConnectionCause::SendEffectAcknowledgement,
+        ));
+    }
+    protocol.runner_text(&frame);
+    progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
+    record_progress(connection_event, *progress);
+    Ok(PendingObservation {
+        message_id,
+        sequence,
+        kind,
     })
 }
 
@@ -1655,7 +1827,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, mpsc};
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Error as WebSocketError;
     use tokio_tungstenite::tungstenite::Message;
@@ -1666,18 +1838,20 @@ mod tests {
 
     use super::{
         ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
-        ConnectionProgress, FrameSource, OpeningHello, ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME,
-        close_locally, close_outcome, opening_hello, run, run_established,
+        ConnectionProgress, FrameSource, OBSERVATION_WINDOW, OpeningHello, ProtocolLog,
+        RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
+        run_established,
     };
     use crate::runner::credential::{Credential, test_credential};
     use crate::runner::service::Sleeper;
     use crate::runner::service::assignment::AssignmentManager;
     use crate::runner::service::config::Config;
     use crate::runner::service::test_support::{
-        accept_fixture_socket, accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
-        deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
-        offer_assignment_after_handshake, sleep_request, welcome, with_watchdog,
+        DeterminismTranscript, SleepRelease, accept_fixture_socket, accept_opened_fixture_socket,
+        assignment_offer, controlled_sleeper, deterministic_frame_source, effect_acknowledgement,
+        expect_close_frame, expect_opening_hello, fixture_listener, healthy_wall_clock,
+        observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
+        sleep_request, welcome, with_watchdog,
     };
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
 
@@ -1695,6 +1869,7 @@ mod tests {
         connection_event: Event,
         active_effect_event: ActiveEffectEvent,
         assignment_manager: Mutex<AssignmentManager>,
+        _sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
         opening: Vec<u8>,
     }
 
@@ -1703,7 +1878,7 @@ mod tests {
             let config = test_config("wss://gateway.example.test/v1/connect");
             let frame_source = deterministic_frame_source();
             let opening = test_opening(&config, frame_source.as_ref());
-            let (sleeper, _sleep_requests) = controlled_sleeper();
+            let (sleeper, sleep_requests) = controlled_sleeper();
             let (recorder, capture) = test_recorder(BOOT_ID);
             let connection_event = recorder.start("runner.gateway_connection", []);
             let assignment_manager = Mutex::new(AssignmentManager::new(
@@ -1720,6 +1895,7 @@ mod tests {
                 connection_event,
                 active_effect_event: ActiveEffectEvent::new(),
                 assignment_manager,
+                _sleep_requests: sleep_requests,
                 opening,
             }
         }
@@ -1785,6 +1961,172 @@ mod tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn fills_exact_observation_window_and_refills_one_fifo_slot() {
+        let context = EstablishedTestContext::new();
+        context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .enqueue_fixture_transitions(40);
+        let (inbound, reader, writer, mut outbound) =
+            scripted_duplex(DeterminismTranscript::default());
+        let mut next_sequence = 2;
+        let established = run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            reader,
+            writer,
+        );
+        let peer = async {
+            let hello = with_watchdog(outbound.recv())
+                .await
+                .expect("opening hello timed out")
+                .expect("opening hello missing");
+            assert!(matches!(hello, Message::Text(_)));
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+
+            let mut window = Vec::new();
+            for _ in 0..OBSERVATION_WINDOW {
+                let message = with_watchdog(outbound.recv())
+                    .await
+                    .expect("observation window fill timed out")
+                    .expect("observation window ended early");
+                let Message::Text(text) = message else {
+                    panic!("observation window contained a control frame");
+                };
+                window.push(
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .expect("decode window observation"),
+                );
+            }
+            assert_eq!(window[0]["sequence"], 2);
+            assert_eq!(window[31]["sequence"], 33);
+            assert!(outbound.try_recv().is_err(), "window exceeded 32 frames");
+
+            inbound.send(observation_acknowledgement(
+                window[0]["messageId"].as_str().expect("window message ID"),
+                2,
+            ));
+            let refill = with_watchdog(outbound.recv())
+                .await
+                .expect("one-slot refill timed out")
+                .expect("one-slot refill missing");
+            let Message::Text(refill) = refill else {
+                panic!("one-slot refill was not text");
+            };
+            let refill: serde_json::Value =
+                serde_json::from_str(&refill).expect("decode one-slot refill");
+            assert_eq!(refill["sequence"], 34);
+            assert_eq!(refill["payload"]["executionEventSequence"], 33);
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("window fixture timed out");
+        result.expect("window fixture connection failed");
+        assert_eq!(next_sequence, 35);
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_only_unacknowledged_semantics_with_fresh_identity() {
+        let context = EstablishedTestContext::new();
+        context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .enqueue_fixture_transitions(2);
+        let mut next_sequence = 2;
+
+        let (first_inbound, first_reader, first_writer, mut first_outbound) =
+            scripted_duplex(DeterminismTranscript::default());
+        let first_connection = run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            first_reader,
+            first_writer,
+        );
+        let first_peer = async {
+            first_outbound.recv().await.expect("first opening hello");
+            first_inbound.send(welcome());
+            first_inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            let first: serde_json::Value = serde_json::from_str(
+                first_outbound
+                    .recv()
+                    .await
+                    .expect("first observation")
+                    .to_text()
+                    .unwrap(),
+            )
+            .unwrap();
+            let second: serde_json::Value = serde_json::from_str(
+                first_outbound
+                    .recv()
+                    .await
+                    .expect("second observation")
+                    .to_text()
+                    .unwrap(),
+            )
+            .unwrap();
+            first_inbound.send(observation_acknowledgement(
+                first["messageId"].as_str().unwrap(),
+                first["sequence"].as_u64().unwrap(),
+            ));
+            first_inbound.send(Message::Close(None));
+            second
+        };
+        let (first_result, original) =
+            with_watchdog(async { tokio::join!(first_connection, first_peer) })
+                .await
+                .expect("first connection timed out");
+        first_result.expect("first connection failed");
+        assert_eq!(original["payload"]["executionEventSequence"], 2);
+        assert_eq!(next_sequence, 4);
+
+        let (second_inbound, second_reader, second_writer, mut second_outbound) =
+            scripted_duplex(DeterminismTranscript::default());
+        let second_connection = run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            second_reader,
+            second_writer,
+        );
+        let second_peer = async {
+            second_outbound
+                .recv()
+                .await
+                .expect("replacement opening hello");
+            second_inbound.send(welcome());
+            second_inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            let replay: serde_json::Value = serde_json::from_str(
+                second_outbound
+                    .recv()
+                    .await
+                    .expect("replayed observation")
+                    .to_text()
+                    .unwrap(),
+            )
+            .unwrap();
+            second_inbound.send(Message::Close(None));
+            replay
+        };
+        let (second_result, replay) =
+            with_watchdog(async { tokio::join!(second_connection, second_peer) })
+                .await
+                .expect("replacement connection timed out");
+        second_result.expect("replacement connection failed");
+
+        assert_eq!(replay["payload"], original["payload"]);
+        assert_ne!(replay["messageId"], original["messageId"]);
+        assert_eq!(replay["sequence"], 4);
+        assert_eq!(next_sequence, 5);
     }
 
     #[tokio::test]
@@ -2195,6 +2537,7 @@ mod tests {
                             "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abj",
                             "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
                             "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+                            "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
                             "reason": "stale_or_invalid_acceptance"
                         }
                     })
@@ -2306,11 +2649,11 @@ mod tests {
             ("pong", None),
             ("text", Some("assignment_offer")),
             ("text", Some("effect_acknowledged")),
-            ("text", Some("observation_ack")),
             ("text", Some("assignment_rejected")),
-            ("text", Some("assignment_release")),
             ("text", Some("observation_ack")),
+            ("text", Some("assignment_release")),
             ("text", Some("effect_acknowledged")),
+            ("text", Some("observation_ack")),
             ("text", Some("observation_ack")),
             ("close", None),
         ];

@@ -1,6 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
-use std::os::unix::fs::PermissionsExt as _;
+use std::num::NonZeroU64;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::Path;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::time::Duration;
 
 use super::*;
@@ -8,6 +13,11 @@ use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedAttachment,
     ResolvedImports, admit_workflow,
+};
+use crate::execution::workflow::archived_attempt::{
+    ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
+    ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedStepDetail,
+    ArchivedWorkflowOutcome, load_local_archived_attempt, load_local_archived_attempt_observed,
 };
 use crate::execution::workflow::resolution;
 
@@ -20,6 +30,12 @@ struct AdmittedFixture {
 
 impl AdmittedFixture {
     fn new() -> Self {
+        Self::from_source(
+            "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+        )
+    }
+
+    fn from_source(source: &str) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -27,11 +43,7 @@ impl AdmittedFixture {
         for directory in [&source_root, &execution_root, &run_parent] {
             fs::create_dir(directory).unwrap();
         }
-        fs::write(
-            source_root.join("workflow.yaml"),
-            "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
-        )
-        .unwrap();
+        fs::write(source_root.join("workflow.yaml"), source).unwrap();
         let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let admitted = admit_workflow(
             workflow,
@@ -252,6 +264,38 @@ fn attempt_directory_names_are_exact_at_the_six_digit_boundary() {
     assert_eq!(
         attempt_directory_name(u64::MAX).as_deref(),
         Some("18446744073709551615")
+    );
+}
+
+#[test]
+fn retained_manifest_rejects_source_files_out_of_canonical_order() {
+    let source_file = |path: &str, ordinal: u64| ManifestSourceFileV1 {
+        path: path.to_owned(),
+        file: ManifestFileV1 {
+            ordinal,
+            relative_file: format!("files/{ordinal:04}"),
+            size_bytes: 0,
+            digest: DigestV1::sha256(&[]),
+        },
+    };
+    let manifest = WorkflowManifestV1 {
+        schema_version: 1,
+        workflow_path: "workflow.yaml".to_owned(),
+        source_root: "/source".to_owned(),
+        maximum_parallel_steps: 1,
+        source_files: vec![
+            source_file("workflow.yaml", 1),
+            source_file("prompt.txt", 2),
+        ],
+        imports: ManifestImportsV1 {
+            prompt: None,
+            attachments: Vec::new(),
+        },
+    };
+
+    assert_eq!(
+        validate_manifest(&manifest),
+        Err(LocalRunDirectoryError::SerializationUnavailable)
     );
 }
 
@@ -530,7 +574,7 @@ fn settle_as_workflow_failed(run: &InitialLocalRun) {
             attempt.settled_at = Some(settled);
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
-            attempt.progress.steps[1].state = AttemptStepStateV1::NotRun;
+            attempt.progress.steps[1].state = AttemptStepStateV1::Blocked;
             attempt.result = AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
             };
@@ -703,4 +747,1116 @@ fn json_bytes(value: Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(&value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+fn settle_as_succeeded(run: &LocalAttemptOwner) {
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.state = AttemptStateV1::Succeeded;
+            for step in &mut attempt.progress.steps {
+                step.state = AttemptStepStateV1::Succeeded;
+            }
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn settle_as_cancelled(run: &LocalAttemptOwner) {
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled.clone());
+            attempt.state = AttemptStateV1::Cancelled;
+            attempt.cancellation = Some(AttemptCancellationV1 {
+                reason: CancellationReasonV1::UserRequest,
+                requested_at: settled.clone(),
+                force_stop_deadline: settled,
+                workflow_confirmed: true,
+            });
+            for step in &mut attempt.progress.steps {
+                step.state = AttemptStepStateV1::Cancelled;
+            }
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) -> PathBuf {
+    let durable = read_state(run.root_handle()).unwrap();
+    let attempt = durable.attempts.last().unwrap();
+    let run_document = read_run(run.root_handle()).unwrap();
+    let command_output = serde_json::json!({
+        "stdout": {
+            "encoding": "base64",
+            "data": BASE64_STANDARD.encode([0_u8, 0xff, b'\n']),
+            "retainedBytes": 3,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": false
+        },
+        "stderr": {
+            "encoding": "base64",
+            "data": BASE64_STANDARD.encode(b"warning\n"),
+            "retainedBytes": 8,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": true
+        }
+    });
+    let (outcome, steps, primary_failure) = match attempt.state {
+        AttemptStateV1::Succeeded => (
+            "succeeded",
+            vec![
+                serde_json::json!({
+                    "id": "first",
+                    "kind": "cmd",
+                    "state": "succeeded",
+                    "startedAt": "2026-08-02T12:01:44Z",
+                    "durationMilliseconds": 100,
+                    "commandOutput": command_output.clone()
+                }),
+                serde_json::json!({
+                    "id": "second",
+                    "kind": "cmd",
+                    "state": "succeeded",
+                    "startedAt": "2026-08-02T12:01:44.1Z",
+                    "durationMilliseconds": 200,
+                    "commandOutput": command_output.clone()
+                }),
+            ],
+            None,
+        ),
+        AttemptStateV1::WorkflowFailed => (
+            "failed",
+            vec![
+                serde_json::json!({
+                    "id": "first",
+                    "kind": "cmd",
+                    "state": "failed",
+                    "startedAt": "2026-08-02T12:01:44Z",
+                    "durationMilliseconds": 100,
+                    "failure": {
+                        "phase": "execution",
+                        "cause": { "code": "command_exit", "exitCode": 23 }
+                    },
+                    "commandOutput": command_output
+                }),
+                serde_json::json!({
+                    "id": "second",
+                    "kind": "cmd",
+                    "state": "blocked",
+                    "dependency": "first"
+                }),
+            ],
+            Some(serde_json::json!({
+                "step": "first",
+                "phase": "execution",
+                "cause": { "code": "command_exit", "exitCode": 23 }
+            })),
+        ),
+        AttemptStateV1::Cancelled => (
+            "cancelled",
+            vec![
+                serde_json::json!({
+                    "id": "first",
+                    "kind": "cmd",
+                    "state": "cancelled",
+                    "reason": "user_request"
+                }),
+                serde_json::json!({
+                    "id": "second",
+                    "kind": "cmd",
+                    "state": "cancelled",
+                    "reason": "user_request"
+                }),
+            ],
+            None,
+        ),
+        state => panic!("unsupported fixture state: {state:?}"),
+    };
+    let mut result = serde_json::json!({
+        "schemaVersion": 1,
+        "attemptNumber": attempt.attempt_number,
+        "workflow": {
+            "path": fixture.admitted.workflow().source.workflow_path,
+            "provenance": {
+                "kind": "local",
+                "sourceRoot": fixture.admitted.workflow().source.source_root
+            },
+            "digest": {
+                "algorithm": run_document.workflow_digest.algorithm,
+                "value": run_document.workflow_digest.value
+            }
+        },
+        "execution": {
+            "executionRoot": attempt.execution_root,
+            "maximumParallelSteps": 2,
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:45.25Z",
+            "durationMilliseconds": 1250
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 65536
+        },
+        "outcome": outcome,
+        "steps": steps,
+        "exports": {}
+    });
+    if let Some(primary_failure) = primary_failure {
+        result["primaryFailure"] = primary_failure;
+    }
+    if let Some(cancellation) = &attempt.cancellation {
+        result["cancellation"] = serde_json::json!({
+            "reason": cancellation.reason,
+            "forceStopDeadline": cancellation.force_stop_deadline,
+        });
+    }
+    let result_directory = run
+        .run_directory()
+        .join(attempt_result_relative_path(attempt.attempt_number));
+    fs::create_dir_all(result_directory.join("exports")).unwrap();
+    fs::write(result_directory.join("result.json"), json_bytes(result)).unwrap();
+    run.record_result_published().unwrap();
+    result_directory
+}
+
+fn result_value(result_directory: &Path) -> Value {
+    serde_json::from_slice(&fs::read(result_directory.join("result.json")).unwrap()).unwrap()
+}
+
+fn overwrite_result(result_directory: &Path, value: Value) {
+    fs::write(result_directory.join("result.json"), json_bytes(value)).unwrap();
+}
+
+fn assert_archive_ineligible(
+    failure: ArchivedAttemptLoadError,
+    reason: ArchivedAttemptIneligibilityReason,
+) {
+    let ArchivedAttemptLoadError::Ineligible(failure) = failure else {
+        panic!("expected attempt ineligibility, got {failure:?}");
+    };
+    assert_eq!(failure.reason, reason);
+}
+
+fn assert_archive_operational(
+    failure: ArchivedAttemptLoadError,
+    code: ArchivedAttemptOperationalErrorCode,
+) {
+    let ArchivedAttemptLoadError::Operational(failure) = failure else {
+        panic!("expected archive operational failure, got {failure:?}");
+    };
+    assert_eq!(failure.code, code);
+}
+
+fn durable_tree(path: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        let mut children = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let relative = child.strip_prefix(root).unwrap().to_owned();
+            if child.is_dir() {
+                entries.insert(relative, None);
+                visit(root, &child, entries);
+            } else {
+                entries.insert(relative, Some(fs::read(&child).unwrap()));
+            }
+        }
+    }
+    let mut entries = BTreeMap::new();
+    visit(path, path, &mut entries);
+    entries
+}
+
+#[test]
+fn archived_attempt_loads_failed_current_result_and_raw_stream_prefixes_read_only() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-current");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let before = durable_tree(&run_path);
+
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+
+    assert_eq!(archived.current_attempt_number, 1);
+    assert_eq!(archived.attempt_number, 1);
+    assert_eq!(archived.state, ArchivedAttemptState::WorkflowFailed);
+    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Failed);
+    assert_eq!(archived.result_directory, result_directory);
+    assert_eq!(archived.workflow.presentation_order, ["first", "second"]);
+    assert_eq!(archived.steps.len(), 2);
+    assert!(matches!(
+        archived.steps[0].detail,
+        ArchivedStepDetail::Failed(_)
+    ));
+    let output = archived.steps[0].command_output.as_ref().unwrap();
+    assert_eq!(output.stdout.bytes.as_ref(), [0_u8, 0xff, b'\n']);
+    assert_eq!(output.stdout.retained_bytes, 3);
+    assert_eq!(output.stdout.discarded_bytes, 0);
+    assert!(!output.stdout.truncated);
+    assert!(!output.stdout.fully_drained);
+    assert_eq!(durable_tree(&run_path), before);
+    assert_eq!(read_state(run.root_handle()).unwrap().attempts.len(), 1);
+}
+
+#[test]
+fn archived_attempt_selects_current_and_explicit_historical_publications() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-history");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    publish_result_fixture(&fixture, &initial);
+    drop(initial);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed initial attempt should be retryable");
+    };
+    let retry = (*pending)
+        .begin(&fixture.admitted)
+        .unwrap_or_else(|_| panic!("retry should begin"));
+    settle_as_succeeded(&retry);
+    publish_result_fixture(&fixture, &retry);
+
+    let current = load_local_archived_attempt(&run_path, None).unwrap();
+    assert_eq!(current.current_attempt_number, 2);
+    assert_eq!(current.attempt_number, 2);
+    assert_eq!(current.outcome, ArchivedWorkflowOutcome::Succeeded);
+
+    let historical =
+        load_local_archived_attempt(&run_path, Some(NonZeroU64::new(1).unwrap())).unwrap();
+    assert_eq!(historical.current_attempt_number, 2);
+    assert_eq!(historical.attempt_number, 1);
+    assert_eq!(historical.outcome, ArchivedWorkflowOutcome::Failed);
+
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, Some(NonZeroU64::new(3).unwrap())).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::Unknown,
+    );
+}
+
+#[test]
+fn archived_attempt_reports_each_nonpublished_disposition_without_fallback() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-nonterminal");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::Nonterminal,
+    );
+
+    run.record_executor_fault_before_execution().unwrap();
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::Interrupted,
+    );
+
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-rejected");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            attempt.state = AttemptStateV1::Rejected;
+            attempt.settled_at = Some(attempt.created_at.clone());
+            attempt.rejection = Some(AttemptRejectionV1 {
+                code: RejectionCodeV1::ImmutableSpecificationUnusable,
+            });
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::Rejected,
+            };
+            Ok(())
+        })
+        .unwrap();
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::Rejected,
+    );
+
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-pending");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::Unpublished,
+    );
+
+    run.record_result_publication_failed(PublicationFailurePhaseV1::Serialization)
+        .unwrap();
+    assert_archive_ineligible(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptIneligibilityReason::PublicationFailed,
+    );
+}
+
+#[test]
+fn archived_attempt_rejects_malformed_and_cross_document_mismatched_results() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-invalid-result");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let valid = result_value(&result_directory);
+
+    fs::write(
+        result_directory.join("result.json"),
+        b"{\"schemaVersion\":1}",
+    )
+    .unwrap();
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    let mut invalid_values = Vec::new();
+    let mut value = valid.clone();
+    value["unknown"] = Value::Bool(true);
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["attemptNumber"] = Value::from(2);
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["workflow"]["digest"]["value"] = Value::String("0".repeat(64));
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["execution"]["executionRoot"] = Value::String("/different".to_owned());
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["outcome"] = Value::String("succeeded".to_owned());
+    value.as_object_mut().unwrap().remove("primaryFailure");
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["steps"].as_array_mut().unwrap().swap(0, 1);
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["steps"][0]["commandOutput"]["stdout"]["retainedBytes"] = Value::from(2);
+    invalid_values.push(value);
+    let mut value = valid.clone();
+    value["steps"][0]["failure"]["cause"]["code"] = Value::String("future_code".to_owned());
+    value["primaryFailure"]["cause"]["code"] = Value::String("future_code".to_owned());
+    invalid_values.push(value);
+
+    for value in invalid_values {
+        overwrite_result(&result_directory, value);
+        assert_archive_operational(
+            load_local_archived_attempt(&run_path, None).unwrap_err(),
+            ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        );
+    }
+}
+
+#[test]
+fn archived_attempt_uses_only_the_authoritative_recorded_result_location() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-result-location");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    publish_result_fixture(&fixture, &run);
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(run_path.join(STATE_FILE)).unwrap()).unwrap();
+    state["attempts"][0]["result"]["relativeDirectory"] =
+        Value::String("attempts/000001/other".to_owned());
+    fs::write(run_path.join(STATE_FILE), json_bytes(state)).unwrap();
+
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_rejects_a_broken_retained_workflow_closure() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-broken-closure");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    publish_result_fixture(&fixture, &run);
+    let retained_source = run_path.join("workflow/files/0001");
+    fs::set_permissions(&retained_source, Permissions::from_mode(0o600)).unwrap();
+    fs::write(retained_source, b"changed\n").unwrap();
+
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_loads_cancelled_commands_that_never_started() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-pending-cancellation");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_cancelled(&run);
+    publish_result_fixture(&fixture, &run);
+
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+
+    assert_eq!(archived.state, ArchivedAttemptState::Cancelled);
+    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Cancelled);
+    assert!(archived.steps.iter().all(|step| {
+        matches!(step.detail, ArchivedStepDetail::Cancelled { .. })
+            && step.started_at.is_none()
+            && step.duration.is_none()
+            && step.command_output.is_none()
+    }));
+}
+
+#[test]
+fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
+    let mut source = String::from("schemaVersion: 1\nsteps:\n");
+    for index in 0..25 {
+        source.push_str(&format!(
+            "  step{index}:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+        ));
+    }
+    let fixture = AdmittedFixture::from_source(&source);
+    let run_path = fixture.run_path("archive-large-result");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+
+    let durable = read_state(run.root_handle()).unwrap();
+    let attempt = durable.attempts.last().unwrap();
+    let run_document = read_run(run.root_handle()).unwrap();
+    let stream = serde_json::json!({
+        "encoding": "base64",
+        "data": BASE64_STANDARD.encode(vec![b'x'; 65_536]),
+        "retainedBytes": 65_536,
+        "discardedBytes": 0,
+        "truncated": false,
+        "fullyDrained": true
+    });
+    let steps = attempt
+        .progress
+        .steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "id": step.id,
+                "kind": "cmd",
+                "state": "succeeded",
+                "startedAt": "2026-08-02T12:01:44Z",
+                "durationMilliseconds": 1,
+                "commandOutput": {
+                    "stdout": stream.clone(),
+                    "stderr": stream.clone()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let result = serde_json::json!({
+        "schemaVersion": 1,
+        "attemptNumber": attempt.attempt_number,
+        "workflow": {
+            "path": fixture.admitted.workflow().source.workflow_path,
+            "provenance": {
+                "kind": "local",
+                "sourceRoot": fixture.admitted.workflow().source.source_root
+            },
+            "digest": {
+                "algorithm": run_document.workflow_digest.algorithm,
+                "value": run_document.workflow_digest.value
+            }
+        },
+        "execution": {
+            "executionRoot": attempt.execution_root,
+            "maximumParallelSteps": 2,
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 1000
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 65_536
+        },
+        "outcome": "succeeded",
+        "steps": steps,
+        "exports": {}
+    });
+    let result_bytes = json_bytes(result);
+    assert!(u64::try_from(result_bytes.len()).unwrap() > MAXIMUM_DURABLE_JSON_BYTES);
+    let result_directory = run
+        .run_directory()
+        .join(attempt_result_relative_path(attempt.attempt_number));
+    fs::create_dir_all(result_directory.join("exports")).unwrap();
+    fs::write(result_directory.join("result.json"), result_bytes).unwrap();
+    run.record_result_published().unwrap();
+
+    let archived = load_local_archived_attempt(&run_path, None)
+        .expect("the result schema bounds streams independently, not the whole document");
+    assert_eq!(archived.steps.len(), 25);
+}
+
+#[test]
+fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
+    let prefix = "a/b;x=";
+    let control_count = 128 - prefix.chars().count();
+    let media_type = format!("{prefix}{}", "\u{1}".repeat(control_count));
+    let source_media_type = format!("{prefix}{}", "\\u0001".repeat(control_count));
+    let mut source = format!(
+        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      payload:\n        kind: file\n        path: payload.bin\n        mediaType: \"{source_media_type}\"\nexports:\n"
+    );
+    for index in 0..4_096 {
+        let name = format!("e{}{index:04}", "a".repeat(59));
+        source.push_str(&format!("  {name}:\n    ref: outputs.produce.payload\n"));
+    }
+    let fixture = AdmittedFixture::from_source(&source);
+    let run_path = fixture.run_path("large-result");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+
+    let durable = read_state(run.root_handle()).unwrap();
+    let attempt = durable.attempts.last().unwrap();
+    let run_document = read_run(run.root_handle()).unwrap();
+    let metadata = serde_json::json!({
+        "state": "available",
+        "kind": "file",
+        "mediaType": media_type,
+        "path": "exports/0001",
+        "sizeBytes": 1,
+        "digest": {
+            "algorithm": "sha256",
+            "value": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+        }
+    });
+    let exports = (0..4_096)
+        .map(|index| (format!("e{}{index:04}", "a".repeat(59)), metadata.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let result = serde_json::json!({
+        "schemaVersion": 1,
+        "attemptNumber": attempt.attempt_number,
+        "workflow": {
+            "path": fixture.admitted.workflow().source.workflow_path,
+            "provenance": {
+                "kind": "local",
+                "sourceRoot": fixture.admitted.workflow().source.source_root
+            },
+            "digest": {
+                "algorithm": run_document.workflow_digest.algorithm,
+                "value": run_document.workflow_digest.value
+            }
+        },
+        "execution": {
+            "executionRoot": attempt.execution_root,
+            "maximumParallelSteps": 2,
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 1000
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 65536
+        },
+        "outcome": "succeeded",
+        "steps": [{
+            "id": "produce",
+            "kind": "cmd",
+            "state": "succeeded",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000,
+            "commandOutput": {
+                "stdout": {
+                    "encoding": "base64",
+                    "data": "",
+                    "retainedBytes": 0,
+                    "discardedBytes": 0,
+                    "truncated": false,
+                    "fullyDrained": true
+                },
+                "stderr": {
+                    "encoding": "base64",
+                    "data": "",
+                    "retainedBytes": 0,
+                    "discardedBytes": 0,
+                    "truncated": false,
+                    "fullyDrained": true
+                }
+            }
+        }],
+        "exports": exports
+    });
+    let result_bytes = json_bytes(result);
+    assert!(
+        u64::try_from(result_bytes.len()).unwrap()
+            <= crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES
+    );
+    let archived_reader_limit = 4 * 1024 * 1024 + 2 * (65_536_u64.div_ceil(3) * 4);
+    assert!(
+        u64::try_from(result_bytes.len()).unwrap() > archived_reader_limit,
+        "result bytes: {}, archived reader limit: {archived_reader_limit}",
+        result_bytes.len()
+    );
+    let result_directory = run
+        .run_directory()
+        .join(attempt_result_relative_path(attempt.attempt_number));
+    fs::create_dir_all(result_directory.join("exports")).unwrap();
+    fs::write(result_directory.join("exports/0001"), b"x").unwrap();
+    fs::write(result_directory.join("result.json"), &result_bytes).unwrap();
+    let result_root = open_directory_path(&result_directory).unwrap();
+    crate::execution::workflow::artifact_set::read_and_validate(
+        &result_root,
+        crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+    )
+    .expect("fixture must be valid Artifact Set V1");
+    run.record_result_published().unwrap();
+
+    load_local_archived_attempt(&run_path, None)
+        .expect("a valid published Artifact Set V1 result must remain inspectable");
+}
+
+#[test]
+fn archived_attempt_enforces_alias_source_identity() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      one:\n        kind: file\n        path: one.bin\n        mediaType: application/octet-stream\n      two:\n        kind: file\n        path: two.bin\n        mediaType: application/octet-stream\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\nexports:\n  a:\n    ref: outputs.first.one\n  b:\n    ref: outputs.first.one\n  c:\n    ref: outputs.first.two\n",
+    );
+    let run_path = fixture.run_path("archive-alias-identity");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let metadata = serde_json::json!({
+        "state": "available",
+        "kind": "file",
+        "mediaType": "application/octet-stream",
+        "path": "exports/0001",
+        "sizeBytes": 1,
+        "digest": {
+            "algorithm": "sha256",
+            "value": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+        }
+    });
+    let mut valid = result_value(&result_directory);
+    valid["exports"] = serde_json::json!({
+        "a": metadata.clone(),
+        "b": metadata.clone(),
+        "c": {
+            "state": "available",
+            "kind": "file",
+            "mediaType": "application/octet-stream",
+            "path": "exports/0003",
+            "sizeBytes": 1,
+            "digest": {
+                "algorithm": "sha256",
+                "value": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+            }
+        }
+    });
+    overwrite_result(&result_directory, valid.clone());
+    fs::write(result_directory.join("exports/0001"), b"x").unwrap();
+    fs::write(result_directory.join("exports/0003"), b"x").unwrap();
+    let result_root = open_directory_path(&result_directory).unwrap();
+    crate::execution::workflow::artifact_set::read_and_validate(
+        &result_root,
+        crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+    )
+    .expect("the alias and equal-content carriers form a valid Artifact Set V1 result");
+    load_local_archived_attempt(&run_path, None)
+        .expect("aliases of one retained output must share their owner carrier");
+
+    let mut non_owner = valid.clone();
+    non_owner["exports"]["b"]["path"] = Value::String("exports/0002".to_owned());
+    overwrite_result(&result_directory, non_owner);
+    fs::write(result_directory.join("exports/0002"), b"x").unwrap();
+    crate::execution::workflow::artifact_set::read_and_validate(
+        &result_root,
+        crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+    )
+    .expect("separate carriers are portable without the retained source identities");
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    let mut shared_by_distinct_sources = valid;
+    shared_by_distinct_sources["exports"]["c"] = metadata;
+    overwrite_result(&result_directory, shared_by_distinct_sources);
+    fs::remove_file(result_directory.join("exports/0002")).unwrap();
+    fs::remove_file(result_directory.join("exports/0003")).unwrap();
+    crate::execution::workflow::artifact_set::read_and_validate(
+        &result_root,
+        crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+    )
+    .expect("equal bytes are portable without the retained source identities");
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_enforces_stream_prefix_retention_invariants() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-stream-retention");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let valid = result_value(&result_directory);
+
+    let mut full_prefix = valid.clone();
+    full_prefix["steps"][0]["commandOutput"]["stdout"] = serde_json::json!({
+        "encoding": "base64",
+        "data": BASE64_STANDARD.encode(vec![b'x'; 65_536]),
+        "retainedBytes": 65_536,
+        "discardedBytes": 1,
+        "truncated": true,
+        "fullyDrained": true
+    });
+    overwrite_result(&result_directory, full_prefix);
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    let mut impossible = valid;
+    impossible["steps"][0]["commandOutput"]["stdout"]["discardedBytes"] = Value::from(1);
+    impossible["steps"][0]["commandOutput"]["stdout"]["truncated"] = Value::Bool(true);
+    overwrite_result(&result_directory, impossible);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_validates_failure_identities_against_the_retained_step() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: [\"true\"]\n    outputs:\n      artifact:\n        kind: file\n        path: artifact.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run_path = fixture.run_path("archive-failure-identities");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let original = result_value(&result_directory);
+
+    let mut invalid_name = original.clone();
+    let invalid_name_cause = serde_json::json!({
+        "code": "input_invalid_name",
+        "input": "../escape"
+    });
+    invalid_name["steps"][0]["failure"] = serde_json::json!({
+        "phase": "start",
+        "cause": invalid_name_cause.clone()
+    });
+    invalid_name["steps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("commandOutput");
+    invalid_name["primaryFailure"] = serde_json::json!({
+        "step": "first",
+        "phase": "start",
+        "cause": invalid_name_cause
+    });
+    overwrite_result(&result_directory, invalid_name);
+    load_local_archived_attempt(&run_path, None)
+        .expect("an invalid-name failure preserves the offending producer identity");
+
+    let mut input_failure = original.clone();
+    let declared_input_cause = serde_json::json!({
+        "code": "input_value_size_limit",
+        "input": "prompt"
+    });
+    input_failure["steps"][0]["failure"] = serde_json::json!({
+        "phase": "start",
+        "cause": declared_input_cause.clone()
+    });
+    input_failure["steps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("commandOutput");
+    input_failure["primaryFailure"] = serde_json::json!({
+        "step": "first",
+        "phase": "start",
+        "cause": declared_input_cause
+    });
+    overwrite_result(&result_directory, input_failure.clone());
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    input_failure["steps"][0]["failure"]["cause"]["input"] = Value::String("fabricated".to_owned());
+    input_failure["primaryFailure"]["cause"]["input"] = Value::String("fabricated".to_owned());
+    overwrite_result(&result_directory, input_failure);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    let mut indexed_scalar = original.clone();
+    let indexed_cause = serde_json::json!({
+        "code": "input_collection_ordinal_limit",
+        "input": "prompt",
+        "collectionIndex": 0
+    });
+    indexed_scalar["steps"][0]["failure"] = serde_json::json!({
+        "phase": "start",
+        "cause": indexed_cause.clone()
+    });
+    indexed_scalar["steps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("commandOutput");
+    indexed_scalar["primaryFailure"] = serde_json::json!({
+        "step": "first",
+        "phase": "start",
+        "cause": indexed_cause
+    });
+    overwrite_result(&result_directory, indexed_scalar);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    let mut output_failure = original;
+    let declared_output_cause = serde_json::json!({
+        "code": "output_missing",
+        "output": "artifact"
+    });
+    output_failure["steps"][0]["failure"] = serde_json::json!({
+        "phase": "output_capture",
+        "cause": declared_output_cause.clone()
+    });
+    output_failure["primaryFailure"] = serde_json::json!({
+        "step": "first",
+        "phase": "output_capture",
+        "cause": declared_output_cause
+    });
+    overwrite_result(&result_directory, output_failure.clone());
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    output_failure["steps"][0]["failure"]["cause"]["output"] =
+        Value::String("fabricated".to_owned());
+    output_failure["primaryFailure"]["cause"]["output"] = Value::String("fabricated".to_owned());
+    overwrite_result(&result_directory, output_failure);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  third:\n    kind: cmd\n    dependsOn: [first, second]\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run_path = fixture.run_path("archive-terminal-invariants");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.state = AttemptStateV1::WorkflowFailed;
+            attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.progress.steps[1].state = AttemptStepStateV1::Succeeded;
+            attempt.progress.steps[2].state = AttemptStepStateV1::Blocked;
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    let durable = read_state(run.root_handle()).unwrap();
+    let attempt = durable.attempts.last().unwrap();
+    let run_document = read_run(run.root_handle()).unwrap();
+    let stream = serde_json::json!({
+        "encoding": "base64",
+        "data": "",
+        "retainedBytes": 0,
+        "discardedBytes": 0,
+        "truncated": false,
+        "fullyDrained": true
+    });
+    let command_output = serde_json::json!({
+        "stdout": stream.clone(),
+        "stderr": stream
+    });
+    let valid = serde_json::json!({
+        "schemaVersion": 1,
+        "attemptNumber": attempt.attempt_number,
+        "workflow": {
+            "path": fixture.admitted.workflow().source.workflow_path,
+            "provenance": {
+                "kind": "local",
+                "sourceRoot": fixture.admitted.workflow().source.source_root
+            },
+            "digest": {
+                "algorithm": run_document.workflow_digest.algorithm,
+                "value": run_document.workflow_digest.value
+            }
+        },
+        "execution": {
+            "executionRoot": attempt.execution_root,
+            "maximumParallelSteps": 2,
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 1000
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 65_536
+        },
+        "outcome": "failed",
+        "primaryFailure": {
+            "step": "first",
+            "phase": "execution",
+            "cause": { "code": "command_exit", "exitCode": 23 }
+        },
+        "steps": [
+            {
+                "id": "first",
+                "kind": "cmd",
+                "state": "failed",
+                "startedAt": "2026-08-02T12:01:44Z",
+                "durationMilliseconds": 100,
+                "failure": {
+                    "phase": "execution",
+                    "cause": { "code": "command_exit", "exitCode": 23 }
+                },
+                "commandOutput": command_output.clone()
+            },
+            {
+                "id": "second",
+                "kind": "cmd",
+                "state": "succeeded",
+                "startedAt": "2026-08-02T12:01:44Z",
+                "durationMilliseconds": 100,
+                "commandOutput": command_output
+            },
+            {
+                "id": "third",
+                "kind": "cmd",
+                "state": "blocked",
+                "dependency": "first"
+            }
+        ],
+        "exports": {}
+    });
+    let result_directory = run
+        .run_directory()
+        .join(attempt_result_relative_path(attempt.attempt_number));
+    fs::create_dir_all(result_directory.join("exports")).unwrap();
+    overwrite_result(&result_directory, valid.clone());
+    run.record_result_published().unwrap();
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    let mut false_blocker = valid.clone();
+    false_blocker["steps"][2]["dependency"] = Value::String("second".to_owned());
+    overwrite_result(&result_directory, false_blocker);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    let mut impossible_success = valid;
+    impossible_success["outcome"] = Value::String("succeeded".to_owned());
+    impossible_success
+        .as_object_mut()
+        .unwrap()
+        .remove("primaryFailure");
+    overwrite_result(&result_directory, impossible_success);
+    run.state
+        .update(|state| {
+            current_attempt_mut(state)?.state = AttemptStateV1::Succeeded;
+            Ok(())
+        })
+        .unwrap();
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_rejects_not_run_step_with_failed_dependency() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-impossible-not-run");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let mut result = result_value(&result_directory);
+    result["steps"][1] = serde_json::json!({
+        "id": "second",
+        "kind": "cmd",
+        "state": "not_run",
+        "reason": "failure_stop"
+    });
+    overwrite_result(&result_directory, result);
+    run.state
+        .update(|state| {
+            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::NotRun;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+}
+
+#[test]
+fn archived_attempt_rejects_symlinks_and_does_not_adopt_replacements() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-symlink");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let result = result_directory.join("result.json");
+    fs::rename(&result, result_directory.join("result-real.json")).unwrap();
+    symlink("result-real.json", &result).unwrap();
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable,
+    );
+
+    fs::remove_file(&result).unwrap();
+    fs::rename(result_directory.join("result-real.json"), &result).unwrap();
+    let replacement = fs::read(&result).unwrap();
+    assert_archive_operational(
+        load_local_archived_attempt_observed(
+            &run_path,
+            None,
+            |_| {},
+            |result_directory| {
+                let result = result_directory.join("result.json");
+                fs::rename(
+                    &result,
+                    result_directory.join("result-before-replacement.json"),
+                )
+                .unwrap();
+                fs::write(result, &replacement).unwrap();
+            },
+        )
+        .unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable,
+    );
+
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-path-replacement");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    publish_result_fixture(&fixture, &run);
+    let archived = load_local_archived_attempt_observed(
+        &run_path,
+        None,
+        |run_directory| {
+            let moved = run_directory.with_file_name("archive-path-original");
+            fs::rename(run_directory, moved).unwrap();
+            fs::create_dir(run_directory).unwrap();
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(archived.attempt_number, 1);
+    assert!(durable_tree(&run_path).is_empty());
 }
