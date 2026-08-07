@@ -1445,7 +1445,7 @@ impl CaptureWorker {
             candidates
                 .outputs()
                 .iter()
-                .map(|(name, output)| (name.clone(), CapturedValue::file(output.clone()))),
+                .map(|(name, output)| (name.clone(), output.clone())),
         );
         let occurrence = DriverOccurrence::outputs_captured(step, action, values);
         let _ = started.send(());

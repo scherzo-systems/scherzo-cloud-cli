@@ -1,4 +1,5 @@
 mod account;
+mod artifact;
 mod auth;
 mod organization;
 mod principal;
@@ -7,10 +8,14 @@ mod version;
 mod workflow;
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use serde::Serialize;
 
 use crate::api::HttpTransportPolicy;
 use crate::human_auth::deployment::Deployment;
@@ -49,6 +54,8 @@ impl HttpOptions {
 enum Command {
     #[command(about = account::ABOUT)]
     Account(account::Command),
+    #[command(about = artifact::ABOUT)]
+    Artifact(artifact::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
     #[command(about = organization::ABOUT)]
@@ -74,11 +81,96 @@ impl Cli {
         match self.command {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
+            Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
             Some(Command::Workflow(command)) => command.execute(),
+        }
+    }
+}
+
+fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(&bytes)?;
+    stdout.flush()
+}
+
+fn execute_read_only_with_signals(
+    context: &'static str,
+    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> ExitCode + Send + 'static,
+) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Error: start {context} runtime: {:?}", error.kind());
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async move {
+        let signals = (|| -> io::Result<_> {
+            let interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            Ok((interrupt, terminate))
+        })();
+        let Ok((mut interrupt, mut terminate)) = signals else {
+            eprintln!("Error: install {context} signal observation");
+            return ExitCode::FAILURE;
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let operation_cancelled = Arc::clone(&cancelled);
+        let operation_completed = Arc::clone(&completed);
+        let mut running = tokio::task::spawn_blocking(move || {
+            operation(&operation_cancelled, &operation_completed)
+        });
+        tokio::select! {
+            biased;
+            signal = first_read_only_signal(&mut interrupt, &mut terminate) => {
+                cancelled.store(true, Ordering::Release);
+                if completed.load(Ordering::Acquire) {
+                    finish_read_only_operation(context, running.await)
+                } else {
+                    ExitCode::from(signal)
+                }
+            }
+            result = &mut running => finish_read_only_operation(context, result),
+        }
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
+}
+
+async fn first_read_only_signal(
+    interrupt: &mut tokio::signal::unix::Signal,
+    terminate: &mut tokio::signal::unix::Signal,
+) -> u8 {
+    tokio::select! {
+        biased;
+        _ = interrupt.recv() => 130,
+        _ = terminate.recv() => 143,
+    }
+}
+
+fn finish_read_only_operation(
+    context: &str,
+    result: Result<ExitCode, tokio::task::JoinError>,
+) -> ExitCode {
+    match result {
+        Ok(exit) => exit,
+        Err(error) => {
+            eprintln!("Error: complete {context} operation: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -183,6 +275,8 @@ mod tests {
         let expected = [
             "account",
             "account signup",
+            "artifact",
+            "artifact validate",
             "auth",
             "auth login",
             "auth logout",
@@ -213,6 +307,7 @@ mod tests {
         let help = command_help(&[]);
 
         assert!(help.contains("account       Manage your Scherzo Cloud account"));
+        assert!(help.contains("artifact      Inspect and validate portable workflow artifacts"));
         assert!(help.contains("auth          Manage your Scherzo Cloud sign-in"));
         assert!(help.contains("organization  Manage Scherzo Cloud organizations"));
         assert!(help.contains("version       Print version information"));
@@ -229,6 +324,20 @@ mod tests {
 
         assert!(help.contains("signup  Create your Scherzo Cloud account"));
         assert!(command_help(&["account", "signup"]).contains("--allow-insecure-http"));
+    }
+
+    #[test]
+    fn artifact_help_is_composed_from_command_metadata() {
+        let help = command_help(&["artifact"]);
+        let validate = command_help(&["artifact", "validate"]);
+
+        assert!(
+            help.contains("validate  Validate one complete portable Artifact Set V1 directory")
+        );
+        assert!(validate.contains("[OPTIONS] <ARTIFACT_DIR>"));
+        assert!(validate.contains("--json"));
+        assert!(!validate.contains("--plain"));
+        assert!(!validate.contains("--color"));
     }
 
     #[test]
@@ -305,13 +414,13 @@ mod tests {
             "--plain",
             "--json",
             "--color <auto|always|never>",
-            "<WORKFLOW_PATH>",
+            "<WORKFLOW_FILE>",
         ] {
             assert!(run.contains(option), "run help should contain {option}");
         }
         let retry = command_help(&["workflow", "retry"]);
         for option in [
-            "--run-dir <PATH>",
+            "<RUN_DIR>",
             "--execution-root <PATH>",
             "--plain",
             "--json",
@@ -319,12 +428,13 @@ mod tests {
         ] {
             assert!(retry.contains(option), "retry help should contain {option}");
         }
+        assert!(!retry.contains("--run-dir"));
         assert!(!retry.contains("--source-root"));
         assert!(!retry.contains("--prompt-file"));
         assert!(!retry.contains("--max-parallel"));
         let status = command_help(&["workflow", "status"]);
         for option in [
-            "--run-dir <PATH>",
+            "<RUN_DIR>",
             "--plain",
             "--json",
             "--color <auto|always|never>",
@@ -334,22 +444,24 @@ mod tests {
                 "status help should contain {option}"
             );
         }
+        assert!(!status.contains("--run-dir"));
         assert!(!status.contains("--source-root"));
         assert!(!status.contains("--execution-root"));
         let view = command_help(&["workflow", "view"]);
         for option in [
-            "--run-dir <PATH>",
+            "<RUN_DIR>",
             "--attempt <NUMBER>",
             "--color <auto|always|never>",
         ] {
             assert!(view.contains(option), "view help should contain {option}");
         }
+        assert!(!view.contains("--run-dir"));
         assert!(!view.contains("--plain"));
         assert!(!view.contains("--json"));
         assert!(!view.contains("--source-root"));
         assert!(!view.contains("--execution-root"));
         assert!(validate.contains("--source-root <ROOT>"));
-        assert!(validate.contains("<WORKFLOW_PATH>"));
+        assert!(validate.contains("<WORKFLOW_FILE>"));
         assert!(validate.contains("--json"));
     }
 }

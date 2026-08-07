@@ -147,11 +147,50 @@ impl ResolvedWorkflow {
     }
 }
 
+// Runner configuration keeps its source-root-relative workflow mapping.
 pub(crate) fn resolve(
     source_root: &Path,
     selected_workflow: &Path,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
     resolve_with_sources(SourceResolver::new(source_root)?, selected_workflow)
+}
+
+// Human CLI workflow files are ordinary host paths, independent of source-root spelling.
+pub(crate) fn resolve_workflow_file(
+    source_root: &Path,
+    workflow_file: &Path,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    let (source_root, workflow_file) = host_workflow_paths(source_root, workflow_file)?;
+    let sources = SourceResolver::new(&source_root)?;
+    let canonical_workflow = sources.canonical_workflow_file(&workflow_file)?;
+    resolve_with_sources(sources, &canonical_workflow)
+}
+
+fn host_workflow_paths(
+    source_root: &Path,
+    workflow_file: &Path,
+) -> Result<(PathBuf, PathBuf), ResolutionFailure> {
+    if source_root.is_absolute() && workflow_file.is_absolute() {
+        return Ok((source_root.to_owned(), workflow_file.to_owned()));
+    }
+    let initial_cwd = std::env::current_dir().map_err(|_| {
+        ResolutionFailure::new(
+            ResolutionFailureKind::SourceRootUnavailable,
+            ResolutionLocation::SourceRoot,
+        )
+    })?;
+    Ok((
+        host_path_from(&initial_cwd, source_root),
+        host_path_from(&initial_cwd, workflow_file),
+    ))
+}
+
+fn host_path_from(initial_cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        initial_cwd.join(path)
+    }
 }
 
 pub(crate) fn resolve_retained(
@@ -232,7 +271,19 @@ struct SourceResolver {
 
 impl SourceResolver {
     fn new(source_root: &Path) -> Result<Self, ResolutionFailure> {
-        let canonical_root = fs::canonicalize(source_root).map_err(|_| {
+        let supplied_root = if source_root.is_absolute() {
+            source_root.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| {
+                    ResolutionFailure::new(
+                        ResolutionFailureKind::SourceRootUnavailable,
+                        ResolutionLocation::SourceRoot,
+                    )
+                })?
+                .join(source_root)
+        };
+        let canonical_root = fs::canonicalize(&supplied_root).map_err(|_| {
             ResolutionFailure::new(
                 ResolutionFailureKind::SourceRootUnavailable,
                 ResolutionLocation::SourceRoot,
@@ -250,19 +301,6 @@ impl SourceResolver {
                 ResolutionLocation::SourceRoot,
             ));
         }
-
-        let supplied_root = if source_root.is_absolute() {
-            source_root.to_owned()
-        } else {
-            std::env::current_dir()
-                .map_err(|_| {
-                    ResolutionFailure::new(
-                        ResolutionFailureKind::SourceRootUnavailable,
-                        ResolutionLocation::SourceRoot,
-                    )
-                })?
-                .join(source_root)
-        };
 
         Ok(Self {
             canonical_root,
@@ -310,6 +348,26 @@ impl SourceResolver {
         path.strip_prefix(&self.supplied_root)
             .map(|relative| self.canonical_root.join(relative))
             .unwrap_or_else(|_| path.to_owned())
+    }
+
+    fn canonical_workflow_file(&self, workflow_file: &Path) -> Result<PathBuf, ResolutionFailure> {
+        let location = ResolutionLocation::Workflow;
+        let supplied_workflow = workflow_file.to_owned();
+        let canonical_workflow = fs::canonicalize(&supplied_workflow).map_err(|_| {
+            ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+        })?;
+        if canonical_workflow.starts_with(&self.canonical_root) {
+            return Ok(canonical_workflow);
+        }
+
+        let kind = if lexical_normalize(&supplied_workflow)
+            .is_some_and(|path| path.starts_with(&self.supplied_root))
+        {
+            ResolutionFailureKind::SymbolicLinkEscape
+        } else {
+            ResolutionFailureKind::LexicalSourceEscape
+        };
+        Err(ResolutionFailure::new(kind, location))
     }
 
     fn load(

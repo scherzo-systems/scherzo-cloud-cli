@@ -164,6 +164,10 @@ impl RunBundle {
         &self.execution_root
     }
 
+    pub(super) fn initial_cwd(&self) -> &Path {
+        self._temporary.path()
+    }
+
     pub(super) fn args(&self, result: &Path) -> Vec<String> {
         vec![
             "workflow".to_owned(),
@@ -174,7 +178,10 @@ impl RunBundle {
             self.execution_root.to_string_lossy().into_owned(),
             "--run-dir".to_owned(),
             result.to_string_lossy().into_owned(),
-            WORKFLOW_PATH.to_owned(),
+            self.source_root
+                .join(WORKFLOW_PATH)
+                .to_string_lossy()
+                .into_owned(),
         ]
     }
 }
@@ -400,6 +407,40 @@ fn command_only_run_and_help_remain_pi_independent() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("command-only"));
     assert!(attempt_result(&destination).join("result.json").is_file());
+}
+
+#[test]
+fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let args = [
+        "workflow",
+        "run",
+        "--source-root",
+        "source",
+        "--execution-root",
+        "execution",
+        "--run-dir",
+        "results/completable",
+        "source/workflow.yaml",
+        "--json",
+    ];
+    let output = isolated_command(&args.map(str::to_owned))
+        .current_dir(bundle.initial_cwd())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run_directory = fs::canonicalize(bundle.result("completable")).unwrap();
+    assert_eq!(terminal["runDirectory"], run_directory.to_str().unwrap());
+    assert_eq!(terminal["result"]["workflow"]["path"], WORKFLOW_PATH);
 }
 
 #[test]
@@ -1119,7 +1160,6 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
     let status_args = vec![
         "workflow".to_owned(),
         "status".to_owned(),
-        "--run-dir".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
     ];
@@ -2166,7 +2206,6 @@ fn abrupt_owner_loss_terminates_reaps_and_exposes_an_abandoned_attempt() {
     let status = isolated_command(&[
         "workflow".to_owned(),
         "status".to_owned(),
-        "--run-dir".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
     ])

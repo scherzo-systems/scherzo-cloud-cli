@@ -20,6 +20,8 @@ use std::time::Duration;
 
 #[path = "cli/account_signup.rs"]
 mod account_signup;
+#[path = "cli/artifact_validate.rs"]
+mod artifact_validate;
 #[path = "cli/auth_login.rs"]
 mod auth_login;
 #[path = "cli/organization.rs"]
@@ -440,6 +442,7 @@ fn no_arguments_print_composed_root_help() {
     assert!(output.status.success());
     assert!(stdout.contains("Usage: scherzo-cloud [COMMAND]"));
     assert!(stdout.contains("account       Manage your Scherzo Cloud account"));
+    assert!(stdout.contains("artifact      Inspect and validate portable workflow artifacts"));
     assert!(stdout.contains("auth          Manage your Scherzo Cloud sign-in"));
     assert!(stdout.contains("organization  Manage Scherzo Cloud organizations"));
     assert!(stdout.contains("version       Print version information"));
@@ -450,6 +453,17 @@ fn no_arguments_print_composed_root_help() {
         )
     );
     assert!(!stdout.contains("--allow-insecure-http"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn artifact_without_a_subcommand_prints_composed_help() {
+    let output = run(&["artifact"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: scherzo-cloud artifact [COMMAND]"));
+    assert!(stdout.contains("validate  Validate one complete portable Artifact Set V1 directory"));
     assert!(output.stderr.is_empty());
 }
 
@@ -501,6 +515,7 @@ fn workflow_without_a_subcommand_prints_composed_help() {
 
 #[test]
 fn nested_help_flags_use_the_composed_command_tree() {
+    let artifact_validate = run(&["artifact", "validate", "--help"]);
     let auth = run(&["auth", "--help"]);
     let login = run(&["auth", "login", "--help"]);
     let runner = run(&["runner", "--help"]);
@@ -509,6 +524,16 @@ fn nested_help_flags_use_the_composed_command_tree() {
     let workflow_status = run(&["workflow", "status", "--help"]);
     let workflow_validate = run(&["workflow", "validate", "--help"]);
     let workflow_view = run(&["workflow", "view", "--help"]);
+
+    assert!(artifact_validate.status.success());
+    let artifact_validate_stdout = String::from_utf8_lossy(&artifact_validate.stdout);
+    assert!(
+        artifact_validate_stdout
+            .contains("Usage: scherzo-cloud artifact validate [OPTIONS] <ARTIFACT_DIR>")
+    );
+    assert!(artifact_validate_stdout.contains("--json"));
+    assert!(!artifact_validate_stdout.contains("--plain"));
+    assert!(artifact_validate.stderr.is_empty());
 
     assert!(auth.status.success());
     assert!(
@@ -556,8 +581,10 @@ fn nested_help_flags_use_the_composed_command_tree() {
 
     assert!(workflow_status.status.success());
     let workflow_status_stdout = String::from_utf8_lossy(&workflow_status.stdout);
-    assert!(workflow_status_stdout.contains("Usage: scherzo-cloud workflow status [OPTIONS]"));
-    assert!(workflow_status_stdout.contains("--run-dir <PATH>"));
+    assert!(
+        workflow_status_stdout.contains("Usage: scherzo-cloud workflow status [OPTIONS] <RUN_DIR>")
+    );
+    assert!(!workflow_status_stdout.contains("--run-dir"));
     assert!(workflow_status_stdout.contains("--plain"));
     assert!(workflow_status_stdout.contains("--json"));
     assert!(workflow_status_stdout.contains("--color <auto|always|never>"));
@@ -566,7 +593,7 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(workflow_validate.status.success());
     let workflow_validate_stdout = String::from_utf8_lossy(&workflow_validate.stdout);
     assert!(workflow_validate_stdout.contains(
-        "Usage: scherzo-cloud workflow validate [OPTIONS] --source-root <ROOT> <WORKFLOW_PATH>"
+        "Usage: scherzo-cloud workflow validate [OPTIONS] --source-root <ROOT> <WORKFLOW_FILE>"
     ));
     assert!(workflow_validate_stdout.contains("--source-root <ROOT>"));
     assert!(workflow_validate_stdout.contains("--json"));
@@ -576,10 +603,9 @@ fn nested_help_flags_use_the_composed_command_tree() {
     assert!(workflow_view.status.success());
     let workflow_view_stdout = String::from_utf8_lossy(&workflow_view.stdout);
     assert!(
-        workflow_view_stdout
-            .contains("Usage: scherzo-cloud workflow view [OPTIONS] --run-dir <PATH>")
+        workflow_view_stdout.contains("Usage: scherzo-cloud workflow view [OPTIONS] <RUN_DIR>")
     );
-    assert!(workflow_view_stdout.contains("--run-dir <PATH>"));
+    assert!(!workflow_view_stdout.contains("--run-dir"));
     assert!(workflow_view_stdout.contains("--attempt <NUMBER>"));
     assert!(workflow_view_stdout.contains("--color <auto|always|never>"));
     assert!(!workflow_view_stdout.contains("--plain"));

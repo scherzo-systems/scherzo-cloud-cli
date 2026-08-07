@@ -49,7 +49,7 @@ use crate::execution::workflow::publication::{
     WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
     WorkflowStepTiming, prepare_attempt_result_destination, publish_prepared_workflow_result,
 };
-use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve};
+use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve_workflow_file};
 use crate::execution::workflow::run_timing::{
     ObservationClock, RunTimingObservation, RunTimingSnapshot,
 };
@@ -149,15 +149,16 @@ impl Command {
                     return diagnose(error);
                 }
             };
-        let workflow = match resolve(&self.source.source_root, &self.source.workflow_path) {
-            Ok(workflow) => workflow,
-            Err(failure) => {
-                signal_task.abort();
-                return rejection_output(presentation_config, |output| {
-                    output.render_resolution_rejection(&failure)
-                });
-            }
-        };
+        let workflow =
+            match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
+                Ok(workflow) => workflow,
+                Err(failure) => {
+                    signal_task.abort();
+                    return rejection_output(presentation_config, |output| {
+                        output.render_resolution_rejection(&failure)
+                    });
+                }
+            };
         let context = match execution_context_for_workflow(
             &workflow,
             self.execution.execution_root,
@@ -1475,6 +1476,7 @@ mod tests {
 
     use super::*;
     use crate::execution::workflow::observation::TransitionObservation;
+    use crate::execution::workflow::resolution::resolve;
     use crate::execution::workflow::run_timing::ObservationTime;
     use crate::execution::workflow::runtime::{
         SchedulingGate, StepStateKind, TransitionEvent, TransitionSequence, WorkflowState,
@@ -1576,7 +1578,7 @@ mod tests {
         let command = Command {
             source: super::super::LocalWorkflowSource {
                 source_root: PathBuf::from("source"),
-                workflow_path: PathBuf::from("workflow.yaml"),
+                workflow_file: PathBuf::from("workflow.yaml"),
             },
             execution: super::super::LocalExecutionRoot {
                 execution_root: PathBuf::from("execution"),

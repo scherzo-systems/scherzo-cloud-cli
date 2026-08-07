@@ -43,8 +43,7 @@ pub(super) struct PresentationOptions {
 #[derive(Debug, Args)]
 pub(super) struct ExistingLocalRun {
     #[arg(
-        long,
-        value_name = "PATH",
+        value_name = "RUN_DIR",
         help = "Existing durable directory for exactly one workflow run"
     )]
     pub(super) run_dir: PathBuf,
@@ -70,10 +69,10 @@ pub(super) struct LocalWorkflowSource {
     pub(super) source_root: PathBuf,
 
     #[arg(
-        value_name = "WORKFLOW_PATH",
-        help = "Workflow YAML path selected within the source root"
+        value_name = "WORKFLOW_FILE",
+        help = "Workflow YAML file path resolved from the initial working directory"
     )]
-    pub(super) workflow_path: PathBuf,
+    pub(super) workflow_file: PathBuf,
 }
 
 #[derive(Debug, Args)]

@@ -81,7 +81,7 @@ impl FixtureBundle {
     }
 
     fn resolve(&self) -> Result<ResolvedWorkflow, ResolutionFailure> {
-        resolve(&self.root, Path::new(WORKFLOW_PATH))
+        resolve_workflow_file(&self.root, &self.workflow_path())
     }
 }
 

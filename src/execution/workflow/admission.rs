@@ -24,6 +24,9 @@ pub(crate) const MAX_CANCELLATION_GRACE: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
 const MAXIMUM_CAPTURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_CAPTURED_GIT_CARRIERS: usize = 1024;
+const MAXIMUM_CAPTURED_GIT_CARRIER_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_TOTAL_CAPTURED_GIT_CARRIER_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_INPUT_VALUES: usize = 1024;
 const MAXIMUM_INPUT_VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TOTAL_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -310,6 +313,9 @@ pub(crate) struct CaptureLimits {
     maximum_files: usize,
     maximum_file_bytes: u64,
     maximum_total_bytes: u64,
+    maximum_git_carriers: usize,
+    maximum_git_carrier_bytes: u64,
+    maximum_total_git_carrier_bytes: u64,
 }
 
 impl CaptureLimits {
@@ -322,7 +328,22 @@ impl CaptureLimits {
             maximum_files,
             maximum_file_bytes,
             maximum_total_bytes,
+            maximum_git_carriers: MAXIMUM_CAPTURED_GIT_CARRIERS,
+            maximum_git_carrier_bytes: MAXIMUM_CAPTURED_GIT_CARRIER_BYTES,
+            maximum_total_git_carrier_bytes: MAXIMUM_TOTAL_CAPTURED_GIT_CARRIER_BYTES,
         }
+    }
+
+    pub(crate) fn with_git_carrier_limits(
+        mut self,
+        maximum_git_carriers: usize,
+        maximum_git_carrier_bytes: u64,
+        maximum_total_git_carrier_bytes: u64,
+    ) -> Self {
+        self.maximum_git_carriers = maximum_git_carriers;
+        self.maximum_git_carrier_bytes = maximum_git_carrier_bytes;
+        self.maximum_total_git_carrier_bytes = maximum_total_git_carrier_bytes;
+        self
     }
 }
 
@@ -434,6 +455,9 @@ pub(crate) struct ExecutionLimits {
     maximum_captured_files: NonZeroUsize,
     maximum_captured_file_bytes: NonZeroU64,
     maximum_total_captured_bytes: NonZeroU64,
+    maximum_captured_git_carriers: NonZeroUsize,
+    maximum_captured_git_carrier_bytes: NonZeroU64,
+    maximum_total_captured_git_carrier_bytes: NonZeroU64,
     maximum_input_values: NonZeroUsize,
     maximum_input_value_bytes: NonZeroU64,
     maximum_total_input_bytes: NonZeroU64,
@@ -456,6 +480,18 @@ impl ExecutionLimits {
 
     pub(crate) fn maximum_total_captured_bytes(self) -> NonZeroU64 {
         self.maximum_total_captured_bytes
+    }
+
+    pub(crate) fn maximum_captured_git_carriers(self) -> NonZeroUsize {
+        self.maximum_captured_git_carriers
+    }
+
+    pub(crate) fn maximum_captured_git_carrier_bytes(self) -> NonZeroU64 {
+        self.maximum_captured_git_carrier_bytes
+    }
+
+    pub(crate) fn maximum_total_captured_git_carrier_bytes(self) -> NonZeroU64 {
+        self.maximum_total_captured_git_carrier_bytes
     }
 
     pub(crate) fn maximum_input_values(self) -> NonZeroUsize {
@@ -586,6 +622,9 @@ pub(crate) enum AdmissionFailureKind {
     NonPositiveCapturedFiles,
     NonPositiveCapturedFileBytes,
     NonPositiveTotalCapturedBytes,
+    NonPositiveCapturedGitCarriers,
+    NonPositiveCapturedGitCarrierBytes,
+    NonPositiveTotalCapturedGitCarrierBytes,
     NonPositiveInputValues,
     NonPositiveInputValueBytes,
     NonPositiveTotalInputBytes,
@@ -605,6 +644,9 @@ pub(crate) enum AdmissionLocation {
     MaximumCapturedFiles,
     MaximumCapturedFileBytes,
     MaximumTotalCapturedBytes,
+    MaximumCapturedGitCarriers,
+    MaximumCapturedGitCarrierBytes,
+    MaximumTotalCapturedGitCarrierBytes,
     MaximumInputValues,
     MaximumInputValueBytes,
     MaximumTotalInputBytes,
@@ -717,6 +759,29 @@ pub(crate) fn admit_workflow(
                 AdmissionLocation::MaximumTotalCapturedBytes,
             )
         })?;
+    let maximum_captured_git_carriers =
+        NonZeroUsize::new(context.limits.capture.maximum_git_carriers).ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveCapturedGitCarriers,
+                AdmissionLocation::MaximumCapturedGitCarriers,
+            )
+        })?;
+    let maximum_captured_git_carrier_bytes =
+        NonZeroU64::new(context.limits.capture.maximum_git_carrier_bytes).ok_or_else(|| {
+            AdmissionFailure::new(
+                AdmissionFailureKind::NonPositiveCapturedGitCarrierBytes,
+                AdmissionLocation::MaximumCapturedGitCarrierBytes,
+            )
+        })?;
+    let maximum_total_captured_git_carrier_bytes = NonZeroU64::new(
+        context.limits.capture.maximum_total_git_carrier_bytes,
+    )
+    .ok_or_else(|| {
+        AdmissionFailure::new(
+            AdmissionFailureKind::NonPositiveTotalCapturedGitCarrierBytes,
+            AdmissionLocation::MaximumTotalCapturedGitCarrierBytes,
+        )
+    })?;
     let maximum_input_values =
         NonZeroUsize::new(context.limits.input.maximum_values).ok_or_else(|| {
             AdmissionFailure::new(
@@ -777,6 +842,9 @@ pub(crate) fn admit_workflow(
                 maximum_captured_files,
                 maximum_captured_file_bytes,
                 maximum_total_captured_bytes,
+                maximum_captured_git_carriers,
+                maximum_captured_git_carrier_bytes,
+                maximum_total_captured_git_carrier_bytes,
                 maximum_input_values,
                 maximum_input_value_bytes,
                 maximum_total_input_bytes,

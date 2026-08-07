@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::sys::signal::killpg;
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid as NixPid;
 use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_run::{RunBundle, isolated_command, run, signal_bundle};
@@ -31,7 +37,6 @@ fn status_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
         "status".to_owned(),
-        "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
     ];
     args.extend(options.iter().map(|option| (*option).to_owned()));
@@ -48,6 +53,32 @@ fn status_json(run_directory: &Path) -> (std::process::Output, serde_json::Value
     let output = status(run_directory, &["--json"]);
     let value = serde_json::from_slice(&output.stdout).unwrap();
     (output, value)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_group_quiescence(process_group: i32) {
+    const POLL_ATTEMPTS: usize = 2_000;
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    let process_group_path = Path::new("/proc").join(process_group.to_string());
+    let process_group = NixPid::from_raw(process_group);
+    let (_delay_sender, delay_receiver) = std::sync::mpsc::channel::<()>();
+    let mut remaining = POLL_ATTEMPTS;
+    let group_observation = loop {
+        let observation = killpg(process_group, None::<nix::sys::signal::Signal>);
+        if matches!(observation, Err(Errno::ESRCH)) && !process_group_path.exists() {
+            return;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            break observation;
+        }
+        assert!(matches!(
+            delay_receiver.recv_timeout(POLL_INTERVAL),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+    };
+    panic!("guarded process group did not quiesce: {group_observation:?}");
 }
 
 fn read_state(run_directory: &Path) -> serde_json::Value {
@@ -334,12 +365,9 @@ fn orphaned_guarded_cancellation_is_reaped_and_retry_eligible() {
     let mut remaining = Vec::new();
     control.read_to_end(&mut remaining).unwrap();
 
+    // Fixture EOF precedes the independent guard's reap boundary.
+    wait_for_process_group_quiescence(process_group_raw);
     let (output, result) = status_json(&run_directory);
-    assert!(
-        !Path::new("/proc")
-            .join(process_group_raw.to_string())
-            .exists()
-    );
     assert!(output.status.success());
     assert_eq!(result["recovery"]["status"], "abandoned");
     assert_eq!(result["retry"], serde_json::json!({"eligible": true}));
@@ -469,22 +497,15 @@ fn signals_interrupt_blocked_status_output_without_a_valid_object() {
 fn status_usage_errors_return_two_without_a_status_object() {
     for args in [
         vec!["workflow", "status", "--json"],
+        vec!["workflow", "status", "/tmp/run", "--plain", "--json"],
         vec![
             "workflow",
             "status",
-            "--run-dir",
-            "/tmp/run",
-            "--plain",
-            "--json",
-        ],
-        vec![
-            "workflow",
-            "status",
-            "--run-dir",
             "/tmp/run",
             "--execution-root",
             "/tmp/execution",
         ],
+        vec!["workflow", "status", "--run-dir", "/tmp/run"],
     ] {
         let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
         let output = isolated_command(&args).output().unwrap();

@@ -29,13 +29,47 @@ const BASE64_ENCODING: &str = "base64";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResultMetadataError;
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataError> {
-    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) || !bytes.ends_with(b"\n") {
-        return Err(ResultMetadataError);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResultDocumentError {
+    Encoding,
+    Json,
+}
+
+pub(crate) fn decode_document(bytes: &[u8]) -> Result<Value, ResultDocumentError> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf])
+        || !bytes.ends_with(b"\n")
+        || std::str::from_utf8(bytes).is_err()
+    {
+        return Err(ResultDocumentError::Encoding);
     }
-    let unique = serde_json::from_slice::<UniqueValue>(bytes).map_err(|_| ResultMetadataError)?;
+    serde_json::from_slice::<UniqueValue>(bytes)
+        .map(|unique| unique.0)
+        .map_err(|_| ResultDocumentError::Json)
+}
+
+pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), ResultMetadataError> {
+    let retained_exports = document
+        .as_object_mut()
+        .and_then(|object| object.get_mut("exports"))
+        .filter(|exports| exports.is_object())
+        .map(|exports| std::mem::replace(exports, Value::Object(serde_json::Map::new())));
+    let validation = serde_json::from_value::<WorkflowResultV1>(document.clone())
+        .map_err(|_| ResultMetadataError)
+        .and_then(|result| validate(&result));
+    if let Some(retained_exports) = retained_exports
+        && let Some(exports) = document
+            .as_object_mut()
+            .and_then(|object| object.get_mut("exports"))
+    {
+        *exports = retained_exports;
+    }
+    validation
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataError> {
+    let document = decode_document(bytes).map_err(|_| ResultMetadataError)?;
     let result =
-        serde_json::from_value::<WorkflowResultV1>(unique.0).map_err(|_| ResultMetadataError)?;
+        serde_json::from_value::<WorkflowResultV1>(document).map_err(|_| ResultMetadataError)?;
     validate(&result)?;
     Ok(result)
 }
@@ -72,11 +106,34 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
 fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
     let valid = match result.outcome {
         WorkflowOutcomeV1::Succeeded => {
-            result.primary_failure.is_none() && result.cancellation.is_none()
+            result.primary_failure.is_none()
+                && result.cancellation.is_none()
+                && result
+                    .steps
+                    .iter()
+                    .all(|step| step.state == WorkflowStepStateV1::Succeeded)
         }
-        WorkflowOutcomeV1::Failed => result.primary_failure.is_some(),
+        WorkflowOutcomeV1::Failed => {
+            result.primary_failure.is_some()
+                && (result.cancellation.is_some()
+                    || result
+                        .steps
+                        .iter()
+                        .all(|step| step.state != WorkflowStepStateV1::Cancelled))
+        }
         WorkflowOutcomeV1::Cancelled => {
-            result.primary_failure.is_none() && result.cancellation.is_some()
+            result.primary_failure.is_none()
+                && result.cancellation.is_some()
+                && result.steps.iter().all(|step| {
+                    matches!(
+                        step.state,
+                        WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Cancelled
+                    )
+                })
+                && result
+                    .steps
+                    .iter()
+                    .any(|step| step.state == WorkflowStepStateV1::Cancelled)
         }
     };
     if !valid {
@@ -158,8 +215,30 @@ fn validate_steps(steps: &[WorkflowStepV1]) -> Result<(), ResultMetadataError> {
                     )
             }
         };
+        let timing_present = step.started_at.is_some();
+        let output_present = step.command_output.is_some();
+        let timing_valid = match step.state {
+            WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Failed => timing_present,
+            WorkflowStepStateV1::Blocked | WorkflowStepStateV1::NotRun => !timing_present,
+            WorkflowStepStateV1::Cancelled => !output_present || timing_present,
+        };
+        let output_valid = match (step.kind.as_str(), step.state) {
+            ("agent", _) => !output_present,
+            ("cmd", WorkflowStepStateV1::Succeeded) => output_present,
+            ("cmd", WorkflowStepStateV1::Failed) => {
+                output_present
+                    == step
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.phase != FailurePhaseV1::Start)
+            }
+            ("cmd", WorkflowStepStateV1::Blocked | WorkflowStepStateV1::NotRun) => !output_present,
+            ("cmd", WorkflowStepStateV1::Cancelled) => true,
+            _ => false,
+        };
         if !exact_fields
-            || (step.kind == "agent" && step.command_output.is_some())
+            || !timing_valid
+            || !output_valid
             || step.command_output.as_ref().is_some_and(|output| {
                 !valid_stream(&output.stdout) || !valid_stream(&output.stderr)
             })
@@ -377,7 +456,7 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
     Ok(())
 }
 
-fn valid_export_kind(kind: &str, media_type: &str) -> bool {
+pub(super) fn valid_export_kind(kind: &str, media_type: &str) -> bool {
     match kind {
         "file" => media_type.chars().count() <= 128 && super::is_valid_media_type(media_type),
         "text" => media_type == "text/plain; charset=utf-8",
@@ -386,7 +465,7 @@ fn valid_export_kind(kind: &str, media_type: &str) -> bool {
     }
 }
 
-fn parse_carrier_ordinal(path: &str) -> Option<usize> {
+pub(super) fn parse_carrier_ordinal(path: &str) -> Option<usize> {
     let ordinal = path.strip_prefix("exports/")?;
     if ordinal.len() < 4 || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;

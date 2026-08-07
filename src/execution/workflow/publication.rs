@@ -899,6 +899,13 @@ fn write_available_export(
                 )
             })?,
         ),
+        CapturedValue::GitBranch(_) => {
+            return Err(LocalPublicationError::for_export(
+                LocalPublicationPhase::ExportCopy,
+                LocalPublicationFailureKind::UnsupportedExport,
+                name,
+            ));
+        }
     };
     let mut destination = staging.create_export(&file_name).map_err(|kind| {
         LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
@@ -922,6 +929,13 @@ fn write_available_export(
             CapturedValue::Json(value) => {
                 canonical_json::to_writer(&mut hashing, value)
                     .map_err(|_| export_write_error(name))?;
+            }
+            CapturedValue::GitBranch(_) => {
+                return Err(LocalPublicationError::for_export(
+                    LocalPublicationPhase::ExportCopy,
+                    LocalPublicationFailureKind::UnsupportedExport,
+                    name,
+                ));
             }
         }
         hashing.flush().map_err(|_| export_write_error(name))?;
@@ -1370,7 +1384,11 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
                 CaptureFailureKind::FileCountLimitExceeded => FailureCodeV1::CapturedFileCountLimit,
                 CaptureFailureKind::FileSizeLimitExceeded => FailureCodeV1::CapturedFileSizeLimit,
                 CaptureFailureKind::TotalSizeLimitExceeded => FailureCodeV1::CapturedTotalSizeLimit,
-                CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
+                CaptureFailureKind::GitCarrierCountLimitExceeded
+                | CaptureFailureKind::GitCarrierSizeLimitExceeded
+                | CaptureFailureKind::TotalGitCarrierSizeLimitExceeded
+                | CaptureFailureKind::CarrierProducerUnavailable
+                | CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
             };
             let mut cause = FailureCauseV1::code(code);
             cause.output = Some(failure.output_identity().to_owned());

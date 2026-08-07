@@ -690,7 +690,7 @@ fn resolve_text<'a>(
             value_type: WorkflowValueType::Text,
         } => match upstream_value(upstream_outputs, source)? {
             CapturedValue::Text(value) => Ok(value),
-            CapturedValue::Json(_) | CapturedValue::File(_) => {
+            CapturedValue::Json(_) | CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
                 Err(start_error(AgentInputStartFailure::ValueTypeMismatch {
                     source: source.clone(),
                 }))

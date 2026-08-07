@@ -1636,11 +1636,8 @@ impl AssistantUpdateEvent {
                     && append_text(previous, current, self.index, delta, BlockKind::Thinking)
             }
             AssistantUpdateKind::ThinkingEnd(content) => {
-                let block = ContentBlock::Thinking(content.clone());
                 *open == Some(OpenBlock::Thinking(self.index))
-                    && previous.content.get(self.index) == Some(&block)
-                    && current.content.get(self.index) == Some(&block)
-                    && unchanged_except(previous, current, self.index)
+                    && finalize_thinking(previous, current, self.index, content)
                     && clear_open(open)
             }
             AssistantUpdateKind::ToolCallStart => {
@@ -2114,6 +2111,29 @@ fn append_text(
         ) => after.strip_prefix(before) == Some(delta),
         _ => false,
     }
+}
+
+fn finalize_thinking(
+    previous: &AssistantMessage,
+    current: &AssistantMessage,
+    index: usize,
+    finalized: &str,
+) -> bool {
+    if !unchanged_except(previous, current, index) {
+        return false;
+    }
+    matches!(
+        (previous.content.get(index), current.content.get(index)),
+        (
+            Some(ContentBlock::Thinking(streamed)),
+            Some(ContentBlock::Thinking(current))
+        ) if current == finalized
+            && streamed.strip_prefix(finalized).is_some_and(|removed| {
+                removed
+                    .bytes()
+                    .all(|byte| matches!(byte, b'\r' | b'\n'))
+            })
+    )
 }
 
 fn unchanged_except(previous: &AssistantMessage, current: &AssistantMessage, index: usize) -> bool {

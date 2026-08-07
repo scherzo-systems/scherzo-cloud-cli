@@ -6,7 +6,9 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::execution::workflow::rejection::RejectionDiagnostic as Diagnostic;
-use crate::execution::workflow::resolution::{ResolutionFailure, ResolvedWorkflow, resolve};
+use crate::execution::workflow::resolution::{
+    ResolutionFailure, ResolvedWorkflow, resolve_workflow_file,
+};
 
 pub(super) const ABOUT: &str = "Validate a local Workflow V1 bundle without executing it";
 const COMMAND_NAME: &str = "scherzo-cloud workflow validate";
@@ -22,7 +24,7 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        match resolve(&self.source.source_root, &self.source.workflow_path) {
+        match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
             Ok(workflow) => {
                 let result = if self.json {
                     write_json_valid(&workflow)
@@ -136,11 +138,7 @@ fn write_json_invalid(failure: &ResolutionFailure) -> Result<(), OutputError> {
 }
 
 fn write_json(report: &JsonReport<'_>) -> Result<(), OutputError> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, report).map_err(OutputError::WriteJson)?;
-    writeln!(stdout)?;
-    Ok(())
+    super::super::write_pretty_json(report).map_err(OutputError::WriteOutput)
 }
 
 #[derive(Serialize)]
@@ -182,7 +180,6 @@ struct JsonDigest<'a> {
 
 #[derive(Debug)]
 enum OutputError {
-    WriteJson(serde_json::Error),
     WriteOutput(io::Error),
 }
 
@@ -195,9 +192,6 @@ impl From<io::Error> for OutputError {
 impl fmt::Display for OutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WriteJson(error) => {
-                write!(formatter, "write JSON workflow validation result: {error}")
-            }
             Self::WriteOutput(error) => {
                 write!(formatter, "write workflow validation result: {error}")
             }

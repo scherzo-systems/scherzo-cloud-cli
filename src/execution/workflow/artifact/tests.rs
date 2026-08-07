@@ -23,6 +23,24 @@ impl CaptureFixture {
         maximum_file_bytes: u64,
         maximum_total_bytes: u64,
     ) -> Self {
+        Self::with_all_limits(
+            maximum_files,
+            maximum_file_bytes,
+            maximum_total_bytes,
+            64,
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+        )
+    }
+
+    fn with_all_limits(
+        maximum_files: usize,
+        maximum_file_bytes: u64,
+        maximum_total_bytes: u64,
+        maximum_git_carriers: usize,
+        maximum_git_carrier_bytes: u64,
+        maximum_total_git_carrier_bytes: u64,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
         let staging_parent = temporary.path().join("staging");
@@ -31,9 +49,16 @@ impl CaptureFixture {
         let store = ArtifactStaging::create_for_execution(
             &execution_root,
             &staging_parent,
-            NonZeroUsize::new(maximum_files).unwrap(),
-            NonZeroU64::new(maximum_file_bytes).unwrap(),
-            NonZeroU64::new(maximum_total_bytes).unwrap(),
+            CarrierLimits {
+                maximum_count: NonZeroUsize::new(maximum_files).unwrap(),
+                maximum_bytes: NonZeroU64::new(maximum_file_bytes).unwrap(),
+                maximum_total_bytes: NonZeroU64::new(maximum_total_bytes).unwrap(),
+            },
+            CarrierLimits {
+                maximum_count: NonZeroUsize::new(maximum_git_carriers).unwrap(),
+                maximum_bytes: NonZeroU64::new(maximum_git_carrier_bytes).unwrap(),
+                maximum_total_bytes: NonZeroU64::new(maximum_total_git_carrier_bytes).unwrap(),
+            },
         )
         .unwrap();
         Self {
@@ -82,9 +107,16 @@ fn staging_cannot_be_created_inside_the_execution_root() {
     let result = ArtifactStaging::create_for_execution(
         &execution_root,
         &exposed_parent,
-        NonZeroUsize::new(64).unwrap(),
-        NonZeroU64::new(64).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
+        CarrierLimits {
+            maximum_count: NonZeroUsize::new(64).unwrap(),
+            maximum_bytes: NonZeroU64::new(64).unwrap(),
+            maximum_total_bytes: NonZeroU64::new(4096).unwrap(),
+        },
+        CarrierLimits {
+            maximum_count: NonZeroUsize::new(64).unwrap(),
+            maximum_bytes: NonZeroU64::new(64).unwrap(),
+            maximum_total_bytes: NonZeroU64::new(4096).unwrap(),
+        },
     );
 
     assert!(matches!(
@@ -149,6 +181,41 @@ fn captures_a_regular_file_with_path_free_metadata_and_independent_bytes() {
     fs::write(&source_path, b"changed bytes!").unwrap();
     fs::remove_file(&source_path).unwrap();
     assert_eq!(fixture.read(&captured), b"captured bytes");
+}
+
+#[test]
+fn retained_identity_guard_is_a_cleanup_tracked_hard_link() {
+    let fixture = CaptureFixture::new(64);
+    fs::write(fixture.execution_root.join("report.bin"), b"captured bytes").unwrap();
+
+    let captured = fixture.capture("report.bin").unwrap();
+    let staged_path = fixture.staging_path().join(captured.handle().opaque_id());
+    let guard_identity = fixture
+        .store
+        .inner
+        .identity_guards
+        .lock()
+        .unwrap()
+        .get(captured.handle().opaque_id())
+        .unwrap()
+        .clone();
+    let guard_path = fixture.staging_path().join(guard_identity.as_ref());
+    let staged_metadata = fs::metadata(&staged_path).unwrap();
+    let guard_metadata = fs::metadata(&guard_path).unwrap();
+
+    assert_eq!(
+        (staged_metadata.dev(), staged_metadata.ino()),
+        (guard_metadata.dev(), guard_metadata.ino())
+    );
+    assert_eq!(staged_metadata.nlink(), 2);
+
+    drop(captured);
+    assert!(
+        fs::read_dir(fixture.staging_path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -328,6 +395,433 @@ fn total_byte_overflow_rolls_back_the_set_and_the_exact_budget_is_reusable() {
     assert_eq!(overflow.kind(), CaptureFailureKind::TotalSizeLimitExceeded);
     assert_eq!(fixture.store.staged_artifact_count(), 2);
     assert_eq!(exact.keys().cloned().collect::<Vec<_>>(), ["three", "two"]);
+}
+
+struct BytesCarrierProducer(Vec<u8>);
+
+impl CarrierProducer for BytesCarrierProducer {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()> {
+        destination.write_all(&self.0)
+    }
+}
+
+fn git_metadata(base: u8, head: u8, tree: u8) -> GitBranchMetadata {
+    GitBranchMetadata::new(
+        Arc::from(format!("{base:040x}")),
+        Arc::from(format!("{head:040x}")),
+        Arc::from(format!("{tree:040x}")),
+    )
+}
+
+fn failed_capture(result: Result<CaptureCandidateSet, CaptureAttemptFailure>) -> CaptureFailure {
+    match result {
+        Err(CaptureAttemptFailure::Capture(failure)) => failure,
+        Err(CaptureAttemptFailure::Cancelled) => panic!("capture was unexpectedly cancelled"),
+        Ok(_) => panic!("capture unexpectedly succeeded"),
+    }
+}
+
+#[test]
+fn mixed_candidates_commit_and_release_independent_typed_carriers() {
+    let fixture = CaptureFixture::with_all_limits(2, 4, 6, 2, 5, 7);
+    fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
+    let mut producer = BytesCarrierProducer(b"git!!".to_vec());
+    let mut declarations = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "changes",
+            git_metadata(1, 2, 3),
+            Some(&mut producer),
+        )),
+    ];
+
+    let candidates = fixture
+        .store
+        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+        .unwrap();
+
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.reservation_usage(), (1, 4));
+    assert_eq!(fixture.store.git_reservation_usage(), (1, 5));
+    let mut outputs = candidates.commit();
+    assert_eq!(fixture.store.budget_usage(), (1, 4));
+    assert_eq!(fixture.store.git_budget_usage(), (1, 5));
+
+    let file = outputs["report"].as_file().unwrap();
+    assert_eq!(file.carrier().budget_class(), CarrierBudgetClass::File);
+    let CapturedValue::GitBranch(branch) = &outputs["changes"] else {
+        panic!("Git output lost its semantic type");
+    };
+    assert_eq!(branch.output_identity(), "changes");
+    assert_eq!(branch.metadata().artifact_version(), 1);
+    assert_eq!(branch.metadata().object_format().as_str(), "sha1");
+    assert_eq!(branch.metadata().base_oid(), format!("{:040x}", 1));
+    assert_eq!(branch.metadata().head_oid(), format!("{:040x}", 2));
+    assert_eq!(branch.metadata().tree_oid(), format!("{:040x}", 3));
+    let carrier = branch.carrier().unwrap();
+    assert_eq!(carrier.media_type(), "application/vnd.git.bundle");
+    assert_eq!(carrier.identity(), carrier.handle().opaque_id());
+    assert_eq!(carrier.budget_class(), CarrierBudgetClass::Git);
+    let mut bytes = Vec::new();
+    fixture.store.copy_to(carrier.handle(), &mut bytes).unwrap();
+    assert_eq!(bytes, b"git!!");
+
+    drop(outputs.remove("report"));
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (1, 5));
+    drop(outputs);
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+#[test]
+fn aborting_a_mixed_candidate_releases_both_reservations_and_carriers() {
+    let fixture = CaptureFixture::with_all_limits(2, 8, 16, 2, 8, 16);
+    fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
+    let mut producer = BytesCarrierProducer(b"git".to_vec());
+    let mut declarations = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "changes",
+            git_metadata(1, 2, 3),
+            Some(&mut producer),
+        )),
+    ];
+    let candidates = fixture
+        .store
+        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+        .unwrap();
+    assert_eq!(fixture.store.reservation_usage(), (1, 4));
+    assert_eq!(fixture.store.git_reservation_usage(), (1, 3));
+
+    candidates.abort();
+
+    assert_eq!(fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+#[test]
+fn zero_delta_git_value_has_no_carrier_or_budget_charge() {
+    let fixture = CaptureFixture::with_all_limits(1, 1, 1, 1, 1, 1);
+    let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("changes", git_metadata(1, 1, 2), None),
+    )];
+
+    let outputs = fixture
+        .store
+        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+        .unwrap()
+        .commit();
+
+    let CapturedValue::GitBranch(branch) = &outputs["changes"] else {
+        panic!("Git output lost its semantic type");
+    };
+    assert!(branch.carrier().is_none());
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+#[test]
+fn git_overflow_rolls_back_both_ledgers_without_borrowing_file_capacity() {
+    let fixture = CaptureFixture::with_all_limits(3, 8, 16, 2, 3, 3);
+    fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
+    let mut oversized = BytesCarrierProducer(b"git!".to_vec());
+    let mut mixed = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "changes",
+            git_metadata(1, 2, 3),
+            Some(&mut oversized),
+        )),
+    ];
+
+    let failure = failed_capture(
+        fixture
+            .store
+            .capture_candidates(&mut mixed, &CaptureCancellation::default()),
+    );
+
+    assert_eq!(failure.output_identity(), "changes");
+    assert_eq!(
+        failure.kind(),
+        CaptureFailureKind::GitCarrierSizeLimitExceeded
+    );
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+
+    let mut exact = BytesCarrierProducer(b"git".to_vec());
+    let mut exact_declaration = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("prior", git_metadata(1, 2, 3), Some(&mut exact)),
+    )];
+    let retained = fixture
+        .store
+        .capture_candidates(&mut exact_declaration, &CaptureCancellation::default())
+        .unwrap()
+        .commit();
+    assert_eq!(fixture.store.git_budget_usage(), (1, 3));
+
+    fs::write(fixture.execution_root.join("next.bin"), b"x").unwrap();
+    let mut one_more = BytesCarrierProducer(b"x".to_vec());
+    let mut total_overflow = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "next",
+            Path::new("next.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "nextChanges",
+            git_metadata(2, 3, 4),
+            Some(&mut one_more),
+        )),
+    ];
+    let failure = failed_capture(
+        fixture
+            .store
+            .capture_candidates(&mut total_overflow, &CaptureCancellation::default()),
+    );
+    assert_eq!(
+        failure.kind(),
+        CaptureFailureKind::TotalGitCarrierSizeLimitExceeded
+    );
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (1, 3));
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    drop(retained);
+}
+
+#[test]
+fn git_count_failure_acquires_neither_ledger() {
+    let fixture = CaptureFixture::with_all_limits(2, 8, 16, 1, 8, 16);
+    let mut prior_producer = BytesCarrierProducer(b"a".to_vec());
+    let mut prior = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("prior", git_metadata(1, 2, 3), Some(&mut prior_producer)),
+    )];
+    let retained = fixture
+        .store
+        .capture_candidates(&mut prior, &CaptureCancellation::default())
+        .unwrap()
+        .commit();
+    fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
+    let mut next_producer = BytesCarrierProducer(b"b".to_vec());
+    let mut mixed = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "changes",
+            git_metadata(2, 3, 4),
+            Some(&mut next_producer),
+        )),
+    ];
+
+    let failure = failed_capture(
+        fixture
+            .store
+            .capture_candidates(&mut mixed, &CaptureCancellation::default()),
+    );
+
+    assert_eq!(
+        failure.kind(),
+        CaptureFailureKind::GitCarrierCountLimitExceeded
+    );
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (1, 1));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    drop(retained);
+}
+
+struct CancellingCarrierProducer {
+    cancellation: CaptureCancellation,
+}
+
+impl CarrierProducer for CancellingCarrierProducer {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()> {
+        destination.write_all(b"git")?;
+        self.cancellation.cancel();
+        destination.write_all(b"!")
+    }
+}
+
+#[test]
+fn carrier_stream_cancellation_rolls_back_a_mixed_candidate_set() {
+    let fixture = CaptureFixture::with_all_limits(2, 8, 16, 2, 8, 16);
+    fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
+    let cancellation = CaptureCancellation::default();
+    let mut producer = CancellingCarrierProducer {
+        cancellation: cancellation.clone(),
+    };
+    let mut declarations = [
+        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        )),
+        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+            "changes",
+            git_metadata(1, 2, 3),
+            Some(&mut producer),
+        )),
+    ];
+
+    let result = fixture
+        .store
+        .capture_candidates(&mut declarations, &cancellation);
+
+    assert!(matches!(result, Err(CaptureAttemptFailure::Cancelled)));
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+struct GatedCarrierProducer {
+    started: Arc<Barrier>,
+    resume: Arc<Barrier>,
+    bytes: &'static [u8],
+}
+
+impl CarrierProducer for GatedCarrierProducer {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()> {
+        self.started.wait();
+        self.resume.wait();
+        destination.write_all(self.bytes)
+    }
+}
+
+#[test]
+fn concurrent_git_captures_reserve_in_serial_capture_order() {
+    let fixture = CaptureFixture::with_all_limits(1, 1, 1, 2, 3, 3);
+    let started = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let first_store = fixture.store.clone();
+    let first_started = Arc::clone(&started);
+    let first_resume = Arc::clone(&resume);
+    let first = std::thread::spawn(move || {
+        let mut producer = GatedCarrierProducer {
+            started: first_started,
+            resume: first_resume,
+            bytes: b"one",
+        };
+        let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+            GitBranchCaptureDeclaration::new("first", git_metadata(1, 2, 3), Some(&mut producer)),
+        )];
+        first_store.capture_candidates(&mut declarations, &CaptureCancellation::default())
+    });
+    started.wait();
+    let second_store = fixture.store.clone();
+    let second = std::thread::spawn(move || {
+        let mut producer = BytesCarrierProducer(b"two".to_vec());
+        let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+            GitBranchCaptureDeclaration::new("second", git_metadata(2, 3, 4), Some(&mut producer)),
+        )];
+        second_store.capture_candidates(&mut declarations, &CaptureCancellation::default())
+    });
+    resume.wait();
+
+    let retained = first.join().unwrap().unwrap().commit();
+    let failure = failed_capture(second.join().unwrap());
+
+    assert_eq!(failure.output_identity(), "second");
+    assert_eq!(
+        failure.kind(),
+        CaptureFailureKind::TotalGitCarrierSizeLimitExceeded
+    );
+    assert_eq!(fixture.store.git_budget_usage(), (1, 3));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    drop(retained);
+}
+
+#[test]
+fn git_carrier_presence_must_match_semantic_delta() {
+    let fixture = CaptureFixture::with_all_limits(1, 1, 1, 1, 8, 8);
+
+    let mut missing_carrier = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("changed", git_metadata(1, 2, 3), None),
+    )];
+    let missing_carrier_rejected = fixture
+        .store
+        .capture_candidates(&mut missing_carrier, &CaptureCancellation::default())
+        .is_err();
+
+    let mut producer = BytesCarrierProducer(b"bundle".to_vec());
+    let mut forbidden_carrier = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("unchanged", git_metadata(1, 1, 3), Some(&mut producer)),
+    )];
+    let forbidden_carrier_rejected = fixture
+        .store
+        .capture_candidates(&mut forbidden_carrier, &CaptureCancellation::default())
+        .is_err();
+
+    assert_eq!(fixture.store.git_budget_usage(), (0, 0));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+    assert!(
+        missing_carrier_rejected && forbidden_carrier_rejected,
+        "carrier presence invariant was not enforced: missing_rejected={missing_carrier_rejected}, forbidden_rejected={forbidden_carrier_rejected}"
+    );
+}
+
+#[test]
+fn git_carrier_handles_reject_cross_execution_replacement_and_release() {
+    let fixture = CaptureFixture::with_all_limits(1, 1, 1, 1, 8, 8);
+    let other = CaptureFixture::with_all_limits(1, 1, 1, 1, 8, 8);
+    let mut producer = BytesCarrierProducer(b"bundle".to_vec());
+    let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+        GitBranchCaptureDeclaration::new("changes", git_metadata(1, 2, 3), Some(&mut producer)),
+    )];
+    let outputs = fixture
+        .store
+        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+        .unwrap()
+        .commit();
+    let CapturedValue::GitBranch(branch) = &outputs["changes"] else {
+        panic!("Git output lost its semantic type");
+    };
+    let handle = branch.carrier().unwrap().handle().clone();
+
+    assert_eq!(
+        other.store.copy_to(&handle, &mut Vec::new()),
+        Err(ArtifactReadFailure::UnknownHandle)
+    );
+    let staged_path = fixture.staging_path().join(handle.opaque_id());
+    fs::remove_file(&staged_path).unwrap();
+    fs::write(&staged_path, b"replacement").unwrap();
+    assert_eq!(
+        fixture.store.copy_to(&handle, &mut Vec::new()),
+        Err(ArtifactReadFailure::UnknownHandle)
+    );
+
+    fixture.store.release().unwrap();
+    assert_eq!(
+        fixture.store.copy_to(&handle, &mut Vec::new()),
+        Err(ArtifactReadFailure::UnknownHandle)
+    );
 }
 
 #[test]

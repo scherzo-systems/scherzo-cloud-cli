@@ -48,6 +48,8 @@ const RECORDED_CWD: &str = "/execution/worktree";
 const RESPONSE_SUCCESS: &str = include_str!("fixtures/response-success.jsonl");
 const NATIVE_RECOVERY: &str = include_str!("fixtures/native-recovery.jsonl");
 const TERMINAL_TOOL_USE: &str = include_str!("fixtures/terminal-tool-use.jsonl");
+const STREAMED_THINKING: &str = "**Reading package.json contents**";
+const EXPECTED_RESPONSE: &str = "package contents";
 
 #[derive(Clone)]
 enum TestClock {
@@ -150,6 +152,9 @@ case "$PI_FIXTURE_MODE" in
     printf '{"type":"turn_end","message":%s,"toolResults":[]}\n' "$assistant"
     printf '{"type":"agent_end","messages":[%s],"willRetry":false}\n' "$assistant"
     printf '%s\n' '{"type":"agent_settled"}'
+    ;;
+  transcript)
+    cat "$PI_FIXTURE_PHASE_TRANSCRIPT"
     ;;
   *)
     exit 73
@@ -1251,6 +1256,167 @@ fn nul_values(bytes: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &str) -> Vec<u8> {
+    let usage = json!({
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+    });
+    let message = |content: Value, stop_reason: &str| {
+        json!({
+            "role": "assistant",
+            "content": content,
+            "api": "test-api",
+            "provider": "test-provider",
+            "model": "test-model",
+            "usage": &usage,
+            "stopReason": stop_reason,
+            "timestamp": 2
+        })
+    };
+    let empty = message(json!([]), "pending");
+    let thinking_started = message(json!([{"type": "thinking", "thinking": ""}]), "pending");
+    let thinking_content = message(
+        json!([{"type": "thinking", "thinking": STREAMED_THINKING}]),
+        "pending",
+    );
+    let thinking_with_suffix = message(
+        json!([{"type": "thinking", "thinking": format!("{STREAMED_THINKING}{streamed_suffix}")}]),
+        "pending",
+    );
+    let thinking_ended = message(
+        json!([{"type": "thinking", "thinking": finalized_thinking}]),
+        "pending",
+    );
+    let text_started = message(
+        json!([
+            {"type": "thinking", "thinking": finalized_thinking},
+            {"type": "text", "text": ""}
+        ]),
+        "pending",
+    );
+    let text_content = message(
+        json!([
+            {"type": "thinking", "thinking": finalized_thinking},
+            {"type": "text", "text": EXPECTED_RESPONSE}
+        ]),
+        "pending",
+    );
+    let completed = message(
+        json!([
+            {"type": "thinking", "thinking": finalized_thinking},
+            {"type": "text", "text": EXPECTED_RESPONSE}
+        ]),
+        "stop",
+    );
+    let events = [
+        json!({"type": "agent_start"}),
+        json!({"type": "turn_start"}),
+        json!({"type": "message_start", "message": &empty}),
+        json!({
+            "type": "message_update",
+            "message": &thinking_started,
+            "assistantMessageEvent": {
+                "type": "thinking_start",
+                "contentIndex": 0,
+                "partial": &thinking_started
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &thinking_content,
+            "assistantMessageEvent": {
+                "type": "thinking_delta",
+                "contentIndex": 0,
+                "delta": STREAMED_THINKING,
+                "partial": &thinking_content
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &thinking_with_suffix,
+            "assistantMessageEvent": {
+                "type": "thinking_delta",
+                "contentIndex": 0,
+                "delta": streamed_suffix,
+                "partial": &thinking_with_suffix
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &thinking_ended,
+            "assistantMessageEvent": {
+                "type": "thinking_end",
+                "contentIndex": 0,
+                "content": finalized_thinking,
+                "partial": &thinking_ended
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &text_started,
+            "assistantMessageEvent": {
+                "type": "text_start",
+                "contentIndex": 1,
+                "partial": &text_started
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &text_content,
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 1,
+                "delta": EXPECTED_RESPONSE,
+                "partial": &text_content
+            }
+        }),
+        json!({
+            "type": "message_update",
+            "message": &text_content,
+            "assistantMessageEvent": {
+                "type": "text_end",
+                "contentIndex": 1,
+                "content": EXPECTED_RESPONSE,
+                "partial": &text_content
+            }
+        }),
+        json!({"type": "message_end", "message": &completed}),
+        json!({"type": "turn_end", "message": &completed, "toolResults": []}),
+        json!({"type": "agent_end", "messages": [&completed], "willRetry": false}),
+        json!({"type": "agent_settled"}),
+    ];
+    let mut transcript = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut transcript, &event).unwrap();
+        transcript.push(b'\n');
+    }
+    transcript
+}
+
+fn thinking_finalization_fixture(
+    streamed_suffix: &str,
+    finalized_thinking: &str,
+) -> ProcessFixture {
+    let fixture = ProcessFixture::new_with_value_mode(
+        "transcript",
+        "system".to_owned(),
+        "message".to_owned(),
+        AgentValueMode::Response {
+            output: Arc::from("response"),
+        },
+    );
+    fs::write(
+        &fixture.phase_transcript,
+        thinking_finalization_transcript(streamed_suffix, finalized_thinking),
+    )
+    .unwrap();
+    fixture
+}
+
 #[tokio::test]
 async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agent_start() {
     with_watchdog(async {
@@ -1324,6 +1490,72 @@ async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agen
         assert_ne!(first.session, second.session);
         assert!(first.cwd.ends_with(b"/execution/worktree\n"));
         assert!(second.cwd.ends_with(b"/execution/worktree\n"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn thinking_end_may_remove_trailing_line_breaks_before_response_completion() {
+    with_watchdog(async {
+        for streamed_suffix in ["\n\n", "\r\n"] {
+            let run = run_success(thinking_finalization_fixture(
+                streamed_suffix,
+                STREAMED_THINKING,
+            ))
+            .await;
+            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = run.outcome
+            else {
+                panic!("trailing thinking line-break normalization must complete");
+            };
+            assert_eq!(response.as_str(), EXPECTED_RESPONSE);
+            let reasoning = run
+                .observations
+                .iter()
+                .filter_map(|observation| match observation.observation() {
+                    AgentObservation::Reasoning { text } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(reasoning, format!("{STREAMED_THINKING}{streamed_suffix}"));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn thinking_end_may_not_remove_trailing_spaces_or_tabs() {
+    with_watchdog(async {
+        for streamed_suffix in [" ", "\t"] {
+            let run = run_success(thinking_finalization_fixture(
+                streamed_suffix,
+                STREAMED_THINKING,
+            ))
+            .await;
+            assert_eq!(
+                run.outcome,
+                AgentOutcome::Failed {
+                    cause: AgentFailureCause::HarnessProtocolFailed
+                }
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn thinking_end_substantive_rewrite_remains_a_protocol_failure() {
+    with_watchdog(async {
+        let run = run_success(thinking_finalization_fixture(
+            "\n\n",
+            "**Reading package-lock.json contents**",
+        ))
+        .await;
+        assert_eq!(
+            run.outcome,
+            AgentOutcome::Failed {
+                cause: AgentFailureCause::HarnessProtocolFailed
+            }
+        );
     })
     .await;
 }

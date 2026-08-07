@@ -1,16 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{self, Read, Seek as _, SeekFrom};
+use std::io::{Read, Seek as _, SeekFrom};
 use std::os::fd::OwnedFd;
-
-use ring::digest::{Context as DigestContext, SHA256};
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, openat, statat};
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 
 use super::publication::{ExportV1, WorkflowResultV1};
 use super::result_metadata;
 use super::schema_common::lowercase_hex;
+use ring::digest::{Context as DigestContext, SHA256};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, openat, statat};
 
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
@@ -252,11 +249,10 @@ fn validate_utf8(reader: &mut impl Read) -> Result<(), ArtifactSetError> {
     }
 }
 
-fn validate_canonical_json(reader: &mut impl Read) -> Result<(), ArtifactSetError> {
-    let mut compact = CompactJsonReader::new(reader);
-    let mut deserializer = serde_json::Deserializer::from_reader(&mut compact);
-    OrderedUniqueValue::deserialize(&mut deserializer).map_err(|_| ArtifactSetError)?;
-    deserializer.end().map_err(|_| ArtifactSetError)
+fn validate_canonical_json(
+    reader: &mut (impl Read + std::io::Seek),
+) -> Result<(), ArtifactSetError> {
+    super::artifact_json::validate(reader).map_err(|_| ArtifactSetError)
 }
 
 fn bounded_entry_names(
@@ -276,126 +272,4 @@ fn bounded_entry_names(
         entries.insert(name.to_vec());
     }
     Ok(entries)
-}
-
-struct CompactJsonReader<Reader> {
-    inner: Reader,
-    in_string: bool,
-    escaped: bool,
-}
-
-impl<Reader> CompactJsonReader<Reader> {
-    fn new(inner: Reader) -> Self {
-        Self {
-            inner,
-            in_string: false,
-            escaped: false,
-        }
-    }
-}
-
-impl<Reader: Read> Read for CompactJsonReader<Reader> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(bytes)?;
-        for byte in &bytes[..read] {
-            if self.in_string {
-                if self.escaped {
-                    self.escaped = false;
-                } else if *byte == b'\\' {
-                    self.escaped = true;
-                } else if *byte == b'"' {
-                    self.in_string = false;
-                }
-            } else if *byte == b'"' {
-                self.in_string = true;
-            } else if byte.is_ascii_whitespace() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "noncanonical JSON whitespace",
-                ));
-            }
-        }
-        Ok(read)
-    }
-}
-
-struct OrderedUniqueValue;
-
-impl<'de> Deserialize<'de> for OrderedUniqueValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(OrderedUniqueValueVisitor)
-    }
-}
-
-struct OrderedUniqueValueVisitor;
-
-impl<'de> Visitor<'de> for OrderedUniqueValueVisitor {
-    type Value = OrderedUniqueValue;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("compact JSON with ordered unique object members")
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while sequence.next_element::<OrderedUniqueValue>()?.is_some() {}
-        Ok(OrderedUniqueValue)
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut previous: Option<String> = None;
-        while let Some(name) = map.next_key::<String>()? {
-            if previous
-                .as_ref()
-                .is_some_and(|previous| previous.as_bytes() >= name.as_bytes())
-            {
-                return Err(A::Error::custom(
-                    "unordered or duplicate JSON object member",
-                ));
-            }
-            previous = Some(name);
-            map.next_value::<OrderedUniqueValue>()?;
-        }
-        Ok(OrderedUniqueValue)
-    }
 }

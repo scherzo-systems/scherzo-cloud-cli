@@ -2,18 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak};
 
 #[cfg(test)]
 use std::path::PathBuf;
 
+use ring::digest::{Context as DigestContext, SHA256};
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, statat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, fchmod, fstat, linkat, mkdirat, openat, statat, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -23,6 +24,8 @@ use super::private_staging::{
     StagingLifecycle, cleanup_staging, mark_cleanup_failed as mark_staging_cleanup_failed,
     same_file,
 };
+use super::schema_common::lowercase_hex;
+use super::value::CapturedValue;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
@@ -40,11 +43,11 @@ impl CaptureCancellation {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    fn check(&self) -> Result<(), CaptureAttemptFailure> {
+    pub(crate) fn check(&self) -> Result<(), CaptureAttemptFailure> {
         if self.is_cancelled() {
             Err(CaptureAttemptFailure::Cancelled)
         } else {
@@ -52,7 +55,7 @@ impl CaptureCancellation {
         }
     }
 
-    fn boundary(
+    pub(crate) fn boundary(
         &self,
         output_identity: &Arc<str>,
         kind: CaptureBoundaryKind,
@@ -84,6 +87,7 @@ pub(crate) enum CaptureBoundaryKind {
     BeforeRead,
     BeforeWrite,
     AfterWrite,
+    BeforeGitRecheck,
 }
 
 #[cfg(test)]
@@ -146,6 +150,10 @@ pub(crate) enum CaptureFailureKind {
     FileCountLimitExceeded,
     FileSizeLimitExceeded,
     TotalSizeLimitExceeded,
+    GitCarrierCountLimitExceeded,
+    GitCarrierSizeLimitExceeded,
+    TotalGitCarrierSizeLimitExceeded,
+    CarrierProducerUnavailable,
     StagingUnavailable,
 }
 
@@ -184,6 +192,29 @@ impl fmt::Display for CaptureFailure {
 
 impl std::error::Error for CaptureFailure {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierBudgetClass {
+    File,
+    Git,
+}
+
+impl CarrierBudgetClass {
+    const ALL: [Self; 2] = [Self::File, Self::Git];
+
+    fn total_overflow_kind(self) -> CaptureFailureKind {
+        match self {
+            Self::File => CaptureFailureKind::TotalSizeLimitExceeded,
+            Self::Git => CaptureFailureKind::TotalGitCarrierSizeLimitExceeded,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CarrierFileIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
 #[derive(Clone)]
 pub(crate) struct ArtifactHandle {
     store_identity: Arc<str>,
@@ -194,7 +225,9 @@ pub(crate) struct ArtifactHandle {
 struct ArtifactLease {
     store: Weak<ArtifactStagingInner>,
     artifact_identity: Arc<str>,
+    file_identity: CarrierFileIdentity,
     size: u64,
+    budget_class: CarrierBudgetClass,
     budgeted: AtomicBool,
 }
 
@@ -205,7 +238,7 @@ impl ArtifactLease {
 
     fn release_budget(&self, store: &ArtifactStagingInner) {
         if self.budgeted.swap(false, Ordering::AcqRel) {
-            store.release_budget(self.size);
+            store.release_budget(self.budget_class, self.size);
         }
     }
 }
@@ -245,24 +278,185 @@ impl fmt::Debug for ArtifactHandle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CapturedArtifact {
+pub(crate) struct StagedCarrier {
     handle: ArtifactHandle,
-    output_identity: Arc<str>,
     size: u64,
     media_type: Arc<str>,
+    budget_class: CarrierBudgetClass,
+}
+
+impl StagedCarrier {
+    pub(crate) fn handle(&self) -> &ArtifactHandle {
+        &self.handle
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        self.handle.opaque_id()
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub(crate) fn budget_class(&self) -> CarrierBudgetClass {
+        self.budget_class
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedArtifact {
+    output_identity: Arc<str>,
+    carrier: StagedCarrier,
+}
+
+impl CapturedArtifact {
+    pub(crate) fn handle(&self) -> &ArtifactHandle {
+        self.carrier.handle()
+    }
+
+    pub(crate) fn output_identity(&self) -> &str {
+        &self.output_identity
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.carrier.size()
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        self.carrier.media_type()
+    }
+
+    pub(crate) fn carrier(&self) -> &StagedCarrier {
+        &self.carrier
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitObjectFormat {
+    Sha1,
+}
+
+impl GitObjectFormat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitBranchMetadata {
+    artifact_version: u8,
+    object_format: GitObjectFormat,
+    base_oid: Arc<str>,
+    head_oid: Arc<str>,
+    tree_oid: Arc<str>,
+}
+
+impl GitBranchMetadata {
+    pub(crate) fn new(base_oid: Arc<str>, head_oid: Arc<str>, tree_oid: Arc<str>) -> Self {
+        Self {
+            artifact_version: 1,
+            object_format: GitObjectFormat::Sha1,
+            base_oid,
+            head_oid,
+            tree_oid,
+        }
+    }
+
+    pub(crate) fn artifact_version(&self) -> u8 {
+        self.artifact_version
+    }
+
+    pub(crate) fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    pub(crate) fn base_oid(&self) -> &str {
+        &self.base_oid
+    }
+
+    pub(crate) fn head_oid(&self) -> &str {
+        &self.head_oid
+    }
+
+    pub(crate) fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitBranchCarrier {
+    staged: StagedCarrier,
+    sha256: Arc<str>,
+}
+
+impl GitBranchCarrier {
+    pub(crate) fn handle(&self) -> &ArtifactHandle {
+        self.staged.handle()
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        self.staged.identity()
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.staged.size()
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        self.staged.media_type()
+    }
+
+    pub(crate) fn budget_class(&self) -> CarrierBudgetClass {
+        self.staged.budget_class()
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn staged(&self) -> &StagedCarrier {
+        &self.staged
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedGitBranch {
+    output_identity: Arc<str>,
+    metadata: GitBranchMetadata,
+    carrier: Option<GitBranchCarrier>,
+}
+
+impl CapturedGitBranch {
+    pub(crate) fn output_identity(&self) -> &str {
+        &self.output_identity
+    }
+
+    pub(crate) fn metadata(&self) -> &GitBranchMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn carrier(&self) -> Option<&GitBranchCarrier> {
+        self.carrier.as_ref()
+    }
 }
 
 pub(crate) struct CaptureCandidateSet {
-    outputs: BTreeMap<String, CapturedArtifact>,
+    outputs: BTreeMap<String, CapturedValue>,
     reservation: Option<CaptureReservation>,
 }
 
 impl CaptureCandidateSet {
-    pub(crate) fn outputs(&self) -> &BTreeMap<String, CapturedArtifact> {
+    pub(crate) fn outputs(&self) -> &BTreeMap<String, CapturedValue> {
         &self.outputs
     }
 
-    pub(crate) fn commit(mut self) -> BTreeMap<String, CapturedArtifact> {
+    pub(crate) fn commit(mut self) -> BTreeMap<String, CapturedValue> {
         if let Some(mut reservation) = self.reservation.take() {
             reservation.commit(&self.outputs);
         }
@@ -295,45 +489,94 @@ struct CaptureBounds {
     overflow_kind: CaptureFailureKind,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BudgetCounts {
+    files: usize,
+    git_carriers: usize,
+}
+
+impl BudgetCounts {
+    fn get(self, class: CarrierBudgetClass) -> usize {
+        match class {
+            CarrierBudgetClass::File => self.files,
+            CarrierBudgetClass::Git => self.git_carriers,
+        }
+    }
+
+    fn get_mut(&mut self, class: CarrierBudgetClass) -> &mut usize {
+        match class {
+            CarrierBudgetClass::File => &mut self.files,
+            CarrierBudgetClass::Git => &mut self.git_carriers,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BudgetBytes {
+    files: u64,
+    git_carriers: u64,
+}
+
+impl BudgetBytes {
+    fn get(self, class: CarrierBudgetClass) -> u64 {
+        match class {
+            CarrierBudgetClass::File => self.files,
+            CarrierBudgetClass::Git => self.git_carriers,
+        }
+    }
+
+    fn get_mut(&mut self, class: CarrierBudgetClass) -> &mut u64 {
+        match class {
+            CarrierBudgetClass::File => &mut self.files,
+            CarrierBudgetClass::Git => &mut self.git_carriers,
+        }
+    }
+}
+
 struct CaptureReservation {
     store: Arc<ArtifactStagingInner>,
-    files: usize,
-    bytes: u64,
+    counts: BudgetCounts,
+    bytes: BudgetBytes,
     active: bool,
 }
 
 impl CaptureReservation {
-    fn reserve_bytes(&mut self, bytes: u64) -> Result<(), CaptureFailureKind> {
+    fn reserve_bytes(
+        &mut self,
+        class: CarrierBudgetClass,
+        bytes: u64,
+    ) -> Result<(), CaptureFailureKind> {
+        let overflow = class.total_overflow_kind();
         let mut budget = self
             .store
             .budget
             .lock()
             .map_err(|_| CaptureFailureKind::StagingUnavailable)?;
-        let updated_budget = budget
-            .reserved_bytes
-            .checked_add(bytes)
-            .ok_or(CaptureFailureKind::TotalSizeLimitExceeded)?;
-        let updated_reservation = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or(CaptureFailureKind::TotalSizeLimitExceeded)?;
-        budget.reserved_bytes = updated_budget;
-        self.bytes = updated_reservation;
+        let usage = budget.usage_mut(class);
+        let updated_budget = usage.reserved_bytes.checked_add(bytes).ok_or(overflow)?;
+        let updated_reservation = self.bytes.get(class).checked_add(bytes).ok_or(overflow)?;
+        usage.reserved_bytes = updated_budget;
+        *self.bytes.get_mut(class) = updated_reservation;
         Ok(())
     }
 
-    fn commit(&mut self, outputs: &BTreeMap<String, CapturedArtifact>) {
+    fn commit(&mut self, outputs: &BTreeMap<String, CapturedValue>) {
         let mut budget = self
             .store
             .budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        budget.reserved_files = budget.reserved_files.saturating_sub(self.files);
-        budget.reserved_bytes = budget.reserved_bytes.saturating_sub(self.bytes);
-        budget.captured_files += self.files;
-        budget.captured_bytes += self.bytes;
-        for artifact in outputs.values() {
-            artifact.handle.lease.commit_budget();
+        for class in CarrierBudgetClass::ALL {
+            let usage = budget.usage_mut(class);
+            let count = self.counts.get(class);
+            let bytes = self.bytes.get(class);
+            usage.reserved_count = usage.reserved_count.saturating_sub(count);
+            usage.reserved_bytes = usage.reserved_bytes.saturating_sub(bytes);
+            usage.captured_count += count;
+            usage.captured_bytes += bytes;
+        }
+        for carrier in outputs.values().filter_map(CapturedValue::carrier) {
+            carrier.handle.lease.commit_budget();
         }
         self.active = false;
     }
@@ -349,26 +592,11 @@ impl Drop for CaptureReservation {
             .budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        budget.reserved_files = budget.reserved_files.saturating_sub(self.files);
-        budget.reserved_bytes = budget.reserved_bytes.saturating_sub(self.bytes);
-    }
-}
-
-impl CapturedArtifact {
-    pub(crate) fn handle(&self) -> &ArtifactHandle {
-        &self.handle
-    }
-
-    pub(crate) fn output_identity(&self) -> &str {
-        &self.output_identity
-    }
-
-    pub(crate) fn size(&self) -> u64 {
-        self.size
-    }
-
-    pub(crate) fn media_type(&self) -> &str {
-        &self.media_type
+        for class in CarrierBudgetClass::ALL {
+            let usage = budget.usage_mut(class);
+            usage.reserved_count = usage.reserved_count.saturating_sub(self.counts.get(class));
+            usage.reserved_bytes = usage.reserved_bytes.saturating_sub(self.bytes.get(class));
+        }
     }
 }
 
@@ -389,6 +617,64 @@ impl<'a> CaptureDeclaration<'a> {
             output_identity,
             declared_path,
             media_type,
+        }
+    }
+}
+
+pub(crate) trait CarrierProducer: Send {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()>;
+}
+
+pub(crate) struct GitBranchCaptureDeclaration<'a> {
+    output_identity: &'a str,
+    metadata: GitBranchMetadata,
+    producer: Option<&'a mut dyn CarrierProducer>,
+}
+
+impl<'a> GitBranchCaptureDeclaration<'a> {
+    pub(crate) fn new(
+        output_identity: &'a str,
+        metadata: GitBranchMetadata,
+        producer: Option<&'a mut dyn CarrierProducer>,
+    ) -> Self {
+        Self {
+            output_identity,
+            metadata,
+            producer,
+        }
+    }
+}
+
+pub(crate) enum CaptureCandidateDeclaration<'a> {
+    File(CaptureDeclaration<'a>),
+    GitBranch(GitBranchCaptureDeclaration<'a>),
+}
+
+impl CaptureCandidateDeclaration<'_> {
+    fn output_identity(&self) -> &str {
+        match self {
+            Self::File(declaration) => declaration.output_identity,
+            Self::GitBranch(declaration) => declaration.output_identity,
+        }
+    }
+
+    fn budget_class(&self) -> Option<CarrierBudgetClass> {
+        match self {
+            Self::File(_) => Some(CarrierBudgetClass::File),
+            Self::GitBranch(declaration) => declaration
+                .producer
+                .is_some()
+                .then_some(CarrierBudgetClass::Git),
+        }
+    }
+
+    fn carrier_presence_matches_delta(&self) -> bool {
+        match self {
+            Self::File(_) => true,
+            Self::GitBranch(declaration) => {
+                let has_delta = declaration.metadata.base_oid != declaration.metadata.head_oid;
+                has_delta == declaration.producer.is_some()
+            }
         }
     }
 }
@@ -420,23 +706,61 @@ struct ArtifactStagingInner {
     #[cfg(test)]
     staging_path: PathBuf,
     store_identity: Arc<str>,
-    maximum_files: NonZeroUsize,
-    maximum_file_bytes: NonZeroU64,
-    maximum_total_bytes: NonZeroU64,
+    file_limits: CarrierLimits,
+    git_limits: CarrierLimits,
     lifecycle: RwLock<StagingLifecycle>,
     artifacts: Mutex<BTreeSet<Arc<str>>>,
+    identity_guards: Mutex<BTreeMap<Arc<str>, Arc<str>>>,
     budget: Mutex<CaptureBudgetLedger>,
     capture_serial: Mutex<()>,
     #[cfg(test)]
     artifact_unlinks_blocked: AtomicBool,
 }
 
+#[derive(Clone, Copy)]
+struct CarrierLimits {
+    maximum_count: NonZeroUsize,
+    maximum_bytes: NonZeroU64,
+    maximum_total_bytes: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BudgetUsage {
+    captured_count: usize,
+    captured_bytes: u64,
+    reserved_count: usize,
+    reserved_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CaptureBudgetLedger {
-    captured_files: usize,
-    captured_bytes: u64,
-    reserved_files: usize,
-    reserved_bytes: u64,
+    files: BudgetUsage,
+    git_carriers: BudgetUsage,
+}
+
+impl CaptureBudgetLedger {
+    fn usage(self, class: CarrierBudgetClass) -> BudgetUsage {
+        match class {
+            CarrierBudgetClass::File => self.files,
+            CarrierBudgetClass::Git => self.git_carriers,
+        }
+    }
+
+    fn usage_mut(&mut self, class: CarrierBudgetClass) -> &mut BudgetUsage {
+        match class {
+            CarrierBudgetClass::File => &mut self.files,
+            CarrierBudgetClass::Git => &mut self.git_carriers,
+        }
+    }
+}
+
+impl ArtifactStagingInner {
+    fn limits(&self, class: CarrierBudgetClass) -> CarrierLimits {
+        match class {
+            CarrierBudgetClass::File => self.file_limits,
+            CarrierBudgetClass::Git => self.git_limits,
+        }
+    }
 }
 
 impl ArtifactStaging {
@@ -444,15 +768,7 @@ impl ArtifactStaging {
         execution: &AdmittedExecutionContext,
         staging_parent: &Path,
     ) -> Result<Self, ArtifactStagingFailure> {
-        let limits = execution.limits();
-        Self::create_for_root(
-            execution.root_identity().clone(),
-            staging_parent,
-            None,
-            limits.maximum_captured_files(),
-            limits.maximum_captured_file_bytes(),
-            limits.maximum_total_captured_bytes(),
-        )
+        Self::create_for_execution_context(execution, staging_parent, None)
     }
 
     pub(crate) fn create_bound(
@@ -460,14 +776,29 @@ impl ArtifactStaging {
         staging_parent: &Path,
         expected_parent: &OwnedFd,
     ) -> Result<Self, ArtifactStagingFailure> {
+        Self::create_for_execution_context(execution, staging_parent, Some(expected_parent))
+    }
+
+    fn create_for_execution_context(
+        execution: &AdmittedExecutionContext,
+        staging_parent: &Path,
+        expected_parent: Option<&OwnedFd>,
+    ) -> Result<Self, ArtifactStagingFailure> {
         let limits = execution.limits();
         Self::create_for_root(
             execution.root_identity().clone(),
             staging_parent,
-            Some(expected_parent),
-            limits.maximum_captured_files(),
-            limits.maximum_captured_file_bytes(),
-            limits.maximum_total_captured_bytes(),
+            expected_parent,
+            CarrierLimits {
+                maximum_count: limits.maximum_captured_files(),
+                maximum_bytes: limits.maximum_captured_file_bytes(),
+                maximum_total_bytes: limits.maximum_total_captured_bytes(),
+            },
+            CarrierLimits {
+                maximum_count: limits.maximum_captured_git_carriers(),
+                maximum_bytes: limits.maximum_captured_git_carrier_bytes(),
+                maximum_total_bytes: limits.maximum_total_captured_git_carrier_bytes(),
+            },
         )
     }
 
@@ -475,9 +806,8 @@ impl ArtifactStaging {
     fn create_for_execution(
         execution_root: &Path,
         staging_parent: &Path,
-        maximum_files: NonZeroUsize,
-        maximum_file_bytes: NonZeroU64,
-        maximum_total_bytes: NonZeroU64,
+        file_limits: CarrierLimits,
+        git_limits: CarrierLimits,
     ) -> Result<Self, ArtifactStagingFailure> {
         let execution_root = AdmittedExecutionRoot::admit(execution_root)
             .map_err(|_| ArtifactStagingFailure::ExecutionRootUnavailable)?;
@@ -485,9 +815,8 @@ impl ArtifactStaging {
             execution_root,
             staging_parent,
             None,
-            maximum_files,
-            maximum_file_bytes,
-            maximum_total_bytes,
+            file_limits,
+            git_limits,
         )
     }
 
@@ -495,9 +824,8 @@ impl ArtifactStaging {
         execution_root: AdmittedExecutionRoot,
         staging_parent: &Path,
         expected_parent: Option<&OwnedFd>,
-        maximum_files: NonZeroUsize,
-        maximum_file_bytes: NonZeroU64,
-        maximum_total_bytes: NonZeroU64,
+        file_limits: CarrierLimits,
+        git_limits: CarrierLimits,
     ) -> Result<Self, ArtifactStagingFailure> {
         if !execution_root.pathname_is_bound() {
             return Err(ArtifactStagingFailure::ExecutionRootUnavailable);
@@ -527,11 +855,11 @@ impl ArtifactStaging {
                 #[cfg(test)]
                 staging_path,
                 store_identity,
-                maximum_files,
-                maximum_file_bytes,
-                maximum_total_bytes,
+                file_limits,
+                git_limits,
                 lifecycle: RwLock::new(StagingLifecycle::Active),
                 artifacts: Mutex::new(BTreeSet::new()),
+                identity_guards: Mutex::new(BTreeMap::new()),
                 budget: Mutex::new(CaptureBudgetLedger::default()),
                 capture_serial: Mutex::new(()),
                 #[cfg(test)]
@@ -542,15 +870,21 @@ impl ArtifactStaging {
 
     pub(super) fn is_bound_to(&self, execution: &AdmittedExecutionContext) -> bool {
         let limits = execution.limits();
-        if self.inner.maximum_files != limits.maximum_captured_files()
-            || self.inner.maximum_file_bytes != limits.maximum_captured_file_bytes()
-            || self.inner.maximum_total_bytes != limits.maximum_total_captured_bytes()
+        if self.inner.file_limits.maximum_count != limits.maximum_captured_files()
+            || self.inner.file_limits.maximum_bytes != limits.maximum_captured_file_bytes()
+            || self.inner.file_limits.maximum_total_bytes != limits.maximum_total_captured_bytes()
+            || self.inner.git_limits.maximum_count != limits.maximum_captured_git_carriers()
+            || self.inner.git_limits.maximum_bytes != limits.maximum_captured_git_carrier_bytes()
+            || self.inner.git_limits.maximum_total_bytes
+                != limits.maximum_total_captured_git_carrier_bytes()
         {
             return false;
         }
-        self.inner
-            .execution_root
-            .is_same_directory(execution.root_identity())
+        self.is_bound_to_root(execution.root_identity())
+    }
+
+    pub(super) fn is_bound_to_root(&self, root: &AdmittedExecutionRoot) -> bool {
+        self.inner.execution_root.is_same_directory(root)
     }
 
     pub(crate) fn capture_files(
@@ -558,7 +892,11 @@ impl ArtifactStaging {
         declarations: &[CaptureDeclaration<'_>],
     ) -> Result<BTreeMap<String, CapturedArtifact>, CaptureFailure> {
         match self.capture_file_candidates(declarations, &CaptureCancellation::default()) {
-            Ok(candidates) => Ok(candidates.commit()),
+            Ok(candidates) => Ok(candidates
+                .commit()
+                .into_iter()
+                .filter_map(|(identity, value)| value.into_file().map(|file| (identity, file)))
+                .collect()),
             Err(CaptureAttemptFailure::Capture(failure)) => Err(failure),
             Err(CaptureAttemptFailure::Cancelled) => {
                 unreachable!("a private uncancelled capture cannot be cancelled")
@@ -571,6 +909,19 @@ impl ArtifactStaging {
         declarations: &[CaptureDeclaration<'_>],
         cancellation: &CaptureCancellation,
     ) -> Result<CaptureCandidateSet, CaptureAttemptFailure> {
+        let mut declarations = declarations
+            .iter()
+            .copied()
+            .map(CaptureCandidateDeclaration::File)
+            .collect::<Vec<_>>();
+        self.capture_candidates(&mut declarations, cancellation)
+    }
+
+    pub(crate) fn capture_candidates(
+        &self,
+        declarations: &mut [CaptureCandidateDeclaration<'_>],
+        cancellation: &CaptureCancellation,
+    ) -> Result<CaptureCandidateSet, CaptureAttemptFailure> {
         cancellation.check()?;
         let Some(first) = declarations.first() else {
             return Ok(CaptureCandidateSet {
@@ -578,7 +929,7 @@ impl ArtifactStaging {
                 reservation: None,
             });
         };
-        let failure_identity = || Arc::<str>::from(first.output_identity);
+        let failure_identity = || Arc::<str>::from(first.output_identity());
         let _serial = self.inner.capture_serial.lock().map_err(|_| {
             CaptureAttemptFailure::Capture(CaptureFailure::new(
                 failure_identity(),
@@ -587,29 +938,70 @@ impl ArtifactStaging {
         })?;
         cancellation.check()?;
 
+        let mut identities = BTreeSet::new();
+        if let Some(duplicate) = declarations
+            .iter()
+            .find(|declaration| !identities.insert(declaration.output_identity()))
+        {
+            return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::from(duplicate.output_identity()),
+                CaptureFailureKind::StagingUnavailable,
+            )));
+        }
+        if let Some(invalid) = declarations
+            .iter()
+            .find(|declaration| !declaration.carrier_presence_matches_delta())
+        {
+            return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::from(invalid.output_identity()),
+                CaptureFailureKind::StagingUnavailable,
+            )));
+        }
+        let mut requested = BudgetCounts::default();
+        for class in declarations
+            .iter()
+            .filter_map(CaptureCandidateDeclaration::budget_class)
+        {
+            *requested.get_mut(class) = requested.get(class).saturating_add(1);
+        }
         let mut budget = self.inner.budget.lock().map_err(|_| {
             CaptureAttemptFailure::Capture(CaptureFailure::new(
                 failure_identity(),
                 CaptureFailureKind::StagingUnavailable,
             ))
         })?;
-        let remaining_files = self
-            .inner
-            .maximum_files
-            .get()
-            .saturating_sub(budget.captured_files.saturating_add(budget.reserved_files));
-        if declarations.len() > remaining_files {
+        let exceeds = |class| {
+            let usage = budget.usage(class);
+            let remaining = self
+                .inner
+                .limits(class)
+                .maximum_count
+                .get()
+                .saturating_sub(usage.captured_count.saturating_add(usage.reserved_count));
+            requested.get(class) > remaining
+        };
+        if let Some(declaration) = declarations
+            .iter()
+            .find(|declaration| declaration.budget_class().is_some_and(&exceeds))
+        {
+            let kind = match declaration.budget_class() {
+                Some(CarrierBudgetClass::File) => CaptureFailureKind::FileCountLimitExceeded,
+                Some(CarrierBudgetClass::Git) => CaptureFailureKind::GitCarrierCountLimitExceeded,
+                None => CaptureFailureKind::StagingUnavailable,
+            };
             return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
-                failure_identity(),
-                CaptureFailureKind::FileCountLimitExceeded,
+                Arc::from(declaration.output_identity()),
+                kind,
             )));
         }
-        budget.reserved_files += declarations.len();
+        for class in CarrierBudgetClass::ALL {
+            budget.usage_mut(class).reserved_count += requested.get(class);
+        }
         drop(budget);
         let mut reservation = CaptureReservation {
             store: Arc::clone(&self.inner),
-            files: declarations.len(),
-            bytes: 0,
+            counts: requested,
+            bytes: BudgetBytes::default(),
             active: true,
         };
 
@@ -619,41 +1011,52 @@ impl ArtifactStaging {
                 self.rollback_cancelled_capture_set(&captured);
                 return Err(CaptureAttemptFailure::Cancelled);
             }
-            let available_total_bytes = {
-                let budget = self.inner.budget.lock().map_err(|_| {
-                    CaptureAttemptFailure::Capture(CaptureFailure::new(
-                        failure_identity(),
-                        CaptureFailureKind::StagingUnavailable,
-                    ))
-                })?;
-                self.inner
-                    .maximum_total_bytes
-                    .get()
-                    .saturating_sub(budget.captured_bytes.saturating_add(budget.reserved_bytes))
+            let output_identity = Arc::<str>::from(declaration.output_identity());
+            let staged = match declaration {
+                CaptureCandidateDeclaration::File(declaration) => self
+                    .capture_bounds(CarrierBudgetClass::File, &output_identity)
+                    .and_then(|bounds| {
+                        self.stage(
+                            Arc::clone(&output_identity),
+                            declaration.declared_path,
+                            Arc::from(declaration.media_type),
+                            bounds,
+                            cancellation,
+                        )
+                    })
+                    .map(|file| (CapturedValue::file(file), Some(CarrierBudgetClass::File))),
+                CaptureCandidateDeclaration::GitBranch(declaration) => {
+                    let carrier = match declaration.producer.as_deref_mut() {
+                        Some(producer) => self
+                            .capture_bounds(CarrierBudgetClass::Git, &output_identity)
+                            .and_then(|bounds| {
+                                self.stage_git_carrier(
+                                    Arc::clone(&output_identity),
+                                    producer,
+                                    bounds,
+                                    cancellation,
+                                )
+                            })
+                            .map(Some),
+                        None => Ok(None),
+                    };
+                    carrier.map(|carrier| {
+                        let budget_class = carrier
+                            .as_ref()
+                            .map(|carrier| carrier.staged().budget_class());
+                        (
+                            CapturedValue::git_branch(CapturedGitBranch {
+                                output_identity: Arc::clone(&output_identity),
+                                metadata: declaration.metadata.clone(),
+                                carrier,
+                            }),
+                            budget_class,
+                        )
+                    })
+                }
             };
-            let (maximum_bytes, overflow_kind) =
-                if available_total_bytes < self.inner.maximum_file_bytes.get() {
-                    (
-                        available_total_bytes,
-                        CaptureFailureKind::TotalSizeLimitExceeded,
-                    )
-                } else {
-                    (
-                        self.inner.maximum_file_bytes.get(),
-                        CaptureFailureKind::FileSizeLimitExceeded,
-                    )
-                };
-            let artifact = match self.stage(
-                Arc::from(declaration.output_identity),
-                declaration.declared_path,
-                Arc::from(declaration.media_type),
-                CaptureBounds {
-                    maximum_bytes,
-                    overflow_kind,
-                },
-                cancellation,
-            ) {
-                Ok(artifact) => artifact,
+            let (value, budget_class) = match staged {
+                Ok(value) => value,
                 Err(CaptureAttemptFailure::Capture(failure)) => {
                     return Err(CaptureAttemptFailure::Capture(
                         self.rollback_capture_set(&captured, failure),
@@ -664,10 +1067,12 @@ impl ArtifactStaging {
                     return Err(CaptureAttemptFailure::Cancelled);
                 }
             };
-            let artifact_size = artifact.size;
-            captured.insert(declaration.output_identity.to_owned(), artifact);
-            if let Err(kind) = reservation.reserve_bytes(artifact_size) {
-                let failure = CaptureFailure::new(Arc::from(declaration.output_identity), kind);
+            let size = value.carrier().map(StagedCarrier::size);
+            captured.insert(output_identity.to_string(), value);
+            if let Some((class, size)) = budget_class.zip(size)
+                && let Err(kind) = reservation.reserve_bytes(class, size)
+            {
+                let failure = CaptureFailure::new(output_identity, kind);
                 return Err(CaptureAttemptFailure::Capture(
                     self.rollback_capture_set(&captured, failure),
                 ));
@@ -681,6 +1086,38 @@ impl ArtifactStaging {
         Ok(CaptureCandidateSet {
             outputs: captured,
             reservation: Some(reservation),
+        })
+    }
+
+    fn capture_bounds(
+        &self,
+        class: CarrierBudgetClass,
+        output_identity: &Arc<str>,
+    ) -> Result<CaptureBounds, CaptureAttemptFailure> {
+        let budget = self.inner.budget.lock().map_err(|_| {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(output_identity),
+                CaptureFailureKind::StagingUnavailable,
+            ))
+        })?;
+        let limits = self.inner.limits(class);
+        let usage = budget.usage(class);
+        let available_total_bytes = limits
+            .maximum_total_bytes
+            .get()
+            .saturating_sub(usage.captured_bytes.saturating_add(usage.reserved_bytes));
+        let per_carrier_overflow = match class {
+            CarrierBudgetClass::File => CaptureFailureKind::FileSizeLimitExceeded,
+            CarrierBudgetClass::Git => CaptureFailureKind::GitCarrierSizeLimitExceeded,
+        };
+        let (maximum_bytes, overflow_kind) = if available_total_bytes < limits.maximum_bytes.get() {
+            (available_total_bytes, class.total_overflow_kind())
+        } else {
+            (limits.maximum_bytes.get(), per_carrier_overflow)
+        };
+        Ok(CaptureBounds {
+            maximum_bytes,
+            overflow_kind,
         })
     }
 
@@ -728,7 +1165,20 @@ impl ArtifactStaging {
             .budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (budget.captured_files, budget.captured_bytes)
+        (budget.files.captured_count, budget.files.captured_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn git_budget_usage(&self) -> (usize, u64) {
+        let budget = self
+            .inner
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            budget.git_carriers.captured_count,
+            budget.git_carriers.captured_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -738,7 +1188,20 @@ impl ArtifactStaging {
             .budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (budget.reserved_files, budget.reserved_bytes)
+        (budget.files.reserved_count, budget.files.reserved_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn git_reservation_usage(&self) -> (usize, u64) {
+        let budget = self
+            .inner
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            budget.git_carriers.reserved_count,
+            budget.git_carriers.reserved_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -750,7 +1213,7 @@ impl ArtifactStaging {
 
     fn rollback_capture_set(
         &self,
-        captured: &BTreeMap<String, CapturedArtifact>,
+        captured: &BTreeMap<String, CapturedValue>,
         failure: CaptureFailure,
     ) -> CaptureFailure {
         if self.inner.remove_capture_set(captured) {
@@ -764,7 +1227,7 @@ impl ArtifactStaging {
         }
     }
 
-    fn rollback_cancelled_capture_set(&self, captured: &BTreeMap<String, CapturedArtifact>) {
+    fn rollback_cancelled_capture_set(&self, captured: &BTreeMap<String, CapturedValue>) {
         if !self.inner.remove_capture_set(captured) {
             self.inner.mark_cleanup_failed();
         }
@@ -801,7 +1264,7 @@ impl ArtifactStaging {
             declared_path,
             media_type,
             CaptureBounds {
-                maximum_bytes: self.inner.maximum_file_bytes.get(),
+                maximum_bytes: self.inner.file_limits.maximum_bytes.get(),
                 overflow_kind: CaptureFailureKind::FileSizeLimitExceeded,
             },
             &CaptureCancellation::default(),
@@ -825,18 +1288,7 @@ impl ArtifactStaging {
         copier: &mut impl StreamCopier,
     ) -> Result<CapturedArtifact, CaptureAttemptFailure> {
         cancellation.check()?;
-        let lifecycle = self.inner.lifecycle.read().map_err(|_| {
-            CaptureAttemptFailure::Capture(CaptureFailure::new(
-                Arc::clone(&output_identity),
-                CaptureFailureKind::StagingUnavailable,
-            ))
-        })?;
-        if *lifecycle != StagingLifecycle::Active {
-            return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
-                output_identity,
-                CaptureFailureKind::StagingUnavailable,
-            )));
-        }
+        let lifecycle = self.active_lifecycle(&output_identity)?;
         let components = capture_components(declared_path).map_err(|kind| {
             CaptureAttemptFailure::Capture(CaptureFailure::new(Arc::clone(&output_identity), kind))
         })?;
@@ -883,57 +1335,212 @@ impl ArtifactStaging {
                 failure => failure,
             })
             .and_then(|size| {
-                cancellation.check()?;
-                destination.flush().map_err(|_| {
-                    CaptureAttemptFailure::Capture(CaptureFailure::new(
-                        Arc::clone(&output_identity),
-                        CaptureFailureKind::StagingUnavailable,
-                    ))
-                })?;
-                cancellation.check()?;
-                fchmod(&destination, Mode::RUSR).map_err(|_| {
-                    CaptureAttemptFailure::Capture(CaptureFailure::new(
-                        Arc::clone(&output_identity),
-                        CaptureFailureKind::StagingUnavailable,
-                    ))
-                })?;
-                cancellation.check()?;
-                Ok(size)
+                self.finish_destination(
+                    &artifact_identity,
+                    &mut destination,
+                    &output_identity,
+                    cancellation,
+                )
+                .map(|file_identity| (size, file_identity))
             });
         drop(destination);
 
-        match capture_result {
-            Ok(size) => Ok(CapturedArtifact {
-                handle: ArtifactHandle {
-                    store_identity: Arc::clone(&self.inner.store_identity),
-                    artifact_identity: Arc::clone(&artifact_identity),
-                    lease: Arc::new(ArtifactLease {
-                        store: Arc::downgrade(&self.inner),
-                        artifact_identity,
-                        size,
-                        budgeted: AtomicBool::new(false),
-                    }),
-                },
-                output_identity,
+        let (size, file_identity) = self.finish_staging_result(
+            lifecycle,
+            &artifact_identity,
+            &output_identity,
+            capture_result,
+        )?;
+        Ok(CapturedArtifact {
+            output_identity,
+            carrier: self.staged_carrier(
+                artifact_identity,
+                file_identity,
                 size,
                 media_type,
-            }),
-            Err(failure) => {
-                drop(lifecycle);
-                if !self.inner.remove_artifact_while_active(&artifact_identity) {
-                    self.inner.mark_cleanup_failed();
-                    return match failure {
-                        CaptureAttemptFailure::Cancelled => Err(CaptureAttemptFailure::Cancelled),
-                        CaptureAttemptFailure::Capture(_) => {
-                            Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
-                                output_identity,
-                                CaptureFailureKind::StagingUnavailable,
-                            )))
-                        }
-                    };
-                }
-                Err(failure)
+                CarrierBudgetClass::File,
+            ),
+        })
+    }
+
+    fn stage_git_carrier(
+        &self,
+        output_identity: Arc<str>,
+        producer: &mut dyn CarrierProducer,
+        bounds: CaptureBounds,
+        cancellation: &CaptureCancellation,
+    ) -> Result<GitBranchCarrier, CaptureAttemptFailure> {
+        cancellation.check()?;
+        let lifecycle = self.active_lifecycle(&output_identity)?;
+        let (artifact_identity, mut destination) = self.create_destination().map_err(|kind| {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(Arc::clone(&output_identity), kind))
+        })?;
+        let capture_result = {
+            let mut bounded =
+                CarrierDestination::new(&mut destination, bounds, &output_identity, cancellation);
+            let produced = producer.stream_to(&mut bounded);
+            let failure = bounded.failure.take();
+            let size = bounded.bytes_written;
+            match (failure, produced) {
+                (Some(failure), _) => Err(failure),
+                (None, Err(_)) => Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                    Arc::clone(&output_identity),
+                    CaptureFailureKind::CarrierProducerUnavailable,
+                ))),
+                (None, Ok(())) => Ok((size, bounded.finish_digest())),
             }
+        }
+        .and_then(|(size, digest)| {
+            self.finish_destination(
+                &artifact_identity,
+                &mut destination,
+                &output_identity,
+                cancellation,
+            )
+            .map(|file_identity| (size, digest, file_identity))
+        });
+        drop(destination);
+
+        let (size, sha256, file_identity) = self.finish_staging_result(
+            lifecycle,
+            &artifact_identity,
+            &output_identity,
+            capture_result,
+        )?;
+        Ok(GitBranchCarrier {
+            staged: self.staged_carrier(
+                artifact_identity,
+                file_identity,
+                size,
+                Arc::from("application/vnd.git.bundle"),
+                CarrierBudgetClass::Git,
+            ),
+            sha256,
+        })
+    }
+
+    fn active_lifecycle(
+        &self,
+        output_identity: &Arc<str>,
+    ) -> Result<RwLockReadGuard<'_, StagingLifecycle>, CaptureAttemptFailure> {
+        let lifecycle = self.inner.lifecycle.read().map_err(|_| {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(output_identity),
+                CaptureFailureKind::StagingUnavailable,
+            ))
+        })?;
+        if *lifecycle != StagingLifecycle::Active {
+            return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(output_identity),
+                CaptureFailureKind::StagingUnavailable,
+            )));
+        }
+        Ok(lifecycle)
+    }
+
+    fn finish_staging_result<Value>(
+        &self,
+        lifecycle: RwLockReadGuard<'_, StagingLifecycle>,
+        artifact_identity: &Arc<str>,
+        output_identity: &Arc<str>,
+        result: Result<Value, CaptureAttemptFailure>,
+    ) -> Result<Value, CaptureAttemptFailure> {
+        let failure = match result {
+            Ok(value) => return Ok(value),
+            Err(failure) => failure,
+        };
+        drop(lifecycle);
+        if self.inner.remove_artifact_while_active(artifact_identity) {
+            return Err(failure);
+        }
+        self.inner.mark_cleanup_failed();
+        match failure {
+            CaptureAttemptFailure::Cancelled => Err(CaptureAttemptFailure::Cancelled),
+            CaptureAttemptFailure::Capture(_) => {
+                Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                    Arc::clone(output_identity),
+                    CaptureFailureKind::StagingUnavailable,
+                )))
+            }
+        }
+    }
+
+    fn finish_destination(
+        &self,
+        artifact_identity: &Arc<str>,
+        destination: &mut File,
+        output_identity: &Arc<str>,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CarrierFileIdentity, CaptureAttemptFailure> {
+        let unavailable = || {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(output_identity),
+                CaptureFailureKind::StagingUnavailable,
+            ))
+        };
+        cancellation.check()?;
+        destination.flush().map_err(|_| unavailable())?;
+        cancellation.check()?;
+        fchmod(&*destination, Mode::RUSR).map_err(|_| unavailable())?;
+        cancellation.check()?;
+        let metadata = fstat(&*destination).map_err(|_| unavailable())?;
+        let guard_identity = Arc::<str>::from(format!("guard_{artifact_identity}"));
+        let mut identity_guards = self
+            .inner
+            .identity_guards
+            .lock()
+            .map_err(|_| unavailable())?;
+        linkat(
+            &self.inner.staging_root,
+            artifact_identity.as_ref(),
+            &self.inner.staging_root,
+            guard_identity.as_ref(),
+            AtFlags::empty(),
+        )
+        .map_err(|_| unavailable())?;
+        identity_guards.insert(Arc::clone(artifact_identity), Arc::clone(&guard_identity));
+        let guard_metadata = statat(
+            &self.inner.staging_root,
+            guard_identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| unavailable())?;
+        if FileType::from_raw_mode(guard_metadata.st_mode) != FileType::RegularFile
+            || guard_metadata.st_dev != metadata.st_dev
+            || guard_metadata.st_ino != metadata.st_ino
+        {
+            return Err(unavailable());
+        }
+        Ok(CarrierFileIdentity {
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        })
+    }
+
+    fn staged_carrier(
+        &self,
+        artifact_identity: Arc<str>,
+        file_identity: CarrierFileIdentity,
+        size: u64,
+        media_type: Arc<str>,
+        budget_class: CarrierBudgetClass,
+    ) -> StagedCarrier {
+        StagedCarrier {
+            handle: ArtifactHandle {
+                store_identity: Arc::clone(&self.inner.store_identity),
+                artifact_identity: Arc::clone(&artifact_identity),
+                lease: Arc::new(ArtifactLease {
+                    store: Arc::downgrade(&self.inner),
+                    artifact_identity,
+                    file_identity,
+                    size,
+                    budget_class,
+                    budgeted: AtomicBool::new(false),
+                }),
+            },
+            size,
+            media_type,
+            budget_class,
         }
     }
 
@@ -993,36 +1600,68 @@ impl ArtifactStaging {
         if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
             return Err(ArtifactReadFailure::Unavailable);
         }
+        let expected = handle.lease.file_identity;
+        if metadata.st_dev != expected.device || metadata.st_ino != expected.inode {
+            return Err(ArtifactReadFailure::UnknownHandle);
+        }
+        let guard_identity = self
+            .inner
+            .identity_guards
+            .lock()
+            .map_err(|_| ArtifactReadFailure::Unavailable)?
+            .get(&handle.artifact_identity)
+            .cloned()
+            .ok_or(ArtifactReadFailure::UnknownHandle)?;
+        let guard_metadata = statat(
+            &self.inner.staging_root,
+            guard_identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|failure| match failure {
+            Errno::NOENT | Errno::LOOP => ArtifactReadFailure::UnknownHandle,
+            _ => ArtifactReadFailure::Unavailable,
+        })?;
+        if FileType::from_raw_mode(guard_metadata.st_mode) != FileType::RegularFile
+            || guard_metadata.st_dev != expected.device
+            || guard_metadata.st_ino != expected.inode
+        {
+            return Err(ArtifactReadFailure::UnknownHandle);
+        }
         Ok(File::from(opened))
     }
 
     pub(super) fn discard(&self, artifact: &CapturedArtifact) {
-        if artifact.handle.store_identity == self.inner.store_identity
+        self.discard_carrier(artifact.carrier());
+    }
+
+    fn discard_carrier(&self, carrier: &StagedCarrier) {
+        if carrier.handle.store_identity == self.inner.store_identity
             && self
                 .inner
-                .remove_artifact(&artifact.handle.artifact_identity)
+                .remove_artifact(&carrier.handle.artifact_identity)
         {
-            artifact.handle.lease.release_budget(&self.inner);
+            carrier.handle.lease.release_budget(&self.inner);
         }
     }
 }
 
 impl ArtifactStagingInner {
-    fn remove_capture_set(&self, captured: &BTreeMap<String, CapturedArtifact>) -> bool {
+    fn remove_capture_set(&self, captured: &BTreeMap<String, CapturedValue>) -> bool {
         let mut rollback_complete = true;
-        for artifact in captured.values() {
+        for carrier in captured.values().filter_map(CapturedValue::carrier) {
             rollback_complete &=
-                self.remove_artifact_while_active(&artifact.handle.artifact_identity);
+                self.remove_artifact_while_active(&carrier.handle.artifact_identity);
         }
         rollback_complete
     }
 
-    fn release_budget(&self, size: u64) {
+    fn release_budget(&self, class: CarrierBudgetClass, size: u64) {
         let Ok(mut budget) = self.budget.lock() else {
             return;
         };
-        budget.captured_files = budget.captured_files.saturating_sub(1);
-        budget.captured_bytes = budget.captured_bytes.saturating_sub(size);
+        let usage = budget.usage_mut(class);
+        usage.captured_count = usage.captured_count.saturating_sub(1);
+        usage.captured_bytes = usage.captured_bytes.saturating_sub(size);
     }
 
     fn remove_artifact(&self, artifact_identity: &str) -> bool {
@@ -1040,14 +1679,33 @@ impl ArtifactStagingInner {
         if self.artifact_unlinks_blocked.load(Ordering::Acquire) {
             return false;
         }
-        let removed = match unlinkat(&self.staging_root, artifact_identity, AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => true,
-            Err(_) => false,
+        let Ok(mut artifacts) = self.artifacts.lock() else {
+            return false;
         };
-        if removed && let Ok(mut artifacts) = self.artifacts.lock() {
-            artifacts.remove(artifact_identity);
+        let Ok(mut identity_guards) = self.identity_guards.lock() else {
+            return false;
+        };
+        if !matches!(
+            unlinkat(&self.staging_root, artifact_identity, AtFlags::empty()),
+            Ok(()) | Err(Errno::NOENT)
+        ) {
+            return false;
         }
-        removed
+        if let Some(guard_identity) = identity_guards.get(artifact_identity)
+            && !matches!(
+                unlinkat(
+                    &self.staging_root,
+                    guard_identity.as_ref(),
+                    AtFlags::empty(),
+                ),
+                Ok(()) | Err(Errno::NOENT)
+            )
+        {
+            return false;
+        }
+        artifacts.remove(artifact_identity);
+        identity_guards.remove(artifact_identity);
+        true
     }
 
     fn mark_cleanup_failed(&self) {
@@ -1067,15 +1725,33 @@ impl ArtifactStagingInner {
             .artifacts
             .lock()
             .map_err(|_| ArtifactReleaseFailure::CleanupUnavailable)?;
+        let mut identity_guards = self
+            .identity_guards
+            .lock()
+            .map_err(|_| ArtifactReleaseFailure::CleanupUnavailable)?;
         let identities = artifacts.iter().cloned().collect::<Vec<_>>();
         for identity in identities {
             match unlinkat(&self.staging_root, identity.as_ref(), AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => {
-                    artifacts.remove(&identity);
-                }
+                Ok(()) | Err(Errno::NOENT) => {}
                 Err(_) => return Err(ArtifactReleaseFailure::CleanupUnavailable),
             }
+            if let Some(guard_identity) = identity_guards.get(&identity) {
+                match unlinkat(
+                    &self.staging_root,
+                    guard_identity.as_ref(),
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(_) => return Err(ArtifactReleaseFailure::CleanupUnavailable),
+                }
+            }
+            artifacts.remove(&identity);
+            identity_guards.remove(&identity);
         }
+        if !identity_guards.is_empty() {
+            return Err(ArtifactReleaseFailure::CleanupUnavailable);
+        }
+        drop(identity_guards);
         drop(artifacts);
 
         let opened =
@@ -1104,6 +1780,137 @@ impl ArtifactStagingInner {
 impl Drop for ArtifactStagingInner {
     fn drop(&mut self) {
         let _ = self.cleanup();
+    }
+}
+
+pub(crate) struct CarrierDestination<'a> {
+    destination: &'a mut File,
+    bounds: CaptureBounds,
+    output_identity: &'a Arc<str>,
+    cancellation: &'a CaptureCancellation,
+    digest: Option<DigestContext>,
+    bytes_written: u64,
+    failure: Option<CaptureAttemptFailure>,
+}
+
+impl<'a> CarrierDestination<'a> {
+    fn new(
+        destination: &'a mut File,
+        bounds: CaptureBounds,
+        output_identity: &'a Arc<str>,
+        cancellation: &'a CaptureCancellation,
+    ) -> Self {
+        Self {
+            destination,
+            bounds,
+            output_identity,
+            cancellation,
+            digest: Some(DigestContext::new(&SHA256)),
+            bytes_written: 0,
+            failure: None,
+        }
+    }
+
+    fn finish_digest(&mut self) -> Arc<str> {
+        let digest = self
+            .digest
+            .take()
+            .unwrap_or_else(|| DigestContext::new(&SHA256))
+            .finish();
+        Arc::from(lowercase_hex(digest.as_ref()))
+    }
+
+    fn record_failure(&mut self, failure: CaptureAttemptFailure) -> io::Error {
+        self.failure = Some(failure);
+        io::Error::other("private carrier staging rejected the stream")
+    }
+
+    fn staging_failure(&self) -> CaptureAttemptFailure {
+        CaptureAttemptFailure::Capture(CaptureFailure::new(
+            Arc::clone(self.output_identity),
+            CaptureFailureKind::StagingUnavailable,
+        ))
+    }
+}
+
+impl Write for CarrierDestination<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("private carrier staging is unavailable"));
+        }
+        if let Err(failure) = self
+            .cancellation
+            .boundary(self.output_identity, CaptureBoundaryKind::BeforeWrite)
+        {
+            return Err(self.record_failure(failure));
+        }
+        let requested = match u64::try_from(bytes.len()) {
+            Ok(requested) => requested,
+            Err(_) => {
+                let failure = CaptureAttemptFailure::Capture(CaptureFailure::new(
+                    Arc::clone(self.output_identity),
+                    self.bounds.overflow_kind,
+                ));
+                return Err(self.record_failure(failure));
+            }
+        };
+        let remaining = self.bounds.maximum_bytes.saturating_sub(self.bytes_written);
+        if requested > remaining {
+            let failure = CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(self.output_identity),
+                self.bounds.overflow_kind,
+            ));
+            return Err(self.record_failure(failure));
+        }
+        let written = match self.destination.write(bytes) {
+            Ok(0) if !bytes.is_empty() => {
+                let failure = self.staging_failure();
+                return Err(self.record_failure(failure));
+            }
+            Ok(written) => written,
+            Err(_) => {
+                let failure = self.staging_failure();
+                return Err(self.record_failure(failure));
+            }
+        };
+        let written_bytes = match u64::try_from(written) {
+            Ok(written) => written,
+            Err(_) => {
+                let failure = self.staging_failure();
+                return Err(self.record_failure(failure));
+            }
+        };
+        self.bytes_written = match self.bytes_written.checked_add(written_bytes) {
+            Some(total) => total,
+            None => {
+                let failure = self.staging_failure();
+                return Err(self.record_failure(failure));
+            }
+        };
+        if let Some(digest) = &mut self.digest {
+            digest.update(&bytes[..written]);
+        }
+        if let Err(failure) = self
+            .cancellation
+            .boundary(self.output_identity, CaptureBoundaryKind::AfterWrite)
+        {
+            return Err(self.record_failure(failure));
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("private carrier staging is unavailable"));
+        }
+        if let Err(failure) = self.cancellation.check() {
+            return Err(self.record_failure(failure));
+        }
+        if self.destination.flush().is_err() {
+            let failure = self.staging_failure();
+            return Err(self.record_failure(failure));
+        }
+        Ok(())
     }
 }
 

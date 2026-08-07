@@ -35,7 +35,6 @@ fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
         "view".to_owned(),
-        "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
     ];
     args.extend(options.iter().map(|option| (*option).to_owned()));
@@ -47,7 +46,6 @@ fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
         "retry".to_owned(),
-        "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
         execution_root.to_string_lossy().into_owned(),
@@ -62,7 +60,6 @@ fn status_args(run_directory: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
         "status".to_owned(),
-        "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--json".to_owned(),
     ]
@@ -174,6 +171,7 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
     let run_directory = bundle.result("history");
     let initial = run(&bundle.args(&run_directory));
     assert_eq!(initial.status.code(), Some(1));
+    fs::remove_file(bundle.source_root().join("workflow.yaml")).unwrap();
 
     let failed_before = durable_files(&run_directory);
     let failed_view = TuiSession::start(&view_args(&run_directory, &[]));

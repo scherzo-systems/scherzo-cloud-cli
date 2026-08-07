@@ -1,7 +1,6 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
@@ -35,33 +34,10 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> ExitCode {
-        super::execute_with_abandonable_runtime("status", self.execute_async())
-    }
-
-    async fn execute_async(self) -> ExitCode {
-        let Some((mut interrupt, mut terminate)) = super::observe_workflow_signals("status") else {
-            return ExitCode::FAILURE;
-        };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let completed = Arc::new(AtomicBool::new(false));
-        let operation_cancelled = Arc::clone(&cancelled);
-        let operation_completed = Arc::clone(&completed);
-        let mut operation = tokio::task::spawn_blocking(move || {
-            self.execute_blocking(&operation_cancelled, &operation_completed)
-        });
-
-        tokio::select! {
-            biased;
-            signal = first_signal(&mut interrupt, &mut terminate) => {
-                cancelled.store(true, Ordering::Release);
-                if completed.load(Ordering::Acquire) {
-                    joined_operation(operation.await)
-                } else {
-                    ExitCode::from(signal)
-                }
-            }
-            result = &mut operation => joined_operation(result),
-        }
+        super::super::execute_read_only_with_signals(
+            "workflow status",
+            move |cancelled, completed| self.execute_blocking(cancelled, completed),
+        )
     }
 
     fn execute_blocking(&self, cancelled: &AtomicBool, completed: &AtomicBool) -> ExitCode {
@@ -97,24 +73,6 @@ impl Command {
             standard_input_reserved: false,
         }
         .color_enabled()
-    }
-}
-
-async fn first_signal(
-    interrupt: &mut tokio::signal::unix::Signal,
-    terminate: &mut tokio::signal::unix::Signal,
-) -> u8 {
-    tokio::select! {
-        biased;
-        _ = interrupt.recv() => 130,
-        _ = terminate.recv() => 143,
-    }
-}
-
-fn joined_operation(result: Result<ExitCode, tokio::task::JoinError>) -> ExitCode {
-    match result {
-        Ok(exit) => exit,
-        Err(error) => diagnose(format_args!("complete workflow status operation: {error}")),
     }
 }
 
@@ -242,12 +200,7 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
 }
 
 fn write_json(value: &impl Serialize) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    stdout.write_all(&bytes)?;
-    stdout.flush()
+    super::super::write_pretty_json(value)
 }
 
 fn render_plain(

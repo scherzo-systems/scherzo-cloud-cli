@@ -15,6 +15,7 @@ use crate::execution::workflow::admission::{
     ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::artifact::ArtifactStaging;
+use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::execution::workflow::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource, SourceSequence,
     TransitionObservation,
@@ -276,7 +277,7 @@ impl Fixture {
                         started_at,
                         duration: Duration::from_millis(250),
                     }),
-                    command_output: None,
+                    command_output: Some(empty_command_output()),
                 })
                 .collect(),
             exports: BTreeMap::new(),
@@ -335,6 +336,13 @@ fn execution_context(root: PathBuf) -> ExecutionContext {
 
 fn timestamp(value: &str) -> OffsetDateTime {
     OffsetDateTime::parse(value, &Rfc3339).unwrap()
+}
+
+fn empty_command_output() -> StepDiagnostic {
+    StepDiagnostic::from_streams(
+        CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from([]), 0, true),
+        CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from([]), 0, true),
+    )
 }
 
 fn workflow_source() -> &'static str {
@@ -1149,6 +1157,7 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         reason: NotRunReason::FailureStop,
     };
     failed.steps[2].timing = None;
+    failed.steps[2].command_output = None;
     failed.outcome = RunOutcome::Failed {
         primary_failure: StepFailure {
             step: "b".to_owned(),

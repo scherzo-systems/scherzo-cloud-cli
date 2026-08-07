@@ -157,6 +157,9 @@ impl<'a> RejectionLocation<'a> {
             | AdmissionLocation::MaximumCapturedFiles
             | AdmissionLocation::MaximumCapturedFileBytes
             | AdmissionLocation::MaximumTotalCapturedBytes
+            | AdmissionLocation::MaximumCapturedGitCarriers
+            | AdmissionLocation::MaximumCapturedGitCarrierBytes
+            | AdmissionLocation::MaximumTotalCapturedGitCarrierBytes
             | AdmissionLocation::MaximumInputValues
             | AdmissionLocation::MaximumInputValueBytes
             | AdmissionLocation::MaximumTotalInputBytes
@@ -397,6 +400,9 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         | AdmissionFailureKind::NonPositiveCapturedFiles
         | AdmissionFailureKind::NonPositiveCapturedFileBytes
         | AdmissionFailureKind::NonPositiveTotalCapturedBytes
+        | AdmissionFailureKind::NonPositiveCapturedGitCarriers
+        | AdmissionFailureKind::NonPositiveCapturedGitCarrierBytes
+        | AdmissionFailureKind::NonPositiveTotalCapturedGitCarrierBytes
         | AdmissionFailureKind::NonPositiveInputValues
         | AdmissionFailureKind::NonPositiveInputValueBytes
         | AdmissionFailureKind::NonPositiveTotalInputBytes

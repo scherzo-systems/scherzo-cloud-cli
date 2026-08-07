@@ -270,39 +270,31 @@ pub(crate) fn system_process_identity_observation(
     identity: &AuthenticatedProcessGroup,
 ) -> ProcessIdentityObservation {
     let process_group = i64::from(identity.process_group().as_raw_pid());
-    match read_linux_process(process_group) {
-        Ok(Some(leader)) => {
-            return observe_process_snapshot(identity, &[leader]);
-        }
-        Ok(None) => {}
-        Err(()) => return ProcessIdentityObservation::Unavailable,
-    }
+    observe_linux_process_identity(
+        identity,
+        read_linux_process(process_group),
+        process_group_is_quiescent,
+    )
+}
 
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return ProcessIdentityObservation::Unavailable;
-    };
-    let mut group_found = false;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return ProcessIdentityObservation::Unavailable;
-        };
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i64>().ok())
-        else {
-            continue;
-        };
-        match read_linux_process(pid) {
-            Ok(Some(process)) if process.process_group == process_group => group_found = true,
-            Ok(Some(_) | None) => {}
-            Err(()) => return ProcessIdentityObservation::Unavailable,
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn observe_linux_process_identity(
+    identity: &AuthenticatedProcessGroup,
+    leader: Result<Option<ObservedProcess>, ()>,
+    group_is_quiescent: impl FnOnce(Pid) -> bool,
+) -> ProcessIdentityObservation {
+    match leader {
+        Ok(Some(leader)) => observe_process_snapshot(identity, &[leader]),
+        Ok(None) | Err(()) => {
+            // The leader may disappear while procfs is being read. Probe only the
+            // recorded group: ESRCH proves absence, while every other result stays
+            // unavailable rather than depending on unrelated process-table churn.
+            if group_is_quiescent(identity.process_group()) {
+                ProcessIdentityObservation::Absent
+            } else {
+                ProcessIdentityObservation::Unavailable
+            }
         }
-    }
-    if group_found {
-        ProcessIdentityObservation::Unavailable
-    } else {
-        ProcessIdentityObservation::Absent
     }
 }
 
@@ -522,6 +514,21 @@ mod tests {
             );
             assert_eq!(result, expected);
             assert_eq!(signal_count, 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn missing_or_unreadable_linux_leader_uses_target_group_quiescence() {
+        for leader in [Ok(None), Err(())] {
+            assert_eq!(
+                observe_linux_process_identity(&identity(), leader.clone(), |_| true),
+                ProcessIdentityObservation::Absent
+            );
+            assert_eq!(
+                observe_linux_process_identity(&identity(), leader, |_| false),
+                ProcessIdentityObservation::Unavailable
+            );
         }
     }
 

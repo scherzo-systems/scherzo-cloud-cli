@@ -1867,6 +1867,18 @@ fn failure_cause(cause: &StepFailureCause) -> String {
                     CaptureFailureKind::FileCountLimitExceeded => "captured file count limit",
                     CaptureFailureKind::FileSizeLimitExceeded => "captured file size limit",
                     CaptureFailureKind::TotalSizeLimitExceeded => "captured total size limit",
+                    CaptureFailureKind::GitCarrierCountLimitExceeded => {
+                        "captured Git carrier count limit"
+                    }
+                    CaptureFailureKind::GitCarrierSizeLimitExceeded => {
+                        "captured Git carrier size limit"
+                    }
+                    CaptureFailureKind::TotalGitCarrierSizeLimitExceeded => {
+                        "captured total Git carrier size limit"
+                    }
+                    CaptureFailureKind::CarrierProducerUnavailable => {
+                        "Git carrier producer unavailable"
+                    }
                     CaptureFailureKind::StagingUnavailable => "output staging unavailable",
                 };
                 format!("{code} · output {}", failure.output_identity())

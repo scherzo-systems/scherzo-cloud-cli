@@ -15,7 +15,6 @@ fn retry_args(run_directory: &Path, execution_root: &Path, options: &[&str]) -> 
     let mut args = vec![
         "workflow".to_owned(),
         "retry".to_owned(),
-        "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
         execution_root.to_string_lossy().into_owned(),

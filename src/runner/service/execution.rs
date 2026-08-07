@@ -1246,6 +1246,14 @@ fn capture_failure(failure: CaptureFailureKind) -> &'static str {
         CaptureFailureKind::FileCountLimitExceeded => "output_file_count_limit_exceeded",
         CaptureFailureKind::FileSizeLimitExceeded => "output_file_size_limit_exceeded",
         CaptureFailureKind::TotalSizeLimitExceeded => "output_total_size_limit_exceeded",
+        CaptureFailureKind::GitCarrierCountLimitExceeded => {
+            "output_git_carrier_count_limit_exceeded"
+        }
+        CaptureFailureKind::GitCarrierSizeLimitExceeded => "output_git_carrier_size_limit_exceeded",
+        CaptureFailureKind::TotalGitCarrierSizeLimitExceeded => {
+            "output_total_git_carrier_size_limit_exceeded"
+        }
+        CaptureFailureKind::CarrierProducerUnavailable => "output_carrier_producer_unavailable",
         CaptureFailureKind::StagingUnavailable => "output_staging_unavailable",
     }
 }

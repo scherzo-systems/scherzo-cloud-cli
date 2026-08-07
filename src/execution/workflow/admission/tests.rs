@@ -252,7 +252,11 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 2,
-                CaptureLimits::new(11, 3 * 1024 * 1024, 9 * 1024 * 1024),
+                CaptureLimits::new(11, 3 * 1024 * 1024, 9 * 1024 * 1024).with_git_carrier_limits(
+                    19,
+                    4 * 1024 * 1024,
+                    10 * 1024 * 1024,
+                ),
                 InputLimits::new(13, 2 * 1024 * 1024, 7 * 1024 * 1024, 5 * 1024 * 1024),
                 96 * 1024,
             ),
@@ -321,6 +325,30 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             .maximum_captured_file_bytes()
             .get(),
         3 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_captured_git_carriers()
+            .get(),
+        19
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_captured_git_carrier_bytes()
+            .get(),
+        4 * 1024 * 1024
+    );
+    assert_eq!(
+        admitted
+            .execution()
+            .limits()
+            .maximum_total_captured_git_carrier_bytes()
+            .get(),
+        10 * 1024 * 1024
     );
     recorder.assert_empty();
     assert_eq!(root_snapshot(&fixture.execution_root), root_before);
@@ -591,6 +619,53 @@ fn admission_rejects_nonpositive_execution_limits_and_unbounded_cancellation_pol
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(captured_files, file_bytes, total_bytes),
+                        InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                        1024 * 1024,
+                    ),
+                    EnvironmentSnapshot::default(),
+                    CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+                ),
+            ),
+            kind,
+            location,
+        );
+    }
+
+    for (git_carriers, carrier_bytes, total_bytes, kind, location) in [
+        (
+            0,
+            1,
+            1,
+            AdmissionFailureKind::NonPositiveCapturedGitCarriers,
+            AdmissionLocation::MaximumCapturedGitCarriers,
+        ),
+        (
+            1,
+            0,
+            1,
+            AdmissionFailureKind::NonPositiveCapturedGitCarrierBytes,
+            AdmissionLocation::MaximumCapturedGitCarrierBytes,
+        ),
+        (
+            1,
+            1,
+            0,
+            AdmissionFailureKind::NonPositiveTotalCapturedGitCarrierBytes,
+            AdmissionLocation::MaximumTotalCapturedGitCarrierBytes,
+        ),
+    ] {
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        assert_failure(
+            admit_workflow(
+                fixture.resolve(),
+                ResolvedImports::default(),
+                ExecutionContext::new(
+                    fixture.execution_root.clone(),
+                    ExecutionRootLifecycle::EngineOwnedRetained,
+                    ExecutionPolicyLimits::new(
+                        1,
+                        CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024)
+                            .with_git_carrier_limits(git_carriers, carrier_bytes, total_bytes),
                         InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                         1024 * 1024,
                     ),

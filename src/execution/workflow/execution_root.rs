@@ -106,6 +106,19 @@ impl AdmittedExecutionRoot {
             .is_ok_and(|identity| identity == self.inner.identity)
     }
 
+    pub(super) fn bind_command_ref(
+        &self,
+        command: &mut Command,
+    ) -> Result<(), WorkingDirectorySelectionFailure> {
+        if !self.pathname_is_bound() {
+            return Err(WorkingDirectorySelectionFailure::ExecutionRootRebound);
+        }
+        let directory = dup(&self.inner.directory)
+            .map_err(|_| WorkingDirectorySelectionFailure::Unavailable)?;
+        bind_directory(command, directory);
+        Ok(())
+    }
+
     pub(super) fn select_working_directory(
         &self,
         declared_cwd: Option<&str>,

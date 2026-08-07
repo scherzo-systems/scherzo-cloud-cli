@@ -12,9 +12,9 @@ executable.
 The current release supports help, version inspection, OAuth Device Authorization,
 server-confirmed human authentication status, explicit human-principal signup, local
 human-credential logout, organization profile management and one-page member-directory
-reads, local Workflow V1 definition validation, mixed command and agent execution, and
-durable run status inspection, runner
-diagnostics, and a development-only outbound runner transport. `runner serve` connects
+reads, local Workflow V1 definition validation, portable artifact-set validation, mixed
+command and agent execution, durable run status inspection, runner diagnostics, and a
+development-only outbound runner transport. `runner serve` connects
 to an explicitly configured runner gateway, transport-acknowledges assignment effects,
 and resolves and admits one configured local command workflow without claiming that
 execution occurred.
@@ -32,14 +32,15 @@ without running it:
 ```sh
 scherzo-cloud workflow validate \
   --source-root ./my-repository \
-  .scherzo/workflows/check.yaml
+  ./my-repository/.scherzo/workflows/check.yaml
 ```
 
 `--source-root` is required and defines the complete directory boundary for the
 selected workflow YAML and all static prompts, message files, attachments, and result
-schemas. The selected workflow path is interpreted within that explicit root. The CLI
-does not infer the boundary from the current directory, an enclosing repository, or
-the YAML file's directory.
+schemas. The workflow file is an ordinary host path resolved from the process's initial
+working directory, then canonicalized and required to remain within that explicit root.
+The CLI does not infer the boundary from an enclosing repository or the YAML file's
+directory.
 
 The source distribution publishes the self-contained Workflow V1 JSON Schema at
 [`schemas/workflow-v1.schema.json`](schemas/workflow-v1.schema.json). Configure a JSON
@@ -64,6 +65,34 @@ execute command or agent steps, check harness or model availability, read human 
 runner credentials, or contact Scherzo Cloud. A zero exit status means only that the
 local definition resolved successfully.
 
+## Portable artifact validation
+
+Validate one copied or downloaded Artifact Set V1 directory without its original run,
+workflow source, or execution checkout:
+
+```sh
+scherzo-cloud artifact validate ./downloaded-attempt-result
+```
+
+The command validates the complete closed `result.json` contract and every declared
+export. It checks the exact root and `exports/` inventory, aliases, portable carrier
+paths, confined regular-file identity, sizes, SHA-256 digests, media types, UTF-8 text,
+and compact ordered JSON. Current `file`, `text`, and `json` artifacts are supported;
+unknown kinds and `git_branch` entries are rejected. There is no single-export selector
+or repair mode.
+
+Validation opens the selected directory read-only, follows no symbolic link beneath its
+opened root, and leaves the set unchanged. It does not read workflow-run state,
+credentials, or configuration, and it does not contact Scherzo Cloud, a provider, a Git
+remote, or any other network service.
+
+Add `--json` for one Artifact Validate Result Schema 1 document. A valid result has
+`outcome: "valid"`, `exitStatus: 0`, the canonical artifact-directory path, and bounded
+summary counts. An invalid result has `outcome: "invalid"`, `exitStatus: 1`, and the
+complete contractually bounded deterministic diagnostic sequence instead of a summary.
+Human mode reports the same diagnostic codes and ordering. Command-line usage errors
+return 2 and do not inspect the artifact directory.
+
 ## Local workflow execution
 
 Use `scherzo-cloud workflow run` to execute a mixed command and PiJsonV1 agent
@@ -76,7 +105,7 @@ scherzo-cloud workflow run \
   --execution-root ./my-checkout \
   --run-dir ./runs/check-001 \
   --max-parallel 2 \
-  .scherzo/workflows/check.yaml
+  ./my-repository/.scherzo/workflows/check.yaml
 ```
 
 The run directory must not exist and must be disjoint from the execution root. The CLI
@@ -113,7 +142,7 @@ is active. Once the retained attempt is complete, the interface remains open for
 post-run inspection until `q`; Scherzo then restores raw mode, the alternate screen, and
 the cursor before invoking the shared standard plain-summary renderer. The summary and
 process status are therefore the same contracts used by forced plain output. Inspect the
-durable run later with `workflow status --run-dir <PATH>`; retry is always explicit.
+durable run later with `workflow status <RUN_DIR>`; retry is always explicit.
 
 Local execution snapshots the inherited environment after resolution and removes
 `SCHERZO_` variables before launching commands or agents. When the resolved workflow has
@@ -132,7 +161,14 @@ Inspect the durable state and retry eligibility of an existing local run without
 it:
 
 ```sh
-scherzo-cloud workflow status --run-dir ./runs/check-001
+scherzo-cloud workflow status ./runs/check-001
+```
+
+The run-directory positional is an ordinary host path resolved from the process's
+initial working directory. Retry uses the same durable handle explicitly:
+
+```sh
+scherzo-cloud workflow retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
 Status reads only the closed `run.json` and `state.json` contracts and an existing
@@ -166,7 +202,7 @@ respectively.
 Inspect a successfully published terminal attempt in the read-only terminal viewer:
 
 ```sh
-scherzo-cloud workflow view --run-dir ./runs/check-001 [--attempt 1]
+scherzo-cloud workflow view ./runs/check-001 [--attempt 1]
 ```
 
 Omitting `--attempt` selects the current attempt from one stable durable snapshot. The
@@ -445,7 +481,7 @@ and `runner doctor` remain unchanged and do not initialize runner telemetry.
 ## Release series
 
 `release.toml` declares the reviewed `MAJOR.MINOR` release series. The current series is
-`0.10`. Planning takes the highest fragment impact since the latest stable tag:
+`0.11`. Planning takes the highest fragment impact since the latest stable tag:
 `internal`, `fixed`, and compatible `changed` produce a patch; `added` produces a minor;
 and `breaking` produces a minor before `1.0` or a major afterward. The Cargo package
 fallback remains the selected `MAJOR.MINOR.0`, while release builds inject the exact

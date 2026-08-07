@@ -33,10 +33,41 @@ jobs:
       - name: Check public source
         run: ./scripts/strict-devenv test
 
+  check_macos:
+    name: macOS compile
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_version=$(awk -F '"' '/^rust-version = / { print $2 }' Cargo.toml)
+          if [[ ! "$rust_version" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
+            echo "Could not read a canonical rust-version from Cargo.toml: $rust_version" >&2
+            exit 1
+          fi
+          rustup toolchain install "$rust_version" \
+            --profile minimal \
+            --target aarch64-apple-darwin
+          echo "RUSTUP_TOOLCHAIN=$rust_version" >>"$GITHUB_ENV"
+      - name: Check macOS compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets --all-features \
+            --target aarch64-apple-darwin
+
   plan_release:
     name: Plan release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: check
+    needs:
+      - check
+      - check_macos
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:

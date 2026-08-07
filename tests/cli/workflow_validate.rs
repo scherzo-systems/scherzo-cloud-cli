@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tempfile::TempDir;
 
@@ -132,12 +132,16 @@ fn validate(bundle: &WorkflowBundle, json: bool) -> std::process::Output {
         .set_nonblocking(true)
         .expect("network sentinel should be nonblocking");
     let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let workflow_file = bundle.workflow_path();
+    let workflow_file = workflow_file
+        .to_str()
+        .expect("temporary workflow path should be UTF-8");
     let mut args = vec![
         "workflow",
         "validate",
         "--source-root",
         bundle.root_argument(),
-        WORKFLOW_PATH,
+        workflow_file,
     ];
     if json {
         args.push("--json");
@@ -329,6 +333,64 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
 }
 
 #[test]
+fn relative_workflow_file_is_cwd_relative_without_root_relative_fallback() {
+    let bundle = WorkflowBundle::valid();
+    let initial_cwd = bundle.root.parent().unwrap();
+    let execute = |workflow_file: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+            .current_dir(initial_cwd)
+            .args([
+                "workflow",
+                "validate",
+                "--source-root",
+                "source",
+                workflow_file,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let natural = execute("source/workflows/complete.yaml");
+    assert!(natural.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&natural.stdout).unwrap();
+    assert_eq!(report["workflow"]["path"], WORKFLOW_PATH);
+
+    let superseded = execute(WORKFLOW_PATH);
+    assert_eq!(superseded.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&superseded.stdout).unwrap();
+    assert_eq!(report["outcome"], "invalid");
+    assert_eq!(report["diagnostics"][0]["code"], "source_unavailable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absolute_workflow_paths_do_not_require_a_named_current_directory() {
+    let bundle = WorkflowBundle::valid();
+    let removed_cwd = tempfile::tempdir().unwrap();
+    let removed_cwd = removed_cwd.keep();
+    let output = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cd \"$1\" && rmdir \"$1\" && exec \"$2\" workflow validate --source-root \"$3\" \"$4\" --json",
+            "sh",
+            removed_cwd.to_str().unwrap(),
+            env!("CARGO_BIN_EXE_scherzo-cloud"),
+            bundle.root_argument(),
+            bundle.workflow_path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn source_root_is_required_even_for_an_absolute_workflow_path() {
     let bundle = WorkflowBundle::valid();
     let selected_path = bundle.workflow_path();
@@ -356,9 +418,7 @@ fn selected_workflow_must_remain_within_the_explicit_source_root() {
         "validate",
         "--source-root",
         bundle.root_argument(),
-        Path::new("../outside.yaml")
-            .to_str()
-            .expect("fixture path should be UTF-8"),
+        outside.to_str().expect("fixture path should be UTF-8"),
         "--json",
     ]);
 

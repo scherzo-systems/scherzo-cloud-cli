@@ -1,6 +1,7 @@
 {
   buildIdentity ? "unknown",
   cacert,
+  git,
   jq,
   lib,
   rustPlatform,
@@ -25,6 +26,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   nativeBuildInputs = [ jq ];
+  nativeCheckInputs = [ git ];
 
   env = {
     SCHERZO_CLOUD_BUILD_IDENTITY = buildIdentity;
