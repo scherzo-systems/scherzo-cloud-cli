@@ -894,9 +894,11 @@ exec sleep 300\n",
         Ok(_) => panic!("timed-out Git admission unexpectedly succeeded"),
     };
     assert_eq!(failure, GitWorkspaceAdmissionFailure::GitTimedOut);
-    let pid = fs::read_to_string(marker).unwrap().trim().to_owned();
     #[cfg(target_os = "linux")]
-    assert!(!Path::new("/proc").join(pid).exists());
+    {
+        let pid = fs::read_to_string(marker).unwrap().trim().to_owned();
+        assert!(!Path::new("/proc").join(pid).exists());
+    }
 }
 
 #[test]
@@ -980,6 +982,7 @@ fn capture_cancellation_terminates_and_reaps_bundle_process_and_rolls_back() {
         crate::timing::sleep(Duration::from_millis(10));
     }
     let pid = fs::read_to_string(&marker).unwrap().trim().to_owned();
+    assert!(!pid.is_empty());
 
     cancellation.cancel();
     assert_eq!(
