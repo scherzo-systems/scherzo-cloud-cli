@@ -77,9 +77,11 @@ scherzo-cloud artifact validate ./downloaded-attempt-result
 The command validates the complete closed `result.json` contract and every declared
 export. It checks the exact root and `exports/` inventory, aliases, portable carrier
 paths, confined regular-file identity, sizes, SHA-256 digests, media types, UTF-8 text,
-and compact ordered JSON. Current `file`, `text`, and `json` artifacts are supported;
-unknown kinds and `git_branch` entries are rejected. There is no single-export selector
-or repair mode.
+compact ordered JSON, and changed or zero-delta `git_branch` artifacts. Git validation
+checks the closed semantic metadata, carrier-presence rule, bundle-v2 header and profile,
+pack framing and checksum, and reconstructible object facts without a destination
+repository. Unknown kinds are rejected. There is no single-export selector or repair
+mode.
 
 Validation opens the selected directory read-only, follows no symbolic link beneath its
 opened root, and leaves the set unchanged. It does not read workflow-run state,
@@ -154,6 +156,15 @@ an executable or alter selection. The adapter does not read Scherzo human or run
 credentials and does not contact Scherzo Cloud; an admitted agent harness may use the
 provider and other host authority selected by its closed profile and inherited
 environment.
+
+Command and agent steps may declare `kind: git_branch`. Such an output is export-only in
+Workflow V1 and cannot bind a downstream command input or agent message. Before any step
+starts, local admission requires the execution root to be exactly one SHA-1 Git worktree
+root and pins its current commit as the baseline. Successful capture requires a clean
+committed head descended from that baseline. A changed head publishes one Git bundle
+carrier; an unchanged head publishes the semantic zero-delta result without a carrier.
+Repository remotes, destination branches, providers, credentials, and publication policy
+are not workflow fields.
 
 ## Local workflow status
 

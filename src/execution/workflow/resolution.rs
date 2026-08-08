@@ -145,6 +145,18 @@ impl ResolvedWorkflow {
         self.result_schemas
             .get(&(step.to_owned(), output.to_owned()))
     }
+
+    pub(crate) fn requires_git_capture(&self) -> bool {
+        self.definition.steps.values().any(|step| {
+            let outputs = match step {
+                ValidatedStep::Command(step) => &step.common.outputs,
+                ValidatedStep::Agent(step) => &step.common.outputs,
+            };
+            outputs
+                .values()
+                .any(|output| matches!(output.definition, Output::GitBranch))
+        })
+    }
 }
 
 // Runner configuration keeps its source-root-relative workflow mapping.

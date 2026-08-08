@@ -137,6 +137,26 @@ fn git_parent(arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn add_clean_submodule(repository: &Path, source: &Path) {
+    init_repository(source);
+    fs::write(source.join("nested.txt"), b"clean\n").unwrap();
+    git(source, &["add", "nested.txt"]);
+    git(source, &["commit", "--quiet", "-m", "nested"]);
+    git(
+        repository,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.to_str().unwrap(),
+            "nested",
+        ],
+    );
+    git(repository, &["commit", "--quiet", "-am", "add submodule"]);
+}
+
 fn git_oid(repository: &Path, expression: &str) -> String {
     git(repository, &["rev-parse", expression])
         .trim()
@@ -288,6 +308,28 @@ fn admission_requires_the_execution_root_to_be_the_sha1_worktree_root() {
 }
 
 #[test]
+fn admission_rejects_a_clean_tracked_submodule() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::write(repository.join("base.txt"), b"base\n").unwrap();
+    git(&repository, &["add", "base.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    add_clean_submodule(&repository, &temporary.path().join("submodule-source"));
+    let (admitted, _artifacts) = admitted_capture(temporary.path(), &repository, []);
+
+    let failure =
+        match GitCaptureContext::admit(admitted.execution(), &CaptureCancellation::default()) {
+            Err(failure) => failure,
+            Ok(_) => panic!("multi-repository workspace unexpectedly admitted"),
+        };
+    assert_eq!(
+        failure,
+        GitWorkspaceAdmissionFailure::ExecutionRootNotWorkTreeRoot
+    );
+}
+
+#[test]
 fn git_trace_environment_cannot_author_the_workspace() {
     let temporary = tempfile::tempdir().unwrap();
     let repository = temporary.path().join("repository");
@@ -391,26 +433,7 @@ fn dirty_index_worktree_untracked_and_submodule_states_fail_without_adapter_auth
 
     let fixture = GitFixture::new();
     let submodule_source = fixture._temporary.path().join("submodule-source");
-    init_repository(&submodule_source);
-    fs::write(submodule_source.join("nested.txt"), b"clean\n").unwrap();
-    git(&submodule_source, &["add", "nested.txt"]);
-    git(&submodule_source, &["commit", "--quiet", "-m", "nested"]);
-    git(
-        &fixture.repository,
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            "--quiet",
-            submodule_source.to_str().unwrap(),
-            "nested",
-        ],
-    );
-    git(
-        &fixture.repository,
-        &["commit", "--quiet", "-am", "add submodule"],
-    );
+    add_clean_submodule(&fixture.repository, &submodule_source);
     fs::write(fixture.repository.join("nested/nested.txt"), b"dirty\n").unwrap();
     let before = repository_bytes(&fixture.repository);
 
@@ -419,6 +442,20 @@ fn dirty_index_worktree_untracked_and_submodule_states_fail_without_adapter_auth
         GitCaptureFailure::WorkspaceDirty
     );
     assert_eq!(repository_bytes(&fixture.repository), before);
+    assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
+}
+
+#[test]
+fn capture_rejects_a_clean_submodule_added_after_admission() {
+    let fixture = GitFixture::new();
+    let submodule_source = fixture._temporary.path().join("submodule-source");
+    add_clean_submodule(&fixture.repository, &submodule_source);
+
+    assert_eq!(
+        capture_failure(fixture.capture()),
+        GitCaptureFailure::WorkspaceChanged
+    );
+    assert_eq!(fixture.artifacts.git_reservation_usage(), (0, 0));
     assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
 }
 
@@ -597,6 +634,39 @@ fn capture_rejects_post_admission_redirects_to_an_unrelated_promisor_source() {
         &format!("file://{}", fixture.source.display()),
         unrelated.to_str().unwrap(),
     ]);
+    git(
+        &fixture.workspace.repository,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("file://{}", unrelated.display()),
+        ],
+    );
+    let unavailable_source = fixture.source.with_extension("unavailable");
+    fs::rename(&fixture.source, unavailable_source).unwrap();
+
+    assert_eq!(
+        capture_failure(fixture.workspace.capture()),
+        GitCaptureFailure::SourceAuthorityChanged
+    );
+    assert_eq!(fixture.workspace.artifacts.staged_artifact_count(), 0);
+}
+
+#[test]
+fn git_config_environment_cannot_hide_post_admission_source_changes() {
+    let prepared = prepare_promisor();
+    let unrelated = prepared.temporary.path().join("unrelated.git");
+    git_parent(&[
+        "clone",
+        "--quiet",
+        "--mirror",
+        &format!("file://{}", prepared.source.display()),
+        unrelated.to_str().unwrap(),
+    ]);
+    let config_override = prepared.temporary.path().join("config-override");
+    fs::write(&config_override, b"").unwrap();
+    let fixture = finish_promisor(prepared, [("GIT_CONFIG", config_override.as_os_str())]);
     git(
         &fixture.workspace.repository,
         &[

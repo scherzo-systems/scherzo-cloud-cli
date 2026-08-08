@@ -831,7 +831,7 @@ fn resolve_value_mode(
                     schema,
                 })
             }
-            Output::File { .. } => None,
+            Output::File { .. } | Output::GitBranch => None,
         };
         if let Some(candidate) = candidate {
             if mode.is_some() {

@@ -16,7 +16,10 @@ use rustix::fs::{
     unlinkat,
 };
 use rustix::io::Errno;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::Error as _;
+use serde::ser::SerializeStruct as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
@@ -27,6 +30,7 @@ use super::artifact_set;
 use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::execution_root::open_directory;
+use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::private_staging::{directory_entry_names, same_file};
 use super::resolution::WorkflowContentDigest;
@@ -467,6 +471,23 @@ pub(crate) enum FailureCodeV1 {
     CapturedFileCountLimit,
     CapturedFileSizeLimit,
     CapturedTotalSizeLimit,
+    CapturedGitCarrierCountLimit,
+    CapturedGitCarrierSizeLimit,
+    CapturedTotalGitCarrierSizeLimit,
+    GitExecutionRootRebound,
+    GitHeadUnavailable,
+    GitBaselineNotAncestor,
+    GitCleanlinessUnavailable,
+    GitWorkspaceDirty,
+    GitTreeUnavailable,
+    GitRequiredObjectsUnavailable,
+    GitSourceAuthorityChanged,
+    GitStructureLimitExceeded,
+    GitBundleGenerationFailed,
+    GitBundleProfileInvalid,
+    GitBundleVerificationFailed,
+    GitWorkspaceChanged,
+    GitTemporaryStorageUnavailable,
     OutputStagingUnavailable,
 }
 
@@ -546,21 +567,174 @@ pub(crate) struct DiagnosticStreamV1 {
     pub(crate) fully_drained: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExportV1 {
     Available {
         kind: String,
-        #[serde(rename = "mediaType")]
         media_type: String,
         path: String,
-        #[serde(rename = "sizeBytes")]
         size_bytes: u64,
         digest: DigestV1,
+    },
+    GitBranch {
+        artifact_version: u8,
+        object_format: String,
+        base_oid: String,
+        head_oid: String,
+        tree_oid: String,
+        carrier: Option<GitBranchCarrierV1>,
     },
     Unavailable {
         reason: ExportUnavailableReasonV1,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GitBranchCarrierV1 {
+    pub(crate) path: String,
+    pub(crate) media_type: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) digest: DigestV1,
+}
+
+impl Serialize for ExportV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available {
+                kind,
+                media_type,
+                path,
+                size_bytes,
+                digest,
+            } => {
+                let mut state = serializer.serialize_struct("AvailableExportV1", 6)?;
+                state.serialize_field("state", "available")?;
+                state.serialize_field("kind", kind)?;
+                state.serialize_field("mediaType", media_type)?;
+                state.serialize_field("path", path)?;
+                state.serialize_field("sizeBytes", size_bytes)?;
+                state.serialize_field("digest", digest)?;
+                state.end()
+            }
+            Self::GitBranch {
+                artifact_version,
+                object_format,
+                base_oid,
+                head_oid,
+                tree_oid,
+                carrier,
+            } => {
+                let mut state = serializer
+                    .serialize_struct("GitBranchExportV1", if carrier.is_some() { 8 } else { 7 })?;
+                state.serialize_field("state", "available")?;
+                state.serialize_field("kind", "git_branch")?;
+                state.serialize_field("artifactVersion", artifact_version)?;
+                state.serialize_field("objectFormat", object_format)?;
+                state.serialize_field("baseOid", base_oid)?;
+                state.serialize_field("headOid", head_oid)?;
+                state.serialize_field("treeOid", tree_oid)?;
+                if let Some(carrier) = carrier {
+                    state.serialize_field("carrier", carrier)?;
+                }
+                state.end()
+            }
+            Self::Unavailable { reason } => {
+                let mut state = serializer.serialize_struct("UnavailableExportV1", 2)?;
+                state.serialize_field("state", "unavailable")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExportV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let state = value.get("state").and_then(Value::as_str);
+        let kind = value.get("kind").and_then(Value::as_str);
+        match (state, kind) {
+            (Some("available"), Some("git_branch")) => {
+                let wire = serde_json::from_value::<GitBranchExportWire>(value)
+                    .map_err(D::Error::custom)?;
+                if wire.state != "available" || wire.kind != "git_branch" {
+                    return Err(D::Error::custom("invalid Git branch export"));
+                }
+                Ok(Self::GitBranch {
+                    artifact_version: wire.artifact_version,
+                    object_format: wire.object_format,
+                    base_oid: wire.base_oid,
+                    head_oid: wire.head_oid,
+                    tree_oid: wire.tree_oid,
+                    carrier: wire.carrier,
+                })
+            }
+            (Some("available"), Some(_)) => {
+                let wire = serde_json::from_value::<AvailableExportWire>(value)
+                    .map_err(D::Error::custom)?;
+                if wire.state != "available" {
+                    return Err(D::Error::custom("invalid available export"));
+                }
+                Ok(Self::Available {
+                    kind: wire.kind,
+                    media_type: wire.media_type,
+                    path: wire.path,
+                    size_bytes: wire.size_bytes,
+                    digest: wire.digest,
+                })
+            }
+            (Some("unavailable"), None) => {
+                let wire = serde_json::from_value::<UnavailableExportWire>(value)
+                    .map_err(D::Error::custom)?;
+                if wire.state != "unavailable" {
+                    return Err(D::Error::custom("invalid unavailable export"));
+                }
+                Ok(Self::Unavailable {
+                    reason: wire.reason,
+                })
+            }
+            _ => Err(D::Error::custom("invalid export state or kind")),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AvailableExportWire {
+    state: String,
+    kind: String,
+    media_type: String,
+    path: String,
+    size_bytes: u64,
+    digest: DigestV1,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitBranchExportWire {
+    state: String,
+    kind: String,
+    artifact_version: u8,
+    object_format: String,
+    base_oid: String,
+    head_oid: String,
+    tree_oid: String,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    carrier: Option<GitBranchCarrierV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnavailableExportWire {
+    state: String,
+    reason: ExportUnavailableReasonV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -854,6 +1028,7 @@ fn captured_type_matches(value_type: WorkflowValueType, output: &CapturedValue) 
         (WorkflowValueType::File, CapturedValue::File(_))
             | (WorkflowValueType::Text, CapturedValue::Text(_))
             | (WorkflowValueType::Json, CapturedValue::Json(_))
+            | (WorkflowValueType::GitBranch, CapturedValue::GitBranch(_))
     )
 }
 
@@ -865,6 +1040,9 @@ fn write_available_export(
     ordinal: usize,
     output: &CapturedValue,
 ) -> Result<ExportV1, LocalPublicationError> {
+    if let CapturedValue::GitBranch(branch) = output {
+        return write_git_branch_export(staging, observer, artifacts, name, ordinal, branch);
+    }
     observe(
         observer,
         &PublicationBoundary::BeforeExportCopy {
@@ -983,6 +1161,101 @@ fn write_available_export(
         Some(name),
     )?;
     Ok(metadata)
+}
+
+fn write_git_branch_export(
+    staging: &mut StagingDirectory<'_>,
+    observer: &mut impl PublicationObserver,
+    artifacts: &ArtifactStaging,
+    name: &str,
+    ordinal: usize,
+    branch: &super::artifact::CapturedGitBranch,
+) -> Result<ExportV1, LocalPublicationError> {
+    let metadata = branch.metadata();
+    let has_delta = metadata.base_oid() != metadata.head_oid();
+    if has_delta != branch.carrier().is_some() {
+        return Err(invalid_run_result());
+    }
+    let carrier = match branch.carrier() {
+        None => None,
+        Some(carrier) => {
+            observe(
+                observer,
+                &PublicationBoundary::BeforeExportCopy {
+                    export: name.to_owned(),
+                },
+                LocalPublicationPhase::ExportCopy,
+                LocalPublicationFailureKind::ArtifactUnavailable,
+                Some(name),
+            )?;
+            let file_name = format!("{ordinal:04}");
+            let mut destination = staging.create_export(&file_name).map_err(|kind| {
+                LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
+            })?;
+            let mut digest = DigestContext::new(&SHA256);
+            let copied = {
+                let mut hashing = HashingWriter {
+                    destination: &mut destination,
+                    digest: &mut digest,
+                    bytes: 0,
+                };
+                artifacts
+                    .copy_to(carrier.handle(), &mut hashing)
+                    .map_err(|failure| copy_error(name, failure))?;
+                hashing.flush().map_err(|_| export_write_error(name))?;
+                hashing.bytes
+            };
+            destination.flush().map_err(|_| export_write_error(name))?;
+            let observed_digest = lowercase_hex(digest.finish().as_ref());
+            if copied != carrier.size() || observed_digest != carrier.sha256() {
+                return Err(LocalPublicationError::for_export(
+                    LocalPublicationPhase::ExportCopy,
+                    LocalPublicationFailureKind::ArtifactUnavailable,
+                    name,
+                ));
+            }
+            observer
+                .close_staged_file(
+                    destination,
+                    &StagedFile::Export {
+                        export: name.to_owned(),
+                    },
+                )
+                .map_err(|_| {
+                    LocalPublicationError::for_export(
+                        LocalPublicationPhase::Close,
+                        LocalPublicationFailureKind::ExportWriteUnavailable,
+                        name,
+                    )
+                })?;
+            observe(
+                observer,
+                &PublicationBoundary::AfterExportCopy {
+                    export: name.to_owned(),
+                },
+                LocalPublicationPhase::ExportCopy,
+                LocalPublicationFailureKind::ArtifactUnavailable,
+                Some(name),
+            )?;
+            Some(GitBranchCarrierV1 {
+                path: format!("{EXPORT_DIRECTORY}/{file_name}"),
+                media_type: carrier.media_type().to_owned(),
+                size_bytes: copied,
+                digest: DigestV1 {
+                    algorithm: "sha256".to_owned(),
+                    value: observed_digest,
+                },
+            })
+        }
+    };
+    Ok(ExportV1::GitBranch {
+        artifact_version: metadata.artifact_version(),
+        object_format: metadata.object_format().as_str().to_owned(),
+        base_oid: metadata.base_oid().to_owned(),
+        head_oid: metadata.head_oid().to_owned(),
+        tree_oid: metadata.tree_oid().to_owned(),
+        carrier,
+    })
 }
 
 fn observe(
@@ -1384,14 +1657,61 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
                 CaptureFailureKind::FileCountLimitExceeded => FailureCodeV1::CapturedFileCountLimit,
                 CaptureFailureKind::FileSizeLimitExceeded => FailureCodeV1::CapturedFileSizeLimit,
                 CaptureFailureKind::TotalSizeLimitExceeded => FailureCodeV1::CapturedTotalSizeLimit,
-                CaptureFailureKind::GitCarrierCountLimitExceeded
-                | CaptureFailureKind::GitCarrierSizeLimitExceeded
-                | CaptureFailureKind::TotalGitCarrierSizeLimitExceeded
-                | CaptureFailureKind::CarrierProducerUnavailable
-                | CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
+                CaptureFailureKind::GitCarrierCountLimitExceeded => {
+                    FailureCodeV1::CapturedGitCarrierCountLimit
+                }
+                CaptureFailureKind::GitCarrierSizeLimitExceeded => {
+                    FailureCodeV1::CapturedGitCarrierSizeLimit
+                }
+                CaptureFailureKind::TotalGitCarrierSizeLimitExceeded => {
+                    FailureCodeV1::CapturedTotalGitCarrierSizeLimit
+                }
+                CaptureFailureKind::CarrierProducerUnavailable => {
+                    FailureCodeV1::GitBundleGenerationFailed
+                }
+                CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
             };
             let mut cause = FailureCauseV1::code(code);
             cause.output = Some(failure.output_identity().to_owned());
+            cause
+        }
+        OutputCaptureFailure::Git { output, failure } => {
+            let code = match failure {
+                GitCaptureFailure::Cancelled | GitCaptureFailure::Artifact(_) => {
+                    FailureCodeV1::OutputStagingUnavailable
+                }
+                GitCaptureFailure::ExecutionRootRebound => FailureCodeV1::GitExecutionRootRebound,
+                GitCaptureFailure::StagingMismatch => FailureCodeV1::OutputStagingUnavailable,
+                GitCaptureFailure::HeadUnavailable => FailureCodeV1::GitHeadUnavailable,
+                GitCaptureFailure::BaselineNotAncestor => FailureCodeV1::GitBaselineNotAncestor,
+                GitCaptureFailure::CleanlinessUnavailable => {
+                    FailureCodeV1::GitCleanlinessUnavailable
+                }
+                GitCaptureFailure::WorkspaceDirty => FailureCodeV1::GitWorkspaceDirty,
+                GitCaptureFailure::TreeUnavailable => FailureCodeV1::GitTreeUnavailable,
+                GitCaptureFailure::RequiredObjectsUnavailable => {
+                    FailureCodeV1::GitRequiredObjectsUnavailable
+                }
+                GitCaptureFailure::SourceAuthorityChanged => {
+                    FailureCodeV1::GitSourceAuthorityChanged
+                }
+                GitCaptureFailure::GitStructureLimitExceeded => {
+                    FailureCodeV1::GitStructureLimitExceeded
+                }
+                GitCaptureFailure::BundleGenerationFailed => {
+                    FailureCodeV1::GitBundleGenerationFailed
+                }
+                GitCaptureFailure::BundleProfileInvalid => FailureCodeV1::GitBundleProfileInvalid,
+                GitCaptureFailure::BundleVerificationFailed => {
+                    FailureCodeV1::GitBundleVerificationFailed
+                }
+                GitCaptureFailure::WorkspaceChanged => FailureCodeV1::GitWorkspaceChanged,
+                GitCaptureFailure::TemporaryStorageUnavailable => {
+                    FailureCodeV1::GitTemporaryStorageUnavailable
+                }
+            };
+            let mut cause = FailureCauseV1::code(code);
+            cause.output = Some(output.clone());
             cause
         }
     }

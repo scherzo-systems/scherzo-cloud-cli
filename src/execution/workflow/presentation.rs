@@ -836,7 +836,7 @@ impl PresentationDefinition {
                                 Output::AgentResult { .. } => {
                                     Some(StepSuccessPresentation::AgentResult)
                                 }
-                                Output::File { .. } => None,
+                                Output::File { .. } | Output::GitBranch => None,
                             })
                             .unwrap_or(StepSuccessPresentation::AgentWithoutValue);
                         PresentationStep {
@@ -872,6 +872,7 @@ fn presentation_outputs(
                 Output::AgentResponse => "agent_response".to_owned(),
                 Output::AgentResult { schema } => format!("agent_result → {schema}"),
                 Output::File { path, .. } => format!("file → {path}"),
+                Output::GitBranch => "git_branch".to_owned(),
             };
             (name.clone(), visible_text(&detail))
         })
@@ -1882,6 +1883,9 @@ fn failure_cause(cause: &StepFailureCause) -> String {
                     CaptureFailureKind::StagingUnavailable => "output staging unavailable",
                 };
                 format!("{code} · output {}", failure.output_identity())
+            }
+            OutputCaptureFailure::Git { output, failure } => {
+                format!("Git branch capture {failure:?} · output {output}")
             }
         },
     }

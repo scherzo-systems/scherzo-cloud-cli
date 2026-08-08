@@ -775,6 +775,64 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
 }
 
 #[test]
+fn git_branch_is_exportable_but_rejected_from_every_downstream_binding() {
+    let producer = "schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      changes:
+        kind: git_branch
+";
+    let exported = format!("{producer}exports:\n  changes:\n    ref: outputs.produce.changes\n");
+    let workflow = validate_yaml(&exported).unwrap();
+    assert_eq!(
+        workflow.exports["changes"].value_type,
+        WorkflowValueType::GitBranch
+    );
+
+    let command = format!(
+        "{producer}  consume:\n    kind: cmd\n    inputs:\n      changes:\n        ref: outputs.produce.changes\n    command:\n      argv: [\"true\"]\n"
+    );
+    assert_failure(
+        &command,
+        ValidationFailureKind::TerminalOutputReference,
+        ValidationLocation::StepInput {
+            step: "consume".to_owned(),
+            input: "changes".to_owned(),
+        },
+    );
+
+    for (message, location) in [
+        (
+            "        text: [{ ref: outputs.produce.changes }]",
+            ValidationLocation::MessageText {
+                step: "consume".to_owned(),
+                index: 0,
+            },
+        ),
+        (
+            "        text: [{ file: system.md }]\n        attachments: [{ ref: outputs.produce.changes }]",
+            ValidationLocation::MessageAttachment {
+                step: "consume".to_owned(),
+                index: 0,
+            },
+        ),
+    ] {
+        let agent = format!(
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      changes:\n        kind: git_branch\n  consume:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n{message}\n"
+        );
+        assert_failure(
+            &agent,
+            ValidationFailureKind::TerminalOutputReference,
+            location,
+        );
+    }
+}
+
+#[test]
 fn output_kind_and_agent_cardinality_rules_are_enforced() {
     let mut command =
         decode(b"schemaVersion: 1\nsteps: {command: {kind: cmd, command: {argv: [\"true\"]}}}\n")

@@ -24,9 +24,9 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use super::admission::{AdmittedExecutionContext, EnvironmentSnapshot};
 use super::artifact::{
     ArtifactReadFailure, ArtifactStaging, CaptureAttemptFailure, CaptureBoundaryKind,
-    CaptureCancellation, CaptureCandidateDeclaration, CaptureCandidateSet, CaptureFailure,
-    CaptureFailureKind, CarrierDestination, CarrierProducer, GitBranchCaptureDeclaration,
-    GitBranchMetadata, GitObjectFormat,
+    CaptureCancellation, CaptureCandidateDeclaration, CaptureCandidateSet, CaptureDeclaration,
+    CaptureFailure, CaptureFailureKind, CarrierDestination, CarrierProducer,
+    GitBranchCaptureDeclaration, GitBranchMetadata, GitObjectFormat,
 };
 use super::execution_root::{AdmittedExecutionRoot, WorkingDirectorySelectionFailure};
 use super::schema_common::{is_lowercase_hex, lowercase_hex};
@@ -39,6 +39,7 @@ const MAXIMUM_PACK_ENTRIES: usize = 1_000_000;
 const MAXIMUM_INFLATED_GIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_OBJECT_LIST_BYTES: usize = 41 * MAXIMUM_PACK_ENTRIES;
 const MAXIMUM_OBJECT_SIZE_LIST_BYTES: usize = 21 * MAXIMUM_PACK_ENTRIES;
+const MAXIMUM_TRACKED_ENTRY_MODE_BYTES: usize = 7 * (MAXIMUM_PACK_ENTRIES + 1);
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const BUNDLE_MEDIA_TYPE: &str = "application/vnd.git.bundle";
 
@@ -92,7 +93,13 @@ impl fmt::Display for GitCaptureFailure {
 
 impl std::error::Error for GitCaptureFailure {}
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+pub(crate) enum GitAwareCaptureDeclaration<'a> {
+    File(CaptureDeclaration<'a>),
+    GitBranch(&'a str),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct GitCaptureContext {
     root: AdmittedExecutionRoot,
     environment: EnvironmentSnapshot,
@@ -167,6 +174,19 @@ impl GitCaptureContext {
             return Err(GitWorkspaceAdmissionFailure::UnsupportedObjectFormat);
         }
 
+        let tracked_modes = context
+            .read_tracked_entry_modes(cancellation)
+            .map_err(admission_process_failure)?;
+        if tracked_modes.stdout.truncated {
+            return Err(GitWorkspaceAdmissionFailure::GitOutputLimitExceeded);
+        }
+        if !tracked_modes.status.success() {
+            return Err(GitWorkspaceAdmissionFailure::GitUnavailable);
+        }
+        if contains_gitlink(&tracked_modes.stdout.bytes) {
+            return Err(GitWorkspaceAdmissionFailure::ExecutionRootNotWorkTreeRoot);
+        }
+
         let baseline = context
             .run_source(
                 &["rev-parse", "--verify", "HEAD^{commit}"],
@@ -208,12 +228,33 @@ impl GitCaptureContext {
         artifacts: &ArtifactStaging,
         cancellation: &CaptureCancellation,
     ) -> Result<CaptureCandidateSet, GitCaptureFailure> {
+        self.capture_step(
+            &[GitAwareCaptureDeclaration::GitBranch(output_identity)],
+            artifacts,
+            cancellation,
+        )
+    }
+
+    /// Captures one step's file and Git declarations as one physical candidate set.
+    pub(crate) fn capture_step(
+        &self,
+        declarations: &[GitAwareCaptureDeclaration<'_>],
+        artifacts: &ArtifactStaging,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CaptureCandidateSet, GitCaptureFailure> {
         cancellation
             .check()
             .map_err(|_| GitCaptureFailure::Cancelled)?;
         if !artifacts.is_bound_to_root(&self.root) {
             return Err(GitCaptureFailure::StagingMismatch);
         }
+        let first_git = declarations
+            .iter()
+            .find_map(|declaration| match declaration {
+                GitAwareCaptureDeclaration::GitBranch(identity) => Some(*identity),
+                GitAwareCaptureDeclaration::File(_) => None,
+            })
+            .ok_or(GitCaptureFailure::BundleProfileInvalid)?;
 
         let initial = self.observe(cancellation)?;
         // Treating the admitted baseline as the sole shallow boundary keeps revision traversal
@@ -221,37 +262,56 @@ impl GitCaptureContext {
         // ordinary promisor hydration instead of silently accepting another shallow cutoff.
         let shallow = self.baseline_shallow_file()?;
         self.require_ancestor(&initial.head_oid, shallow.path(), cancellation)?;
-        let object_count = if initial.head_oid == self.baseline_oid {
-            0
-        } else {
+        let changed = initial.head_oid != self.baseline_oid;
+        let object_count = if changed {
             self.require_capture_objects(&initial.head_oid, shallow.path(), cancellation)?
+        } else {
+            0
         };
         let metadata = GitBranchMetadata::new(
             Arc::clone(&self.baseline_oid),
             Arc::clone(&initial.head_oid),
             Arc::clone(&initial.tree_oid),
         );
-        let mut producer = (initial.head_oid != self.baseline_oid).then(|| GitBundleProducer {
-            context: self,
-            baseline_oid: Arc::clone(&self.baseline_oid),
-            head_oid: Arc::clone(&initial.head_oid),
-            shallow_file: shallow.path(),
-            cancellation,
-            failure: None,
-        });
+        let mut producers = declarations
+            .iter()
+            .filter(|declaration| {
+                changed && matches!(declaration, GitAwareCaptureDeclaration::GitBranch(_))
+            })
+            .map(|_| GitBundleProducer {
+                context: self,
+                baseline_oid: Arc::clone(&self.baseline_oid),
+                head_oid: Arc::clone(&initial.head_oid),
+                shallow_file: shallow.path(),
+                cancellation,
+                failure: None,
+            })
+            .collect::<Vec<_>>();
         let staged = {
-            let mut declarations = [CaptureCandidateDeclaration::GitBranch(
-                GitBranchCaptureDeclaration::new(
-                    output_identity,
-                    metadata.clone(),
-                    producer
-                        .as_mut()
-                        .map(|producer| producer as &mut dyn CarrierProducer),
-                ),
-            )];
-            artifacts.capture_candidates(&mut declarations, cancellation)
+            let mut producers = producers.iter_mut();
+            let mut candidates = declarations
+                .iter()
+                .map(|declaration| match declaration {
+                    GitAwareCaptureDeclaration::File(declaration) => {
+                        CaptureCandidateDeclaration::File(*declaration)
+                    }
+                    GitAwareCaptureDeclaration::GitBranch(identity) => {
+                        let producer = changed.then(|| {
+                            producers.next().unwrap_or_else(|| {
+                                unreachable!("every changed Git declaration has one producer")
+                            }) as &mut dyn CarrierProducer
+                        });
+                        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
+                            identity,
+                            metadata.clone(),
+                            producer,
+                        ))
+                    }
+                })
+                .collect::<Vec<_>>();
+            artifacts.capture_candidates(&mut candidates, cancellation)
         };
-        let production_failure = producer.and_then(|producer| producer.failure);
+        let production_failure = producers.into_iter().find_map(|producer| producer.failure);
         let candidates = match staged {
             Ok(candidates) if production_failure.is_none() => candidates,
             Ok(candidates) => {
@@ -263,25 +323,30 @@ impl GitCaptureContext {
             }
         };
 
-        if initial.head_oid != self.baseline_oid
-            && let Err(failure) = self.verify_staged(
-                output_identity,
-                artifacts,
-                &candidates,
-                &metadata,
-                object_count,
-                cancellation,
-            )
-        {
-            candidates.abort();
-            return Err(failure);
+        if changed {
+            for output_identity in declarations
+                .iter()
+                .filter_map(|declaration| match declaration {
+                    GitAwareCaptureDeclaration::GitBranch(identity) => Some(*identity),
+                    GitAwareCaptureDeclaration::File(_) => None,
+                })
+            {
+                if let Err(failure) = self.verify_staged(
+                    output_identity,
+                    artifacts,
+                    &candidates,
+                    &metadata,
+                    object_count,
+                    cancellation,
+                ) {
+                    candidates.abort();
+                    return Err(failure);
+                }
+            }
         }
 
         cancellation
-            .boundary(
-                &Arc::from(output_identity),
-                CaptureBoundaryKind::BeforeGitRecheck,
-            )
+            .boundary(&Arc::from(first_git), CaptureBoundaryKind::BeforeGitRecheck)
             .map_err(|_| GitCaptureFailure::Cancelled)?;
         let final_observation = match self.observe(cancellation) {
             Ok(observation) => observation,
@@ -333,6 +398,7 @@ impl GitCaptureContext {
         if clean.stdout.truncated || !clean.stdout.bytes.is_empty() {
             return Err(GitCaptureFailure::WorkspaceDirty);
         }
+        self.require_single_repository(cancellation)?;
 
         let tree_expression = format!("{head_oid}^{{tree}}");
         let tree = self
@@ -651,6 +717,41 @@ impl GitCaptureContext {
         Ok(shallow)
     }
 
+    fn read_tracked_entry_modes(
+        &self,
+        cancellation: &CaptureCancellation,
+    ) -> Result<ProcessOutput, ProcessFailure> {
+        self.run_source(
+            &["ls-files", "--format=%(objectmode)"],
+            ProcessInput::None,
+            MAXIMUM_TRACKED_ENTRY_MODE_BYTES,
+            cancellation,
+            true,
+            None,
+        )
+    }
+
+    fn require_single_repository(
+        &self,
+        cancellation: &CaptureCancellation,
+    ) -> Result<(), GitCaptureFailure> {
+        let tracked_modes = self
+            .read_tracked_entry_modes(cancellation)
+            .map_err(|failure| {
+                capture_process_failure(failure, GitCaptureFailure::CleanlinessUnavailable)
+            })?;
+        if tracked_modes.stdout.truncated {
+            return Err(GitCaptureFailure::GitStructureLimitExceeded);
+        }
+        if !tracked_modes.status.success() {
+            return Err(GitCaptureFailure::CleanlinessUnavailable);
+        }
+        if contains_gitlink(&tracked_modes.stdout.bytes) {
+            return Err(GitCaptureFailure::WorkspaceChanged);
+        }
+        Ok(())
+    }
+
     fn read_source_authority(
         &self,
         cancellation: &CaptureCancellation,
@@ -948,6 +1049,12 @@ fn source_authority_snapshot(output: &ProcessOutput) -> Option<Arc<[u8]>> {
     }
 }
 
+fn contains_gitlink(bytes: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .any(|mode| mode == b"160000")
+}
+
 fn reserved_git_environment(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
     matches!(
@@ -967,6 +1074,7 @@ fn reserved_git_environment(name: &OsStr) -> bool {
             | b"GIT_OPTIONAL_LOCKS"
             | b"GIT_NO_REPLACE_OBJECTS"
             | b"GIT_REPLACE_REF_BASE"
+            | b"GIT_CONFIG"
             | b"GIT_CONFIG_COUNT"
             | b"GIT_CONFIG_PARAMETERS"
             | b"GIT_CONFIG_GLOBAL"

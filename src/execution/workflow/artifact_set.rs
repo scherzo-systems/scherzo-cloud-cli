@@ -2,7 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek as _, SeekFrom};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::AtomicBool;
 
+use super::git_artifact::{
+    GitArtifactDescriptor, GitArtifactValidationBudget, validate_git_bundle,
+};
 use super::publication::{ExportV1, WorkflowResultV1};
 use super::result_metadata;
 use super::schema_common::lowercase_hex;
@@ -106,20 +110,61 @@ pub(crate) fn validate(root: &OwnedFd, result: &WorkflowResultV1) -> Result<(), 
     }
 
     let mut total_bytes = 0_u64;
+    let mut git_budget = GitArtifactValidationBudget::default();
     for (path, metadata) in carriers {
         let name = path.strip_prefix("exports/").ok_or(ArtifactSetError)?;
-        validate_carrier(&exports, name, metadata, &mut total_bytes)?;
+        validate_carrier(&exports, name, &metadata, &mut total_bytes, &mut git_budget)?;
     }
     Ok(())
 }
 
-fn carrier_metadata(result: &WorkflowResultV1) -> BTreeMap<&str, &ExportV1> {
+struct CarrierMetadata<'a> {
+    kind: &'a str,
+    size_bytes: u64,
+    digest: &'a super::publication::DigestV1,
+    git: Option<GitArtifactDescriptor<'a>>,
+}
+
+fn carrier_metadata(result: &WorkflowResultV1) -> BTreeMap<&str, CarrierMetadata<'_>> {
     result
         .exports
         .values()
         .filter_map(|export| match export {
-            ExportV1::Available { path, .. } => Some((path.as_str(), export)),
-            ExportV1::Unavailable { .. } => None,
+            ExportV1::Available {
+                kind,
+                path,
+                size_bytes,
+                digest,
+                ..
+            } => Some((
+                path.as_str(),
+                CarrierMetadata {
+                    kind,
+                    size_bytes: *size_bytes,
+                    digest,
+                    git: None,
+                },
+            )),
+            ExportV1::GitBranch {
+                base_oid,
+                head_oid,
+                tree_oid,
+                carrier: Some(carrier),
+                ..
+            } => Some((
+                carrier.path.as_str(),
+                CarrierMetadata {
+                    kind: "git_branch",
+                    size_bytes: carrier.size_bytes,
+                    digest: &carrier.digest,
+                    git: Some(GitArtifactDescriptor {
+                        base_oid,
+                        head_oid,
+                        tree_oid,
+                    }),
+                },
+            )),
+            ExportV1::GitBranch { carrier: None, .. } | ExportV1::Unavailable { .. } => None,
         })
         .collect()
 }
@@ -127,18 +172,16 @@ fn carrier_metadata(result: &WorkflowResultV1) -> BTreeMap<&str, &ExportV1> {
 fn validate_carrier(
     exports: &OwnedFd,
     name: &str,
-    metadata: &ExportV1,
+    metadata: &CarrierMetadata<'_>,
     total_bytes: &mut u64,
+    git_budget: &mut GitArtifactValidationBudget,
 ) -> Result<(), ArtifactSetError> {
-    let ExportV1::Available {
+    let CarrierMetadata {
         kind,
         size_bytes,
         digest,
-        ..
-    } = metadata
-    else {
-        return Err(ArtifactSetError);
-    };
+        git,
+    } = metadata;
     let descriptor = openat(
         exports,
         name,
@@ -184,7 +227,7 @@ fn validate_carrier(
         return Err(ArtifactSetError);
     }
 
-    match kind.as_str() {
+    match *kind {
         "file" => {}
         "text" => {
             file.seek(SeekFrom::Start(0))
@@ -195,6 +238,11 @@ fn validate_carrier(
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| ArtifactSetError)?;
             validate_canonical_json(&mut file)?;
+        }
+        "git_branch" => {
+            let descriptor = git.ok_or(ArtifactSetError)?;
+            validate_git_bundle(&mut file, descriptor, git_budget, &AtomicBool::new(false))
+                .map_err(|_| ArtifactSetError)?;
         }
         _ => return Err(ArtifactSetError),
     }

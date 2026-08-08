@@ -303,6 +303,34 @@ fn normalized_run_directory(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
+fn git(repository: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn initialize_git_repository(repository: &Path) {
+    git(repository, &["init", "--quiet"]);
+    git(repository, &["config", "user.name", "Scherzo Test"]);
+    git(
+        repository,
+        &["config", "user.email", "test@example.invalid"],
+    );
+    fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
+    git(repository, &["add", "tracked.txt"]);
+    git(repository, &["commit", "--quiet", "-m", "baseline"]);
+}
+
 fn producer_consumer_source() -> &'static str {
     r#"schemaVersion: 1
 steps:
@@ -362,6 +390,33 @@ steps:
 exports:
   response:
     ref: outputs.answer.response
+"#
+}
+
+fn git_branch_agent_source() -> &'static str {
+    r#"schemaVersion: 1
+agentProfiles:
+  local:
+    harness:
+      kind: pi
+      config:
+        model: fixture/model
+        thinking: off
+steps:
+  implement:
+    kind: agent
+    agent:
+      profile: local
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      changes:
+        kind: git_branch
+exports:
+  changes:
+    ref: outputs.implement.changes
 "#
 }
 
@@ -508,6 +563,266 @@ exports:
         files,
         std::collections::BTreeSet::from(["0001".into(), "0003".into()])
     );
+}
+
+#[test]
+fn git_context_rejection_occurs_before_any_step_starts() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  mutate:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf started > marker.txt"]
+    outputs:
+      changes:
+        kind: git_branch
+exports:
+  changes:
+    ref: outputs.mutate.changes
+"#,
+    );
+    initialize_git_repository(bundle.initial_cwd());
+    let destination = bundle.result("git-context-rejected");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejection["outcome"], "rejected");
+    assert_eq!(rejection["phase"], "admission");
+    assert_eq!(
+        rejection["diagnostics"][0]["code"],
+        "git_context_execution_root_mismatch"
+    );
+    assert!(!bundle.execution_root().join("marker.txt").exists());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn changed_git_branch_aliases_publish_one_valid_bundle_with_mixed_outputs() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "set -eu; printf 'changed\\n' > tracked.txt; printf report > report.txt; git add tracked.txt report.txt; git commit --quiet -m change"]
+    outputs:
+      changes:
+        kind: git_branch
+      changesAgain:
+        kind: git_branch
+      report:
+        kind: file
+        path: report.txt
+        mediaType: text/plain
+exports:
+  changesAlias:
+    ref: outputs.produce.changes
+  changesDistinct:
+    ref: outputs.produce.changesAgain
+  changesPrimary:
+    ref: outputs.produce.changes
+  report:
+    ref: outputs.produce.report
+"#,
+    );
+    initialize_git_repository(bundle.execution_root());
+    let destination = bundle.result("git-changed");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &terminal["result"];
+    let alias = &result["exports"]["changesAlias"];
+    let distinct = &result["exports"]["changesDistinct"];
+    assert_eq!(alias, &result["exports"]["changesPrimary"]);
+    assert_eq!(alias["kind"], "git_branch");
+    assert_eq!(alias["artifactVersion"], 1);
+    assert_eq!(alias["objectFormat"], "sha1");
+    assert_ne!(alias["baseOid"], alias["headOid"]);
+    assert_eq!(alias["carrier"]["path"], "exports/0001");
+    assert_eq!(alias["carrier"]["mediaType"], "application/vnd.git.bundle");
+    assert_eq!(distinct["baseOid"], alias["baseOid"]);
+    assert_eq!(distinct["headOid"], alias["headOid"]);
+    assert_eq!(distinct["treeOid"], alias["treeOid"]);
+    assert_eq!(distinct["carrier"]["path"], "exports/0002");
+    assert_eq!(result["exports"]["report"]["path"], "exports/0004");
+    let artifact = attempt_result(&destination);
+    let files = fs::read_dir(artifact.join("exports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        files,
+        std::collections::BTreeSet::from(["0001".into(), "0002".into(), "0004".into()])
+    );
+    let mut complete_set = result.clone();
+    complete_set["exports"]["unavailable"] = serde_json::json!({
+        "state": "unavailable",
+        "reason": "source_blocked"
+    });
+    let mut result_bytes = serde_json::to_vec_pretty(&complete_set).unwrap();
+    result_bytes.push(b'\n');
+    fs::write(artifact.join("result.json"), result_bytes).unwrap();
+
+    let validation = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        "--json".to_owned(),
+        artifact.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        validation.status.success(),
+        "artifact validation failed: {}",
+        String::from_utf8_lossy(&validation.stdout)
+    );
+
+    let carrier_path = artifact.join("exports/0001");
+    let original = fs::read(&carrier_path).unwrap();
+    let advertised_ref = b"refs/scherzo/head";
+    let ref_offset = original
+        .windows(advertised_ref.len())
+        .position(|window| window == advertised_ref)
+        .unwrap();
+    let mut wrong_profile = original.clone();
+    wrong_profile[ref_offset..ref_offset + advertised_ref.len()]
+        .copy_from_slice(b"refs/scherzo/heap");
+    fs::write(&carrier_path, wrong_profile).unwrap();
+    let invalid_profile = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        "--json".to_owned(),
+        artifact.to_string_lossy().into_owned(),
+    ]);
+    let profile_report: serde_json::Value =
+        serde_json::from_slice(&invalid_profile.stdout).unwrap();
+    let profile_codes = profile_report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(profile_codes.contains(&"carrier_digest_mismatch"));
+    assert!(profile_codes.contains(&"git_bundle_profile_invalid"));
+
+    let mut wrong_checksum = original.clone();
+    *wrong_checksum.last_mut().unwrap() ^= 1;
+    fs::write(&carrier_path, wrong_checksum).unwrap();
+    let invalid_checksum = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        "--json".to_owned(),
+        artifact.to_string_lossy().into_owned(),
+    ]);
+    let checksum_report: serde_json::Value =
+        serde_json::from_slice(&invalid_checksum.stdout).unwrap();
+    let checksum_codes = checksum_report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(checksum_codes.contains(&"carrier_digest_mismatch"));
+    assert!(checksum_codes.contains(&"git_pack_checksum_mismatch"));
+}
+
+#[test]
+fn zero_delta_git_branch_has_no_carrier_file_or_reservation_artifact() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  inspect:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      changes:
+        kind: git_branch
+exports:
+  changes:
+    ref: outputs.inspect.changes
+"#,
+    );
+    initialize_git_repository(bundle.execution_root());
+    let destination = bundle.result("git-zero-delta");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = result_json(&destination);
+    let branch = &result["exports"]["changes"];
+    assert_eq!(branch["kind"], "git_branch");
+    assert_eq!(branch["baseOid"], branch["headOid"]);
+    assert!(branch.get("carrier").is_none());
+    let artifact = attempt_result(&destination);
+    assert_eq!(fs::read_dir(artifact.join("exports")).unwrap().count(), 0);
+    let validation = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        "--json".to_owned(),
+        artifact.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        validation.status.success(),
+        "zero-delta artifact validation failed: {}",
+        String::from_utf8_lossy(&validation.stdout)
+    );
+}
+
+#[test]
+fn agent_step_captures_and_publishes_a_changed_git_branch() {
+    let execution = format!(
+        "printf 'agent change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m agent-change; {}",
+        response_pi_execution()
+    );
+    let pi = PiFixture::with_execution("0.83.0", COMPLETE_HELP, true, &execution);
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(pi.path_directory().to_path_buf())
+            .chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
+    let bundle = RunBundle::new(git_branch_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    initialize_git_repository(bundle.execution_root());
+    let destination = bundle.result("agent-git-branch");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args).env("PATH", path).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = result_json(&destination);
+    let branch = &result["exports"]["changes"];
+    assert_eq!(branch["kind"], "git_branch");
+    assert_ne!(branch["baseOid"], branch["headOid"]);
+    assert_eq!(branch["carrier"]["path"], "exports/0001");
 }
 
 #[test]

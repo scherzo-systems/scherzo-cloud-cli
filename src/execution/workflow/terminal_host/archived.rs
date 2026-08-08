@@ -650,6 +650,7 @@ fn archived_output_description(output: &WorkflowOutput) -> (&'static str, String
         WorkflowOutput::AgentResponse => ("agent_response", "—".to_owned()),
         WorkflowOutput::AgentResult { schema } => ("agent_result", safe_text(schema)),
         WorkflowOutput::File { path, .. } => ("file", safe_text(path)),
+        WorkflowOutput::GitBranch => ("git_branch", "—".to_owned()),
     }
 }
 
@@ -711,6 +712,7 @@ fn normalize_outputs(outputs: &mut std::collections::BTreeMap<String, WorkflowOu
         match output {
             WorkflowOutput::AgentResponse => {}
             WorkflowOutput::AgentResult { schema } => *schema = safe_text(schema),
+            WorkflowOutput::GitBranch => {}
             WorkflowOutput::File {
                 path, media_type, ..
             } => {

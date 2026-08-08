@@ -153,6 +153,7 @@ impl<'a> RejectionLocation<'a> {
             }),
             AdmissionLocation::Step { step } => Some(Self::for_step("step", step)),
             AdmissionLocation::ExecutionRoot => Some(Self::simple("execution_root")),
+            AdmissionLocation::GitContext => Some(Self::simple("git_context")),
             AdmissionLocation::MaximumParallelSteps
             | AdmissionLocation::MaximumCapturedFiles
             | AdmissionLocation::MaximumCapturedFileBytes
@@ -322,9 +323,13 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "message_type_mismatch",
             "Reference a value type accepted by this message destination.",
         ),
+        ValidationFailureKind::TerminalOutputReference => (
+            "terminal_output_reference",
+            "Export git_branch directly; it cannot bind a downstream step value.",
+        ),
         ValidationFailureKind::IllegalCommandOutput => (
             "illegal_command_output",
-            "Declare only file outputs on command steps.",
+            "Declare only file or git_branch outputs on command steps.",
         ),
         ValidationFailureKind::ExcessAgentResponseOutput => (
             "excess_agent_response_output",
@@ -395,6 +400,30 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         AdmissionFailureKind::ExecutionRootNotDirectory => Some((
             "execution_root_not_directory",
             "The execution root must identify a directory.",
+        )),
+        AdmissionFailureKind::GitContextRequired => Some((
+            "git_context_required",
+            "Use an execution adapter that supplies Git branch capture context.",
+        )),
+        AdmissionFailureKind::GitContextUnavailable => Some((
+            "git_context_unavailable",
+            "Make Git available before running a workflow with git_branch output.",
+        )),
+        AdmissionFailureKind::GitContextNotRepository => Some((
+            "git_context_not_repository",
+            "Use a Git worktree root as the execution root.",
+        )),
+        AdmissionFailureKind::GitContextExecutionRootMismatch => Some((
+            "git_context_execution_root_mismatch",
+            "Bind the execution root to exactly one Git worktree root.",
+        )),
+        AdmissionFailureKind::GitObjectFormatUnsupported => Some((
+            "git_object_format_unsupported",
+            "Use a SHA-1 Git repository for git_branch output.",
+        )),
+        AdmissionFailureKind::GitBaselineUnavailable => Some((
+            "git_baseline_unavailable",
+            "Check out a readable baseline commit before running the workflow.",
         )),
         AdmissionFailureKind::NonPositiveParallelism
         | AdmissionFailureKind::NonPositiveCapturedFiles

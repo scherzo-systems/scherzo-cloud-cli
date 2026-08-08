@@ -43,6 +43,7 @@ use super::execution_root::{
     AdmittedExecutionRoot, AdmittedWorkingDirectory, ExecutableCandidate,
     WorkingDirectorySelectionFailure,
 };
+use super::git_capture::{GitAwareCaptureDeclaration, GitCaptureFailure};
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
 use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionObserver};
 use super::pi::PiConfig;
@@ -114,6 +115,10 @@ pub(crate) enum OutputCaptureFailure {
     StepUnavailable,
     UnsupportedOutput,
     Capture(CaptureFailure),
+    Git {
+        output: String,
+        failure: GitCaptureFailure,
+    },
     TaskUnavailable,
 }
 
@@ -1097,12 +1102,9 @@ where
             .ok_or(StepStartFailure::StepUnavailable)?;
         let body = match StepBody::from(definition) {
             StepBody::Command(command) => {
-                if command
-                    .common
-                    .outputs
-                    .values()
-                    .any(|output| !matches!(&output.definition, Output::File { .. }))
-                {
+                if command.common.outputs.values().any(|output| {
+                    !matches!(&output.definition, Output::File { .. } | Output::GitBranch)
+                }) {
                     return Err(StepStartFailure::OutputsUnsupported);
                 }
                 let cwd = resolve_working_directory(
@@ -1382,16 +1384,52 @@ impl CaptureWorker {
             .outputs
             .iter()
             .filter_map(|(output_identity, output)| match &output.definition {
-                Output::File { path, media_type } => Some(Ok(CaptureDeclaration::new(
-                    output_identity,
-                    Path::new(path),
-                    media_type,
-                ))),
+                Output::File { path, media_type } => Some(GitAwareCaptureDeclaration::File(
+                    CaptureDeclaration::new(output_identity, Path::new(path), media_type),
+                )),
+                Output::GitBranch => Some(GitAwareCaptureDeclaration::GitBranch(output_identity)),
                 Output::AgentResponse | Output::AgentResult { .. } => None,
             })
-            .collect::<Result<Vec<_>, CaptureWorkerFailure>>()?;
+            .collect::<Vec<_>>();
+        if declarations
+            .iter()
+            .any(|declaration| matches!(declaration, GitAwareCaptureDeclaration::GitBranch(_)))
+        {
+            let Some(git) = self.admitted.git_capture() else {
+                return Err(CaptureWorkerFailure::Failed(
+                    OutputCaptureFailure::UnsupportedOutput,
+                ));
+            };
+            return git
+                .capture_step(&declarations, &self.artifacts, cancellation)
+                .map_err(|failure| match failure {
+                    GitCaptureFailure::Cancelled => CaptureWorkerFailure::Cancelled,
+                    GitCaptureFailure::Artifact(failure) => {
+                        CaptureWorkerFailure::Failed(OutputCaptureFailure::Capture(failure))
+                    }
+                    failure => {
+                        let output = declarations
+                            .iter()
+                            .find_map(|declaration| match declaration {
+                                GitAwareCaptureDeclaration::GitBranch(output) => {
+                                    Some((*output).to_owned())
+                                }
+                                GitAwareCaptureDeclaration::File(_) => None,
+                            })
+                            .unwrap_or_default();
+                        CaptureWorkerFailure::Failed(OutputCaptureFailure::Git { output, failure })
+                    }
+                });
+        }
+        let files = declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                GitAwareCaptureDeclaration::File(declaration) => Some(*declaration),
+                GitAwareCaptureDeclaration::GitBranch(_) => None,
+            })
+            .collect::<Vec<_>>();
         self.artifacts
-            .capture_file_candidates(&declarations, cancellation)
+            .capture_file_candidates(&files, cancellation)
             .map_err(|failure| match failure {
                 CaptureAttemptFailure::Cancelled => CaptureWorkerFailure::Cancelled,
                 CaptureAttemptFailure::Capture(failure) => {

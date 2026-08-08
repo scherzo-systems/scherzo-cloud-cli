@@ -2422,6 +2422,7 @@ fn output_description(output: &WorkflowOutput) -> (&'static str, String) {
         WorkflowOutput::AgentResponse => ("agent_response", "—".to_owned()),
         WorkflowOutput::AgentResult { schema } => ("agent_result", visible_text(schema)),
         WorkflowOutput::File { path, .. } => ("file", visible_text(path)),
+        WorkflowOutput::GitBranch => ("git_branch", "—".to_owned()),
     }
 }
 

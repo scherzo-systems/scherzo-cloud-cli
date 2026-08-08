@@ -12,6 +12,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::artifact_json::{self, ArtifactJsonFailure};
+use super::git_artifact::{
+    GitArtifactDescriptor, GitArtifactFailure, GitArtifactValidationBudget, validate_git_bundle,
+};
 use super::presentation::visible_text;
 use super::result_metadata::{self, ResultDocumentError};
 use super::schema_common::{is_identifier, is_lowercase_hex, lowercase_hex};
@@ -161,6 +164,7 @@ impl PortableArtifactValidation {
 pub(crate) enum PortableArtifactValidationFailure {
     AccessBookkeepingUnavailable,
     CurrentDirectoryUnavailable,
+    ScratchUnavailable,
     Interrupted,
 }
 
@@ -506,6 +510,7 @@ pub(crate) fn validate_portable_artifact_set(
     }
 
     let mut total_bytes = 0_u64;
+    let mut git_budget = GitArtifactValidationBudget::default();
     for (path, group) in &metadata.carriers {
         check_cancelled(cancelled)?;
         validate_carrier(
@@ -513,6 +518,7 @@ pub(crate) fn validate_portable_artifact_set(
             path,
             group,
             &mut total_bytes,
+            &mut git_budget,
             cancelled,
             &mut diagnostics,
         )?;
@@ -831,8 +837,16 @@ struct CarrierGroup {
     first_metadata: Option<MetadataFingerprint>,
     alias_metadata_mismatch: bool,
     kinds: BTreeSet<CarrierKind>,
+    git_descriptors: BTreeSet<GitDescriptor>,
     size_bytes: BTreeSet<u64>,
     digests: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GitDescriptor {
+    base_oid: String,
+    head_oid: String,
+    tree_oid: String,
 }
 
 impl CarrierGroup {
@@ -840,6 +854,7 @@ impl CarrierGroup {
         owner_ordinal: usize,
         metadata: Option<MetadataFingerprint>,
         kind: Option<CarrierKind>,
+        descriptor: Option<GitDescriptor>,
         size_bytes: Option<u64>,
         digest: Option<String>,
     ) -> Self {
@@ -848,10 +863,11 @@ impl CarrierGroup {
             first_metadata: metadata,
             alias_metadata_mismatch: false,
             kinds: BTreeSet::new(),
+            git_descriptors: BTreeSet::new(),
             size_bytes: BTreeSet::new(),
             digests: BTreeSet::new(),
         };
-        group.record(metadata, kind, size_bytes, digest);
+        group.record(metadata, kind, descriptor, size_bytes, digest);
         group
     }
 
@@ -859,12 +875,16 @@ impl CarrierGroup {
         &mut self,
         metadata: Option<MetadataFingerprint>,
         kind: Option<CarrierKind>,
+        descriptor: Option<GitDescriptor>,
         size_bytes: Option<u64>,
         digest: Option<String>,
     ) {
         self.alias_metadata_mismatch |= metadata != self.first_metadata;
         if let Some(kind) = kind {
             self.kinds.insert(kind);
+        }
+        if let Some(descriptor) = descriptor {
+            self.git_descriptors.insert(descriptor);
         }
         if let Some(size_bytes) = size_bytes {
             self.size_bytes.insert(size_bytes);
@@ -902,6 +922,7 @@ enum CarrierKind {
     File,
     Text,
     Json,
+    GitBranch,
 }
 
 impl CarrierKind {
@@ -910,6 +931,7 @@ impl CarrierKind {
             Self::File => "file",
             Self::Text => "text",
             Self::Json => "json",
+            Self::GitBranch => "git_branch",
         }
     }
 }
@@ -976,8 +998,12 @@ fn inspect_exports(
             Some("file") => Some(CarrierKind::File),
             Some("text") => Some(CarrierKind::Text),
             Some("json") => Some(CarrierKind::Json),
+            Some("git_branch") => Some(CarrierKind::GitBranch),
             _ => None,
         };
+        let descriptor = (kind == Some(CarrierKind::GitBranch))
+            .then(|| git_descriptor(entry))
+            .flatten();
         let entry_object = entry.as_object();
         let direct_path = entry_object
             .and_then(|object| object.get("path"))
@@ -997,12 +1023,18 @@ fn inspect_exports(
             .and_then(Value::as_u64);
         let nested_digest = valid_digest(nested_carrier.and_then(|object| object.get("digest")));
         let fingerprint = metadata_fingerprint(entry);
+        let invalid_zero_delta = descriptor.as_ref().is_some_and(|descriptor| {
+            descriptor.base_oid == descriptor.head_oid && nested_carrier.is_some()
+        });
 
         let shape_valid = if !is_identifier(name) {
             false
         } else {
             match state {
                 Some("unavailable") => valid_unavailable_entry(entry),
+                Some("available") if kind == Some(CarrierKind::GitBranch) => {
+                    valid_git_branch_entry(entry, descriptor.as_ref(), invalid_zero_delta)
+                }
                 Some("available") if kind.is_some() => valid_available_entry(entry, kind),
                 _ => false,
             }
@@ -1010,10 +1042,22 @@ fn inspect_exports(
         if !shape_valid {
             diagnostics.export("export_entry_invalid", name, 0);
         }
+        if invalid_zero_delta {
+            diagnostics.export("git_zero_delta_invalid", name, 4);
+        }
 
         if let (Some(kind), Some(media_type)) =
             (kind, entry.get("mediaType").and_then(Value::as_str))
+            && kind != CarrierKind::GitBranch
             && !result_metadata::valid_export_kind(kind.as_str(), media_type)
+        {
+            diagnostics.export("export_media_type_invalid", name, 1);
+        }
+        if kind == Some(CarrierKind::GitBranch)
+            && nested_carrier
+                .and_then(|carrier| carrier.get("mediaType"))
+                .and_then(Value::as_str)
+                .is_some_and(|media_type| media_type != "application/vnd.git.bundle")
         {
             diagnostics.export("export_media_type_invalid", name, 1);
         }
@@ -1025,7 +1069,8 @@ fn inspect_exports(
             ordinal,
             direct_path,
             fingerprint,
-            kind,
+            kind.filter(|kind| *kind != CarrierKind::GitBranch),
+            None,
             direct_size,
             direct_digest,
         );
@@ -1036,7 +1081,8 @@ fn inspect_exports(
             ordinal,
             nested_path,
             fingerprint,
-            None,
+            (kind == Some(CarrierKind::GitBranch)).then_some(CarrierKind::GitBranch),
+            descriptor,
             nested_size,
             nested_digest,
         );
@@ -1056,6 +1102,7 @@ fn record_carrier_reference(
     path: Option<&str>,
     fingerprint: Option<MetadataFingerprint>,
     kind: Option<CarrierKind>,
+    descriptor: Option<GitDescriptor>,
     size_bytes: Option<u64>,
     digest: Option<String>,
 ) {
@@ -1072,12 +1119,13 @@ fn record_carrier_reference(
             ordinal,
             fingerprint,
             kind,
+            descriptor,
             size_bytes,
             digest,
         )),
         std::collections::btree_map::Entry::Occupied(occupied) => {
             let group = occupied.into_mut();
-            group.record(fingerprint, kind, size_bytes, digest);
+            group.record(fingerprint, kind, descriptor, size_bytes, digest);
             group
         }
     };
@@ -1109,6 +1157,78 @@ fn valid_available_entry(entry: &Value, kind: Option<CarrierKind>) -> bool {
         && object.get("path").and_then(Value::as_str).is_some()
         && object.get("sizeBytes").and_then(Value::as_u64).is_some()
         && valid_digest(object.get("digest")).is_some()
+}
+
+fn git_descriptor(entry: &Value) -> Option<GitDescriptor> {
+    let object = entry.as_object()?;
+    if object.get("artifactVersion").and_then(Value::as_u64) != Some(1)
+        || object.get("objectFormat").and_then(Value::as_str) != Some("sha1")
+    {
+        return None;
+    }
+    let base_oid = object.get("baseOid")?.as_str()?;
+    let head_oid = object.get("headOid")?.as_str()?;
+    let tree_oid = object.get("treeOid")?.as_str()?;
+    if !is_lowercase_hex(base_oid, 40)
+        || !is_lowercase_hex(head_oid, 40)
+        || !is_lowercase_hex(tree_oid, 40)
+    {
+        return None;
+    }
+    Some(GitDescriptor {
+        base_oid: base_oid.to_owned(),
+        head_oid: head_oid.to_owned(),
+        tree_oid: tree_oid.to_owned(),
+    })
+}
+
+fn valid_git_branch_entry(
+    entry: &Value,
+    descriptor: Option<&GitDescriptor>,
+    invalid_zero_delta: bool,
+) -> bool {
+    let (Some(object), Some(descriptor)) = (entry.as_object(), descriptor) else {
+        return false;
+    };
+    if descriptor.base_oid == descriptor.head_oid && !invalid_zero_delta {
+        exact_keys(
+            object,
+            &[
+                "state",
+                "kind",
+                "artifactVersion",
+                "objectFormat",
+                "baseOid",
+                "headOid",
+                "treeOid",
+            ],
+        )
+    } else {
+        exact_keys(
+            object,
+            &[
+                "state",
+                "kind",
+                "artifactVersion",
+                "objectFormat",
+                "baseOid",
+                "headOid",
+                "treeOid",
+                "carrier",
+            ],
+        ) && object
+            .get("carrier")
+            .and_then(Value::as_object)
+            .is_some_and(valid_git_carrier)
+    }
+}
+
+fn valid_git_carrier(carrier: &Map<String, Value>) -> bool {
+    exact_keys(carrier, &["path", "mediaType", "sizeBytes", "digest"])
+        && carrier.get("path").and_then(Value::as_str).is_some()
+        && carrier.get("mediaType").and_then(Value::as_str) == Some("application/vnd.git.bundle")
+        && carrier.get("sizeBytes").and_then(Value::as_u64).is_some()
+        && valid_digest(carrier.get("digest")).is_some()
 }
 
 fn exact_keys(object: &Map<String, Value>, expected: &[&str]) -> bool {
@@ -1263,6 +1383,7 @@ fn validate_carrier(
     path: &str,
     group: &CarrierGroup,
     total_bytes: &mut u64,
+    git_budget: &mut GitArtifactValidationBudget,
     cancelled: &AtomicBool,
     diagnostics: &mut Diagnostics,
 ) -> Result<(), PortableArtifactValidationFailure> {
@@ -1408,6 +1529,44 @@ fn validate_carrier(
                     };
                     if let Some(code) = code {
                         diagnostics.carrier(code, path, 6);
+                    }
+                }
+                CarrierKind::GitBranch => {
+                    for descriptor in &group.git_descriptors {
+                        let result = validate_git_bundle(
+                            &mut file,
+                            GitArtifactDescriptor {
+                                base_oid: &descriptor.base_oid,
+                                head_oid: &descriptor.head_oid,
+                                tree_oid: &descriptor.tree_oid,
+                            },
+                            git_budget,
+                            cancelled,
+                        );
+                        let code = match result {
+                            Ok(()) => None,
+                            Err(GitArtifactFailure::Header) => Some("git_bundle_header_invalid"),
+                            Err(GitArtifactFailure::Profile) => Some("git_bundle_profile_invalid"),
+                            Err(GitArtifactFailure::Pack) => Some("git_pack_invalid"),
+                            Err(GitArtifactFailure::Checksum) => Some("git_pack_checksum_mismatch"),
+                            Err(GitArtifactFailure::Content) => Some("git_content_invalid"),
+                            Err(GitArtifactFailure::StructureLimit) => {
+                                Some("git_structure_limit_exceeded")
+                            }
+                            Err(GitArtifactFailure::Unavailable) => {
+                                diagnostics.carrier("carrier_unavailable", path, 0);
+                                None
+                            }
+                            Err(GitArtifactFailure::Scratch) => {
+                                return Err(PortableArtifactValidationFailure::ScratchUnavailable);
+                            }
+                            Err(GitArtifactFailure::Interrupted) => {
+                                return Err(PortableArtifactValidationFailure::Interrupted);
+                            }
+                        };
+                        if let Some(code) = code {
+                            diagnostics.carrier(code, path, 7);
+                        }
                     }
                 }
             }

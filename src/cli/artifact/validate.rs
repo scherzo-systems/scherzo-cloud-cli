@@ -47,6 +47,10 @@ impl Command {
                 eprintln!("Error: resolve the initial artifact validation directory");
                 return ExitCode::FAILURE;
             }
+            Err(PortableArtifactValidationFailure::ScratchUnavailable) => {
+                eprintln!("Error: use artifact validation scratch storage");
+                return ExitCode::FAILURE;
+            }
         };
         if cancelled.load(Ordering::Acquire) {
             return ExitCode::FAILURE;

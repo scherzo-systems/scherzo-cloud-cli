@@ -316,6 +316,23 @@ pub(crate) fn is_output_failure_code(code: FailureCodeV1) -> bool {
             | FailureCodeV1::CapturedFileCountLimit
             | FailureCodeV1::CapturedFileSizeLimit
             | FailureCodeV1::CapturedTotalSizeLimit
+            | FailureCodeV1::CapturedGitCarrierCountLimit
+            | FailureCodeV1::CapturedGitCarrierSizeLimit
+            | FailureCodeV1::CapturedTotalGitCarrierSizeLimit
+            | FailureCodeV1::GitExecutionRootRebound
+            | FailureCodeV1::GitHeadUnavailable
+            | FailureCodeV1::GitBaselineNotAncestor
+            | FailureCodeV1::GitCleanlinessUnavailable
+            | FailureCodeV1::GitWorkspaceDirty
+            | FailureCodeV1::GitTreeUnavailable
+            | FailureCodeV1::GitRequiredObjectsUnavailable
+            | FailureCodeV1::GitSourceAuthorityChanged
+            | FailureCodeV1::GitStructureLimitExceeded
+            | FailureCodeV1::GitBundleGenerationFailed
+            | FailureCodeV1::GitBundleProfileInvalid
+            | FailureCodeV1::GitBundleVerificationFailed
+            | FailureCodeV1::GitWorkspaceChanged
+            | FailureCodeV1::GitTemporaryStorageUnavailable
             | FailureCodeV1::OutputStagingUnavailable
     )
 }
@@ -361,6 +378,23 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::CapturedFileCountLimit
         | FailureCodeV1::CapturedFileSizeLimit
         | FailureCodeV1::CapturedTotalSizeLimit
+        | FailureCodeV1::CapturedGitCarrierCountLimit
+        | FailureCodeV1::CapturedGitCarrierSizeLimit
+        | FailureCodeV1::CapturedTotalGitCarrierSizeLimit
+        | FailureCodeV1::GitExecutionRootRebound
+        | FailureCodeV1::GitHeadUnavailable
+        | FailureCodeV1::GitBaselineNotAncestor
+        | FailureCodeV1::GitCleanlinessUnavailable
+        | FailureCodeV1::GitWorkspaceDirty
+        | FailureCodeV1::GitTreeUnavailable
+        | FailureCodeV1::GitRequiredObjectsUnavailable
+        | FailureCodeV1::GitSourceAuthorityChanged
+        | FailureCodeV1::GitStructureLimitExceeded
+        | FailureCodeV1::GitBundleGenerationFailed
+        | FailureCodeV1::GitBundleProfileInvalid
+        | FailureCodeV1::GitBundleVerificationFailed
+        | FailureCodeV1::GitWorkspaceChanged
+        | FailureCodeV1::GitTemporaryStorageUnavailable
         | FailureCodeV1::OutputStagingUnavailable => false,
         FailureCodeV1::PreparationTaskUnavailable
         | FailureCodeV1::InputsUnavailable
@@ -416,24 +450,56 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
         if !is_identifier(name) {
             return Err(ResultMetadataError);
         }
-        let ExportV1::Available {
-            kind,
-            media_type,
-            path,
-            size_bytes: _,
-            digest,
-        } = export
-        else {
-            continue;
+        let carrier_path = match export {
+            ExportV1::Available {
+                kind,
+                media_type,
+                path,
+                size_bytes: _,
+                digest,
+            } => {
+                if !valid_export_kind(kind, media_type)
+                    || !valid_digest(digest)
+                    || parse_carrier_ordinal(path).is_none()
+                {
+                    return Err(ResultMetadataError);
+                }
+                Some(path.as_str())
+            }
+            ExportV1::GitBranch {
+                artifact_version,
+                object_format,
+                base_oid,
+                head_oid,
+                tree_oid,
+                carrier,
+            } => {
+                if *artifact_version != 1
+                    || object_format != "sha1"
+                    || !is_lowercase_hex(base_oid, 40)
+                    || !is_lowercase_hex(head_oid, 40)
+                    || !is_lowercase_hex(tree_oid, 40)
+                    || (base_oid != head_oid) != carrier.is_some()
+                {
+                    return Err(ResultMetadataError);
+                }
+                match carrier {
+                    Some(carrier)
+                        if carrier.media_type == "application/vnd.git.bundle"
+                            && valid_digest(&carrier.digest)
+                            && parse_carrier_ordinal(&carrier.path).is_some() =>
+                    {
+                        Some(carrier.path.as_str())
+                    }
+                    Some(_) => return Err(ResultMetadataError),
+                    None => None,
+                }
+            }
+            ExportV1::Unavailable { .. } => None,
         };
-        if !valid_export_kind(kind, media_type)
-            || digest.algorithm != SHA256_ALGORITHM
-            || !is_lowercase_hex(&digest.value, 64)
-            || parse_carrier_ordinal(path).is_none()
-        {
-            return Err(ResultMetadataError);
+        if let Some(path) = carrier_path {
+            groups.entry(path).or_default().push((index + 1, export));
         }
-        groups.entry(path).or_default().push((index + 1, export));
     }
     if groups.len() > MAXIMUM_CARRIERS {
         return Err(ResultMetadataError);
@@ -454,6 +520,10 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
         }
     }
     Ok(())
+}
+
+fn valid_digest(digest: &super::publication::DigestV1) -> bool {
+    digest.algorithm == SHA256_ALGORITHM && is_lowercase_hex(&digest.value, 64)
 }
 
 pub(super) fn valid_export_kind(kind: &str, media_type: &str) -> bool {

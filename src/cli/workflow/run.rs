@@ -637,13 +637,16 @@ pub(super) fn execution_context_for_workflow(
     cancellation: CancellationSource,
 ) -> Result<ExecutionContext, PiInstallationFailure> {
     let environment = EnvironmentSnapshot::new(env::vars_os());
-    let context = ExecutionContext::new(
+    let mut context = ExecutionContext::new(
         root,
         ExecutionRootLifecycle::CallerOwnedRetained,
         default_execution_policy_limits(maximum_parallel_steps),
         environment.clone(),
         CancellationPolicy::new(cancellation, CANCELLATION_GRACE),
     );
+    if workflow.requires_git_capture() {
+        context = context.with_local_git_capture();
+    }
     if workflow.definition.steps.values().any(|step| {
         matches!(
             step,

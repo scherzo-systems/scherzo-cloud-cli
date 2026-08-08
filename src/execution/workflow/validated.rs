@@ -9,6 +9,7 @@ pub(crate) enum WorkflowValueType {
     AttachmentCollection,
     Json,
     File,
+    GitBranch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::{File, FileTimes};
+use std::io::Write as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
@@ -11,7 +12,8 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime};
 
-use ring::digest::{SHA256, digest};
+use flate2::{Compression, write::ZlibEncoder};
+use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -145,6 +147,57 @@ fn write_result(root: &Path, result: &Value) {
     let mut bytes = serde_json::to_vec_pretty(result).unwrap();
     bytes.push(b'\n');
     fs::write(root.join("result.json"), bytes).unwrap();
+}
+
+fn compress_pack_entry(pack: &mut Vec<u8>, bytes: &[u8]) {
+    let mut compressed = ZlibEncoder::new(Vec::new(), Compression::default());
+    compressed.write_all(bytes).unwrap();
+    pack.extend_from_slice(&compressed.finish().unwrap());
+}
+
+fn finish_external_delta_bundle(base: &str, head: &str, mut pack: Vec<u8>) -> Vec<u8> {
+    let checksum = digest(&SHA1_FOR_LEGACY_USE_ONLY, &pack);
+    pack.extend_from_slice(checksum.as_ref());
+
+    let mut bundle =
+        format!("# v2 git bundle\n-{base} prerequisite\n{head} refs/scherzo/head\n\n").into_bytes();
+    bundle.extend_from_slice(&pack);
+    bundle
+}
+
+fn malformed_external_delta_bundle(base: &str, head: &str) -> Vec<u8> {
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&1_u32.to_be_bytes());
+    pack.push(0x73); // REF_DELTA with three inflated delta bytes.
+    pack.extend_from_slice(&[0xaa_u8; 20]);
+    compress_pack_entry(&mut pack, &[0, 0, 0]); // Base size, result size, invalid opcode.
+    finish_external_delta_bundle(base, head, pack)
+}
+
+fn overdeep_unresolved_delta_bundle(base: &str, head: &str) -> Vec<u8> {
+    const OFS_DELTA_COUNT: u32 = 65;
+
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&(OFS_DELTA_COUNT + 1).to_be_bytes());
+
+    let mut previous_offset = pack.len();
+    pack.push(0x72); // REF_DELTA with a valid empty-to-empty delta program.
+    pack.extend_from_slice(&[0xaa_u8; 20]);
+    compress_pack_entry(&mut pack, &[0, 0]);
+    for _ in 0..OFS_DELTA_COUNT {
+        let offset = pack.len();
+        let distance = offset - previous_offset;
+        assert!(distance < 128, "fixture OFS distance must fit one byte");
+        pack.push(0x62); // OFS_DELTA with a valid empty-to-empty delta program.
+        pack.push(u8::try_from(distance).unwrap());
+        compress_pack_entry(&mut pack, &[0, 0]);
+        previous_offset = offset;
+    }
+    finish_external_delta_bundle(base, head, pack)
 }
 
 fn byte_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -440,6 +493,116 @@ fn malformed_export_does_not_hide_its_usable_carrier_reference() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(diagnostic_codes(&report).contains(&"carrier_digest_mismatch"));
+}
+
+#[test]
+fn malformed_unresolved_reference_delta_is_rejected() {
+    let artifact = ArtifactSet::valid();
+    let base = "a".repeat(40);
+    let head = "b".repeat(40);
+    let tree = "c".repeat(40);
+    let bundle = malformed_external_delta_bundle(&base, &head);
+    fs::write(artifact.root.join("exports/0001"), &bundle).unwrap();
+    let mut result = artifact.result();
+    result["exports"]["data"] = json!({
+        "state": "available",
+        "kind": "git_branch",
+        "artifactVersion": 1,
+        "objectFormat": "sha1",
+        "baseOid": base,
+        "headOid": head,
+        "treeOid": tree,
+        "carrier": {
+            "path": "exports/0001",
+            "mediaType": "application/vnd.git.bundle",
+            "sizeBytes": bundle.len(),
+            "digest": {
+                "algorithm": "sha256",
+                "value": hex(digest(&SHA256, &bundle).as_ref())
+            }
+        }
+    });
+    artifact.replace_result(&result);
+
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{report:#}");
+    assert!(diagnostic_codes(&report).contains(&"git_pack_invalid"));
+}
+
+#[test]
+fn unresolved_delta_chain_over_the_profile_limit_is_rejected() {
+    let artifact = ArtifactSet::valid();
+    let base = "a".repeat(40);
+    let head = "b".repeat(40);
+    let tree = "c".repeat(40);
+    let bundle = overdeep_unresolved_delta_bundle(&base, &head);
+    fs::write(artifact.root.join("exports/0001"), &bundle).unwrap();
+    let mut result = artifact.result();
+    result["exports"]["data"] = json!({
+        "state": "available",
+        "kind": "git_branch",
+        "artifactVersion": 1,
+        "objectFormat": "sha1",
+        "baseOid": base,
+        "headOid": head,
+        "treeOid": tree,
+        "carrier": {
+            "path": "exports/0001",
+            "mediaType": "application/vnd.git.bundle",
+            "sizeBytes": bundle.len(),
+            "digest": {
+                "algorithm": "sha256",
+                "value": hex(digest(&SHA256, &bundle).as_ref())
+            }
+        }
+    });
+    artifact.replace_result(&result);
+
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{report:#}");
+    assert!(
+        diagnostic_codes(&report).contains(&"git_structure_limit_exceeded"),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn zero_delta_carrier_diagnostic_does_not_hide_other_shape_errors() {
+    let artifact = ArtifactSet::valid();
+    let bytes = fs::read(artifact.root.join("exports/0001")).unwrap();
+    let mut result = artifact.result();
+    result["exports"]["data"] = json!({
+        "state": "available",
+        "kind": "git_branch",
+        "artifactVersion": 1,
+        "objectFormat": "sha1",
+        "baseOid": "0".repeat(40),
+        "headOid": "0".repeat(40),
+        "treeOid": "1".repeat(40),
+        "carrier": {
+            "path": "exports/0001",
+            "mediaType": "application/vnd.git.bundle",
+            "sizeBytes": bytes.len(),
+            "digest": {
+                "algorithm": "sha256",
+                "value": hex(digest(&SHA256, &bytes).as_ref())
+            }
+        },
+        "unexpected": true
+    });
+    artifact.replace_result(&result);
+
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codes = diagnostic_codes(&report);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(codes.contains(&"export_entry_invalid"));
+    assert!(codes.contains(&"git_zero_delta_invalid"));
 }
 
 #[cfg(target_os = "linux")]

@@ -60,6 +60,7 @@ pub(crate) enum Output {
     AgentResponse,
     AgentResult { schema: String },
     File { path: String, media_type: String },
+    GitBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

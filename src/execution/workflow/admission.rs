@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use super::agent::{AgentInvocationLimits, PositiveDuration};
+use super::artifact::CaptureCancellation;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
+use super::git_capture::{GitCaptureContext, GitWorkspaceAdmissionFailure};
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
@@ -423,6 +425,7 @@ pub(crate) struct ExecutionContext {
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
+    local_git_capture: bool,
 }
 
 impl ExecutionContext {
@@ -440,7 +443,13 @@ impl ExecutionContext {
             environment,
             cancellation,
             pi_installation: None,
+            local_git_capture: false,
         }
+    }
+
+    pub(crate) fn with_local_git_capture(mut self) -> Self {
+        self.local_git_capture = true;
+        self
     }
 
     pub(crate) fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
@@ -587,6 +596,7 @@ pub(crate) struct AdmittedWorkflow {
     imports: ResolvedImports,
     execution: AdmittedExecutionContext,
     agent_steps: Arc<BTreeMap<String, AdmittedAgentStep>>,
+    git_capture: Option<Arc<GitCaptureContext>>,
 }
 
 impl AdmittedWorkflow {
@@ -609,6 +619,10 @@ impl AdmittedWorkflow {
     pub(crate) fn agent_steps(&self) -> &BTreeMap<String, AdmittedAgentStep> {
         &self.agent_steps
     }
+
+    pub(crate) fn git_capture(&self) -> Option<&GitCaptureContext> {
+        self.git_capture.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,6 +632,12 @@ pub(crate) enum AdmissionFailureKind {
     AgentStepRuntimeUnsupported,
     ExecutionRootUnavailable,
     ExecutionRootNotDirectory,
+    GitContextRequired,
+    GitContextUnavailable,
+    GitContextNotRepository,
+    GitContextExecutionRootMismatch,
+    GitObjectFormatUnsupported,
+    GitBaselineUnavailable,
     NonPositiveParallelism,
     NonPositiveCapturedFiles,
     NonPositiveCapturedFileBytes,
@@ -640,6 +660,7 @@ pub(crate) enum AdmissionLocation {
     AttachmentImport { index: usize },
     Step { step: String },
     ExecutionRoot,
+    GitContext,
     MaximumParallelSteps,
     MaximumCapturedFiles,
     MaximumCapturedFileBytes,
@@ -831,31 +852,70 @@ pub(crate) fn admit_workflow(
     }
 
     let root = canonical_execution_root(&context.root)?;
+    let execution = AdmittedExecutionContext {
+        root,
+        root_lifecycle: context.root_lifecycle,
+        limits: ExecutionLimits {
+            maximum_parallel_steps,
+            maximum_captured_files,
+            maximum_captured_file_bytes,
+            maximum_total_captured_bytes,
+            maximum_captured_git_carriers,
+            maximum_captured_git_carrier_bytes,
+            maximum_total_captured_git_carrier_bytes,
+            maximum_input_values,
+            maximum_input_value_bytes,
+            maximum_total_input_bytes,
+            maximum_live_input_bytes,
+            maximum_step_log_bytes,
+        },
+        environment: context.environment.without_reserved_variables(),
+        cancellation: context.cancellation,
+    };
+    let git_capture = if workflow.requires_git_capture() {
+        if !context.local_git_capture {
+            return Err(AdmissionFailure::new(
+                AdmissionFailureKind::GitContextRequired,
+                AdmissionLocation::GitContext,
+            ));
+        }
+        Some(Arc::new(
+            GitCaptureContext::admit(&execution, &CaptureCancellation::default())
+                .map_err(git_admission_failure)?,
+        ))
+    } else {
+        None
+    };
     Ok(AdmittedWorkflow {
         workflow: Arc::new(workflow),
         imports,
-        execution: AdmittedExecutionContext {
-            root,
-            root_lifecycle: context.root_lifecycle,
-            limits: ExecutionLimits {
-                maximum_parallel_steps,
-                maximum_captured_files,
-                maximum_captured_file_bytes,
-                maximum_total_captured_bytes,
-                maximum_captured_git_carriers,
-                maximum_captured_git_carrier_bytes,
-                maximum_total_captured_git_carrier_bytes,
-                maximum_input_values,
-                maximum_input_value_bytes,
-                maximum_total_input_bytes,
-                maximum_live_input_bytes,
-                maximum_step_log_bytes,
-            },
-            environment: context.environment.without_reserved_variables(),
-            cancellation: context.cancellation,
-        },
+        execution,
         agent_steps: Arc::new(agent_steps),
+        git_capture,
     })
+}
+
+fn git_admission_failure(failure: GitWorkspaceAdmissionFailure) -> AdmissionFailure {
+    let kind = match failure {
+        GitWorkspaceAdmissionFailure::Cancelled
+        | GitWorkspaceAdmissionFailure::GitUnavailable
+        | GitWorkspaceAdmissionFailure::GitTimedOut
+        | GitWorkspaceAdmissionFailure::GitOutputLimitExceeded => {
+            AdmissionFailureKind::GitContextUnavailable
+        }
+        GitWorkspaceAdmissionFailure::NotWorkTree => AdmissionFailureKind::GitContextNotRepository,
+        GitWorkspaceAdmissionFailure::ExecutionRootRebound
+        | GitWorkspaceAdmissionFailure::ExecutionRootNotWorkTreeRoot => {
+            AdmissionFailureKind::GitContextExecutionRootMismatch
+        }
+        GitWorkspaceAdmissionFailure::UnsupportedObjectFormat => {
+            AdmissionFailureKind::GitObjectFormatUnsupported
+        }
+        GitWorkspaceAdmissionFailure::BaselineUnavailable => {
+            AdmissionFailureKind::GitBaselineUnavailable
+        }
+    };
+    AdmissionFailure::new(kind, AdmissionLocation::GitContext)
 }
 
 fn admit_agent_steps(

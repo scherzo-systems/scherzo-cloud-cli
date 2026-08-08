@@ -110,6 +110,8 @@ enum OutputDto {
         #[serde(rename = "mediaType")]
         media_type: String,
     },
+    #[serde(rename = "git_branch")]
+    GitBranch,
 }
 
 #[derive(Deserialize)]
@@ -244,6 +246,7 @@ impl OutputDto {
             Self::AgentResponse => Output::AgentResponse,
             Self::AgentResult { schema } => Output::AgentResult { schema },
             Self::File { path, media_type } => Output::File { path, media_type },
+            Self::GitBranch => Output::GitBranch,
         }
     }
 }

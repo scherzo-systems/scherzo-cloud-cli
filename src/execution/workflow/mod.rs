@@ -13,6 +13,7 @@ pub(crate) mod diagnostic;
 pub(crate) mod document;
 pub(crate) mod execution;
 mod execution_root;
+mod git_artifact;
 pub(crate) mod git_capture;
 pub(crate) mod input;
 pub(crate) mod local_run;

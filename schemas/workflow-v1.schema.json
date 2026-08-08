@@ -203,10 +203,23 @@
       },
       "required": ["kind", "path", "mediaType"]
     },
+    "GitBranchOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "git_branch" }
+      },
+      "required": ["kind"]
+    },
     "CommandOutputs": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Identifier" },
-      "additionalProperties": { "$ref": "#/$defs/FileOutput" }
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/$defs/FileOutput" },
+          { "$ref": "#/$defs/GitBranchOutput" }
+        ]
+      }
     },
     "AgentOutputs": {
       "type": "object",
@@ -215,7 +228,8 @@
         "oneOf": [
           { "$ref": "#/$defs/AgentResponseOutput" },
           { "$ref": "#/$defs/AgentResultOutput" },
-          { "$ref": "#/$defs/FileOutput" }
+          { "$ref": "#/$defs/FileOutput" },
+          { "$ref": "#/$defs/GitBranchOutput" }
         ]
       }
     },

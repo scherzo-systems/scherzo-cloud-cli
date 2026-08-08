@@ -25,6 +25,7 @@ pub(crate) enum ValidationFailureKind {
     UnknownOutputStep,
     UnknownOutput,
     MessageTypeMismatch,
+    TerminalOutputReference,
     IllegalCommandOutput,
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
@@ -320,7 +321,13 @@ fn infer_reference_prerequisite(
     let ValueReference::Output(reference) = reference else {
         return Ok(());
     };
-    declared_output(document, reference, location.clone())?;
+    let output = declared_output(document, reference, location.clone())?;
+    if matches!(output, Output::GitBranch) {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::TerminalOutputReference,
+            location,
+        ));
+    }
     if reference.step == step_name {
         return Err(ValidationFailure::new(
             ValidationFailureKind::SelfDependency,
@@ -336,7 +343,7 @@ fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFa
         match step {
             Step::Command(command) => {
                 for (output_name, output) in &command.common.outputs {
-                    if !matches!(output, Output::File { .. }) {
+                    if !matches!(output, Output::File { .. } | Output::GitBranch) {
                         return Err(output_failure(
                             ValidationFailureKind::IllegalCommandOutput,
                             step_name,
@@ -368,7 +375,7 @@ fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFa
                                     .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
                             }
                         }
-                        Output::File { .. } => None,
+                        Output::File { .. } | Output::GitBranch => None,
                     };
                     if let Some(kind) = failure_kind {
                         return Err(output_failure(kind, step_name, output_name));
@@ -699,6 +706,7 @@ fn output_value_type(output: &Output) -> WorkflowValueType {
         Output::AgentResponse => WorkflowValueType::Text,
         Output::AgentResult { .. } => WorkflowValueType::Json,
         Output::File { .. } => WorkflowValueType::File,
+        Output::GitBranch => WorkflowValueType::GitBranch,
     }
 }
 

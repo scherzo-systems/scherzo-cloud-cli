@@ -1229,6 +1229,7 @@ fn output_capture_failure(failure: &OutputCaptureFailure) -> &'static str {
         OutputCaptureFailure::StepUnavailable => "output_step_unavailable",
         OutputCaptureFailure::UnsupportedOutput => "output_unsupported",
         OutputCaptureFailure::Capture(failure) => capture_failure(failure.kind()),
+        OutputCaptureFailure::Git { .. } => "output_git_capture_failed",
         OutputCaptureFailure::TaskUnavailable => "output_task_unavailable",
     }
 }

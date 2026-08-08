@@ -19,7 +19,7 @@ use crate::execution::workflow::admission::{
 };
 use crate::execution::workflow::command_contract::{
     ServeWorkflowContractFailure, ServeWorkflowContractFailureKind,
-    require_inputless_workflow_no_exports,
+    require_inputless_workflow_no_outputs,
 };
 use crate::execution::workflow::resolution;
 use crate::runner_protocol::{
@@ -1289,7 +1289,7 @@ impl AssignmentManager {
             AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable)
         })?;
         let workflow =
-            require_inputless_workflow_no_exports(workflow).map_err(serve_contract_decline)?;
+            require_inputless_workflow_no_outputs(workflow).map_err(serve_contract_decline)?;
         let transition_budget = self.outbox.reserve(workflow.definition.steps.len())?;
         let context = self.execution_context(&offer.execution_spec, &root.execution)?;
         let admitted = admit_workflow(workflow, ResolvedImports::default(), context)
@@ -1542,7 +1542,7 @@ fn serve_contract_decline(failure: ServeWorkflowContractFailure) -> AssignmentDe
         ServeWorkflowContractFailureKind::InvalidStepCount => {
             AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowSourceUnavailable)
         }
-        ServeWorkflowContractFailureKind::DeclaredExport => {
+        ServeWorkflowContractFailureKind::DeclaredOutput => {
             AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowContractInvalid)
         }
     }
@@ -1862,26 +1862,28 @@ printf '%s\n' '{"type":"agent_settled"}'
     }
 
     #[test]
-    fn admits_command_outputs_and_rejects_exports() {
-        let output_workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf value > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        path: value.txt\n        mediaType: text/plain\n";
-        let (_temporary, mut manager) = manager_fixture(output_workflow);
-        manager.handle_offer(offer("bg")).unwrap();
-        assert_eq!(manager.active_step_count(), Some(1));
-
-        let exported =
-            format!("{output_workflow}exports:\n  value:\n    ref: outputs.write.value\n");
-        let (_temporary, mut manager) = manager_fixture(&exported);
-        manager.handle_offer(offer("bh")).unwrap();
-        let pending = manager.pending_observations(&BTreeSet::new(), 1);
-        assert!(matches!(
-            &pending[0].observation,
-            AssignmentObservation::Decision(AssignmentDecision::Rejected {
-                decline: AssignmentDecline::RunnerUnable(
-                    RunnerUnableReason::WorkflowContractInvalid
-                ),
-                ..
-            })
-        ));
+    fn rejects_file_and_git_branch_outputs_before_acceptance() {
+        for output in [
+            "        kind: file\n        path: value.txt\n        mediaType: text/plain\n",
+            "        kind: git_branch\n",
+        ] {
+            let workflow = format!(
+                "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n{output}"
+            );
+            let (_temporary, mut manager) = manager_fixture(&workflow);
+            manager.handle_offer(offer("bg")).unwrap();
+            let pending = manager.pending_observations(&BTreeSet::new(), 1);
+            assert!(matches!(
+                &pending[0].observation,
+                AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                    decline: AssignmentDecline::RunnerUnable(
+                        RunnerUnableReason::WorkflowContractInvalid
+                    ),
+                    ..
+                })
+            ));
+            assert!(manager.slot.is_none());
+        }
     }
 
     #[test]
@@ -1917,7 +1919,7 @@ printf '%s\n' '{"type":"agent_settled"}'
 
     #[test]
     fn rejects_agent_workflow_without_runtime_before_acceptance() {
-        let workflow = "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{ file: system.md }]\n    outputs:\n      response:\n        kind: agent_response\n";
+        let workflow = "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{ file: system.md }]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         manager.handle_offer(offer("bg")).unwrap();
         let pending = manager.pending_observations(&BTreeSet::new(), 1);
@@ -2507,8 +2509,8 @@ printf '%s\n' '{"type":"agent_settled"}'
     }
 
     #[tokio::test]
-    async fn executes_output_dependent_command_dag_and_reports_dense_transitions() {
-        let workflow = "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf value > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        path: value.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      value:\n        ref: outputs.produce.value\n    command:\n      argv: [\"sh\", \"-c\", \"test \\\"$(cat \\\"$SCHERZO_STEP_INPUTS/values/value\\\")\\\" = value\"]\n";
+    async fn executes_explicit_command_dag_and_reports_dense_transitions() {
+        let workflow = "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  consume:\n    kind: cmd\n    dependsOn: [produce]\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
@@ -2545,8 +2547,8 @@ printf '%s\n' '{"type":"agent_settled"}'
     }
 
     #[tokio::test]
-    async fn executes_agent_response_dependent_mixed_dag() {
-        let workflow = "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{ file: system.md }]\n    outputs:\n      response:\n        kind: agent_response\n  consume:\n    kind: cmd\n    inputs:\n      value:\n        ref: outputs.agent.response\n    command:\n      argv: [\"sh\", \"-c\", \"test \\\"$(cat \\\"$SCHERZO_STEP_INPUTS/values/value\\\")\\\" = value\"]\n";
+    async fn executes_outputless_agent_and_command_dag() {
+        let workflow = "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{ file: system.md }]\n  consume:\n    kind: cmd\n    dependsOn: [agent]\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture_with_pi(workflow, Some(SUCCESSFUL_PI));
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();

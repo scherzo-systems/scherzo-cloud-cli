@@ -163,6 +163,9 @@ pub(crate) struct ArchivedExecution {
     pub(crate) duration: Duration,
 }
 
+// The archive projection owns decoded bytes rather than the result wire encoding, so a
+// separate type keeps untrusted deserialization out of the presentation model.
+// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedDiagnosticStream {
     pub(crate) bytes: Arc<[u8]>,
@@ -171,6 +174,7 @@ pub(crate) struct ArchivedDiagnosticStream {
     pub(crate) truncated: bool,
     pub(crate) fully_drained: bool,
 }
+// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedCommandOutput {
@@ -1005,6 +1009,27 @@ fn validate_exports(
                     return Err(());
                 }
             }
+            ExportV1::GitBranch { carrier, .. } => {
+                let identity = (source.step.clone(), source.output.clone());
+                let owner = *owner_ordinals.get(&identity).ok_or(())?;
+                if source_step.state != ArchivedStepState::Succeeded
+                    || source.value_type != WorkflowValueType::GitBranch
+                {
+                    return Err(());
+                }
+                if let Some(carrier) = carrier
+                    && (carrier.path != format!("exports/{owner:04}")
+                        || !valid_digest(&carrier.digest.algorithm, &carrier.digest.value)
+                        || paths_by_source
+                            .insert(identity.clone(), carrier.path.clone())
+                            .is_some_and(|retained| retained != carrier.path)
+                        || sources_by_path
+                            .insert(carrier.path.clone(), identity.clone())
+                            .is_some_and(|retained| retained != identity))
+                {
+                    return Err(());
+                }
+            }
             ExportV1::Unavailable { reason } => {
                 let expected = match source_step.state {
                     ArchivedStepState::Failed => ExportUnavailableReasonV1::Failed,
@@ -1027,6 +1052,7 @@ fn export_kind(value_type: WorkflowValueType) -> &'static str {
         WorkflowValueType::File => "file",
         WorkflowValueType::Text => "text",
         WorkflowValueType::Json => "json",
+        WorkflowValueType::GitBranch => "git_branch",
         WorkflowValueType::AttachmentCollection => "unsupported",
     }
 }
@@ -1045,6 +1071,7 @@ fn export_media_type<'a>(
         Output::File { media_type, .. } => media_type,
         Output::AgentResponse => "text/plain; charset=utf-8",
         Output::AgentResult { .. } => "application/json",
+        Output::GitBranch => "application/vnd.git.bundle",
     })
 }
 
