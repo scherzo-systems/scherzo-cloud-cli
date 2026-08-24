@@ -17,6 +17,8 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use super::*;
+use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
+use crate::execution::codex::ValidatedCodexInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
@@ -27,8 +29,8 @@ use crate::execution::workflow::agent::scripted::{
     ScriptedAgentDispatcher, ScriptedAgentValue, scripted_agent_dispatcher,
 };
 use crate::execution::workflow::agent::{
-    AgentFailureCause, AgentLifecycleMilestone, AgentObservation, AgentObservationEnvelope,
-    WorkflowRunId,
+    AgentCompatibilityProfile, AgentFailureCause, AgentLifecycleMilestone, AgentObservation,
+    AgentObservationEnvelope, AgentValueKind, WorkflowRunId,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::execution::workflow::agent_input::AgentInputStaging;
@@ -36,13 +38,19 @@ use crate::execution::workflow::artifact::{ArtifactReadFailure, ArtifactStaging}
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::input::InputStaging;
+use crate::execution::workflow::invocation_accounting::{InvocationAccountingLog, InvocationUsage};
 use crate::execution::workflow::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, NoopExecutionObserver,
     TransitionObservation,
 };
+use crate::execution::workflow::recovery::{
+    RECOVERY_AGENT_INSTRUCTIONS, RECOVERY_CONTEXT_VARIABLE, RecoveryDecisionFailureKind,
+    RecoveryHandlerFailure, read_recovery_context,
+};
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
-    ExportValue, FailurePhase, NotRunReason, StepState, StepStateKind, TransitionEvent,
+    ExportValue, FailurePhase, NotRunReason, RecoveryHandlerOutcome, StepState, StepStateKind,
+    TransitionEvent,
 };
 use crate::execution::workflow::step_runtime::{
     AgentExecution, CommandExecutionFailure, StepExecutionFailure, StepFailureCause,
@@ -304,7 +312,13 @@ fn execution_fixture_with_source_files(
             environment,
             CancellationPolicy::new(cancellation, Duration::from_secs(1)),
         )
-        .with_pi_installation(ValidatedPiInstallation::fixture("/validated/pi".into())),
+        .with_pi_installation(ValidatedPiInstallation::fixture("/validated/pi".into()))
+        .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(
+            "/validated/claude".into(),
+        ))
+        .with_codex_installation(ValidatedCodexInstallation::fixture(
+            "/validated/codex".into(),
+        )),
     )
     .unwrap();
     let artifacts = ArtifactStaging::create(admitted.execution(), &staging_root).unwrap();
@@ -333,8 +347,344 @@ fn execution_fixture_with_source_files(
 }
 
 #[tokio::test]
-async fn local_recovery_execution_guard_rejects_before_target_start() {
-    let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"sh\", \"-c\", \"touch target-started\"]\n";
+async fn source_neutral_command_handler_repairs_and_rechecks_with_private_authority() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              if IFS= read -r unexpected; then exit 91; fi
+              test -r "$SCHERZO_RECOVERY_CONTEXT"
+              test ! -w "$SCHERZO_RECOVERY_CONTEXT"
+              /bin/grep -q '"schemaVersion": 1' "$SCHERZO_RECOVERY_CONTEXT"
+              /bin/grep -q '"recoveryRound": 1' "$SCHERZO_RECOVERY_CONTEXT"
+              /bin/grep -q '"executionNumber": 1' "$SCHERZO_RECOVERY_CONTEXT"
+              /bin/grep -q '"command_stderr"' "$SCHERZO_RECOVERY_CONTEXT"
+              test -z "${SCHERZO_INHERITED+x}"
+              printf '%s\n%s\n' SCHERZO_RECOVERY_CONTEXT SCHERZO_RECOVERY_RESULT > recovery-environment.txt
+              printf '%s\n%s\n' "$SCHERZO_RECOVERY_CONTEXT" "$SCHERZO_RECOVERY_RESULT" > recovery-private-paths.txt
+              printf repaired > repaired.marker
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"target should pass unchanged"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf 'handler ordinary output is diagnostic only'
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          printf 'target diagnostic' >&2
+          if test -f repaired.marker; then
+            printf 'terminal output' > artifact.txt
+            exit 0
+          fi
+          printf 'provisional output' > artifact.txt
+          exit 75
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.txt
+        mediaType: text/plain
+exports:
+  artifact:
+    ref: outputs.repair.artifact
+"#;
+        let fixture = execution_fixture(
+            source,
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([
+                ("PATH", "/bin:/usr/bin"),
+                ("EXPLICIT_VALUE", "retained"),
+                ("SCHERZO_INHERITED", "must-be-scrubbed"),
+            ]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let diagnostics = StepDiagnosticLog::default();
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &diagnostics,
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let ExportValue::Available { output } = &result.exports["artifact"] else {
+            panic!("the recovered target output must be available");
+        };
+        let mut bytes = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"terminal output");
+        assert_eq!(
+            fs::read_to_string(fixture.execution_root.join("recovery-environment.txt")).unwrap(),
+            "SCHERZO_RECOVERY_CONTEXT\nSCHERZO_RECOVERY_RESULT\n"
+        );
+        let private_paths = fs::read_to_string(
+            fixture.execution_root.join("recovery-private-paths.txt"),
+        )
+        .unwrap();
+        assert!(private_paths.lines().all(|path| !Path::new(path).exists()));
+        assert_eq!(fs::read(fixture.execution_root.join("repaired.marker")).unwrap(), b"repaired");
+        let invocations = diagnostics.invocation_ids("repair");
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 3);
+        let handler_diagnostic = diagnostics.get_invocation("repair", invocations[1]).unwrap();
+        assert_eq!(
+            handler_diagnostic.standard_output().bytes(),
+            b"handler ordinary output is diagnostic only"
+        );
+        assert_eq!(
+            diagnostics.get("repair").unwrap().standard_output().bytes(),
+            b"",
+            "handler diagnostics must not become ordinary step output"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn omitted_recovery_handler_cwd_inherits_command_target_cwd() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    cwd: nested
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              printf repaired > repaired.marker
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv: [/bin/sh, -c, "test -f repaired.marker || exit 75"]
+"#;
+        let fixture = execution_fixture(
+            source,
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        fs::create_dir(fixture.execution_root.join("nested")).unwrap();
+
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert_eq!(
+            fs::read(fixture.execution_root.join("nested/repaired.marker")).unwrap(),
+            b"repaired"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn output_capture_failure_cleans_up_then_reruns_the_complete_target() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              test ! -e artifact.txt
+              printf repaired > repaired.marker
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"restored generation precondition","reason":"rerun the complete target"}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          printf x >> target-runs.txt
+          if test -f repaired.marker; then
+            printf 'captured only from execution 2' > artifact.txt
+          fi
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.txt
+        mediaType: text/plain
+exports:
+  artifact:
+    ref: outputs.repair.artifact
+"#;
+        let fixture = execution_fixture(
+            source,
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert_eq!(
+            fs::read(fixture.execution_root.join("target-runs.txt")).unwrap(),
+            b"xx"
+        );
+        let ExportValue::Available { output } = &result.exports["artifact"] else {
+            panic!("execution 2 must own the terminal output");
+        };
+        let mut bytes = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"captured only from execution 2");
+        assert_eq!(fixture.artifacts.reservation_usage(), (0, 0));
+        assert_eq!(fixture.inputs.reservation_usage(), (0, 0, 0));
+        assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn command_handler_failures_stop_once_without_authorizing_recheck() {
+    with_watchdog(async {
+        let scenarios = [
+            (
+                "start",
+                r#"command:
+          argv: [/definitely-missing-recovery-handler]"#,
+                RecoveryHandlerFailure::CommandLaunchFailed,
+            ),
+            (
+                "execution",
+                r#"command:
+          argv: [/bin/sh, -c, "printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"looks valid\",\"reason\":\"but exit fails\"}' > \"$SCHERZO_RECOVERY_RESULT\"; exit 9"]"#,
+                RecoveryHandlerFailure::CommandExitFailed { code: Some(9) },
+            ),
+            (
+                "missing",
+                r#"command:
+          argv: [/bin/sh, -c, "true"]"#,
+                RecoveryHandlerFailure::ResultMissing,
+            ),
+            (
+                "validation",
+                r#"command:
+          argv: [/bin/sh, -c, "printf '{' > \"$SCHERZO_RECOVERY_RESULT\""]"#,
+                RecoveryHandlerFailure::DecisionInvalid(
+                    RecoveryDecisionFailureKind::InvalidJson,
+                ),
+            ),
+            (
+                "settlement",
+                r#"command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"valid","reason":"before settlement sabotage"}' > "$SCHERZO_RECOVERY_RESULT"
+              root=${SCHERZO_RECOVERY_CONTEXT%/context/context.json}
+              mv "$root" "$root-moved""#,
+                RecoveryHandlerFailure::SettlementFailed,
+            ),
+        ];
+
+        for (name, command, expected) in scenarios {
+            let source = format!(
+                "schemaVersion: 1\nsteps:\n  repair:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        {command}\n    command:\n      argv: [/bin/sh, -c, \"printf x >> target-count.txt; exit 75\"]\n"
+            );
+            let fixture = execution_fixture(
+                &source,
+                ResolvedImports::default(),
+                EnvironmentSnapshot::new([(
+                    OsString::from("PATH"),
+                    env::var_os("PATH").unwrap(),
+                )]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let diagnostics = StepDiagnosticLog::default();
+            let coordinated = crate::execution::workflow::step_runtime::execute_workflow_observed(
+                fixture.admitted,
+                &fixture.artifacts,
+                &fixture.inputs,
+                &diagnostics,
+                TestClock,
+                NoopCommitPort,
+                NoopExecutionObserver,
+                AgentExecution::disabled(),
+                crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("{name} scenario failed to coordinate: {failure:?}"));
+            assert!(matches!(coordinated.state.workflow, WorkflowState::Failed { .. }));
+            assert_eq!(
+                fs::read(fixture.execution_root.join("target-count.txt")).unwrap(),
+                b"x",
+                "{name} handler failure must not authorize target execution 2"
+            );
+            let recovery = coordinated.state.steps["repair"].recovery.as_ref().unwrap();
+            assert_eq!(recovery.rounds.len(), 1);
+            let RecoveryHandlerOutcome::Failed {
+                cause: StepFailureCause::RecoveryHandler(actual),
+                ..
+            } = &recovery.rounds[0].handler.as_ref().unwrap().outcome
+            else {
+                panic!("{name} did not retain one typed handler failure");
+            };
+            assert_eq!(actual, &expected, "{name} handler failure kind");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn configured_inactive_local_recovery_preserves_target_execution() {
+    let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"/bin/sh\", \"-c\", \": > target-started\"]\n";
     let fixture = execution_fixture(
         source,
         ResolvedImports::default(),
@@ -371,8 +721,8 @@ async fn local_recovery_execution_guard_rejects_before_target_start() {
         NoopExecutionObserver,
     )
     .await;
-    assert_eq!(result, Err(CoordinationError::RecoveryExecutionGuardActive));
-    assert!(!fixture.execution_root.join("target-started").exists());
+    assert_eq!(result.unwrap().outcome, RunOutcome::Succeeded);
+    assert!(fixture.execution_root.join("target-started").exists());
 }
 
 #[tokio::test]
@@ -882,6 +1232,658 @@ fn agent_runtime(
         fixture.diagnostic_sessions.clone(),
         adapter,
     )
+}
+
+fn agent_runtime_with_accounting(
+    fixture: &ExecutionFixture,
+    adapter: ScriptedAgentDispatcher,
+    accounting: InvocationAccountingLog,
+) -> AgentExecution<ScriptedAgentDispatcher> {
+    AgentExecution::enabled_with_accounting(
+        WorkflowRunId::from(Arc::from("run-fixed")),
+        fixture.agent_inputs.clone(),
+        fixture.diagnostic_sessions.clone(),
+        adapter,
+        accounting,
+    )
+}
+
+fn recovery_profile_source(profile: AgentCompatibilityProfile) -> &'static str {
+    match profile {
+        AgentCompatibilityProfile::PiJsonV1 => {
+            r#"agentProfiles:
+  recovery:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+"#
+        }
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
+            r#"agentProfiles:
+  recovery:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+        effort: xhigh
+"#
+        }
+        AgentCompatibilityProfile::CodexAppServerV1 => {
+            r#"agentProfiles:
+  recovery:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: xhigh
+"#
+        }
+    }
+}
+
+#[tokio::test]
+async fn omitted_recovery_handler_cwd_inherits_agent_target_cwd() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{}steps:
+  repair:
+    kind: cmd
+    cwd: nested
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+    command:
+      argv: [/bin/sh, -c, "exit 75"]
+"#,
+            recovery_profile_source(AgentCompatibilityProfile::PiJsonV1)
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("recovery.md", b"Inspect the target working directory.")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        fs::create_dir(fixture.execution_root.join("nested")).unwrap();
+        let (adapter, mut control) = scripted_agent_dispatcher();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            let agents = agent_runtime(&fixture, adapter);
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        assert_eq!(
+            started.working_directory(),
+            fs::canonicalize(fixture.execution_root.join("nested")).unwrap()
+        );
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                "schemaVersion": 1,
+                "decision": "gave_up",
+                "summary": "inspection complete",
+                "reason": "the fixture only checks cwd inheritance"
+            }))))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+        assert!(matches!(
+            execution.await.unwrap().unwrap().outcome,
+            RunOutcome::Failed { .. }
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_key_agent_decision_stops_without_recheck() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{}steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+    command:
+      argv: [/bin/sh, -c, "printf x >> target-count.txt; exit 75"]
+"#,
+            recovery_profile_source(AgentCompatibilityProfile::PiJsonV1)
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("recovery.md", b"Submit a recovery decision.")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = scripted_agent_dispatcher();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let diagnostics = StepDiagnosticLog::default();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            let agents = agent_runtime(&fixture, adapter);
+            async move {
+                crate::execution::workflow::step_runtime::execute_workflow_observed(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &diagnostics,
+                    TestClock,
+                    NoopCommitPort,
+                    NoopExecutionObserver,
+                    agents,
+                    crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::RawResult(Arc::from(
+                br#"{"schemaVersion":1,"decision":"recheck","decision":"gave_up","summary":"ambiguous","reason":"duplicate authority"}"#
+                    .as_slice(),
+            )))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+
+        let coordinated = execution.await.unwrap().unwrap();
+        assert!(matches!(coordinated.state.workflow, WorkflowState::Failed { .. }));
+        assert_eq!(
+            fs::read(fixture.execution_root.join("target-count.txt")).unwrap(),
+            b"x",
+            "an ambiguous agent decision must not authorize execution 2"
+        );
+        let recovery = coordinated.state.steps["repair"].recovery.as_ref().unwrap();
+        let RecoveryHandlerOutcome::Failed {
+            cause: StepFailureCause::RecoveryHandler(actual),
+            ..
+        } = &recovery.rounds[0].handler.as_ref().unwrap().outcome
+        else {
+            panic!("the duplicate decision must retain one typed handler failure");
+        };
+        assert_eq!(
+            actual,
+            &RecoveryHandlerFailure::AgentResultInvalid(
+                RecoveryDecisionFailureKind::DuplicateKey
+            )
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
+    with_watchdog(async {
+        for profile in [
+            AgentCompatibilityProfile::PiJsonV1,
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+            AgentCompatibilityProfile::CodexAppServerV1,
+        ] {
+            let source = format!(
+                r#"schemaVersion: 1
+{}steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+    command:
+      argv: [/bin/sh, -c, "test -f repaired.marker"]
+"#,
+                recovery_profile_source(profile)
+            );
+            let fixture = execution_fixture_with_source_files(
+                &source,
+                &[(
+                    "recovery.md",
+                    b"Repair the generated workspace, then request a recheck.",
+                )],
+                ResolvedImports::default(),
+                EnvironmentSnapshot::new([
+                    ("PATH", "/bin:/usr/bin"),
+                    ("SCHERZO_INHERITED", "must-be-scrubbed"),
+                ]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let (adapter, mut control) = scripted_agent_dispatcher();
+            let accounting = InvocationAccountingLog::default();
+            let agents = agent_runtime_with_accounting(&fixture, adapter, accounting.clone());
+            let diagnostics = StepDiagnosticLog::default();
+            let execution_diagnostics = diagnostics.clone();
+            let artifacts = fixture.artifacts.clone();
+            let inputs = fixture.inputs.clone();
+            let (observer, observations, _observed) = RecordingObserver::new();
+            let execution = tokio::spawn({
+                let admitted = fixture.admitted.clone();
+                async move {
+                    execute_workflow(
+                        admitted,
+                        &artifacts,
+                        &inputs,
+                        &execution_diagnostics,
+                        agents,
+                        TestClock,
+                        observer,
+                    )
+                    .await
+                }
+            });
+
+            let started = control.wait_until_started().await.unwrap();
+            assert_eq!(started.profile(), profile);
+            assert_eq!(started.system_prompt(), RECOVERY_AGENT_INSTRUCTIONS);
+            assert_eq!(
+                started.message(),
+                "Repair the generated workspace, then request a recheck."
+            );
+            assert_eq!(started.value_kind(), AgentValueKind::Result);
+            assert!(started.attachments().is_empty());
+            assert!(started.result_endpoint_directory().is_dir());
+            assert!(started.diagnostic_directory().is_dir());
+            let context_path = PathBuf::from(
+                started
+                    .environment()
+                    .variable(std::ffi::OsStr::new(RECOVERY_CONTEXT_VARIABLE))
+                    .unwrap(),
+            );
+            assert!(
+                started
+                    .environment()
+                    .variable(std::ffi::OsStr::new("SCHERZO_INHERITED"))
+                    .is_none()
+            );
+            let context = read_recovery_context(&fs::read(&context_path).unwrap()).unwrap();
+            assert_eq!(context.target.id, "repair");
+            assert_eq!(context.recovery_round, 1);
+            assert_eq!(context.failed_execution.execution_number, 1);
+            assert_eq!(context.failed_execution.invocation_id, 1);
+            assert!(
+                context
+                    .diagnostics
+                    .iter()
+                    .all(|entry| entry.trust == "untrusted")
+            );
+            let handler_action = started.identity().invocation();
+            let result_endpoint = started.result_endpoint_directory().to_owned();
+            let diagnostic_directory = started.diagnostic_directory().to_owned();
+            started.control().start().await.unwrap();
+            started
+                .control()
+                .observe(AgentObservation::AssistantText {
+                    text: Arc::from("I choose gave_up in prose, which is not authority."),
+                })
+                .await
+                .unwrap();
+            started
+                .control()
+                .observe(AgentObservation::Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                })
+                .await
+                .unwrap();
+            fs::write(
+                fixture.execution_root.join("repaired.marker"),
+                b"agent mutation",
+            )
+            .unwrap();
+            started
+                .control()
+                .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                    "schemaVersion": 1,
+                    "decision": "recheck",
+                    "summary": "repaired workspace",
+                    "reason": "run the unchanged target"
+                }))))
+                .await
+                .unwrap();
+            started.control().complete().await.unwrap();
+
+            let result = execution.await.unwrap().unwrap();
+            assert_eq!(result.outcome, RunOutcome::Succeeded);
+            assert!(!context_path.exists());
+            assert!(!result_endpoint.exists());
+            assert!(diagnostic_directory.exists());
+            assert_eq!(
+                accounting.usage(handler_action),
+                Some(InvocationUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                })
+            );
+            let native = accounting.native_session(handler_action).unwrap();
+            assert_eq!(native.profile, profile);
+            assert_ne!(native.diagnostic_identity.as_ref(), "unavailable");
+            match profile {
+                AgentCompatibilityProfile::PiJsonV1
+                | AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
+                    assert!(native.native_session_identity.is_some());
+                }
+                AgentCompatibilityProfile::CodexAppServerV1 => {
+                    assert!(native.native_session_identity.is_none());
+                }
+            }
+            let observations = observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(observations.iter().any(|observation| matches!(
+                observation,
+                ExecutionObservation::Agent(envelope)
+                    if envelope.invocation() == handler_action
+                        && matches!(envelope.observation(), AgentObservation::AssistantText { .. })
+            )));
+            assert_eq!(diagnostics.invocation_ids("repair").len(), 2);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn failed_agent_target_handler_and_recheck_use_three_fresh_accounted_invocations() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{}steps:
+  repair:
+    kind: agent
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+    agent:
+      profile: recovery
+      systemPrompt: target.md
+      message:
+        text:
+          - file: target.md
+"#,
+            recovery_profile_source(AgentCompatibilityProfile::PiJsonV1)
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[
+                ("target.md", b"Run the unchanged target protocol."),
+                (
+                    "recovery.md",
+                    b"Repair the workspace and request a recheck.",
+                ),
+            ],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = scripted_agent_dispatcher();
+        let accounting = InvocationAccountingLog::default();
+        let agents = agent_runtime_with_accounting(&fixture, adapter, accounting.clone());
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let target_one = control.wait_until_started().await.unwrap();
+        assert_eq!(target_one.value_kind(), AgentValueKind::None);
+        assert_eq!(
+            target_one.system_prompt(),
+            "Run the unchanged target protocol."
+        );
+        let target_one_action = target_one.identity().invocation();
+        let target_one_staging = target_one.result_endpoint_directory().to_owned();
+        let target_one_diagnostics = target_one.diagnostic_directory().to_owned();
+        target_one.control().start().await.unwrap();
+        target_one
+            .control()
+            .observe(AgentObservation::Usage {
+                input_tokens: 2,
+                output_tokens: 1,
+            })
+            .await
+            .unwrap();
+        target_one
+            .control()
+            .fail(AgentFailureCause::HarnessProtocolFailed)
+            .await
+            .unwrap();
+
+        let handler = control.wait_until_started().await.unwrap();
+        assert!(!target_one_staging.exists());
+        assert_eq!(handler.value_kind(), AgentValueKind::Result);
+        assert_eq!(handler.system_prompt(), RECOVERY_AGENT_INSTRUCTIONS);
+        let handler_action = handler.identity().invocation();
+        let handler_staging = handler.result_endpoint_directory().to_owned();
+        let handler_diagnostics = handler.diagnostic_directory().to_owned();
+        handler.control().start().await.unwrap();
+        handler
+            .control()
+            .observe(AgentObservation::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            })
+            .await
+            .unwrap();
+        fs::write(
+            fixture.execution_root.join("agent-repaired.marker"),
+            b"visible",
+        )
+        .unwrap();
+        handler
+            .control()
+            .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                "schemaVersion": 1,
+                "decision": "recheck",
+                "summary": "agent repaired workspace",
+                "reason": "run the unchanged target"
+            }))))
+            .await
+            .unwrap();
+        handler.control().complete().await.unwrap();
+
+        let target_two = control.wait_until_started().await.unwrap();
+        assert!(!handler_staging.exists());
+        assert_eq!(target_two.value_kind(), AgentValueKind::None);
+        assert_eq!(
+            target_two.system_prompt(),
+            "Run the unchanged target protocol."
+        );
+        assert_eq!(target_two.message(), "Run the unchanged target protocol.");
+        assert_eq!(
+            fs::read(fixture.execution_root.join("agent-repaired.marker")).unwrap(),
+            b"visible"
+        );
+        let target_two_action = target_two.identity().invocation();
+        let target_two_diagnostics = target_two.diagnostic_directory().to_owned();
+        assert_ne!(target_one_action, handler_action);
+        assert_ne!(handler_action, target_two_action);
+        assert_ne!(target_one_diagnostics, handler_diagnostics);
+        assert_ne!(handler_diagnostics, target_two_diagnostics);
+        target_two.control().start().await.unwrap();
+        target_two
+            .control()
+            .observe(AgentObservation::Usage {
+                input_tokens: 5,
+                output_tokens: 4,
+            })
+            .await
+            .unwrap();
+        target_two.control().complete().await.unwrap();
+
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert_eq!(
+            accounting.usage(target_one_action),
+            Some(InvocationUsage {
+                input_tokens: 2,
+                output_tokens: 1,
+            })
+        );
+        assert_eq!(
+            accounting.usage(handler_action),
+            Some(InvocationUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+            })
+        );
+        assert_eq!(
+            accounting.usage(target_two_action),
+            Some(InvocationUsage {
+                input_tokens: 5,
+                output_tokens: 4,
+            })
+        );
+        assert_eq!(accounting.recorded_invocations().len(), 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_waits_for_recovery_agent_quiescence_and_rejects_late_decision() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+{}steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+    command:
+      argv: [/bin/sh, -c, "exit 75"]
+"#,
+            recovery_profile_source(AgentCompatibilityProfile::PiJsonV1)
+        );
+        let cancellation = CancellationSource::new();
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("recovery.md", b"Wait for operator control.")],
+            ResolvedImports::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            cancellation.clone(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = scripted_agent_dispatcher();
+        let diagnostics = StepDiagnosticLog::default();
+        let execution_diagnostics = diagnostics.clone();
+        let agents = agent_runtime(&fixture, adapter);
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let mut execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &execution_diagnostics,
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        let context_path = PathBuf::from(
+            started
+                .environment()
+                .variable(std::ffi::OsStr::new(RECOVERY_CONTEXT_VARIABLE))
+                .unwrap(),
+        );
+        let result_endpoint = started.result_endpoint_directory().to_owned();
+        started.control().start().await.unwrap();
+        let mut barrier = started.control().block().unwrap();
+        barrier.wait_until_blocked().await.unwrap();
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        assert!(
+            !execution.is_finished(),
+            "terminal cancellation must wait for the blocked adapter"
+        );
+        let late_control = started.control().clone();
+        let late_decision = tokio::spawn(async move {
+            late_control
+                .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                    "schemaVersion": 1,
+                    "decision": "recheck",
+                    "summary": "too late",
+                    "reason": "cancellation already owns authority"
+                }))))
+                .await
+        });
+        barrier.release().unwrap();
+        assert!(late_decision.await.unwrap().is_err());
+
+        let result = (&mut execution).await.unwrap().unwrap();
+        assert_eq!(
+            result.outcome,
+            RunOutcome::Cancelled {
+                reason: CancellationReason::UserRequest
+            }
+        );
+        assert!(!context_path.exists());
+        assert!(!result_endpoint.exists());
+        assert_eq!(diagnostics.invocation_ids("repair").len(), 1);
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -158,6 +158,45 @@ pub(crate) fn render_plain(
             .ok_or(ArchivedViewOutputFailure::InvalidProjection)?;
         rendered.push_str(&plain_step_row(step, definition, color));
         rendered.push('\n');
+        if let Some(recovery) = &step.recovery {
+            let terminal_failure = match &step.detail {
+                ArchivedStepDetail::Failed(failure) => Some(archived_failure_detail(failure)),
+                _ => None,
+            };
+            rendered.push_str(&format!(
+                "  recovery {} · rounds {}/{} · {} invocations\n",
+                super::presentation::terminal_recovery_detail(
+                    recovery,
+                    terminal_failure.as_deref(),
+                ),
+                recovery.rounds.len(),
+                recovery.configured_retries,
+                step.invocations.len(),
+            ));
+            for invocation in &step.invocations {
+                rendered.push_str(&format!(
+                    "    invocation {} · {} · {} · usage input {} output {} · {} diagnostics\n",
+                    invocation.invocation_id,
+                    match invocation.role {
+                        super::publication::RecoveryInvocationRoleV1::Target => format!(
+                            "target execution {}",
+                            invocation.target_execution.unwrap_or_default()
+                        ),
+                        super::publication::RecoveryInvocationRoleV1::RecoveryHandler => format!(
+                            "recovery_handler round {}",
+                            invocation.recovery_round.unwrap_or_default()
+                        ),
+                    },
+                    match invocation.state {
+                        super::publication::RecoveryInvocationStateV1::Settled => "settled",
+                        super::publication::RecoveryInvocationStateV1::Cancelled => "cancelled",
+                    },
+                    invocation.usage.input_tokens,
+                    invocation.usage.output_tokens,
+                    invocation.diagnostics.len(),
+                ));
+            }
+        }
     }
 
     let counts = terminal_counts(&attempt.steps);
@@ -438,6 +477,9 @@ pub(crate) const fn operational_error_code(
     match code {
         ArchivedAttemptOperationalErrorCode::RunDirectoryUnavailable => "run_directory_unavailable",
         ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid => "run_directory_invalid",
+        ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported => {
+            "recovery_schema_unsupported"
+        }
         ArchivedAttemptOperationalErrorCode::LockQueryFailed => "lock_query_failed",
         ArchivedAttemptOperationalErrorCode::StatusSnapshotUnstable => "status_snapshot_unstable",
         ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable => {
@@ -455,6 +497,9 @@ const fn operational_error_message(code: ArchivedAttemptOperationalErrorCode) ->
         }
         ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid => {
             "The run directory is invalid. Select a supported workflow run directory."
+        }
+        ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported => {
+            "The recovery summary version is unsupported. Select a schema-1 workflow attempt."
         }
         ArchivedAttemptOperationalErrorCode::LockQueryFailed => {
             "Run ownership cannot be inspected safely. Check the run lock and try again."
@@ -599,19 +644,7 @@ fn archived_failure_cause(cause: &ArchivedFailureCause) -> String {
 }
 
 fn snake_case_debug(value: impl std::fmt::Debug) -> String {
-    let value = format!("{value:?}");
-    let mut result = String::with_capacity(value.len());
-    for (index, character) in value.chars().enumerate() {
-        if character.is_ascii_uppercase() {
-            if index != 0 {
-                result.push('_');
-            }
-            result.push(character.to_ascii_lowercase());
-        } else {
-            result.push(character);
-        }
-    }
-    result
+    super::presentation::snake_case_debug(value)
 }
 
 pub(crate) const fn archived_cancellation_reason(
@@ -779,6 +812,7 @@ mod tests {
         let operational = [
             ArchivedAttemptOperationalErrorCode::RunDirectoryUnavailable,
             ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid,
+            ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported,
             ArchivedAttemptOperationalErrorCode::LockQueryFailed,
             ArchivedAttemptOperationalErrorCode::StatusSnapshotUnstable,
             ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable,
@@ -909,6 +943,8 @@ mod tests {
                 duration: Some(Duration::from_secs(1)),
                 detail: ArchivedStepDetail::Succeeded,
                 command_output: None,
+                recovery: None,
+                invocations: Vec::new(),
             }],
         }
     }

@@ -38,8 +38,9 @@ use super::private_staging::{directory_entry_names, same_file};
 use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
 use super::runtime::{
-    ExportSet, ExportUnavailableReason, ExportValue, FailurePhase, NotRunReason, RunOutcome,
-    StepFailure, StepState,
+    ActiveStepInvocation, ExportSet, ExportUnavailableReason, ExportValue, FailurePhase,
+    NotRunReason, RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
+    RecoveryTerminalDisposition, RunOutcome, StepFailure, StepRecoveryState, StepState,
 };
 use super::schema_common::{lowercase_hex, utc_timestamp};
 use super::step_runtime::{
@@ -90,6 +91,8 @@ pub(crate) struct WorkflowRunStep {
     pub(crate) state: StepState<StepFailureCause, CapturedValue>,
     pub(crate) timing: Option<WorkflowStepTiming>,
     pub(crate) command_output: Option<StepDiagnostic>,
+    pub(crate) recovery: Option<StepRecoverySummaryV1>,
+    pub(crate) invocations: Vec<RecoveryInvocationV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,6 +481,14 @@ pub(crate) struct WorkflowStepV1 {
         deserialize_with = "deserialize_non_null_option",
         skip_serializing_if = "Option::is_none"
     )]
+    pub(crate) recovery: Option<StepRecoverySummaryV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) invocations: Vec<RecoveryInvocationV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) started_at: Option<String>,
     #[serde(
         default,
@@ -515,6 +526,280 @@ pub(crate) struct WorkflowStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) command_output: Option<CommandOutputV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryHandlerKindV1 {
+    Cmd,
+    Agent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StepRecoverySummaryV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) configured_retries: u8,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) handler_kind: Option<RecoveryHandlerKindV1>,
+    pub(crate) rounds: Vec<RecoveryRoundSummaryV1>,
+    pub(crate) termination: RecoveryTerminationV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryRoundSummaryV1 {
+    pub(crate) number: u8,
+    pub(crate) failed_execution: RecoveryFailedExecutionV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) handler: Option<RecoveryHandlerSummaryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryFailedExecutionV1 {
+    pub(crate) execution_number: u8,
+    pub(crate) invocation_id: u64,
+    pub(crate) failure: FailureV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryHandlerOutcomeV1 {
+    Recheck,
+    GaveUp,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryHandlerSummaryV1 {
+    pub(crate) kind: RecoveryHandlerKindV1,
+    pub(crate) invocation_id: u64,
+    pub(crate) outcome: RecoveryHandlerOutcomeV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) summary: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reason: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) failure: Option<RecoveryHandlerFailureV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RecoveryTerminationV1 {
+    Recovered {
+        #[serde(rename = "executionNumber")]
+        execution_number: u8,
+    },
+    Exhausted {
+        #[serde(rename = "executionNumber")]
+        execution_number: u8,
+    },
+    GaveUp {
+        round: u8,
+    },
+    HandlerFailed {
+        round: u8,
+        #[serde(rename = "handlerFailure")]
+        handler_failure: RecoveryHandlerFailureV1,
+    },
+    Cancelled {
+        round: u8,
+        #[serde(rename = "activeRole")]
+        active_role: RecoveryInvocationRoleV1,
+        #[serde(
+            rename = "executionNumber",
+            default,
+            deserialize_with = "deserialize_non_null_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        execution_number: Option<u8>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryHandlerFailurePhaseV1 {
+    Start,
+    Execution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryHandlerFailureV1 {
+    pub(crate) phase: RecoveryHandlerFailurePhaseV1,
+    pub(crate) cause: RecoveryHandlerFailureCauseV1,
+}
+
+// Recovery handler and target failures are separate closed schemas; keeping each field
+// explicit is clearer than a generic cause that could admit fields at the wrong boundary.
+// jscpd:ignore-start
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryHandlerFailureCauseV1 {
+    pub(crate) code: RecoveryHandlerFailureCodeV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) exit_code: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) decision_rejection: Option<RecoveryDecisionRejectionV1>,
+}
+// jscpd:ignore-end
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryHandlerFailureCodeV1 {
+    ContextUnavailable,
+    HandlerUnavailable,
+    WorkingDirectoryUnavailable,
+    CommandPreparationFailed,
+    CommandLaunchFailed,
+    CommandWaitFailed,
+    CommandExitFailed,
+    ProcessQuiescenceFailed,
+    ResultMissing,
+    ResultSymbolicLink,
+    ResultNotRegular,
+    ResultUnavailable,
+    ResultTooLarge,
+    DecisionInvalid,
+    AgentInputFailed,
+    AgentFailed,
+    AgentResultMissing,
+    AgentResultInvalid,
+    SettlementFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryDecisionRejectionV1 {
+    InputTooLarge,
+    InvalidUtf8,
+    InvalidJson,
+    DuplicateKey,
+    UnknownField,
+    UnsupportedSchemaVersion,
+    UnknownDecision,
+    EmptySummary,
+    SummaryTooLong,
+    EmptyReason,
+    ReasonTooLong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryInvocationRoleV1 {
+    Target,
+    RecoveryHandler,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryInvocationStateV1 {
+    Settled,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryInvocationV1 {
+    pub(crate) invocation_id: u64,
+    pub(crate) role: RecoveryInvocationRoleV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) target_execution: Option<u8>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) recovery_round: Option<u8>,
+    pub(crate) state: RecoveryInvocationStateV1,
+    pub(crate) started_at: String,
+    pub(crate) finished_at: String,
+    pub(crate) duration_milliseconds: u64,
+    pub(crate) usage: RecoveryInvocationUsageV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) diagnostics: Vec<RecoveryInvocationDiagnosticV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) diagnostic_reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryInvocationUsageV1 {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+}
+
+pub(crate) fn total_recovery_usage(
+    invocations: &[RecoveryInvocationV1],
+) -> RecoveryInvocationUsageV1 {
+    invocations
+        .iter()
+        .fold(RecoveryInvocationUsageV1::default(), |total, invocation| {
+            RecoveryInvocationUsageV1 {
+                input_tokens: total
+                    .input_tokens
+                    .saturating_add(invocation.usage.input_tokens),
+                output_tokens: total
+                    .output_tokens
+                    .saturating_add(invocation.usage.output_tokens),
+            }
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryDiagnosticKindV1 {
+    CommandStdout,
+    CommandStderr,
+    AgentHarnessStdout,
+    AgentHarnessStderr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryInvocationDiagnosticV1 {
+    pub(crate) kind: RecoveryDiagnosticKindV1,
+    pub(crate) reference: String,
+    pub(crate) stream: DiagnosticStreamV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1902,6 +2187,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
         | StepState::Cancelling { .. } => return Err(invalid_run_result()),
     };
     let command_output = step
@@ -1924,6 +2210,8 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         .to_owned(),
         failure_policy: step.failure_policy,
         state,
+        recovery: step.recovery.clone(),
+        invocations: step.invocations.clone(),
         started_at,
         duration_milliseconds,
         failure,
@@ -1934,7 +2222,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
     })
 }
 
-fn command_output_v1(
+pub(crate) fn command_output_v1(
     diagnostic: &StepDiagnostic,
 ) -> Result<CommandOutputV1, LocalPublicationError> {
     Ok(CommandOutputV1 {
@@ -1961,6 +2249,269 @@ fn diagnostic_stream_v1(
         truncated: discarded_bytes != 0,
         fully_drained: stream.fully_drained(),
     })
+}
+
+pub(crate) fn step_recovery_summary_v1(
+    recovery: Option<&StepRecoveryState<StepFailureCause>>,
+) -> Result<Option<StepRecoverySummaryV1>, LocalPublicationError> {
+    let Some(recovery) = recovery else {
+        return Ok(None);
+    };
+    if recovery.rounds.is_empty() {
+        return if recovery.terminal_disposition.is_none() {
+            Ok(None)
+        } else {
+            Err(invalid_run_result())
+        };
+    }
+    let rounds = recovery_round_summaries_v1(recovery, true)?;
+    let termination = match recovery
+        .terminal_disposition
+        .ok_or_else(invalid_run_result)?
+    {
+        RecoveryTerminalDisposition::Recovered { execution_number } => {
+            RecoveryTerminationV1::Recovered {
+                execution_number: execution_number.get(),
+            }
+        }
+        RecoveryTerminalDisposition::Exhausted { execution_number } => {
+            RecoveryTerminationV1::Exhausted {
+                execution_number: execution_number.get(),
+            }
+        }
+        RecoveryTerminalDisposition::GaveUp { round } => {
+            RecoveryTerminationV1::GaveUp { round: round.get() }
+        }
+        RecoveryTerminalDisposition::HandlerFailed { round, phase } => {
+            let failure = recovery
+                .rounds
+                .iter()
+                .find(|candidate| candidate.number == round)
+                .and_then(|round| round.handler.as_ref())
+                .and_then(|handler| match &handler.outcome {
+                    RecoveryHandlerOutcome::Failed {
+                        phase: retained_phase,
+                        cause,
+                    } if *retained_phase == phase => Some(cause),
+                    _ => None,
+                })
+                .ok_or_else(invalid_run_result)?;
+            RecoveryTerminationV1::HandlerFailed {
+                round: round.get(),
+                handler_failure: recovery_handler_failure_v1(phase, failure)?,
+            }
+        }
+        RecoveryTerminalDisposition::Cancelled { round, active } => {
+            let (active_role, execution_number) = match active {
+                ActiveStepInvocation::Target { execution_number } => (
+                    RecoveryInvocationRoleV1::Target,
+                    Some(execution_number.get()),
+                ),
+                ActiveStepInvocation::RecoveryHandler { .. } => {
+                    (RecoveryInvocationRoleV1::RecoveryHandler, None)
+                }
+            };
+            RecoveryTerminationV1::Cancelled {
+                round: round.get(),
+                active_role,
+                execution_number,
+            }
+        }
+    };
+    Ok(Some(StepRecoverySummaryV1 {
+        schema_version: 1,
+        configured_retries: recovery.configured_rounds,
+        handler_kind: recovery.handler_kind.map(recovery_handler_kind_v1),
+        rounds,
+        termination,
+    }))
+}
+
+pub(crate) fn recovery_round_summaries_v1(
+    recovery: &StepRecoveryState<StepFailureCause>,
+    require_settled_handlers: bool,
+) -> Result<Vec<RecoveryRoundSummaryV1>, LocalPublicationError> {
+    recovery
+        .rounds
+        .iter()
+        .map(|round| {
+            let handler = round
+                .handler
+                .as_ref()
+                .map(|handler| {
+                    let (outcome, summary, reason, failure) = match &handler.outcome {
+                        RecoveryHandlerOutcome::Recheck { summary, reason } => (
+                            RecoveryHandlerOutcomeV1::Recheck,
+                            Some(summary.clone()),
+                            Some(reason.clone()),
+                            None,
+                        ),
+                        RecoveryHandlerOutcome::GaveUp { summary, reason } => (
+                            RecoveryHandlerOutcomeV1::GaveUp,
+                            Some(summary.clone()),
+                            Some(reason.clone()),
+                            None,
+                        ),
+                        RecoveryHandlerOutcome::Failed { phase, cause } => (
+                            RecoveryHandlerOutcomeV1::Failed,
+                            None,
+                            None,
+                            Some(recovery_handler_failure_v1(*phase, cause)?),
+                        ),
+                        RecoveryHandlerOutcome::Cancelled => {
+                            (RecoveryHandlerOutcomeV1::Cancelled, None, None, None)
+                        }
+                        RecoveryHandlerOutcome::Starting | RecoveryHandlerOutcome::Running
+                            if !require_settled_handlers =>
+                        {
+                            return Ok(None);
+                        }
+                        RecoveryHandlerOutcome::Starting | RecoveryHandlerOutcome::Running => {
+                            return Err(invalid_run_result());
+                        }
+                    };
+                    Ok(Some(RecoveryHandlerSummaryV1 {
+                        kind: recovery_handler_kind_v1(handler.kind),
+                        invocation_id: handler.invocation.transition_sequence.get(),
+                        outcome,
+                        summary,
+                        reason,
+                        failure,
+                    }))
+                })
+                .transpose()?
+                .flatten();
+            Ok(RecoveryRoundSummaryV1 {
+                number: round.number.get(),
+                failed_execution: RecoveryFailedExecutionV1 {
+                    execution_number: round.failed_execution.execution_number.get(),
+                    invocation_id: round.failed_execution.invocation.transition_sequence.get(),
+                    failure: failure_v1(
+                        round.failed_execution.phase,
+                        &round.failed_execution.cause,
+                    )?,
+                },
+                handler,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn recovery_handler_kind_v1(kind: RecoveryHandlerKind) -> RecoveryHandlerKindV1 {
+    match kind {
+        RecoveryHandlerKind::Command => RecoveryHandlerKindV1::Cmd,
+        RecoveryHandlerKind::Agent => RecoveryHandlerKindV1::Agent,
+    }
+}
+
+fn recovery_handler_failure_v1(
+    phase: RecoveryHandlerFailurePhase,
+    cause: &StepFailureCause,
+) -> Result<RecoveryHandlerFailureV1, LocalPublicationError> {
+    let StepFailureCause::RecoveryHandler(cause) = cause else {
+        return Err(invalid_run_result());
+    };
+    let (code, exit_code, decision_rejection) = match cause {
+        super::recovery::RecoveryHandlerFailure::ContextUnavailable => {
+            (RecoveryHandlerFailureCodeV1::ContextUnavailable, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::HandlerUnavailable => {
+            (RecoveryHandlerFailureCodeV1::HandlerUnavailable, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::WorkingDirectoryUnavailable => (
+            RecoveryHandlerFailureCodeV1::WorkingDirectoryUnavailable,
+            None,
+            None,
+        ),
+        super::recovery::RecoveryHandlerFailure::CommandPreparationFailed => (
+            RecoveryHandlerFailureCodeV1::CommandPreparationFailed,
+            None,
+            None,
+        ),
+        super::recovery::RecoveryHandlerFailure::CommandLaunchFailed => (
+            RecoveryHandlerFailureCodeV1::CommandLaunchFailed,
+            None,
+            None,
+        ),
+        super::recovery::RecoveryHandlerFailure::CommandWaitFailed => {
+            (RecoveryHandlerFailureCodeV1::CommandWaitFailed, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::CommandExitFailed { code } => {
+            (RecoveryHandlerFailureCodeV1::CommandExitFailed, *code, None)
+        }
+        super::recovery::RecoveryHandlerFailure::ProcessQuiescenceFailed => (
+            RecoveryHandlerFailureCodeV1::ProcessQuiescenceFailed,
+            None,
+            None,
+        ),
+        super::recovery::RecoveryHandlerFailure::ResultMissing => {
+            (RecoveryHandlerFailureCodeV1::ResultMissing, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::ResultSymbolicLink => {
+            (RecoveryHandlerFailureCodeV1::ResultSymbolicLink, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::ResultNotRegular => {
+            (RecoveryHandlerFailureCodeV1::ResultNotRegular, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::ResultUnavailable => {
+            (RecoveryHandlerFailureCodeV1::ResultUnavailable, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::ResultTooLarge => {
+            (RecoveryHandlerFailureCodeV1::ResultTooLarge, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::DecisionInvalid(rejection) => (
+            RecoveryHandlerFailureCodeV1::DecisionInvalid,
+            None,
+            Some(recovery_decision_rejection_v1(*rejection)),
+        ),
+        super::recovery::RecoveryHandlerFailure::AgentInputFailed => {
+            (RecoveryHandlerFailureCodeV1::AgentInputFailed, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::AgentFailed => {
+            (RecoveryHandlerFailureCodeV1::AgentFailed, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::AgentResultMissing => {
+            (RecoveryHandlerFailureCodeV1::AgentResultMissing, None, None)
+        }
+        super::recovery::RecoveryHandlerFailure::AgentResultInvalid(rejection) => (
+            RecoveryHandlerFailureCodeV1::AgentResultInvalid,
+            None,
+            Some(recovery_decision_rejection_v1(*rejection)),
+        ),
+        super::recovery::RecoveryHandlerFailure::SettlementFailed => {
+            (RecoveryHandlerFailureCodeV1::SettlementFailed, None, None)
+        }
+    };
+    Ok(RecoveryHandlerFailureV1 {
+        phase: match phase {
+            RecoveryHandlerFailurePhase::Start => RecoveryHandlerFailurePhaseV1::Start,
+            RecoveryHandlerFailurePhase::Execution => RecoveryHandlerFailurePhaseV1::Execution,
+        },
+        cause: RecoveryHandlerFailureCauseV1 {
+            code,
+            exit_code,
+            decision_rejection,
+        },
+    })
+}
+
+fn recovery_decision_rejection_v1(
+    rejection: super::recovery::RecoveryDecisionFailureKind,
+) -> RecoveryDecisionRejectionV1 {
+    use super::recovery::RecoveryDecisionFailureKind as Source;
+    match rejection {
+        Source::InputTooLarge => RecoveryDecisionRejectionV1::InputTooLarge,
+        Source::InvalidUtf8 => RecoveryDecisionRejectionV1::InvalidUtf8,
+        Source::InvalidJson => RecoveryDecisionRejectionV1::InvalidJson,
+        Source::DuplicateKey => RecoveryDecisionRejectionV1::DuplicateKey,
+        Source::UnknownField => RecoveryDecisionRejectionV1::UnknownField,
+        Source::UnsupportedSchemaVersion => RecoveryDecisionRejectionV1::UnsupportedSchemaVersion,
+        Source::UnknownDecision => RecoveryDecisionRejectionV1::UnknownDecision,
+        Source::EmptySummary => RecoveryDecisionRejectionV1::EmptySummary,
+        Source::SummaryTooLong => RecoveryDecisionRejectionV1::SummaryTooLong,
+        Source::EmptyReason => RecoveryDecisionRejectionV1::EmptyReason,
+        Source::ReasonTooLong => RecoveryDecisionRejectionV1::ReasonTooLong,
+    }
 }
 
 fn primary_failure_v1(
@@ -2318,6 +2869,11 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
             step.command_output.as_ref().is_some_and(|output| {
                 !output.standard_output().fully_drained()
                     || !output.standard_error().fully_drained()
+            }) || step.invocations.iter().any(|invocation| {
+                invocation
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| !diagnostic.stream.fully_drained)
             })
         })
         || run.finalization.as_ref().is_some_and(|finalization| {

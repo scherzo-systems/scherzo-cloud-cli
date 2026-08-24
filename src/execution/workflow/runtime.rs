@@ -9,7 +9,8 @@ use super::finalization_context::{
 };
 use super::validated::{
     ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedCommonStep, ValidatedFinalizer,
-    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
+    ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
+    ValidatedWorkflow, WorkflowNodeRole,
 };
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -24,7 +25,7 @@ impl TransitionSequence {
     }
 
     fn next(self) -> Self {
-        Self(self.0 + 1)
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -56,6 +57,197 @@ pub(crate) enum FailurePhase {
     Start,
     Execution,
     OutputCapture,
+}
+
+impl FailurePhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Execution => "execution",
+            Self::OutputCapture => "output_capture",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TargetExecutionNumber(u8);
+
+impl TargetExecutionNumber {
+    pub(crate) const FIRST: Self = Self(1);
+
+    pub(crate) const fn get(self) -> u8 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fixture(value: u8) -> Self {
+        Self(value)
+    }
+
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RecoveryRoundNumber(u8);
+
+// Recovery rounds and target executions deliberately remain distinct typed ordinals even while
+// V1 keeps their values equal; sharing one type would erase the versioned ABI invariant.
+// jscpd:ignore-start
+impl RecoveryRoundNumber {
+    pub(crate) const fn get(self) -> u8 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fixture(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+// jscpd:ignore-end
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryHandlerKind {
+    Command,
+    Agent,
+}
+
+impl RecoveryHandlerKind {
+    fn from_validated(handler: &ValidatedRecoveryHandler) -> Self {
+        match handler {
+            ValidatedRecoveryHandler::Command { .. } => Self::Command,
+            ValidatedRecoveryHandler::Agent { .. } => Self::Agent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryHandlerActivity {
+    Starting,
+    Running,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveStepInvocation {
+    Target {
+        execution_number: TargetExecutionNumber,
+    },
+    RecoveryHandler {
+        round: RecoveryRoundNumber,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProvisionalTargetFailure<Cause> {
+    pub(crate) execution_number: TargetExecutionNumber,
+    pub(crate) invocation: ActionId,
+    pub(crate) phase: FailurePhase,
+    pub(crate) cause: Cause,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryDecisionKind {
+    Recheck,
+    GaveUp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryDecision {
+    pub(crate) kind: RecoveryDecisionKind,
+    pub(crate) summary: String,
+    pub(crate) reason: String,
+}
+
+impl RecoveryDecision {
+    pub(crate) fn recheck(summary: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            kind: RecoveryDecisionKind::Recheck,
+            summary: summary.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn gave_up(summary: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            kind: RecoveryDecisionKind::GaveUp,
+            summary: summary.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryHandlerFailurePhase {
+    Start,
+    Execution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryHandlerOutcome<Cause> {
+    Starting,
+    Running,
+    Recheck {
+        summary: String,
+        reason: String,
+    },
+    GaveUp {
+        summary: String,
+        reason: String,
+    },
+    Failed {
+        phase: RecoveryHandlerFailurePhase,
+        cause: Cause,
+    },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryHandlerRecord<Cause> {
+    pub(crate) kind: RecoveryHandlerKind,
+    pub(crate) invocation: ActionId,
+    pub(crate) outcome: RecoveryHandlerOutcome<Cause>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryRoundRecord<Cause> {
+    pub(crate) number: RecoveryRoundNumber,
+    pub(crate) failed_execution: ProvisionalTargetFailure<Cause>,
+    pub(crate) handler: Option<RecoveryHandlerRecord<Cause>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryTerminalDisposition {
+    Recovered {
+        execution_number: TargetExecutionNumber,
+    },
+    Exhausted {
+        execution_number: TargetExecutionNumber,
+    },
+    GaveUp {
+        round: RecoveryRoundNumber,
+    },
+    HandlerFailed {
+        round: RecoveryRoundNumber,
+        phase: RecoveryHandlerFailurePhase,
+    },
+    Cancelled {
+        round: RecoveryRoundNumber,
+        active: ActiveStepInvocation,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StepRecoveryState<Cause> {
+    pub(crate) configured_rounds: u8,
+    pub(crate) handler_kind: Option<RecoveryHandlerKind>,
+    pub(crate) rounds: Vec<RecoveryRoundRecord<Cause>>,
+    pub(crate) terminal_disposition: Option<RecoveryTerminalDisposition>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,13 +352,32 @@ pub(crate) enum StepState<Cause, Output> {
     Starting,
     Running,
     CapturingOutputs,
-    Cancelling { reason: CancellationReason },
-    Succeeded { outputs: OutputSet<Output> },
-    Failed { phase: FailurePhase, cause: Cause },
-    Blocked { dependency: String },
-    InputUnavailable { references: Vec<String> },
-    NotRun { reason: NotRunReason },
-    Cancelled { reason: CancellationReason },
+    Recovering {
+        round: RecoveryRoundNumber,
+        handler: RecoveryHandlerActivity,
+    },
+    Cancelling {
+        reason: CancellationReason,
+    },
+    Succeeded {
+        outputs: OutputSet<Output>,
+    },
+    Failed {
+        phase: FailurePhase,
+        cause: Cause,
+    },
+    Blocked {
+        dependency: String,
+    },
+    InputUnavailable {
+        references: Vec<String>,
+    },
+    NotRun {
+        reason: NotRunReason,
+    },
+    Cancelled {
+        reason: CancellationReason,
+    },
 }
 
 impl<Cause, Output> StepState<Cause, Output> {
@@ -176,6 +387,7 @@ impl<Cause, Output> StepState<Cause, Output> {
             Self::Starting => StepStateKind::Starting,
             Self::Running => StepStateKind::Running,
             Self::CapturingOutputs => StepStateKind::CapturingOutputs,
+            Self::Recovering { .. } => StepStateKind::Recovering,
             Self::Cancelling { .. } => StepStateKind::Cancelling,
             Self::Succeeded { .. } => StepStateKind::Succeeded,
             Self::Failed { .. } => StepStateKind::Failed,
@@ -188,7 +400,11 @@ impl<Cause, Output> StepState<Cause, Output> {
     fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Running | Self::CapturingOutputs | Self::Cancelling { .. }
+            Self::Starting
+                | Self::Running
+                | Self::CapturingOutputs
+                | Self::Recovering { .. }
+                | Self::Cancelling { .. }
         )
     }
 
@@ -211,6 +427,7 @@ pub(crate) enum StepStateKind {
     Starting,
     Running,
     CapturingOutputs,
+    Recovering,
     Cancelling,
     Succeeded,
     Failed,
@@ -223,6 +440,15 @@ pub(crate) enum StepStateKind {
 pub(crate) struct StepRuntimeState<Cause, Output> {
     pub(crate) state: StepState<Cause, Output>,
     pub(crate) current_action: Option<ActionId>,
+    pub(crate) target_execution: Option<TargetExecutionNumber>,
+    pub(crate) active_invocation: Option<ActiveStepInvocation>,
+    pub(crate) recovery: Option<StepRecoveryState<Cause>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeRecovery {
+    retries: u8,
+    handler_kind: Option<RecoveryHandlerKind>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +458,7 @@ struct RuntimeStep {
     prerequisites: Arc<[ResolvedDirectPrerequisite]>,
     inputs: BTreeMap<String, ResolvedValueSource>,
     declared_outputs: BTreeSet<String>,
+    recovery: Option<RuntimeRecovery>,
     when: BTreeSet<FinalizationTrigger>,
 }
 
@@ -249,6 +476,7 @@ struct RuntimeDefinition {
     finalizer_presentation_order: Vec<String>,
     exports: BTreeMap<String, RuntimeExport>,
     maximum_parallel_steps: NonZeroUsize,
+    maximum_transitions: u64,
 }
 
 impl RuntimeDefinition {
@@ -256,10 +484,15 @@ impl RuntimeDefinition {
         Self::from_workflow(
             &admitted.workflow().definition,
             admitted.execution().limits().maximum_parallel_steps(),
+            admitted.capacity().maximum_transitions,
         )
     }
 
-    fn from_workflow(workflow: &ValidatedWorkflow, maximum_parallel_steps: NonZeroUsize) -> Self {
+    fn from_workflow(
+        workflow: &ValidatedWorkflow,
+        maximum_parallel_steps: NonZeroUsize,
+        maximum_transitions: u64,
+    ) -> Self {
         let ordinary_ids = workflow.steps.keys().cloned().collect();
         let finalizer_ids = workflow.finalizers.keys().cloned().collect();
         let steps = workflow
@@ -268,7 +501,12 @@ impl RuntimeDefinition {
             .map(|(id, step)| {
                 (
                     id.clone(),
-                    runtime_step(WorkflowNodeRole::Step, step, BTreeSet::new()),
+                    runtime_step(
+                        WorkflowNodeRole::Step,
+                        step,
+                        workflow.recoveries.get(id).and_then(Option::as_ref),
+                        BTreeSet::new(),
+                    ),
                 )
             })
             .chain(
@@ -298,6 +536,7 @@ impl RuntimeDefinition {
             finalizer_presentation_order: workflow.finalizer_presentation_order.clone(),
             exports,
             maximum_parallel_steps,
+            maximum_transitions,
         }
     }
 }
@@ -306,6 +545,7 @@ fn runtime_finalizer(finalizer: &ValidatedFinalizer) -> RuntimeStep {
     runtime_step(
         WorkflowNodeRole::Finalizer,
         &finalizer.body,
+        None,
         finalizer.when.clone(),
     )
 }
@@ -313,6 +553,7 @@ fn runtime_finalizer(finalizer: &ValidatedFinalizer) -> RuntimeStep {
 fn runtime_step(
     role: WorkflowNodeRole,
     step: &ValidatedStep,
+    recovery: Option<&ValidatedStepRecovery>,
     when: BTreeSet<FinalizationTrigger>,
 ) -> RuntimeStep {
     let common = common_step(step);
@@ -348,6 +589,13 @@ fn runtime_step(
                 .collect(),
         },
         declared_outputs: common.outputs.keys().cloned().collect(),
+        recovery: recovery.map(|recovery| RuntimeRecovery {
+            retries: recovery.retries,
+            handler_kind: recovery
+                .handler
+                .as_ref()
+                .map(RecoveryHandlerKind::from_validated),
+        }),
         when,
     }
 }
@@ -453,6 +701,13 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     pub(crate) last_transition_sequence: TransitionSequence,
 }
 
+#[cfg(test)]
+impl<Cause, Output, Deadline> RuntimeState<Cause, Output, Deadline> {
+    pub(crate) fn admitted_transition_ceiling(&self) -> u64 {
+        self.definition.maximum_transitions
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CancellationRequest<Deadline> {
     pub(crate) reason: CancellationReason,
@@ -487,6 +742,29 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
     },
     OutputCaptureFailed {
         step: String,
+        action: ActionId,
+        cause: Cause,
+    },
+    RecoveryHandlerStarted {
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+    },
+    RecoveryHandlerStartFailed {
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        cause: Cause,
+    },
+    RecoveryHandlerCompleted {
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        decision: RecoveryDecision,
+    },
+    RecoveryHandlerExecutionFailed {
+        step: String,
+        round: RecoveryRoundNumber,
         action: ActionId,
         cause: Cause,
     },
@@ -537,7 +815,14 @@ pub(crate) enum ActionInput<Output> {
 pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
     StartStep {
         step: String,
+        execution_number: TargetExecutionNumber,
         inputs: BTreeMap<String, ActionInput<Output>>,
+    },
+    StartRecoveryHandler {
+        step: String,
+        round: RecoveryRoundNumber,
+        kind: RecoveryHandlerKind,
+        history: Vec<RecoveryRoundRecord<Cause>>,
     },
     CaptureOutputs {
         step: String,
@@ -545,11 +830,13 @@ pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
     },
     CancelStep {
         step: String,
+        active: ActiveStepInvocation,
         reason: CancellationReason,
         deadline: Deadline,
     },
     ForceAbortStep {
         step: String,
+        active: ActiveStepInvocation,
         reason: CancellationReason,
         deadline: Deadline,
     },
@@ -650,13 +937,21 @@ where
     let steps = start
         .definition
         .steps
-        .keys()
-        .map(|step| {
+        .iter()
+        .map(|(step, definition)| {
             (
                 step.clone(),
                 StepRuntimeState {
                     state: StepState::Pending,
                     current_action: None,
+                    target_execution: None,
+                    active_invocation: None,
+                    recovery: definition.recovery.map(|recovery| StepRecoveryState {
+                        configured_rounds: recovery.retries,
+                        handler_kind: recovery.handler_kind,
+                        rounds: Vec::with_capacity(usize::from(recovery.retries)),
+                        terminal_disposition: None,
+                    }),
                 },
             )
         })
@@ -763,6 +1058,7 @@ where
                     action: Action::CaptureOutputs { step, provisional },
                 });
             } else {
+                mark_recovered(reduction, &step);
                 transition_step(
                     reduction,
                     &step,
@@ -771,6 +1067,7 @@ where
                     },
                     None,
                 );
+                clear_active_invocation(&mut reduction.state, &step);
             }
         }
         Occurrence::StepExecutionFailed {
@@ -801,7 +1098,9 @@ where
             {
                 return false;
             }
+            mark_recovered(reduction, &step);
             transition_step(reduction, &step, StepState::Succeeded { outputs }, None);
+            clear_active_invocation(&mut reduction.state, &step);
         }
         Occurrence::OutputCaptureFailed {
             step,
@@ -814,6 +1113,76 @@ where
                 action,
                 StepStateKind::CapturingOutputs,
                 FailurePhase::OutputCapture,
+                cause,
+            );
+        }
+        Occurrence::RecoveryHandlerStarted {
+            step,
+            round,
+            action,
+        } => {
+            if !handler_accepts(
+                &reduction.state,
+                &step,
+                round,
+                RecoveryHandlerActivity::Starting,
+                action,
+            ) {
+                return false;
+            }
+            set_handler_outcome(
+                &mut reduction.state,
+                &step,
+                round,
+                RecoveryHandlerOutcome::Running,
+            );
+            transition_step(
+                reduction,
+                &step,
+                StepState::Recovering {
+                    round,
+                    handler: RecoveryHandlerActivity::Running,
+                },
+                Some(action),
+            );
+        }
+        Occurrence::RecoveryHandlerStartFailed {
+            step,
+            round,
+            action,
+            cause,
+        } => {
+            return apply_handler_failure(
+                reduction,
+                step,
+                round,
+                action,
+                RecoveryHandlerActivity::Starting,
+                RecoveryHandlerFailurePhase::Start,
+                cause,
+            );
+        }
+        Occurrence::RecoveryHandlerCompleted {
+            step,
+            round,
+            action,
+            decision,
+        } => {
+            return apply_handler_decision(reduction, step, round, action, decision);
+        }
+        Occurrence::RecoveryHandlerExecutionFailed {
+            step,
+            round,
+            action,
+            cause,
+        } => {
+            return apply_handler_failure(
+                reduction,
+                step,
+                round,
+                action,
+                RecoveryHandlerActivity::Running,
+                RecoveryHandlerFailurePhase::Execution,
                 cause,
             );
         }
@@ -849,10 +1218,12 @@ where
             return apply_force_abort(reduction, operation, deadline);
         }
         Occurrence::StepQuiesced { step, action } => {
-            let Some(reason) = cancelling_step_reason(&reduction.state, &step, action) else {
+            let Some((reason, active)) = cancelling_step(&reduction.state, &step, action) else {
                 return false;
             };
+            mark_recovery_cancelled(&mut reduction.state, &step, active);
             transition_step(reduction, &step, StepState::Cancelled { reason }, None);
+            clear_active_invocation(&mut reduction.state, &step);
         }
     }
     true
@@ -1113,7 +1484,19 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
             StepStateKind::Pending => {
                 transition_step(reduction, &step, StepState::Cancelled { reason }, None);
             }
-            StepStateKind::Starting | StepStateKind::Running | StepStateKind::CapturingOutputs => {
+            StepStateKind::Starting
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering => {
+                let Some(active) = reduction
+                    .state
+                    .steps
+                    .get(&step)
+                    .and_then(|runtime| runtime.active_invocation)
+                else {
+                    continue;
+                };
+                mark_handler_cancelled(&mut reduction.state, &step, active);
                 let sequence =
                     transition_step(reduction, &step, StepState::Cancelling { reason }, None);
                 let action = force_context.as_ref().map_or_else(
@@ -1125,6 +1508,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
                 let requested = match &force_context {
                     Some((_, deadline)) => Action::ForceAbortStep {
                         step,
+                        active,
                         reason,
                         deadline: deadline.clone(),
                     },
@@ -1134,6 +1518,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
                         };
                         Action::CancelStep {
                             step,
+                            active,
                             reason,
                             deadline,
                         }
@@ -1151,10 +1536,19 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
                 let action = ActionId::for_force_abort(*operation, containment_index);
                 containment_index += 1;
                 set_current_action(&mut reduction.state, &step, action);
+                let Some(active) = reduction
+                    .state
+                    .steps
+                    .get(&step)
+                    .and_then(|runtime| runtime.active_invocation)
+                else {
+                    continue;
+                };
                 reduction.actions.push(RequestedAction {
                     id: action,
                     action: Action::ForceAbortStep {
                         step,
+                        active,
                         reason,
                         deadline: deadline.clone(),
                     },
@@ -1170,14 +1564,16 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
     }
 }
 
-fn cancelling_step_reason<Cause, Output, Deadline>(
+fn cancelling_step<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     step: &str,
     action: ActionId,
-) -> Option<CancellationReason> {
+) -> Option<(CancellationReason, ActiveStepInvocation)> {
     let runtime = state.steps.get(step)?;
     match &runtime.state {
-        StepState::Cancelling { reason } if runtime.current_action == Some(action) => Some(*reason),
+        StepState::Cancelling { reason } if runtime.current_action == Some(action) => {
+            Some((*reason, runtime.active_invocation?))
+        }
         _ => None,
     }
 }
@@ -1201,6 +1597,250 @@ where
     let Some(definition) = reduction.state.definition.steps.get(&step).cloned() else {
         return false;
     };
+    if definition.role == WorkflowNodeRole::Step
+        && activate_recovery_round(reduction, &step, action, phase, cause.clone())
+    {
+        return true;
+    }
+    if definition.recovery.is_some() {
+        mark_recovery_exhausted(&mut reduction.state, &step);
+    }
+    settle_target_failure(reduction, step, definition, phase, cause);
+    true
+}
+
+fn activate_recovery_round<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: &str,
+    action: ActionId,
+    phase: FailurePhase,
+    cause: Cause,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let Some(runtime) = reduction.state.steps.get(step) else {
+        return false;
+    };
+    let Some(execution_number) = runtime.target_execution else {
+        return false;
+    };
+    let Some(recovery) = runtime.recovery.as_ref() else {
+        return false;
+    };
+    if recovery.rounds.len() >= usize::from(recovery.configured_rounds) {
+        return false;
+    }
+    let Some(round_value) = u8::try_from(recovery.rounds.len())
+        .ok()
+        .and_then(|round| round.checked_add(1))
+    else {
+        return false;
+    };
+    let round = RecoveryRoundNumber(round_value);
+    if round.get() != execution_number.get() {
+        return false;
+    }
+    let handler_kind = recovery.handler_kind;
+    let failed_execution = ProvisionalTargetFailure {
+        execution_number,
+        invocation: action,
+        phase,
+        cause,
+    };
+    let Some(recovery) = reduction
+        .state
+        .steps
+        .get_mut(step)
+        .and_then(|runtime| runtime.recovery.as_mut())
+    else {
+        return false;
+    };
+    recovery.rounds.push(RecoveryRoundRecord {
+        number: round,
+        failed_execution,
+        handler: None,
+    });
+
+    match handler_kind {
+        Some(kind) => {
+            if let Some(runtime) = reduction.state.steps.get_mut(step) {
+                runtime.active_invocation = Some(ActiveStepInvocation::RecoveryHandler { round });
+            }
+            let sequence = transition_step(
+                reduction,
+                step,
+                StepState::Recovering {
+                    round,
+                    handler: RecoveryHandlerActivity::Starting,
+                },
+                None,
+            );
+            let action = ActionId::for_transition(sequence);
+            let Some(round_record) = reduction
+                .state
+                .steps
+                .get_mut(step)
+                .and_then(|runtime| runtime.recovery.as_mut())
+                .and_then(|recovery| recovery.rounds.last_mut())
+            else {
+                return false;
+            };
+            round_record.handler = Some(RecoveryHandlerRecord {
+                kind,
+                invocation: action,
+                outcome: RecoveryHandlerOutcome::Starting,
+            });
+            set_current_action(&mut reduction.state, step, action);
+            let history = reduction
+                .state
+                .steps
+                .get(step)
+                .and_then(|runtime| runtime.recovery.as_ref())
+                .map(|recovery| recovery.rounds.clone())
+                .unwrap_or_default();
+            reduction.actions.push(RequestedAction {
+                id: action,
+                action: Action::StartRecoveryHandler {
+                    step: step.to_owned(),
+                    round,
+                    kind,
+                    history,
+                },
+            });
+        }
+        None => {
+            let Some(next_execution) = execution_number.next() else {
+                return false;
+            };
+            let Some(definition) = reduction.state.definition.steps.get(step).cloned() else {
+                return false;
+            };
+            let inputs = resolved_action_inputs(&reduction.state, &definition);
+            authorize_target(reduction, step.to_owned(), next_execution, inputs);
+        }
+    }
+    true
+}
+
+fn apply_handler_decision<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+    round: RecoveryRoundNumber,
+    action: ActionId,
+    decision: RecoveryDecision,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    if !handler_accepts(
+        &reduction.state,
+        &step,
+        round,
+        RecoveryHandlerActivity::Running,
+        action,
+    ) {
+        return false;
+    }
+    let outcome = match decision.kind {
+        RecoveryDecisionKind::Recheck => RecoveryHandlerOutcome::Recheck {
+            summary: decision.summary,
+            reason: decision.reason,
+        },
+        RecoveryDecisionKind::GaveUp => RecoveryHandlerOutcome::GaveUp {
+            summary: decision.summary,
+            reason: decision.reason,
+        },
+    };
+    set_handler_outcome(&mut reduction.state, &step, round, outcome);
+    match decision.kind {
+        RecoveryDecisionKind::Recheck => {
+            let Some(execution_number) = latest_target_failure(&reduction.state, &step)
+                .and_then(|failure| failure.execution_number.next())
+            else {
+                return false;
+            };
+            let Some(definition) = reduction.state.definition.steps.get(&step).cloned() else {
+                return false;
+            };
+            let inputs = resolved_action_inputs(&reduction.state, &definition);
+            authorize_target(reduction, step, execution_number, inputs);
+        }
+        RecoveryDecisionKind::GaveUp => {
+            set_recovery_disposition(
+                &mut reduction.state,
+                &step,
+                RecoveryTerminalDisposition::GaveUp { round },
+            );
+            settle_latest_target_failure(reduction, step);
+        }
+    }
+    true
+}
+
+fn apply_handler_failure<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+    round: RecoveryRoundNumber,
+    action: ActionId,
+    expected: RecoveryHandlerActivity,
+    phase: RecoveryHandlerFailurePhase,
+    cause: Cause,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    if !handler_accepts(&reduction.state, &step, round, expected, action) {
+        return false;
+    }
+    set_handler_outcome(
+        &mut reduction.state,
+        &step,
+        round,
+        RecoveryHandlerOutcome::Failed { phase, cause },
+    );
+    set_recovery_disposition(
+        &mut reduction.state,
+        &step,
+        RecoveryTerminalDisposition::HandlerFailed { round, phase },
+    );
+    settle_latest_target_failure(reduction, step);
+    true
+}
+
+fn settle_latest_target_failure<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let Some(failure) = latest_target_failure(&reduction.state, &step).cloned() else {
+        return;
+    };
+    let Some(definition) = reduction.state.definition.steps.get(&step).cloned() else {
+        return;
+    };
+    settle_target_failure(reduction, step, definition, failure.phase, failure.cause);
+}
+
+fn settle_target_failure<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+    definition: RuntimeStep,
+    phase: FailurePhase,
+    cause: Cause,
+) where
+    Cause: Clone,
+    Deadline: Clone,
+{
     let primary_failure = StepFailure {
         step: step.clone(),
         role: definition.role,
@@ -1208,6 +1848,7 @@ where
         cause: cause.clone(),
     };
     transition_step(reduction, &step, StepState::Failed { phase, cause }, None);
+    clear_active_invocation(&mut reduction.state, &step);
     if definition.failure_policy == FailurePolicy::Required {
         match definition.role {
             WorkflowNodeRole::Step => close_ordinary_gate_for_failure(reduction, primary_failure),
@@ -1216,7 +1857,151 @@ where
             }
         }
     }
-    true
+}
+
+fn latest_target_failure<'a, Cause, Output, Deadline>(
+    state: &'a RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+) -> Option<&'a ProvisionalTargetFailure<Cause>> {
+    state
+        .steps
+        .get(step)?
+        .recovery
+        .as_ref()?
+        .rounds
+        .last()
+        .map(|round| &round.failed_execution)
+}
+
+fn handler_accepts<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    round: RecoveryRoundNumber,
+    expected: RecoveryHandlerActivity,
+    action: ActionId,
+) -> bool {
+    state.steps.get(step).is_some_and(|runtime| {
+        runtime.current_action == Some(action)
+            && runtime.active_invocation == Some(ActiveStepInvocation::RecoveryHandler { round })
+            && matches!(
+                &runtime.state,
+                StepState::Recovering {
+                    round: active_round,
+                    handler,
+                } if *active_round == round && *handler == expected
+            )
+    })
+}
+
+fn set_handler_outcome<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    round: RecoveryRoundNumber,
+    outcome: RecoveryHandlerOutcome<Cause>,
+) {
+    if let Some(handler) = state
+        .steps
+        .get_mut(step)
+        .and_then(|runtime| runtime.recovery.as_mut())
+        .and_then(|recovery| recovery.rounds.last_mut())
+        .filter(|record| record.number == round)
+        .and_then(|record| record.handler.as_mut())
+    {
+        handler.outcome = outcome;
+    }
+}
+
+fn set_recovery_disposition<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    disposition: RecoveryTerminalDisposition,
+) {
+    if let Some(recovery) = state
+        .steps
+        .get_mut(step)
+        .and_then(|runtime| runtime.recovery.as_mut())
+    {
+        recovery.terminal_disposition = Some(disposition);
+    }
+}
+
+fn mark_recovery_exhausted<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+) {
+    if let Some(execution_number) = activated_recovery_execution(state, step) {
+        set_recovery_disposition(
+            state,
+            step,
+            RecoveryTerminalDisposition::Exhausted { execution_number },
+        );
+    }
+}
+
+fn mark_recovered<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: &str,
+) {
+    if let Some(execution_number) = activated_recovery_execution(&reduction.state, step) {
+        set_recovery_disposition(
+            &mut reduction.state,
+            step,
+            RecoveryTerminalDisposition::Recovered { execution_number },
+        );
+    }
+}
+
+fn activated_recovery_execution<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+) -> Option<TargetExecutionNumber> {
+    let runtime = state.steps.get(step)?;
+    runtime
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| !recovery.rounds.is_empty())
+        .then_some(runtime.target_execution)
+        .flatten()
+}
+
+fn mark_handler_cancelled<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    active: ActiveStepInvocation,
+) {
+    if let ActiveStepInvocation::RecoveryHandler { round } = active {
+        set_handler_outcome(state, step, round, RecoveryHandlerOutcome::Cancelled);
+    }
+}
+
+fn mark_recovery_cancelled<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    active: ActiveStepInvocation,
+) {
+    let Some(round) = state
+        .steps
+        .get(step)
+        .and_then(|runtime| runtime.recovery.as_ref())
+        .and_then(|recovery| recovery.rounds.last())
+        .map(|round| round.number)
+    else {
+        return;
+    };
+    set_recovery_disposition(
+        state,
+        step,
+        RecoveryTerminalDisposition::Cancelled { round, active },
+    );
+}
+
+fn clear_active_invocation<Cause, Output, Deadline>(
+    state: &mut RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+) {
+    if let Some(runtime) = state.steps.get_mut(step) {
+        runtime.active_invocation = None;
+    }
 }
 
 // Primary failure selection is phase-specific even though both transitions carry the same
@@ -1561,14 +2346,31 @@ fn select_ready_nodes<Provisional, Cause, Output, Deadline>(
         .take(available_slots)
         .collect::<Vec<_>>();
     for (step, inputs) in selected {
-        let sequence = transition_step(reduction, &step, StepState::Starting, None);
-        let action_id = ActionId::for_transition(sequence);
-        set_current_action(&mut reduction.state, &step, action_id);
-        reduction.actions.push(RequestedAction {
-            id: action_id,
-            action: Action::StartStep { step, inputs },
-        });
+        authorize_target(reduction, step, TargetExecutionNumber::FIRST, inputs);
     }
+}
+
+fn authorize_target<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+    execution_number: TargetExecutionNumber,
+    inputs: BTreeMap<String, ActionInput<Output>>,
+) {
+    if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+        runtime.target_execution = Some(execution_number);
+        runtime.active_invocation = Some(ActiveStepInvocation::Target { execution_number });
+    }
+    let sequence = transition_step(reduction, &step, StepState::Starting, None);
+    let action_id = ActionId::for_transition(sequence);
+    set_current_action(&mut reduction.state, &step, action_id);
+    reduction.actions.push(RequestedAction {
+        id: action_id,
+        action: Action::StartStep {
+            step,
+            execution_number,
+            inputs,
+        },
+    });
 }
 
 fn resolved_action_inputs<Cause, Output, Deadline>(
@@ -1863,6 +2665,7 @@ fn erase_outputs<Cause: Clone, Output>(
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
         | StepState::Cancelling { .. } => return None,
     })
 }
@@ -1995,6 +2798,7 @@ where
                 | StepState::Starting
                 | StepState::Running
                 | StepState::CapturingOutputs
+                | StepState::Recovering { .. }
                 | StepState::Cancelling { .. } => return None,
             };
             Some((name.clone(), value))
@@ -2081,6 +2885,10 @@ fn next_sequence<Cause, Output, Deadline>(
     state: &mut RuntimeState<Cause, Output, Deadline>,
 ) -> TransitionSequence {
     let sequence = state.last_transition_sequence.next();
+    assert!(
+        sequence.get() <= state.definition.maximum_transitions,
+        "reducer exceeded the admitted transition ceiling"
+    );
     state.last_transition_sequence = sequence;
     sequence
 }

@@ -11,7 +11,10 @@ use crate::execution::workflow::observation::{
     CommandOutputObservation, SourceSequence, TransitionObservation,
 };
 use crate::execution::workflow::resolution;
-use crate::execution::workflow::runtime::{ActionId, FailurePhase, TransitionSequence};
+use crate::execution::workflow::runtime::{
+    ActionId, ActiveStepInvocation, FailurePhase, RecoveryDecisionKind, RecoveryHandlerActivity,
+    RecoveryHandlerKind, RecoveryRoundNumber, TargetExecutionNumber, TransitionSequence,
+};
 use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
 use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::execution::workflow::value::CapturedValue;
@@ -570,6 +573,56 @@ async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suff
     assert_eq!(&step(&snapshot, "consume").log, &consume_before);
 }
 
+#[tokio::test]
+async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
+    let (_temporary, workflow) = resolve_workflow(
+        "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 2\n      handler:\n        kind: cmd\n        command:\n          argv: [/bin/true]\n    command:\n      argv: [/bin/false]\n",
+    );
+    let base = crate::timing::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock.clone());
+    let handler = ObservedStepTransition::Recovery {
+        active: ActiveStepInvocation::RecoveryHandler {
+            round: RecoveryRoundNumber::fixture(1),
+        },
+        configured_rounds: 2,
+        handler_kind: Some(RecoveryHandlerKind::Command),
+        handler_state: Some(RecoveryHandlerActivity::Running),
+        decision: None,
+    };
+    view.observe(step_transition(
+        "verify",
+        StepStateKind::Running,
+        StepStateKind::Recovering,
+        Some(handler.clone()),
+    ))
+    .await;
+    let snapshot = view.snapshot();
+    assert_eq!(snapshot.steps[0].state, StepStateKind::Recovering);
+    assert_eq!(snapshot.steps[0].fact, Some(handler));
+
+    clock.set(point(base, 10));
+    let target = ObservedStepTransition::Recovery {
+        active: ActiveStepInvocation::Target {
+            execution_number: TargetExecutionNumber::fixture(2),
+        },
+        configured_rounds: 2,
+        handler_kind: Some(RecoveryHandlerKind::Command),
+        handler_state: None,
+        decision: Some(RecoveryDecisionKind::Recheck),
+    };
+    view.observe(step_transition(
+        "verify",
+        StepStateKind::Recovering,
+        StepStateKind::Starting,
+        Some(target.clone()),
+    ))
+    .await;
+    let snapshot = view.snapshot();
+    assert_eq!(snapshot.steps[0].state, StepStateKind::Starting);
+    assert_eq!(snapshot.steps[0].fact, Some(target));
+}
+
 #[test]
 fn lifecycle_completion_requires_matching_started_phase() {
     let (_temporary, workflow) = resolved_workflow();
@@ -754,6 +807,8 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                     duration: Duration::from_millis(30),
                 }),
                 command_output: None,
+                recovery: None,
+                invocations: Vec::new(),
             },
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
@@ -771,6 +826,8 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                     duration: Duration::from_millis(40),
                 }),
                 command_output: None,
+                recovery: None,
+                invocations: Vec::new(),
             },
         ],
         finalization: None,

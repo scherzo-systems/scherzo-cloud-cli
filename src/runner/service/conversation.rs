@@ -19,7 +19,7 @@ use super::source::{
     CredentialBrokerFailure, CredentialOperation, ProviderCredential, SourceCredentialBroker,
 };
 use super::test_support::{
-    DeterminismTranscript, healthy_wall_clock, scripted_duplex, with_watchdog,
+    DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::test_credential;
@@ -455,7 +455,7 @@ async fn replay_conversation(conversation: Conversation) -> Result<(), Connectio
     let connection_event = recorder.start("runner.conversation_replay", []);
     let active_effect_event = ActiveEffectEvent::new();
     let mut assignment_manager =
-        AssignmentManager::new(&config, REPLAY_BOOT_ID.to_owned(), healthy_wall_clock());
+        AssignmentManager::new(&config, REPLAY_BOOT_ID.to_owned(), fixture_lease_clock());
     assignment_manager.use_source_broker_fixture(Arc::new(UnavailableSourceBroker));
     let assignment_manager = Mutex::new(assignment_manager);
     let transcript = DeterminismTranscript::default();

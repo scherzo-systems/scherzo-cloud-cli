@@ -16,7 +16,7 @@ use super::connection::{
 use super::test_support::{
     DeterminismTranscript, ScriptedConnection, ScriptedInbound, ScriptedReader, ScriptedWriter,
     SleepRelease, assignment_offer, controlled_shutdown, controlled_sleeper_with_transcript,
-    deterministic_frame_source, effect_observation_acknowledgement, healthy_wall_clock,
+    deterministic_frame_source, effect_observation_acknowledgement, fixture_lease_clock,
     observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
     with_watchdog,
 };
@@ -469,7 +469,7 @@ impl EstablishedRuntime {
         let assignment_manager = Mutex::new(AssignmentManager::new(
             &self.config,
             BOOT_ID.to_owned(),
-            healthy_wall_clock(),
+            fixture_lease_clock(),
         ));
         run_established(
             ConnectionDependencies::new(
@@ -549,7 +549,7 @@ fn deterministic_connection_loop_dependencies(
         frame_source,
         sleeper,
         recorder,
-        healthy_wall_clock(),
+        fixture_lease_clock(),
         boot_id,
     )
 }
@@ -626,7 +626,6 @@ fn scripted_assignment_offer() -> Message {
         decoded["payload"]["runId"],
         "run_01k0z6r1w8f4jy2m7q9v3x5abj"
     );
-    assert!(decoded["payload"].get("offerExpiresAt").is_none());
     offer
 }
 

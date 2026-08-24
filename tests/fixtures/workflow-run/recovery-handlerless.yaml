@@ -1,0 +1,27 @@
+schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          printf x >> target-runs
+          if [ ! -f handlerless-ready ]; then
+            : > handlerless-ready
+            printf 'provisional execution 1\n' >&2
+            exit 75
+          fi
+          printf 'execution 2 owns this output\n' > recovered.txt
+    outputs:
+      recovered:
+        kind: file
+        path: recovered.txt
+        mediaType: text/plain
+exports:
+  recovered:
+    ref: outputs.verify.recovered

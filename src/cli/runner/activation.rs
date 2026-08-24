@@ -7,9 +7,9 @@ use super::{
     CloudOptions, RegistrationTarget, cloud, completed_cloud_result,
     validate_activation_destination, write_activation_issuance, write_activation_summary,
 };
-use crate::api::generate_idempotency_key;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use crate::idempotency::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner enrollment activations";
 const COMMAND_PATH: &[&str] = &["runner", "activation"];

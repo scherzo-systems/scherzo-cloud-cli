@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -96,12 +96,45 @@ impl StepDiagnostic {
 
 #[derive(Clone, Default)]
 pub(crate) struct StepDiagnosticLog {
-    entries: Arc<Mutex<BTreeMap<String, StepDiagnostic>>>,
+    entries: Arc<Mutex<BTreeMap<(String, ActionId), StepDiagnostic>>>,
+    recovery_handlers: Arc<Mutex<BTreeSet<(String, ActionId)>>>,
 }
 
 impl StepDiagnosticLog {
     pub(crate) fn get(&self, step: &str) -> Option<StepDiagnostic> {
-        lock_entries(&self.entries).get(step).cloned()
+        let recovery_handlers = lock_recovery_handlers(&self.recovery_handlers).clone();
+        lock_entries(&self.entries).iter().rev().find_map(
+            |((entry_step, invocation), diagnostic)| {
+                (entry_step == step
+                    && !recovery_handlers.contains(&(entry_step.clone(), *invocation)))
+                .then(|| diagnostic.clone())
+            },
+        )
+    }
+
+    pub(crate) fn mark_recovery_handler(&self, step: &str, invocation: ActionId) {
+        lock_recovery_handlers(&self.recovery_handlers).insert((step.to_owned(), invocation));
+    }
+
+    pub(crate) fn is_recovery_handler(&self, step: &str, invocation: ActionId) -> bool {
+        lock_recovery_handlers(&self.recovery_handlers).contains(&(step.to_owned(), invocation))
+    }
+
+    pub(crate) fn get_invocation(
+        &self,
+        step: &str,
+        invocation: ActionId,
+    ) -> Option<StepDiagnostic> {
+        lock_entries(&self.entries)
+            .get(&(step.to_owned(), invocation))
+            .cloned()
+    }
+
+    pub(crate) fn invocation_ids(&self, step: &str) -> Vec<ActionId> {
+        lock_entries(&self.entries)
+            .keys()
+            .filter_map(|(entry_step, invocation)| (entry_step == step).then_some(*invocation))
+            .collect()
     }
 
     pub(super) fn start_capture<Deadline, Observer, StandardOutput, StandardError>(
@@ -122,6 +155,7 @@ impl StepDiagnosticLog {
         PendingStepDiagnostic {
             log: self.clone(),
             step: step.clone(),
+            invocation,
             standard_output: tokio::spawn(drain_stream(
                 standard_output,
                 maximum_stream_bytes,
@@ -167,11 +201,12 @@ impl StepDiagnosticLog {
     pub(super) fn record(
         &self,
         step: String,
+        invocation: ActionId,
         standard_output: CapturedDiagnosticStream,
         standard_error: CapturedDiagnosticStream,
     ) {
         lock_entries(&self.entries).insert(
-            step,
+            (step, invocation),
             StepDiagnostic {
                 standard_output,
                 standard_error,
@@ -221,6 +256,7 @@ impl DiagnosticStreamCapture {
 pub(super) struct PendingStepDiagnostic {
     log: StepDiagnosticLog,
     step: String,
+    invocation: ActionId,
     standard_output: JoinHandle<CapturedDiagnosticStream>,
     standard_error: JoinHandle<CapturedDiagnosticStream>,
 }
@@ -236,6 +272,7 @@ impl PendingStepDiagnostic {
             tokio::join!(self.standard_output, self.standard_error);
         self.log.record(
             self.step,
+            self.invocation,
             standard_output.unwrap_or_else(|_| CapturedDiagnosticStream::reader_unavailable()),
             standard_error.unwrap_or_else(|_| CapturedDiagnosticStream::reader_unavailable()),
         );
@@ -299,8 +336,17 @@ where
 }
 
 fn lock_entries(
-    entries: &Mutex<BTreeMap<String, StepDiagnostic>>,
-) -> MutexGuard<'_, BTreeMap<String, StepDiagnostic>> {
+    entries: &Mutex<BTreeMap<(String, ActionId), StepDiagnostic>>,
+) -> MutexGuard<'_, BTreeMap<(String, ActionId), StepDiagnostic>> {
+    match entries.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_recovery_handlers(
+    entries: &Mutex<BTreeSet<(String, ActionId)>>,
+) -> MutexGuard<'_, BTreeSet<(String, ActionId)>> {
     match entries.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

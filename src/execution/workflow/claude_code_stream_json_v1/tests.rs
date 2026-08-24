@@ -839,6 +839,41 @@ fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
 }
 
 #[test]
+fn duplicate_keys_in_streamed_result_candidate_fail_before_normalization() {
+    let values = [
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        message_start("msg-result"),
+        stream_event(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "tool-structured-output",
+                "name": "StructuredOutput",
+                "input": {},
+            },
+        })),
+        stream_event(json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json":
+                    "{\"result\":{\"decision\":\"recheck\",\"decision\":\"gave_up\"}}",
+            },
+        })),
+        stream_event(json!({"type": "content_block_stop", "index": 0})),
+    ];
+
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    assert_eq!(
+        parser.push_stdout(&framed(&values), drop),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    assert!(matches!(parser.finish(false), AgentOutcome::Failed(_)));
+}
+
+#[test]
 fn result_candidate_requires_correlated_success_acknowledgement() {
     let envelope = json!({"result": 7});
     let call_id = "tool-structured-output";

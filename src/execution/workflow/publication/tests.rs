@@ -146,6 +146,8 @@ fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunSte
             duration: Duration::from_millis(240),
         }),
         command_output: Some(diagnostic(true)),
+        recovery: None,
+        invocations: Vec::new(),
     }
 }
 
@@ -1260,5 +1262,91 @@ fn incomplete_command_output_selects_local_failure_status_without_changing_outco
     assert_eq!(
         value["result"]["steps"][0]["commandOutput"]["stdout"]["fullyDrained"],
         false
+    );
+}
+
+#[test]
+fn recovered_invocation_with_incomplete_diagnostics_selects_local_failure_status() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let failure = FailureV1 {
+        phase: FailurePhaseV1::Execution,
+        cause: FailureCauseV1 {
+            code: FailureCodeV1::CommandExit,
+            input: None,
+            collection_index: None,
+            output: None,
+            exit_code: Some(75),
+            protocol_rejection: None,
+        },
+    };
+    let incomplete = command_output_v1(&diagnostic(false)).unwrap();
+    let complete = command_output_v1(&diagnostic(true)).unwrap();
+    run.steps[0].recovery = Some(StepRecoverySummaryV1 {
+        schema_version: 1,
+        configured_retries: 1,
+        handler_kind: None,
+        rounds: vec![RecoveryRoundSummaryV1 {
+            number: 1,
+            failed_execution: RecoveryFailedExecutionV1 {
+                execution_number: 1,
+                invocation_id: 1,
+                failure,
+            },
+            handler: None,
+        }],
+        termination: RecoveryTerminationV1::Recovered {
+            execution_number: 2,
+        },
+    });
+    run.steps[0].invocations = vec![
+        RecoveryInvocationV1 {
+            invocation_id: 1,
+            role: RecoveryInvocationRoleV1::Target,
+            target_execution: Some(1),
+            recovery_round: None,
+            state: RecoveryInvocationStateV1::Settled,
+            started_at: "2026-08-02T12:01:44.01Z".to_owned(),
+            finished_at: "2026-08-02T12:01:44.02Z".to_owned(),
+            duration_milliseconds: 10,
+            usage: RecoveryInvocationUsageV1::default(),
+            diagnostics: vec![RecoveryInvocationDiagnosticV1 {
+                kind: RecoveryDiagnosticKindV1::CommandStdout,
+                reference: "attempts/000001/invocations/00000000000000000001/stdout.bin".to_owned(),
+                stream: incomplete.stdout,
+            }],
+            diagnostic_reference: None,
+        },
+        RecoveryInvocationV1 {
+            invocation_id: 2,
+            role: RecoveryInvocationRoleV1::Target,
+            target_execution: Some(2),
+            recovery_round: None,
+            state: RecoveryInvocationStateV1::Settled,
+            started_at: "2026-08-02T12:01:44.021Z".to_owned(),
+            finished_at: "2026-08-02T12:01:44.031Z".to_owned(),
+            duration_milliseconds: 10,
+            usage: RecoveryInvocationUsageV1::default(),
+            diagnostics: vec![RecoveryInvocationDiagnosticV1 {
+                kind: RecoveryDiagnosticKindV1::CommandStdout,
+                reference: "attempts/000001/invocations/00000000000000000002/stdout.bin".to_owned(),
+                stream: complete.stdout,
+            }],
+            diagnostic_reference: None,
+        },
+    ];
+    let destination = fixture.destination("incomplete-recovery-invocation");
+
+    let terminal = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let value = serde_json::to_value(terminal).unwrap();
+
+    assert_eq!(value["outcome"], "succeeded");
+    assert_eq!(
+        value["result"]["steps"][0]["invocations"][0]["diagnostics"][0]["stream"]["fullyDrained"],
+        false
+    );
+    assert_eq!(
+        value["exitStatus"], 1,
+        "an incomplete provisional invocation stream is a contracted local integrity failure"
     );
 }

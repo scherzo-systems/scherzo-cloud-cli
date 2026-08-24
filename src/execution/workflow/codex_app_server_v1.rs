@@ -15,6 +15,7 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
     CompletedAgentInvocation,
 };
+use super::strict_json;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_CORRELATION_BYTES: u64 = 64 * 1024;
@@ -626,8 +627,7 @@ impl CodexAppServerV1Parser {
         {
             return Err(self.failure_for_current_phase());
         }
-        let value =
-            serde_json::from_slice::<Value>(frame).map_err(|_| self.failure_for_current_phase())?;
+        let value = strict_json::from_slice(frame).map_err(|_| self.failure_for_current_phase())?;
         let object = value
             .as_object()
             .ok_or_else(|| self.failure_for_current_phase())?;
@@ -2235,7 +2235,7 @@ fn content_safe_diagnostic(message: &str, maximum_bytes: usize) -> (String, bool
     (safe, false)
 }
 
-struct WeakResultEnvelope(Value);
+struct WeakResultEnvelope(String);
 
 impl<'de> Deserialize<'de> for WeakResultEnvelope {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -2267,7 +2267,7 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
             if result.is_some() {
                 return Err(de::Error::duplicate_field("result"));
             }
-            result = Some(map.next_value::<Value>()?);
+            result = Some(map.next_value::<String>()?);
         }
         result
             .map(WeakResultEnvelope)
@@ -2276,15 +2276,19 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
 }
 
 fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
-    serde_json::from_str::<WeakResultEnvelope>(text)
-        .map(|envelope| envelope.0)
-        .map_err(|_| ())
+    let envelope = serde_json::from_str::<WeakResultEnvelope>(text).map_err(|_| ())?;
+    strict_json::from_str(&envelope.0).map_err(|_| ())
 }
 
 fn weak_result_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"result": {}},
+        "properties": {
+            "result": {
+                "type": "string",
+                "description": "JSON-encode the structured workflow result as one string.",
+            }
+        },
         "required": ["result"],
         "additionalProperties": false,
     })

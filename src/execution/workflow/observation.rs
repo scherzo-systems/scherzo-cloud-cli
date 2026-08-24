@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use super::admission::CancellationReason;
 use super::agent::AgentObservationEnvelope;
-use super::runtime::{ActionId, FailurePhase, NotRunReason, TransitionEvent};
+use super::runtime::{
+    ActionId, ActiveStepInvocation, FailurePhase, NotRunReason, RecoveryDecisionKind,
+    RecoveryHandlerActivity, RecoveryHandlerKind, TransitionEvent,
+};
 use super::step_runtime::StepFailureCause;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +51,13 @@ pub(crate) struct CommandOutputClosedObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ObservedStepTransition {
+    Recovery {
+        active: ActiveStepInvocation,
+        configured_rounds: u8,
+        handler_kind: Option<RecoveryHandlerKind>,
+        handler_state: Option<RecoveryHandlerActivity>,
+        decision: Option<RecoveryDecisionKind>,
+    },
     OutputsCommitted {
         outputs: Vec<String>,
     },

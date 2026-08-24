@@ -8,14 +8,16 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::Sleeper;
 use super::artifact_delivery::{
     ArtifactDeliveryBroker, ArtifactDeliveryOutcome, ArtifactDeliverySpec,
     ClosedArtifactDeliveryFailure,
 };
 use super::assignment::{
-    AcceptedAssignment, AssignmentObservation, ExecutionReport, LeaseAuthority, ManagerEvent,
-    ObservationOutbox,
+    AcceptedAssignment, AssignmentObservation, CausalLease, ExecutionReport, LeaseAuthority,
+    ManagerEvent, ObservationOutbox, RenewalRequestFailure,
+};
+use super::lease_clock::{
+    LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
 use crate::execution::workflow::admission::CancellationReason;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -70,6 +72,8 @@ struct ProcessGuardState {
     next_id: u64,
     records: BTreeMap<String, GuardRecord>,
     forced_containment_started: bool,
+    #[cfg(test)]
+    quiescence_fixture: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -84,6 +88,8 @@ impl AssignmentProcessGuards {
                 next_id: 1,
                 records: BTreeMap::new(),
                 forced_containment_started: false,
+                #[cfg(test)]
+                quiescence_fixture: None,
             })),
         }
     }
@@ -114,14 +120,24 @@ impl AssignmentProcessGuards {
     }
 
     fn is_quiescent(&self) -> bool {
+        let state = self.lock();
+        #[cfg(test)]
+        if let Some(quiescent) = &state.quiescence_fixture {
+            return quiescent.load(std::sync::atomic::Ordering::Acquire);
+        }
         let inspector = SystemProcessIdentityInspector;
-        self.lock().records.values().all(|record| {
+        state.records.values().all(|record| {
             record.lifecycle == GuardLifecycle::Quiesced
                 || matches!(
                     inspector.observe(&record.identity),
                     ProcessIdentityObservation::Absent
                 )
         })
+    }
+
+    #[cfg(test)]
+    fn use_quiescence_fixture(&self, quiescent: Arc<std::sync::atomic::AtomicBool>) {
+        self.lock().quiescence_fixture = Some(quiescent);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ProcessGuardState> {
@@ -214,7 +230,8 @@ impl PostStopFence {
 
 struct ExecutionCompletion {
     final_observation_id: Option<u64>,
-    final_delivery_deadline: Option<Instant>,
+    final_delivery_deadline: Option<LeaseInstant>,
+    lease_clock_failed: bool,
 }
 
 impl ExecutionCompletion {
@@ -222,6 +239,7 @@ impl ExecutionCompletion {
         Self {
             final_observation_id,
             final_delivery_deadline: None,
+            lease_clock_failed: false,
         }
     }
 
@@ -240,6 +258,14 @@ impl ExecutionCompletion {
     fn without_report() -> Self {
         Self::selected(None)
     }
+
+    fn lease_clock_failed(final_observation_id: Option<u64>) -> Self {
+        Self {
+            final_observation_id,
+            final_delivery_deadline: None,
+            lease_clock_failed: true,
+        }
+    }
 }
 
 pub(super) struct ExecutionJob {
@@ -247,7 +273,8 @@ pub(super) struct ExecutionJob {
     outbox: ObservationOutbox,
     artifact_delivery: ArtifactDeliveryBroker,
     manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
-    sleeper: Arc<dyn Sleeper>,
+    lease_clock: LeaseClock,
+    causal_lease: CausalLease,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
 }
 
@@ -257,7 +284,8 @@ impl ExecutionJob {
         outbox: ObservationOutbox,
         artifact_delivery: ArtifactDeliveryBroker,
         manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
-        sleeper: Arc<dyn Sleeper>,
+        lease_clock: LeaseClock,
+        causal_lease: CausalLease,
         authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
     ) -> Self {
         Self {
@@ -265,7 +293,8 @@ impl ExecutionJob {
             outbox,
             artifact_delivery,
             manager_events,
-            sleeper,
+            lease_clock,
+            causal_lease,
             authority_updates,
         }
     }
@@ -281,14 +310,18 @@ impl ExecutionJob {
         let mut completion = self
             .run_workflow(&assignment_id, &attempt_id, &run_id)
             .await;
-        if completion.final_observation_id.is_some() {
-            completion.final_delivery_deadline = Some(self.terminal_report_deadline());
+        if completion.final_observation_id.is_some() && !completion.lease_clock_failed {
+            match self.terminal_report_deadline() {
+                Ok(deadline) => completion.final_delivery_deadline = Some(deadline),
+                Err(_) => completion.lease_clock_failed = true,
+            }
         }
         let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
             final_observation_id: completion.final_observation_id,
             final_delivery_deadline: completion.final_delivery_deadline,
+            lease_clock_failed: completion.lease_clock_failed,
             retained_root: Some(retained_root),
         });
         self.outbox.wake();
@@ -300,22 +333,41 @@ impl ExecutionJob {
         attempt_id: &str,
         run_id: &str,
     ) -> ExecutionCompletion {
-        if !self.has_execution_authority() {
-            return ExecutionCompletion::without_report();
+        let post_stop_fence = PostStopFence::new();
+        let cancellation = self
+            .accepted
+            .admitted
+            .execution()
+            .cancellation()
+            .source()
+            .clone();
+        match self.has_execution_authority() {
+            Ok(true) => {}
+            Ok(false) => return ExecutionCompletion::without_report(),
+            Err(_) => {
+                return self.fail_before_execution(
+                    &cancellation,
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                );
+            }
         }
-        let started_at = RunnerExecutionClock.now();
-        if self
-            .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
-            .is_none()
+        let initial_authority = self.authority_updates.borrow().clone();
+        let initial_wait = match self
+            .lease_clock
+            .start_wait(initial_authority.renewal_request)
         {
-            return ExecutionCompletion::ordinary(self.abort(
-                assignment_id,
-                attempt_id,
-                0,
-                "runner_internal_failure",
-            ));
-        }
-
+            Ok(wait) => wait,
+            Err(_) => {
+                return self.fail_before_execution(
+                    &cancellation,
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                );
+            }
+        };
         let artifacts = match ArtifactStaging::create(
             self.accepted.admitted.execution(),
             &self.accepted.root.private,
@@ -392,19 +444,36 @@ impl ExecutionJob {
             None
         };
 
-        if !self.has_execution_authority() {
-            let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            return ExecutionCompletion::without_report();
+        match self.has_execution_authority() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                return ExecutionCompletion::without_report();
+            }
+            Err(_) => {
+                let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                return self.fail_before_execution(
+                    &cancellation,
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                );
+            }
         }
 
-        let post_stop_fence = PostStopFence::new();
-        let cancellation = self
-            .accepted
-            .admitted
-            .execution()
-            .cancellation()
-            .source()
-            .clone();
+        let started_at = RunnerExecutionClock.now();
+        if self
+            .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
+            .is_none()
+        {
+            return ExecutionCompletion::ordinary(self.abort(
+                assignment_id,
+                attempt_id,
+                0,
+                "runner_internal_failure",
+            ));
+        }
+
         let observer = RunnerExecutionObserver::new(
             assignment_id.to_owned(),
             attempt_id.to_owned(),
@@ -463,8 +532,10 @@ impl ExecutionJob {
                     process_guard_registry,
                 ),
                 &cancellation,
-                self.sleeper.as_ref(),
+                &self.lease_clock,
                 self.authority_updates.clone(),
+                Some((initial_authority.sequence, initial_wait)),
+                &self.causal_lease,
                 &self.outbox,
                 assignment_id,
                 attempt_id,
@@ -490,8 +561,10 @@ impl ExecutionJob {
                     process_guard_registry,
                 ),
                 &cancellation,
-                self.sleeper.as_ref(),
+                &self.lease_clock,
                 self.authority_updates.clone(),
+                Some((initial_authority.sequence, initial_wait)),
+                &self.causal_lease,
                 &self.outbox,
                 assignment_id,
                 attempt_id,
@@ -526,6 +599,18 @@ impl ExecutionJob {
             LeaseExecution::ContainmentDeadline => {
                 let _ = artifacts.release();
                 return ExecutionCompletion::fenced(None, None);
+            }
+            LeaseExecution::LeaseClockFailed { quiescent } => {
+                let _ = artifacts.release();
+                let report = quiescent.then(|| {
+                    self.abort(
+                        assignment_id,
+                        attempt_id,
+                        observer.last_sequence(),
+                        "runner_internal_failure",
+                    )
+                });
+                return ExecutionCompletion::lease_clock_failed(report.flatten());
             }
         };
         if support_cleanup_failed {
@@ -598,7 +683,21 @@ impl ExecutionJob {
                 self.deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
                     .await
             }
-            None => internal_delivery_failure("preparation"),
+            None => Ok(internal_delivery_failure("preparation")),
+        };
+        let delivery = match delivery {
+            Ok(delivery) => delivery,
+            Err(_) => {
+                post_stop_fence.fence();
+                self.accepted.process_guards.begin_forced_containment();
+                let _ = artifacts.release();
+                return ExecutionCompletion::lease_clock_failed(self.abort(
+                    assignment_id,
+                    attempt_id,
+                    last_sequence,
+                    "runner_internal_failure",
+                ));
+            }
         };
         if delivery == ArtifactDeliveryOutcome::AuthorityLost {
             let _ = artifacts.release();
@@ -701,6 +800,8 @@ impl ExecutionJob {
                 command_output: (kind == WorkflowRunStepKind::Command)
                     .then(|| diagnostics.get(id))
                     .flatten(),
+                recovery: None,
+                invocations: Vec::new(),
             });
         }
         let finalization = match (
@@ -735,6 +836,8 @@ impl ExecutionJob {
                         command_output: (kind == WorkflowRunStepKind::Command)
                             .then(|| diagnostics.get(id))
                             .flatten(),
+                        recovery: None,
+                        invocations: Vec::new(),
                     });
                 }
                 if !summarized.is_empty() {
@@ -792,7 +895,7 @@ impl ExecutionJob {
         attempt_id: &str,
         artifacts: &ArtifactStaging,
         prepared: crate::execution::workflow::publication::PreparedCloudWorkflowResult,
-    ) -> ArtifactDeliveryOutcome {
+    ) -> Result<ArtifactDeliveryOutcome, LeaseClockError> {
         for carrier in prepared.carriers {
             let delivery = ArtifactDeliverySpec::cloud_carrier(
                 assignment_id.to_owned(),
@@ -800,9 +903,9 @@ impl ExecutionJob {
                 artifacts,
                 carrier,
             );
-            let outcome = self.await_delivery(assignment_id, delivery).await;
+            let outcome = self.await_delivery(assignment_id, delivery).await?;
             if !matches!(outcome, ArtifactDeliveryOutcome::Delivered { .. }) {
-                return outcome;
+                return Ok(outcome);
             }
         }
         self.await_delivery(
@@ -820,77 +923,110 @@ impl ExecutionJob {
         &self,
         assignment_id: &str,
         delivery: ArtifactDeliverySpec,
-    ) -> ArtifactDeliveryOutcome {
+    ) -> Result<ArtifactDeliveryOutcome, LeaseClockError> {
         let Ok(mut completion) = self.artifact_delivery.start(delivery) else {
-            return internal_delivery_failure("registration");
+            return Ok(internal_delivery_failure("registration"));
         };
         let mut authority_updates = self.authority_updates.clone();
         loop {
             let authority = authority_updates.borrow_and_update().clone();
-            if authority.revoked || self.sleeper.now() >= authority.expires_deadline {
+            let now = self.lease_clock.now()?;
+            if authority.revoked
+                || !matches!(
+                    now.checked_cmp(authority.local_expiry)?,
+                    std::cmp::Ordering::Less
+                )
+            {
                 self.artifact_delivery.cancel_assignment(assignment_id);
-                return ArtifactDeliveryOutcome::AuthorityLost;
+                return Ok(ArtifactDeliveryOutcome::AuthorityLost);
             }
-            if self.sleeper.now() >= authority.renewal_deadline {
-                if self
-                    .outbox
-                    .enqueue(AssignmentObservation::LeaseRenewalRequested {
-                        assignment_id: assignment_id.to_owned(),
-                        attempt_id: self.accepted.attempt_id().to_owned(),
-                        current_lease_sequence: authority.sequence,
-                    })
-                    .is_err()
-                {
-                    return internal_delivery_failure("preparation");
+            if !matches!(
+                now.checked_cmp(authority.renewal_request)?,
+                std::cmp::Ordering::Less
+            ) {
+                match self.causal_lease.request_renewal(
+                    authority.sequence,
+                    assignment_id,
+                    self.accepted.attempt_id(),
+                    &self.lease_clock,
+                    &self.outbox,
+                ) {
+                    Ok(()) => {}
+                    Err(RenewalRequestFailure::LeaseClock) => {
+                        return Err(LeaseClockError::ClockUnavailable);
+                    }
+                    Err(RenewalRequestFailure::Outbox | RenewalRequestFailure::Sequence) => {
+                        return Ok(internal_delivery_failure("preparation"));
+                    }
                 }
                 tokio::select! {
-                    result = &mut completion => return result
-                        .unwrap_or_else(|_| internal_delivery_failure("preparation")),
+                    result = &mut completion => return Ok(result
+                        .unwrap_or_else(|_| internal_delivery_failure("preparation"))),
                     changed = authority_updates.changed() => {
                         if changed.is_err() {
                             self.artifact_delivery.cancel_assignment(assignment_id);
-                            return ArtifactDeliveryOutcome::AuthorityLost;
+                            return Ok(ArtifactDeliveryOutcome::AuthorityLost);
                         }
                     }
-                    () = self.sleeper.sleep(duration_until(
-                        self.sleeper.as_ref(),
-                        authority.expires_deadline,
-                    )) => {
+                    result = wait_for_lease_deadline(&self.lease_clock, authority.local_expiry) => {
+                        result?;
                         self.artifact_delivery.cancel_assignment(assignment_id);
-                        return ArtifactDeliveryOutcome::AuthorityLost;
+                        return Ok(ArtifactDeliveryOutcome::AuthorityLost);
                     }
                 }
                 continue;
             }
             tokio::select! {
-                result = &mut completion => return result
-                    .unwrap_or_else(|_| internal_delivery_failure("preparation")),
+                result = &mut completion => return Ok(result
+                    .unwrap_or_else(|_| internal_delivery_failure("preparation"))),
                 changed = authority_updates.changed() => {
                     if changed.is_err() {
                         self.artifact_delivery.cancel_assignment(assignment_id);
-                        return ArtifactDeliveryOutcome::AuthorityLost;
+                        return Ok(ArtifactDeliveryOutcome::AuthorityLost);
                     }
                 }
-                () = self.sleeper.sleep(duration_until(
-                    self.sleeper.as_ref(),
-                    authority.renewal_deadline,
-                )) => {}
+                result = wait_for_lease_deadline(&self.lease_clock, authority.renewal_request) => {
+                    result?;
+                }
             }
         }
     }
 
-    fn has_execution_authority(&self) -> bool {
-        let authority = self.authority_updates.borrow();
-        !authority.revoked && self.sleeper.now() < authority.cancellation_deadline
+    fn fail_before_execution(
+        &self,
+        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        post_stop_fence: &PostStopFence,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> ExecutionCompletion {
+        begin_forced_containment(cancellation, post_stop_fence, &self.accepted.process_guards);
+        ExecutionCompletion::lease_clock_failed(self.abort(
+            assignment_id,
+            attempt_id,
+            0,
+            "runner_internal_failure",
+        ))
     }
 
-    fn terminal_report_deadline(&self) -> Instant {
-        let selected_at = self.sleeper.now();
+    fn has_execution_authority(&self) -> Result<bool, LeaseClockError> {
         let authority = self.authority_updates.borrow();
-        selected_at
-            .checked_add(authority.terminal_report_delivery_budget)
-            .unwrap_or(authority.expires_deadline)
-            .min(authority.expires_deadline)
+        Ok(!authority.revoked
+            && matches!(
+                self.lease_clock
+                    .now()?
+                    .checked_cmp(authority.cancellation_start)?,
+                std::cmp::Ordering::Less
+            ))
+    }
+
+    fn terminal_report_deadline(&self) -> Result<LeaseInstant, LeaseClockError> {
+        let selected_at = self.lease_clock.now()?;
+        let authority = self.authority_updates.borrow();
+        let budget_end = selected_at.checked_add(authority.terminal_report_delivery_budget)?;
+        match budget_end.checked_cmp(authority.local_expiry)? {
+            std::cmp::Ordering::Greater => Ok(authority.local_expiry),
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(budget_end),
+        }
     }
 
     fn abort_unless_fenced(
@@ -1026,12 +1162,22 @@ fn artifact_delivery_result(delivery: &ArtifactDeliveryOutcome) -> Value {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LeaseFailureContext<'a> {
+    cancellation: &'a crate::execution::workflow::admission::CancellationSource,
+    post_stop_fence: &'a PostStopFence,
+    process_guards: &'a AssignmentProcessGuards,
+}
+
 enum LeaseExecution<Output> {
     Completed {
         output: Output,
         final_delivery_budget: Option<Duration>,
     },
     ContainmentDeadline,
+    LeaseClockFailed {
+        quiescent: bool,
+    },
 }
 
 #[expect(
@@ -1041,8 +1187,10 @@ enum LeaseExecution<Output> {
 async fn run_under_lease<F, Output>(
     execution: F,
     cancellation: &crate::execution::workflow::admission::CancellationSource,
-    sleeper: &dyn Sleeper,
+    lease_clock: &LeaseClock,
     mut authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+    mut initial_wait: Option<(u64, LeaseWait)>,
+    causal_lease: &CausalLease,
     outbox: &ObservationOutbox,
     assignment_id: &str,
     attempt_id: &str,
@@ -1055,41 +1203,95 @@ where
     tokio::pin!(execution);
     loop {
         let authority = authority_updates.borrow_and_update().clone();
-        if authority.revoked || sleeper.now() >= authority.cancellation_deadline {
+        let failure = LeaseFailureContext {
+            cancellation,
+            post_stop_fence,
+            process_guards,
+        };
+        let now = match lease_clock.now() {
+            Ok(now) => now,
+            Err(_) => {
+                return fail_lease_clock(cancellation, post_stop_fence, process_guards);
+            }
+        };
+        let cancellation_due = match now.checked_cmp(authority.cancellation_start) {
+            Ok(ordering) => ordering != std::cmp::Ordering::Less,
+            Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+        };
+        if authority.revoked || cancellation_due {
             return finish_after_lease_loss(
                 &mut execution,
                 cancellation,
-                sleeper,
+                lease_clock,
                 &authority,
                 post_stop_fence,
                 process_guards,
             )
             .await;
         }
+        let armed_wait = match initial_wait.take() {
+            Some((sequence, wait)) if sequence == authority.sequence => Some(wait),
+            Some(_) | None => None,
+        };
         tokio::select! {
             biased;
-            () = sleeper.sleep(duration_until(sleeper, authority.renewal_deadline)) => {
-                if outbox
-                    .enqueue(AssignmentObservation::LeaseRenewalRequested {
-                        assignment_id: assignment_id.to_owned(),
-                        attempt_id: attempt_id.to_owned(),
-                        current_lease_sequence: authority.sequence,
-                    })
-                    .is_err()
-                {
-                    cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
-                    return LeaseExecution::Completed {
-                        output: execution.await,
-                        final_delivery_budget: None,
-                    };
+            wait = wait_for_lease_deadline_or_armed(
+                lease_clock,
+                authority.renewal_request,
+                armed_wait,
+            ) => {
+                if wait.is_err() {
+                    return fail_lease_timer(&mut execution, failure).await;
                 }
-                tokio::select! {
-                    biased;
-                    () = sleeper.sleep(duration_until(sleeper, authority.cancellation_deadline)) => {
+                let now = match lease_clock.now() {
+                    Ok(now) => now,
+                    Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+                };
+                if !matches!(
+                    now.checked_cmp(authority.cancellation_start),
+                    Ok(std::cmp::Ordering::Less)
+                ) {
+                    return finish_after_lease_loss(
+                        &mut execution,
+                        cancellation,
+                        lease_clock,
+                        &authority,
+                        post_stop_fence,
+                        process_guards,
+                    ).await;
+                }
+                match causal_lease.request_renewal(
+                    authority.sequence,
+                    assignment_id,
+                    attempt_id,
+                    lease_clock,
+                    outbox,
+                ) {
+                    Ok(()) => {}
+                    Err(RenewalRequestFailure::LeaseClock) => {
+                        return fail_lease_clock(cancellation, post_stop_fence, process_guards);
+                    }
+                    Err(RenewalRequestFailure::Outbox | RenewalRequestFailure::Sequence) => {
                         return finish_after_lease_loss(
                             &mut execution,
                             cancellation,
-                            sleeper,
+                            lease_clock,
+                            &authority,
+                            post_stop_fence,
+                            process_guards,
+                        ).await;
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    wait = wait_for_lease_deadline(lease_clock, authority.cancellation_start) => {
+                        if wait.is_err() {
+                            return fail_lease_timer(&mut execution, failure).await;
+                        }
+                        return finish_after_lease_loss(
+                            &mut execution,
+                            cancellation,
+                            lease_clock,
                             &authority,
                             post_stop_fence,
                             process_guards,
@@ -1100,7 +1302,7 @@ where
                             return finish_after_lease_loss(
                                 &mut execution,
                                 cancellation,
-                                sleeper,
+                                lease_clock,
                                 &authority,
                                 post_stop_fence,
                                 process_guards,
@@ -1108,10 +1310,15 @@ where
                         }
                     }
                     result = &mut execution => {
-                        return LeaseExecution::Completed {
-                            output: result,
-                            final_delivery_budget: None,
-                        };
+                        return complete_ready_execution(
+                            result,
+                            cancellation,
+                            lease_clock,
+                            &authority,
+                            post_stop_fence,
+                            process_guards,
+                            false,
+                        );
                     }
                 }
             }
@@ -1120,7 +1327,7 @@ where
                     return finish_after_lease_loss(
                         &mut execution,
                         cancellation,
-                        sleeper,
+                        lease_clock,
                         &authority,
                         post_stop_fence,
                         process_guards,
@@ -1128,19 +1335,84 @@ where
                 }
             }
             result = &mut execution => {
+                return complete_ready_execution(
+                    result,
+                    cancellation,
+                    lease_clock,
+                    &authority,
+                    post_stop_fence,
+                    process_guards,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+fn complete_ready_execution<Output>(
+    output: Output,
+    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    lease_clock: &LeaseClock,
+    authority: &LeaseAuthority,
+    post_stop_fence: &PostStopFence,
+    process_guards: &AssignmentProcessGuards,
+    lease_already_lost: bool,
+) -> LeaseExecution<Output> {
+    let now = match lease_clock.now() {
+        Ok(now) => now,
+        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+    };
+    if !lease_already_lost {
+        match now.checked_cmp(authority.cancellation_start) {
+            Ok(std::cmp::Ordering::Less) if !authority.revoked => {
                 return LeaseExecution::Completed {
-                    output: result,
+                    output,
                     final_delivery_budget: None,
                 };
             }
+            Ok(_) => {}
+            Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
         }
+    }
+    cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
+    match now.checked_cmp(authority.force_stop_start) {
+        Ok(std::cmp::Ordering::Less) => {
+            return LeaseExecution::Completed {
+                output,
+                final_delivery_budget: Some(authority.terminal_report_delivery_budget),
+            };
+        }
+        Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
+            begin_forced_containment(cancellation, post_stop_fence, process_guards);
+        }
+        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+    }
+    match lease_clock
+        .now()
+        .and_then(|now| now.checked_cmp(authority.force_stop_end))
+    {
+        Ok(std::cmp::Ordering::Greater) => LeaseExecution::ContainmentDeadline,
+        Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            if process_guards.is_quiescent() =>
+        {
+            LeaseExecution::Completed {
+                output,
+                final_delivery_budget: Some(authority.terminal_report_delivery_budget),
+            }
+        }
+        Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+            LeaseExecution::ContainmentDeadline
+        }
+        Err(_) => LeaseExecution::LeaseClockFailed {
+            quiescent: process_guards.is_quiescent(),
+        },
     }
 }
 
 async fn finish_after_lease_loss<F, Output>(
     execution: &mut std::pin::Pin<&mut F>,
     cancellation: &crate::execution::workflow::admission::CancellationSource,
-    sleeper: &dyn Sleeper,
+    lease_clock: &LeaseClock,
     authority: &LeaseAuthority,
     post_stop_fence: &PostStopFence,
     process_guards: &AssignmentProcessGuards,
@@ -1149,44 +1421,140 @@ where
     F: Future<Output = Output>,
 {
     cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
-    if sleeper.now() < authority.stop_deadline {
+    let failure = LeaseFailureContext {
+        cancellation,
+        post_stop_fence,
+        process_guards,
+    };
+    let now = match lease_clock.now() {
+        Ok(now) => now,
+        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+    };
+    let before_force_stop = match now.checked_cmp(authority.force_stop_start) {
+        Ok(std::cmp::Ordering::Less) => true,
+        Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
+        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+    };
+    if before_force_stop {
         tokio::select! {
             biased;
-            () = sleeper.sleep(duration_until(sleeper, authority.stop_deadline)) => {}
+            wait = wait_for_lease_deadline(lease_clock, authority.force_stop_start) => {
+                if wait.is_err() {
+                    return fail_lease_timer(execution, failure).await;
+                }
+            }
             output = execution.as_mut() => {
-                return LeaseExecution::Completed {
+                return complete_ready_execution(
                     output,
-                    final_delivery_budget: Some(authority.terminal_report_delivery_budget),
-                };
+                    cancellation,
+                    lease_clock,
+                    authority,
+                    post_stop_fence,
+                    process_guards,
+                    true,
+                );
             }
         }
     }
 
-    post_stop_fence.fence();
-    process_guards.begin_forced_containment();
-    if sleeper.now() > authority.force_stop_deadline {
-        return LeaseExecution::ContainmentDeadline;
+    begin_forced_containment(cancellation, post_stop_fence, process_guards);
+    let now = match lease_clock.now() {
+        Ok(now) => now,
+        Err(_) => {
+            return LeaseExecution::LeaseClockFailed {
+                quiescent: process_guards.is_quiescent(),
+            };
+        }
+    };
+    match now.checked_cmp(authority.force_stop_end) {
+        Ok(std::cmp::Ordering::Greater) => return LeaseExecution::ContainmentDeadline,
+        Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {}
+        Err(_) => {
+            return LeaseExecution::LeaseClockFailed {
+                quiescent: process_guards.is_quiescent(),
+            };
+        }
     }
     tokio::select! {
         biased;
-        output = execution.as_mut() => {
-            if process_guards.is_quiescent() {
-                LeaseExecution::Completed {
-                    output,
-                    final_delivery_budget: Some(authority.terminal_report_delivery_budget),
-                }
-            } else {
-                LeaseExecution::ContainmentDeadline
+        output = execution.as_mut() => complete_ready_execution(
+            output,
+            cancellation,
+            lease_clock,
+            authority,
+            post_stop_fence,
+            process_guards,
+            true,
+        ),
+        wait = wait_for_lease_deadline(lease_clock, authority.force_stop_end) => {
+            match wait {
+                Ok(()) => LeaseExecution::ContainmentDeadline,
+                Err(_) => fail_lease_timer(execution, failure).await,
             }
-        }
-        () = sleeper.sleep(duration_until(sleeper, authority.force_stop_deadline)) => {
-            LeaseExecution::ContainmentDeadline
         }
     }
 }
 
-fn duration_until(sleeper: &dyn Sleeper, deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(sleeper.now())
+async fn fail_lease_timer<F, Output>(
+    execution: &mut std::pin::Pin<&mut F>,
+    failure: LeaseFailureContext<'_>,
+) -> LeaseExecution<Output>
+where
+    F: Future<Output = Output>,
+{
+    let LeaseFailureContext {
+        cancellation,
+        post_stop_fence,
+        process_guards,
+    } = failure;
+    begin_forced_containment(cancellation, post_stop_fence, process_guards);
+    if !process_guards.is_quiescent() {
+        let _ = execution.as_mut().await;
+    }
+    LeaseExecution::LeaseClockFailed {
+        quiescent: process_guards.is_quiescent(),
+    }
+}
+
+fn fail_lease_clock<Output>(
+    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    post_stop_fence: &PostStopFence,
+    process_guards: &AssignmentProcessGuards,
+) -> LeaseExecution<Output> {
+    begin_forced_containment(cancellation, post_stop_fence, process_guards);
+    LeaseExecution::LeaseClockFailed {
+        quiescent: process_guards.is_quiescent(),
+    }
+}
+
+fn begin_forced_containment(
+    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    post_stop_fence: &PostStopFence,
+    process_guards: &AssignmentProcessGuards,
+) {
+    cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
+    post_stop_fence.fence();
+    process_guards.begin_forced_containment();
+}
+
+async fn wait_for_lease_deadline(
+    lease_clock: &LeaseClock,
+    deadline: LeaseInstant,
+) -> Result<(), LeaseClockError> {
+    wait_for_lease_deadline_or_armed(lease_clock, deadline, None).await
+}
+
+async fn wait_for_lease_deadline_or_armed(
+    lease_clock: &LeaseClock,
+    deadline: LeaseInstant,
+    armed: Option<LeaseWait>,
+) -> Result<(), LeaseClockError> {
+    let wait = match armed {
+        Some(wait) => wait,
+        None => lease_clock.start_wait(deadline)?,
+    };
+    let cancellation = LeaseWaitCancellation::default();
+    wait.wait(&cancellation).await.map(|_| ())
 }
 
 fn release_staging(
@@ -1542,6 +1910,7 @@ fn finalizer_result(result: &FinalizerResult<StepFailureCause>) -> Value {
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
         | StepState::Cancelling { .. } => {
             object.insert("state".to_owned(), json!("incomplete"));
         }
@@ -1571,7 +1940,8 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
             ]);
             if let Some(observed) = &transition.step {
                 match observed {
-                    ObservedStepTransition::OutputsCommitted { .. } => {}
+                    ObservedStepTransition::Recovery { .. }
+                    | ObservedStepTransition::OutputsCommitted { .. } => {}
                     ObservedStepTransition::Failed { phase, cause } => {
                         event.insert("failure".to_owned(), failure_evidence(*phase, cause));
                     }
@@ -2011,6 +2381,7 @@ fn step_state_name(state: StepStateKind) -> &'static str {
         StepStateKind::Starting => "starting",
         StepStateKind::Running => "running",
         StepStateKind::CapturingOutputs => "capturing_outputs",
+        StepStateKind::Recovering => "recovering",
         StepStateKind::Cancelling => "cancelling",
         StepStateKind::Succeeded => "succeeded",
         StepStateKind::Failed => "failed",
@@ -2099,19 +2470,19 @@ mod tests {
     use crate::execution::workflow::validated::{
         ResolvedOutputSource, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
     };
-    use crate::runner::service::test_support::{
-        SleepRelease, controlled_sleeper, sleep_request, with_watchdog,
-    };
+    use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
+    use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
     use crate::runner_protocol::{RunnerEnvelope, encode_runner_frame};
 
-    fn lease_authority(now: Instant) -> LeaseAuthority {
+    fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
         LeaseAuthority {
             sequence: 4,
-            renewal_deadline: now.checked_add(Duration::from_secs(2)).unwrap(),
-            cancellation_deadline: now.checked_add(Duration::from_secs(4)).unwrap(),
-            stop_deadline: now.checked_add(Duration::from_secs(5)).unwrap(),
-            force_stop_deadline: now.checked_add(Duration::from_secs(8)).unwrap(),
-            expires_deadline: now.checked_add(Duration::from_secs(12)).unwrap(),
+            basis,
+            renewal_request: basis.checked_add(Duration::from_secs(2)).unwrap(),
+            cancellation_start: basis.checked_add(Duration::from_secs(4)).unwrap(),
+            force_stop_start: basis.checked_add(Duration::from_secs(5)).unwrap(),
+            force_stop_end: basis.checked_add(Duration::from_secs(8)).unwrap(),
+            local_expiry: basis.checked_add(Duration::from_secs(12)).unwrap(),
             terminal_report_delivery_budget: Duration::from_secs(7),
             revoked: false,
         }
@@ -2120,7 +2491,7 @@ mod tests {
     struct SupervisedLeaseFixture {
         result: tokio::sync::oneshot::Sender<&'static str>,
         task: tokio::task::JoinHandle<LeaseExecution<&'static str>>,
-        sleeps: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+        waits: tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
         cancellation: crate::execution::workflow::admission::CancellationSource,
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
@@ -2136,9 +2507,27 @@ mod tests {
     }
 
     fn supervise_execution<Execution, Output>(
-        sleeper: Arc<dyn Sleeper>,
+        lease_clock: LeaseClock,
         authority: LeaseAuthority,
         execution: Execution,
+    ) -> SupervisedExecution<Output>
+    where
+        Execution: Future<Output = Output> + Send + 'static,
+        Output: Send + 'static,
+    {
+        supervise_execution_with_guards(
+            lease_clock,
+            authority,
+            execution,
+            AssignmentProcessGuards::new(),
+        )
+    }
+
+    fn supervise_execution_with_guards<Execution, Output>(
+        lease_clock: LeaseClock,
+        authority: LeaseAuthority,
+        execution: Execution,
+        guards: AssignmentProcessGuards,
     ) -> SupervisedExecution<Output>
     where
         Execution: Future<Output = Output> + Send + 'static,
@@ -2149,15 +2538,17 @@ mod tests {
         let outbox = ObservationOutbox::new();
         let fence = PostStopFence::new();
         let observed_fence = fence.clone();
-        let guards = AssignmentProcessGuards::new();
         let observed_guards = guards.clone();
+        let causal_lease = CausalLease::new(authority.basis);
         let (authority_sender, authority_updates) = tokio::sync::watch::channel(authority);
         let task = tokio::spawn(async move {
             run_under_lease(
                 execution,
                 &cancellation,
-                sleeper.as_ref(),
+                &lease_clock,
                 authority_updates,
+                None,
+                &causal_lease,
                 &outbox,
                 "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -2176,17 +2567,16 @@ mod tests {
     }
 
     fn supervised_lease_fixture() -> SupervisedLeaseFixture {
-        let (sleeper, sleeps) = controlled_sleeper();
+        let (lease_clock, _control, waits) = controlled_lease_clock();
+        let basis = lease_clock.now().unwrap();
         let (result_sender, result) = tokio::sync::oneshot::channel();
-        let supervised = supervise_execution(
-            Arc::clone(&sleeper),
-            lease_authority(sleeper.now()),
-            async { result.await.expect("fixture result") },
-        );
+        let supervised = supervise_execution(lease_clock, lease_authority(basis), async {
+            result.await.expect("fixture result")
+        });
         SupervisedLeaseFixture {
             result: result_sender,
             task: supervised.task,
-            sleeps,
+            waits,
             cancellation: supervised.cancellation,
             fence: supervised.fence,
             guards: supervised.guards,
@@ -2194,25 +2584,85 @@ mod tests {
         }
     }
 
+    async fn lease_wait_request(
+        waits: &mut tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
+        expected: Duration,
+    ) -> LeaseTimerRelease {
+        loop {
+            let (duration, release) = waits
+                .recv()
+                .await
+                .expect("controlled lease clock closed before the expected timer");
+            if duration == expected {
+                return release;
+            }
+        }
+    }
+
+    fn assert_forced_containment(
+        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        fence: &PostStopFence,
+        guards: &AssignmentProcessGuards,
+    ) {
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::ExecutionLeaseExpired)
+        );
+        assert!(fence.is_fenced());
+        assert!(guards.forced_containment_started());
+    }
+
+    fn unavailable_timer_fixture() -> (LeaseClock, LeaseAuthority) {
+        let (lease_clock, control, _waits) = controlled_lease_clock();
+        let authority = lease_authority(lease_clock.now().unwrap());
+        control.make_timer_unavailable();
+        (lease_clock, authority)
+    }
+
+    async fn lease_clock_failure_outcome<Output: Send + 'static>(
+        task: tokio::task::JoinHandle<LeaseExecution<Output>>,
+    ) -> LeaseExecution<Output> {
+        with_watchdog(task)
+            .await
+            .expect("timer failure supervision timed out")
+            .expect("timer failure supervision task failed")
+    }
+
+    async fn assert_lease_clock_failure<Output: Send + 'static>(
+        supervised: SupervisedExecution<Output>,
+    ) {
+        assert!(matches!(
+            lease_clock_failure_outcome(supervised.task).await,
+            LeaseExecution::LeaseClockFailed { quiescent: true }
+        ));
+        assert_forced_containment(
+            &supervised.cancellation,
+            &supervised.fence,
+            &supervised.guards,
+        );
+    }
+
     #[tokio::test]
     async fn sixty_second_lease_grace_allows_clean_exit_after_thirty_seconds() {
-        let (sleeper, mut sleeps) = controlled_sleeper();
-        let now = sleeper.now();
-        let execution_sleeper = Arc::clone(&sleeper);
+        let (lease_clock, _control, _lease_waits) = controlled_lease_clock();
+        let basis = lease_clock.now().unwrap();
+        let (execution_sleeper, mut execution_sleeps) = controlled_sleeper();
+        let workflow_sleeper = Arc::clone(&execution_sleeper);
         let supervised = supervise_execution(
-            Arc::clone(&sleeper),
+            lease_clock,
             LeaseAuthority {
                 sequence: 1,
-                renewal_deadline: now,
-                cancellation_deadline: now,
-                stop_deadline: now.checked_add(Duration::from_secs(60)).unwrap(),
-                force_stop_deadline: now.checked_add(Duration::from_secs(65)).unwrap(),
-                expires_deadline: now.checked_add(Duration::from_secs(72)).unwrap(),
+                basis,
+                renewal_request: basis,
+                cancellation_start: basis,
+                force_stop_start: basis.checked_add(Duration::from_secs(60)).unwrap(),
+                force_stop_end: basis.checked_add(Duration::from_secs(65)).unwrap(),
+                local_expiry: basis.checked_add(Duration::from_secs(72)).unwrap(),
                 terminal_report_delivery_budget: Duration::from_secs(7),
                 revoked: false,
             },
             async move {
-                execution_sleeper.sleep(Duration::from_secs(30)).await;
+                workflow_sleeper.sleep(Duration::from_secs(30)).await;
                 "clean-exit"
             },
         );
@@ -2223,7 +2673,7 @@ mod tests {
                 .expect("lease cancellation was not requested"),
             CancellationReason::ExecutionLeaseExpired
         );
-        sleep_request(&mut sleeps, Duration::from_secs(30))
+        sleep_request(&mut execution_sleeps, Duration::from_secs(30))
             .await
             .release();
 
@@ -2242,12 +2692,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_timer_failure_contains_without_accepting_ready_progress() {
+        let (lease_clock, authority) = unavailable_timer_fixture();
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let supervised = supervise_execution(lease_clock, authority, async {
+            result.await.expect("fixture result")
+        });
+
+        assert_lease_clock_failure(supervised).await;
+        assert!(result_sender.send("ready-late").is_err());
+    }
+
+    #[tokio::test]
+    async fn persistent_lease_timer_failure_waits_for_observed_quiescence() {
+        let (lease_clock, authority) = unavailable_timer_fixture();
+        let quiescent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guards = AssignmentProcessGuards::new();
+        guards.use_quiescence_fixture(Arc::clone(&quiescent));
+        let completion_quiescent = Arc::clone(&quiescent);
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let supervised = supervise_execution_with_guards(
+            lease_clock,
+            authority,
+            async move {
+                result.await.expect("fixture result");
+                completion_quiescent.store(true, std::sync::atomic::Ordering::Release);
+            },
+            guards,
+        );
+
+        assert_eq!(
+            with_watchdog(supervised.cancellation.wait_for_cancellation())
+                .await
+                .expect("timer failure did not begin containment"),
+            CancellationReason::ExecutionLeaseExpired
+        );
+        result_sender
+            .send(())
+            .expect("timer failure dropped execution before quiescence");
+        assert_lease_clock_failure(supervised).await;
+    }
+
+    #[tokio::test]
     async fn exact_stop_boundary_fences_before_a_ready_late_result() {
         let mut fixture = supervised_lease_fixture();
-        sleep_request(&mut fixture.sleeps, Duration::from_secs(2))
+        lease_wait_request(&mut fixture.waits, Duration::from_secs(2))
             .await
             .release();
-        sleep_request(&mut fixture.sleeps, Duration::from_secs(2))
+        lease_wait_request(&mut fixture.waits, Duration::from_secs(2))
             .await
             .release();
         assert_eq!(
@@ -2256,7 +2748,7 @@ mod tests {
                 .expect("lease cancellation was not requested"),
             CancellationReason::ExecutionLeaseExpired
         );
-        let stop_boundary = sleep_request(&mut fixture.sleeps, Duration::from_secs(1)).await;
+        let stop_boundary = lease_wait_request(&mut fixture.waits, Duration::from_secs(1)).await;
         fixture.result.send("late-success").unwrap();
         stop_boundary.release();
 
@@ -2276,6 +2768,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlong_suspend_contains_before_ready_completion() {
+        let (lease_clock, control, mut waits) = controlled_lease_clock();
+        let basis = lease_clock.now().unwrap();
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let supervised = supervise_execution(lease_clock, lease_authority(basis), async {
+            result.await.expect("fixture result")
+        });
+
+        lease_wait_request(&mut waits, Duration::from_secs(2))
+            .await
+            .release();
+        let _delayed_cancellation_wake =
+            lease_wait_request(&mut waits, Duration::from_secs(2)).await;
+        control.simulate_suspend(Duration::from_secs(4));
+        result_sender.send("ready-after-suspend").unwrap();
+
+        let outcome = with_watchdog(supervised.task)
+            .await
+            .expect("lease supervision timed out")
+            .expect("lease supervision task failed");
+        assert!(matches!(outcome, LeaseExecution::Completed { .. }));
+        assert_eq!(
+            supervised.cancellation.cancellation_reason(),
+            Some(CancellationReason::ExecutionLeaseExpired),
+            "the first runner action after a suspend past force-stop start must cancel"
+        );
+        assert!(
+            supervised.fence.is_fenced(),
+            "the first runner action after a suspend past force-stop start must fence output"
+        );
+        assert!(
+            supervised.guards.forced_containment_started(),
+            "the first runner action after a suspend past force-stop start must contain processes"
+        );
+    }
+
+    #[tokio::test]
     async fn force_reap_accepts_exact_boundary_and_rejects_late_completion() {
         let mut exact = supervised_lease_fixture();
         for duration in [
@@ -2283,9 +2812,11 @@ mod tests {
             Duration::from_secs(2),
             Duration::from_secs(1),
         ] {
-            sleep_request(&mut exact.sleeps, duration).await.release();
+            lease_wait_request(&mut exact.waits, duration)
+                .await
+                .release();
         }
-        let reap_boundary = sleep_request(&mut exact.sleeps, Duration::from_secs(3)).await;
+        let reap_boundary = lease_wait_request(&mut exact.waits, Duration::from_secs(3)).await;
         exact.result.send("exact-boundary").unwrap();
         reap_boundary.release();
 
@@ -2307,7 +2838,9 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(3),
         ] {
-            sleep_request(&mut late.sleeps, duration).await.release();
+            lease_wait_request(&mut late.waits, duration)
+                .await
+                .release();
         }
         assert!(matches!(
             with_watchdog(late.task)

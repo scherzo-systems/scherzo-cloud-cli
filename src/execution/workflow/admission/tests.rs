@@ -400,10 +400,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         resolved.capacity.requirements.general_maximum_transitions
     );
     assert_eq!(local.capacity().resolved, resolved.capacity);
-    assert_eq!(
-        local.recovery_execution_guard(),
-        Some(RecoveryExecutionGuard::Local)
-    );
+    assert_eq!(local.recovery_execution_guard(), None);
     assert_eq!(local.recovery_handlers().len(), 1);
 
     let runner = admit_runner_workflow(
@@ -435,14 +432,23 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
 }
 
 #[test]
-fn maximal_232_round_workflow_admits_exact_resolver_capacity() {
+fn maximal_handler_workflow_admits_exact_cloud_capacity() {
     let mut source = String::from(
         "schemaVersion: 1\nagentProfiles:\n  repair:\n    harness:\n      kind: pi\n      config: {model: openai/gpt-5, thinking: high}\nsteps:\n",
     );
-    for index in 0..24 {
-        let retries = if index == 23 { 2 } else { 10 };
+    for index in 0..20 {
+        let recovery = match index {
+            0..=17 => {
+                "    recovery:\n      retries: 10\n      handler:\n        kind: agent\n        profile: repair\n        prompt: recovery.md\n"
+            }
+            18 => {
+                "    recovery:\n      retries: 8\n      handler:\n        kind: agent\n        profile: repair\n        prompt: recovery.md\n"
+            }
+            19 => "    recovery:\n      retries: 1\n",
+            _ => "",
+        };
         source.push_str(&format!(
-            "  step{index}:\n    kind: cmd\n    recovery:\n      retries: {retries}\n      handler:\n        kind: agent\n        profile: repair\n        prompt: recovery.md\n    command: {{argv: [\"true\"]}}\n"
+            "  step{index}:\n    kind: cmd\n{recovery}    command: {{argv: [\"true\"]}}\n"
         ));
     }
     let fixture = WorkflowFixture::new(&source);
@@ -453,10 +459,10 @@ fn maximal_232_round_workflow_admits_exact_resolver_capacity() {
     .unwrap();
     let resolved = fixture.resolve();
     let requirements = resolved.capacity.requirements;
-    assert_eq!(requirements.general_maximum_transitions, 1_283);
+    assert_eq!(requirements.general_maximum_transitions, 1_048);
     assert_eq!(requirements.cloud_maximum_transitions, 1_027);
-    assert_eq!(requirements.maximum_invocations, 488);
-    assert_eq!(requirements.maximum_retained_bytes_per_invocation, 137_518);
+    assert_eq!(requirements.maximum_invocations, 397);
+    assert_eq!(requirements.maximum_retained_bytes_per_invocation, 169_039);
     let exact = WorkflowCapacityBudget::exact(&resolved.capacity);
 
     let admitted = admit_runner_workflow(
@@ -474,7 +480,7 @@ fn maximal_232_round_workflow_admits_exact_resolver_capacity() {
             )),
     )
     .unwrap();
-    assert_eq!(admitted.recovery_handlers().len(), 24);
+    assert_eq!(admitted.recovery_handlers().len(), 19);
     assert_eq!(admitted.capacity().resolved.requirements, requirements);
     assert_eq!(
         admitted.execution().limits().maximum_step_log_bytes().get(),

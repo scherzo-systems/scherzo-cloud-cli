@@ -22,11 +22,14 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
+use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use super::coordinator::{CommitPort, CommittedActionKind, CommittedReduction};
+use super::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use super::document::FailurePolicy;
 use super::execution_root::AdmittedExecutionRoot;
+use super::invocation_accounting::InvocationAccountingLog;
 use super::private_staging::{
     create_staging_root, directory_entry_names, open_directory_path, remove_staging_root, same_file,
 };
@@ -40,7 +43,9 @@ use super::publication::{
     cancellation_step_reason, failure_v1, finalization_trigger,
 };
 use super::resolution::{ResolvedWorkflow, resolve_retained};
-use super::runtime::{FinalizationSummary, StepState, WorkflowState};
+use super::runtime::{
+    ActiveStepInvocation, FinalizationSummary, StepState, TargetExecutionNumber, WorkflowState,
+};
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex, lowercase_hex,
     utc_timestamp,
@@ -54,6 +59,7 @@ const WORKFLOW_DIRECTORY: &str = "workflow";
 const WORKFLOW_FILES_DIRECTORY: &str = "files";
 const WORKFLOW_MANIFEST_FILE: &str = "manifest.json";
 const ATTEMPTS_DIRECTORY: &str = "attempts";
+const INVOCATIONS_DIRECTORY: &str = "invocations";
 const PRIVATE_DIRECTORY: &str = ".private";
 const INITIAL_ATTEMPT_NUMBER: u64 = 1;
 const INITIAL_ATTEMPT_DIRECTORY: &str = "000001";
@@ -94,6 +100,7 @@ pub(crate) enum LocalRunDirectoryError {
     HostIdentityUnavailable,
     SerializationUnavailable,
     StateInvalid,
+    RecoverySchemaUnsupported,
     StateConflict,
     StateWriteUnavailable,
     AtomicCommitUnavailable,
@@ -243,7 +250,7 @@ pub(super) enum AttemptStateV1 {
 }
 
 impl AttemptStateV1 {
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Succeeded
@@ -322,6 +329,9 @@ pub(super) struct AttemptProgressV1 {
     last_transition_sequence: u64,
     pub(super) steps: Vec<AttemptStepV1>,
     outstanding_actions: Vec<OutstandingActionV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) invocations: Vec<DurableInvocationV1>,
+    pub(super) accounting: DurableInvocationAccountingV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -331,11 +341,117 @@ pub(super) struct AttemptStepV1 {
     pub(super) role: AttemptNodeRoleV1,
     pub(super) failure_policy: FailurePolicy,
     pub(super) state: AttemptStepStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recovery: Option<DurableStepRecoveryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableStepRecoveryV1 {
+    pub(super) schema_version: u8,
+    pub(super) configured_retries: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler_kind: Option<DurableRecoveryHandlerKindV1>,
+    pub(super) rounds: Vec<DurableRecoveryRoundV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) active: Option<DurableRecoveryActiveV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) termination: Option<super::publication::RecoveryTerminationV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum AttemptNodeRoleV1 {
+pub(super) enum DurableRecoveryHandlerKindV1 {
+    Cmd,
+    Agent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRecoveryRoundV1 {
+    pub(super) number: u8,
+    pub(super) failed_execution: super::publication::RecoveryFailedExecutionV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler: Option<super::publication::RecoveryHandlerSummaryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRecoveryActiveV1 {
+    pub(super) role: super::publication::RecoveryInvocationRoleV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recovery_round: Option<u8>,
+    pub(super) invocation_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler_state: Option<DurableRecoveryHandlerStateV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) decision: Option<super::publication::RecoveryHandlerOutcomeV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DurableRecoveryHandlerStateV1 {
+    Starting,
+    Running,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableInvocationV1 {
+    pub(crate) invocation_id: u64,
+    pub(crate) step_id: String,
+    pub(crate) node_role: AttemptNodeRoleV1,
+    pub(crate) role: super::publication::RecoveryInvocationRoleV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_round: Option<u8>,
+    pub(crate) state: DurableInvocationStateV1,
+    pub(crate) started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<String>,
+    pub(crate) usage: super::publication::RecoveryInvocationUsageV1,
+    pub(crate) diagnostics: Vec<DurableInvocationDiagnosticV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic_reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DurableInvocationStateV1 {
+    Active,
+    Settled,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableInvocationDiagnosticV1 {
+    pub(crate) kind: super::publication::RecoveryDiagnosticKindV1,
+    pub(crate) reference: String,
+    pub(crate) retained_bytes: u64,
+    pub(crate) discarded_bytes: u64,
+    pub(crate) truncated: bool,
+    pub(crate) fully_drained: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableInvocationAccountingV1 {
+    pub(super) maximum_invocations: u64,
+    pub(super) observed_invocations: u64,
+    pub(super) settled_invocations: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) retained_diagnostic_bytes: u64,
+    pub(super) discarded_diagnostic_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptNodeRoleV1 {
     Step,
     Finalizer,
 }
@@ -424,12 +540,17 @@ struct OutstandingActionV1 {
     step_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_role: Option<AttemptNodeRoleV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_round: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OutstandingActionKindV1 {
     StartStep,
+    StartRecoveryHandler,
     CaptureOutputs,
     CancelStep,
     FinishRun,
@@ -531,6 +652,7 @@ enum DiagnosticCodeV1 {
 pub(crate) enum LocalStatusErrorCode {
     RunDirectoryUnavailable,
     RunDirectoryInvalid,
+    RecoverySchemaUnsupported,
     LockQueryFailed,
     StatusSnapshotUnstable,
 }
@@ -540,6 +662,7 @@ impl LocalStatusErrorCode {
         match self {
             Self::RunDirectoryUnavailable => "run_directory_unavailable",
             Self::RunDirectoryInvalid => "run_directory_invalid",
+            Self::RecoverySchemaUnsupported => "recovery_schema_unsupported",
             Self::LockQueryFailed => "lock_query_failed",
             Self::StatusSnapshotUnstable => "status_snapshot_unstable",
         }
@@ -549,6 +672,9 @@ impl LocalStatusErrorCode {
         match self {
             Self::RunDirectoryUnavailable => "The run directory is unavailable.",
             Self::RunDirectoryInvalid => "The run directory does not contain valid V1 state.",
+            Self::RecoverySchemaUnsupported => {
+                "The run uses an unsupported recovery summary schema version."
+            }
             Self::LockQueryFailed => "The run lock could not be inspected.",
             Self::StatusSnapshotUnstable => {
                 "The run state changed too quickly to obtain a stable snapshot."
@@ -851,11 +977,29 @@ impl LocalAttemptOwner {
         LocalAttemptOwnershipReleased { _private: () }
     }
 
-    pub(crate) fn commit_port(&self) -> LocalRunCommitPort {
+    pub(crate) fn commit_port(
+        &self,
+        diagnostics: StepDiagnosticLog,
+        accounting: InvocationAccountingLog,
+    ) -> LocalRunCommitPort {
         LocalRunCommitPort {
             state: Arc::clone(&self.state),
             finalizers: Arc::clone(&self.finalizers),
+            diagnostics,
+            accounting,
         }
+    }
+
+    pub(crate) fn durable_invocations(
+        &self,
+    ) -> Result<Vec<DurableInvocationV1>, LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        let attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_number == self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        Ok(attempt.progress.invocations.clone())
     }
 
     pub(crate) fn process_guard_registry(&self) -> ProcessGuardRegistry {
@@ -995,6 +1139,8 @@ impl Drop for LocalAttemptOwner {
 pub(crate) struct LocalRunCommitPort {
     state: Arc<StateStore>,
     finalizers: Arc<[AttemptStepV1]>,
+    diagnostics: StepDiagnosticLog,
+    accounting: InvocationAccountingLog,
 }
 
 impl<Deadline>
@@ -1009,14 +1155,24 @@ where
         &mut self,
         commit: CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
     ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(self.state.commit_runtime(&commit, &self.finalizers))
+        ready(self.state.commit_runtime(
+            &commit,
+            &self.finalizers,
+            &self.diagnostics,
+            &self.accounting,
+        ))
     }
 }
+
+type PendingRecoveryInvocationKey = (u64, String, u8);
+type PendingRecoveryInvocation = (u64, String);
 
 struct StateStore {
     root: Arc<OwnedFd>,
     private: Arc<OwnedFd>,
     current: Mutex<LocalRunStateV1>,
+    pending_recovery_invocations:
+        Mutex<BTreeMap<PendingRecoveryInvocationKey, PendingRecoveryInvocation>>,
 }
 
 impl StateStore {
@@ -1024,6 +1180,8 @@ impl StateStore {
         &self,
         commit: &CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
         finalizers: &[AttemptStepV1],
+        diagnostics: &StepDiagnosticLog,
+        accounting: &InvocationAccountingLog,
     ) -> Result<(), LocalRunDirectoryError>
     where
         Deadline: DurableDeadline,
@@ -1040,6 +1198,12 @@ impl StateStore {
             }
             attempt.progress.last_transition_sequence = commit.state.last_transition_sequence.get();
             update_step_progress(attempt, &commit.state, finalizers)?;
+            update_invocation_ledger(self, attempt, commit, diagnostics, accounting, &now)?;
+            update_recovery_progress(
+                &mut attempt.progress.steps,
+                &attempt.progress.invocations,
+                &commit.state.steps,
+            )?;
             attempt.progress.outstanding_actions =
                 outstanding_actions(attempt, &commit.state.steps)?;
             for requested in &commit.actions {
@@ -1162,7 +1326,11 @@ impl DurableProcessGuardStore for StateStore {
                 .iter()
                 .find(|action| {
                     action.action_id == action_id
-                        && matches!(action.kind, OutstandingActionKindV1::StartStep)
+                        && matches!(
+                            action.kind,
+                            OutstandingActionKindV1::StartStep
+                                | OutstandingActionKindV1::StartRecoveryHandler
+                        )
                         && action.step_id.as_deref() == Some(step)
                 })
                 .and_then(|action| action.node_role)
@@ -1339,6 +1507,7 @@ fn create_with_observer(
         root: Arc::clone(&root),
         private,
         current: Mutex::new(initial_state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
     });
     let private_directory = target.normalized.join(PRIVATE_DIRECTORY);
     let result_directory = target
@@ -1593,6 +1762,382 @@ fn initial_state(
     })
 }
 
+fn update_invocation_ledger<Deadline>(
+    store: &StateStore,
+    attempt: &mut LocalAttemptV1,
+    commit: &CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
+    diagnostics: &StepDiagnosticLog,
+    accounting: &InvocationAccountingLog,
+    now: &str,
+) -> Result<(), LocalRunDirectoryError> {
+    for (step_id, runtime) in &commit.state.steps {
+        let Some(recovery) = runtime
+            .recovery
+            .as_ref()
+            .filter(|recovery| !recovery.rounds.is_empty())
+        else {
+            continue;
+        };
+        for round in &recovery.rounds {
+            let invocation_id = round.failed_execution.invocation.transition_sequence.get();
+            if attempt
+                .progress
+                .invocations
+                .iter()
+                .any(|invocation| invocation.invocation_id == invocation_id)
+            {
+                continue;
+            }
+            let execution_number = round.failed_execution.execution_number.get();
+            let pending = store
+                .pending_recovery_invocations
+                .lock()
+                .map_err(|_| LocalRunDirectoryError::StateConflict)?
+                .remove(&(attempt.attempt_number, step_id.clone(), execution_number));
+            let started_at = match pending {
+                Some((pending_invocation, started_at)) if pending_invocation == invocation_id => {
+                    started_at
+                }
+                Some(_) => return Err(LocalRunDirectoryError::StateConflict),
+                None => attempt.started_at.clone().unwrap_or_else(|| now.to_owned()),
+            };
+            attempt.progress.invocations.push(DurableInvocationV1 {
+                invocation_id,
+                step_id: step_id.clone(),
+                node_role: AttemptNodeRoleV1::Step,
+                role: super::publication::RecoveryInvocationRoleV1::Target,
+                target_execution: Some(execution_number),
+                recovery_round: None,
+                state: DurableInvocationStateV1::Active,
+                started_at,
+                finished_at: None,
+                usage: super::publication::RecoveryInvocationUsageV1::default(),
+                diagnostics: Vec::new(),
+                diagnostic_reference: None,
+            });
+        }
+    }
+    for action in &commit.actions {
+        let (role, target_execution, recovery_round) = match action.kind {
+            CommittedActionKind::StartStep => (
+                super::publication::RecoveryInvocationRoleV1::Target,
+                action.execution_number.map(TargetExecutionNumber::get),
+                None,
+            ),
+            CommittedActionKind::StartRecoveryHandler => (
+                super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+                None,
+                action
+                    .recovery_round
+                    .map(super::runtime::RecoveryRoundNumber::get),
+            ),
+            CommittedActionKind::CaptureOutputs
+            | CommittedActionKind::CancelStep
+            | CommittedActionKind::ForceAbortStep
+            | CommittedActionKind::FinishRun => continue,
+        };
+        let step_id = action
+            .step
+            .as_ref()
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let runtime_recovery = commit
+            .state
+            .steps
+            .get(step_id)
+            .and_then(|runtime| runtime.recovery.as_ref());
+        let recovery_active = runtime_recovery.is_some_and(|recovery| !recovery.rounds.is_empty());
+        let invocation_id = action.id.transition_sequence.get();
+        if !recovery_active {
+            if runtime_recovery.is_some()
+                && matches!(action.kind, CommittedActionKind::StartStep)
+                && let Some(execution_number) = action.execution_number
+            {
+                let key = (
+                    attempt.attempt_number,
+                    step_id.clone(),
+                    execution_number.get(),
+                );
+                let mut pending = store
+                    .pending_recovery_invocations
+                    .lock()
+                    .map_err(|_| LocalRunDirectoryError::StateConflict)?;
+                if let Some(retained) = pending.get(&key) {
+                    if retained.0 != invocation_id {
+                        return Err(LocalRunDirectoryError::StateConflict);
+                    }
+                } else {
+                    pending.insert(key, (invocation_id, now.to_owned()));
+                }
+            }
+            continue;
+        }
+        let node_role =
+            attempt_node_role(attempt, step_id).ok_or(LocalRunDirectoryError::StateConflict)?;
+        if let Some(existing) = attempt
+            .progress
+            .invocations
+            .iter()
+            .find(|invocation| invocation.invocation_id == invocation_id)
+        {
+            if existing.step_id != *step_id
+                || existing.node_role != node_role
+                || existing.role != role
+                || existing.target_execution != target_execution
+                || existing.recovery_round != recovery_round
+            {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            continue;
+        }
+        if u64::try_from(attempt.progress.invocations.len())
+            .ok()
+            .is_none_or(|count| count >= attempt.progress.accounting.maximum_invocations)
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        attempt.progress.invocations.push(DurableInvocationV1 {
+            invocation_id,
+            step_id: step_id.clone(),
+            node_role,
+            role,
+            target_execution,
+            recovery_round,
+            state: DurableInvocationStateV1::Active,
+            started_at: now.to_owned(),
+            finished_at: None,
+            usage: super::publication::RecoveryInvocationUsageV1::default(),
+            diagnostics: Vec::new(),
+            diagnostic_reference: None,
+        });
+    }
+
+    for index in 0..attempt.progress.invocations.len() {
+        let should_settle = {
+            let invocation = &attempt.progress.invocations[index];
+            invocation.state == DurableInvocationStateV1::Active
+                && !durable_invocation_is_active(invocation, &commit.state.steps)
+        };
+        if !should_settle {
+            continue;
+        }
+        let (step_id, invocation_id, role) = {
+            let invocation = &attempt.progress.invocations[index];
+            (
+                invocation.step_id.clone(),
+                invocation.invocation_id,
+                invocation.role,
+            )
+        };
+        let action = super::runtime::ActionId {
+            transition_sequence: super::runtime::TransitionSequence(invocation_id),
+        };
+        let diagnostic = diagnostics.get_invocation(&step_id, action);
+        let agent = accounting.native_session(action);
+        let retained = diagnostic
+            .as_ref()
+            .map(|diagnostic| {
+                store.retain_invocation_diagnostics(
+                    attempt.attempt_number,
+                    invocation_id,
+                    diagnostic,
+                    agent.is_some(),
+                )
+            })
+            .transpose()?;
+        let usage = accounting.usage(action).unwrap_or_default();
+        let diagnostic_reference = agent.map(|session| {
+            format!(
+                "diagnostics/{}/{}",
+                match session.profile {
+                    AgentCompatibilityProfile::PiJsonV1 => "pi-json-v1",
+                    AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
+                        "claude-code-stream-json-v1"
+                    }
+                    AgentCompatibilityProfile::CodexAppServerV1 => "codex-app-server-v1",
+                },
+                session.diagnostic_identity
+            )
+        });
+        let cancelled = commit
+            .state
+            .steps
+            .get(&step_id)
+            .is_some_and(|runtime| matches!(runtime.state, StepState::Cancelled { .. }));
+        let invocation = &mut attempt.progress.invocations[index];
+        invocation.state = if cancelled {
+            DurableInvocationStateV1::Cancelled
+        } else {
+            DurableInvocationStateV1::Settled
+        };
+        invocation.finished_at = Some(now.to_owned());
+        invocation.usage = super::publication::RecoveryInvocationUsageV1 {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        };
+        invocation.diagnostics = retained.unwrap_or_default();
+        invocation.diagnostic_reference = diagnostic_reference;
+        if role == super::publication::RecoveryInvocationRoleV1::RecoveryHandler
+            && !diagnostics.is_recovery_handler(&step_id, action)
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+    }
+    attempt
+        .progress
+        .invocations
+        .sort_by_key(|invocation| invocation.invocation_id);
+    recalculate_invocation_accounting(&mut attempt.progress)
+}
+
+fn durable_invocation_is_active<Cause, Output>(
+    invocation: &DurableInvocationV1,
+    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
+) -> bool {
+    let Some(active) = runtime_steps
+        .get(&invocation.step_id)
+        .and_then(|runtime| runtime.active_invocation)
+    else {
+        return false;
+    };
+    match (invocation.role, active) {
+        (
+            super::publication::RecoveryInvocationRoleV1::Target,
+            ActiveStepInvocation::Target { execution_number },
+        ) => invocation.target_execution == Some(execution_number.get()),
+        (
+            super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+            ActiveStepInvocation::RecoveryHandler { round },
+        ) => invocation.recovery_round == Some(round.get()),
+        _ => false,
+    }
+}
+
+fn recalculate_invocation_accounting(
+    progress: &mut AttemptProgressV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let mut settled = 0_u64;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut retained_diagnostic_bytes = 0_u64;
+    let mut discarded_diagnostic_bytes = 0_u64;
+    for invocation in &progress.invocations {
+        if invocation.state != DurableInvocationStateV1::Active {
+            settled = settled
+                .checked_add(1)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        }
+        input_tokens = input_tokens
+            .checked_add(invocation.usage.input_tokens)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        output_tokens = output_tokens
+            .checked_add(invocation.usage.output_tokens)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        for diagnostic in &invocation.diagnostics {
+            retained_diagnostic_bytes = retained_diagnostic_bytes
+                .checked_add(diagnostic.retained_bytes)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            discarded_diagnostic_bytes = discarded_diagnostic_bytes
+                .checked_add(diagnostic.discarded_bytes)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        }
+    }
+    let observed_invocations = u64::try_from(progress.invocations.len())
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if observed_invocations > progress.accounting.maximum_invocations {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    progress.accounting.observed_invocations = observed_invocations;
+    progress.accounting.settled_invocations = settled;
+    progress.accounting.input_tokens = input_tokens;
+    progress.accounting.output_tokens = output_tokens;
+    progress.accounting.retained_diagnostic_bytes = retained_diagnostic_bytes;
+    progress.accounting.discarded_diagnostic_bytes = discarded_diagnostic_bytes;
+    Ok(())
+}
+
+impl StateStore {
+    fn retain_invocation_diagnostics(
+        &self,
+        attempt_number: u64,
+        invocation_id: u64,
+        diagnostic: &StepDiagnostic,
+        agent: bool,
+    ) -> Result<Vec<DurableInvocationDiagnosticV1>, LocalRunDirectoryError> {
+        let attempts = open_directory_at(&self.root, ATTEMPTS_DIRECTORY)?;
+        let attempt_name =
+            attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt = open_directory_at(&attempts, &attempt_name)?;
+        let invocations = create_or_open_directory(&attempt, INVOCATIONS_DIRECTORY)?;
+        let invocation_name = format!("{invocation_id:020}");
+        let invocation = create_or_open_directory(&invocations, &invocation_name)?;
+        let (stdout_kind, stderr_kind) = if agent {
+            (
+                super::publication::RecoveryDiagnosticKindV1::AgentHarnessStdout,
+                super::publication::RecoveryDiagnosticKindV1::AgentHarnessStderr,
+            )
+        } else {
+            (
+                super::publication::RecoveryDiagnosticKindV1::CommandStdout,
+                super::publication::RecoveryDiagnosticKindV1::CommandStderr,
+            )
+        };
+        let mut retained = Vec::with_capacity(2);
+        for (name, kind, stream) in [
+            ("stdout.bin", stdout_kind, diagnostic.standard_output()),
+            ("stderr.bin", stderr_kind, diagnostic.standard_error()),
+        ] {
+            write_or_verify_immutable_file(&invocation, name, stream.bytes())?;
+            let discarded_bytes = stream
+                .truncation()
+                .map_or(0, |truncation| truncation.discarded_bytes());
+            retained.push(DurableInvocationDiagnosticV1 {
+                kind,
+                reference: format!(
+                    "{ATTEMPTS_DIRECTORY}/{attempt_name}/{INVOCATIONS_DIRECTORY}/{invocation_name}/{name}"
+                ),
+                retained_bytes: u64::try_from(stream.bytes().len())
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+                discarded_bytes,
+                truncated: discarded_bytes != 0,
+                fully_drained: stream.fully_drained(),
+            });
+        }
+        sync_directory(&invocation)?;
+        sync_directory(&invocations)?;
+        sync_directory(&attempt)?;
+        Ok(retained)
+    }
+}
+
+fn create_or_open_directory(
+    parent: &OwnedFd,
+    name: &str,
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    match mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => open_directory_at(parent, name),
+        Err(_) => Err(LocalRunDirectoryError::StagingUnavailable),
+    }
+}
+
+fn write_or_verify_immutable_file(
+    directory: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LocalRunDirectoryError> {
+    match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => write_new_immutable_file(directory, name, bytes),
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile => {
+            let retained = read_regular_file(directory, name)?;
+            if retained == bytes {
+                Ok(())
+            } else {
+                Err(LocalRunDirectoryError::StateConflict)
+            }
+        }
+        Ok(_) | Err(_) => Err(LocalRunDirectoryError::StateConflict),
+    }
+}
+
 fn update_step_progress<Deadline>(
     attempt: &mut LocalAttemptV1,
     runtime: &super::runtime::RuntimeState<StepFailureCause, super::value::CapturedValue, Deadline>,
@@ -1711,12 +2256,129 @@ fn update_progress_nodes<Cause, Output>(
     Ok(())
 }
 
+fn update_recovery_progress(
+    nodes: &mut [AttemptStepV1],
+    invocations: &[DurableInvocationV1],
+    runtime_steps: &BTreeMap<
+        String,
+        super::runtime::StepRuntimeState<StepFailureCause, super::value::CapturedValue>,
+    >,
+) -> Result<(), LocalRunDirectoryError> {
+    for node in nodes {
+        let runtime = runtime_steps
+            .get(&node.id)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let Some(recovery) = runtime
+            .recovery
+            .as_ref()
+            .filter(|recovery| !recovery.rounds.is_empty())
+        else {
+            node.recovery = None;
+            continue;
+        };
+        let termination = if recovery.terminal_disposition.is_some() {
+            super::publication::step_recovery_summary_v1(Some(recovery))
+                .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?
+                .map(|summary| summary.termination)
+        } else {
+            None
+        };
+        let rounds = super::publication::recovery_round_summaries_v1(recovery, false)
+            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?
+            .into_iter()
+            .map(|round| DurableRecoveryRoundV1 {
+                number: round.number,
+                failed_execution: round.failed_execution,
+                handler: round.handler,
+            })
+            .collect();
+        let active = runtime.active_invocation.and_then(|active| {
+            let (role, target_execution, recovery_round) = match active {
+                ActiveStepInvocation::Target { execution_number } => (
+                    super::publication::RecoveryInvocationRoleV1::Target,
+                    Some(execution_number.get()),
+                    None,
+                ),
+                ActiveStepInvocation::RecoveryHandler { round } => (
+                    super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+                    None,
+                    Some(round.get()),
+                ),
+            };
+            let invocation = invocations.iter().find(|invocation| {
+                invocation.step_id == node.id
+                    && invocation.role == role
+                    && invocation.target_execution == target_execution
+                    && invocation.recovery_round == recovery_round
+                    && invocation.state == DurableInvocationStateV1::Active
+            })?;
+            let (handler_state, decision) = match (&runtime.state, recovery.rounds.last()) {
+                (StepState::Recovering { handler, .. }, _) => (
+                    Some(match handler {
+                        super::runtime::RecoveryHandlerActivity::Starting => {
+                            DurableRecoveryHandlerStateV1::Starting
+                        }
+                        super::runtime::RecoveryHandlerActivity::Running => {
+                            DurableRecoveryHandlerStateV1::Running
+                        }
+                    }),
+                    None,
+                ),
+                (_, Some(round)) => (
+                    None,
+                    round
+                        .handler
+                        .as_ref()
+                        .and_then(|handler| match handler.outcome {
+                            super::runtime::RecoveryHandlerOutcome::Recheck { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Recheck)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::GaveUp { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::GaveUp)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Failed { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Failed)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Cancelled => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Cancelled)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Starting
+                            | super::runtime::RecoveryHandlerOutcome::Running => None,
+                        }),
+                ),
+                (_, None) => (None, None),
+            };
+            Some(DurableRecoveryActiveV1 {
+                role,
+                target_execution,
+                recovery_round,
+                invocation_id: invocation.invocation_id,
+                handler_state,
+                decision,
+            })
+        });
+        node.recovery = Some(DurableStepRecoveryV1 {
+            schema_version: 1,
+            configured_retries: recovery.configured_rounds,
+            handler_kind: recovery.handler_kind.map(|kind| match kind {
+                super::runtime::RecoveryHandlerKind::Command => DurableRecoveryHandlerKindV1::Cmd,
+                super::runtime::RecoveryHandlerKind::Agent => DurableRecoveryHandlerKindV1::Agent,
+            }),
+            rounds,
+            active,
+            termination,
+        });
+    }
+    Ok(())
+}
+
 fn attempt_step_state<Cause, Output>(state: &StepState<Cause, Output>) -> AttemptStepStateV1 {
     match state {
         StepState::Pending => AttemptStepStateV1::Pending,
         StepState::Starting => AttemptStepStateV1::Starting,
         StepState::Running => AttemptStepStateV1::Running,
         StepState::CapturingOutputs => AttemptStepStateV1::CapturingOutputs,
+        StepState::Recovering { .. } => AttemptStepStateV1::Running,
         StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
         StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
         StepState::Failed { .. } => AttemptStepStateV1::Failed,
@@ -1773,6 +2435,7 @@ where
                 | StepState::Starting
                 | StepState::Running
                 | StepState::CapturingOutputs
+                | StepState::Recovering { .. }
                 | StepState::Cancelling { .. }
                 | StepState::Blocked { .. }
                 | StepState::NotRun {
@@ -1855,6 +2518,7 @@ fn outstanding_actions<Cause, Output>(
             let action = runtime.current_action?;
             let kind = match runtime.state {
                 StepState::Starting | StepState::Running => OutstandingActionKindV1::StartStep,
+                StepState::Recovering { .. } => OutstandingActionKindV1::StartRecoveryHandler,
                 StepState::CapturingOutputs => OutstandingActionKindV1::CaptureOutputs,
                 StepState::Cancelling { .. } => OutstandingActionKindV1::CancelStep,
                 StepState::Pending
@@ -1867,11 +2531,20 @@ fn outstanding_actions<Cause, Output>(
                     return Some(Err(LocalRunDirectoryError::StateConflict));
                 }
             };
+            let (target_execution, recovery_round) = match runtime.active_invocation {
+                Some(ActiveStepInvocation::Target { execution_number }) => {
+                    (Some(execution_number.get()), None)
+                }
+                Some(ActiveStepInvocation::RecoveryHandler { round }) => (None, Some(round.get())),
+                None => (None, None),
+            };
             Some(Ok(OutstandingActionV1 {
                 action_id: action.transition_sequence.get(),
                 kind,
                 step_id: Some(node.id.clone()),
                 node_role: Some(node.role),
+                target_execution,
+                recovery_round,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1964,7 +2637,7 @@ fn current_attempt_mut(
     Ok(attempt)
 }
 
-fn attempt_result_relative_path(attempt_number: u64) -> String {
+pub(super) fn attempt_result_relative_path(attempt_number: u64) -> String {
     format!(
         "{ATTEMPTS_DIRECTORY}/{}/result",
         attempt_directory_name(attempt_number).unwrap_or_else(|| attempt_number.to_string())
@@ -2128,6 +2801,78 @@ fn read_state_with_size(root: &OwnedFd) -> Result<(LocalRunStateV1, u64), LocalR
     Ok((decode_state(&bytes)?, size))
 }
 
+pub(super) fn mark_validated_result_published(
+    requested: &Path,
+    attempt_number: u64,
+) -> Result<bool, LocalRunDirectoryError> {
+    let normalized =
+        std::fs::canonicalize(requested).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let root =
+        open_directory_path(&normalized).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let lock = open_retry_lock(&root)?;
+    match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(Errno::AGAIN | Errno::ACCESS) => return Ok(false),
+        Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+    }
+    verify_retry_lock_identity(&root, &lock)?;
+    verify_existing_run_layout(&root)?;
+    let run = read_run(&root)?;
+    let state = read_state(&root)?;
+    if state.local_run_id != run.local_run_id {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let expected = attempt_result_relative_path(attempt_number);
+    let attempt = state
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == attempt_number)
+        .ok_or(LocalRunDirectoryError::StateConflict)?;
+    match &attempt.result {
+        AttemptResultV1::Published { relative_directory } if *relative_directory == expected => {
+            return Ok(true);
+        }
+        AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::PublicationPending,
+        } if attempt.state.is_terminal() => {}
+        _ => return Err(LocalRunDirectoryError::StateConflict),
+    }
+
+    let attempts = open_directory_at(&root, ATTEMPTS_DIRECTORY)?;
+    let attempt_name =
+        attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
+    open_directory_at(&attempt_directory, "result")?;
+
+    let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
+    let root = Arc::new(root);
+    let store = StateStore {
+        root,
+        private,
+        current: Mutex::new(state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
+    };
+    store.update(|state| {
+        let attempt = state
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt_number == attempt_number)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        match attempt.result {
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            } if attempt.state.is_terminal() => {
+                attempt.result = AttemptResultV1::Published {
+                    relative_directory: expected,
+                };
+                Ok(())
+            }
+            _ => Err(LocalRunDirectoryError::StateConflict),
+        }
+    })?;
+    Ok(true)
+}
+
 pub(crate) fn acquire_local_retry(
     requested: &Path,
 ) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
@@ -2224,6 +2969,7 @@ fn open_locked_retry(
         root: Arc::clone(&root),
         private,
         current: Mutex::new(state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
     });
     Ok(LocalRetryOpen::Acquired(Box::new(PendingLocalRetry {
         normalized,
@@ -2477,8 +3223,8 @@ pub(super) fn read_stable_local_run_snapshot(
     let lock = open_status_lock(&root, &reported_directory)?;
 
     for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
-        let (before, _) =
-            read_state_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+        let (before, _) = read_state_with_size(&root)
+            .map_err(|error| status_state_error(error, &reported_directory))?;
         if before.local_run_id != run.local_run_id {
             return Err(invalid_status_error(&reported_directory));
         }
@@ -2486,8 +3232,8 @@ pub(super) fn read_stable_local_run_snapshot(
             code: LocalStatusErrorCode::LockQueryFailed,
             run_directory: reported_directory.clone(),
         })?;
-        let (after, state_bytes) =
-            read_state_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+        let (after, state_bytes) = read_state_with_size(&root)
+            .map_err(|error| status_state_error(error, &reported_directory))?;
         if after.local_run_id != run.local_run_id {
             return Err(invalid_status_error(&reported_directory));
         }
@@ -2535,6 +3281,20 @@ pub(crate) fn read_local_run_status(
 fn invalid_status_error(run_directory: &Option<PathBuf>) -> LocalStatusError {
     LocalStatusError {
         code: LocalStatusErrorCode::RunDirectoryInvalid,
+        run_directory: run_directory.clone(),
+    }
+}
+
+fn status_state_error(
+    error: LocalRunDirectoryError,
+    run_directory: &Option<PathBuf>,
+) -> LocalStatusError {
+    LocalStatusError {
+        code: if error == LocalRunDirectoryError::RecoverySchemaUnsupported {
+            LocalStatusErrorCode::RecoverySchemaUnsupported
+        } else {
+            LocalStatusErrorCode::RunDirectoryInvalid
+        },
         run_directory: run_directory.clone(),
     }
 }
@@ -2834,6 +3594,20 @@ fn fresh_attempt(
             last_transition_sequence: 0,
             steps,
             outstanding_actions: Vec::new(),
+            invocations: Vec::new(),
+            accounting: DurableInvocationAccountingV1 {
+                maximum_invocations: admitted
+                    .capacity()
+                    .resolved
+                    .requirements
+                    .maximum_invocations,
+                observed_invocations: 0,
+                settled_invocations: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                retained_diagnostic_bytes: 0,
+                discarded_diagnostic_bytes: 0,
+            },
         },
         finalization: None,
         process_guards: Vec::new(),
@@ -2878,6 +3652,7 @@ fn fresh_progress_node(
         role,
         failure_policy,
         state: AttemptStepStateV1::Pending,
+        recovery: None,
     })
 }
 
@@ -3135,9 +3910,44 @@ fn decode_run(bytes: &[u8]) -> Result<LocalRunV1, LocalRunDirectoryError> {
 }
 
 fn decode_state(bytes: &[u8]) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
+    let document: Value =
+        serde_json::from_slice(bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    dispatch_durable_recovery_versions(&document)?;
     let state: LocalRunStateV1 = decode_schema_one(bytes)?;
     validate_state(&state)?;
     Ok(state)
+}
+
+fn dispatch_durable_recovery_versions(document: &Value) -> Result<(), LocalRunDirectoryError> {
+    let Some(attempts) = document.get("attempts").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for attempt in attempts {
+        let ordinary = attempt
+            .get("progress")
+            .and_then(|progress| progress.get("steps"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        let finalizers = attempt
+            .get("finalization")
+            .and_then(|finalization| finalization.get("finalizers"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for recovery in ordinary
+            .chain(finalizers)
+            .filter_map(|step| step.get("recovery"))
+        {
+            if recovery
+                .get("schemaVersion")
+                .is_some_and(|version| version.as_u64() != Some(1))
+            {
+                return Err(LocalRunDirectoryError::RecoverySchemaUnsupported);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_schema_one<Document>(bytes: &[u8]) -> Result<Document, LocalRunDirectoryError>
@@ -3369,6 +4179,7 @@ fn validate_attempt(
             return Err(LocalRunDirectoryError::StateInvalid);
         }
     }
+    validate_attempt_recovery(attempt, &step_ids)?;
     validate_attempt_finalization(attempt, &mut step_ids)?;
     let mut action_ids = BTreeSet::new();
     let mut prior_action_id = 0;
@@ -3383,6 +4194,14 @@ fn validate_attempt(
                 .step_id
                 .as_deref()
                 .is_some_and(|id| attempt_node_role(attempt, id) != action.node_role)
+            || (requires_step
+                && (action.target_execution.is_some() == action.recovery_round.is_some()))
+            || (!requires_step
+                && (action.target_execution.is_some() || action.recovery_round.is_some()))
+            || (matches!(action.kind, OutstandingActionKindV1::StartRecoveryHandler)
+                && action.recovery_round.is_none())
+            || (matches!(action.kind, OutstandingActionKindV1::StartStep)
+                && action.target_execution.is_none())
         {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
@@ -3407,6 +4226,106 @@ fn validate_attempt(
         }
     }
     validate_attempt_result(attempt)
+}
+
+fn validate_attempt_recovery(
+    attempt: &LocalAttemptV1,
+    step_ids: &BTreeSet<&str>,
+) -> Result<(), LocalRunDirectoryError> {
+    if attempt.progress.accounting.maximum_invocations == 0
+        || u64::try_from(attempt.progress.invocations.len())
+            .ok()
+            .is_none_or(|count| count > attempt.progress.accounting.maximum_invocations)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut invocation_ids = BTreeSet::new();
+    let mut previous_invocation_id = 0_u64;
+    for invocation in &attempt.progress.invocations {
+        if invocation.invocation_id == 0
+            || invocation.invocation_id <= previous_invocation_id
+            || !invocation_ids.insert(invocation.invocation_id)
+            || !step_ids.contains(invocation.step_id.as_str())
+            || attempt_node_role(attempt, &invocation.step_id) != Some(invocation.node_role)
+            || invocation.target_execution.is_some() == invocation.recovery_round.is_some()
+            || (invocation.role == super::publication::RecoveryInvocationRoleV1::Target)
+                != invocation.target_execution.is_some()
+            || !valid_timestamp(&invocation.started_at)
+            || invocation
+                .finished_at
+                .as_deref()
+                .is_some_and(|finished| !valid_timestamp(finished))
+            || (invocation.state == DurableInvocationStateV1::Active)
+                != invocation.finished_at.is_none()
+            || invocation
+                .diagnostic_reference
+                .as_deref()
+                .is_some_and(|path| {
+                    !is_canonical_relative_path(path) || path.split('/').any(str::is_empty)
+                })
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        for diagnostic in &invocation.diagnostics {
+            if !is_canonical_relative_path(&diagnostic.reference)
+                || diagnostic.truncated != (diagnostic.discarded_bytes != 0)
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        previous_invocation_id = invocation.invocation_id;
+    }
+    if attempt.state.is_terminal()
+        && attempt
+            .progress
+            .invocations
+            .iter()
+            .any(|invocation| invocation.state == DurableInvocationStateV1::Active)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut projected = attempt.progress.clone();
+    recalculate_invocation_accounting(&mut projected)?;
+    if projected.accounting != attempt.progress.accounting {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for step in &attempt.progress.steps {
+        let Some(recovery) = &step.recovery else {
+            continue;
+        };
+        if recovery.schema_version != 1
+            || !(1..=10).contains(&recovery.configured_retries)
+            || recovery.rounds.is_empty()
+            || recovery.rounds.len() > usize::from(recovery.configured_retries)
+            || recovery
+                .rounds
+                .iter()
+                .enumerate()
+                .any(|(index, round)| round.number != u8::try_from(index + 1).unwrap_or(u8::MAX))
+            || recovery.termination.is_some()
+                != matches!(
+                    step.state,
+                    AttemptStepStateV1::Succeeded
+                        | AttemptStepStateV1::Failed
+                        | AttemptStepStateV1::Cancelled
+                )
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        if let Some(active) = &recovery.active
+            && !attempt.progress.invocations.iter().any(|invocation| {
+                invocation.invocation_id == active.invocation_id
+                    && invocation.step_id == step.id
+                    && invocation.role == active.role
+                    && invocation.target_execution == active.target_execution
+                    && invocation.recovery_round == active.recovery_round
+                    && invocation.state == DurableInvocationStateV1::Active
+            })
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    Ok(())
 }
 
 fn validate_attempt_finalization<'a>(

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -16,8 +15,8 @@ use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
-use crate::runner::service::assignment::{WallClockHealth, WallClockHealthFailure};
 use crate::runner::service::connection::{ConnectionError, FrameSource, run_established_shared};
+pub(crate) use crate::runner::service::lease_clock::fixture_lease_clock;
 use crate::runner::service::{
     ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
 };
@@ -59,22 +58,6 @@ pub(crate) fn deterministic_frame_source() -> Arc<dyn FrameSource> {
     Arc::new(DeterministicFrameSource {
         next: AtomicU64::new(0),
     })
-}
-
-struct HealthyWallClock;
-
-impl WallClockHealth for HealthyWallClock {
-    fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure> {
-        Ok(Duration::ZERO)
-    }
-
-    fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure> {
-        OffsetDateTime::parse("2026-07-23T00:00:00Z", &Rfc3339).map_err(|_| WallClockHealthFailure)
-    }
-}
-
-pub(crate) fn healthy_wall_clock() -> Arc<dyn WallClockHealth> {
-    Arc::new(HealthyWallClock)
 }
 
 struct ControlledShutdown {

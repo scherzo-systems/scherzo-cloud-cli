@@ -715,6 +715,7 @@ impl WorkflowRunStepViewState {
             | StepStateKind::Starting
             | StepStateKind::Running
             | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering
             | StepStateKind::Cancelling => {}
         }
     }
@@ -748,6 +749,7 @@ impl WorkflowRunStepViewState {
             | StepState::Starting
             | StepState::Running
             | StepState::CapturingOutputs
+            | StepState::Recovering { .. }
             | StepState::Cancelling { .. } => {}
         }
         self.terminal_timing = terminal.timing.clone();
@@ -950,6 +952,7 @@ fn terminal_step_is_valid(
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
         | StepState::Cancelling { .. } => false,
     }
 }
@@ -962,6 +965,7 @@ fn terminal_state_kind(
         StepState::Starting => StepStateKind::Starting,
         StepState::Running => StepStateKind::Running,
         StepState::CapturingOutputs => StepStateKind::CapturingOutputs,
+        StepState::Recovering { .. } => StepStateKind::Recovering,
         StepState::Cancelling { .. } => StepStateKind::Cancelling,
         StepState::Succeeded { .. } => StepStateKind::Succeeded,
         StepState::Failed { .. } => StepStateKind::Failed,
@@ -998,6 +1002,7 @@ fn terminal_step_fact(
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
         | StepState::Succeeded { .. } => None,
     }
 }

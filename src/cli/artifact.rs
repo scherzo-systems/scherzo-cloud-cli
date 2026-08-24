@@ -1,3 +1,4 @@
+mod assembly;
 mod download;
 mod validate;
 

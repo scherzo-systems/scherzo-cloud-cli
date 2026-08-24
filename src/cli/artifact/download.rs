@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
+use super::assembly::{ArtifactAssemblyError, assemble_artifact_set};
 use crate::api::{ArtifactApi, ArtifactApiError, HttpClient};
-use crate::execution::workflow::cloud_artifact::{ArtifactAssemblyError, assemble_artifact_set};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
@@ -86,10 +86,7 @@ impl Command {
 
 fn write_result(
     deployment: &str,
-    result: Result<
-        crate::execution::workflow::cloud_artifact::AssembledArtifact,
-        ArtifactAssemblyError,
-    >,
+    result: Result<super::assembly::AssembledArtifact, ArtifactAssemblyError>,
 ) -> anyhow::Result<ExitCode> {
     match result {
         Ok(assembled) => {

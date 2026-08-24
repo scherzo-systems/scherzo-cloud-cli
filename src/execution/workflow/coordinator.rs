@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Add;
@@ -7,8 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::admission::{AdmittedWorkflow, CancellationOperation};
 use super::runtime::{
-    self, ActionId, CancellationRequest, Occurrence, OutputSet, Reduction, RequestedAction,
-    RuntimeState, TransitionEvent, WorkflowState,
+    self, ActionId, CancellationRequest, Occurrence, OutputSet, RecoveryDecision,
+    RecoveryRoundNumber, Reduction, RequestedAction, RuntimeState, TransitionEvent, WorkflowState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -24,7 +25,7 @@ impl OccurrenceOrdinal {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriverDeadline {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +86,60 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         })
     }
 
+    pub(crate) fn recovery_handler_started(
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+    ) -> Self {
+        Self(Occurrence::RecoveryHandlerStarted {
+            step,
+            round,
+            action,
+        })
+    }
+
+    pub(crate) fn recovery_handler_start_failed(
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        cause: Cause,
+    ) -> Self {
+        Self(Occurrence::RecoveryHandlerStartFailed {
+            step,
+            round,
+            action,
+            cause,
+        })
+    }
+
+    pub(crate) fn recovery_handler_completed(
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        decision: RecoveryDecision,
+    ) -> Self {
+        Self(Occurrence::RecoveryHandlerCompleted {
+            step,
+            round,
+            action,
+            decision,
+        })
+    }
+
+    pub(crate) fn recovery_handler_execution_failed(
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        cause: Cause,
+    ) -> Self {
+        Self(Occurrence::RecoveryHandlerExecutionFailed {
+            step,
+            round,
+            action,
+            cause,
+        })
+    }
+
     pub(crate) fn step_quiesced(step: String, action: ActionId) -> Self {
         Self(Occurrence::StepQuiesced { step, action })
     }
@@ -137,6 +192,48 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 action,
                 cause,
             },
+            Occurrence::RecoveryHandlerStarted {
+                step,
+                round,
+                action,
+            } => Occurrence::RecoveryHandlerStarted {
+                step,
+                round,
+                action,
+            },
+            Occurrence::RecoveryHandlerStartFailed {
+                step,
+                round,
+                action,
+                cause,
+            } => Occurrence::RecoveryHandlerStartFailed {
+                step,
+                round,
+                action,
+                cause,
+            },
+            Occurrence::RecoveryHandlerCompleted {
+                step,
+                round,
+                action,
+                decision,
+            } => Occurrence::RecoveryHandlerCompleted {
+                step,
+                round,
+                action,
+                decision,
+            },
+            Occurrence::RecoveryHandlerExecutionFailed {
+                step,
+                round,
+                action,
+                cause,
+            } => Occurrence::RecoveryHandlerExecutionFailed {
+                step,
+                round,
+                action,
+                cause,
+            },
             Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
             Occurrence::CancellationRequested { deadline, .. } => match deadline {},
             Occurrence::CancellationOperationRequested {
@@ -148,6 +245,84 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 operation: _,
                 deadline,
             } => match deadline {},
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DriverOccurrenceKind {
+    StepStarted,
+    StepStartFailed,
+    StepExecutionCompleted,
+    StepExecutionFailed,
+    OutputsCaptured,
+    OutputCaptureFailed,
+    RecoveryHandlerStarted,
+    RecoveryHandlerStartFailed,
+    RecoveryHandlerCompleted,
+    RecoveryHandlerExecutionFailed,
+    StepQuiesced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DriverOccurrenceIdentity {
+    action: ActionId,
+    kind: DriverOccurrenceKind,
+    round: Option<RecoveryRoundNumber>,
+}
+
+impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
+    fn identity(&self) -> DriverOccurrenceIdentity {
+        let (action, kind, round) = match &self.0 {
+            Occurrence::StepStarted { action, .. } => {
+                (*action, DriverOccurrenceKind::StepStarted, None)
+            }
+            Occurrence::StepStartFailed { action, .. } => {
+                (*action, DriverOccurrenceKind::StepStartFailed, None)
+            }
+            Occurrence::StepExecutionCompleted { action, .. } => {
+                (*action, DriverOccurrenceKind::StepExecutionCompleted, None)
+            }
+            Occurrence::StepExecutionFailed { action, .. } => {
+                (*action, DriverOccurrenceKind::StepExecutionFailed, None)
+            }
+            Occurrence::OutputsCaptured { action, .. } => {
+                (*action, DriverOccurrenceKind::OutputsCaptured, None)
+            }
+            Occurrence::OutputCaptureFailed { action, .. } => {
+                (*action, DriverOccurrenceKind::OutputCaptureFailed, None)
+            }
+            Occurrence::RecoveryHandlerStarted { round, action, .. } => (
+                *action,
+                DriverOccurrenceKind::RecoveryHandlerStarted,
+                Some(*round),
+            ),
+            Occurrence::RecoveryHandlerStartFailed { round, action, .. } => (
+                *action,
+                DriverOccurrenceKind::RecoveryHandlerStartFailed,
+                Some(*round),
+            ),
+            Occurrence::RecoveryHandlerCompleted { round, action, .. } => (
+                *action,
+                DriverOccurrenceKind::RecoveryHandlerCompleted,
+                Some(*round),
+            ),
+            Occurrence::RecoveryHandlerExecutionFailed { round, action, .. } => (
+                *action,
+                DriverOccurrenceKind::RecoveryHandlerExecutionFailed,
+                Some(*round),
+            ),
+            Occurrence::StepQuiesced { action, .. } => {
+                (*action, DriverOccurrenceKind::StepQuiesced, None)
+            }
+            Occurrence::CancellationRequested { deadline, .. }
+            | Occurrence::CancellationOperationRequested { deadline, .. }
+            | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
+        };
+        DriverOccurrenceIdentity {
+            action,
+            kind,
+            round,
         }
     }
 }
@@ -465,6 +640,7 @@ pub(crate) trait CoordinatorClock: Clone + Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommittedActionKind {
     StartStep,
+    StartRecoveryHandler,
     CaptureOutputs,
     CancelStep,
     ForceAbortStep,
@@ -476,6 +652,8 @@ pub(crate) struct CommittedAction {
     pub(crate) id: ActionId,
     pub(crate) kind: CommittedActionKind,
     pub(crate) step: Option<String>,
+    pub(crate) execution_number: Option<runtime::TargetExecutionNumber>,
+    pub(crate) recovery_round: Option<RecoveryRoundNumber>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -505,9 +683,11 @@ pub(crate) enum CoordinationError {
     AgentRuntimeUnavailable,
     CommitFailed,
     OccurrenceChannelClosed,
+    OccurrenceConflict,
+    OccurrenceIdentityCapacityExceeded,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
-    RecoveryExecutionGuardActive,
+    RunnerRecoveryExecutionGuardActive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,8 +719,9 @@ where
 impl<Provisional, Cause, Output, Clock, Commits, Actions>
     Coordinator<Provisional, Cause, Output, Clock, Commits, Actions>
 where
-    Cause: Clone,
-    Output: Clone,
+    Provisional: Clone + Eq,
+    Cause: Clone + Eq,
+    Output: Clone + Eq,
     Clock: CoordinatorClock,
     Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
@@ -582,6 +763,8 @@ where
         let mut ordinal = OccurrenceOrdinal(0)
             .next()
             .ok_or(CoordinationError::OccurrenceOrdinalExhausted)?;
+        let mut observed_driver_occurrences = BTreeMap::new();
+        let occurrence_identity_capacity = self.admitted.capacity().maximum_transitions;
         let initialization =
             runtime::initialize_with_operation::<Provisional, Cause, Output, Clock::Instant>(
                 &self.admitted,
@@ -593,7 +776,7 @@ where
         }
 
         loop {
-            let (occurrence, acknowledgement, ordinal_assigned) = loop {
+            let (occurrence, acknowledgement, ordinal_assigned, exact_replay) = loop {
                 let input = tokio::select! {
                     biased;
                     changed = cancellation.changed() => {
@@ -663,7 +846,7 @@ where
                 };
                 match input {
                     CoordinatorInput::Cancellation(occurrence) => {
-                        break (occurrence, None, false);
+                        break (occurrence, None, false, false);
                     }
                     CoordinatorInput::Driver {
                         selected,
@@ -674,10 +857,29 @@ where
                         let Some(resolved) = selected.resolve().await else {
                             continue;
                         };
+                        let identity = resolved.occurrence.identity();
+                        let exact_replay = if let Some(observed) =
+                            observed_driver_occurrences.get(&identity)
+                        {
+                            if observed != &resolved.occurrence {
+                                return Err(CoordinationError::OccurrenceConflict);
+                            }
+                            true
+                        } else {
+                            if u64::try_from(observed_driver_occurrences.len()).unwrap_or(u64::MAX)
+                                >= occurrence_identity_capacity
+                            {
+                                return Err(CoordinationError::OccurrenceIdentityCapacityExceeded);
+                            }
+                            observed_driver_occurrences
+                                .insert(identity, resolved.occurrence.clone());
+                            false
+                        };
                         break (
                             resolved.occurrence.into_runtime(),
                             resolved.acknowledgement,
                             ordinal_assigned,
+                            exact_replay,
                         );
                     }
                 }
@@ -690,7 +892,16 @@ where
             let Some(state) = self.state.as_ref() else {
                 return Err(CoordinationError::ReducerStateUnavailable);
             };
-            let reduction = runtime::reduce(state, occurrence);
+            let reduction = if exact_replay {
+                Reduction {
+                    state: state.clone(),
+                    events: Vec::new(),
+                    actions: Vec::new(),
+                    occurrence_accepted: false,
+                }
+            } else {
+                runtime::reduce(state, occurrence)
+            };
             if self.commit(ordinal, reduction, acknowledgement).await? {
                 return self.result(ordinal);
             }
@@ -781,25 +992,49 @@ where
 fn committed_action<Provisional, Cause, Output, Deadline>(
     requested: &RequestedAction<Provisional, Cause, Output, Deadline>,
 ) -> CommittedAction {
-    let (kind, step) = match &requested.action {
-        runtime::Action::StartStep { step, .. } => {
-            (CommittedActionKind::StartStep, Some(step.clone()))
-        }
-        runtime::Action::CaptureOutputs { step, .. } => {
-            (CommittedActionKind::CaptureOutputs, Some(step.clone()))
-        }
-        runtime::Action::CancelStep { step, .. } => {
-            (CommittedActionKind::CancelStep, Some(step.clone()))
-        }
-        runtime::Action::ForceAbortStep { step, .. } => {
-            (CommittedActionKind::ForceAbortStep, Some(step.clone()))
-        }
-        runtime::Action::FinishRun { .. } => (CommittedActionKind::FinishRun, None),
+    let (kind, step, execution_number, recovery_round) = match &requested.action {
+        runtime::Action::StartStep {
+            step,
+            execution_number,
+            ..
+        } => (
+            CommittedActionKind::StartStep,
+            Some(step.clone()),
+            Some(*execution_number),
+            None,
+        ),
+        runtime::Action::StartRecoveryHandler { step, round, .. } => (
+            CommittedActionKind::StartRecoveryHandler,
+            Some(step.clone()),
+            None,
+            Some(*round),
+        ),
+        runtime::Action::CaptureOutputs { step, .. } => (
+            CommittedActionKind::CaptureOutputs,
+            Some(step.clone()),
+            None,
+            None,
+        ),
+        runtime::Action::CancelStep { step, .. } => (
+            CommittedActionKind::CancelStep,
+            Some(step.clone()),
+            None,
+            None,
+        ),
+        runtime::Action::ForceAbortStep { step, .. } => (
+            CommittedActionKind::ForceAbortStep,
+            Some(step.clone()),
+            None,
+            None,
+        ),
+        runtime::Action::FinishRun { .. } => (CommittedActionKind::FinishRun, None, None, None),
     };
     CommittedAction {
         id: requested.id,
         kind,
         step,
+        execution_number,
+        recovery_round,
     }
 }
 

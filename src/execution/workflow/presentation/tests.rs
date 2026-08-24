@@ -281,6 +281,8 @@ impl Fixture {
                         duration: Duration::from_millis(250),
                     }),
                     command_output: Some(empty_command_output()),
+                    recovery: None,
+                    invocations: Vec::new(),
                 })
                 .collect(),
             finalization: None,
@@ -988,6 +990,8 @@ steps:
         },
         timing: None,
         command_output: None,
+        recovery: None,
+        invocations: Vec::new(),
     };
     let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::AgentResult).unwrap();
     assert_eq!(summary_detail, "result captured · 1 output");

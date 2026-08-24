@@ -319,6 +319,14 @@ will separate human CLI commands, runner connectivity and assignment ownership, 
 DTOs, and one-run execution. Additional workspace crates are not introduced until a
 real compile-time dependency boundary requires them.
 
+`tests/architecture.rs` enforces the top-level module dependency graph, the containment
+of `api::generated` within the API boundary, and the confinement of command parsing,
+HTTP, WebSocket, telemetry, and terminal dependencies to their owning modules. The
+crate-root `src/test_support.rs` module is a `cfg(test)`-only leaf shared exclusively by
+execution and runner tests for hermetic Git command construction; it is not a production
+component or a general cross-component utility. Changing a module boundary requires
+updating that test and this document in the same change.
+
 The CLI uses a typed `clap` command tree. Each command module owns its arguments, help
 metadata, and execution dispatch; parent modules compose those commands so parsing and
 rendered help come from the same structure. Bare command groups may print their composed

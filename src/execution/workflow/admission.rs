@@ -802,7 +802,6 @@ impl WorkflowExecutionContract {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryExecutionGuard {
-    Local,
     Runner,
 }
 
@@ -1277,7 +1276,7 @@ pub(crate) fn admit_local_workflow(
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_guarded_workflow(workflow, imports, context, RecoveryExecutionGuard::Local)
+    admit_workflow(workflow, imports, context)
 }
 
 pub(crate) fn admit_runner_workflow(
@@ -1285,22 +1284,13 @@ pub(crate) fn admit_runner_workflow(
     imports: ResolvedImports,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_guarded_workflow(workflow, imports, context, RecoveryExecutionGuard::Runner)
-}
-
-fn admit_guarded_workflow(
-    workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
-    context: ExecutionContext,
-    guard: RecoveryExecutionGuard,
-) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    let contract = match guard {
-        RecoveryExecutionGuard::Local => WorkflowExecutionContract::General,
-        RecoveryExecutionGuard::Runner => {
-            WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1
-        }
-    };
-    admit_workflow_for(workflow, imports, context, contract, Some(guard))
+    admit_workflow_for(
+        workflow,
+        imports,
+        context,
+        WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1,
+        Some(RecoveryExecutionGuard::Runner),
+    )
 }
 
 pub(crate) fn admit_workflow(

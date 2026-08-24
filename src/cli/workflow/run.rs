@@ -14,6 +14,7 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::unix::AsyncFd;
 
 use crate::execution::AgentHarnessInstallationFailure;
@@ -37,6 +38,7 @@ use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{WorkflowExecutionResult, execute_workflow};
 use crate::execution::workflow::input::InputStaging;
+use crate::execution::workflow::invocation_accounting::InvocationAccountingLog;
 use crate::execution::workflow::local_run::{
     DurableDeadline, InitialLocalRun, LocalAttemptOwner, LocalAttemptOwnershipReleased,
     PublicationFailurePhaseV1,
@@ -50,11 +52,12 @@ use crate::execution::workflow::presentation::{
 };
 use crate::execution::workflow::presentation_feed::DisplayDeadline;
 use crate::execution::workflow::publication::{
-    LocalPublicationError, LocalPublicationPhase, WorkflowRunCancellation, WorkflowRunFinalization,
-    WorkflowRunFinalizationCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
-    WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowStepTiming,
-    prepare_attempt_result_destination, publish_prepared_workflow_result,
-    summary_disposition_matches,
+    LocalPublicationError, LocalPublicationPhase, RecoveryInvocationDiagnosticV1,
+    RecoveryInvocationStateV1, RecoveryInvocationV1, WorkflowRunCancellation,
+    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunResult,
+    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
+    WorkflowStepTiming, command_output_v1, prepare_attempt_result_destination,
+    publish_prepared_workflow_result, step_recovery_summary_v1, summary_disposition_matches,
 };
 use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve_workflow_file};
 use crate::execution::workflow::run_timing::{
@@ -467,6 +470,7 @@ pub(super) async fn execute_owned_attempt(
         None
     };
     let diagnostics = StepDiagnosticLog::default();
+    let accounting = InvocationAccountingLog::default();
     let agents = match (&agent_staging, agent_diagnostic_sessions) {
         (Some(staging), Some(diagnostic_sessions)) => {
             let maximum_log_bytes = admitted.execution().limits().maximum_step_log_bytes();
@@ -484,11 +488,12 @@ pub(super) async fn execute_owned_attempt(
                 host.stop_terminal().await;
                 return diagnose("prepare local agent runtimes");
             };
-            AgentExecution::enabled(
+            AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_directory.as_str())),
                 staging.clone(),
                 diagnostic_sessions,
                 dispatcher,
+                accounting.clone(),
             )
         }
         (None, None) => AgentExecution::Disabled,
@@ -509,7 +514,7 @@ pub(super) async fn execute_owned_attempt(
         &diagnostics,
         agents,
         SystemExecutionClock,
-        owned_run.commit_port(),
+        owned_run.commit_port(diagnostics.clone(), accounting),
         observer.clone(),
         owned_run.process_guard_registry(),
     )
@@ -529,6 +534,16 @@ pub(super) async fn execute_owned_attempt(
             return diagnose(format_args!("execute admitted local workflow: {error:?}"));
         }
     };
+    let durable_invocations = match owned_run.durable_invocations() {
+        Ok(invocations) => invocations,
+        Err(error) => {
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose(error);
+        }
+    };
     let observed_timing = observer.snapshot();
     let run_timing = match observed_run_timing(&observed_timing) {
         Some(timing) => timing,
@@ -543,9 +558,12 @@ pub(super) async fn execute_owned_attempt(
     let run = match build_run_result(
         &workflow,
         &admitted,
-        &diagnostics,
         execution,
-        observed_timing,
+        LocalRunEvidence {
+            diagnostics: &diagnostics,
+            durable_invocations: &durable_invocations,
+            timing: observed_timing,
+        },
         run_timing,
         &owned_run,
     ) {
@@ -1414,15 +1432,23 @@ fn publication_failure_phase(phase: LocalPublicationPhase) -> PublicationFailure
     }
 }
 
+struct LocalRunEvidence<'a> {
+    diagnostics: &'a StepDiagnosticLog,
+    durable_invocations: &'a [crate::execution::workflow::local_run::DurableInvocationV1],
+    timing: RunTimingSnapshot,
+}
+
 fn build_run_result(
     workflow: &ResolvedWorkflow,
     admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
-    diagnostics: &StepDiagnosticLog,
     execution: WorkflowExecutionResult<ExecutionInstant>,
-    timing: RunTimingSnapshot,
+    evidence: LocalRunEvidence<'_>,
     run_timing: WorkflowRunTiming,
     local_run: &InitialLocalRun,
 ) -> anyhow::Result<WorkflowRunResult> {
+    let diagnostics = evidence.diagnostics;
+    let durable_invocations = evidence.durable_invocations;
+    let timing = &evidence.timing;
     let cancellation = match timing.cancellation {
         None => None,
         Some((reason, deadline)) => {
@@ -1445,6 +1471,7 @@ fn build_run_result(
         }
     };
     let mut states = execution.steps;
+    let mut recoveries = execution.recoveries;
     let mut steps = Vec::with_capacity(states.len());
     for id in &workflow.definition.presentation_order {
         let state = states
@@ -1469,6 +1496,16 @@ fn build_run_result(
             }
             None => return Err(invalid_terminal_result_error()),
         };
+        let recovery_state = recoveries
+            .remove(id)
+            .ok_or_else(invalid_terminal_result_error)?;
+        let recovery = step_recovery_summary_v1(recovery_state.as_ref())
+            .map_err(|_| invalid_terminal_result_error())?;
+        let invocations = if recovery.is_some() {
+            project_recovery_invocations(id, durable_invocations, diagnostics)?
+        } else {
+            Vec::new()
+        };
         steps.push(WorkflowRunStep {
             id: id.clone(),
             role: WorkflowNodeRole::Step,
@@ -1479,6 +1516,8 @@ fn build_run_result(
             command_output: (kind == WorkflowRunStepKind::Command)
                 .then(|| diagnostics.get(id))
                 .flatten(),
+            recovery,
+            invocations,
         });
     }
     let finalization = match (
@@ -1519,6 +1558,12 @@ fn build_run_result(
                 };
                 let (kind, failure_policy) = finalizer_kind_and_policy(workflow, id)
                     .ok_or_else(invalid_terminal_result_error)?;
+                let recovery = recoveries
+                    .remove(id)
+                    .ok_or_else(invalid_terminal_result_error)?;
+                if recovery.is_some() {
+                    return Err(invalid_terminal_result_error());
+                }
                 finalizers.push(WorkflowRunStep {
                     id: id.clone(),
                     role: WorkflowNodeRole::Finalizer,
@@ -1529,6 +1574,8 @@ fn build_run_result(
                     command_output: (kind == WorkflowRunStepKind::Command)
                         .then(|| diagnostics.get(id))
                         .flatten(),
+                    recovery: None,
+                    invocations: Vec::new(),
                 });
             }
             if !retained.is_empty() {
@@ -1548,7 +1595,7 @@ fn build_run_result(
         }
         (true, Some(_)) | (false, None) => return Err(invalid_terminal_result_error()),
     };
-    if !states.is_empty() {
+    if !states.is_empty() || !recoveries.is_empty() {
         return Err(invalid_terminal_result_error());
     }
     Ok(WorkflowRunResult {
@@ -1567,6 +1614,100 @@ fn build_run_result(
         exports: execution.exports,
         export_sources: workflow.definition.exports.clone(),
     })
+}
+
+fn project_recovery_invocations(
+    step_id: &str,
+    durable: &[crate::execution::workflow::local_run::DurableInvocationV1],
+    diagnostics: &StepDiagnosticLog,
+) -> anyhow::Result<Vec<RecoveryInvocationV1>> {
+    let mut projected = Vec::new();
+    for invocation in durable
+        .iter()
+        .filter(|invocation| invocation.step_id == step_id)
+    {
+        let finished_at = invocation
+            .finished_at
+            .as_deref()
+            .ok_or_else(invalid_terminal_result_error)?;
+        let started = OffsetDateTime::parse(&invocation.started_at, &Rfc3339)
+            .map_err(|_| invalid_terminal_result_error())?;
+        let finished = OffsetDateTime::parse(finished_at, &Rfc3339)
+            .map_err(|_| invalid_terminal_result_error())?;
+        let duration = (finished - started).whole_milliseconds();
+        let duration_milliseconds =
+            u64::try_from(duration).map_err(|_| invalid_terminal_result_error())?;
+        let action = crate::execution::workflow::runtime::ActionId {
+            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(
+                invocation.invocation_id,
+            ),
+        };
+        let retained = diagnostics.get_invocation(step_id, action);
+        let command_output = retained
+            .as_ref()
+            .map(command_output_v1)
+            .transpose()
+            .map_err(|_| invalid_terminal_result_error())?;
+        if command_output.is_some() != !invocation.diagnostics.is_empty() {
+            return Err(invalid_terminal_result_error());
+        }
+        let mut invocation_diagnostics = Vec::with_capacity(invocation.diagnostics.len());
+        for diagnostic in &invocation.diagnostics {
+            let output = command_output
+                .as_ref()
+                .ok_or_else(invalid_terminal_result_error)?;
+            let stream = match diagnostic.kind {
+                crate::execution::workflow::publication::RecoveryDiagnosticKindV1::CommandStdout
+                | crate::execution::workflow::publication::RecoveryDiagnosticKindV1::AgentHarnessStdout => {
+                    output.stdout.clone()
+                }
+                crate::execution::workflow::publication::RecoveryDiagnosticKindV1::CommandStderr
+                | crate::execution::workflow::publication::RecoveryDiagnosticKindV1::AgentHarnessStderr => {
+                    output.stderr.clone()
+                }
+            };
+            if stream.retained_bytes != diagnostic.retained_bytes
+                || stream.discarded_bytes != diagnostic.discarded_bytes
+                || stream.truncated != diagnostic.truncated
+                || stream.fully_drained != diagnostic.fully_drained
+            {
+                return Err(invalid_terminal_result_error());
+            }
+            invocation_diagnostics.push(RecoveryInvocationDiagnosticV1 {
+                kind: diagnostic.kind,
+                reference: diagnostic.reference.clone(),
+                stream,
+            });
+        }
+        projected.push(RecoveryInvocationV1 {
+            invocation_id: invocation.invocation_id,
+            role: invocation.role,
+            target_execution: invocation.target_execution,
+            recovery_round: invocation.recovery_round,
+            state: match invocation.state {
+                crate::execution::workflow::local_run::DurableInvocationStateV1::Settled => {
+                    RecoveryInvocationStateV1::Settled
+                }
+                crate::execution::workflow::local_run::DurableInvocationStateV1::Cancelled => {
+                    RecoveryInvocationStateV1::Cancelled
+                }
+                crate::execution::workflow::local_run::DurableInvocationStateV1::Active => {
+                    return Err(invalid_terminal_result_error());
+                }
+            },
+            started_at: invocation.started_at.clone(),
+            finished_at: finished_at.to_owned(),
+            duration_milliseconds,
+            usage: invocation.usage,
+            diagnostics: invocation_diagnostics,
+            diagnostic_reference: invocation.diagnostic_reference.clone(),
+        });
+    }
+    if projected.is_empty() {
+        return Err(invalid_terminal_result_error());
+    }
+    projected.sort_by_key(|invocation| invocation.invocation_id);
+    Ok(projected)
 }
 
 fn finalizer_kind_and_policy(

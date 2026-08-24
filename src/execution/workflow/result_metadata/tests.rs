@@ -317,6 +317,114 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
 }
 
 #[test]
+fn recovery_version_dispatch_precedes_nested_interpretation() {
+    let mut result = result_fixture();
+    result["steps"][0]["recovery"] = json!({
+        "schemaVersion": 2,
+        "futureNestedShape": {"not": "schema one"}
+    });
+
+    assert_eq!(
+        dispatch_recovery_summary_versions(&result),
+        Err(RecoverySummaryVersionError::Unsupported)
+    );
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+}
+
+fn recovered_result_fixture() -> Value {
+    let mut result = result_fixture();
+    result["steps"][0]["recovery"] = json!({
+        "schemaVersion": 1,
+        "configuredRetries": 1,
+        "rounds": [{
+            "number": 1,
+            "failedExecution": {
+                "executionNumber": 1,
+                "invocationId": 1,
+                "failure": {
+                    "phase": "execution",
+                    "cause": { "code": "harness_failed" }
+                }
+            }
+        }],
+        "termination": {
+            "kind": "recovered",
+            "executionNumber": 2
+        }
+    });
+    result["steps"][0]["invocations"] = json!([
+        {
+            "invocationId": 1,
+            "role": "target",
+            "targetExecution": 1,
+            "state": "settled",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "finishedAt": "2026-08-02T12:01:44.1Z",
+            "durationMilliseconds": 100,
+            "usage": { "inputTokens": 1, "outputTokens": 1 }
+        },
+        {
+            "invocationId": 3,
+            "role": "target",
+            "targetExecution": 2,
+            "state": "settled",
+            "startedAt": "2026-08-02T12:01:44.2Z",
+            "finishedAt": "2026-08-02T12:01:44.3Z",
+            "durationMilliseconds": 100,
+            "usage": { "inputTokens": 1, "outputTokens": 1 }
+        }
+    ]);
+    result
+}
+
+fn handler_invocation_fixture() -> Value {
+    json!({
+        "invocationId": 2,
+        "role": "recovery_handler",
+        "recoveryRound": 1,
+        "state": "settled",
+        "startedAt": "2026-08-02T12:01:44.1Z",
+        "finishedAt": "2026-08-02T12:01:44.2Z",
+        "durationMilliseconds": 100,
+        "usage": { "inputTokens": 0, "outputTokens": 0 }
+    })
+}
+
+#[test]
+fn recovered_summary_rejects_a_handler_that_gave_up() {
+    let mut result = recovered_result_fixture();
+    result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");
+    result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+        "kind": "cmd",
+        "invocationId": 2,
+        "outcome": "gave_up",
+        "summary": "No repair was made.",
+        "reason": "The handler refused to recheck."
+    });
+    result["steps"][0]["invocations"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, handler_invocation_fixture());
+
+    assert_eq!(
+        decode(&encode(&result)),
+        Err(ResultMetadataError),
+        "gave_up is terminal and cannot authorize the target execution claimed to recover"
+    );
+}
+
+#[test]
+fn handlerless_summary_rejects_a_phantom_handler_invocation() {
+    let mut result = recovered_result_fixture();
+    result["steps"][0]["invocations"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, handler_invocation_fixture());
+
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+}
+
+#[test]
 fn accepts_consistent_alias_metadata_owned_by_the_lowest_ordinal() {
     let decoded = decode(&encode(&result_fixture())).unwrap();
 

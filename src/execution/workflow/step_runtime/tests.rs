@@ -39,8 +39,8 @@ use crate::execution::workflow::execution_root::ExecutionRootPrelaunchBoundary;
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
-    self, Action, ExportValue, Occurrence, RequestedAction, StepState, TransitionSequence,
-    WorkflowState,
+    self, Action, ActiveStepInvocation, ExportValue, Occurrence, RequestedAction, StepState,
+    TargetExecutionNumber, TransitionSequence, WorkflowState,
 };
 use crate::execution::workflow::value::CapturedValue;
 
@@ -769,6 +769,11 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
             crate::execution::workflow::runtime::StepRuntimeState {
                 state: StepState::Running,
                 current_action: Some(started_action),
+                target_execution: Some(TargetExecutionNumber::FIRST),
+                active_invocation: Some(ActiveStepInvocation::Target {
+                    execution_number: TargetExecutionNumber::FIRST,
+                }),
+                recovery: None,
             }
         );
         assert_eq!(
@@ -1044,6 +1049,9 @@ steps:
             },
             action: Action::ForceAbortStep {
                 step: "task".to_owned(),
+                active: ActiveStepInvocation::Target {
+                    execution_number: TargetExecutionNumber::FIRST,
+                },
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::ZERO),
             },
@@ -2604,7 +2612,7 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
         );
         let deadline = TestInstant(Duration::from_secs(41));
         let (start, cancel) = running_cancellation_actions(&admitted, deadline);
-        let Action::StartStep { step, inputs } = start.action else {
+        let Action::StartStep { step, inputs, .. } = start.action else {
             panic!("fixture did not produce a start action");
         };
         let Action::CancelStep {
@@ -3208,6 +3216,9 @@ async fn force_abort_of_gracefully_cancelling_command_reports_the_force_action()
             },
             action: Action::ForceAbortStep {
                 step: "task".to_owned(),
+                active: ActiveStepInvocation::Target {
+                    execution_number: TargetExecutionNumber::FIRST,
+                },
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::ZERO),
             },
@@ -4039,7 +4050,8 @@ fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
     .into_iter()
     .filter_map(|requested| match requested.action {
         Action::StartStep { step, .. } => Some((step, requested.id)),
-        Action::CaptureOutputs { .. }
+        Action::StartRecoveryHandler { .. }
+        | Action::CaptureOutputs { .. }
         | Action::CancelStep { .. }
         | Action::ForceAbortStep { .. }
         | Action::FinishRun { .. } => None,

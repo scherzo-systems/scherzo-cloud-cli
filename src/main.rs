@@ -19,6 +19,7 @@ mod error;
 mod execution;
 mod exit_code;
 mod human_auth;
+mod idempotency;
 mod process;
 mod public_id;
 mod runner;

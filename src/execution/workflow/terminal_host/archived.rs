@@ -279,6 +279,8 @@ struct ArchivedTerminalStepView {
     timing: Option<super::super::run_view_model::WorkflowRunElapsed>,
     detail: ArchivedStepDetail,
     output: ArchivedCommandOutputView,
+    recovery: Option<super::super::publication::StepRecoverySummaryV1>,
+    invocations: Vec<super::super::publication::RecoveryInvocationV1>,
 }
 
 #[derive(Clone)]
@@ -372,6 +374,8 @@ impl ArchivedTerminalStepView {
             command,
             state: archived_step_state(step.state),
             timing,
+            recovery: step.recovery,
+            invocations: step.invocations,
             detail: step.detail,
             output,
         }
@@ -420,22 +424,27 @@ impl StepProjection for ArchivedTerminalStepView {
                 let output_count = self.definition.outputs().len();
                 match &self.definition {
                     WorkflowPresentationStep::Command { .. } if output_count == 0 => {
-                        Some("exit 0".to_owned())
+                        Some(self.with_recovery_detail("exit 0".to_owned()))
                     }
-                    WorkflowPresentationStep::Command { .. } => {
-                        Some(format!("exit 0 · {}", output_count_detail(output_count)))
-                    }
+                    WorkflowPresentationStep::Command { .. } => Some(self.with_recovery_detail(
+                        format!("exit 0 · {}", output_count_detail(output_count)),
+                    )),
                     WorkflowPresentationStep::Agent { .. } if output_count != 0 => {
-                        Some(output_count_detail(output_count))
+                        Some(self.with_recovery_detail(output_count_detail(output_count)))
                     }
-                    WorkflowPresentationStep::Agent { .. } => None,
+                    WorkflowPresentationStep::Agent { .. } => self
+                        .recovery
+                        .as_ref()
+                        .map(|_| self.with_recovery_detail(String::new())),
                 }
             }
-            ArchivedStepDetail::Failed(failure) => Some(issue_detail_for_step(
-                archived_failure_detail(failure),
-                &self.definition,
-                self.state,
-            )),
+            ArchivedStepDetail::Failed(failure) => {
+                Some(self.with_recovery_detail(issue_detail_for_step(
+                    archived_failure_detail(failure),
+                    &self.definition,
+                    self.state,
+                )))
+            }
             ArchivedStepDetail::Blocked { dependency } => Some(issue_detail_for_step(
                 format!("blocked by {}", safe_text(dependency)),
                 &self.definition,
@@ -451,7 +460,7 @@ impl StepProjection for ArchivedTerminalStepView {
                 Some("finalizer_trigger_not_selected".to_owned())
             }
             ArchivedStepDetail::Cancelled { reason } => {
-                Some(archived_cancellation_reason(*reason).to_owned())
+                Some(self.with_recovery_detail(archived_cancellation_reason(*reason).to_owned()))
             }
         }
     }
@@ -467,6 +476,18 @@ impl StepProjection for ArchivedTerminalStepView {
     }
 
     fn inspector_fact(&self) -> Option<InspectorField> {
+        if self.recovery.is_some() {
+            return Some(InspectorField::new(
+                "recovery",
+                self.with_recovery_detail(String::new()),
+                match self.state {
+                    StepStateKind::Succeeded => Tone::Success,
+                    StepStateKind::Failed => Tone::Failure,
+                    StepStateKind::Cancelled => Tone::Blocked,
+                    _ => Tone::Neutral,
+                },
+            ));
+        }
         match &self.detail {
             ArchivedStepDetail::Succeeded => Some(InspectorField::new(
                 "outputs",
@@ -517,6 +538,34 @@ impl StepProjection for ArchivedTerminalStepView {
 
     fn show_empty_outputs(&self) -> bool {
         false
+    }
+}
+
+impl ArchivedTerminalStepView {
+    fn with_recovery_detail(&self, base: String) -> String {
+        let Some(recovery) = &self.recovery else {
+            return base;
+        };
+        let terminal_failure = match &self.detail {
+            ArchivedStepDetail::Failed(failure) => Some(archived_failure_detail(failure)),
+            _ => None,
+        };
+        let termination = super::super::presentation::terminal_recovery_detail(
+            recovery,
+            terminal_failure.as_deref(),
+        );
+        let usage = super::super::publication::total_recovery_usage(&self.invocations);
+        let recovery_detail = format!(
+            "{termination} · {} invocations · usage input {} output {}",
+            self.invocations.len(),
+            usage.input_tokens,
+            usage.output_tokens
+        );
+        if base.is_empty() {
+            recovery_detail
+        } else {
+            format!("{base} · {recovery_detail}")
+        }
     }
 }
 
@@ -1905,6 +1954,8 @@ mod tests {
                     duration: Some(Duration::from_secs(1)),
                     detail: ArchivedStepDetail::Succeeded,
                     command_output,
+                    recovery: None,
+                    invocations: Vec::new(),
                 },
                 ArchivedStep {
                     id: "verify".to_owned(),
@@ -1915,6 +1966,8 @@ mod tests {
                     duration: Some(Duration::from_secs(2)),
                     detail: ArchivedStepDetail::Failed(failure),
                     command_output: None,
+                    recovery: None,
+                    invocations: Vec::new(),
                 },
             ],
         }

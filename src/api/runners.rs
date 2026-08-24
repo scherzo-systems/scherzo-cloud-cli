@@ -30,7 +30,6 @@ pub(crate) type RunnerRegistrationList = models::RunnerRegistrationList;
 pub(crate) type RunnerActivation = models::RunnerActivation;
 pub(crate) type RunnerActivationList = models::RunnerActivationList;
 pub(crate) type RunnerActivationState = models::runner_activation::State;
-pub(crate) type RunnerActivationArtifact = models::RunnerActivationArtifact;
 pub(crate) type RunnerActivationIssuance = models::RunnerActivationIssuance;
 pub(crate) type RunnerCredential = models::RunnerCredential;
 pub(crate) type RunnerCredentialList = models::RunnerCredentialList;

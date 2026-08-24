@@ -8,12 +8,11 @@ use clap::Args;
 use serde::Serialize;
 // jscpd:ignore-end
 
-use crate::api::{
-    HttpClient, HumanPrincipal, SignupError, SignupOutcome, generate_idempotency_key, signup_human,
-};
+use crate::api::{HttpClient, HumanPrincipal, SignupError, SignupOutcome, signup_human};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
+use crate::idempotency::generate_idempotency_key;
 
 use super::super::principal::PrincipalResult;
 

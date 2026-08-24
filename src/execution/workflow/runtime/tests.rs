@@ -6,7 +6,7 @@ use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports,
-    admit_workflow,
+    admit_runner_workflow, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -64,6 +64,7 @@ fn definition(
                             .iter()
                             .map(|output| (*output).to_owned())
                             .collect(),
+                        recovery: None,
                         when: BTreeSet::new(),
                     },
                 )
@@ -85,6 +86,7 @@ fn definition(
             })
             .collect(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
+        maximum_transitions: 10_000,
     }
 }
 
@@ -182,6 +184,7 @@ fn start_action(value: u64, step: &str) -> TestAction {
         id: action_id(value),
         action: Action::StartStep {
             step: step.to_owned(),
+            execution_number: TargetExecutionNumber::FIRST,
             inputs: BTreeMap::new(),
         },
     }
@@ -217,6 +220,9 @@ fn cancel_action(
         id: action_id(value),
         action: Action::CancelStep {
             step: step.to_owned(),
+            active: ActiveStepInvocation::Target {
+                execution_number: TargetExecutionNumber::FIRST,
+            },
             reason,
             deadline: deadline(arbiter_tick),
         },
@@ -297,6 +303,7 @@ fn finalizer_definition(
                     prerequisites: Arc::from([]),
                     inputs: BTreeMap::new(),
                     declared_outputs: outputs.iter().map(|output| (*output).to_owned()).collect(),
+                    recovery: None,
                     when: BTreeSet::new(),
                 },
             )
@@ -341,6 +348,7 @@ fn finalizer_definition(
                         })
                         .collect(),
                     declared_outputs: BTreeSet::new(),
+                    recovery: None,
                     when: when.iter().copied().collect(),
                 },
             )
@@ -353,6 +361,7 @@ fn finalizer_definition(
         finalizer_presentation_order: finalizers.iter().map(|(id, ..)| (*id).to_owned()).collect(),
         exports: BTreeMap::new(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
+        maximum_transitions: 10_000,
     }
 }
 
@@ -2955,7 +2964,7 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
     );
     let [
         RequestedAction {
-            action: Action::StartStep { step, inputs },
+            action: Action::StartStep { step, inputs, .. },
             ..
         },
     ] = initialized.actions.as_slice()
@@ -3420,4 +3429,1031 @@ fn force_abort_allocates_one_distinct_containment_action_per_active_finalizer() 
             .iter()
             .all(|id| id.transition_sequence.get() > (1_u64 << 63))
     );
+}
+
+fn configure_recovery(
+    definition: &mut RuntimeDefinition,
+    step: &str,
+    retries: u8,
+    handler_kind: Option<RecoveryHandlerKind>,
+    admitted_ceiling: u64,
+) {
+    definition.steps.get_mut(step).unwrap().recovery = Some(RuntimeRecovery {
+        retries,
+        handler_kind,
+    });
+    definition.maximum_transitions = admitted_ceiling;
+}
+
+fn recovery_round(value: u8) -> RecoveryRoundNumber {
+    RecoveryRoundNumber(value)
+}
+
+#[test]
+fn recovery_trace_handlerless_recheck_commits_only_execution_two_outputs() {
+    let mut graph = definition(&[("fetch", &[], &["result"])], &[], 1);
+    configure_recovery(&mut graph, "fetch", 2, None, 18);
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let first_action = initialized.actions[0].id;
+    let Action::StartStep {
+        execution_number, ..
+    } = initialized.actions[0].action
+    else {
+        panic!("recovery target did not start");
+    };
+    assert_eq!(execution_number.get(), 1);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".into(),
+            action: first_action,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "fetch".into(),
+            action: first_action,
+            cause: "exit 75".into(),
+        },
+    );
+    assert_eq!(state.steps["fetch"].state, StepState::Starting);
+    assert_eq!(state.steps["fetch"].target_execution.unwrap().get(), 2);
+    assert!(matches!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ));
+    assert!(provisional.events.iter().all(|event| !matches!(
+        event,
+        TransitionEvent::Step {
+            to: StepStateKind::Failed,
+            ..
+        }
+    )));
+    let recovery = state.steps["fetch"].recovery.as_ref().unwrap();
+    assert_eq!(recovery.rounds.len(), 1);
+    assert_eq!(recovery.rounds[0].failed_execution.cause, "exit 75");
+    assert!(recovery.rounds[0].handler.is_none());
+    assert!(recovery.terminal_disposition.is_none());
+    let [recheck] = provisional.actions.as_slice() else {
+        panic!("handlerless recovery did not authorize exactly one recheck");
+    };
+    let Action::StartStep {
+        execution_number,
+        inputs,
+        ..
+    } = &recheck.action
+    else {
+        panic!("handlerless recovery authorized a non-target action");
+    };
+    assert_eq!(execution_number.get(), 2);
+    assert!(inputs.is_empty());
+    assert_ne!(recheck.id, first_action);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".into(),
+            action: recheck.id,
+        },
+    );
+    let capture = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "fetch".into(),
+            action: recheck.id,
+            provisional: "execution-two-candidate".into(),
+        },
+    );
+    let capture_action = capture.actions[0].id;
+    assert_eq!(
+        capture.actions[0].action,
+        Action::CaptureOutputs {
+            step: "fetch".into(),
+            provisional: "execution-two-candidate".into(),
+        }
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::OutputsCaptured {
+            step: "fetch".into(),
+            action: capture_action,
+            outputs: output_set(&[("result", "execution-two-output")]),
+        },
+    );
+
+    assert_eq!(
+        state.steps["fetch"].state,
+        StepState::Succeeded {
+            outputs: output_set(&[("result", "execution-two-output")]),
+        }
+    );
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert_eq!(
+        state.steps["fetch"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .terminal_disposition,
+        Some(RecoveryTerminalDisposition::Recovered {
+            execution_number: TargetExecutionNumber(2),
+        })
+    );
+    assert!(ordinary_issues(&state).is_empty());
+    assert!(state.last_transition_sequence.get() <= 18);
+}
+
+#[test]
+fn recovery_trace_gave_up_preserves_the_target_failure_and_starts_no_recheck() {
+    let mut graph = definition(&[("verify", &[], &[])], &[], 1);
+    configure_recovery(
+        &mut graph,
+        "verify",
+        1,
+        Some(RecoveryHandlerKind::Command),
+        13,
+    );
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let target = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "verify".into(),
+            action: target,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "verify".into(),
+            action: target,
+            cause: "verification failed".into(),
+        },
+    );
+    let [handler] = provisional.actions.as_slice() else {
+        panic!("configured recovery did not authorize one handler");
+    };
+    let Action::StartRecoveryHandler {
+        round,
+        kind,
+        history,
+        ..
+    } = &handler.action
+    else {
+        panic!("configured recovery authorized the wrong action");
+    };
+    assert_eq!(*round, recovery_round(1));
+    assert_eq!(*kind, RecoveryHandlerKind::Command);
+    assert_eq!(
+        history,
+        &state.steps["verify"].recovery.as_ref().unwrap().rounds
+    );
+    assert_eq!(
+        state.steps["verify"].state.kind(),
+        StepStateKind::Recovering
+    );
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerStarted {
+            step: "verify".into(),
+            round: recovery_round(1),
+            action: handler.id,
+        },
+    );
+    let wrong_round = reduce(
+        &state,
+        Occurrence::RecoveryHandlerCompleted {
+            step: "verify".into(),
+            round: recovery_round(2),
+            action: handler.id,
+            decision: RecoveryDecision::gave_up("wrong", "wrong round"),
+        },
+    );
+    assert_noop(&state, &wrong_round);
+
+    let gave_up = reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerCompleted {
+            step: "verify".into(),
+            round: recovery_round(1),
+            action: handler.id,
+            decision: RecoveryDecision::gave_up("cannot repair", "source is invalid"),
+        },
+    );
+    assert_eq!(
+        state.steps["verify"].state,
+        StepState::Failed {
+            phase: FailurePhase::Execution,
+            cause: "verification failed".into(),
+        }
+    );
+    let WorkflowState::Failed {
+        primary_failure,
+        later_cancellation: None,
+    } = &state.workflow
+    else {
+        panic!("gave_up did not settle a required failure");
+    };
+    assert_eq!(primary_failure.cause, "verification failed");
+    assert_eq!(
+        state.steps["verify"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .terminal_disposition,
+        Some(RecoveryTerminalDisposition::GaveUp {
+            round: recovery_round(1),
+        })
+    );
+    assert!(gave_up.actions.iter().all(|action| !matches!(
+        action.action,
+        Action::StartStep { .. } | Action::StartRecoveryHandler { .. }
+    )));
+    assert_eq!(ordinary_issues(&state).len(), 1);
+}
+
+#[test]
+fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
+    let mut graph = definition(&[("compile", &[], &[])], &[], 1);
+    configure_recovery(&mut graph, "compile", 1, None, 13);
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let first = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "compile".into(),
+            action: first,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "compile".into(),
+            action: first,
+            cause: "first failure".into(),
+        },
+    );
+    assert!(provisional.events.iter().all(|event| !matches!(
+        event,
+        TransitionEvent::Workflow {
+            to: WorkflowState::Executing {
+                gate: SchedulingGate::FailureStopped { .. },
+            },
+            ..
+        }
+    )));
+    let second = provisional.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "compile".into(),
+            action: second,
+        },
+    );
+    let exhausted = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "compile".into(),
+            action: second,
+            cause: "latest failure".into(),
+        },
+    );
+    let WorkflowState::Failed {
+        primary_failure,
+        later_cancellation: None,
+    } = &state.workflow
+    else {
+        panic!("required exhaustion did not fail the workflow");
+    };
+    assert_eq!(primary_failure.cause, "latest failure");
+    assert_eq!(
+        state.steps["compile"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .terminal_disposition,
+        Some(RecoveryTerminalDisposition::Exhausted {
+            execution_number: TargetExecutionNumber(2),
+        })
+    );
+    assert_eq!(
+        exhausted
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                TransitionEvent::Workflow {
+                    to: WorkflowState::Executing {
+                        gate: SchedulingGate::FailureStopped { .. },
+                    },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(ordinary_issues(&state).len(), 1);
+}
+
+#[test]
+fn recovery_trace_advisory_exhaustion_releases_control_only_after_terminal_failure() {
+    let mut graph = definition(&[("lint", &[], &[]), ("package", &["lint"], &[])], &[], 1);
+    graph.steps.get_mut("lint").unwrap().failure_policy = FailurePolicy::Advisory;
+    configure_recovery(&mut graph, "lint", 1, None, 18);
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let first = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "lint".into(),
+            action: first,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".into(),
+            action: first,
+            cause: "lint one".into(),
+        },
+    );
+    assert_eq!(state.steps["package"].state, StepState::Pending);
+    assert_eq!(provisional.actions.len(), 1);
+    let second = provisional.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "lint".into(),
+            action: second,
+        },
+    );
+    let exhausted = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".into(),
+            action: second,
+            cause: "lint two".into(),
+        },
+    );
+    assert!(matches!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ));
+    assert_eq!(state.steps["lint"].state.kind(), StepStateKind::Failed);
+    assert_eq!(state.steps["package"].state.kind(), StepStateKind::Starting);
+    let [package] = exhausted.actions.as_slice() else {
+        panic!("advisory terminal failure did not release its control consumer");
+    };
+    assert!(matches!(&package.action, Action::StartStep { step, .. } if step == "package"));
+    let issues = ordinary_issues(&state);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].step_id, "lint");
+    assert_eq!(issues[0].failure_policy, FailurePolicy::Advisory);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "package".into(),
+            action: package.id,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "package".into(),
+            action: package.id,
+            provisional: String::new(),
+        },
+    );
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+}
+
+#[test]
+fn recovery_trace_handler_start_failure_stops_without_retrying_the_handler() {
+    let mut graph = definition(&[("verify", &[], &[])], &[], 1);
+    configure_recovery(
+        &mut graph,
+        "verify",
+        2,
+        Some(RecoveryHandlerKind::Command),
+        18,
+    );
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let target = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "verify".into(),
+            action: target,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "verify".into(),
+            action: target,
+            cause: "target failure".into(),
+        },
+    );
+    let handler = provisional.actions[0].id;
+    let stopped = reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerStartFailed {
+            step: "verify".into(),
+            round: recovery_round(1),
+            action: handler,
+            cause: "handler launch failure".into(),
+        },
+    );
+    assert_eq!(state.steps["verify"].state.kind(), StepStateKind::Failed);
+    assert_eq!(
+        state.steps["verify"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .terminal_disposition,
+        Some(RecoveryTerminalDisposition::HandlerFailed {
+            round: recovery_round(1),
+            phase: RecoveryHandlerFailurePhase::Start,
+        })
+    );
+    assert!(stopped.actions.iter().all(|action| !matches!(
+        action.action,
+        Action::StartStep { .. } | Action::StartRecoveryHandler { .. }
+    )));
+    let recovery = state.steps["verify"].recovery.as_ref().unwrap();
+    assert_eq!(recovery.rounds.len(), 1);
+    assert!(matches!(
+        recovery.rounds[0].handler.as_ref().unwrap().outcome,
+        RecoveryHandlerOutcome::Failed {
+            phase: RecoveryHandlerFailurePhase::Start,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn recovery_trace_agent_handler_execution_failure_preserves_target_precedence() {
+    let mut graph = definition(&[("verify", &[], &[])], &[], 1);
+    configure_recovery(
+        &mut graph,
+        "verify",
+        2,
+        Some(RecoveryHandlerKind::Agent),
+        18,
+    );
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let target = initialized.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "verify".into(),
+            action: target,
+        },
+    );
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "verify".into(),
+            action: target,
+            cause: "target failure".into(),
+        },
+    );
+    let handler = provisional.actions[0].id;
+    assert!(matches!(
+        provisional.actions[0].action,
+        Action::StartRecoveryHandler {
+            kind: RecoveryHandlerKind::Agent,
+            ..
+        }
+    ));
+    reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerStarted {
+            step: "verify".into(),
+            round: recovery_round(1),
+            action: handler,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerExecutionFailed {
+            step: "verify".into(),
+            round: recovery_round(1),
+            action: handler,
+            cause: "handler protocol failure".into(),
+        },
+    );
+    let WorkflowState::Failed {
+        primary_failure,
+        later_cancellation: None,
+    } = &state.workflow
+    else {
+        panic!("handler failure did not settle the required target");
+    };
+    assert_eq!(primary_failure.cause, "target failure");
+    assert_eq!(
+        state.steps["verify"].state,
+        StepState::Failed {
+            phase: FailurePhase::Execution,
+            cause: "target failure".into(),
+        }
+    );
+    let recovery = state.steps["verify"].recovery.as_ref().unwrap();
+    assert!(matches!(
+        recovery.rounds[0].handler.as_ref().unwrap().outcome,
+        RecoveryHandlerOutcome::Failed {
+            phase: RecoveryHandlerFailurePhase::Execution,
+            ref cause,
+        } if cause == "handler protocol failure"
+    ));
+}
+
+#[test]
+fn recovery_trace_cancellation_preempts_all_five_active_phases() {
+    #[derive(Clone, Copy)]
+    enum Phase {
+        TargetStart,
+        TargetExecution,
+        TargetCapture,
+        HandlerStart,
+        HandlerExecution,
+    }
+
+    for phase in [
+        Phase::TargetStart,
+        Phase::TargetExecution,
+        Phase::TargetCapture,
+        Phase::HandlerStart,
+        Phase::HandlerExecution,
+    ] {
+        let mut graph = definition(&[("verify", &[], &["result"])], &[], 1);
+        configure_recovery(
+            &mut graph,
+            "verify",
+            1,
+            Some(RecoveryHandlerKind::Command),
+            13,
+        );
+        let initialized = initialize_test(graph);
+        let mut state = initialized.state;
+        let target = initialized.actions[0].id;
+        let (active_action, expected_active, late) = match phase {
+            Phase::TargetStart => (
+                target,
+                ActiveStepInvocation::Target {
+                    execution_number: TargetExecutionNumber::FIRST,
+                },
+                Occurrence::StepStartFailed {
+                    step: "verify".into(),
+                    action: target,
+                    cause: "late start failure".into(),
+                },
+            ),
+            Phase::TargetExecution => {
+                reduce_and_advance(
+                    &mut state,
+                    Occurrence::StepStarted {
+                        step: "verify".into(),
+                        action: target,
+                    },
+                );
+                (
+                    target,
+                    ActiveStepInvocation::Target {
+                        execution_number: TargetExecutionNumber::FIRST,
+                    },
+                    Occurrence::StepExecutionFailed {
+                        step: "verify".into(),
+                        action: target,
+                        cause: "late execution failure".into(),
+                    },
+                )
+            }
+            Phase::TargetCapture => {
+                reduce_and_advance(
+                    &mut state,
+                    Occurrence::StepStarted {
+                        step: "verify".into(),
+                        action: target,
+                    },
+                );
+                let capture = reduce_and_advance(
+                    &mut state,
+                    Occurrence::StepExecutionCompleted {
+                        step: "verify".into(),
+                        action: target,
+                        provisional: "candidate".into(),
+                    },
+                );
+                let capture_action = capture.actions[0].id;
+                (
+                    capture_action,
+                    ActiveStepInvocation::Target {
+                        execution_number: TargetExecutionNumber::FIRST,
+                    },
+                    Occurrence::OutputCaptureFailed {
+                        step: "verify".into(),
+                        action: capture_action,
+                        cause: "late capture failure".into(),
+                    },
+                )
+            }
+            Phase::HandlerStart | Phase::HandlerExecution => {
+                reduce_and_advance(
+                    &mut state,
+                    Occurrence::StepStarted {
+                        step: "verify".into(),
+                        action: target,
+                    },
+                );
+                let recovery = reduce_and_advance(
+                    &mut state,
+                    Occurrence::StepExecutionFailed {
+                        step: "verify".into(),
+                        action: target,
+                        cause: "provisional target failure".into(),
+                    },
+                );
+                let handler = recovery.actions[0].id;
+                if matches!(phase, Phase::HandlerExecution) {
+                    reduce_and_advance(
+                        &mut state,
+                        Occurrence::RecoveryHandlerStarted {
+                            step: "verify".into(),
+                            round: recovery_round(1),
+                            action: handler,
+                        },
+                    );
+                }
+                let late = if matches!(phase, Phase::HandlerStart) {
+                    Occurrence::RecoveryHandlerStartFailed {
+                        step: "verify".into(),
+                        round: recovery_round(1),
+                        action: handler,
+                        cause: "late handler start failure".into(),
+                    }
+                } else {
+                    Occurrence::RecoveryHandlerCompleted {
+                        step: "verify".into(),
+                        round: recovery_round(1),
+                        action: handler,
+                        decision: RecoveryDecision::recheck("late", "cancelled"),
+                    }
+                };
+                (
+                    handler,
+                    ActiveStepInvocation::RecoveryHandler {
+                        round: recovery_round(1),
+                    },
+                    late,
+                )
+            }
+        };
+        assert_eq!(state.steps["verify"].current_action, Some(active_action));
+        let cancelled = reduce_and_advance(
+            &mut state,
+            Occurrence::CancellationRequested {
+                reason: CancellationReason::UserRequest,
+                deadline: deadline(90),
+            },
+        );
+        let [cancel] = cancelled.actions.as_slice() else {
+            panic!("cancellation did not address exactly one active role");
+        };
+        assert_eq!(
+            cancel.action,
+            Action::CancelStep {
+                step: "verify".into(),
+                active: expected_active,
+                reason: CancellationReason::UserRequest,
+                deadline: deadline(90),
+            }
+        );
+        assert_eq!(
+            state.steps["verify"].state.kind(),
+            StepStateKind::Cancelling
+        );
+        let stale = reduce(&state, late);
+        assert_noop(&state, &stale);
+        let quiesced = reduce_and_advance(
+            &mut state,
+            Occurrence::StepQuiesced {
+                step: "verify".into(),
+                action: cancel.id,
+            },
+        );
+        assert_eq!(state.steps["verify"].state.kind(), StepStateKind::Cancelled);
+        assert_eq!(
+            state.workflow,
+            WorkflowState::Cancelled {
+                reason: CancellationReason::UserRequest,
+            }
+        );
+        assert!(quiesced.actions.iter().all(|action| !matches!(
+            action.action,
+            Action::StartStep { .. } | Action::StartRecoveryHandler { .. }
+        )));
+        let recovery = state.steps["verify"].recovery.as_ref().unwrap();
+        if matches!(phase, Phase::HandlerStart | Phase::HandlerExecution) {
+            assert_eq!(
+                recovery.terminal_disposition,
+                Some(RecoveryTerminalDisposition::Cancelled {
+                    round: recovery_round(1),
+                    active: expected_active,
+                })
+            );
+            assert!(matches!(
+                recovery.rounds[0].handler.as_ref().unwrap().outcome,
+                RecoveryHandlerOutcome::Cancelled
+            ));
+        } else {
+            assert!(recovery.rounds.is_empty());
+            assert!(recovery.terminal_disposition.is_none());
+        }
+    }
+}
+
+#[test]
+fn recovery_trace_output_capture_failure_only_authorizes_a_full_target_rerun() {
+    let mut graph = finalizer_definition(
+        &[("build", FailurePolicy::Required, &[], &[], &["artifact"])],
+        &[(
+            "cleanup",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[("context", "finalization.context")],
+            &[],
+        )],
+        1,
+    );
+    configure_recovery(
+        &mut graph,
+        "build",
+        1,
+        Some(RecoveryHandlerKind::Command),
+        16,
+    );
+    let initialized = initialize_test(graph);
+    let mut state = initialized.state;
+    let first = initialized.actions[0].id;
+    let first_inputs = match &initialized.actions[0].action {
+        Action::StartStep { inputs, .. } => inputs.clone(),
+        _ => panic!("build target did not start"),
+    };
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "build".into(),
+            action: first,
+        },
+    );
+    let capture = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "build".into(),
+            action: first,
+            provisional: "released-candidate".into(),
+        },
+    );
+    let capture_action = capture.actions[0].id;
+    let provisional = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputCaptureFailed {
+            step: "build".into(),
+            action: capture_action,
+            cause: "capture failed after cleanup".into(),
+        },
+    );
+    assert_eq!(state.steps["cleanup"].state, StepState::Pending);
+    assert!(matches!(
+        provisional.actions.as_slice(),
+        [RequestedAction {
+            action: Action::StartRecoveryHandler { .. },
+            ..
+        }]
+    ));
+    assert!(provisional.actions.iter().all(|action| !matches!(
+        action.action,
+        Action::CaptureOutputs { .. } | Action::StartStep { .. }
+    )));
+    let recovery = state.steps["build"].recovery.as_ref().unwrap();
+    assert_eq!(
+        recovery.rounds[0].failed_execution.phase,
+        FailurePhase::OutputCapture
+    );
+    let handler = provisional.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerStarted {
+            step: "build".into(),
+            round: recovery_round(1),
+            action: handler,
+        },
+    );
+    let recheck = reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerCompleted {
+            step: "build".into(),
+            round: recovery_round(1),
+            action: handler,
+            decision: RecoveryDecision::recheck("workspace repaired", "rerun target"),
+        },
+    );
+    let [second] = recheck.actions.as_slice() else {
+        panic!("recheck did not authorize one complete target");
+    };
+    let Action::StartStep {
+        execution_number,
+        inputs,
+        ..
+    } = &second.action
+    else {
+        panic!("recheck authorized capture-only work");
+    };
+    assert_eq!(execution_number.get(), 2);
+    assert_eq!(inputs, &first_inputs);
+    assert_ne!(second.id, first);
+    assert_ne!(second.id, capture_action);
+    assert_eq!(state.steps["cleanup"].state, StepState::Pending);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "build".into(),
+            action: second.id,
+        },
+    );
+    let second_capture = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "build".into(),
+            action: second.id,
+            provisional: "fresh-candidate".into(),
+        },
+    );
+    let final_boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputsCaptured {
+            step: "build".into(),
+            action: second_capture.actions[0].id,
+            outputs: output_set(&[("artifact", "fresh-output")]),
+        },
+    );
+    assert!(matches!(state.workflow, WorkflowState::Finalizing { .. }));
+    assert_eq!(state.steps["cleanup"].state.kind(), StepStateKind::Starting);
+    let [
+        RequestedAction {
+            action: Action::StartStep { step, inputs, .. },
+            ..
+        },
+    ] = final_boundary.actions.as_slice()
+    else {
+        panic!("finalizer did not wait for terminal recovery success");
+    };
+    assert_eq!(step, "cleanup");
+    let ActionInput::FinalizationContext(context) = &inputs["context"] else {
+        panic!("finalizer context was not committed at ordinary quiescence");
+    };
+    assert_eq!(
+        context.as_ref(),
+        br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#
+    );
+    assert!(state.last_transition_sequence.get() <= 16);
+}
+
+#[test]
+fn cloud_output_capture_recovery_stays_within_its_admitted_transition_ceiling() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        r#"schemaVersion: 1
+steps:
+  build:
+    kind: cmd
+    recovery:
+      retries: 2
+      handler:
+        kind: cmd
+        command:
+          argv: ["true"]
+    command:
+      argv: ["false"]
+    outputs:
+      artifact:
+        kind: file
+        path: artifact.txt
+        mediaType: text/plain
+"#,
+    )
+    .unwrap();
+    let admitted = admit_runner_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedImports::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionRootLifecycle::CallerOwnedRetained,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+    assert_eq!(admitted.capacity().maximum_transitions, 17);
+
+    let initialized = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let mut state = initialized.state;
+    let mut target = initialized.actions[0].id;
+    for round in 1_u8..=2 {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: "build".into(),
+                action: target,
+            },
+        );
+        let capture = reduce_and_advance(
+            &mut state,
+            Occurrence::StepExecutionCompleted {
+                step: "build".into(),
+                action: target,
+                provisional: format!("candidate-{round}"),
+            },
+        );
+        let recovering = reduce_and_advance(
+            &mut state,
+            Occurrence::OutputCaptureFailed {
+                step: "build".into(),
+                action: capture.actions[0].id,
+                cause: format!("capture failure {round}"),
+            },
+        );
+        let handler = recovering.actions[0].id;
+        reduce_and_advance(
+            &mut state,
+            Occurrence::RecoveryHandlerStarted {
+                step: "build".into(),
+                round: recovery_round(round),
+                action: handler,
+            },
+        );
+        let recheck = reduce_and_advance(
+            &mut state,
+            Occurrence::RecoveryHandlerCompleted {
+                step: "build".into(),
+                round: recovery_round(round),
+                action: handler,
+                decision: RecoveryDecision::recheck("repaired", "rerun target"),
+            },
+        );
+        target = recheck.actions[0].id;
+    }
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "build".into(),
+            action: target,
+        },
+    );
+    let capture = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "build".into(),
+            action: target,
+            provisional: "terminal-candidate".into(),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::OutputCaptureFailed {
+            step: "build".into(),
+            action: capture.actions[0].id,
+            cause: "terminal capture failure".into(),
+        },
+    );
+
+    assert!(matches!(state.workflow, WorkflowState::Failed { .. }));
+    assert!(state.last_transition_sequence.get() <= 17);
 }

@@ -70,7 +70,7 @@ impl LeafOptions {
     where
         O: HumanCredentialOutcome,
     {
-        let idempotency_key = crate::api::generate_idempotency_key()
+        let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate organization mutation request identity")?;
         self.execute(
             deployment,

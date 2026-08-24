@@ -487,7 +487,7 @@ mod tests {
     use crate::runner::control_protocol::{AssignmentCounts, Response, decode_response};
     use crate::runner::credential::test_credential;
     use crate::runner::service::config::Config;
-    use crate::runner::service::test_support::healthy_wall_clock;
+    use crate::runner::service::test_support::fixture_lease_clock;
 
     async fn exchange(request: &[u8]) -> Vec<u8> {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -500,7 +500,7 @@ mod tests {
         let assignments = Arc::new(Mutex::new(AssignmentManager::new(
             &config,
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            healthy_wall_clock(),
+            fixture_lease_clock(),
         )));
         let status = Arc::new(LiveStatus::new(
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),

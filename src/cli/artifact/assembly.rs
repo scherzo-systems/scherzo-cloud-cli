@@ -14,7 +14,9 @@ use crate::api::{
 };
 use crate::public_id::valid_typed_id;
 
-use super::portable_artifact::{PortableArtifactValidationFailure, validate_portable_artifact_set};
+use crate::execution::workflow::portable_artifact::{
+    PortableArtifactValidationFailure, validate_portable_artifact_set,
+};
 
 const INVENTORY_PAGE_LIMIT: u16 = 200;
 const CAPABILITY_BATCH_SIZE: usize = 100;
@@ -709,7 +711,7 @@ mod tests {
             },
             "commandOutputPolicy": {
                 "encoding": "base64",
-                "maximumRetainedBytesPerStream": super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+                "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
             },
             "outcome": "succeeded",
             "steps": [{

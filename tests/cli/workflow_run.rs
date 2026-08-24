@@ -4807,7 +4807,7 @@ fn codex_app_server_fixture() {
                 &mut output,
                 CODEX_TURN_ID,
                 "invalid-result",
-                r#"{"result":-1}"#,
+                r#"{"result":"-1"}"#,
             );
             send_codex_turn_completed(&mut output, CODEX_TURN_ID, "completed", vec![invalid], None);
             let correction = read_codex_client_frame(&mut input);
@@ -4844,7 +4844,7 @@ fn codex_app_server_fixture() {
                 &mut output,
                 CODEX_CORRECTION_TURN_ID,
                 "valid-result",
-                r#"{"result":7}"#,
+                r#"{"result":"7"}"#,
             );
             send_codex_turn_completed(
                 &mut output,

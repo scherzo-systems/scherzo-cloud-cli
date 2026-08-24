@@ -45,6 +45,7 @@ const DIAGNOSTIC_CODES: &[&str] = &[
     "result_encoding_invalid",
     "result_json_invalid",
     "result_schema_unsupported",
+    "recovery_schema_unsupported",
     "result_schema_invalid",
     "exports_directory_missing",
     "exports_directory_symbolic_link",
@@ -389,6 +390,9 @@ fn diagnostic_message(code: &str) -> &'static str {
         "result_encoding_invalid" => "result.json does not use the required UTF-8 encoding.",
         "result_json_invalid" => "result.json is not one complete unique-member JSON value.",
         "result_schema_unsupported" => "result.json uses an unsupported schema version.",
+        "recovery_schema_unsupported" => {
+            "result.json uses an unsupported recovery summary schema version."
+        }
         "result_schema_invalid" => "result.json violates the portable workflow result contract.",
         "exports_directory_missing" => "The artifact set does not contain exports.",
         "exports_directory_symbolic_link" => "exports is a symbolic link.",
@@ -905,6 +909,10 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
             diagnostics.result("result_schema_unsupported", Some("/schemaVersion"));
         }
         _ => diagnostics.result("result_schema_invalid", Some("/schemaVersion")),
+    }
+    if supported_schema && result_metadata::dispatch_recovery_summary_versions(&document).is_err() {
+        diagnostics.result("recovery_schema_unsupported", Some("/steps"));
+        supported_schema = false;
     }
     if supported_schema && result_metadata::validate_document_envelope(&mut document).is_err() {
         diagnostics.result("result_schema_invalid", None);

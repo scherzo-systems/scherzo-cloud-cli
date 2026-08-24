@@ -34,7 +34,7 @@ use super::document::{FailurePolicy, Output as WorkflowOutput};
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
     PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
-    finalization_trigger, header_timestamp, human_duration, shell_quote,
+    finalization_trigger, header_timestamp, human_duration, recovery_progress_detail, shell_quote,
     shell_quote_visible_argument, step_kind, visible_text,
 };
 use super::presentation_feed::{
@@ -2458,6 +2458,23 @@ fn inspector_timing<Step: StepProjection>(
 
 fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<InspectorField> {
     match fact? {
+        ObservedStepTransition::Recovery {
+            active,
+            configured_rounds,
+            handler_kind,
+            handler_state,
+            decision,
+        } => Some(InspectorField::new(
+            "recovery",
+            recovery_progress_detail(
+                *active,
+                *configured_rounds,
+                *handler_kind,
+                *handler_state,
+                *decision,
+            ),
+            Tone::Active,
+        )),
         ObservedStepTransition::Failed { phase, cause } => Some(InspectorField::new(
             "failure",
             failure_detail(*phase, cause),
@@ -2855,6 +2872,19 @@ impl StepColumns {
 
 fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
     match &step.fact {
+        Some(ObservedStepTransition::Recovery {
+            active,
+            configured_rounds,
+            handler_kind,
+            handler_state,
+            decision,
+        }) => Some(recovery_progress_detail(
+            *active,
+            *configured_rounds,
+            *handler_kind,
+            *handler_state,
+            *decision,
+        )),
         Some(ObservedStepTransition::OutputsCommitted { outputs }) => {
             Some(output_count_detail(outputs.len()))
         }
@@ -3426,6 +3456,7 @@ fn empty_log_message(state: StepStateKind) -> &'static str {
         StepStateKind::Starting
         | StepStateKind::Running
         | StepStateKind::CapturingOutputs
+        | StepStateKind::Recovering
         | StepStateKind::Cancelling => "Waiting for output…",
         StepStateKind::Succeeded
         | StepStateKind::Failed
@@ -4251,6 +4282,7 @@ fn step_counts(snapshot: &WorkflowRunViewSnapshot) -> StepCounts {
             StepStateKind::Starting
             | StepStateKind::Running
             | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering
             | StepStateKind::Cancelling => counts.active += 1,
             StepStateKind::Succeeded => counts.succeeded += 1,
             StepStateKind::Failed => counts.failed += 1,
@@ -4355,6 +4387,7 @@ fn step_state_glyph<Step: StepProjection>(step: &Step) -> &'static str {
             RUNNING_INDICATOR_FRAMES[index]
         }
         StepStateKind::CapturingOutputs => "◕",
+        StepStateKind::Recovering => "◑",
         StepStateKind::Cancelling => "◒",
         StepStateKind::Succeeded => "✓",
         StepStateKind::Failed => "×",
@@ -4370,6 +4403,7 @@ fn step_state_label(state: StepStateKind) -> &'static str {
         StepStateKind::Starting => "starting",
         StepStateKind::Running => "running",
         StepStateKind::CapturingOutputs => "capturing",
+        StepStateKind::Recovering => "recovering",
         StepStateKind::Cancelling => "cancelling",
         StepStateKind::Succeeded => "succeeded",
         StepStateKind::Failed => "failed",
@@ -4385,9 +4419,10 @@ fn step_state_style(state: StepStateKind, color: bool) -> Style {
 
 fn step_state_tone(state: StepStateKind) -> Tone {
     match state {
-        StepStateKind::Starting | StepStateKind::Running | StepStateKind::CapturingOutputs => {
-            Tone::Active
-        }
+        StepStateKind::Starting
+        | StepStateKind::Running
+        | StepStateKind::CapturingOutputs
+        | StepStateKind::Recovering => Tone::Active,
         StepStateKind::Succeeded => Tone::Success,
         StepStateKind::Failed => Tone::Failure,
         StepStateKind::Cancelling | StepStateKind::Blocked | StepStateKind::Cancelled => {
@@ -7261,6 +7296,8 @@ finalizers:
                 state: step_state,
                 timing: step_timing,
                 command_output: None,
+                recovery: None,
+                invocations: Vec::new(),
             }],
             finalization: None,
             exports: BTreeMap::new(),

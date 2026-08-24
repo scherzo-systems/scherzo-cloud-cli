@@ -362,6 +362,157 @@
         "stderr": { "$ref": "#/$defs/DiagnosticStream" }
       }
     },
+    "RecoveryHandlerFailure": {
+      "type": "object", "additionalProperties": false, "required": ["phase", "cause"],
+      "properties": {
+        "phase": { "enum": ["start", "execution"] },
+        "cause": {
+          "type": "object", "additionalProperties": false, "required": ["code"],
+          "properties": {
+            "code": {
+              "enum": [
+                "context_unavailable", "handler_unavailable", "working_directory_unavailable",
+                "command_preparation_failed", "command_launch_failed", "command_wait_failed",
+                "command_exit_failed", "process_quiescence_failed", "result_missing",
+                "result_symbolic_link", "result_not_regular", "result_unavailable",
+                "result_too_large", "decision_invalid", "agent_input_failed", "agent_failed",
+                "agent_result_missing", "agent_result_invalid", "settlement_failed"
+              ]
+            },
+            "exitCode": { "type": "integer" },
+            "decisionRejection": {
+              "enum": [
+                "input_too_large", "invalid_utf8", "invalid_json", "duplicate_key",
+                "unknown_field", "unsupported_schema_version", "unknown_decision",
+                "empty_summary", "summary_too_long", "empty_reason", "reason_too_long"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "RecoveryHandler": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "invocationId", "outcome"],
+      "properties": {
+        "kind": { "enum": ["cmd", "agent"] },
+        "invocationId": { "type": "integer", "minimum": 1 },
+        "outcome": { "enum": ["recheck", "gave_up", "failed", "cancelled"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "failure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+      }
+    },
+    "RecoveryRound": {
+      "type": "object", "additionalProperties": false,
+      "required": ["number", "failedExecution"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "failedExecution": {
+          "type": "object", "additionalProperties": false,
+          "required": ["executionNumber", "invocationId", "failure"],
+          "properties": {
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "invocationId": { "type": "integer", "minimum": 1 },
+            "failure": { "$ref": "#/$defs/Failure" }
+          }
+        },
+        "handler": { "$ref": "#/$defs/RecoveryHandler" }
+      }
+    },
+    "RecoveryTermination": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "executionNumber"],
+          "properties": {
+            "kind": { "enum": ["recovered", "exhausted"] },
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "round"],
+          "properties": {
+            "kind": { "const": "gave_up" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "round", "handlerFailure"],
+          "properties": {
+            "kind": { "const": "handler_failed" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "handlerFailure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "round", "activeRole"],
+          "properties": {
+            "kind": { "const": "cancelled" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "activeRole": { "enum": ["target", "recovery_handler"] },
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+          }
+        }
+      ]
+    },
+    "StepRecovery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "configuredRetries", "rounds", "termination"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "configuredRetries": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "handlerKind": { "enum": ["cmd", "agent"] },
+        "rounds": {
+          "type": "array", "minItems": 1, "maxItems": 10,
+          "items": { "$ref": "#/$defs/RecoveryRound" }
+        },
+        "termination": { "$ref": "#/$defs/RecoveryTermination" }
+      }
+    },
+    "RecoveryInvocation": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "invocationId", "role", "state", "startedAt", "finishedAt",
+        "durationMilliseconds", "usage"
+      ],
+      "properties": {
+        "invocationId": { "type": "integer", "minimum": 1 },
+        "role": { "enum": ["target", "recovery_handler"] },
+        "targetExecution": { "type": "integer", "minimum": 1, "maximum": 11 },
+        "recoveryRound": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "state": { "enum": ["settled", "cancelled"] },
+        "startedAt": { "$ref": "#/$defs/Timestamp" },
+        "finishedAt": { "$ref": "#/$defs/Timestamp" },
+        "durationMilliseconds": { "type": "integer", "minimum": 0 },
+        "usage": {
+          "type": "object", "additionalProperties": false,
+          "required": ["inputTokens", "outputTokens"],
+          "properties": {
+            "inputTokens": { "type": "integer", "minimum": 0 },
+            "outputTokens": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "diagnostics": {
+          "type": "array", "maxItems": 2,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["kind", "reference", "stream"],
+            "properties": {
+              "kind": {
+                "enum": ["command_stdout", "command_stderr", "agent_harness_stdout", "agent_harness_stderr"]
+              },
+              "reference": { "type": "string", "minLength": 1 },
+              "stream": { "$ref": "#/$defs/DiagnosticStream" }
+            }
+          }
+        },
+        "diagnosticReference": { "type": "string", "minLength": 1 }
+      }
+    },
     "WorkflowStep": {
       "type": "object",
       "additionalProperties": false,
@@ -389,7 +540,12 @@
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$" }
         },
-        "commandOutput": { "$ref": "#/$defs/CommandOutput" }
+        "commandOutput": { "$ref": "#/$defs/CommandOutput" },
+        "recovery": { "$ref": "#/$defs/StepRecovery" },
+        "invocations": {
+          "type": "array", "minItems": 1,
+          "items": { "$ref": "#/$defs/RecoveryInvocation" }
+        }
       },
       "allOf": [
         {
@@ -498,6 +654,17 @@
                 { "required": ["unavailableReferences"] }
               ]
             }
+          }
+        },
+        {
+          "if": { "required": ["recovery"] },
+          "then": { "required": ["invocations"] },
+          "else": { "not": { "required": ["invocations"] } }
+        },
+        {
+          "if": { "properties": { "role": { "const": "finalizer" } }, "required": ["role"] },
+          "then": {
+            "not": { "anyOf": [{ "required": ["recovery"] }, { "required": ["invocations"] }] }
           }
         },
         {

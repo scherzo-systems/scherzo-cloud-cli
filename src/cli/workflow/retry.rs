@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use clap::Args;
 
 use crate::execution::workflow::admission::{CancellationSource, admit_local_workflow};
+use crate::execution::workflow::archived_attempt::reconcile_current_result_publication;
 use crate::execution::workflow::local_run::{
     LocalRetryBeginError, LocalRetryOpen, acquire_local_retry,
 };
@@ -41,6 +42,7 @@ impl Command {
             Ok(task) => task,
             Err(error) => return Err(error.into()),
         };
+        reconcile_current_result_publication(&self.run.run_dir);
         let pending = match acquire_local_retry(&self.run.run_dir) {
             Ok(LocalRetryOpen::Acquired(pending)) => *pending,
             Ok(LocalRetryOpen::Rejected(rejection)) => {

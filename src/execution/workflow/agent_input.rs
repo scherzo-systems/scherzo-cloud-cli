@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use serde_json::Value;
 
@@ -20,7 +21,7 @@ use super::agent::{
     AgentInvocationStaging, AgentObservationSink, AgentProcessContext, AgentPrompt, AgentValueMode,
     MAXIMUM_INLINE_AGENT_INPUT_BYTES, StagedAgentAttachment,
 };
-use super::agent_diagnostics::AgentDiagnosticSessionStore;
+use super::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
 use super::canonical_json;
 use super::claude_code::ClaudeCodeConfig;
@@ -29,6 +30,7 @@ use super::codex::CodexConfig;
 use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use super::document::Output;
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
+use super::invocation_accounting::InvocationAccountingLog;
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
 #[cfg(test)]
@@ -38,10 +40,15 @@ use super::private_staging::{
     mark_cleanup_failed, remove_open_tree_at, remove_staging_root,
 };
 use super::process_group::ProcessGuardRegistry;
+use super::recovery::{
+    MAXIMUM_RECOVERY_DECISION_BYTES, RECOVERY_AGENT_INSTRUCTIONS, RECOVERY_CONTEXT_VARIABLE,
+    RECOVERY_DECISION_SCHEMA_JSON, recovery_handler_cwd,
+};
+use super::result_validation::RetainedResultSchema;
 use super::step_runtime::{WorkingDirectoryFailure, resolve_working_directory};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedMessageSource,
-    ValidatedStep, WorkflowImport, WorkflowValueType,
+    ValidatedRecoveryHandler, ValidatedStep, WorkflowImport, WorkflowValueType,
 };
 use super::value::CapturedValue;
 
@@ -706,15 +713,7 @@ where
         admitted_step,
     )?;
     check_cancellation(&cancellation)?;
-    let lifecycle = staging
-        .inner
-        .lifecycle
-        .read()
-        .map_err(|_| staging_error())?;
-    if *lifecycle != StagingLifecycle::Active {
-        return Err(staging_error());
-    }
-    let view = staging.reserve_view()?;
+    let (lifecycle, view) = reserve_active_view(staging)?;
     let staged_attachments =
         match stage_attachments(staging, artifacts, &view, &plan.attachments, &cancellation) {
             Ok(attachments) => attachments,
@@ -723,17 +722,8 @@ where
                 return Err(abort_view(view, error));
             }
         };
-    let message_file = if plan.prompt.message().len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
-        match stage_message(&view, plan.prompt.message(), &cancellation) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                drop(lifecycle);
-                return Err(abort_view(view, error));
-            }
-        }
-    } else {
-        None
-    };
+    let (lifecycle, view, message_file) =
+        stage_optional_message(lifecycle, view, plan.prompt.message(), &cancellation)?;
     if fchmod(&view.attachment_directory, Mode::RUSR | Mode::XUSR).is_err() {
         drop(lifecycle);
         return Err(abort_view(view, staging_error()));
@@ -753,66 +743,31 @@ where
         ));
     }
 
-    let mut invocation_staging =
-        AgentInvocationStaging::new(view.result_endpoint_path().to_owned());
-    if let Some(message_file) = message_file {
-        invocation_staging = invocation_staging.with_message_file(message_file);
-    }
-    let harness_version = match admitted_step {
-        AdmittedHarness::Pi(admission) => admission.installation().version().as_str(),
-        AdmittedHarness::ClaudeCode(admission) => admission.installation().version().as_str(),
-        AdmittedHarness::Codex(admission) => admission.installation().version().as_str(),
-    };
-    let diagnostic_session =
-        match diagnostic_sessions.allocate(&identity, admitted_step.profile(), harness_version) {
-            Ok(session) => session,
-            Err(_) => {
-                drop(lifecycle);
-                return Err(abort_view(
-                    view,
-                    start_error(AgentInputStartFailure::StagingUnavailable),
-                ));
-            }
-        };
-    // The macro keeps the common immutable envelope in one place while the closed enum
-    // preserves a distinct native type for each exhaustively selected profile.
-    macro_rules! materialize_invocation {
-        ($variant:ident, $profile:expr, $admission:ident) => {
-            ClosedAgentInvocation::$variant(agent_invocation(
-                identity,
-                $profile,
-                $admission.installation().executable(),
-                $admission.installation().version().as_str(),
-                $admission.configuration().clone(),
-                $admission.limits().clone(),
-                working_directory,
-                admitted.execution().environment().clone(),
-                invocation_staging,
-                diagnostic_session,
-                plan.prompt,
-                staged_attachments,
-                plan.value_mode,
-                cancellation,
-                process_guards,
-                observation_sink,
-            ))
-        };
-    }
-    let invocation = match admitted_step {
-        AdmittedHarness::Pi(admission) => {
-            materialize_invocation!(Pi, AgentCompatibilityProfile::PiJsonV1, admission)
-        }
-        AdmittedHarness::ClaudeCode(admission) => materialize_invocation!(
-            ClaudeCode,
-            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-            admission
-        ),
-        AdmittedHarness::Codex(admission) => materialize_invocation!(
-            Codex,
-            AgentCompatibilityProfile::CodexAppServerV1,
-            admission
-        ),
-    };
+    let invocation_staging = invocation_staging(&view, message_file);
+    let (lifecycle, view, diagnostic_session) = allocate_diagnostic_session(
+        lifecycle,
+        view,
+        diagnostic_sessions,
+        &identity,
+        admitted_step,
+    )?;
+    let invocation = closed_agent_invocation(
+        admitted_step,
+        None,
+        AgentInvocationEnvelope {
+            identity,
+            working_directory,
+            environment: admitted.execution().environment().clone(),
+            staging: invocation_staging,
+            diagnostic_session,
+            prompt: plan.prompt,
+            attachments: staged_attachments,
+            value_mode: plan.value_mode,
+            cancellation,
+            process_guards,
+            observation_sink,
+        },
+    );
     drop(lifecycle);
     Ok(MaterializedAgentInvocation {
         invocation,
@@ -822,29 +777,289 @@ where
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the closed invocation constructor keeps every admitted identity explicit"
+    reason = "recovery materialization keeps every private authority and identity explicit"
 )]
-fn agent_invocation<NativeConfiguration, ProtocolLimits, Sink>(
+pub(crate) fn materialize_recovery_agent_invocation<Sink>(
+    admitted: &AdmittedWorkflow,
+    staging: &AgentInputStaging,
+    diagnostic_sessions: &AgentDiagnosticSessionStore,
     identity: AgentInvocationIdentity,
-    profile: AgentCompatibilityProfile,
-    executable: &Path,
-    version: &str,
-    configuration: NativeConfiguration,
-    limits: super::agent::AgentInvocationLimits<ProtocolLimits>,
+    step_name: &str,
+    context_path: &Path,
+    cancellation: CancellationSource,
+    process_guards: ProcessGuardRegistry,
+    accounting: &InvocationAccountingLog,
+    observation_sink: Sink,
+) -> Result<MaterializedAgentInvocation<Sink>, AgentInputMaterializationError>
+where
+    Sink: AgentObservationSink,
+{
+    check_cancellation(&cancellation)?;
+    let recovery = admitted
+        .workflow()
+        .definition
+        .recoveries
+        .get(step_name)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| start_error(AgentInputStartFailure::StepUnavailable))?;
+    let ValidatedRecoveryHandler::Agent { prompt, cwd, .. } = recovery
+        .handler
+        .as_ref()
+        .ok_or_else(|| start_error(AgentInputStartFailure::StepUnavailable))?
+    else {
+        return Err(start_error(AgentInputStartFailure::StepUnavailable));
+    };
+    let harness = admitted
+        .recovery_handler(step_name)
+        .ok_or_else(|| start_error(AgentInputStartFailure::AgentAdmissionUnavailable))?;
+    if !staging.is_bound_to(admitted.execution()) {
+        return Err(start_error(AgentInputStartFailure::AgentStagingMismatch));
+    }
+    let cwd = recovery_handler_cwd(admitted, step_name, cwd.as_deref())
+        .map_err(|()| start_error(AgentInputStartFailure::StepUnavailable))?;
+    let working_directory = resolve_working_directory(admitted.execution().root_identity(), cwd)
+        .map_err(|failure| start_error(AgentInputStartFailure::WorkingDirectory(failure)))?;
+    let trusted_prompt = retained_bytes(admitted, prompt)?;
+    let trusted_prompt = std::str::from_utf8(trusted_prompt).map_err(|_| {
+        start_error(AgentInputStartFailure::InvalidRetainedText {
+            path: prompt.clone(),
+        })
+    })?;
+    let schema_document = Arc::new(
+        serde_json::from_str::<Value>(RECOVERY_DECISION_SCHEMA_JSON)
+            .map_err(|_| start_error(AgentInputStartFailure::InvalidValueMode))?,
+    );
+    let schema = RetainedResultSchema::compile(
+        Arc::from(RECOVERY_DECISION_SCHEMA_JSON.as_bytes()),
+        schema_document,
+    )
+    .map_err(|_| start_error(AgentInputStartFailure::InvalidValueMode))?;
+
+    let (lifecycle, view) = reserve_active_view(staging)?;
+    let (lifecycle, view, message_file) =
+        stage_optional_message(lifecycle, view, trusted_prompt, &cancellation)?;
+    if fchmod(&view.attachment_directory, Mode::RUSR | Mode::XUSR).is_err()
+        || !working_directory.validate_execution_root()
+    {
+        drop(lifecycle);
+        return Err(abort_view(view, staging_error()));
+    }
+    let invocation_staging = invocation_staging(&view, message_file);
+    let (lifecycle, view, diagnostic_session) =
+        allocate_diagnostic_session(lifecycle, view, diagnostic_sessions, &identity, harness)?;
+    accounting.record_native_session(&identity, harness.profile(), &diagnostic_session);
+    let environment = admitted.execution().environment().with_variable(
+        RECOVERY_CONTEXT_VARIABLE.into(),
+        context_path.as_os_str().to_owned(),
+    );
+    let prompt = AgentPrompt::new(
+        Arc::from(RECOVERY_AGENT_INSTRUCTIONS),
+        Arc::from(trusted_prompt),
+    );
+    let value_mode = AgentValueMode::Result {
+        output: Arc::from("recovery_decision"),
+        schema,
+    };
+    let maximum_result_bytes =
+        NonZeroU64::new(u64::try_from(MAXIMUM_RECOVERY_DECISION_BYTES).unwrap_or(u64::MAX))
+            .unwrap_or(NonZeroU64::MIN);
+
+    let invocation = closed_agent_invocation(
+        harness,
+        Some(maximum_result_bytes),
+        AgentInvocationEnvelope {
+            identity,
+            working_directory,
+            environment,
+            staging: invocation_staging,
+            diagnostic_session,
+            prompt,
+            attachments: Vec::new(),
+            value_mode,
+            cancellation,
+            process_guards,
+            observation_sink,
+        },
+    );
+    drop(lifecycle);
+    Ok(MaterializedAgentInvocation {
+        invocation,
+        staging: view,
+    })
+}
+
+fn reserve_active_view(
+    staging: &AgentInputStaging,
+) -> Result<
+    (
+        RwLockReadGuard<'_, StagingLifecycle>,
+        AgentInputStagingLease,
+    ),
+    AgentInputMaterializationError,
+> {
+    let lifecycle = staging
+        .inner
+        .lifecycle
+        .read()
+        .map_err(|_| staging_error())?;
+    if *lifecycle != StagingLifecycle::Active {
+        return Err(staging_error());
+    }
+    let view = staging.reserve_view()?;
+    Ok((lifecycle, view))
+}
+
+fn stage_optional_message<'a>(
+    lifecycle: RwLockReadGuard<'a, StagingLifecycle>,
+    view: AgentInputStagingLease,
+    message: &str,
+    cancellation: &CancellationSource,
+) -> Result<
+    (
+        RwLockReadGuard<'a, StagingLifecycle>,
+        AgentInputStagingLease,
+        Option<PathBuf>,
+    ),
+    AgentInputMaterializationError,
+> {
+    let message_file = if message.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+        match stage_message(&view, message, cancellation) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                drop(lifecycle);
+                return Err(abort_view(view, error));
+            }
+        }
+    } else {
+        None
+    };
+    Ok((lifecycle, view, message_file))
+}
+
+fn invocation_staging(
+    view: &AgentInputStagingLease,
+    message_file: Option<PathBuf>,
+) -> AgentInvocationStaging {
+    let staging = AgentInvocationStaging::new(view.result_endpoint_path().to_owned());
+    match message_file {
+        Some(message_file) => staging.with_message_file(message_file),
+        None => staging,
+    }
+}
+
+fn allocate_diagnostic_session<'a>(
+    lifecycle: RwLockReadGuard<'a, StagingLifecycle>,
+    view: AgentInputStagingLease,
+    sessions: &AgentDiagnosticSessionStore,
+    identity: &AgentInvocationIdentity,
+    harness: &AdmittedHarness,
+) -> Result<
+    (
+        RwLockReadGuard<'a, StagingLifecycle>,
+        AgentInputStagingLease,
+        AgentDiagnosticSession,
+    ),
+    AgentInputMaterializationError,
+> {
+    match sessions.allocate(identity, harness.profile(), harness_version(harness)) {
+        Ok(session) => Ok((lifecycle, view, session)),
+        Err(_) => {
+            drop(lifecycle);
+            Err(abort_view(
+                view,
+                start_error(AgentInputStartFailure::StagingUnavailable),
+            ))
+        }
+    }
+}
+
+fn harness_version(harness: &AdmittedHarness) -> &str {
+    match harness {
+        AdmittedHarness::Pi(admission) => admission.installation().version().as_str(),
+        AdmittedHarness::ClaudeCode(admission) => admission.installation().version().as_str(),
+        AdmittedHarness::Codex(admission) => admission.installation().version().as_str(),
+    }
+}
+
+struct AgentInvocationEnvelope<Sink> {
+    identity: AgentInvocationIdentity,
     working_directory: super::execution_root::AdmittedWorkingDirectory,
     environment: super::admission::EnvironmentSnapshot,
     staging: AgentInvocationStaging,
-    diagnostic_session: super::agent_diagnostics::AgentDiagnosticSession,
+    diagnostic_session: AgentDiagnosticSession,
     prompt: AgentPrompt,
     attachments: Vec<StagedAgentAttachment>,
     value_mode: AgentValueMode,
     cancellation: CancellationSource,
     process_guards: ProcessGuardRegistry,
     observation_sink: Sink,
+}
+
+fn closed_agent_invocation<Sink>(
+    harness: &AdmittedHarness,
+    maximum_result_bytes: Option<NonZeroU64>,
+    envelope: AgentInvocationEnvelope<Sink>,
+) -> ClosedAgentInvocation<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    macro_rules! admitted_invocation {
+        ($variant:ident, $profile:expr, $admission:ident) => {{
+            let mut limits = $admission.limits().clone();
+            if let Some(maximum) = maximum_result_bytes {
+                limits = limits.with_maximum_result_bytes(maximum);
+            }
+            ClosedAgentInvocation::$variant(agent_invocation(
+                $profile,
+                $admission.installation().executable(),
+                $admission.installation().version().as_str(),
+                $admission.configuration().clone(),
+                limits,
+                envelope,
+            ))
+        }};
+    }
+    match harness {
+        AdmittedHarness::Pi(admission) => {
+            admitted_invocation!(Pi, AgentCompatibilityProfile::PiJsonV1, admission)
+        }
+        AdmittedHarness::ClaudeCode(admission) => admitted_invocation!(
+            ClaudeCode,
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+            admission
+        ),
+        AdmittedHarness::Codex(admission) => admitted_invocation!(
+            Codex,
+            AgentCompatibilityProfile::CodexAppServerV1,
+            admission
+        ),
+    }
+}
+
+fn agent_invocation<NativeConfiguration, ProtocolLimits, Sink>(
+    profile: AgentCompatibilityProfile,
+    executable: &Path,
+    version: &str,
+    configuration: NativeConfiguration,
+    limits: super::agent::AgentInvocationLimits<ProtocolLimits>,
+    envelope: AgentInvocationEnvelope<Sink>,
 ) -> AgentInvocation<NativeConfiguration, ProtocolLimits, Sink>
 where
     Sink: AgentObservationSink,
 {
+    let AgentInvocationEnvelope {
+        identity,
+        working_directory,
+        environment,
+        staging,
+        diagnostic_session,
+        prompt,
+        attachments,
+        value_mode,
+        cancellation,
+        process_guards,
+        observation_sink,
+    } = envelope;
     AgentInvocation::new(
         identity,
         AdmittedAgentAdapter::new(

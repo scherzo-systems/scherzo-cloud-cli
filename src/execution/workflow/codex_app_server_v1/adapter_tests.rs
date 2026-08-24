@@ -1022,6 +1022,10 @@ fn send_turn_terminal(
     );
 }
 
+fn result_envelope(result: Value) -> String {
+    json!({"result": serde_json::to_string(&result).unwrap()}).to_string()
+}
+
 fn send_result_turn(
     output: &mut impl Write,
     turn_id: &str,
@@ -1557,17 +1561,17 @@ fn codex_process_fixture() {
             "result-correction"
             | "result-exhausted"
             | "result-correction-failed"
-            | "result-correction-interrupted" => Some(r#"{"result":-1}"#),
-            "result-oversized" => Some(
-                r#"{"result":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
-            ),
-            "result-settlement-blocked" => Some(r#"{"result":7}"#),
-            "result-root-object" => Some(r#"{"result":{"answer":7}}"#),
-            "result-root-array" => Some(r#"{"result":[1,2]}"#),
-            "result-root-string" => Some(r#"{"result":"value"}"#),
-            "result-root-number" => Some(r#"{"result":7}"#),
-            "result-root-boolean" => Some(r#"{"result":true}"#),
-            "result-root-null" => Some(r#"{"result":null}"#),
+            | "result-correction-interrupted" => Some(result_envelope(json!(-1))),
+            "result-oversized" => Some(result_envelope(json!(
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ))),
+            "result-settlement-blocked" => Some(result_envelope(json!(7))),
+            "result-root-object" => Some(result_envelope(json!({"answer": 7}))),
+            "result-root-array" => Some(result_envelope(json!([1, 2]))),
+            "result-root-string" => Some(result_envelope(json!("value"))),
+            "result-root-number" => Some(result_envelope(json!(7))),
+            "result-root-boolean" => Some(result_envelope(json!(true))),
+            "result-root-null" => Some(result_envelope(json!(null))),
             "result-missing" => None,
             _ => panic!("unknown result scenario"),
         };
@@ -1575,7 +1579,7 @@ fn codex_process_fixture() {
             &mut output,
             TURN_ID,
             "result-first",
-            first_candidate,
+            first_candidate.as_deref(),
             "completed",
         );
         if scenario == "result-settlement-blocked" {
@@ -1601,7 +1605,12 @@ fn codex_process_fixture() {
                 correction["params"]["outputSchema"],
                 json!({
                     "type": "object",
-                    "properties": {"result": {}},
+                    "properties": {
+                        "result": {
+                            "type": "string",
+                            "description": "JSON-encode the structured workflow result as one string.",
+                        }
+                    },
                     "required": ["result"],
                     "additionalProperties": false,
                 }),
@@ -1628,9 +1637,9 @@ fn codex_process_fixture() {
                 }),
             );
             let (candidate, status) = match scenario.as_str() {
-                "result-correction" => (Some(r#"{"result":7}"#), "completed"),
-                "result-exhausted" => (Some(r#"{"result":0}"#), "completed"),
-                "result-oversized" => (Some(r#"{"result":"ok"}"#), "completed"),
+                "result-correction" => (Some(result_envelope(json!(7))), "completed"),
+                "result-exhausted" => (Some(result_envelope(json!(0))), "completed"),
+                "result-oversized" => (Some(result_envelope(json!("ok"))), "completed"),
                 "result-correction-failed" => (None, "failed"),
                 "result-correction-interrupted" => (None, "interrupted"),
                 _ => unreachable!(),
@@ -1639,7 +1648,7 @@ fn codex_process_fixture() {
                 &mut output,
                 CORRECTION_TURN_ID,
                 "result-second",
-                candidate,
+                candidate.as_deref(),
                 status,
             );
         }
@@ -2592,7 +2601,7 @@ pub(super) mod exact_binary {
     async fn structured_result_uses_authoritative_validation_and_settles() {
         with_watchdog(async {
             let (mut provider, release_response) =
-                LoopbackResponsesProvider::start_blocked(r#"{"result":7}"#).await;
+                LoopbackResponsesProvider::start_blocked(r#"{"result":"7"}"#).await;
             let fixture = ProcessFixture::with_exact_binary(
                 provider.address,
                 result_mode(json!({

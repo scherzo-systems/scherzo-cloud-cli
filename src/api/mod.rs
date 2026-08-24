@@ -5,7 +5,6 @@ mod current_principal;
 mod http_client;
 pub(crate) mod http_util;
 mod human_principal;
-mod idempotency;
 mod organizations;
 mod problem;
 mod runners;
@@ -26,7 +25,6 @@ pub(crate) use current_principal::{
 };
 pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
-pub(crate) use idempotency::generate_idempotency_key;
 pub(crate) use organizations::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
     ListOrganizationMembershipsOutcome, MembershipRole, Organization, OrganizationError,
@@ -35,9 +33,9 @@ pub(crate) use organizations::{
     list_organization_memberships, update_organization,
 };
 pub(crate) use runners::{
-    RunnerActivationArtifact, RunnerActivationIssuance, RunnerActivationState, RunnerApi,
-    RunnerCredentialEffectiveState, RunnerCredentialStoredState, RunnerFailure, RunnerPool,
-    RunnerPoolList, RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
+    RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,
+    RunnerCredentialStoredState, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
+    RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

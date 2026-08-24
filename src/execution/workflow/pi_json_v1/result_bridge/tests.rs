@@ -350,6 +350,12 @@ async fn oversized_malformed_and_multi_frame_connections_are_fatal() {
         (65_u32.to_be_bytes().to_vec(), 64_u64),
         (framed(b"not-json"), 1024),
         (
+            framed(
+                br#"{"kind":"ValidatePiResultV1","toolCallId":"call-fixed","toolName":"scherzo_result_fixed","arguments":{"result":{"decision":"recheck","decision":"gave_up"}}}"#,
+            ),
+            1024,
+        ),
+        (
             {
                 let mut frame = framed(&request_bytes(
                     "call-fixed",

@@ -54,7 +54,16 @@
               "state": "pending"
             }
           ],
-          "outstandingActions": []
+          "outstandingActions": [],
+          "accounting": {
+            "maximumInvocations": 1,
+            "observedInvocations": 0,
+            "settledInvocations": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "retainedDiagnosticBytes": 0,
+            "discardedDiagnosticBytes": 0
+          }
         },
         "processGuards": [],
         "result": {

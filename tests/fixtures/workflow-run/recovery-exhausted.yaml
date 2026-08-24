@@ -1,0 +1,27 @@
+schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 2
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          printf x >> target-runs
+          if [ -f retry-success ]; then
+            printf 'fresh retry execution 1 owns this output\n' > recovered.txt
+            exit 0
+          fi
+          printf 'target remains broken\n' >&2
+          exit 75
+    outputs:
+      recovered:
+        kind: file
+        path: recovered.txt
+        mediaType: text/plain
+exports:
+  recovered:
+    ref: outputs.verify.recovered

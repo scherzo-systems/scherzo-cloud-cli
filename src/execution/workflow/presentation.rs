@@ -32,7 +32,9 @@ use super::rejection::{RejectionDiagnostic, human_resolution_remedy};
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolvedWorkflow};
 use super::run_timing::{ObservationClock, ObservationTime};
 use super::runtime::{
-    FailurePhase, NotRunReason, RunOutcome, StepState, StepStateKind, TransitionEvent,
+    ActiveStepInvocation, FailurePhase, NotRunReason, RecoveryDecisionKind,
+    RecoveryHandlerActivity, RecoveryHandlerKind, RunOutcome, StepState, StepStateKind,
+    TransitionEvent,
 };
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
@@ -1033,12 +1035,13 @@ where
                     self.step_starts
                         .entry(step.clone())
                         .or_insert(observed_at.monotonic);
-                    let detail = self
-                        .feed
-                        .definition()
-                        .steps
-                        .get(&step)
-                        .map_or_else(|| "cmd".to_owned(), start_detail);
+                    let detail = observed_recovery_detail(transition.step).unwrap_or_else(|| {
+                        self.feed
+                            .definition()
+                            .steps
+                            .get(&step)
+                            .map_or_else(|| "cmd".to_owned(), start_detail)
+                    });
                     self.write_event(observed_at.utc, &step, "start", &detail, TokenRole::Active)
                 }
                 StepStateKind::Succeeded => {
@@ -1169,6 +1172,17 @@ where
                         "cancelled",
                         &detail,
                         TokenRole::Blocked,
+                    )
+                }
+                StepStateKind::Recovering => {
+                    let detail = observed_recovery_detail(transition.step)
+                        .unwrap_or_else(|| "recovery active".to_owned());
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "recovering",
+                        &detail,
+                        TokenRole::Active,
                     )
                 }
                 StepStateKind::Pending
@@ -1905,6 +1919,71 @@ fn visible_text_with_backslash(value: &str, escape_backslash: bool) -> String {
     visible
 }
 
+fn observed_recovery_detail(observed: Option<ObservedStepTransition>) -> Option<String> {
+    let ObservedStepTransition::Recovery {
+        active,
+        configured_rounds,
+        handler_kind,
+        handler_state,
+        decision,
+    } = observed?
+    else {
+        return None;
+    };
+    Some(recovery_progress_detail(
+        active,
+        configured_rounds,
+        handler_kind,
+        handler_state,
+        decision,
+    ))
+}
+
+pub(crate) fn recovery_progress_detail(
+    active: ActiveStepInvocation,
+    configured_rounds: u8,
+    handler_kind: Option<RecoveryHandlerKind>,
+    handler_state: Option<RecoveryHandlerActivity>,
+    decision: Option<RecoveryDecisionKind>,
+) -> String {
+    let latest_round = match active {
+        ActiveStepInvocation::Target { execution_number } => {
+            execution_number.get().saturating_sub(1).max(1)
+        }
+        ActiveStepInvocation::RecoveryHandler { round } => round.get(),
+    };
+    let mut detail = match active {
+        ActiveStepInvocation::Target { execution_number } => {
+            format!(
+                "target execution {} · round {latest_round}/{configured_rounds}",
+                execution_number.get()
+            )
+        }
+        ActiveStepInvocation::RecoveryHandler { round } => format!(
+            "recovery_handler {} {} · round {}/{configured_rounds}",
+            match handler_kind {
+                Some(RecoveryHandlerKind::Command) => "cmd",
+                Some(RecoveryHandlerKind::Agent) => "agent",
+                None => "unknown",
+            },
+            match handler_state {
+                Some(RecoveryHandlerActivity::Starting) => "starting",
+                Some(RecoveryHandlerActivity::Running) => "running",
+                None => "active",
+            },
+            round.get()
+        ),
+    };
+    if let Some(decision) = decision {
+        detail.push_str(" · decision ");
+        detail.push_str(match decision {
+            RecoveryDecisionKind::Recheck => "recheck",
+            RecoveryDecisionKind::GaveUp => "gave_up",
+        });
+    }
+    detail
+}
+
 pub(crate) fn cancellation_reason(reason: CancellationReason) -> &'static str {
     reason.as_str()
 }
@@ -1919,16 +1998,8 @@ pub(crate) fn finalization_trigger(
     }
 }
 
-fn failure_phase(phase: FailurePhase) -> &'static str {
-    match phase {
-        FailurePhase::Start => "start",
-        FailurePhase::Execution => "execution",
-        FailurePhase::OutputCapture => "output_capture",
-    }
-}
-
 pub(crate) fn failure_detail(phase: FailurePhase, cause: &StepFailureCause) -> String {
-    format!("{} · {}", failure_phase(phase), failure_cause(cause))
+    format!("{} · {}", phase.as_str(), failure_cause(cause))
 }
 
 fn failure_cause(cause: &StepFailureCause) -> String {
@@ -1998,6 +2069,7 @@ fn failure_cause(cause: &StepFailureCause) -> String {
         StepFailureCause::Execution(StepExecutionFailure::Agent(failure)) => {
             failure.code().replace('_', " ")
         }
+        StepFailureCause::RecoveryHandler(_) => "recovery handler failed".to_owned(),
         StepFailureCause::OutputCapture(failure) => match failure {
             OutputCaptureFailure::StepUnavailable => "step unavailable".to_owned(),
             OutputCaptureFailure::UnsupportedOutput => "output unsupported".to_owned(),
@@ -2066,7 +2138,7 @@ fn summary_step(
     step: &WorkflowRunStep,
     success: StepSuccessPresentation,
 ) -> Option<(&'static str, String, TokenRole)> {
-    match &step.state {
+    let (state, mut detail, role) = match &step.state {
         StepState::Succeeded { outputs } => Some((
             "succeeded",
             success_detail(success, outputs.len()),
@@ -2109,8 +2181,96 @@ fn summary_step(
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
-        | StepState::Cancelling { .. } => None,
+        | StepState::Recovering { .. }
+        | StepState::Cancelling { .. } => return None,
+    }?;
+    if let Some(recovery) = &step.recovery {
+        let usage = super::publication::total_recovery_usage(&step.invocations);
+        let terminal_failure = match &step.state {
+            StepState::Failed { phase, cause } => Some(failure_detail(*phase, cause)),
+            _ => None,
+        };
+        detail.push_str(&format!(
+            " · {} · {} invocations · usage input {} output {}",
+            terminal_recovery_detail(recovery, terminal_failure.as_deref()),
+            step.invocations.len(),
+            usage.input_tokens,
+            usage.output_tokens,
+        ));
     }
+    Some((state, detail, role))
+}
+
+pub(crate) fn terminal_recovery_detail(
+    recovery: &super::publication::StepRecoverySummaryV1,
+    terminal_failure: Option<&str>,
+) -> String {
+    let mut detail = match &recovery.termination {
+        super::publication::RecoveryTerminationV1::Recovered { execution_number } => {
+            format!("recovered at target execution {execution_number}")
+        }
+        super::publication::RecoveryTerminationV1::Exhausted { execution_number } => {
+            format!("recovery exhausted at target execution {execution_number}")
+        }
+        super::publication::RecoveryTerminationV1::GaveUp { round } => {
+            format!("recovery gave_up at round {round}")
+        }
+        super::publication::RecoveryTerminationV1::HandlerFailed { round, .. } => {
+            format!("recovery handler failed at round {round}")
+        }
+        super::publication::RecoveryTerminationV1::Cancelled { round, .. } => {
+            format!("recovery cancelled at round {round}")
+        }
+    };
+    let retained_failure = recovery
+        .rounds
+        .last()
+        .map(|round| published_failure_detail(&round.failed_execution.failure));
+    if let Some(failure) = terminal_failure.or(retained_failure.as_deref()) {
+        detail.push_str(" · latest target failure ");
+        detail.push_str(failure);
+    }
+    detail
+}
+
+fn published_failure_detail(failure: &super::publication::FailureV1) -> String {
+    let phase = match failure.phase {
+        super::publication::FailurePhaseV1::Start => "start",
+        super::publication::FailurePhaseV1::Execution => "execution",
+        super::publication::FailurePhaseV1::OutputCapture => "output_capture",
+    };
+    let mut cause = snake_case_debug(failure.cause.code);
+    if let Some(input) = &failure.cause.input {
+        cause.push_str(" · input ");
+        cause.push_str(&visible_text(input));
+    }
+    if let Some(index) = failure.cause.collection_index {
+        cause.push_str(&format!(" · collection index {index}"));
+    }
+    if let Some(output) = &failure.cause.output {
+        cause.push_str(" · output ");
+        cause.push_str(&visible_text(output));
+    }
+    if let Some(exit_code) = failure.cause.exit_code {
+        cause.push_str(&format!(" · exit {exit_code}"));
+    }
+    format!("{phase} · {cause}")
+}
+
+pub(crate) fn snake_case_debug(value: impl std::fmt::Debug) -> String {
+    let value = format!("{value:?}");
+    let mut result = String::with_capacity(value.len());
+    for (index, character) in value.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index != 0 {
+                result.push('_');
+            }
+            result.push(character.to_ascii_lowercase());
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn issue_detail(detail: String, failure_policy: FailurePolicy) -> String {
@@ -2144,6 +2304,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
             | StepState::Starting
             | StepState::Running
             | StepState::CapturingOutputs
+            | StepState::Recovering { .. }
             | StepState::Cancelling { .. } => None,
         };
         if let Some(index) = index {

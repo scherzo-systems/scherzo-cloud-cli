@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "multiplicationCases": [
-    {"name": "maximal-handler-invocation-partition", "left": 488, "right": 137518, "expected": 67108784},
+    {"name": "maximal-handler-invocation-partition", "left": 397, "right": 169039, "expected": 67108483},
     {"name": "aggregate-multiplication-overflow", "left": 18446744073709551615, "right": 2, "overflow": true}
   ],
   "boundCases": [
@@ -50,19 +50,19 @@
       }
     },
     {
-      "name": "exact-cap-no-finalizers-maximal-232-rounds",
-      "steps": 24,
+      "name": "exact-cloud-cap-no-finalizers-maximal-handlers",
+      "steps": 20,
       "finalizers": 0,
-      "recoveryRounds": 232,
-      "handlerRounds": 232,
+      "recoveryRounds": 189,
+      "handlerRounds": 188,
       "expected": {
-        "generalMaximumTransitions": 1283,
+        "generalMaximumTransitions": 1048,
         "cloudMaximumTransitions": 1027,
-        "maximumInvocations": 488,
-        "maximumRetainedBytesPerInvocation": 137518,
-        "diagnosticRetentionBytes": 134217568,
-        "nativeSessionRetentionBytes": 67108784,
-        "aggregateRetentionBytes": 201326352,
+        "maximumInvocations": 397,
+        "maximumRetainedBytesPerInvocation": 169039,
+        "diagnosticRetentionBytes": 134216966,
+        "nativeSessionRetentionBytes": 67108483,
+        "aggregateRetentionBytes": 201325449,
         "encodedOutboxBytes": 104988672
       }
     },
@@ -84,19 +84,19 @@
       }
     },
     {
-      "name": "exact-cap-with-finalizer",
-      "steps": 24,
+      "name": "exact-cloud-cap-with-finalizer-and-handlers",
+      "steps": 20,
       "finalizers": 1,
-      "recoveryRounds": 231,
-      "handlerRounds": 231,
+      "recoveryRounds": 188,
+      "handlerRounds": 188,
       "expected": {
-        "generalMaximumTransitions": 1286,
+        "generalMaximumTransitions": 1051,
         "cloudMaximumTransitions": 1030,
-        "maximumInvocations": 487,
-        "maximumRetainedBytesPerInvocation": 137800,
-        "diagnosticRetentionBytes": 134217200,
-        "nativeSessionRetentionBytes": 67108600,
-        "aggregateRetentionBytes": 201325800,
+        "maximumInvocations": 397,
+        "maximumRetainedBytesPerInvocation": 169039,
+        "diagnosticRetentionBytes": 134216966,
+        "nativeSessionRetentionBytes": 67108483,
+        "aggregateRetentionBytes": 201325449,
         "encodedOutboxBytes": 105185280
       }
     },

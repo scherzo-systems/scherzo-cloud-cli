@@ -14,7 +14,7 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 
-use crate::api::generate_idempotency_key;
+use crate::idempotency::generate_idempotency_key;
 
 use super::validation::{valid_secret_syntax, valid_typed_id};
 
@@ -47,14 +47,24 @@ pub(crate) struct ActivationArtifact {
     expires_at: String,
 }
 
+/// Owned activation fields supplied by the caller that received the Cloud
+/// response. Translation from API DTOs happens at that boundary so the
+/// runner component never references the human API client.
+pub(crate) struct ActivationArtifactParts {
+    pub(crate) activation_url: String,
+    pub(crate) activation_token: String,
+    pub(crate) runner_id: String,
+    pub(crate) expires_at: String,
+}
+
 impl ActivationArtifact {
-    pub(crate) fn from_api(artifact: &crate::api::RunnerActivationArtifact) -> Self {
+    pub(crate) fn from_parts(parts: ActivationArtifactParts) -> Self {
         Self {
             schema_version: 1,
-            activation_url: artifact.activation_url.clone(),
-            activation_token: artifact.activation_token.clone(),
-            runner_id: artifact.runner_id.clone(),
-            expires_at: artifact.expires_at.clone(),
+            activation_url: parts.activation_url,
+            activation_token: parts.activation_token,
+            runner_id: parts.runner_id,
+            expires_at: parts.expires_at,
         }
     }
 

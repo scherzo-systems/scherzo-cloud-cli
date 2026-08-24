@@ -1830,6 +1830,8 @@ mod tests {
                         CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from([]), 0, true),
                         CapturedDiagnosticStream::from_parts(Arc::<[u8]>::from([]), 0, true),
                     )),
+                    recovery: None,
+                    invocations: Vec::new(),
                 }],
                 finalization: None,
                 exports,

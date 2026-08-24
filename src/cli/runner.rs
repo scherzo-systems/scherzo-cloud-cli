@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 
-use crate::api::generate_idempotency_key;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use crate::idempotency::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Work with the Scherzo Cloud runner";
 const NAME: &str = "runner";
@@ -353,7 +353,14 @@ fn write_activation_issuance(
             "activation issuance replay omitted its secret; issue a replacement activation with a new command"
         )
     })?;
-    let artifact = crate::runner::enrollment::ActivationArtifact::from_api(api_artifact);
+    let artifact = crate::runner::enrollment::ActivationArtifact::from_parts(
+        crate::runner::enrollment::ActivationArtifactParts {
+            activation_url: api_artifact.activation_url.clone(),
+            activation_token: api_artifact.activation_token.clone(),
+            runner_id: api_artifact.runner_id.clone(),
+            expires_at: api_artifact.expires_at.clone(),
+        },
+    );
     crate::runner::enrollment::write_activation_file(destination, &artifact)
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(artifact)

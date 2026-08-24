@@ -522,6 +522,30 @@ impl StateCommitObserver for FailAfterReplace {
 }
 
 #[test]
+fn invocation_evidence_republication_preserves_first_authoritative_bytes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = open_directory_path(temporary.path()).unwrap();
+    let original = b"first authoritative diagnostic";
+
+    write_or_verify_immutable_file(&directory, "diagnostic.bin", original).unwrap();
+    let first = fs::read(temporary.path().join("diagnostic.bin")).unwrap();
+    write_or_verify_immutable_file(&directory, "diagnostic.bin", original).unwrap();
+    assert_eq!(
+        fs::read(temporary.path().join("diagnostic.bin")).unwrap(),
+        first
+    );
+
+    assert_eq!(
+        write_or_verify_immutable_file(&directory, "diagnostic.bin", b"changed"),
+        Err(LocalRunDirectoryError::StateConflict)
+    );
+    assert_eq!(
+        fs::read(temporary.path().join("diagnostic.bin")).unwrap(),
+        first
+    );
+}
+
+#[test]
 fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
     let fixture = AdmittedFixture::new();
     let run = InitialLocalRun::create(&fixture.run_path("atomic"), &fixture.admitted).unwrap();

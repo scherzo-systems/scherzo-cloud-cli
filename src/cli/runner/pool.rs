@@ -1,9 +1,9 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use crate::api::generate_idempotency_key;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use crate::idempotency::generate_idempotency_key;
 
 use super::{CloudOptions, cloud};
 

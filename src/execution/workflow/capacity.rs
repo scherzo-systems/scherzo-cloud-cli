@@ -172,7 +172,9 @@ pub(crate) fn transition_bounds(
         .and_then(|value| value.checked_add(counts.recovery_rounds))
         .ok_or(CapacityCalculationFailure::ArithmeticOverflow)?;
     let general = weighted_bound(weighted_nodes, counts.finalizers, 5)?;
-    let cloud = weighted_bound(weighted_nodes, counts.finalizers, 4)?;
+    let cloud = weighted_bound(weighted_nodes, counts.finalizers, 4)?
+        .checked_add(counts.handler_rounds)
+        .ok_or(CapacityCalculationFailure::ArithmeticOverflow)?;
     Ok((weighted_nodes, general, cloud))
 }
 

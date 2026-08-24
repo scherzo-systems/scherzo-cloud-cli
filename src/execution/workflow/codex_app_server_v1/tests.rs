@@ -51,6 +51,10 @@ fn take_json(parser: &mut CodexAppServerV1Parser) -> Value {
     serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
 }
 
+fn result_envelope(result: Value) -> String {
+    json!({"result": serde_json::to_string(&result).unwrap()}).to_string()
+}
+
 fn feed(
     parser: &mut CodexAppServerV1Parser,
     mut value: Value,
@@ -924,9 +928,11 @@ fn absent_empty_oversized_delta_only_and_failed_outputs_never_commit() {
 fn malformed_wrapped_duplicate_and_missing_result_candidates_never_commit() {
     for text in [
         "not-json",
-        "```json\n{\"result\":1}\n```",
-        "{\"result\":1,\"result\":2}",
-        "{\"result\":1,\"extra\":true}",
+        "```json\n{\"result\":\"1\"}\n```",
+        "{\"result\":\"1\",\"result\":\"2\"}",
+        "{\"result\":\"1\",\"extra\":true}",
+        "{\"result\":\"not-json\"}",
+        "{\"result\":\"{\\\"decision\\\":\\\"recheck\\\",\\\"decision\\\":\\\"gave_up\\\"}\"}",
     ] {
         let mut parser = running_parser(AgentValueKind::Result, 1024);
         feed(&mut parser, item_started("result", "agentMessage")).unwrap();
@@ -960,7 +966,7 @@ fn malformed_wrapped_duplicate_and_missing_result_candidates_never_commit() {
         feed(&mut duplicate, item_started(id, "agentMessage")).unwrap();
         feed(
             &mut duplicate,
-            item_completed(id, "{\"result\":1}", json!("final_answer")),
+            item_completed(id, "{\"result\":\"1\"}", json!("final_answer")),
         )
         .unwrap();
     }
@@ -969,8 +975,8 @@ fn malformed_wrapped_duplicate_and_missing_result_candidates_never_commit() {
             &mut duplicate,
             turn_completed(
                 vec![
-                    json!({"id": "first", "type": "agentMessage", "text": "{\"result\":1}", "phase": "final_answer"}),
-                    json!({"id": "second", "type": "agentMessage", "text": "{\"result\":1}", "phase": "final_answer"}),
+                    json!({"id": "first", "type": "agentMessage", "text": "{\"result\":\"1\"}", "phase": "final_answer"}),
+                    json!({"id": "second", "type": "agentMessage", "text": "{\"result\":\"1\"}", "phase": "final_answer"}),
                 ],
                 "completed",
             ),
@@ -992,7 +998,7 @@ fn malformed_wrapped_duplicate_and_missing_result_candidates_never_commit() {
 fn one_rejection_queues_one_same_thread_correction_then_exhausts() {
     let mut parser = running_parser(AgentValueKind::Result, 1024);
     for (id, value, turn_id) in [("first", -1, "turn-1"), ("second", 0, "turn-2")] {
-        let text = format!("{{\"result\":{value}}}");
+        let text = result_envelope(json!(value));
         feed(
             &mut parser,
             json!({

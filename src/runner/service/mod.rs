@@ -9,10 +9,6 @@ mod conversation;
 #[cfg(test)]
 mod determinism_spike;
 mod execution;
-#[allow(
-    dead_code,
-    reason = "the suspend-aware lease boundary is proven before the lease supervisor cutover"
-)]
 mod lease_clock;
 mod source;
 #[cfg(test)]
@@ -32,7 +28,7 @@ pub(crate) use config::Config;
 use crate::execution::workflow::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use crate::runner::control_protocol::{ConnectionFailure, ControlError};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
-use assignment::{AssignmentManager, SystemWallClockHealth, WallClockHealth};
+use assignment::AssignmentManager;
 use backoff::Backoff;
 use connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
@@ -40,6 +36,7 @@ use connection::{
     record_progress,
 };
 use control::{ControlServer, ControlServerError, LiveStatus, ReloadRequest};
+use lease_clock::{LeaseClock, LeaseClockError};
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
@@ -88,6 +85,10 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 );
 
 pub(crate) trait Sleeper: Send + Sync {
+    #[allow(
+        dead_code,
+        reason = "deterministic transport tests inspect their logical sleep clock"
+    )]
     fn now(&self) -> std::time::Instant;
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_>;
 }
@@ -218,7 +219,7 @@ struct ConnectionLoopDependencies {
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
-    wall_clock: Arc<dyn WallClockHealth>,
+    lease_clock: LeaseClock,
     boot_id: String,
 }
 
@@ -228,7 +229,7 @@ impl ConnectionLoopDependencies {
         frame_source: Arc<dyn FrameSource>,
         sleeper: Arc<dyn Sleeper>,
         recorder: Arc<Recorder>,
-        wall_clock: Arc<dyn WallClockHealth>,
+        lease_clock: LeaseClock,
         boot_id: String,
     ) -> Self {
         Self {
@@ -236,7 +237,7 @@ impl ConnectionLoopDependencies {
             frame_source,
             sleeper,
             recorder,
-            wall_clock,
+            lease_clock,
             boot_id,
         }
     }
@@ -250,6 +251,7 @@ pub(crate) enum ServiceError {
     ShutdownDeadlineExceeded,
     Connection(ConnectionError),
     Control(ControlServerError),
+    LeaseClock(LeaseClockError),
 }
 
 impl fmt::Display for ServiceError {
@@ -267,6 +269,7 @@ impl fmt::Display for ServiceError {
                 write!(formatter, "runner service stopped unexpectedly: {error}")
             }
             Self::Control(error) => write!(formatter, "start runner local control: {error}"),
+            Self::LeaseClock(error) => write!(formatter, "runner lease clock failed: {error}"),
         }
     }
 }
@@ -280,6 +283,7 @@ impl std::error::Error for ServiceError {
             | Self::ShutdownDeadlineExceeded => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
+            Self::LeaseClock(error) => Some(error),
         }
     }
 }
@@ -297,14 +301,14 @@ async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
     let recorder = Recorder::stderr(&boot_id);
-    let wall_clock: Arc<dyn WallClockHealth> = Arc::new(SystemWallClockHealth);
+    let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
     run_service_loop(
         config,
         frame_source,
         sleeper,
         recorder,
-        wall_clock,
+        lease_clock,
         boot_id,
         &mut shutdown,
     )
@@ -317,16 +321,16 @@ async fn run_until_cancelled_with_dependencies(
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
-    wall_clock: Arc<dyn WallClockHealth>,
     mut shutdown: Box<dyn Shutdown>,
 ) -> Result<(), ServiceError> {
     let boot_id = frame_source.public_id("rbt_");
+    let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     run_service_loop(
         config,
         frame_source,
         sleeper,
         recorder,
-        wall_clock,
+        lease_clock,
         boot_id,
         shutdown.as_mut(),
     )
@@ -338,7 +342,7 @@ async fn run_service_loop(
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
-    wall_clock: Arc<dyn WallClockHealth>,
+    lease_clock: LeaseClock,
     boot_id: String,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
@@ -348,7 +352,7 @@ async fn run_service_loop(
             frame_source,
             sleeper,
             recorder,
-            wall_clock,
+            lease_clock,
             boot_id,
         ),
         &WebSocketConnector,
@@ -369,13 +373,13 @@ async fn run_connection_loop(
         frame_source,
         sleeper,
         recorder,
-        wall_clock,
+        lease_clock,
         boot_id,
     } = dependencies;
     let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new_with_sleeper(
         &config,
         boot_id.clone(),
-        wall_clock,
+        lease_clock,
         Arc::clone(&sleeper),
     )));
     let live_status = Arc::new(LiveStatus::new(
@@ -425,6 +429,13 @@ async fn run_connection_loop(
     let mut shutdown_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
+        if assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease_clock_failure_ready_to_exit()
+        {
+            return Err(ServiceError::LeaseClock(LeaseClockError::ClockUnavailable));
+        }
         if shutting_down
             && assignment_manager
                 .lock()
@@ -1109,7 +1120,8 @@ const fn connection_failure(cause: ConnectionCause) -> ConnectionFailure {
         | ConnectionCause::UnexpectedRawGatewayFrame
         | ConnectionCause::InvalidExecutionLeasePolicy
         | ConnectionCause::ChangedExecutionLeasePolicy
-        | ConnectionCause::ConflictingAssignmentOffer => ConnectionFailure::Protocol,
+        | ConnectionCause::ConflictingAssignmentOffer
+        | ConnectionCause::RunnerLeaseClockFailure => ConnectionFailure::Protocol,
         _ => ConnectionFailure::Network,
     }
 }
@@ -1212,7 +1224,7 @@ mod tests {
         FixtureSocket, SleepRelease, accept_fixture_socket, accept_fixture_socket_with_headers,
         accept_opened_fixture_socket, assignment_offer, controlled_shutdown, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
-        expect_close_frame, expect_opening_hello, fixture_listener, healthy_wall_clock,
+        expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
         observation_acknowledgement, offer_assignment_after_handshake, sleep_request,
         terminal_observation_acknowledgement, welcome, with_watchdog,
     };
@@ -1392,7 +1404,7 @@ mod tests {
         let assignments = Arc::new(std::sync::Mutex::new(AssignmentManager::new_with_sleeper(
             config,
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
-            healthy_wall_clock(),
+            fixture_lease_clock(),
             Arc::new(TokioSleeper),
         )));
         let status = Arc::new(LiveStatus::new(
@@ -2152,7 +2164,6 @@ mod tests {
             deterministic_frame_source(),
             sleeper,
             recorder,
-            healthy_wall_clock(),
             shutdown,
         ));
         (service, capture, shutdown_trigger)
@@ -2263,7 +2274,6 @@ mod tests {
             deterministic_frame_source(),
             sleeper,
             recorder,
-            healthy_wall_clock(),
             shutdown,
         ))
         .await

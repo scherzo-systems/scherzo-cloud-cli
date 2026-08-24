@@ -347,6 +347,11 @@ impl<AdapterProtocolLimits> AgentInvocationLimits<AdapterProtocolLimits> {
         self.maximum_result_bytes
     }
 
+    pub(crate) fn with_maximum_result_bytes(mut self, maximum: NonZeroU64) -> Self {
+        self.maximum_result_bytes = self.maximum_result_bytes.min(maximum);
+        self
+    }
+
     pub(crate) fn maximum_result_rejection_feedback_bytes(&self) -> NonZeroU64 {
         self.maximum_result_rejection_feedback_bytes
     }

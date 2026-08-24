@@ -21,7 +21,7 @@ type TimerFuture = Pin<Box<dyn Future<Output = Result<(), LeaseClockError>> + Se
 ///
 /// The representation stays private so callers cannot construct an instant from civil time or
 /// from a suspend-excluding clock.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LeaseInstant {
     clock_domain: u64,
     nanoseconds: u64,
@@ -50,6 +50,10 @@ impl LeaseInstant {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "operator and deterministic lease-clock evidence use elapsed samples"
+    )]
     pub(super) fn checked_duration_since(self, earlier: Self) -> Result<Duration, LeaseClockError> {
         self.require_same_domain(earlier)?;
         let nanoseconds = self
@@ -77,8 +81,12 @@ fn duration_nanoseconds(duration: Duration) -> Result<u64, LeaseClockError> {
     u64::try_from(duration.as_nanos()).map_err(|_| LeaseClockError::ArithmeticOverflow)
 }
 
+#[allow(
+    dead_code,
+    reason = "unsupported targets fail closed in their platform implementation"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LeaseClockError {
+pub(crate) enum LeaseClockError {
     UnsupportedPlatform,
     ClockUnavailable,
     TimerUnavailable,
@@ -107,6 +115,216 @@ impl std::error::Error for LeaseClockError {}
 trait LeaseClockSource: Send + Sync {
     fn now_nanoseconds(&self) -> Result<u64, LeaseClockError>;
     fn start_timer(&self, deadline_nanoseconds: u64) -> Result<TimerFuture, LeaseClockError>;
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct ControlledLeaseClock {
+    source: Arc<ControlledLeaseClockSource>,
+}
+
+#[cfg(test)]
+struct ControlledLeaseClockSource {
+    state: Arc<std::sync::Mutex<ControlledLeaseClockState>>,
+    requests: tokio::sync::mpsc::UnboundedSender<(Duration, LeaseTimerRelease)>,
+}
+
+#[cfg(test)]
+struct ControlledLeaseClockState {
+    now_nanoseconds: u64,
+    active_timers: usize,
+    clock_available: bool,
+    timer_available: bool,
+    wait_available: bool,
+}
+
+#[cfg(test)]
+pub(super) struct LeaseTimerRelease {
+    deadline_nanoseconds: u64,
+    notification: Arc<Notify>,
+    state: Arc<std::sync::Mutex<ControlledLeaseClockState>>,
+}
+
+#[cfg(test)]
+impl LeaseTimerRelease {
+    pub(super) fn release(self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.now_nanoseconds = state.now_nanoseconds.max(self.deadline_nanoseconds);
+        drop(state);
+        self.notification.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "focused lease failure tests select the required controlled fault"
+)]
+impl ControlledLeaseClock {
+    pub(super) fn advance(&self, duration: Duration) {
+        let nanoseconds = duration_nanoseconds(duration).expect("controlled lease clock duration");
+        let mut state = self
+            .source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.now_nanoseconds = state
+            .now_nanoseconds
+            .checked_add(nanoseconds)
+            .expect("controlled lease clock advance overflowed");
+    }
+
+    pub(super) fn simulate_suspend(&self, duration: Duration) {
+        self.advance(duration);
+    }
+
+    pub(super) fn make_clock_unavailable(&self) {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clock_available = false;
+    }
+
+    pub(super) fn make_timer_unavailable(&self) {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .timer_available = false;
+    }
+
+    pub(super) fn make_wait_fail(&self) {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_available = false;
+    }
+
+    pub(super) fn active_timers(&self) -> usize {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_timers
+    }
+}
+
+#[cfg(test)]
+struct ControlledLeaseTimerRegistration {
+    state: Arc<std::sync::Mutex<ControlledLeaseClockState>>,
+}
+
+#[cfg(test)]
+impl Drop for ControlledLeaseTimerRegistration {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_timers -= 1;
+    }
+}
+
+#[cfg(test)]
+impl LeaseClockSource for ControlledLeaseClockSource {
+    fn now_nanoseconds(&self) -> Result<u64, LeaseClockError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .clock_available
+            .then_some(state.now_nanoseconds)
+            .ok_or(LeaseClockError::ClockUnavailable)
+    }
+
+    fn start_timer(&self, deadline_nanoseconds: u64) -> Result<TimerFuture, LeaseClockError> {
+        let (duration, state) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.timer_available {
+                return Err(LeaseClockError::TimerUnavailable);
+            }
+            let duration =
+                Duration::from_nanos(deadline_nanoseconds.saturating_sub(state.now_nanoseconds));
+            state.active_timers += 1;
+            (duration, Arc::clone(&self.state))
+        };
+        let notification = Arc::new(Notify::new());
+        let release = LeaseTimerRelease {
+            deadline_nanoseconds,
+            notification: Arc::clone(&notification),
+            state: Arc::clone(&state),
+        };
+        if self.requests.send((duration, release)).is_err() {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active_timers -= 1;
+            return Err(LeaseClockError::TimerUnavailable);
+        }
+        let registration = ControlledLeaseTimerRegistration { state };
+        Ok(Box::pin(async move {
+            let _registration = registration;
+            notification.notified().await;
+            let wait_available = _registration
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .wait_available;
+            wait_available
+                .then_some(())
+                .ok_or(LeaseClockError::TimerWaitFailed)
+        }))
+    }
+}
+
+#[cfg(test)]
+struct FixtureLeaseClockSource;
+
+#[cfg(test)]
+impl LeaseClockSource for FixtureLeaseClockSource {
+    fn now_nanoseconds(&self) -> Result<u64, LeaseClockError> {
+        Ok(1_000_000_000)
+    }
+
+    fn start_timer(&self, _deadline_nanoseconds: u64) -> Result<TimerFuture, LeaseClockError> {
+        Ok(Box::pin(std::future::pending()))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_lease_clock() -> LeaseClock {
+    LeaseClock::with_source(Arc::new(FixtureLeaseClockSource))
+        .expect("allocate fixture lease clock domain")
+}
+
+#[cfg(test)]
+pub(super) fn controlled_lease_clock() -> (
+    LeaseClock,
+    ControlledLeaseClock,
+    tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let source = Arc::new(ControlledLeaseClockSource {
+        state: Arc::new(std::sync::Mutex::new(ControlledLeaseClockState {
+            now_nanoseconds: 1_000_000_000,
+            active_timers: 0,
+            clock_available: true,
+            timer_available: true,
+            wait_available: true,
+        })),
+        requests,
+    });
+    let erased: Arc<dyn LeaseClockSource> = source.clone();
+    let clock = LeaseClock::with_source(erased).expect("allocate controlled lease clock domain");
+    (clock, ControlledLeaseClock { source }, receiver)
 }
 
 /// The reusable clock boundary owned by Runner Serve.
@@ -164,6 +382,10 @@ pub(super) struct LeaseWaitCancellation {
 }
 
 impl LeaseWaitCancellation {
+    #[allow(
+        dead_code,
+        reason = "operator and deterministic tests cancel armed native waits"
+    )]
     pub(super) fn cancel(&self) {
         if !self.cancelled.swap(true, AtomicOrdering::AcqRel) {
             self.changed.notify_waiters();
@@ -455,6 +677,7 @@ mod platform {
         reason = "mach_continuous_time and its timebase are the macOS suspend-aware clock boundary"
     )]
     unsafe extern "C" {
+        #[cfg(test)]
         fn mach_absolute_time() -> u64;
         fn mach_continuous_time() -> u64;
         fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;

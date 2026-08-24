@@ -17,7 +17,9 @@ use crate::execution::workflow::admission::{
     ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
-use crate::execution::workflow::runtime::{Action, StepState};
+use crate::execution::workflow::runtime::{
+    Action, RecoveryDecision, RecoveryTerminalDisposition, StepState, TargetExecutionNumber,
+};
 
 const WORKFLOW: &str = r#"schemaVersion: 1
 steps:
@@ -261,6 +263,9 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
             cancellation_release.action.action,
             Action::CancelStep {
                 step: step.clone(),
+                active: runtime::ActiveStepInvocation::Target {
+                    execution_number: runtime::TargetExecutionNumber::FIRST,
+                },
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::from_secs(107)),
             }
@@ -654,4 +659,353 @@ async fn execution_start_samples_an_already_admitted_cancellation() {
     assert_eq!(timeline.len(), 2);
     assert_eq!(timeline[0], TimelineEntry::Commit(OccurrenceOrdinal(1)));
     assert!(matches!(timeline[1], TimelineEntry::Action(_)));
+}
+
+#[tokio::test]
+async fn scripted_handlerless_port_retains_provisional_history_before_recheck() {
+    const RECOVERY_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  fetch:
+    kind: cmd
+    recovery:
+      retries: 2
+    command:
+      argv: ["true"]
+    outputs:
+      result:
+        kind: file
+        path: result.txt
+        mediaType: text/plain
+"#;
+    let fixture = admitted_fixture_for_workflow(
+        CancellationSource::new(),
+        Duration::from_secs(7),
+        RECOVERY_WORKFLOW,
+    );
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let initialized = commits.recv().await.unwrap();
+        assert_eq!(initialized.occurrence_ordinal.get(), 1);
+        assert_eq!(initialized.state.admitted_transition_ceiling(), 18);
+        let first = actions.recv().await.unwrap();
+        let Action::StartStep {
+            step,
+            execution_number,
+            ..
+        } = &first.action.action
+        else {
+            panic!("scripted port did not receive target execution one");
+        };
+        assert_eq!(step, "fetch");
+        assert_eq!(execution_number.get(), 1);
+        let first_id = first.action.id;
+        sender
+            .send(DriverOccurrence::step_started("fetch".into(), first_id))
+            .await
+            .unwrap();
+        first.resume.send(()).unwrap();
+
+        assert_eq!(commits.recv().await.unwrap().occurrence_ordinal.get(), 2);
+        sender
+            .send(DriverOccurrence::step_execution_failed(
+                "fetch".into(),
+                first_id,
+                "exit 75".into(),
+            ))
+            .await
+            .unwrap();
+        let provisional = commits.recv().await.unwrap();
+        assert_eq!(provisional.occurrence_ordinal.get(), 3);
+        assert_eq!(provisional.state.steps["fetch"].state, StepState::Starting);
+        let history = &provisional.state.steps["fetch"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .rounds;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].failed_execution.cause, "exit 75");
+        assert!(provisional.occurrence_accepted);
+        assert!(provisional.events.iter().all(|event| {
+            !matches!(
+                event,
+                TransitionEvent::Step {
+                    to: runtime::StepStateKind::Failed,
+                    ..
+                }
+            )
+        }));
+        let second = actions.recv().await.unwrap();
+        let Action::StartStep {
+            execution_number, ..
+        } = second.action.action
+        else {
+            panic!("handlerless provisional failure did not release a full target recheck");
+        };
+        assert_eq!(execution_number.get(), 2);
+        assert_ne!(second.action.id, first_id);
+        let second_id = second.action.id;
+        sender
+            .send(DriverOccurrence::step_started("fetch".into(), second_id))
+            .await
+            .unwrap();
+        second.resume.send(()).unwrap();
+
+        assert_eq!(commits.recv().await.unwrap().occurrence_ordinal.get(), 4);
+        sender
+            .send(DriverOccurrence::step_execution_completed(
+                "fetch".into(),
+                second_id,
+                "execution-two-candidate".into(),
+            ))
+            .await
+            .unwrap();
+        let capturing = commits.recv().await.unwrap();
+        assert_eq!(capturing.occurrence_ordinal.get(), 5);
+        let capture = actions.recv().await.unwrap();
+        assert!(matches!(
+            capture.action.action,
+            Action::CaptureOutputs { .. }
+        ));
+        let capture_id = capture.action.id;
+        sender
+            .send(DriverOccurrence::outputs_captured(
+                "fetch".into(),
+                capture_id,
+                BTreeMap::from([("result".into(), "execution-two-output".into())]),
+            ))
+            .await
+            .unwrap();
+        capture.resume.send(()).unwrap();
+
+        let terminal = commits.recv().await.unwrap();
+        assert_eq!(terminal.occurrence_ordinal.get(), 6);
+        assert_eq!(terminal.state.workflow, WorkflowState::Succeeded);
+        assert_eq!(
+            terminal.state.steps["fetch"]
+                .recovery
+                .as_ref()
+                .unwrap()
+                .terminal_disposition,
+            Some(RecoveryTerminalDisposition::Recovered {
+                execution_number: TargetExecutionNumber::fixture(2),
+            })
+        );
+        assert_eq!(
+            terminal.state.steps["fetch"].state,
+            StepState::Succeeded {
+                outputs: BTreeMap::from([("result".into(), "execution-two-output".into())]),
+            }
+        );
+        let finish = actions.recv().await.unwrap();
+        assert!(matches!(finish.action.action, Action::FinishRun { .. }));
+        finish.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result.unwrap().state.workflow, WorkflowState::Succeeded);
+}
+
+#[tokio::test]
+async fn changed_payload_for_one_handler_occurrence_identity_fails_closed() {
+    const HANDLER_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv: ["true"]
+    command:
+      argv: ["false"]
+"#;
+    let fixture = admitted_fixture_for_workflow(
+        CancellationSource::new(),
+        Duration::from_secs(7),
+        HANDLER_WORKFLOW,
+    );
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let _ = commits.recv().await.unwrap();
+        let target = actions.recv().await.unwrap();
+        let target_id = target.action.id;
+        sender
+            .send(DriverOccurrence::step_started("verify".into(), target_id))
+            .await
+            .unwrap();
+        target.resume.send(()).unwrap();
+        let _ = commits.recv().await.unwrap();
+        sender
+            .send(DriverOccurrence::step_execution_failed(
+                "verify".into(),
+                target_id,
+                "target failure".into(),
+            ))
+            .await
+            .unwrap();
+        let recovering = commits.recv().await.unwrap();
+        assert!(matches!(
+            recovering.state.steps["verify"].state,
+            StepState::Recovering { .. }
+        ));
+        let handler = actions.recv().await.unwrap();
+        let Action::StartRecoveryHandler { round, .. } = handler.action.action else {
+            panic!("scripted handler port did not receive its action");
+        };
+        let wrong_round = round.next().unwrap();
+        let handler_id = handler.action.id;
+        sender
+            .send(DriverOccurrence::recovery_handler_started(
+                "verify".into(),
+                round,
+                handler_id,
+            ))
+            .await
+            .unwrap();
+        handler.resume.send(()).unwrap();
+        let _ = commits.recv().await.unwrap();
+
+        let exact = DriverOccurrence::recovery_handler_completed(
+            "verify".into(),
+            wrong_round,
+            handler_id,
+            RecoveryDecision::recheck("unchanged", "wrong round"),
+        );
+        sender.send(exact.clone()).await.unwrap();
+        let first_stale = commits.recv().await.unwrap();
+        assert!(!first_stale.occurrence_accepted);
+        sender.send(exact).await.unwrap();
+        let duplicate = commits.recv().await.unwrap();
+        assert!(!duplicate.occurrence_accepted);
+        assert!(duplicate.events.is_empty());
+
+        sender
+            .send(DriverOccurrence::recovery_handler_completed(
+                "verify".into(),
+                wrong_round,
+                handler_id,
+                RecoveryDecision::recheck("changed", "same identity"),
+            ))
+            .await
+            .unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result, Err(CoordinationError::OccurrenceConflict));
+}
+
+#[tokio::test]
+async fn exact_replay_of_an_early_stale_occurrence_remains_inert() {
+    let fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let initialized = commits.recv().await.unwrap();
+        assert_eq!(initialized.occurrence_ordinal.get(), 1);
+        let start = actions.recv().await.unwrap();
+        let start_id = start.action.id;
+        start.resume.send(()).unwrap();
+
+        let early_failure = DriverOccurrence::step_execution_failed(
+            "task".into(),
+            start_id,
+            "early failure".into(),
+        );
+        sender.send(early_failure.clone()).await.unwrap();
+        let early_stale = commits.recv().await.unwrap();
+        assert!(!early_stale.occurrence_accepted);
+        assert_eq!(early_stale.state.steps["task"].state, StepState::Starting);
+
+        sender
+            .send(DriverOccurrence::step_started("task".into(), start_id))
+            .await
+            .unwrap();
+        let running = commits.recv().await.unwrap();
+        assert!(running.occurrence_accepted);
+        assert_eq!(running.state.steps["task"].state, StepState::Running);
+
+        sender.send(early_failure).await.unwrap();
+        let replayed = commits.recv().await.unwrap();
+        assert!(
+            !replayed.occurrence_accepted,
+            "an exact replay became authoritative after the step entered a compatible state"
+        );
+        assert_eq!(replayed.state.steps["task"].state, StepState::Running);
+
+        sender
+            .send(DriverOccurrence::step_execution_completed(
+                "task".into(),
+                start_id,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        let terminal = commits.recv().await.unwrap();
+        assert_eq!(terminal.state.workflow, WorkflowState::Succeeded);
+        let finish = actions.recv().await.unwrap();
+        finish.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result.unwrap().state.workflow, WorkflowState::Succeeded);
 }

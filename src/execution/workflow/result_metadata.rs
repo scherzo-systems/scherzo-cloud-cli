@@ -12,8 +12,10 @@ use super::MAXIMUM_PARALLEL_STEPS;
 use super::document::FailurePolicy;
 use super::publication::{
     CancellationReasonV1, DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
-    FinalizationTriggerV1, StepReasonV1, WorkflowNodeRoleV1, WorkflowOutcomeV1,
-    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    FinalizationTriggerV1, RecoveryHandlerFailureCodeV1, RecoveryHandlerOutcomeV1,
+    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryTerminationV1, StepReasonV1,
+    WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1,
+    WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -29,8 +31,8 @@ pub(super) const MAXIMUM_RESULT_NON_STREAM_JSON_BYTES: u64 =
     MAXIMUM_RESULT_STRUCTURE_JSON_BYTES + MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES;
 // Durable capture reserves the live run byte budget independently for stdout and
 // stderr. Base64 expands their aggregate and may add one padded quartet per stream.
-pub(super) const MAXIMUM_ENCODED_RETAINED_STREAM_BYTES: u64 =
-    super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN.div_ceil(3) * 4 + 2 * MAXIMUM_STEPS as u64 * 4;
+pub(super) const MAXIMUM_ENCODED_RETAINED_STREAM_BYTES: u64 = 2
+    * (super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN.div_ceil(3) * 4 + 2 * MAXIMUM_STEPS as u64 * 4);
 pub(crate) const MAXIMUM_RESULT_JSON_BYTES: u64 =
     MAXIMUM_ENCODED_RETAINED_STREAM_BYTES + MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
 const SHA256_ALGORITHM: &str = "sha256";
@@ -45,6 +47,11 @@ pub(crate) enum ResultDocumentError {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoverySummaryVersionError {
+    Unsupported,
+}
+
 pub(crate) fn decode_document(bytes: &[u8]) -> Result<Value, ResultDocumentError> {
     if bytes.starts_with(&[0xef, 0xbb, 0xbf])
         || !bytes.ends_with(b"\n")
@@ -55,6 +62,34 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<Value, ResultDocumentError
     serde_json::from_slice::<UniqueValue>(bytes)
         .map(|unique| unique.0)
         .map_err(|_| ResultDocumentError::Json)
+}
+
+pub(crate) fn dispatch_recovery_summary_versions(
+    document: &Value,
+) -> Result<(), RecoverySummaryVersionError> {
+    let recoveries = document
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            document
+                .get("finalization")
+                .and_then(|finalization| finalization.get("finalizers"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|step| step.get("recovery"));
+    for recovery in recoveries {
+        if recovery
+            .get("schemaVersion")
+            .is_some_and(|version| version.as_u64() != Some(1))
+        {
+            return Err(RecoverySummaryVersionError::Unsupported);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), ResultMetadataError> {
@@ -78,6 +113,7 @@ pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), Res
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataError> {
     let document = decode_document(bytes).map_err(|_| ResultMetadataError)?;
+    dispatch_recovery_summary_versions(&document).map_err(|_| ResultMetadataError)?;
     let result =
         serde_json::from_value::<WorkflowResultV1>(document).map_err(|_| ResultMetadataError)?;
     validate(&result)?;
@@ -483,8 +519,285 @@ fn validate_steps(
         {
             return Err(ResultMetadataError);
         }
+        validate_step_recovery(step)?;
     }
     Ok(())
+}
+
+fn validate_step_recovery(step: &WorkflowStepV1) -> Result<(), ResultMetadataError> {
+    let Some(recovery) = &step.recovery else {
+        return step
+            .invocations
+            .is_empty()
+            .then_some(())
+            .ok_or(ResultMetadataError);
+    };
+    if step.role != WorkflowNodeRoleV1::Step
+        || recovery.schema_version != 1
+        || !(1..=10).contains(&recovery.configured_retries)
+        || recovery.rounds.is_empty()
+        || recovery.rounds.len() > usize::from(recovery.configured_retries)
+        || step.invocations.is_empty()
+    {
+        return Err(ResultMetadataError);
+    }
+
+    let mut invocation_ids = BTreeSet::new();
+    let mut target_executions = BTreeSet::new();
+    let mut handler_rounds = BTreeSet::new();
+    let mut previous_invocation = 0_u64;
+    let mut retained_diagnostic_bytes = 0_u64;
+    for invocation in &step.invocations {
+        if invocation.invocation_id == 0
+            || invocation.invocation_id <= previous_invocation
+            || !invocation_ids.insert(invocation.invocation_id)
+            || invocation.target_execution.is_some() == invocation.recovery_round.is_some()
+            || (invocation.role == RecoveryInvocationRoleV1::Target)
+                != invocation.target_execution.is_some()
+            || parse_canonical_utc_timestamp(&invocation.started_at).is_none()
+            || parse_canonical_utc_timestamp(&invocation.finished_at).is_none()
+            || !valid_invocation_duration(invocation)
+            || invocation
+                .diagnostic_reference
+                .as_deref()
+                .is_some_and(|reference| !is_canonical_relative_path(reference))
+        {
+            return Err(ResultMetadataError);
+        }
+        match invocation.role {
+            RecoveryInvocationRoleV1::Target => {
+                if !target_executions
+                    .insert(invocation.target_execution.ok_or(ResultMetadataError)?)
+                {
+                    return Err(ResultMetadataError);
+                }
+            }
+            RecoveryInvocationRoleV1::RecoveryHandler => {
+                if !handler_rounds.insert(invocation.recovery_round.ok_or(ResultMetadataError)?) {
+                    return Err(ResultMetadataError);
+                }
+            }
+        }
+        for diagnostic in &invocation.diagnostics {
+            if !is_canonical_relative_path(&diagnostic.reference)
+                || !valid_stream(&diagnostic.stream, super::MAXIMUM_RETAINED_BYTES_PER_STREAM)
+            {
+                return Err(ResultMetadataError);
+            }
+            retained_diagnostic_bytes = retained_diagnostic_bytes
+                .checked_add(diagnostic.stream.retained_bytes)
+                .ok_or(ResultMetadataError)?;
+        }
+        previous_invocation = invocation.invocation_id;
+    }
+    if retained_diagnostic_bytes > super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN {
+        return Err(ResultMetadataError);
+    }
+
+    for (index, round) in recovery.rounds.iter().enumerate() {
+        let expected_round = u8::try_from(index + 1).map_err(|_| ResultMetadataError)?;
+        if round.number != expected_round
+            || round.failed_execution.execution_number != expected_round
+            || !validate_failure(&round.failed_execution.failure).is_ok()
+            || !invocation_ids.contains(&round.failed_execution.invocation_id)
+            || !step.invocations.iter().any(|invocation| {
+                invocation.invocation_id == round.failed_execution.invocation_id
+                    && invocation.role == RecoveryInvocationRoleV1::Target
+                    && invocation.target_execution == Some(expected_round)
+                    && invocation.state == RecoveryInvocationStateV1::Settled
+            })
+        {
+            return Err(ResultMetadataError);
+        }
+        let terminal_handler_outcome = match &recovery.termination {
+            RecoveryTerminationV1::GaveUp { round } if *round == expected_round => {
+                Some(RecoveryHandlerOutcomeV1::GaveUp)
+            }
+            RecoveryTerminationV1::HandlerFailed { round, .. } if *round == expected_round => {
+                Some(RecoveryHandlerOutcomeV1::Failed)
+            }
+            RecoveryTerminationV1::Cancelled {
+                round,
+                active_role: RecoveryInvocationRoleV1::RecoveryHandler,
+                ..
+            } if *round == expected_round => Some(RecoveryHandlerOutcomeV1::Cancelled),
+            _ => None,
+        };
+        let handler_invocation_id = match (&recovery.handler_kind, &round.handler) {
+            (None, None) => None,
+            (Some(kind), Some(handler))
+                if *kind == handler.kind
+                    && handler.invocation_id > round.failed_execution.invocation_id
+                    && handler.outcome
+                        == terminal_handler_outcome
+                            .unwrap_or(RecoveryHandlerOutcomeV1::Recheck) =>
+            {
+                validate_handler_summary(handler)?;
+                let invocation = step
+                    .invocations
+                    .iter()
+                    .find(|invocation| invocation.invocation_id == handler.invocation_id)
+                    .ok_or(ResultMetadataError)?;
+                let expected_state = if handler.outcome == RecoveryHandlerOutcomeV1::Cancelled {
+                    RecoveryInvocationStateV1::Cancelled
+                } else {
+                    RecoveryInvocationStateV1::Settled
+                };
+                if invocation.role != RecoveryInvocationRoleV1::RecoveryHandler
+                    || invocation.recovery_round != Some(expected_round)
+                    || invocation.state != expected_state
+                {
+                    return Err(ResultMetadataError);
+                }
+                Some(handler.invocation_id)
+            }
+            _ => return Err(ResultMetadataError),
+        };
+        if terminal_handler_outcome.is_none() {
+            let next_target = step
+                .invocations
+                .iter()
+                .find(|invocation| {
+                    invocation.role == RecoveryInvocationRoleV1::Target
+                        && invocation.target_execution == expected_round.checked_add(1)
+                })
+                .ok_or(ResultMetadataError)?;
+            if next_target.invocation_id
+                <= handler_invocation_id.unwrap_or(round.failed_execution.invocation_id)
+            {
+                return Err(ResultMetadataError);
+            }
+        }
+    }
+
+    let last_round = u8::try_from(recovery.rounds.len()).map_err(|_| ResultMetadataError)?;
+    let maximum_target = *target_executions
+        .iter()
+        .next_back()
+        .ok_or(ResultMetadataError)?;
+    let handler_rounds_valid = match recovery.handler_kind {
+        None => handler_rounds.is_empty(),
+        Some(_) => handler_rounds.iter().copied().eq(1..=last_round),
+    };
+    if target_executions.iter().copied().ne(1..=maximum_target) || !handler_rounds_valid {
+        return Err(ResultMetadataError);
+    }
+    match &recovery.termination {
+        RecoveryTerminationV1::Recovered { execution_number }
+            if step.state == WorkflowStepStateV1::Succeeded
+                && *execution_number == last_round.saturating_add(1)
+                && maximum_target == *execution_number => {}
+        RecoveryTerminationV1::Exhausted { execution_number }
+            if step.state == WorkflowStepStateV1::Failed
+                && recovery.rounds.len() == usize::from(recovery.configured_retries)
+                && *execution_number == last_round.saturating_add(1)
+                && maximum_target == *execution_number => {}
+        RecoveryTerminationV1::GaveUp { round }
+            if step.state == WorkflowStepStateV1::Failed
+                && *round == last_round
+                && maximum_target == *round
+                && recovery.rounds.last().is_some_and(|record| {
+                    record
+                        .handler
+                        .as_ref()
+                        .is_some_and(|handler| handler.outcome == RecoveryHandlerOutcomeV1::GaveUp)
+                })
+                && step.failure.as_ref()
+                    == recovery
+                        .rounds
+                        .last()
+                        .map(|round| &round.failed_execution.failure) => {}
+        RecoveryTerminationV1::HandlerFailed {
+            round,
+            handler_failure,
+        } if step.state == WorkflowStepStateV1::Failed
+            && *round == last_round
+            && maximum_target == *round
+            && recovery.rounds.last().is_some_and(|record| {
+                record.handler.as_ref().is_some_and(|handler| {
+                    handler.outcome == RecoveryHandlerOutcomeV1::Failed
+                        && handler.failure.as_ref() == Some(handler_failure)
+                })
+            })
+            && step.failure.as_ref()
+                == recovery
+                    .rounds
+                    .last()
+                    .map(|round| &round.failed_execution.failure) => {}
+        RecoveryTerminationV1::Cancelled {
+            round,
+            active_role,
+            execution_number,
+        } if step.state == WorkflowStepStateV1::Cancelled
+            && *round == last_round
+            && ((*active_role == RecoveryInvocationRoleV1::Target
+                && execution_number.is_some_and(|execution| execution == maximum_target))
+                || (*active_role == RecoveryInvocationRoleV1::RecoveryHandler
+                    && execution_number.is_none()))
+            && step.invocations.iter().any(|invocation| {
+                invocation.role == *active_role
+                    && invocation.state == RecoveryInvocationStateV1::Cancelled
+                    && (execution_number.is_none()
+                        || invocation.target_execution == *execution_number)
+            }) => {}
+        _ => return Err(ResultMetadataError),
+    }
+    Ok(())
+}
+
+fn valid_invocation_duration(invocation: &super::publication::RecoveryInvocationV1) -> bool {
+    let Some(started) = parse_canonical_utc_timestamp(&invocation.started_at) else {
+        return false;
+    };
+    let Some(finished) = parse_canonical_utc_timestamp(&invocation.finished_at) else {
+        return false;
+    };
+    u64::try_from((finished - started).whole_milliseconds()) == Ok(invocation.duration_milliseconds)
+}
+
+fn validate_handler_summary(
+    handler: &super::publication::RecoveryHandlerSummaryV1,
+) -> Result<(), ResultMetadataError> {
+    match handler.outcome {
+        RecoveryHandlerOutcomeV1::Recheck | RecoveryHandlerOutcomeV1::GaveUp => {
+            if handler.summary.as_deref().is_none_or(|value| {
+                value.is_empty()
+                    || value.len() > super::recovery::MAXIMUM_RECOVERY_DECISION_TEXT_BYTES
+            }) || handler.reason.as_deref().is_none_or(|value| {
+                value.is_empty()
+                    || value.len() > super::recovery::MAXIMUM_RECOVERY_DECISION_TEXT_BYTES
+            }) || handler.failure.is_some()
+            {
+                return Err(ResultMetadataError);
+            }
+        }
+        RecoveryHandlerOutcomeV1::Failed => {
+            let failure = handler.failure.as_ref().ok_or(ResultMetadataError)?;
+            if handler.summary.is_some()
+                || handler.reason.is_some()
+                || !valid_handler_failure(failure)
+            {
+                return Err(ResultMetadataError);
+            }
+        }
+        RecoveryHandlerOutcomeV1::Cancelled => {
+            if handler.summary.is_some() || handler.reason.is_some() || handler.failure.is_some() {
+                return Err(ResultMetadataError);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_handler_failure(failure: &super::publication::RecoveryHandlerFailureV1) -> bool {
+    let decision = failure.cause.decision_rejection.is_some();
+    let exit = failure.cause.exit_code.is_some();
+    match failure.cause.code {
+        RecoveryHandlerFailureCodeV1::CommandExitFailed => !decision,
+        RecoveryHandlerFailureCodeV1::DecisionInvalid
+        | RecoveryHandlerFailureCodeV1::AgentResultInvalid => decision && !exit,
+        _ => !decision && !exit,
+    }
 }
 
 pub(super) fn validate_failure(failure: &FailureV1) -> Result<(), ResultMetadataError> {

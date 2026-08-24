@@ -1,0 +1,33 @@
+schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              : > command-repair-applied
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the local repair.","reason":"The unchanged target can now succeed."}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          printf x >> target-runs
+          test -f command-repair-applied || exit 75
+          printf 'only execution 2 owns this output\n' > repaired.txt
+    outputs:
+      repaired:
+        kind: file
+        path: repaired.txt
+        mediaType: text/plain
+exports:
+  repaired:
+    ref: outputs.verify.repaired

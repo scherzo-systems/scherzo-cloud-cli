@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::{Future, ready};
 
-use super::admission::AdmittedWorkflow;
+use super::admission::{AdmittedWorkflow, RecoveryExecutionGuard};
 use super::artifact::ArtifactStaging;
 use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
 use super::diagnostic::StepDiagnosticLog;
@@ -25,6 +25,8 @@ use super::value::CapturedValue;
 pub(crate) struct WorkflowExecutionResult<Deadline = ()> {
     pub(crate) outcome: RunOutcome<StepFailureCause>,
     pub(crate) steps: BTreeMap<String, StepState<StepFailureCause, CapturedValue>>,
+    pub(crate) recoveries:
+        BTreeMap<String, Option<super::runtime::StepRecoveryState<StepFailureCause>>>,
     pub(crate) finalization_summary:
         Option<super::runtime::FinalizationSummary<StepFailureCause, Deadline>>,
     pub(crate) exports: ExportSet<CapturedValue>,
@@ -89,6 +91,47 @@ fn observed_step_transition<Deadline>(
         return None;
     };
     let runtime = state.steps.get(step)?;
+    if matches!(
+        to,
+        StepStateKind::Starting
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering
+    ) && let Some(recovery) = runtime
+        .recovery
+        .as_ref()
+        .filter(|recovery| !recovery.rounds.is_empty())
+        && let Some(active) = runtime.active_invocation
+    {
+        let handler_state = match runtime.state {
+            StepState::Recovering { handler, .. } => Some(handler),
+            _ => None,
+        };
+        let decision = recovery.rounds.last().and_then(|round| {
+            round
+                .handler
+                .as_ref()
+                .and_then(|handler| match handler.outcome {
+                    super::runtime::RecoveryHandlerOutcome::Recheck { .. } => {
+                        Some(super::runtime::RecoveryDecisionKind::Recheck)
+                    }
+                    super::runtime::RecoveryHandlerOutcome::GaveUp { .. } => {
+                        Some(super::runtime::RecoveryDecisionKind::GaveUp)
+                    }
+                    super::runtime::RecoveryHandlerOutcome::Starting
+                    | super::runtime::RecoveryHandlerOutcome::Running
+                    | super::runtime::RecoveryHandlerOutcome::Failed { .. }
+                    | super::runtime::RecoveryHandlerOutcome::Cancelled => None,
+                })
+        });
+        return Some(ObservedStepTransition::Recovery {
+            active,
+            configured_rounds: recovery.configured_rounds,
+            handler_kind: recovery.handler_kind,
+            handler_state,
+            decision,
+        });
+    }
     match (to, &runtime.state) {
         (StepStateKind::Succeeded, StepState::Succeeded { outputs }) => {
             Some(ObservedStepTransition::OutputsCommitted {
@@ -150,8 +193,10 @@ where
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
     // jscpd:ignore-end
 {
-    if admitted.has_recovery() && admitted.recovery_execution_guard().is_some() {
-        return Err(CoordinationError::RecoveryExecutionGuardActive);
+    if admitted.has_recovery()
+        && admitted.recovery_execution_guard() == Some(RecoveryExecutionGuard::Runner)
+    {
+        return Err(CoordinationError::RunnerRecoveryExecutionGuardActive);
     }
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
@@ -184,12 +229,12 @@ where
             return Err(CoordinationError::ReducerStateUnavailable);
         }
     };
-    let steps = coordinated
+    let (steps, recoveries) = coordinated
         .state
         .steps
         .into_iter()
-        .map(|(step, runtime)| (step, runtime.state))
-        .collect();
+        .map(|(step, runtime)| ((step.clone(), runtime.state), (step, runtime.recovery)))
+        .unzip();
     let finalization_summary = coordinated.state.finalization_summary;
     let exports = coordinated
         .state
@@ -198,6 +243,7 @@ where
     Ok(WorkflowExecutionResult {
         outcome,
         steps,
+        recoveries,
         finalization_summary,
         exports,
         provenance,

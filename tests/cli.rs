@@ -34,6 +34,8 @@ mod codex_installation;
 mod organization;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
+#[path = "cli/recovery.rs"]
+mod recovery;
 #[path = "cli/runner_administration.rs"]
 mod runner_administration;
 #[path = "cli/runner_enrollment.rs"]

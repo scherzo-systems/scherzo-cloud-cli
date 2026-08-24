@@ -23,13 +23,14 @@ use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 pub(crate) enum ScriptedAgentValue {
     Response(Arc<str>),
     Result(Arc<Value>),
+    RawResult(Arc<[u8]>),
 }
 
 impl ScriptedAgentValue {
     fn kind(&self) -> AgentValueKind {
         match self {
             Self::Response(_) => AgentValueKind::Response,
-            Self::Result(_) => AgentValueKind::Result,
+            Self::Result(_) | Self::RawResult(_) => AgentValueKind::Result,
         }
     }
 }
@@ -38,7 +39,12 @@ impl ScriptedAgentValue {
 pub(crate) struct ScriptedInvocationStarted {
     identity: AgentInvocationIdentity,
     profile: AgentCompatibilityProfile,
+    system_prompt: Arc<str>,
     message: Arc<str>,
+    working_directory: std::path::PathBuf,
+    result_endpoint_directory: std::path::PathBuf,
+    diagnostic_directory: std::path::PathBuf,
+    environment: crate::execution::workflow::admission::EnvironmentSnapshot,
     attachments: Arc<[super::StagedAgentAttachment]>,
     value_kind: AgentValueKind,
     control: ScriptedInvocationControl,
@@ -53,8 +59,34 @@ impl ScriptedInvocationStarted {
         self.profile
     }
 
+    // The scripted adapter exposes prompt fields for protocol-order assertions; these accessors
+    // intentionally mirror the immutable production prompt without sharing its authority type.
+    // jscpd:ignore-start
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+    // jscpd:ignore-end
+
+    pub(crate) fn working_directory(&self) -> &std::path::Path {
+        &self.working_directory
+    }
+
+    pub(crate) fn result_endpoint_directory(&self) -> &std::path::Path {
+        &self.result_endpoint_directory
+    }
+
+    pub(crate) fn diagnostic_directory(&self) -> &std::path::Path {
+        &self.diagnostic_directory
+    }
+
+    pub(crate) fn environment(
+        &self,
+    ) -> &crate::execution::workflow::admission::EnvironmentSnapshot {
+        &self.environment
     }
 
     pub(crate) fn attachments(&self) -> &[super::StagedAgentAttachment] {
@@ -345,7 +377,15 @@ where
             .send(ScriptedInvocationStarted {
                 identity: invocation.identity().clone(),
                 profile: invocation.adapter().profile(),
+                system_prompt: Arc::from(invocation.prompt().system_prompt()),
                 message: Arc::from(invocation.prompt().message()),
+                working_directory: invocation.process().cwd().to_owned(),
+                result_endpoint_directory: invocation
+                    .staging()
+                    .result_endpoint_directory()
+                    .to_owned(),
+                diagnostic_directory: invocation.diagnostic_session().directory().to_owned(),
+                environment: invocation.process().environment().clone(),
                 attachments: Arc::from(invocation.attachments()),
                 value_kind: invocation.value_mode().kind(),
                 control: ScriptedInvocationControl {
@@ -504,6 +544,17 @@ where
                 value,
                 Arc::from(bytes),
             ))
+        }
+        ScriptedAgentValue::RawResult(bytes) => {
+            if u64::try_from(bytes.len()).map_or(true, |bytes| {
+                bytes > invocation.limits().maximum_result_bytes().get()
+            }) {
+                return Err(ScriptedAgentError::ValueTooLarge);
+            }
+            let value = serde_json::from_slice(bytes.as_ref())
+                .map(Arc::new)
+                .map_err(|_| ScriptedAgentError::WrongValueMode)?;
+            CompletedAgentInvocation::Result(BoundedSchemaValidAgentResult::fixture(value, bytes))
         }
     };
     *provisional = Some(completed);

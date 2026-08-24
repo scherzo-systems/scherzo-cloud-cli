@@ -657,6 +657,7 @@ pub(crate) enum ConnectionCause {
     ChangedExecutionLeasePolicy,
     ConflictingAssignmentOffer,
     AssignmentDecisionCapacity,
+    RunnerLeaseClockFailure,
 }
 
 impl ConnectionCause {
@@ -712,6 +713,7 @@ impl ConnectionCause {
             }
             Self::ConflictingAssignmentOffer => "conflicting assignment offer",
             Self::AssignmentDecisionCapacity => "assignment decision capacity exhausted",
+            Self::RunnerLeaseClockFailure => "runner lease clock failed",
         }
     }
 
@@ -759,6 +761,7 @@ impl ConnectionCause {
             Self::ChangedExecutionLeasePolicy => "changed_execution_lease_policy",
             Self::ConflictingAssignmentOffer => "conflicting_assignment_offer",
             Self::AssignmentDecisionCapacity => "assignment_decision_capacity",
+            Self::RunnerLeaseClockFailure => "runner_lease_clock_failure",
         }
     }
 
@@ -1503,8 +1506,25 @@ where
         .notification();
 
     loop {
+        let (lease_clock_failed, failure_report) = {
+            let mut assignments = assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failed = assignments.lease_clock_has_failed();
+            let report = assignments.pending_lease_clock_failure_report();
+            (failed, report)
+        };
+        if lease_clock_failed {
+            buffered_effect = None;
+            if failure_report.is_some() {
+                in_flight.clear();
+            }
+        }
         if progress.handshake_completed && in_flight.len() < OBSERVATION_WINDOW {
-            if let Some(effect) = buffered_effect.take() {
+            if let Some(effect) = (!lease_clock_failed)
+                .then(|| buffered_effect.take())
+                .flatten()
+            {
                 let pending = send_effect_receipt(
                     &mut writer,
                     config,
@@ -1532,7 +1552,11 @@ where
                     PendingObservationKind::EffectReceipt => None,
                 })
                 .collect();
-            let available = OBSERVATION_WINDOW - in_flight.len();
+            let available = if failure_report.is_some() {
+                1
+            } else {
+                OBSERVATION_WINDOW - in_flight.len()
+            };
             let pending = assignment_manager
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1556,6 +1580,17 @@ where
                 }
                 continue;
             }
+        }
+
+        if assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease_clock_failure_ready_to_exit()
+        {
+            return Err(ConnectionError::terminal(
+                progress,
+                ConnectionCause::RunnerLeaseClockFailure,
+            ));
         }
 
         let notified = assignment_notification.notified();
@@ -2079,15 +2114,22 @@ where
         Ok(Some(job)) => job.spawn(),
         Ok(None) => {}
         Err(failure) => {
-            let cause = match failure {
+            let (cause, terminal) = match failure {
                 AssignmentManagerFailure::ConflictingOffer => {
-                    ConnectionCause::ConflictingAssignmentOffer
+                    (ConnectionCause::ConflictingAssignmentOffer, true)
                 }
                 AssignmentManagerFailure::DecisionCapacity => {
-                    ConnectionCause::AssignmentDecisionCapacity
+                    (ConnectionCause::AssignmentDecisionCapacity, false)
+                }
+                AssignmentManagerFailure::LeaseClock => {
+                    (ConnectionCause::RunnerLeaseClockFailure, true)
                 }
             };
-            return Err(ConnectionError::retryable(*progress, cause));
+            return Err(if terminal {
+                ConnectionError::terminal(*progress, cause)
+            } else {
+                ConnectionError::retryable(*progress, cause)
+            });
         }
     }
     Ok(pending)
@@ -2304,7 +2346,7 @@ mod tests {
         DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
         accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_listener, healthy_wall_clock, observation_acknowledgement,
+        expect_opening_hello, fixture_lease_clock, fixture_listener, observation_acknowledgement,
         offer_assignment_after_handshake, scripted_duplex, sleep_request, welcome, with_watchdog,
     };
     use crate::runner::service::{Sequence, Sleeper};
@@ -2345,7 +2387,7 @@ mod tests {
             let assignment_manager = Mutex::new(AssignmentManager::new(
                 &config,
                 BOOT_ID.to_owned(),
-                healthy_wall_clock(),
+                fixture_lease_clock(),
             ));
             Self {
                 config,
@@ -2403,6 +2445,47 @@ mod tests {
         (inbound, outbound, established)
     }
 
+    fn full_observation_window_context() -> EstablishedTestContext {
+        let context = EstablishedTestContext::new();
+        context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .enqueue_fixture_transitions(40);
+        context
+    }
+
+    async fn open_and_fill_observation_window(
+        inbound: &ScriptedInbound,
+        outbound: &mut mpsc::UnboundedReceiver<Message>,
+    ) -> Vec<serde_json::Value> {
+        assert!(matches!(
+            with_watchdog(outbound.recv())
+                .await
+                .expect("opening hello timed out")
+                .expect("opening hello missing"),
+            Message::Text(_)
+        ));
+        inbound.send(welcome());
+        inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+
+        let mut window = Vec::new();
+        for _ in 0..OBSERVATION_WINDOW {
+            let message = with_watchdog(outbound.recv())
+                .await
+                .expect("observation window fill timed out")
+                .expect("observation window ended early");
+            let Message::Text(text) = message else {
+                panic!("observation window contained a control frame");
+            };
+            window.push(
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .expect("decode window observation"),
+            );
+        }
+        window
+    }
+
     struct FixtureArtifactBody {
         path: PathBuf,
     }
@@ -2455,38 +2538,12 @@ mod tests {
 
     #[tokio::test]
     async fn fills_exact_observation_window_and_refills_one_fifo_slot() {
-        let context = EstablishedTestContext::new();
-        context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .enqueue_fixture_transitions(40);
+        let context = full_observation_window_context();
         let mut next_sequence = 2;
         let (inbound, mut outbound, established) =
             established_fixture(&context, &mut next_sequence);
         let peer = async {
-            let hello = with_watchdog(outbound.recv())
-                .await
-                .expect("opening hello timed out")
-                .expect("opening hello missing");
-            assert!(matches!(hello, Message::Text(_)));
-            inbound.send(welcome());
-            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
-
-            let mut window = Vec::new();
-            for _ in 0..OBSERVATION_WINDOW {
-                let message = with_watchdog(outbound.recv())
-                    .await
-                    .expect("observation window fill timed out")
-                    .expect("observation window ended early");
-                let Message::Text(text) = message else {
-                    panic!("observation window contained a control frame");
-                };
-                window.push(
-                    serde_json::from_str::<serde_json::Value>(&text)
-                        .expect("decode window observation"),
-                );
-            }
+            let window = open_and_fill_observation_window(&inbound, &mut outbound).await;
             assert_eq!(window[0]["sequence"], 2);
             assert_eq!(window[31]["sequence"], 33);
             assert!(outbound.try_recv().is_err(), "window exceeded 32 frames");
@@ -2514,6 +2571,43 @@ mod tests {
             .expect("window fixture timed out");
         result.expect("window fixture connection failed");
         assert_eq!(next_sequence, 35);
+    }
+
+    #[tokio::test]
+    async fn lease_clock_failure_bypasses_a_full_normal_observation_window() {
+        let context = full_observation_window_context();
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            let _window = open_and_fill_observation_window(&inbound, &mut outbound).await;
+            context
+                .assignment_manager
+                .lock()
+                .unwrap()
+                .enqueue_fixture_lease_clock_failure_report();
+
+            let terminal = with_watchdog(outbound.recv())
+                .await
+                .expect("lease clock failure report timed out")
+                .expect("lease clock failure report missing");
+            let Message::Text(terminal) = terminal else {
+                panic!("lease clock failure report was not text");
+            };
+            let terminal: serde_json::Value =
+                serde_json::from_str(&terminal).expect("decode lease clock failure report");
+            assert_eq!(terminal["type"], "execution_aborted");
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("lease clock failure reporting fixture timed out");
+        let error = result.expect_err("lease clock failure must end the connection");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::RunnerLeaseClockFailure
+        );
+        assert!(error.is_terminal());
     }
 
     #[tokio::test]
@@ -3917,7 +4011,7 @@ mod tests {
         let assignment_manager = Mutex::new(AssignmentManager::new(
             config,
             BOOT_ID.to_owned(),
-            healthy_wall_clock(),
+            fixture_lease_clock(),
         ));
         let sequence = Sequence::new(*next_sequence);
         let result = run(

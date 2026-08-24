@@ -2,13 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::TempDir;
-use time::OffsetDateTime;
-#[cfg(test)]
-use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Notify, mpsc};
 
 use super::Sleeper;
@@ -17,6 +14,7 @@ use super::artifact_delivery::{
 };
 use super::config::{AssignmentConfig, Config};
 use super::execution::{AssignmentProcessGuards, ExecutionJob};
+use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
@@ -45,73 +43,6 @@ pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 105_185_280;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
-
-#[allow(
-    dead_code,
-    reason = "removed from lease admission before runtime clock deletion"
-)]
-pub(super) trait WallClockHealth: Send + Sync {
-    fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure>;
-    fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure>;
-}
-
-#[allow(
-    dead_code,
-    reason = "removed from lease admission before runtime clock deletion"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct WallClockHealthFailure;
-
-pub(super) struct SystemWallClockHealth;
-
-impl WallClockHealth for SystemWallClockHealth {
-    fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure> {
-        system_wall_clock_uncertainty()
-    }
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "SystemWallClockHealth is the runner lease wall-clock boundary"
-    )]
-    fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure> {
-        Ok(OffsetDateTime::now_utc())
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(
-    dead_code,
-    reason = "removed from lease admission before runtime clock deletion"
-)]
-#[allow(
-    unsafe_code,
-    reason = "adjtimex is the Linux boundary for kernel-maintained clock synchronization health"
-)]
-fn system_wall_clock_uncertainty() -> Result<Duration, WallClockHealthFailure> {
-    // SAFETY: `timex` is a plain C data structure, and `adjtimex` receives a valid,
-    // uniquely borrowed pointer for the duration of the call.
-    let mut status: libc::timex = unsafe { std::mem::zeroed() };
-    // SAFETY: `status` is initialized and exclusively borrowed by the syscall.
-    let state = unsafe { libc::adjtimex(&mut status) };
-    if state < 0
-        || state == libc::TIME_ERROR
-        || status.status & libc::STA_UNSYNC != 0
-        || status.maxerror < 0
-    {
-        return Err(WallClockHealthFailure);
-    }
-    let microseconds = u64::try_from(status.maxerror).map_err(|_| WallClockHealthFailure)?;
-    Ok(Duration::from_micros(microseconds))
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(
-    dead_code,
-    reason = "removed from lease admission before runtime clock deletion"
-)]
-fn system_wall_clock_uncertainty() -> Result<Duration, WallClockHealthFailure> {
-    Err(WallClockHealthFailure)
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentOffer {
@@ -593,6 +524,23 @@ impl ObservationOutbox {
         }
     }
 
+    fn is_encoded(&self, id: u64) -> bool {
+        self.lock()
+            .entries
+            .iter()
+            .any(|entry| entry.id == id && entry.encoded)
+    }
+
+    fn retain_only(&self, id: u64) {
+        let mut state = self.lock();
+        for entry in &mut state.entries {
+            entry.replayable = entry.id == id;
+        }
+        state
+            .entries
+            .retain(|entry| entry.replayable || entry.encoded);
+    }
+
     fn fence_assignment(&self, assignment_id: &str) {
         let mut state = self.lock();
         for entry in &mut state.entries {
@@ -661,14 +609,88 @@ pub(super) enum WelcomePolicyFailure {
 pub(super) enum AssignmentManagerFailure {
     ConflictingOffer,
     DecisionCapacity,
+    LeaseClock,
+}
+
+#[derive(Clone)]
+pub(super) struct CausalLease {
+    state: Arc<Mutex<CausalLeaseState>>,
+}
+
+struct CausalLeaseState {
+    bases: BTreeMap<u64, LeaseInstant>,
+    renewal_requests: BTreeSet<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RenewalRequestFailure {
+    LeaseClock,
+    Outbox,
+    Sequence,
+}
+
+impl CausalLease {
+    pub(super) fn new(acceptance_basis: LeaseInstant) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CausalLeaseState {
+                bases: BTreeMap::from([(1, acceptance_basis)]),
+                renewal_requests: BTreeSet::new(),
+            })),
+        }
+    }
+
+    fn basis(&self, sequence: u64) -> Option<LeaseInstant> {
+        self.lock().bases.get(&sequence).copied()
+    }
+
+    pub(super) fn request_renewal(
+        &self,
+        current_sequence: u64,
+        assignment_id: &str,
+        attempt_id: &str,
+        lease_clock: &LeaseClock,
+        outbox: &ObservationOutbox,
+    ) -> Result<(), RenewalRequestFailure> {
+        let next_sequence = current_sequence
+            .checked_add(1)
+            .ok_or(RenewalRequestFailure::Sequence)?;
+        let mut state = self.lock();
+        if state.renewal_requests.contains(&next_sequence) {
+            return Ok(());
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = state.bases.entry(next_sequence)
+        {
+            let basis = lease_clock
+                .now()
+                .map_err(|_| RenewalRequestFailure::LeaseClock)?;
+            entry.insert(basis);
+        }
+        outbox
+            .enqueue(AssignmentObservation::LeaseRenewalRequested {
+                assignment_id: assignment_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                current_lease_sequence: current_sequence,
+            })
+            .map_err(|_| RenewalRequestFailure::Outbox)?;
+        state.renewal_requests.insert(next_sequence);
+        Ok(())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CausalLeaseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 struct RetainedDecision {
     offer: AssignmentOffer,
     response: AssignmentDecision,
     response_observation_id: Option<u64>,
+    causal_lease: Option<CausalLease>,
     start: Option<AssignmentStart>,
     renewals: BTreeMap<String, AssignmentRenewal>,
+    rejected_renewals: BTreeMap<String, AssignmentRenewal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -729,16 +751,63 @@ impl AcceptedAssignment {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LeaseAuthority {
     pub(super) sequence: u64,
-    pub(super) renewal_deadline: Instant,
-    pub(super) cancellation_deadline: Instant,
-    pub(super) stop_deadline: Instant,
-    pub(super) force_stop_deadline: Instant,
-    pub(super) expires_deadline: Instant,
+    pub(super) basis: LeaseInstant,
+    pub(super) renewal_request: LeaseInstant,
+    pub(super) cancellation_start: LeaseInstant,
+    pub(super) force_stop_start: LeaseInstant,
+    pub(super) force_stop_end: LeaseInstant,
+    pub(super) local_expiry: LeaseInstant,
     pub(super) terminal_report_delivery_budget: Duration,
     pub(super) revoked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GrantValidationFailure {
+    MissingBasis,
+    Arithmetic,
+}
+
+impl LeaseAuthority {
+    fn derive(
+        sequence: u64,
+        basis: LeaseInstant,
+        policy: &ExecutionLeasePolicy,
+        cancellation_grace: Duration,
+    ) -> Result<Self, LeaseClockError> {
+        let lease_duration = Duration::from_millis(policy.lease_duration_milliseconds);
+        let fencing_margin = Duration::from_millis(policy.fencing_margin_milliseconds);
+        let renewal_delivery_budget = Duration::from_millis(
+            u64::try_from(policy.renewal_delivery_budget_milliseconds)
+                .map_err(|_| LeaseClockError::ArithmeticOverflow)?,
+        );
+        let force_stop_reap_budget = Duration::from_millis(
+            u64::try_from(policy.force_stop_and_reap_budget_milliseconds)
+                .map_err(|_| LeaseClockError::ArithmeticOverflow)?,
+        );
+        let terminal_report_delivery_budget = Duration::from_millis(
+            u64::try_from(policy.terminal_report_delivery_budget_milliseconds)
+                .map_err(|_| LeaseClockError::ArithmeticOverflow)?,
+        );
+        let local_expiry = basis.checked_add(lease_duration)?;
+        let force_stop_start = local_expiry.checked_sub(fencing_margin)?;
+        let cancellation_start = force_stop_start.checked_sub(cancellation_grace)?;
+        let renewal_request = cancellation_start.checked_sub(renewal_delivery_budget)?;
+        let force_stop_end = force_stop_start.checked_add(force_stop_reap_budget)?;
+        Ok(Self {
+            sequence,
+            basis,
+            renewal_request,
+            cancellation_start,
+            force_stop_start,
+            force_stop_end,
+            local_expiry,
+            terminal_report_delivery_budget,
+            revoked: false,
+        })
+    }
 }
 
 struct RunningAssignment {
@@ -746,6 +815,7 @@ struct RunningAssignment {
     cancellation: CancellationSource,
     cancellation_grace: Duration,
     current_grant: ExecutionLeaseGrant,
+    causal_lease: CausalLease,
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
 }
 
@@ -775,7 +845,8 @@ pub(super) enum ManagerEvent {
     Finished {
         assignment_id: String,
         final_observation_id: Option<u64>,
-        final_delivery_deadline: Option<Instant>,
+        final_delivery_deadline: Option<LeaseInstant>,
+        lease_clock_failed: bool,
         retained_root: Option<AssignmentRoot>,
     },
     FinalGraceElapsed {
@@ -783,6 +854,7 @@ pub(super) enum ManagerEvent {
         final_observation_id: u64,
         continue_reporting: bool,
     },
+    LeaseClockFailed,
 }
 
 #[derive(Clone)]
@@ -855,12 +927,7 @@ pub(super) struct AssignmentManager {
     codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
     boot_id: String,
     environment: EnvironmentSnapshot,
-    #[allow(
-        dead_code,
-        reason = "removed from lease admission before runtime clock deletion"
-    )]
-    wall_clock: Arc<dyn WallClockHealth>,
-    sleeper: Arc<dyn Sleeper>,
+    lease_clock: LeaseClock,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     #[cfg(test)]
     fixture_materialized_source: Option<(PathBuf, PathBuf)>,
@@ -873,20 +940,18 @@ pub(super) struct AssignmentManager {
     events: mpsc::UnboundedReceiver<ManagerEvent>,
     event_sender: mpsc::UnboundedSender<ManagerEvent>,
     shutting_down: bool,
+    lease_clock_failed: bool,
+    lease_clock_failure_report: Option<u64>,
     guard_processes: bool,
 }
 
 impl AssignmentManager {
     #[cfg(test)]
-    pub(super) fn new(
-        config: &Config,
-        boot_id: String,
-        wall_clock: Arc<dyn WallClockHealth>,
-    ) -> Self {
+    pub(super) fn new(config: &Config, boot_id: String, lease_clock: LeaseClock) -> Self {
         Self::new_inner(
             config,
             boot_id,
-            wall_clock,
+            lease_clock,
             Arc::new(super::TokioSleeper),
             false,
         )
@@ -895,26 +960,26 @@ impl AssignmentManager {
     pub(super) fn new_with_sleeper(
         config: &Config,
         boot_id: String,
-        wall_clock: Arc<dyn WallClockHealth>,
+        lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
-        Self::new_inner(config, boot_id, wall_clock, sleeper, true)
+        Self::new_inner(config, boot_id, lease_clock, sleeper, true)
     }
 
     #[cfg(test)]
     fn new_for_test_with_sleeper(
         config: &Config,
         boot_id: String,
-        wall_clock: Arc<dyn WallClockHealth>,
+        lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
-        Self::new_inner(config, boot_id, wall_clock, sleeper, false)
+        Self::new_inner(config, boot_id, lease_clock, sleeper, false)
     }
 
     fn new_inner(
         config: &Config,
         boot_id: String,
-        wall_clock: Arc<dyn WallClockHealth>,
+        lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
         guard_processes: bool,
     ) -> Self {
@@ -934,8 +999,7 @@ impl AssignmentManager {
             codex_installation: config.codex_installation().cloned(),
             boot_id: boot_id.clone(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
-            wall_clock,
-            sleeper,
+            lease_clock,
             source_broker: HttpSourceCredentialBroker::new(
                 config.endpoint(),
                 config.credential(),
@@ -954,6 +1018,8 @@ impl AssignmentManager {
             events,
             event_sender,
             shutting_down: false,
+            lease_clock_failed: false,
+            lease_clock_failure_report: None,
             guard_processes,
         }
     }
@@ -1178,6 +1244,9 @@ impl AssignmentManager {
                 Err(AssignmentManagerFailure::ConflictingOffer)
             };
         }
+        if start.lease.sequence != 1 {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         self.decisions[index].start = Some(start.clone());
 
         let Some(slot) = self.slot.take() else {
@@ -1191,16 +1260,50 @@ impl AssignmentManager {
             self.slot = Some(LocalSlot::Accepted(accepted));
             return Ok(None);
         }
+        let Some(causal_lease) = self.decisions[index].causal_lease.clone() else {
+            let identity = accepted.identity.clone();
+            drop(accepted);
+            self.finish_before_execution(identity, "execution_lease_expired")?;
+            return Ok(None);
+        };
         let cancellation_grace = accepted.admitted.execution().cancellation().grace();
-        let authority = match self.validate_grant(&start.lease, 1, cancellation_grace) {
-            Ok(authority) => authority,
-            Err(()) => {
+        let authority =
+            match self.validate_grant(&start.lease, 1, cancellation_grace, &causal_lease) {
+                Ok(authority) => authority,
+                Err(GrantValidationFailure::MissingBasis) => {
+                    let identity = accepted.identity.clone();
+                    drop(accepted);
+                    self.finish_before_execution(identity, "execution_lease_expired")?;
+                    return Ok(None);
+                }
+                Err(GrantValidationFailure::Arithmetic) => {
+                    self.slot = Some(LocalSlot::Accepted(accepted));
+                    self.lease_clock_failed = true;
+                    return Err(AssignmentManagerFailure::LeaseClock);
+                }
+            };
+        let now = match self.lease_clock.now() {
+            Ok(now) => now,
+            Err(_) => {
+                self.slot = Some(LocalSlot::Accepted(accepted));
+                self.lease_clock_failed = true;
+                return Err(AssignmentManagerFailure::LeaseClock);
+            }
+        };
+        match now.checked_cmp(authority.cancellation_start) {
+            Ok(std::cmp::Ordering::Less) => {}
+            Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
                 let identity = accepted.identity.clone();
                 drop(accepted);
                 self.finish_before_execution(identity, "execution_lease_expired")?;
                 return Ok(None);
             }
-        };
+            Err(_) => {
+                self.slot = Some(LocalSlot::Accepted(accepted));
+                self.lease_clock_failed = true;
+                return Err(AssignmentManagerFailure::LeaseClock);
+            }
+        }
         let cancellation = accepted
             .admitted
             .execution()
@@ -1213,6 +1316,7 @@ impl AssignmentManager {
             cancellation,
             cancellation_grace,
             current_grant: start.lease,
+            causal_lease: causal_lease.clone(),
             authority_updates,
         })));
         Ok(Some(ExecutionJob::new(
@@ -1220,7 +1324,8 @@ impl AssignmentManager {
             self.outbox.clone(),
             self.artifact_delivery.clone(),
             self.event_sender.clone(),
-            Arc::clone(&self.sleeper),
+            self.lease_clock.clone(),
+            causal_lease,
             authority_receiver,
         )))
     }
@@ -1239,11 +1344,12 @@ impl AssignmentManager {
         }) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        if let Some(known) = self
-            .decisions
-            .iter()
-            .find_map(|decision| decision.renewals.get(&renewal.effect_id))
-        {
+        if let Some(known) = self.decisions.iter().find_map(|decision| {
+            decision
+                .renewals
+                .get(&renewal.effect_id)
+                .or_else(|| decision.rejected_renewals.get(&renewal.effect_id))
+        }) {
             return if known == &renewal {
                 Ok(())
             } else {
@@ -1263,72 +1369,92 @@ impl AssignmentManager {
         {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
+        if decision
+            .renewals
+            .values()
+            .chain(decision.rejected_renewals.values())
+            .any(|known| known.lease.sequence == renewal.lease.sequence)
+        {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        let running_matches = matches!(
+            &self.slot,
+            Some(LocalSlot::Running(running))
+                if running.identity.assignment_id == renewal.assignment_id
+        );
+        if !running_matches {
+            // A later causal request must not change this grant's replay disposition.
+            self.decisions[index]
+                .rejected_renewals
+                .insert(renewal.effect_id.clone(), renewal);
+            return Ok(());
+        }
         let Some(LocalSlot::Running(running)) = &self.slot else {
             return Ok(());
         };
-        if running.identity.assignment_id != renewal.assignment_id {
-            return Ok(());
-        }
-        let now = self.sleeper.now();
-        let monotonic_stopped = {
-            let authority = running.authority_updates.borrow();
-            authority.revoked || now >= authority.stop_deadline
+        let now = match self.lease_clock.now() {
+            Ok(now) => now,
+            Err(_) => return Err(self.fail_lease_clock()),
         };
-        let current_stopped = monotonic_stopped;
-        if current_stopped {
+        let authority = running.authority_updates.borrow().clone();
+        let cancellation_order = match now.checked_cmp(authority.cancellation_start) {
+            Ok(ordering) => ordering,
+            Err(_) => return Err(self.fail_lease_clock()),
+        };
+        let cancellation_started = authority.revoked
+            || running.cancellation.is_cancelled()
+            || cancellation_order != std::cmp::Ordering::Less;
+        if cancellation_started {
             let Some(LocalSlot::Running(running)) = &mut self.slot else {
                 return Ok(());
             };
-            revoke_authority(running, now);
-        }
-
-        let Some(LocalSlot::Running(running)) = &self.slot else {
+            revoke_authority(running);
             return Ok(());
-        };
+        }
         if renewal.lease.sequence <= running.current_grant.sequence {
-            return if renewal.lease.sequence == running.current_grant.sequence
-                && decision
-                    .renewals
-                    .values()
-                    .any(|known| known.lease.sequence == running.current_grant.sequence)
-            {
-                Err(AssignmentManagerFailure::ConflictingOffer)
-            } else {
-                Ok(())
-            };
+            return Ok(());
         }
         let expected_sequence = running
             .current_grant
             .sequence
             .checked_add(1)
             .ok_or(AssignmentManagerFailure::ConflictingOffer)?;
-        if renewal.lease.sequence != expected_sequence
-            || (running.cancellation.is_cancelled() && !current_stopped)
-        {
-            return if running.cancellation.is_cancelled() {
-                Ok(())
-            } else {
-                Err(AssignmentManagerFailure::ConflictingOffer)
-            };
+        if renewal.lease.sequence != expected_sequence {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
         }
         let cancellation_grace = running.cancellation_grace;
-        let current_grant = running.current_grant.clone();
-        let authority = self
-            .validate_grant(&renewal.lease, expected_sequence, cancellation_grace)
-            .and_then(|authority| {
-                grant_extends(&current_grant, &renewal.lease)
-                    .then_some(authority)
-                    .ok_or(())
-            })
-            .map_err(|()| AssignmentManagerFailure::ConflictingOffer)?;
+        let causal_lease = running.causal_lease.clone();
+        let current_expiry = authority.local_expiry;
+        let next_authority = match self.validate_grant(
+            &renewal.lease,
+            expected_sequence,
+            cancellation_grace,
+            &causal_lease,
+        ) {
+            Ok(authority) => authority,
+            Err(GrantValidationFailure::MissingBasis) => {
+                self.decisions[index]
+                    .rejected_renewals
+                    .insert(renewal.effect_id.clone(), renewal);
+                return Ok(());
+            }
+            Err(GrantValidationFailure::Arithmetic) => {
+                return Err(self.fail_lease_clock());
+            }
+        };
+        match next_authority.local_expiry.checked_cmp(current_expiry) {
+            Ok(std::cmp::Ordering::Greater) => {}
+            Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+            Err(_) => return Err(self.fail_lease_clock()),
+        }
 
         let Some(LocalSlot::Running(running)) = &mut self.slot else {
             return Ok(());
         };
-        if !current_stopped {
-            running.current_grant = renewal.lease.clone();
-            running.authority_updates.send_replace(authority);
-        }
+        running.current_grant = renewal.lease.clone();
+        running.authority_updates.send_replace(next_authority);
         self.decisions[index]
             .renewals
             .insert(renewal.effect_id.clone(), renewal);
@@ -1369,7 +1495,6 @@ impl AssignmentManager {
             self.retire_assignment_observations(assignment_id);
             return Ok(());
         }
-        let now = self.sleeper.now();
         match &mut self.slot {
             Some(LocalSlot::Accepted(accepted))
                 if accepted.identity.assignment_id == assignment_id =>
@@ -1381,7 +1506,7 @@ impl AssignmentManager {
                 if running.identity.assignment_id == assignment_id
                     && reason == "execution_lease_expired" =>
             {
-                revoke_authority(running, now);
+                revoke_authority(running);
             }
             _ => {}
         }
@@ -1412,6 +1537,9 @@ impl AssignmentManager {
             retained.response_observation_id = None;
         }
         if observation.is_terminal() {
+            if self.lease_clock_failure_report == Some(id) {
+                self.lease_clock_failure_report = None;
+            }
             if matches!(
                 &self.slot,
                 Some(LocalSlot::Finishing(finishing)) if finishing.final_observation_id == id
@@ -1512,13 +1640,33 @@ impl AssignmentManager {
             final_observation_id,
             _retained_root: None,
         }));
-        self.start_final_grace(
-            identity.assignment_id,
-            final_observation_id,
-            FINAL_ACKNOWLEDGEMENT_GRACE,
-            true,
-        );
+        let deadline = self
+            .lease_clock
+            .now()
+            .and_then(|now| now.checked_add(FINAL_ACKNOWLEDGEMENT_GRACE))
+            .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
+        self.start_final_grace(identity.assignment_id, final_observation_id, deadline, true)
+            .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
         Ok(())
+    }
+
+    pub(super) fn lease_clock_has_failed(&mut self) -> bool {
+        self.drain_events();
+        self.lease_clock_failed
+    }
+
+    pub(super) fn pending_lease_clock_failure_report(&mut self) -> Option<u64> {
+        self.drain_events();
+        self.lease_clock_failure_report
+            .filter(|id| !self.outbox.is_encoded(*id))
+    }
+
+    pub(super) fn lease_clock_failure_ready_to_exit(&mut self) -> bool {
+        self.drain_events();
+        self.lease_clock_failed
+            && self
+                .lease_clock_failure_report
+                .is_none_or(|id| self.outbox.is_encoded(id) || !self.outbox.contains(id))
     }
 
     pub(super) fn shutdown_complete(&mut self) -> bool {
@@ -1574,7 +1722,10 @@ impl AssignmentManager {
                         Err(decline) => rejected(&offer, decline),
                     };
                     let accepted = matches!(response, AssignmentDecision::Accepted { .. });
-                    if self.retain_decision(*offer, response).is_err() || !accepted {
+                    if let Err(failure) = self.retain_decision(*offer, response) {
+                        self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
+                        self.slot = None;
+                    } else if !accepted {
                         self.slot = None;
                     }
                 }
@@ -1582,6 +1733,7 @@ impl AssignmentManager {
                     assignment_id,
                     final_observation_id,
                     final_delivery_deadline,
+                    lease_clock_failed,
                     retained_root,
                 } => {
                     let Some(LocalSlot::Running(running)) = self.slot.take() else {
@@ -1594,17 +1746,35 @@ impl AssignmentManager {
                     let identity = running.identity;
                     let Some(final_observation_id) = final_observation_id else {
                         self.retire_assignment_observations(&assignment_id);
+                        self.lease_clock_failed |= lease_clock_failed;
                         self.outbox.wake();
                         continue;
                     };
+                    if lease_clock_failed {
+                        self.begin_lease_clock_failure_reporting(final_observation_id);
+                        self.reporting = Some(identity);
+                        continue;
+                    }
                     let Some(final_delivery_deadline) = final_delivery_deadline else {
                         self.retire_assignment_observations(&assignment_id);
                         self.outbox.wake();
                         continue;
                     };
-                    let remaining =
-                        final_delivery_deadline.saturating_duration_since(self.sleeper.now());
-                    if remaining.is_zero() {
+                    let deadline_pending = match self
+                        .lease_clock
+                        .now()
+                        .and_then(|now| now.checked_cmp(final_delivery_deadline))
+                    {
+                        Ok(std::cmp::Ordering::Less) => true,
+                        Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
+                        Err(_) => {
+                            self.lease_clock_failed = true;
+                            self.reporting = Some(identity);
+                            self.outbox.wake();
+                            continue;
+                        }
+                    };
+                    if !deadline_pending {
                         self.retire_assignment_observations(&assignment_id);
                         self.outbox.wake();
                         continue;
@@ -1614,12 +1784,17 @@ impl AssignmentManager {
                         final_observation_id,
                         _retained_root: retained_root,
                     }));
-                    self.start_final_grace(
-                        identity.assignment_id,
-                        final_observation_id,
-                        remaining,
-                        false,
-                    );
+                    if self
+                        .start_final_grace(
+                            identity.assignment_id,
+                            final_observation_id,
+                            final_delivery_deadline,
+                            false,
+                        )
+                        .is_err()
+                    {
+                        self.lease_clock_failed = true;
+                    }
                 }
                 ManagerEvent::FinalGraceElapsed {
                     assignment_id,
@@ -1641,6 +1816,12 @@ impl AssignmentManager {
                         self.slot = Some(LocalSlot::Finishing(finishing));
                     }
                 }
+                ManagerEvent::LeaseClockFailed => {
+                    self.lease_clock_failed = true;
+                    if let Some(LocalSlot::Running(running)) = &mut self.slot {
+                        revoke_authority(running);
+                    }
+                }
             }
         }
     }
@@ -1649,21 +1830,26 @@ impl AssignmentManager {
         &self,
         assignment_id: String,
         final_observation_id: u64,
-        duration: Duration,
+        deadline: LeaseInstant,
         continue_reporting: bool,
-    ) {
-        let sleeper = Arc::clone(&self.sleeper);
+    ) -> Result<(), LeaseClockError> {
+        let wait = self.lease_clock.start_wait(deadline)?;
         let sender = self.event_sender.clone();
         let outbox = self.outbox.clone();
         tokio::spawn(async move {
-            sleeper.sleep(duration).await;
-            let _ = sender.send(ManagerEvent::FinalGraceElapsed {
-                assignment_id,
-                final_observation_id,
-                continue_reporting,
-            });
+            let cancellation = LeaseWaitCancellation::default();
+            let event = match wait.wait(&cancellation).await {
+                Ok(_) => ManagerEvent::FinalGraceElapsed {
+                    assignment_id,
+                    final_observation_id,
+                    continue_reporting,
+                },
+                Err(_) => ManagerEvent::LeaseClockFailed,
+            };
+            let _ = sender.send(event);
             outbox.wake();
         });
+        Ok(())
     }
 
     fn apply_successor_fences(&mut self, successor_assignment_id: &str) {
@@ -1739,6 +1925,15 @@ impl AssignmentManager {
         offer: AssignmentOffer,
         response: AssignmentDecision,
     ) -> Result<(), AssignmentManagerFailure> {
+        let causal_lease = if matches!(response, AssignmentDecision::Accepted { .. }) {
+            let basis = self
+                .lease_clock
+                .now()
+                .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
+            Some(CausalLease::new(basis))
+        } else {
+            None
+        };
         let response_observation_id = self
             .outbox
             .enqueue(AssignmentObservation::Decision(response.clone()))
@@ -1747,8 +1942,10 @@ impl AssignmentManager {
             offer,
             response,
             response_observation_id: Some(response_observation_id),
+            causal_lease,
             start: None,
             renewals: BTreeMap::new(),
+            rejected_renewals: BTreeMap::new(),
         });
         Ok(())
     }
@@ -1771,60 +1968,40 @@ impl AssignmentManager {
         }
     }
 
+    fn fail_lease_clock(&mut self) -> AssignmentManagerFailure {
+        if let Some(LocalSlot::Running(running)) = &mut self.slot {
+            revoke_authority(running);
+        }
+        self.lease_clock_failed = true;
+        AssignmentManagerFailure::LeaseClock
+    }
+
+    fn begin_lease_clock_failure_reporting(&mut self, final_observation_id: u64) {
+        self.lease_clock_failed = true;
+        self.lease_clock_failure_report = Some(final_observation_id);
+        self.outbox.retain_only(final_observation_id);
+        self.outbox.wake();
+    }
+
     fn validate_grant(
         &self,
         grant: &ExecutionLeaseGrant,
         expected_sequence: u64,
         cancellation_grace: Duration,
-    ) -> Result<LeaseAuthority, ()> {
+        causal_lease: &CausalLease,
+    ) -> Result<LeaseAuthority, GrantValidationFailure> {
         if grant.sequence != expected_sequence {
-            return Err(());
+            return Err(GrantValidationFailure::MissingBasis);
         }
-        #[cfg(not(test))]
-        {
-            let _ = (&self.lease_policy, cancellation_grace);
-            // Sequence-only grants require a retained causal local basis. This
-            // contract milestone deliberately grants no receipt-based authority
-            // before that runtime state is implemented.
-            Err(())
-        }
-        #[cfg(test)]
-        {
-            // Existing execution tests exercise repository-owned containment and
-            // reporting with a controlled sleeper. Keep those tests independent
-            // of the removed wire timestamps until causal bases replace this
-            // test-only authority fixture.
-            let policy = self.lease_policy.as_ref().ok_or(())?;
-            let received_at = self.sleeper.now();
-            let expires_after = Duration::from_secs(grant.sequence.checked_mul(30).ok_or(())?);
-            let fencing_margin = Duration::from_millis(policy.fencing_margin_milliseconds);
-            let stop_after = expires_after.checked_sub(fencing_margin).ok_or(())?;
-            let cancellation_after = stop_after.checked_sub(cancellation_grace).ok_or(())?;
-            let renewal_delivery = Duration::from_millis(
-                u64::try_from(policy.renewal_delivery_budget_milliseconds).map_err(|_| ())?,
-            );
-            let force_stop_reap = Duration::from_millis(
-                u64::try_from(policy.force_stop_and_reap_budget_milliseconds).map_err(|_| ())?,
-            );
-            let terminal_report_delivery_budget = Duration::from_millis(
-                u64::try_from(policy.terminal_report_delivery_budget_milliseconds)
-                    .map_err(|_| ())?,
-            );
-            Ok(LeaseAuthority {
-                sequence: grant.sequence,
-                renewal_deadline: received_at
-                    .checked_add(cancellation_after.saturating_sub(renewal_delivery))
-                    .ok_or(())?,
-                cancellation_deadline: received_at.checked_add(cancellation_after).ok_or(())?,
-                stop_deadline: received_at.checked_add(stop_after).ok_or(())?,
-                force_stop_deadline: received_at
-                    .checked_add(stop_after.checked_add(force_stop_reap).ok_or(())?)
-                    .ok_or(())?,
-                expires_deadline: received_at.checked_add(expires_after).ok_or(())?,
-                terminal_report_delivery_budget,
-                revoked: false,
-            })
-        }
+        let policy = self
+            .lease_policy
+            .as_ref()
+            .ok_or(GrantValidationFailure::MissingBasis)?;
+        let basis = causal_lease
+            .basis(expected_sequence)
+            .ok_or(GrantValidationFailure::MissingBasis)?;
+        LeaseAuthority::derive(expected_sequence, basis, policy, cancellation_grace)
+            .map_err(|_| GrantValidationFailure::Arithmetic)
     }
 
     fn prepare_execution_root(
@@ -1853,6 +2030,22 @@ impl AssignmentManager {
             private,
             source,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enqueue_fixture_lease_clock_failure_report(&mut self) {
+        let final_observation_id = self
+            .outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                report: ExecutionReport::Aborted {
+                    last_execution_event_sequence: 40,
+                    reason: "runner_internal_failure".to_owned(),
+                },
+            })
+            .expect("enqueue fixture lease clock failure report");
+        self.begin_lease_clock_failure_reporting(final_observation_id);
     }
 
     #[cfg(test)]
@@ -1968,22 +2161,13 @@ fn build_execution_context(
     })
 }
 
-fn revoke_authority(running: &mut RunningAssignment, now: Instant) {
+fn revoke_authority(running: &mut RunningAssignment) {
     running.authority_updates.send_modify(|authority| {
         authority.revoked = true;
-        authority.renewal_deadline = now;
-        authority.cancellation_deadline = now;
-        authority.stop_deadline = now;
-        authority.force_stop_deadline = now;
-        authority.expires_deadline = now;
     });
     running.cancellation.request_cancellation(
         crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired,
     );
-}
-
-fn grant_extends(current: &ExecutionLeaseGrant, next: &ExecutionLeaseGrant) -> bool {
-    next.sequence == current.sequence.saturating_add(1)
 }
 
 fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePolicyFailure> {
@@ -2204,17 +2388,18 @@ mod tests {
     use crate::execution::pi::ValidatedPiInstallation;
     use crate::runner::credential::test_credential;
     use crate::runner::service::config::Config;
+    use crate::runner::service::lease_clock::{
+        ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
+    };
     use crate::runner::service::source::{
         CredentialBrokerFailure, CredentialOperation, ProviderCredential,
     };
-    use crate::runner::service::test_support::{
-        SleepRelease, controlled_sleeper, sleep_request, with_watchdog,
-    };
+    use crate::runner::service::test_support::{fixture_lease_clock, with_watchdog};
     use crate::runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
-        ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse,
+        ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse, CloudFrame,
         ExecutionLimitsV1RunnerProjection, ExecutionSourceV1RunnerProjection,
-        WorkflowSourceClosureDigestV1RunnerProjection,
+        WorkflowSourceClosureDigestV1RunnerProjection, decode_cloud_frame,
     };
 
     const NOW: &str = "2026-07-23T00:00:00Z";
@@ -2440,36 +2625,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         panic!("intentional assignment command fixture failure");
     }
 
-    #[allow(
-        dead_code,
-        reason = "removed from lease admission before runtime clock deletion"
-    )]
-    struct FixedWallClockHealth {
-        uncertainty: Mutex<Result<Duration, WallClockHealthFailure>>,
-        now: OffsetDateTime,
-    }
-
-    impl WallClockHealth for FixedWallClockHealth {
-        fn uncertainty(&self) -> Result<Duration, WallClockHealthFailure> {
-            *self.uncertainty.lock().unwrap()
-        }
-
-        fn now_utc(&self) -> Result<OffsetDateTime, WallClockHealthFailure> {
-            Ok(self.now)
-        }
-    }
-
-    fn wall_clock(uncertainty: Duration) -> Arc<dyn WallClockHealth> {
-        wall_clock_at(uncertainty, NOW)
-    }
-
-    fn wall_clock_at(uncertainty: Duration, now: &str) -> Arc<dyn WallClockHealth> {
-        Arc::new(FixedWallClockHealth {
-            uncertainty: Mutex::new(Ok(uncertainty)),
-            now: OffsetDateTime::parse(now, &Rfc3339).unwrap(),
-        })
-    }
-
     fn policy() -> ExecutionLeasePolicy {
         ExecutionLeasePolicy {
             schema_version: 2,
@@ -2594,7 +2749,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let mut manager = AssignmentManager::new_for_test_with_sleeper(
             &config,
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
-            wall_clock(Duration::ZERO),
+            fixture_lease_clock(),
             sleeper,
         );
         manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
@@ -2759,6 +2914,46 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
+    fn start_from_civil_time(offered: &AssignmentOffer, sent_at: &str) -> AssignmentStart {
+        let encoded = serde_json::to_vec(&json!({
+            "protocolVersion": 1,
+            "direction": "cloud_to_runner",
+            "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "sentAt": sent_at,
+            "type": "assignment_start",
+            "payloadVersion": 1,
+            "payload": {
+                "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+                "assignmentId": offered.assignment_id,
+                "runId": offered.run_id,
+                "attemptId": offered.attempt_id,
+                "executionSpecId": offered.execution_spec.execution_spec_id,
+                "lease": { "leaseSequence": 1 }
+            }
+        }))
+        .unwrap();
+        let CloudFrame::AssignmentStart {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            execution_spec_id,
+            lease,
+            ..
+        } = decode_cloud_frame(&encoded).expect("civil-time assignment start must decode")
+        else {
+            panic!("fixture decoded as another Cloud frame");
+        };
+        AssignmentStart {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            execution_spec_id,
+            lease,
+        }
+    }
+
     fn renewal_for(offered: &AssignmentOffer) -> AssignmentRenewal {
         AssignmentRenewal {
             effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abj".to_owned(),
@@ -2787,7 +2982,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .unwrap()
     }
 
-    fn enqueue_completion(manager: &AssignmentManager, final_delivery_deadline: Instant) -> u64 {
+    fn enqueue_completion(
+        manager: &AssignmentManager,
+        final_delivery_deadline: LeaseInstant,
+    ) -> u64 {
         let identity = match &manager.slot {
             Some(LocalSlot::Running(running)) => running.identity.clone(),
             _ => panic!("fixture assignment must be running"),
@@ -2799,6 +2997,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 assignment_id: identity.assignment_id,
                 final_observation_id: Some(final_observation_id),
                 final_delivery_deadline: Some(final_delivery_deadline),
+                lease_clock_failed: false,
                 retained_root: None,
             })
             .unwrap();
@@ -2816,20 +3015,81 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         execution_job(manager, offered).spawn();
     }
 
+    fn request_next_renewal(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
+        let causal_lease = match &manager.slot {
+            Some(LocalSlot::Running(running)) => running.causal_lease.clone(),
+            _ => panic!("assignment must remain running"),
+        };
+        causal_lease
+            .request_renewal(
+                1,
+                &offered.assignment_id,
+                &offered.attempt_id,
+                &manager.lease_clock,
+                &manager.outbox,
+            )
+            .unwrap();
+    }
+
+    fn controlled_execution_job(
+        manager: &mut AssignmentManager,
+        offered: &AssignmentOffer,
+    ) -> (
+        ControlledLeaseClock,
+        tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
+        ExecutionJob,
+    ) {
+        let (lease_clock, control, waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        manager.handle_offer(offered.clone()).unwrap();
+        let job = execution_job(manager, offered);
+        (control, waits, job)
+    }
+
     fn controlled_running_fixture() -> (
         tempfile::TempDir,
         AssignmentManager,
-        tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+        tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
         AssignmentOffer,
     ) {
         let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let (temporary, mut manager) = manager_fixture(workflow);
-        let (sleeper, sleep_requests) = controlled_sleeper();
-        manager.sleeper = sleeper;
+        let (lease_clock, _control, lease_waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         spawn_execution(&mut manager, &offered);
-        (temporary, manager, sleep_requests, offered)
+        (temporary, manager, lease_waits, offered)
+    }
+
+    async fn lease_wait_request(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
+        expected: Duration,
+    ) -> LeaseTimerRelease {
+        loop {
+            let (duration, release) = requests
+                .recv()
+                .await
+                .expect("controlled lease clock closed before the expected timer");
+            if duration == expected {
+                return release;
+            }
+        }
+    }
+
+    async fn wait_for_manager_state(
+        manager: &mut AssignmentManager,
+        mut reached: impl FnMut(&mut AssignmentManager) -> bool,
+    ) {
+        let notification = manager.notification();
+        loop {
+            let notified = notification.notified();
+            tokio::pin!(notified);
+            if reached(manager) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager) {
@@ -3437,6 +3697,347 @@ steps:
         assert!(manager.handle_start(start).unwrap().is_none());
     }
 
+    fn authority_offsets(authority: &LeaseAuthority) -> Vec<Duration> {
+        [
+            authority.renewal_request,
+            authority.cancellation_start,
+            authority.force_stop_start,
+            authority.force_stop_end,
+            authority.local_expiry,
+        ]
+        .into_iter()
+        .map(|boundary| boundary.checked_duration_since(authority.basis).unwrap())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn causal_acceptance_basis() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (lease_clock, awake, _waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        let acceptance_basis = manager.decisions[0]
+            .causal_lease
+            .as_ref()
+            .unwrap()
+            .basis(1)
+            .unwrap();
+
+        awake.advance(Duration::from_secs(100));
+        let start = start_for(&offered);
+        let job = manager
+            .handle_start(start.clone())
+            .unwrap()
+            .expect("delayed causal start retains authority");
+        let authority = job.authority_updates.borrow().clone();
+        assert_eq!(authority.basis, acceptance_basis);
+        assert_eq!(
+            authority_offsets(&authority),
+            vec![
+                Duration::from_secs(303),
+                Duration::from_secs(308),
+                Duration::from_secs(309),
+                Duration::from_secs(314),
+                Duration::from_secs(320),
+            ]
+        );
+        assert!(manager.handle_start(start).unwrap().is_none());
+
+        fn remaining_after_advance(simulated_suspend: bool) -> Duration {
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            let (lease_clock, control, _waits) = controlled_lease_clock();
+            manager.lease_clock = lease_clock;
+            let offered = offer("bh");
+            manager.handle_offer(offered.clone()).unwrap();
+            let job = manager
+                .handle_start(start_for(&offered))
+                .unwrap()
+                .expect("causal start has authority");
+            if simulated_suspend {
+                control.simulate_suspend(Duration::from_secs(120));
+            } else {
+                control.advance(Duration::from_secs(120));
+            }
+            job.authority_updates
+                .borrow()
+                .cancellation_start
+                .checked_duration_since(manager.lease_clock.now().unwrap())
+                .unwrap()
+        }
+        assert_eq!(
+            remaining_after_advance(false),
+            remaining_after_advance(true),
+            "awake delay and simulated suspend must consume equal authority"
+        );
+
+        let (_temporary, mut boundary_manager) = manager_fixture(workflow);
+        let (lease_clock, boundary, _waits) = controlled_lease_clock();
+        boundary_manager.lease_clock = lease_clock;
+        let boundary_offer = offer("bj");
+        boundary_manager
+            .handle_offer(boundary_offer.clone())
+            .unwrap();
+        boundary.advance(Duration::from_secs(308));
+        assert!(
+            boundary_manager
+                .handle_start(start_for(&boundary_offer))
+                .unwrap()
+                .is_none(),
+            "a start at cancellation must not produce an execution job"
+        );
+    }
+
+    #[test]
+    fn wrong_wall_time_after_transport_does_not_change_lease_authority() {
+        fn outcome(sent_at: &str) -> (Vec<Duration>, usize) {
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            let (lease_clock, _control, _waits) = controlled_lease_clock();
+            manager.lease_clock = lease_clock;
+            let offered = offer("bg");
+            manager.handle_offer(offered.clone()).unwrap();
+            let start = start_from_civil_time(&offered, sent_at);
+            let mut invocations = 0;
+            let job = manager.handle_start(start.clone()).unwrap();
+            if job.is_some() {
+                invocations += 1;
+            }
+            assert!(manager.handle_start(start).unwrap().is_none());
+            (
+                authority_offsets(&job.unwrap().authority_updates.borrow()),
+                invocations,
+            )
+        }
+
+        let past = outcome("1900-01-01T00:00:00Z");
+        let future = outcome("9999-12-31T23:59:59Z");
+        assert_eq!(past, future);
+        assert_eq!(past.1, 1);
+    }
+
+    #[test]
+    fn delayed_replayed_and_conflicting_grants() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (lease_clock, control, _waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        let original_basis = manager.decisions[0]
+            .causal_lease
+            .as_ref()
+            .unwrap()
+            .basis(1)
+            .unwrap();
+        control.advance(Duration::from_secs(100));
+        let start = start_for(&offered);
+        let job = manager
+            .handle_start(start.clone())
+            .unwrap()
+            .expect("delayed start invokes once");
+        let original_authority = job.authority_updates.borrow().clone();
+        assert_eq!(original_authority.basis, original_basis);
+        assert!(manager.handle_start(start).unwrap().is_none());
+        assert_eq!(*job.authority_updates.borrow(), original_authority);
+
+        let mut stale = renewal_for(&offered);
+        stale.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abm".to_owned();
+        stale.lease.sequence = 1;
+        manager.handle_renewal(stale).unwrap();
+        let mut gap = renewal_for(&offered);
+        gap.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abn".to_owned();
+        gap.lease.sequence = 3;
+        assert_eq!(
+            manager.handle_renewal(gap),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+        request_next_renewal(&mut manager, &offered);
+        let renewal = renewal_for(&offered);
+        manager.handle_renewal(renewal.clone()).unwrap();
+        let renewed_authority = job.authority_updates.borrow().clone();
+        assert_eq!(renewed_authority.sequence, 2);
+        manager.handle_renewal(renewal.clone()).unwrap();
+        assert_eq!(*job.authority_updates.borrow(), renewed_authority);
+        let mut conflict = renewal;
+        conflict.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abp".to_owned();
+        assert_eq!(
+            manager.handle_renewal(conflict),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let remaining = renewed_authority
+            .cancellation_start
+            .checked_duration_since(manager.lease_clock.now().unwrap())
+            .unwrap();
+        control.advance(remaining);
+        let mut post_stop = renewal_for(&offered);
+        post_stop.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abq".to_owned();
+        post_stop.lease.sequence = 3;
+        manager.handle_renewal(post_stop).unwrap();
+        assert_eq!(job.authority_updates.borrow().sequence, 2);
+        assert!(job.authority_updates.borrow().revoked);
+
+        let (_temporary, mut pre_basis) = manager_fixture(workflow);
+        let (lease_clock, _control, _waits) = controlled_lease_clock();
+        pre_basis.lease_clock = lease_clock;
+        pre_basis.handle_offer(offered.clone()).unwrap();
+        let pre_basis_job = pre_basis
+            .handle_start(start_for(&offered))
+            .unwrap()
+            .expect("valid start dispatches execution");
+        let rejected = renewal_for(&offered);
+        pre_basis.handle_renewal(rejected.clone()).unwrap();
+        pre_basis.finish_transport();
+        request_next_renewal(&mut pre_basis, &offered);
+        pre_basis.handle_renewal(rejected.clone()).unwrap();
+        assert_eq!(pre_basis_job.authority_updates.borrow().sequence, 1);
+        let mut conflicting_reuse = rejected;
+        conflicting_reuse.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abv".to_owned();
+        assert_eq!(
+            pre_basis.handle_renewal(conflicting_reuse),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let (_temporary, mut unsolicited) = manager_fixture(workflow);
+        unsolicited.handle_renewal(renewal_for(&offered)).unwrap();
+        assert!(unsolicited.slot.is_none());
+    }
+
+    #[test]
+    fn pre_start_renewal_replay_never_gains_authority() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (lease_clock, control, _waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+
+        let unsolicited = renewal_for(&offered);
+        manager.handle_renewal(unsolicited.clone()).unwrap();
+
+        let job = manager
+            .handle_start(start_for(&offered))
+            .unwrap()
+            .expect("valid start dispatches execution");
+        control.advance(Duration::from_secs(1));
+        request_next_renewal(&mut manager, &offered);
+        manager.handle_renewal(unsolicited).unwrap();
+
+        assert_eq!(
+            job.authority_updates.borrow().sequence,
+            1,
+            "a grant received before execution and its causal renewal basis must remain inert"
+        );
+    }
+
+    #[test]
+    fn same_boot_reconnect_retains_lease_basis() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (lease_clock, control, _waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        let causal_lease = manager.decisions[0].causal_lease.clone().unwrap();
+        let acceptance_basis = causal_lease.basis(1).unwrap();
+        manager.finish_transport();
+        control.advance(Duration::from_secs(10));
+        manager.handle_offer(offered.clone()).unwrap();
+        assert_eq!(causal_lease.basis(1), Some(acceptance_basis));
+
+        causal_lease
+            .request_renewal(
+                1,
+                &offered.assignment_id,
+                &offered.attempt_id,
+                &manager.lease_clock,
+                &manager.outbox,
+            )
+            .unwrap();
+        let renewal_basis = causal_lease.basis(2).unwrap();
+        manager.finish_transport();
+        control.advance(Duration::from_secs(10));
+        causal_lease
+            .request_renewal(
+                1,
+                &offered.assignment_id,
+                &offered.attempt_id,
+                &manager.lease_clock,
+                &manager.outbox,
+            )
+            .unwrap();
+        assert_eq!(causal_lease.basis(2), Some(renewal_basis));
+
+        let (_new_process_root, mut new_process) = manager_fixture(workflow);
+        assert!(
+            new_process
+                .handle_start(start_for(&offered))
+                .unwrap()
+                .is_none()
+        );
+        assert!(new_process.decisions.is_empty());
+    }
+
+    #[test]
+    fn lease_authority_arithmetic_failure_grants_no_execution() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (lease_clock, _control, _waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+        let offered = offer("bg");
+        manager.handle_offer(offered.clone()).unwrap();
+        manager
+            .lease_policy
+            .as_mut()
+            .unwrap()
+            .lease_duration_milliseconds = u64::MAX;
+
+        assert!(matches!(
+            manager.handle_start(start_for(&offered)),
+            Err(AssignmentManagerFailure::LeaseClock)
+        ));
+        assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    }
+
+    #[tokio::test]
+    async fn lease_timer_failure_marks_runner_boot_unsuccessful_after_terminal_report() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        let (control, _waits, job) = controlled_execution_job(&mut manager, &offered);
+        control.make_timer_unavailable();
+        job.spawn();
+
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.lease_clock_has_failed()
+        }))
+        .await
+        .expect("lease timer failure did not fail the runner boot");
+        let pending = manager.pending_observations(&BTreeSet::new(), 100);
+        assert!(
+            pending.iter().any(|entry| matches!(
+                &entry.observation,
+                AssignmentObservation::Execution {
+                    report: ExecutionReport::Aborted { reason, .. },
+                    ..
+                } if reason == "runner_internal_failure"
+            )),
+            "timer failure pending observations: {pending:#?}"
+        );
+        assert!(pending.iter().all(|entry| !matches!(
+            &entry.observation,
+            AssignmentObservation::Execution {
+                report: ExecutionReport::Started
+                    | ExecutionReport::Transition { .. }
+                    | ExecutionReport::Finished { .. },
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn accepted_runner_assignment_enables_stopped_spawn_registration() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -3454,21 +4055,22 @@ steps:
     async fn lease_terminal_delivery_uses_the_welcomed_budget_without_reporting() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        manager.sleeper = sleeper;
+        let (lease_clock, _control, mut lease_waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         let job = execution_job(&mut manager, &offered);
         drop(job);
         let deadline = manager
-            .sleeper
+            .lease_clock
             .now()
+            .unwrap()
             .checked_add(Duration::from_secs(5))
             .unwrap();
         enqueue_completion(&manager, deadline);
         manager.pending_observations(&BTreeSet::new(), 100);
 
-        sleep_request(&mut sleep_requests, Duration::from_secs(5))
+        lease_wait_request(&mut lease_waits, Duration::from_secs(5))
             .await
             .release();
         let notification = manager.notification();
@@ -3506,7 +4108,7 @@ steps:
             Duration::ZERO
         );
         drop(job);
-        let final_observation_id = enqueue_completion(&manager, manager.sleeper.now());
+        let final_observation_id = enqueue_completion(&manager, manager.lease_clock.now().unwrap());
 
         let pending = manager.pending_observations(&BTreeSet::new(), 100);
         assert!(
@@ -3520,8 +4122,8 @@ steps:
     async fn ordinary_terminal_delivery_uses_the_welcomed_budget() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        manager.sleeper = sleeper;
+        let (lease_clock, _control, mut lease_waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
@@ -3529,8 +4131,8 @@ steps:
         spawn_execution(&mut manager, &offered);
 
         let (renewal_duration, _renewal_release) =
-            with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
-        assert_eq!(renewal_duration, Duration::from_secs(13));
+            with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
+        assert_eq!(renewal_duration, Duration::from_secs(303));
         let notification = manager.notification();
         with_watchdog(async {
             loop {
@@ -3551,11 +4153,11 @@ steps:
         .expect("workflow did not select a terminal report");
 
         let (artifact_duration, _artifact_release) =
-            with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
-        assert_eq!(artifact_duration, Duration::from_secs(13));
+            with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
+        assert_eq!(artifact_duration, Duration::from_secs(303));
 
         let (delivery_duration, _delivery_release) =
-            with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
+            with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
         assert_eq!(delivery_duration, Duration::from_secs(5));
     }
 
@@ -3581,6 +4183,7 @@ steps:
                 assignment_id: offered.assignment_id,
                 final_observation_id: None,
                 final_delivery_deadline: None,
+                lease_clock_failed: false,
                 retained_root: None,
             })
             .unwrap();
@@ -3628,43 +4231,25 @@ steps:
             ),
         )
         .unwrap();
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        manager.sleeper = Arc::clone(&sleeper);
         let offered = offer("bg");
-        manager.handle_offer(offered.clone()).unwrap();
+        let (control, _lease_waits, job) = controlled_execution_job(&mut manager, &offered);
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
-        let job = execution_job(&mut manager, &offered);
 
-        let advancing_sleeper = Arc::clone(&sleeper);
-        let advance = tokio::spawn(async move {
-            advancing_sleeper.sleep(Duration::from_secs(18)).await;
-        });
-        sleep_request(&mut sleep_requests, Duration::from_secs(18))
-            .await
-            .release();
-        advance.await.unwrap();
+        control.advance(Duration::from_secs(308));
         job.spawn();
 
-        let notification = manager.notification();
-        with_watchdog(async {
-            loop {
-                let notified = notification.notified();
-                tokio::pin!(notified);
-                let pending = manager.pending_observations(&BTreeSet::new(), 100);
-                assert!(
-                    pending.iter().all(|entry| !matches!(
-                        entry.observation,
-                        AssignmentObservation::Execution { .. }
-                    )),
-                    "a delayed execution job must not publish assignment observations"
-                );
-                if manager.slot.is_none() {
-                    break;
-                }
-                notified.await;
-            }
-        })
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            let pending = manager.pending_observations(&BTreeSet::new(), 100);
+            assert!(
+                pending.iter().all(|entry| !matches!(
+                    entry.observation,
+                    AssignmentObservation::Execution { .. }
+                )),
+                "a delayed execution job must not publish assignment observations"
+            );
+            manager.slot.is_none()
+        }))
         .await
         .expect("delayed execution job did not relinquish its assignment");
         assert!(
@@ -3682,10 +4267,10 @@ steps:
             .expect("runner did not schedule a lease timer")
             .expect("lease timer channel closed");
 
-        // Cancellation starts after 18 seconds. The welcomed five-second renewal
-        // delivery budget requires a renewal request no later than second 13.
+        // Cancellation starts after 308 seconds. The welcomed five-second renewal
+        // delivery budget requires a renewal request no later than second 303.
         assert!(
-            duration <= Duration::from_secs(13),
+            duration <= Duration::from_secs(303),
             "first lease timer was scheduled at {duration:?}"
         );
     }
@@ -3694,10 +4279,10 @@ steps:
     async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report() {
         let (_temporary, mut manager, mut sleep_requests, _offered) = controlled_running_fixture();
 
-        sleep_request(&mut sleep_requests, Duration::from_secs(13))
+        lease_wait_request(&mut sleep_requests, Duration::from_secs(303))
             .await
             .release();
-        sleep_request(&mut sleep_requests, Duration::from_secs(5))
+        lease_wait_request(&mut sleep_requests, Duration::from_secs(5))
             .await
             .release();
 
@@ -3770,25 +4355,16 @@ steps:
     }
 
     #[tokio::test]
-    async fn renewal_at_monotonic_stop_boundary_is_rejected_despite_wall_clock_lag() {
+    async fn renewal_at_cancellation_boundary_cannot_restore_authority() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        manager.sleeper = Arc::clone(&sleeper);
+        let (lease_clock, control, _lease_waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
         let offered = offer("bg");
         manager.handle_offer(offered.clone()).unwrap();
         let _job = execution_job(&mut manager, &offered);
 
-        let advancing_sleeper = Arc::clone(&sleeper);
-        let advance = tokio::spawn(async move {
-            advancing_sleeper.sleep(Duration::from_secs(19)).await;
-        });
-        sleep_request(&mut sleep_requests, Duration::from_secs(19))
-            .await
-            .release();
-        advance.await.unwrap();
-        manager.wall_clock = wall_clock_at(Duration::ZERO, "2026-07-23T00:00:18.999Z");
-
+        control.advance(Duration::from_secs(308));
         manager.handle_renewal(renewal_for(&offered)).unwrap();
 
         let running = match &manager.slot {
@@ -3811,7 +4387,7 @@ steps:
         let (_temporary, mut manager, mut sleep_requests, offered) = controlled_running_fixture();
 
         let (duration, release) = with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
-        assert_eq!(duration, Duration::from_secs(13));
+        assert_eq!(duration, Duration::from_secs(303));
         release.release();
         let notification = manager.notification();
         let requested = with_watchdog(async {
@@ -3858,7 +4434,7 @@ steps:
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(duration, Duration::from_secs(43));
+        assert_eq!(duration, Duration::from_secs(303));
 
         let mut gap = renewal_for(&offered);
         gap.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned();

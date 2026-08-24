@@ -1,0 +1,27 @@
+schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              : > recovery-handler-ready
+              mkfifo recovery-release
+              read -r ignored < recovery-release
+              : > unexpected-recheck
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Released by the fixture.","reason":"The cancellation assertion failed."}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          printf x >> target-runs
+          exit 75

@@ -26,7 +26,7 @@ use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
     AgentInputMaterializationError, AgentInputStaging, AgentInputStagingLease,
     AgentInputStartFailure, ClosedAgentInvocation, MaterializedAgentInvocation,
-    materialize_agent_invocation,
+    materialize_agent_invocation, materialize_recovery_agent_invocation,
 };
 #[cfg(test)]
 use super::artifact::CaptureBoundaryObserver;
@@ -48,15 +48,24 @@ use super::execution_root::{
 };
 use super::git_capture::{GitAwareCaptureDeclaration, GitCaptureFailure};
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
+use super::invocation_accounting::InvocationAccountingLog;
 use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionObserver};
 use super::process_group::{
     AuthenticatedProcessGroup, ProcessGuardRegistration, ProcessGuardRegistry,
     capture_process_group_identity, interrupt_authenticated_process_group,
 };
-use super::runtime::{Action, ActionId, ActionInput, RequestedAction};
+use super::recovery::{
+    RECOVERY_CONTEXT_VARIABLE, RECOVERY_RESULT_VARIABLE, RecoveryHandlerFailure, RecoveryStaging,
+    parse_recovery_decision, recovery_definition, recovery_handler_cwd,
+};
+use super::runtime::{
+    Action, ActionId, ActionInput, RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord,
+    RequestedAction,
+};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
-    ValidatedCommonStep, ValidatedMessageSource, ValidatedStep, WorkflowImport,
+    ValidatedCommonStep, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
+    WorkflowImport,
 };
 use super::value::CapturedValue;
 
@@ -128,6 +137,7 @@ pub(crate) enum StepFailureCause {
     Start(StepStartFailure),
     Execution(StepExecutionFailure),
     OutputCapture(OutputCaptureFailure),
+    RecoveryHandler(RecoveryHandlerFailure),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +222,7 @@ pub(crate) enum AgentExecution<Dispatcher> {
         staging: AgentInputStaging,
         diagnostic_sessions: AgentDiagnosticSessionStore,
         dispatcher: Dispatcher,
+        accounting: InvocationAccountingLog,
     },
 }
 
@@ -228,17 +239,35 @@ impl<Dispatcher> AgentExecution<Dispatcher> {
         diagnostic_sessions: AgentDiagnosticSessionStore,
         dispatcher: Dispatcher,
     ) -> Self {
+        Self::enabled_with_accounting(
+            run,
+            staging,
+            diagnostic_sessions,
+            dispatcher,
+            InvocationAccountingLog::default(),
+        )
+    }
+
+    pub(crate) fn enabled_with_accounting(
+        run: WorkflowRunId,
+        staging: AgentInputStaging,
+        diagnostic_sessions: AgentDiagnosticSessionStore,
+        dispatcher: Dispatcher,
+        accounting: InvocationAccountingLog,
+    ) -> Self {
         Self::Enabled {
             run,
             staging,
             diagnostic_sessions,
             dispatcher,
+            accounting,
         }
     }
 }
 
 pub(crate) struct AgentExecutionObservationSink<Deadline, Observer> {
     observer: Observer,
+    accounting: InvocationAccountingLog,
     deadline: PhantomData<fn() -> Deadline>,
 }
 
@@ -249,6 +278,7 @@ where
     fn clone(&self) -> Self {
         Self {
             observer: self.observer.clone(),
+            accounting: self.accounting.clone(),
             deadline: PhantomData,
         }
     }
@@ -260,6 +290,7 @@ where
     Observer: ExecutionObserver<Deadline>,
 {
     fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
+        self.accounting.record_observation(&observation);
         self.observer
             .observe(ExecutionObservation::Agent(observation))
     }
@@ -568,13 +599,534 @@ where
         }
     }
 
+    // Keep recovery preparation separate from ordinary DAG input preparation: sharing this
+    // lifecycle-shaped code would make graph inputs representable at the handler boundary.
+    // jscpd:ignore-start
+    async fn execute_recovery_handler(
+        &self,
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        history: Vec<RecoveryRoundRecord<StepFailureCause>>,
+        cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        self.diagnostics.mark_recovery_handler(&step, action);
+        let preparation_runtime = self.clone();
+        let preparation_step = step.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            preparation_runtime.prepare_recovery_handler(&preparation_step, round, action, &history)
+        })
+        .await
+        .unwrap_or(Err(RecoveryHandlerFailure::ContextUnavailable));
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return self
+                    .settle_recovery_start_failure(step, round, action, failure)
+                    .await;
+            }
+        };
+
+        match self.with_work(|work| work.begin_launch(action)) {
+            BeginLaunch::Launch => {}
+            BeginLaunch::Cancelled(cancellation) => {
+                drop(prepared);
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            BeginLaunch::Gone => {
+                drop(prepared);
+                return Ok(());
+            }
+        }
+
+        match prepared {
+            PreparedRecoveryHandler::Command { command, context } => {
+                self.execute_recovery_command(step, round, action, command, context, cancellation)
+                    .await
+            }
+            PreparedRecoveryHandler::Agent { agent, context } => {
+                self.execute_recovery_agent(step, round, action, *agent, context, cancellation)
+                    .await
+            }
+        }
+    }
+
+    // jscpd:ignore-end
+    fn prepare_recovery_handler(
+        &self,
+        step: &str,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        history: &[RecoveryRoundRecord<StepFailureCause>],
+    ) -> Result<
+        PreparedRecoveryHandler<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        RecoveryHandlerFailure,
+    > {
+        let staging = RecoveryStaging::create(self.admitted.execution().root())?;
+        let context =
+            staging.materialize(&self.admitted, step, round, history, &self.diagnostics)?;
+        let handler = recovery_definition(&self.admitted, step)
+            .and_then(|recovery| recovery.handler.as_ref())
+            .ok_or(RecoveryHandlerFailure::HandlerUnavailable)?;
+        match handler {
+            ValidatedRecoveryHandler::Command { argv, cwd } => {
+                let cwd = recovery_handler_cwd(&self.admitted, step, cwd.as_deref())
+                    .map_err(|()| RecoveryHandlerFailure::HandlerUnavailable)?;
+                let cwd = resolve_working_directory(self.admitted.execution().root_identity(), cwd)
+                    .map_err(|_| RecoveryHandlerFailure::WorkingDirectoryUnavailable)?;
+                let mut command =
+                    prepare_command(argv, cwd, self.admitted.execution().environment().clone())
+                        .map_err(|_| RecoveryHandlerFailure::CommandPreparationFailed)?;
+                command.environment = self
+                    .admitted
+                    .execution()
+                    .environment()
+                    .with_variable(
+                        RECOVERY_CONTEXT_VARIABLE.into(),
+                        context.context_path().as_os_str().to_owned(),
+                    )
+                    .with_variable(
+                        RECOVERY_RESULT_VARIABLE.into(),
+                        context.result_path().as_os_str().to_owned(),
+                    );
+                Ok(PreparedRecoveryHandler::Command { command, context })
+            }
+            ValidatedRecoveryHandler::Agent { .. } => {
+                let AgentExecution::Enabled {
+                    run,
+                    staging,
+                    diagnostic_sessions,
+                    accounting,
+                    ..
+                } = &self.agents
+                else {
+                    return Err(RecoveryHandlerFailure::AgentInputFailed);
+                };
+                let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
+                let agent = materialize_recovery_agent_invocation(
+                    &self.admitted,
+                    staging,
+                    diagnostic_sessions,
+                    identity,
+                    step,
+                    context.context_path(),
+                    self.admitted.execution().cancellation().source().clone(),
+                    self.process_guards.clone(),
+                    accounting,
+                    AgentExecutionObservationSink {
+                        observer: self.observer.clone(),
+                        accounting: accounting.clone(),
+                        deadline: PhantomData,
+                    },
+                )
+                .map_err(|_| RecoveryHandlerFailure::AgentInputFailed)?;
+                Ok(PreparedRecoveryHandler::Agent {
+                    agent: Box::new(agent),
+                    context,
+                })
+            }
+        }
+    }
+
+    // Recovery commands share containment mechanics with targets but have private result
+    // authority and handler occurrences, so combining the two paths would blur settlement.
+    // jscpd:ignore-start
+    async fn execute_recovery_command(
+        &self,
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        command: PreparedCommand,
+        context: super::recovery::RecoveryInvocationStaging,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        // Recovery commands always cross the authenticated child-guard boundary,
+        // including source-neutral tests whose commit port has no durable guard store.
+        let mut launched = match command.launch::<Clock::Instant, _>(
+            true,
+            step.clone(),
+            action,
+            &self.diagnostics,
+            self.admitted.execution().limits().maximum_step_log_bytes(),
+            self.observer.clone(),
+        ) {
+            Ok(launched) => launched,
+            Err(_) => {
+                drop(context);
+                return self
+                    .settle_recovery_start_failure(
+                        step,
+                        round,
+                        action,
+                        RecoveryHandlerFailure::CommandLaunchFailed,
+                    )
+                    .await;
+            }
+        };
+        let Some(process_group) = launched.process_group().cloned() else {
+            let _ = launched.force_stop().await;
+            launched.finish_resources().await;
+            drop(context);
+            return self
+                .settle_recovery_start_failure(
+                    step,
+                    round,
+                    action,
+                    RecoveryHandlerFailure::CommandLaunchFailed,
+                )
+                .await;
+        };
+        let registration = match self.process_guards.register(
+            &step,
+            action.transition_sequence.get(),
+            &process_group,
+        ) {
+            Ok(registration) => registration,
+            Err(()) => {
+                let _ = launched.force_stop().await;
+                launched.finish_resources().await;
+                drop(context);
+                return self
+                    .settle_recovery_start_failure(
+                        step,
+                        round,
+                        action,
+                        RecoveryHandlerFailure::CommandLaunchFailed,
+                    )
+                    .await;
+            }
+        };
+        launched.install_registration(registration);
+        if launched.release().is_err() {
+            let _ = launched.force_stop().await;
+            launched.finish_resources().await;
+            drop(context);
+            return self
+                .settle_recovery_start_failure(
+                    step,
+                    round,
+                    action,
+                    RecoveryHandlerFailure::CommandLaunchFailed,
+                )
+                .await;
+        }
+        match self.with_work(|work| work.record_launch(action, process_group)) {
+            RecordLaunch::Running => {}
+            RecordLaunch::Cancelled {
+                cancellation,
+                interrupt,
+            } => {
+                if let Some(group) = interrupt {
+                    let _ = interrupt_authenticated_process_group(&group);
+                }
+                let result = self
+                    .cancel_launched(action, &mut launched, cancellation)
+                    .await;
+                drop(context);
+                return result;
+            }
+            RecordLaunch::Gone => {
+                let _ = launched.force_stop().await;
+                launched.finish_resources().await;
+                drop(context);
+                return Ok(());
+            }
+        }
+        match self
+            .report_recovery_handler_started(&step, round, action, &mut cancellation)
+            .await
+        {
+            Ok(StartDelivery::Published) => {}
+            Ok(StartDelivery::Cancelled(cancellation)) => {
+                let result = self
+                    .cancel_launched(action, &mut launched, cancellation)
+                    .await;
+                drop(context);
+                return result;
+            }
+            Ok(StartDelivery::Gone) => {
+                self.abandon_launched(action, &mut launched).await;
+                drop(context);
+                return Ok(());
+            }
+            Err(failure) => {
+                self.abandon_launched(action, &mut launched).await;
+                drop(context);
+                return Err(failure);
+            }
+        }
+
+        let waited = tokio::select! {
+            biased;
+            _ = &mut cancellation => None,
+            result = launched.wait() => Some(result),
+        };
+        if waited.is_none()
+            && let Some(cancellation) = self.cancellation_for(action)
+        {
+            let result = self
+                .cancel_launched(action, &mut launched, cancellation)
+                .await;
+            drop(context);
+            return result;
+        }
+        let waited = match waited {
+            Some(result) => result,
+            None => launched.wait().await,
+        };
+        let mut outcome = match waited {
+            Ok(status) if status.success() => context
+                .read_decision()
+                .map_err(RecoveryHandlerFailure::from)
+                .and_then(|bytes| {
+                    parse_recovery_decision(&bytes).map_err(RecoveryHandlerFailure::DecisionInvalid)
+                }),
+            Ok(status) => Err(RecoveryHandlerFailure::CommandExitFailed {
+                code: status.code(),
+            }),
+            Err(()) => {
+                if launched.force_stop().await.is_err() {
+                    Err(RecoveryHandlerFailure::ProcessQuiescenceFailed)
+                } else {
+                    Err(RecoveryHandlerFailure::CommandWaitFailed)
+                }
+            }
+        };
+        launched.finish_resources().await;
+        if context.release().is_err() {
+            outcome = Err(RecoveryHandlerFailure::SettlementFailed);
+        }
+        self.settle_recovery_completion(step, round, action, outcome)
+            .await
+    }
+
+    // jscpd:ignore-end
+    // Recovery agents share adapter quiescence with targets but exclude DAG values and accept
+    // only the recovery result schema; keep that authority path independently reviewable.
+    // jscpd:ignore-start
+    async fn execute_recovery_agent(
+        &self,
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        agent: MaterializedAgentInvocation<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        context: super::recovery::RecoveryInvocationStaging,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        let process_control = agent.invocation().process_control().clone();
+        match self.with_work(|work| work.record_agent_launch(action, process_control)) {
+            RecordLaunch::Running => {}
+            RecordLaunch::Cancelled { cancellation, .. } => {
+                drop(agent);
+                drop(context);
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            RecordLaunch::Gone => return Ok(()),
+        }
+        let (invocation, staging) = agent.into_parts();
+        let (started_callback, started) = agent_start_channel();
+        let (terminal, outcome) = agent_terminal_channel(invocation.value_mode());
+        let dispatcher = match &self.agents {
+            AgentExecution::Enabled { dispatcher, .. } => dispatcher.clone(),
+            AgentExecution::Disabled => {
+                drop(staging);
+                drop(context);
+                return self
+                    .settle_recovery_start_failure(
+                        step,
+                        round,
+                        action,
+                        RecoveryHandlerFailure::AgentInputFailed,
+                    )
+                    .await;
+            }
+        };
+        let mut invocation_task = tokio::spawn(async move {
+            invoke_agent_dispatcher(&dispatcher, invocation, started_callback, terminal).await;
+        });
+        let started = started.receive();
+        tokio::pin!(started);
+        let outcome = outcome.receive();
+        tokio::pin!(outcome);
+        let boundary = tokio::select! {
+            biased;
+            result = &mut started => AgentLifecycleBoundary::Started(result),
+            result = &mut outcome => AgentLifecycleBoundary::Terminal(result),
+        };
+        let (lifecycle_started, outcome) = match boundary {
+            AgentLifecycleBoundary::Started(Ok(())) => {
+                match self
+                    .report_recovery_handler_started(&step, round, action, &mut cancellation)
+                    .await
+                {
+                    Ok(StartDelivery::Published) => {}
+                    Ok(StartDelivery::Cancelled(cancellation)) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        drop(context);
+                        return self.finish_cancellation(action, cancellation).await;
+                    }
+                    Ok(StartDelivery::Gone) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        drop(context);
+                        self.with_work(|work| work.abandon(action));
+                        return Ok(());
+                    }
+                    Err(failure) => {
+                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        drop(staging);
+                        drop(context);
+                        self.with_work(|work| work.abandon(action));
+                        return Err(failure);
+                    }
+                }
+                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                (true, outcome)
+            }
+            AgentLifecycleBoundary::Started(Err(_)) => {
+                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                (false, outcome)
+            }
+            AgentLifecycleBoundary::Terminal(outcome) => {
+                let _ = invocation_task.await;
+                (false, outcome)
+            }
+        };
+        let outcome = outcome
+            .unwrap_or_else(|_| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
+        if matches!(outcome, AgentOutcome::Cancelled { .. })
+            && self
+                .admitted
+                .execution()
+                .cancellation()
+                .source()
+                .cancellation_reason()
+                .is_some()
+        {
+            if self.cancellation_for(action).is_none() {
+                let _ = cancellation.await;
+            }
+            if let Some(cancellation) = self.cancellation_for(action) {
+                drop(staging);
+                drop(context);
+                return self.finish_cancellation(action, cancellation).await;
+            }
+        }
+        if !lifecycle_started {
+            drop(staging);
+            drop(context);
+            return self
+                .settle_recovery_start_failure(
+                    step,
+                    round,
+                    action,
+                    RecoveryHandlerFailure::AgentFailed,
+                )
+                .await;
+        }
+        let mut decision = match outcome {
+            AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) => {
+                parse_recovery_decision(result.canonical_json())
+                    .map_err(RecoveryHandlerFailure::AgentResultInvalid)
+            }
+            AgentOutcome::Completed(
+                CompletedAgentInvocation::NoValue
+                | CompletedAgentInvocation::NoResponse
+                | CompletedAgentInvocation::Response(_),
+            ) => Err(RecoveryHandlerFailure::AgentResultMissing),
+            AgentOutcome::Failed(_) | AgentOutcome::Cancelled { .. } => {
+                Err(RecoveryHandlerFailure::AgentFailed)
+            }
+        };
+        if staging.release().is_err() || context.release().is_err() {
+            decision = Err(RecoveryHandlerFailure::SettlementFailed);
+        }
+        self.settle_recovery_completion(step, round, action, decision)
+            .await
+    }
+
+    // jscpd:ignore-end
+    async fn report_recovery_handler_started(
+        &self,
+        step: &str,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<StartDelivery<Clock::Instant>, StepRuntimeError> {
+        self.report_started(
+            DriverOccurrence::recovery_handler_started(step.to_owned(), round, action),
+            action,
+            cancellation,
+        )
+        .await
+    }
+
+    // Handler settlement intentionally mirrors target settlement while emitting a distinct
+    // closed occurrence set that can never publish target values.
+    // jscpd:ignore-start
+    async fn settle_recovery_start_failure(
+        &self,
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        failure: RecoveryHandlerFailure,
+    ) -> Result<(), StepRuntimeError> {
+        self.settle_unlaunched(
+            action,
+            DriverOccurrence::recovery_handler_start_failed(
+                step,
+                round,
+                action,
+                StepFailureCause::RecoveryHandler(failure),
+            ),
+        )
+        .await
+    }
+
+    async fn settle_recovery_completion(
+        &self,
+        step: String,
+        round: RecoveryRoundNumber,
+        action: ActionId,
+        outcome: Result<RecoveryDecision, RecoveryHandlerFailure>,
+    ) -> Result<(), StepRuntimeError> {
+        let occurrence = match outcome {
+            Ok(decision) => {
+                DriverOccurrence::recovery_handler_completed(step, round, action, decision)
+            }
+            Err(failure) => DriverOccurrence::recovery_handler_execution_failed(
+                step,
+                round,
+                action,
+                StepFailureCause::RecoveryHandler(failure),
+            ),
+        };
+        self.settle_agent_occurrence(action, occurrence).await
+    }
+
+    // jscpd:ignore-end
     async fn report_step_started(
         &self,
         step: &str,
         action: ActionId,
         cancellation: &mut oneshot::Receiver<()>,
     ) -> Result<StartDelivery<Clock::Instant>, StepRuntimeError> {
-        let send = self.send(DriverOccurrence::step_started(step.to_owned(), action));
+        self.report_started(
+            DriverOccurrence::step_started(step.to_owned(), action),
+            action,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn report_started(
+        &self,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
+        action: ActionId,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<StartDelivery<Clock::Instant>, StepRuntimeError> {
+        let send = self.send(occurrence);
         tokio::pin!(send);
         tokio::select! {
             biased;
@@ -1126,6 +1678,7 @@ where
                     run,
                     staging,
                     diagnostic_sessions,
+                    accounting,
                     ..
                 } = &self.agents
                 else {
@@ -1149,6 +1702,7 @@ where
                     self.process_guards.clone(),
                     AgentExecutionObservationSink {
                         observer: self.observer.clone(),
+                        accounting: accounting.clone(),
                         deadline: PhantomData,
                     },
                 )
@@ -1160,6 +1714,11 @@ where
                         StepStartFailure::InputsUnavailable
                     }
                 })?;
+                accounting.record_native_session(
+                    materialized.invocation().identity(),
+                    materialized.invocation().profile(),
+                    materialized.invocation().diagnostic_session(),
+                );
                 PreparedStepBody::Agent(Box::new(PreparedAgent { materialized }))
             }
         };
@@ -2184,7 +2743,11 @@ where
         let runtime = self.clone();
         async move {
             match requested.action {
-                Action::StartStep { step, inputs } => {
+                Action::StartStep {
+                    step,
+                    execution_number: _,
+                    inputs,
+                } => {
                     let Some(cancellation) = runtime.register_start(step.clone(), requested.id)
                     else {
                         return;
@@ -2196,6 +2759,33 @@ where
                             .await;
                     });
                 }
+                // A recovery action intentionally has the same delivery deduplication shell as
+                // a target action but dispatches a graph-input-free physical invocation.
+                // jscpd:ignore-start
+                Action::StartRecoveryHandler {
+                    step,
+                    round,
+                    history,
+                    ..
+                } => {
+                    let Some(cancellation) = runtime.register_start(step.clone(), requested.id)
+                    else {
+                        return;
+                    };
+                    let tasks = runtime.tasks.clone();
+                    tasks.spawn(async move {
+                        let _ = runtime
+                            .execute_recovery_handler(
+                                step,
+                                round,
+                                requested.id,
+                                history,
+                                cancellation,
+                            )
+                            .await;
+                    });
+                }
+                // jscpd:ignore-end
                 Action::CancelStep { step, deadline, .. } => {
                     match runtime.request_capture_cancellation(&step, requested.id) {
                         CaptureCancellationRegistration::Active
@@ -2356,7 +2946,9 @@ where
         return Err(CoordinationError::InputStagingMismatch);
     }
     match &agents {
-        AgentExecution::Disabled if !admitted.agent_steps().is_empty() => {
+        AgentExecution::Disabled
+            if !admitted.agent_steps().is_empty() || !admitted.recovery_handlers().is_empty() =>
+        {
             return Err(CoordinationError::AgentRuntimeUnavailable);
         }
         AgentExecution::Enabled { staging, .. } if !staging.is_bound_to(admitted.execution()) => {
@@ -2511,6 +3103,20 @@ fn completed_agent_outputs(
         }
     };
     Ok(BTreeMap::from([output]))
+}
+
+enum PreparedRecoveryHandler<Sink>
+where
+    Sink: AgentObservationSink,
+{
+    Command {
+        command: PreparedCommand,
+        context: super::recovery::RecoveryInvocationStaging,
+    },
+    Agent {
+        agent: Box<MaterializedAgentInvocation<Sink>>,
+        context: super::recovery::RecoveryInvocationStaging,
+    },
 }
 
 struct PreparedStep<Sink>

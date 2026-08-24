@@ -6,6 +6,7 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::execution::workflow::archived_attempt::reconcile_current_result_publication;
 use crate::execution::workflow::local_run::{
     LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot, LocalStatusError,
     LocalStatusResult, RetryIneligibilityReason, read_local_run_status,
@@ -24,7 +25,8 @@ const STYLE_SUCCESS: &str = "38;2;166;227;161";
 const STYLE_FAILURE: &str = "38;2;243;139;168";
 const STYLE_BLOCKED: &str = "38;2;250;179;135";
 
-// Status composes read-only run identity and presentation options without execution inputs.
+// Status composes run identity and presentation options without execution inputs. A terminal
+// publication-pending snapshot may first reconcile an already committed immutable result.
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -50,6 +52,7 @@ impl Command {
         completed: &AtomicBool,
     ) -> super::super::CommandResult {
         debug_assert!(!(self.presentation.plain && self.presentation.json));
+        reconcile_current_result_publication(&self.run.run_dir);
         let snapshot = read_local_run_status(&self.run.run_dir);
         if cancelled.load(Ordering::Acquire) {
             return Ok(ExitCode::GeneralFailure);
@@ -240,6 +243,7 @@ fn write_plain_snapshot(
         styled_recovery(&snapshot.recovery, color)
     )?;
     writeln!(writer, "retry: {}", styled_retry(snapshot.retry, color))?;
+    write_step_recovery(writer, &snapshot.state)?;
     if let LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } = &snapshot.recovery {
         writeln!(writer, "ownership reason: {}", reason.as_str())?;
         writeln!(writer, "remedy: {}", reason.remedy())?;
@@ -255,6 +259,109 @@ fn write_plain_snapshot(
             attempt.trigger,
             styled_state(attempt.state, color),
             styled_result(&attempt.result, color)
+        )?;
+    }
+    Ok(())
+}
+
+fn write_step_recovery(writer: &mut impl Write, state: &Value) -> io::Result<()> {
+    let Some(attempt) = state
+        .get("attempts")
+        .and_then(Value::as_array)
+        .and_then(|attempts| attempts.last())
+    else {
+        return Ok(());
+    };
+    let Some(progress) = attempt.get("progress") else {
+        return Ok(());
+    };
+    if let Some(steps) = progress.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            let Some(recovery) = step.get("recovery") else {
+                continue;
+            };
+            let id = step.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let rounds = recovery
+                .get("rounds")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let maximum = recovery
+                .get("configuredRetries")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let detail = recovery.get("active").map_or_else(
+                || {
+                    recovery
+                        .get("termination")
+                        .and_then(|termination| termination.get("kind"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("incomplete")
+                        .to_owned()
+                },
+                |active| {
+                    let role = active
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let ordinal = active
+                        .get("targetExecution")
+                        .or_else(|| active.get("recoveryRound"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let mut detail = if role == "target" {
+                        format!("target execution {ordinal}")
+                    } else if role == "recovery_handler" {
+                        let kind = recovery
+                            .get("handlerKind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let state = active
+                            .get("handlerState")
+                            .and_then(Value::as_str)
+                            .unwrap_or("active");
+                        format!("recovery_handler {kind} {state} · round {ordinal}")
+                    } else {
+                        format!("{role} {ordinal}")
+                    };
+                    if let Some(decision) = active.get("decision").and_then(Value::as_str) {
+                        detail.push_str(" · decision ");
+                        detail.push_str(decision);
+                    }
+                    detail
+                },
+            );
+            writeln!(
+                writer,
+                "step recovery: {id} · {detail} · rounds {rounds}/{maximum}"
+            )?;
+        }
+    }
+    if let Some(accounting) = progress.get("accounting")
+        && accounting
+            .get("observedInvocations")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != 0
+    {
+        writeln!(
+            writer,
+            "invocations: {} observed · {} settled · usage input {} output {}",
+            accounting
+                .get("observedInvocations")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            accounting
+                .get("settledInvocations")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            accounting
+                .get("inputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            accounting
+                .get("outputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         )?;
     }
     Ok(())

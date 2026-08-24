@@ -18,8 +18,8 @@ use super::document::{FailurePolicy, FinalizationTrigger, Output};
 use super::local_run::{
     AttemptFinalizationV1, AttemptNodeRoleV1, AttemptResultV1, AttemptStateV1, AttemptStepStateV1,
     AttemptTriggerV1, LocalAttemptV1, LocalStatusError, LocalStatusErrorCode, RetainedReadBudget,
-    StableLocalRunSnapshot, load_retained_execution_with_budget, open_directory_at,
-    read_stable_local_run_snapshot,
+    StableLocalRunSnapshot, attempt_result_relative_path, load_retained_execution_with_budget,
+    mark_validated_result_published, open_directory_at, read_stable_local_run_snapshot,
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
@@ -47,6 +47,7 @@ const BASE64_ENCODING: &str = "base64";
 pub(crate) enum ArchivedAttemptOperationalErrorCode {
     RunDirectoryUnavailable,
     RunDirectoryInvalid,
+    RecoverySchemaUnsupported,
     LockQueryFailed,
     StatusSnapshotUnstable,
     PublishedResultUnavailable,
@@ -209,6 +210,8 @@ pub(crate) struct ArchivedStep {
     pub(crate) duration: Option<Duration>,
     pub(crate) detail: ArchivedStepDetail,
     pub(crate) command_output: Option<ArchivedCommandOutput>,
+    pub(crate) recovery: Option<super::publication::StepRecoverySummaryV1>,
+    pub(crate) invocations: Vec<super::publication::RecoveryInvocationV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -268,6 +271,30 @@ pub(crate) fn load_local_archived_attempt(
     requested_attempt: Option<NonZeroU64>,
 ) -> Result<LoadedLocalArchivedAttempt, ArchivedAttemptLoadError> {
     load_local_archived_attempt_with(requested, requested_attempt, &mut NoopArchiveReadObserver)
+}
+
+pub(crate) fn reconcile_current_result_publication(requested: &Path) {
+    let Ok(snapshot) = read_stable_local_run_snapshot(requested) else {
+        return;
+    };
+    let pending = snapshot
+        .state
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == snapshot.state.current_attempt_number)
+        .is_some_and(|attempt| {
+            attempt.state.is_terminal()
+                && matches!(
+                    attempt.result,
+                    AttemptResultV1::NotPublished {
+                        reason: super::local_run::ResultAbsentReasonV1::PublicationPending,
+                    }
+                )
+        });
+    if pending && !snapshot.lock_held {
+        drop(snapshot);
+        let _ = load_local_archived_attempt(requested, None);
+    }
 }
 
 trait ArchiveReadObserver {
@@ -331,14 +358,17 @@ fn load_local_archived_attempt_with(
     observer.stable_snapshot_acquired(&snapshot.run_directory);
     let selected_number =
         requested_attempt.map_or(snapshot.state.current_attempt_number, u64::from);
-    let attempt = select_published_attempt(&snapshot, selected_number)?.clone();
-    let AttemptResultV1::Published {
-        relative_directory: relative_result_directory,
-    } = &attempt.result
-    else {
-        return Err(result_invalid(&snapshot.run_directory));
+    let (attempt, publication_pending) = select_published_attempt(&snapshot, selected_number)?;
+    let attempt = attempt.clone();
+    let relative_result_directory = match &attempt.result {
+        AttemptResultV1::Published { relative_directory } => relative_directory.clone(),
+        AttemptResultV1::NotPublished {
+            reason: super::local_run::ResultAbsentReasonV1::PublicationPending,
+        } if publication_pending => attempt_result_relative_path(attempt.attempt_number),
+        AttemptResultV1::NotPublished { .. } | AttemptResultV1::PublicationFailed { .. } => {
+            return Err(result_invalid(&snapshot.run_directory));
+        }
     };
-    let relative_result_directory = relative_result_directory.clone();
     let result_directory = snapshot
         .run_directory
         .join(Path::new(&relative_result_directory));
@@ -364,8 +394,12 @@ fn load_local_archived_attempt_with(
     retained_budget
         .account(&result_bytes)
         .map_err(|_| result_invalid(&snapshot.run_directory))?;
-    let result =
-        decode_result(&result_bytes).map_err(|()| result_invalid(&snapshot.run_directory))?;
+    let result = decode_result(&result_bytes).map_err(|error| match error {
+        ArchivedResultDecodeError::Invalid => result_invalid(&snapshot.run_directory),
+        ArchivedResultDecodeError::RecoverySchemaUnsupported => {
+            recovery_schema_unsupported(&snapshot.run_directory)
+        }
+    })?;
     artifact_set::validate(&result_root, &result)
         .map_err(|_| result_invalid(&snapshot.run_directory))?;
     let validated = validate_and_project_result(
@@ -376,6 +410,10 @@ fn load_local_archived_attempt_with(
         maximum_parallel_steps,
     )
     .map_err(|()| result_invalid(&snapshot.run_directory))?;
+    if publication_pending {
+        mark_validated_result_published(&snapshot.run_directory, attempt.attempt_number)
+            .map_err(|_| result_invalid(&snapshot.run_directory))?;
+    }
 
     let projection = LocalArchivedAttempt {
         run_directory: snapshot.run_directory.clone(),
@@ -419,7 +457,7 @@ fn load_local_archived_attempt_with(
 fn select_published_attempt(
     snapshot: &StableLocalRunSnapshot,
     selected_number: u64,
-) -> Result<&LocalAttemptV1, ArchivedAttemptLoadError> {
+) -> Result<(&LocalAttemptV1, bool), ArchivedAttemptLoadError> {
     let ineligible = |reason| {
         ArchivedAttemptLoadError::Ineligible(ArchivedAttemptIneligible {
             run_directory: snapshot.run_directory.clone(),
@@ -446,7 +484,18 @@ fn select_published_attempt(
         AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled => {}
     }
     match attempt.result {
-        AttemptResultV1::Published { .. } => Ok(attempt),
+        AttemptResultV1::Published { .. } => Ok((attempt, false)),
+        AttemptResultV1::NotPublished {
+            reason: super::local_run::ResultAbsentReasonV1::PublicationPending,
+        } if !snapshot.lock_held
+            && open_relative_directory(
+                &snapshot.root,
+                &attempt_result_relative_path(attempt.attempt_number),
+            )
+            .is_ok() =>
+        {
+            Ok((attempt, true))
+        }
         AttemptResultV1::PublicationFailed { .. } => Err(ineligible(
             ArchivedAttemptIneligibilityReason::PublicationFailed,
         )),
@@ -463,6 +512,9 @@ fn map_status_error(error: LocalStatusError) -> ArchivedAttemptLoadError {
         }
         LocalStatusErrorCode::RunDirectoryInvalid => {
             ArchivedAttemptOperationalErrorCode::RunDirectoryInvalid
+        }
+        LocalStatusErrorCode::RecoverySchemaUnsupported => {
+            ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported
         }
         LocalStatusErrorCode::LockQueryFailed => {
             ArchivedAttemptOperationalErrorCode::LockQueryFailed
@@ -487,6 +539,13 @@ fn result_unavailable(run_directory: &Path) -> ArchivedAttemptLoadError {
 fn result_invalid(run_directory: &Path) -> ArchivedAttemptLoadError {
     ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
         code: ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        run_directory: Some(run_directory.to_owned()),
+    })
+}
+
+fn recovery_schema_unsupported(run_directory: &Path) -> ArchivedAttemptLoadError {
+    ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
+        code: ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported,
         run_directory: Some(run_directory.to_owned()),
     })
 }
@@ -550,8 +609,20 @@ fn read_immutable_result(
     Ok(bytes)
 }
 
-fn decode_result(bytes: &[u8]) -> Result<WorkflowResultV1, ()> {
-    result_metadata::decode(bytes).map_err(|_| ())
+enum ArchivedResultDecodeError {
+    Invalid,
+    RecoverySchemaUnsupported,
+}
+
+fn decode_result(bytes: &[u8]) -> Result<WorkflowResultV1, ArchivedResultDecodeError> {
+    let document =
+        result_metadata::decode_document(bytes).map_err(|_| ArchivedResultDecodeError::Invalid)?;
+    result_metadata::dispatch_recovery_summary_versions(&document)
+        .map_err(|_| ArchivedResultDecodeError::RecoverySchemaUnsupported)?;
+    let result =
+        serde_json::from_value(document).map_err(|_| ArchivedResultDecodeError::Invalid)?;
+    result_metadata::validate(&result).map_err(|_| ArchivedResultDecodeError::Invalid)?;
+    Ok(result)
 }
 
 struct ProjectedResult {
@@ -635,7 +706,7 @@ fn validate_and_project_result(
             WorkflowOutcomeV1::Failed => FinalizationTriggerV1::Failed,
             WorkflowOutcomeV1::Cancelled => FinalizationTriggerV1::Cancelled,
         });
-    let ordinary_steps = project_steps(attempt, result, workflow)?;
+    let ordinary_steps = project_steps(&snapshot.root, attempt, result, workflow)?;
     validate_terminal_step_facts(ordinary_trigger, &ordinary_steps, workflow)?;
     let (finalization, finalizers) = project_finalization(attempt, result, workflow)?;
     let mut steps = ordinary_steps;
@@ -671,6 +742,7 @@ fn validate_and_project_result(
 }
 
 fn project_steps(
+    root: &OwnedFd,
     attempt: &LocalAttemptV1,
     result: &WorkflowResultV1,
     workflow: &super::resolution::ResolvedWorkflow,
@@ -696,6 +768,7 @@ fn project_steps(
                 || durable.failure_policy != step_failure_policy(definition)
                 || !step_kind_matches(&step.kind, definition)
                 || !step_state_matches(step.state, durable.state)
+                || !durable_recovery_matches_wire(root, attempt, durable, step)
             {
                 return Err(());
             }
@@ -895,6 +968,170 @@ fn parse_optional_timestamp(value: Option<&str>) -> Result<Option<OffsetDateTime
         .transpose()
 }
 
+fn durable_recovery_matches_wire(
+    root: &OwnedFd,
+    attempt: &LocalAttemptV1,
+    durable: &super::local_run::AttemptStepV1,
+    wire: &WorkflowStepV1,
+) -> bool {
+    let recovery_matches = match (&durable.recovery, &wire.recovery) {
+        (None, None) => wire.invocations.is_empty(),
+        (Some(durable), Some(wire)) => {
+            durable.schema_version == wire.schema_version
+                && durable.configured_retries == wire.configured_retries
+                && durable.handler_kind.map(|kind| match kind {
+                    super::local_run::DurableRecoveryHandlerKindV1::Cmd => {
+                        super::publication::RecoveryHandlerKindV1::Cmd
+                    }
+                    super::local_run::DurableRecoveryHandlerKindV1::Agent => {
+                        super::publication::RecoveryHandlerKindV1::Agent
+                    }
+                }) == wire.handler_kind
+                && durable.active.is_none()
+                && durable.termination.as_ref() == Some(&wire.termination)
+                && durable.rounds.len() == wire.rounds.len()
+                && durable
+                    .rounds
+                    .iter()
+                    .zip(&wire.rounds)
+                    .all(|(left, right)| {
+                        left.number == right.number
+                            && left.failed_execution == right.failed_execution
+                            && left.handler == right.handler
+                    })
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    if !recovery_matches {
+        return false;
+    }
+    let retained = attempt
+        .progress
+        .invocations
+        .iter()
+        .filter(|invocation| invocation.step_id == durable.id)
+        .collect::<Vec<_>>();
+    if wire.recovery.is_none() {
+        return true;
+    }
+    retained.len() == wire.invocations.len()
+        && retained
+            .iter()
+            .zip(&wire.invocations)
+            .all(|(durable, wire)| {
+                durable.invocation_id == wire.invocation_id
+                    && durable.role == wire.role
+                    && durable.target_execution == wire.target_execution
+                    && durable.recovery_round == wire.recovery_round
+                    && durable.started_at == wire.started_at
+                    && durable.finished_at.as_deref() == Some(wire.finished_at.as_str())
+                    && durable.usage == wire.usage
+                    && durable.diagnostic_reference == wire.diagnostic_reference
+                    && matches!(
+                        (durable.state, wire.state),
+                        (
+                            super::local_run::DurableInvocationStateV1::Settled,
+                            super::publication::RecoveryInvocationStateV1::Settled
+                        ) | (
+                            super::local_run::DurableInvocationStateV1::Cancelled,
+                            super::publication::RecoveryInvocationStateV1::Cancelled
+                        )
+                    )
+                    && durable.diagnostics.len() == wire.diagnostics.len()
+                    && durable
+                        .diagnostics
+                        .iter()
+                        .zip(&wire.diagnostics)
+                        .all(|(left, right)| {
+                            left.kind == right.kind
+                                && left.reference == right.reference
+                                && left.retained_bytes == right.stream.retained_bytes
+                                && left.discarded_bytes == right.stream.discarded_bytes
+                                && left.truncated == right.stream.truncated
+                                && left.fully_drained == right.stream.fully_drained
+                                && immutable_diagnostic_matches_wire(
+                                    root,
+                                    &left.reference,
+                                    &right.stream,
+                                )
+                        })
+            })
+}
+
+fn immutable_diagnostic_matches_wire(
+    root: &OwnedFd,
+    reference: &str,
+    wire: &DiagnosticStreamV1,
+) -> bool {
+    let Ok(expected) = BASE64_STANDARD.decode(&wire.data) else {
+        return false;
+    };
+    if u64::try_from(expected.len()) != Ok(wire.retained_bytes) {
+        return false;
+    }
+    let path = Path::new(reference);
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let Some(parent) = path.parent().and_then(Path::to_str) else {
+        return false;
+    };
+    let Ok(parent) = open_relative_directory(root, parent) else {
+        return false;
+    };
+    let Ok(descriptor) = openat(
+        &parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(opened) = fstat(&descriptor) else {
+        return false;
+    };
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || u64::try_from(opened.st_size) != Ok(wire.retained_bytes)
+    {
+        return false;
+    }
+
+    let mut file = File::from(descriptor);
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let Ok(count) = file.read(&mut buffer) else {
+            return false;
+        };
+        if count == 0 {
+            break;
+        }
+        let Some(end) = offset.checked_add(count) else {
+            return false;
+        };
+        if expected.get(offset..end) != Some(&buffer[..count]) {
+            return false;
+        }
+        offset = end;
+    }
+    if offset != expected.len() {
+        return false;
+    }
+
+    let Ok(opened_after) = fstat(&file) else {
+        return false;
+    };
+    let Ok(named_after) = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return false;
+    };
+    FileType::from_raw_mode(named_after.st_mode) == FileType::RegularFile
+        && opened.st_dev == opened_after.st_dev
+        && opened.st_ino == opened_after.st_ino
+        && opened.st_dev == named_after.st_dev
+        && opened.st_ino == named_after.st_ino
+        && opened.st_size == opened_after.st_size
+}
+
 fn durable_finalizer_matches_wire(
     durable: &super::local_run::DurableFinalizerV1,
     wire: &WorkflowStepV1,
@@ -1073,6 +1310,8 @@ fn project_step(
         duration,
         detail,
         command_output,
+        recovery: step.recovery.clone(),
+        invocations: step.invocations.clone(),
     })
 }
 
