@@ -95,6 +95,16 @@ if [[ ${#workflow_devenv_installs[@]} -ne 1 ]]; then
   echo "The public check workflow must contain exactly one direct Devenv installation." >&2
   exit 1
 fi
+workflow_no_tui_count=$(
+  grep --fixed-strings --line-regexp --count \
+    '  DEVENV_TUI: "false"' \
+    "$public_root/.github/workflows/check.yml" \
+    || true
+)
+if [[ $workflow_no_tui_count -ne 1 ]]; then
+  echo "The public check workflow must disable the Devenv TUI." >&2
+  exit 1
+fi
 workflow_devenv_install=${workflow_devenv_installs[0]}
 workflow_devenv_install=${workflow_devenv_install#"${workflow_devenv_install%%[![:space:]]*}"}
 if [[ $workflow_devenv_install != \

@@ -1498,6 +1498,7 @@ where
             record_progress(connection_event, progress);
             (progress, None)
         };
+    let mut inbound_silence_timer = inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
     let mut in_flight = VecDeque::<PendingObservation>::new();
     let mut buffered_effect: Option<CloudFrame> = None;
     let assignment_notification = assignment_manager
@@ -1595,12 +1596,12 @@ where
 
         let notified = assignment_notification.notified();
         tokio::pin!(notified);
-        let message = if let Some(timeout) = inbound_silence_timeout {
+        let message = if let Some(timer) = inbound_silence_timer.as_mut() {
             tokio::select! {
                 biased;
                 message = reader.next() => message,
                 () = &mut notified => continue,
-                _ = sleeper.sleep(timeout) => {
+                _ = timer => {
                     protocol.timer_expired("inbound_silence");
                     close_locally(
                         &mut writer,
@@ -1677,10 +1678,14 @@ where
                     ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
                 })?;
                 protocol.control("runner_to_cloud", "pong");
+                inbound_silence_timer =
+                    inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
                 continue;
             }
             Message::Pong(_) => {
                 protocol.control("cloud_to_runner", "pong");
+                inbound_silence_timer =
+                    inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
                 continue;
             }
             Message::Close(close) => {
@@ -1885,6 +1890,7 @@ where
                 status.connected(frame_source.utc_timestamp().ok());
             }
         }
+        inbound_silence_timer = inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
     }
 }
 
@@ -2969,6 +2975,13 @@ mod tests {
                 ),
                 "execution_spec_invalid",
                 Some("source_commit_mismatch"),
+            ),
+            (
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCommitUnavailable,
+                ),
+                "execution_spec_invalid",
+                Some("source_commit_unavailable"),
             ),
             (
                 AssignmentDecline::ExecutionSpecInvalid(

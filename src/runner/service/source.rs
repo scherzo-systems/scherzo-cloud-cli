@@ -22,7 +22,7 @@ use crate::execution::workflow::git_capture::CloudGitCaptureProjection;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
-use crate::runner_protocol::ExecutionSourceV1RunnerProjection;
+use crate::runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_CREDENTIAL_RESPONSE_LIMIT: usize = 128 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,25 +30,10 @@ const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const FETCH_DIAGNOSTIC_LIMIT: u64 = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CredentialOperation {
-    Checkout,
-}
-
-impl CredentialOperation {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Checkout => "checkout",
-        }
-    }
-}
-
 pub(super) trait SourceCredentialBroker: Send + Sync {
     fn issue(
         &self,
         assignment_id: &str,
-        repository_connection_id: &str,
-        operation: CredentialOperation,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure>;
 }
@@ -125,8 +110,6 @@ struct CredentialResponse {
 
 struct CredentialRequest<'a> {
     assignment_id: &'a str,
-    repository_connection_id: &'a str,
-    operation: CredentialOperation,
 }
 
 impl HttpSourceCredentialBroker {
@@ -148,8 +131,6 @@ impl HttpSourceCredentialBroker {
                 "schemaVersion": 1,
                 "bootId": self.boot_id.as_ref(),
                 "assignmentId": request.assignment_id,
-                "repositoryConnectionId": request.repository_connection_id,
-                "operation": request.operation.as_str(),
             }));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -234,14 +215,11 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
     fn issue(
         &self,
         assignment_id: &str,
-        repository_connection_id: &str,
-        operation: CredentialOperation,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
         ensure_broker_current(cancellation)?;
         let broker = self.clone();
         let assignment_id = assignment_id.to_owned();
-        let repository_connection_id = repository_connection_id.to_owned();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -250,8 +228,6 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
                 let result = broker.issue_current(
                     CredentialRequest {
                         assignment_id: &assignment_id,
-                        repository_connection_id: &repository_connection_id,
-                        operation,
                     },
                     &worker_cancellation,
                 );
@@ -339,6 +315,40 @@ pub(super) struct MaterializedSource {
     pub(super) git_capture: Option<CloudGitCaptureProjection>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MaterializationRequest {
+    pub(super) repository_connection_id: String,
+    object_format: String,
+    commit_oid: String,
+    workflow_path: String,
+    workflow_source_closure_digest: WorkflowSourceClosureDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkflowSourceClosureDigest {
+    algorithm: String,
+    value: String,
+}
+
+impl MaterializationRequest {
+    pub(super) fn from_validated(execution_spec: &ExecutionSpecV1RunnerProjection) -> Self {
+        let workflow = &execution_spec.workflow_definition_source;
+        Self {
+            repository_connection_id: execution_spec
+                .primary_workspace_source
+                .repository_connection_id
+                .clone(),
+            object_format: workflow.object_format.clone(),
+            commit_oid: workflow.commit_oid.clone(),
+            workflow_path: workflow.workflow_path.clone(),
+            workflow_source_closure_digest: WorkflowSourceClosureDigest {
+                algorithm: workflow.workflow_source_closure_digest.algorithm.clone(),
+                value: workflow.workflow_source_closure_digest.value.clone(),
+            },
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "source materialization binds explicit assignment authority and three confined roots"
@@ -347,24 +357,28 @@ pub(super) fn materialize(
     broker: Arc<dyn SourceCredentialBroker>,
     environment: &EnvironmentSnapshot,
     assignment_id: &str,
-    projection: &ExecutionSourceV1RunnerProjection,
+    request: &MaterializationRequest,
     cancellation: &CaptureCancellation,
     source_root: &Path,
     ordinary_execution_root: &Path,
     private_root: &Path,
 ) -> Result<MaterializedSource, MaterializationFailure> {
-    if projection.object_format != "sha1" {
+    if request.object_format != "sha1" {
         return Err(MaterializationFailure::UnsupportedObjectFormat);
     }
     ensure_current(cancellation)?;
-    fs::create_dir(source_root).map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    let source_metadata = fs::symlink_metadata(source_root)
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    if !source_metadata.file_type().is_dir()
+        || fs::read_dir(source_root)
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
+            .next()
+            .is_some()
+    {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
     let credential = broker
-        .issue(
-            assignment_id,
-            &projection.checkout_credential_reference,
-            CredentialOperation::Checkout,
-            cancellation,
-        )
+        .issue(assignment_id, cancellation)
         .map_err(map_broker_failure)?;
     ensure_current(cancellation)?;
     let repository_url = Arc::clone(&credential.repository_url);
@@ -397,31 +411,26 @@ pub(super) fn materialize(
             environment,
             private_root,
             &askpass,
-            &projection.commit_oid,
+            &request.commit_oid,
             cancellation,
         )?;
     }
     drop(credential);
     ensure_current(cancellation)?;
-    verify_fetched_commit(source_root, environment, projection, cancellation)?;
-    checkout_pinned_commit(
-        source_root,
-        environment,
-        &projection.commit_oid,
-        cancellation,
-    )?;
+    verify_fetched_commit(source_root, environment, request, cancellation)?;
+    checkout_pinned_commit(source_root, environment, &request.commit_oid, cancellation)?;
 
-    verify_checkout(source_root, environment, projection, cancellation)?;
+    verify_checkout(source_root, environment, request, cancellation)?;
     ensure_current(cancellation)?;
-    let workflow = resolution::resolve(source_root, Path::new(&projection.workflow_path))
+    let workflow = resolution::resolve(source_root, Path::new(&request.workflow_path))
         .map_err(|_| MaterializationFailure::WorkflowUnavailable)?;
     ensure_current(cancellation)?;
-    if workflow.source.workflow_path != projection.workflow_path {
+    if workflow.source.workflow_path != request.workflow_path {
         return Err(MaterializationFailure::WorkflowUnavailable);
     }
     if workflow.content_digest.algorithm.as_str()
-        != projection.workflow_source_closure_digest.algorithm
-        || workflow.content_digest.value != projection.workflow_source_closure_digest.value
+        != request.workflow_source_closure_digest.algorithm
+        || workflow.content_digest.value != request.workflow_source_closure_digest.value
     {
         return Err(MaterializationFailure::WorkflowDigestMismatch);
     }
@@ -430,8 +439,8 @@ pub(super) fn materialize(
         fs::remove_dir(ordinary_execution_root)
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
         let git_capture = CloudGitCaptureProjection::new(
-            Arc::from(projection.commit_oid.as_str()),
-            Arc::from(projection.workflow_source_closure_digest.value.as_str()),
+            Arc::from(request.commit_oid.as_str()),
+            Arc::from(request.workflow_source_closure_digest.value.as_str()),
             cancellation.clone(),
         );
         Ok(MaterializedSource {
@@ -440,8 +449,6 @@ pub(super) fn materialize(
             git_capture: Some(git_capture),
         })
     } else {
-        fs::remove_dir_all(source_root)
-            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
         Ok(MaterializedSource {
             workflow,
             execution_root: ordinary_execution_root.to_owned(),
@@ -632,7 +639,7 @@ fn provider_reports_missing_object(diagnostic: &[u8], commit_oid: &str) -> bool 
 fn verify_fetched_commit(
     root: &Path,
     environment: &EnvironmentSnapshot,
-    projection: &ExecutionSourceV1RunnerProjection,
+    request: &MaterializationRequest,
     cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
     let object_format = run_git_output(
@@ -647,7 +654,7 @@ fn verify_fetched_commit(
     let object_type = run_git_output(
         root,
         environment,
-        &["cat-file", "-t", &projection.commit_oid],
+        &["cat-file", "-t", &request.commit_oid],
         cancellation,
     )?;
     if object_type != b"commit\n" {
@@ -674,17 +681,17 @@ fn checkout_pinned_commit(
 fn verify_checkout(
     root: &Path,
     environment: &EnvironmentSnapshot,
-    projection: &ExecutionSourceV1RunnerProjection,
+    request: &MaterializationRequest,
     cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
-    verify_fetched_commit(root, environment, projection, cancellation)?;
+    verify_fetched_commit(root, environment, request, cancellation)?;
     let head = run_git_output(
         root,
         environment,
         &["rev-parse", "--verify", "HEAD^{commit}"],
         cancellation,
     )?;
-    if head != format!("{}\n", projection.commit_oid).as_bytes() {
+    if head != format!("{}\n", request.commit_oid).as_bytes() {
         return Err(MaterializationFailure::CommitMismatch);
     }
     let mut detached = git_command(root, environment, &["symbolic-ref", "-q", "HEAD"], None);
@@ -999,24 +1006,21 @@ mod tests {
     use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::execution::workflow::value::CapturedValue;
     use crate::runner::credential::test_credential;
-    use crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
 
     struct FixtureBroker {
         repository_url: String,
         token: String,
-        calls: Mutex<Vec<CredentialOperation>>,
+        calls: Mutex<usize>,
     }
 
     impl SourceCredentialBroker for FixtureBroker {
         fn issue(
             &self,
             _assignment_id: &str,
-            _repository_connection_id: &str,
-            operation: CredentialOperation,
             cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
             ensure_broker_current(cancellation)?;
-            self.calls.lock().unwrap().push(operation);
+            *self.calls.lock().unwrap() += 1;
             Ok(fixture_credential(self.repository_url.clone(), &self.token))
         }
     }
@@ -1462,6 +1466,7 @@ mod tests {
         let assignment = tempfile::tempdir().unwrap();
         fs::create_dir(assignment.path().join("execution")).unwrap();
         fs::create_dir(assignment.path().join("private")).unwrap();
+        fs::create_dir(assignment.path().join("source")).unwrap();
         assignment
     }
 
@@ -1469,7 +1474,7 @@ mod tests {
         Arc::new(FixtureBroker {
             repository_url,
             token: token.to_owned(),
-            calls: Mutex::new(Vec::new()),
+            calls: Mutex::new(0),
         })
     }
 
@@ -1489,7 +1494,7 @@ mod tests {
     fn materialization_result(
         assignment: &tempfile::TempDir,
         broker: Arc<FixtureBroker>,
-        projection: &ExecutionSourceV1RunnerProjection,
+        projection: &MaterializationRequest,
     ) -> Result<MaterializedSource, MaterializationFailure> {
         materialization_result_with_cancellation(
             assignment,
@@ -1502,7 +1507,7 @@ mod tests {
     fn materialization_result_with_cancellation(
         assignment: &tempfile::TempDir,
         broker: Arc<FixtureBroker>,
-        projection: &ExecutionSourceV1RunnerProjection,
+        projection: &MaterializationRequest,
         cancellation: &CaptureCancellation,
     ) -> Result<MaterializedSource, MaterializationFailure> {
         materialize(
@@ -1557,24 +1562,22 @@ mod tests {
         }
     }
 
-    fn projection(fixture: &RepositoryFixture) -> ExecutionSourceV1RunnerProjection {
-        let connection = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();
-        ExecutionSourceV1RunnerProjection {
-            repository_connection_id: connection.clone(),
+    fn projection(fixture: &RepositoryFixture) -> MaterializationRequest {
+        MaterializationRequest {
+            repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             object_format: "sha1".to_owned(),
             commit_oid: fixture.commit.clone(),
             workflow_path: "workflows/workflow.yaml".to_owned(),
-            workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection {
+            workflow_source_closure_digest: WorkflowSourceClosureDigest {
                 algorithm: "sha256".to_owned(),
                 value: fixture.digest.clone(),
             },
-            checkout_credential_reference: connection,
         }
     }
 
     fn materialize_fixture(
         fixture: &RepositoryFixture,
-        projection: &ExecutionSourceV1RunnerProjection,
+        projection: &MaterializationRequest,
     ) -> (tempfile::TempDir, MaterializedSource, Arc<FixtureBroker>) {
         let (assignment, broker) = assignment_fixture(&fixture.repository);
         let materialized = materialization_result(&assignment, broker.clone(), projection).unwrap();
@@ -1655,10 +1658,7 @@ mod tests {
         );
         assert!(materialized.git_capture.is_some());
         assert!(!assignment.path().join("execution").exists());
-        assert_eq!(
-            broker.calls.lock().unwrap().as_slice(),
-            [CredentialOperation::Checkout]
-        );
+        assert_eq!(*broker.calls.lock().unwrap(), 1);
         assert_credential_material_removed(&assignment, TOKEN);
         let request_evidence = server.evidence();
         assert!(request_evidence.challenges > 0);
@@ -1941,10 +1941,7 @@ mod tests {
             )
             .unwrap();
         assert!(validation.is_valid());
-        assert_eq!(
-            broker.calls.lock().unwrap().as_slice(),
-            [CredentialOperation::Checkout]
-        );
+        assert_eq!(*broker.calls.lock().unwrap(), 1);
     }
 
     #[test]
@@ -2021,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn outputless_workflow_retains_the_closure_but_not_the_private_checkout() {
+    fn outputless_workflow_retains_the_checkout_for_workspace_lease_release() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let fixture = repository_fixture(workflow);
         let projection = projection(&fixture);
@@ -2032,7 +2029,7 @@ mod tests {
             assignment.path().join("execution")
         );
         assert!(materialized.git_capture.is_none());
-        assert!(!assignment.path().join("source").exists());
+        assert!(assignment.path().join("source").exists());
         assert_eq!(
             materialized
                 .workflow
@@ -2122,16 +2119,15 @@ mod tests {
         commit_repository(&repository);
 
         let (assignment, broker) = assignment_fixture(&repository);
-        let projection = ExecutionSourceV1RunnerProjection {
+        let projection = MaterializationRequest {
             repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             object_format: "sha1".to_owned(),
             commit_oid: "0".repeat(40),
             workflow_path: "workflow.yaml".to_owned(),
-            workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection {
+            workflow_source_closure_digest: WorkflowSourceClosureDigest {
                 algorithm: "sha256".to_owned(),
                 value: "0".repeat(64),
             },
-            checkout_credential_reference: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         };
 
         assert!(matches!(
@@ -2194,12 +2190,7 @@ mod tests {
         });
         let started = crate::timing::monotonic_now();
 
-        let result = broker.issue(
-            "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
-            CredentialOperation::Checkout,
-            &cancellation,
-        );
+        let result = broker.issue("asn_01k0z6r1w8f4jy2m7q9v3x5abc", &cancellation);
 
         assert!(matches!(result, Err(CredentialBrokerFailure::Fenced)));
         assert!(crate::timing::elapsed(started) < Duration::from_secs(2));

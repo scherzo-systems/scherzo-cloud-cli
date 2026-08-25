@@ -572,9 +572,12 @@ fn wait_for_refresh_lock_attempt(process_id: u32) {
 }
 
 fn write_runner_config(directory: &tempfile::TempDir, connection_url: &str) -> String {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let state_path = directory.path().join("runner-state.json");
     let config_path = directory.path().join("runner.json");
+    let work_root = directory.path().join("work");
+    fs::create_dir(&work_root).expect("create runner work root");
+    fs::set_permissions(&work_root, Permissions::from_mode(0o700))
+        .expect("protect runner work root");
     let mode = if connection_url.starts_with("ws://") {
         "development"
     } else {
@@ -603,7 +606,7 @@ fn write_runner_config(directory: &tempfile::TempDir, connection_url: &str) -> S
         "deploymentMode": mode,
         "runnerStatePath": state_path,
         "controlSocketPath": directory.path().join("runner.sock"),
-        "workRoot": manifest.join("tests")
+        "workRoot": work_root
     });
     fs::write(
         &config_path,

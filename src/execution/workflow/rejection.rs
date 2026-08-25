@@ -741,7 +741,7 @@ mod tests {
     fn codex_installation_rejection_uses_the_closed_profile_identity() {
         let failure =
             AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
-                incompatibility: CodexIncompatibility::Version("0.149.0".to_owned()),
+                incompatibility: CodexIncompatibility::Version("0.150.0".to_owned()),
                 identity: None,
             });
 

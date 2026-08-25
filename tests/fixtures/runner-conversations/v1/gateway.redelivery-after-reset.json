@@ -82,9 +82,17 @@
               "maximumParallelSteps": 1
             },
             "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "primaryWorkspaceSource": {
+              "commitOid": "0123456789abcdef0123456789abcdef01234567",
+              "kind": "connected_repository",
+              "materializationContract": "git_full_clone_v1",
+              "objectFormat": "sha1",
+              "providerKind": "github",
+              "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+            },
             "schemaVersion": 1,
-            "source": {
-              "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "sourceBranch": "main",
+            "workflowDefinitionSource": {
               "commitOid": "0123456789abcdef0123456789abcdef01234567",
               "objectFormat": "sha1",
               "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",

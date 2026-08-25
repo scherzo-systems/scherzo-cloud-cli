@@ -1,3 +1,6 @@
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,15 +17,19 @@ use super::connection::{
     OpeningHello, opening_hello, run_established,
 };
 use super::test_support::{
-    DeterminismTranscript, ScriptedConnection, ScriptedInbound, ScriptedReader, ScriptedWriter,
-    SleepRelease, assignment_offer, controlled_shutdown, controlled_sleeper_with_transcript,
-    deterministic_frame_source, effect_observation_acknowledgement, fixture_lease_clock,
-    observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
-    with_watchdog,
+    ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection, ScriptedConnector,
+    ScriptedInbound, ScriptedReader, ScriptedWriter, SleepRelease, assignment_offer,
+    controlled_shutdown, controlled_sleeper_with_transcript, deterministic_frame_source,
+    effect_observation_acknowledgement, fixture_lease_clock, observation_acknowledgement,
+    scripted_connector, scripted_duplex, sleep_request, welcome, with_watchdog,
+};
+use super::workspace::{
+    CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
+    WorkspaceFilesystem,
 };
 use super::{
     Config, ConnectionLoopDependencies, Connector, ServiceError, Shutdown, Sleeper,
-    run_connection_loop,
+    run_connection_loop, run_connection_loop_with_work_root,
 };
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
@@ -65,6 +72,294 @@ async fn reconnect_backoff_reset_and_cancellation_have_a_deterministic_transcrip
             .expect("deterministic reconnect scenario timed out");
         assert_stable_transcript(&mut expected, actual, repetition);
     }
+}
+
+struct FailingTreeRemover;
+
+impl TreeRemover for FailingTreeRemover {
+    fn remove_tree(&self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::other("injected cleanup failure"))
+    }
+}
+
+struct ImmediateCleanupSleeper;
+
+impl CleanupSleeper for ImmediateCleanupSleeper {
+    fn sleep(&self, _duration: Duration, cancellation: &CleanupCancellation) -> bool {
+        !cancellation.is_cancelled()
+    }
+}
+
+struct TrackingSleeper {
+    inner: Arc<dyn Sleeper>,
+    next_id: AtomicUsize,
+    created: mpsc::UnboundedSender<(usize, Duration)>,
+    polled: mpsc::UnboundedSender<usize>,
+}
+
+impl Sleeper for TrackingSleeper {
+    fn now(&self) -> std::time::Instant {
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let _ = self.created.send((id, duration));
+        let polled = self.polled.clone();
+        let mut inner = self.inner.sleep(duration);
+        Box::pin(std::future::poll_fn(move |context| {
+            let _ = polled.send(id);
+            inner.as_mut().poll(context)
+        }))
+    }
+}
+
+struct TrackingSleeperFixture {
+    sleeper: Arc<dyn Sleeper>,
+    creations: mpsc::UnboundedReceiver<(usize, Duration)>,
+    polls: mpsc::UnboundedReceiver<usize>,
+}
+
+fn tracking_sleeper(inner: Arc<dyn Sleeper>) -> TrackingSleeperFixture {
+    let (created, creations) = mpsc::unbounded_channel();
+    let (polled, polls) = mpsc::unbounded_channel();
+    TrackingSleeperFixture {
+        sleeper: Arc::new(TrackingSleeper {
+            inner,
+            next_id: AtomicUsize::new(0),
+            created,
+            polled,
+        }),
+        creations,
+        polls,
+    }
+}
+
+struct GatedFirstRemoval {
+    calls: AtomicUsize,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl TreeRemover for GatedFirstRemoval {
+    fn remove_tree(&self, path: &Path) -> io::Result<()> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            let _ = self.started.send(());
+            self.release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .map_err(|_| io::Error::other("cleanup gate closed"))?;
+        }
+        std::fs::remove_dir_all(path)
+    }
+}
+
+struct NoopWorkRootHook;
+
+impl WorkRootHook for NoopWorkRootHook {
+    fn before_child_enumeration(&self) {}
+}
+
+fn injected_work_root(
+    dependencies: &ConnectionLoopDependencies,
+    remover: Arc<dyn TreeRemover>,
+) -> Arc<WorkRootLease> {
+    WorkRootLease::acquire_with(
+        dependencies.config.assignment().work_root(),
+        &dependencies.boot_id,
+        WorkspaceFilesystem::injected(
+            remover,
+            Arc::new(ImmediateCleanupSleeper),
+            Arc::new(NoopWorkRootHook),
+        ),
+    )
+    .unwrap()
+}
+
+struct CleanupServiceFixture {
+    dependencies: ConnectionLoopDependencies,
+    connector: ScriptedConnector,
+    attempts: mpsc::UnboundedReceiver<ScriptedConnection>,
+    shutdown: Box<dyn Shutdown>,
+    shutdown_trigger: ControlledShutdownTrigger,
+    sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+    work_root: Arc<WorkRootLease>,
+}
+
+fn cleanup_service_fixture(remover: Arc<dyn TreeRemover>) -> CleanupServiceFixture {
+    let transcript = DeterminismTranscript::default();
+    let (sleeper, sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
+    cleanup_service_fixture_with_sleeper(remover, transcript, sleeper, sleep_requests)
+}
+
+fn cleanup_service_fixture_with_sleeper(
+    remover: Arc<dyn TreeRemover>,
+    transcript: DeterminismTranscript,
+    sleeper: Arc<dyn Sleeper>,
+    sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+) -> CleanupServiceFixture {
+    let (connector, attempts) = scripted_connector(transcript);
+    let (shutdown, shutdown_trigger) = controlled_shutdown();
+    let dependencies = deterministic_connection_loop_dependencies(sleeper);
+    let work_root = injected_work_root(&dependencies, remover);
+    CleanupServiceFixture {
+        dependencies,
+        connector,
+        attempts,
+        shutdown,
+        shutdown_trigger,
+        sleep_requests,
+        work_root,
+    }
+}
+
+async fn run_cleanup_service(
+    dependencies: ConnectionLoopDependencies,
+    connector: &ScriptedConnector,
+    shutdown: &mut dyn Shutdown,
+    work_root: Arc<WorkRootLease>,
+) -> Result<(), ServiceError> {
+    run_connection_loop_with_work_root(
+        dependencies,
+        connector,
+        Backoff::with_fixed_unit(1.0),
+        shutdown,
+        work_root,
+    )
+    .await
+}
+
+async fn offer_rejected_assignment(
+    attempts: &mut mpsc::UnboundedReceiver<ScriptedConnection>,
+    sleep_requests: &mut mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+) -> ScriptedConnection {
+    let mut connection = next_connection(attempts).await;
+    let hello = next_hello(&mut connection).await;
+    complete_handshake(&connection, sleep_requests, &hello).await;
+    connection.inbound.send(scripted_assignment_offer());
+    let effect_acknowledgement = next_outbound(&mut connection.outbound).await;
+    assert_eq!(
+        decode_text(&effect_acknowledgement, "effect acknowledgement")["type"],
+        "effect_acknowledged"
+    );
+    let rejection = next_outbound(&mut connection.outbound).await;
+    assert_eq!(
+        decode_text(&rejection, "assignment rejection")["type"],
+        "assignment_rejected"
+    );
+    connection
+}
+
+#[tokio::test]
+async fn cleanup_completion_does_not_restart_the_inbound_silence_timer() {
+    let (started, mut cleanup_started) = tokio::sync::mpsc::unbounded_channel();
+    let (release_cleanup, release) = std::sync::mpsc::channel();
+    let transcript = DeterminismTranscript::default();
+    let (controlled, sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
+    let TrackingSleeperFixture {
+        sleeper: tracked,
+        creations: mut timer_creations,
+        polls: mut timer_polls,
+    } = tracking_sleeper(controlled);
+    let mut fixture = cleanup_service_fixture_with_sleeper(
+        Arc::new(GatedFirstRemoval {
+            calls: AtomicUsize::new(0),
+            started,
+            release: Mutex::new(release),
+        }),
+        transcript,
+        tracked,
+        sleep_requests,
+    );
+    // The recovery and failure cases keep separate peer futures because their post-rejection
+    // synchronization and service termination authority are intentionally different.
+    // Keep shutdown pending: this scenario ends by cancelling the service future after the
+    // assertion rather than exercising the independent graceful-shutdown protocol.
+    let _shutdown_lifetime = fixture.shutdown_trigger;
+    // jscpd:ignore-start
+    let service = run_cleanup_service(
+        fixture.dependencies,
+        &fixture.connector,
+        fixture.shutdown.as_mut(),
+        fixture.work_root,
+    );
+    let peer = async {
+        let _connection =
+            offer_rejected_assignment(&mut fixture.attempts, &mut fixture.sleep_requests).await;
+        // jscpd:ignore-end
+        cleanup_started
+            .recv()
+            .await
+            .expect("cleanup did not reach the injected removal gate");
+        let silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        let mut silence_timer_id = None;
+        while let Ok((id, duration)) = timer_creations.try_recv() {
+            if duration == Duration::from_secs(2) {
+                silence_timer_id = Some(id);
+            }
+        }
+        let silence_timer_id = silence_timer_id.expect("inbound silence timer was not created");
+        while timer_polls.try_recv().is_ok() {}
+        release_cleanup.send(()).unwrap();
+        let repolled = with_watchdog(timer_polls.recv())
+            .await
+            .expect("cleanup completion did not repoll the established connection")
+            .expect("tracking sleeper closed before connection repoll");
+        assert_eq!(
+            repolled, silence_timer_id,
+            "local cleanup completion replaced the gateway silence timer"
+        );
+        drop(silence_timer);
+    };
+    with_watchdog(async {
+        tokio::pin!(service);
+        tokio::pin!(peer);
+        tokio::select! {
+            biased;
+            result = &mut service => {
+                panic!("runner service stopped before cleanup recovery completed: {result:?}")
+            }
+            () = &mut peer => {}
+        }
+    })
+    .await
+    .expect("cleanup recovery scenario timed out");
+}
+
+#[tokio::test]
+async fn cleanup_failure_ends_established_service_without_gateway_close() {
+    let mut fixture = cleanup_service_fixture(Arc::new(FailingTreeRemover));
+    let (finished, service_finished) = tokio::sync::oneshot::channel();
+    // Keep this distinct async ownership boundary beside the recovered case above.
+    // jscpd:ignore-start
+    let service = async {
+        let result = run_cleanup_service(
+            fixture.dependencies,
+            &fixture.connector,
+            fixture.shutdown.as_mut(),
+            fixture.work_root,
+        )
+        .await;
+        let _ = finished.send(());
+        result
+    };
+    let peer = async {
+        let _connection =
+            offer_rejected_assignment(&mut fixture.attempts, &mut fixture.sleep_requests).await;
+        service_finished
+            .await
+            .expect("service dropped without reporting cleanup failure");
+        // jscpd:ignore-end
+    };
+    let result = with_watchdog(async {
+        let (result, ()) = tokio::join!(service, peer);
+        result
+    })
+    .await
+    .expect("cleanup failure did not wake and terminate the established service");
+    assert!(matches!(result, Err(ServiceError::WorkspaceCleanupFailed)));
 }
 
 #[tokio::test]
@@ -273,7 +568,13 @@ async fn run_reconnect_scenario() -> Vec<String> {
     let (sleeper, mut sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
     let (connector, mut attempts) = scripted_connector(transcript.clone());
     let (mut shutdown, cancel) = controlled_shutdown();
-    let service = run_deterministic_connection_loop(sleeper, &connector, shutdown.as_mut());
+    let (finished, service_finished) = tokio::sync::oneshot::channel();
+    let service = async {
+        let result =
+            run_deterministic_connection_loop(sleeper, &connector, shutdown.as_mut()).await;
+        let _ = finished.send(());
+        result
+    };
     let peer = async {
         let mut first = next_connection(&mut attempts).await;
         let first_hello = next_hello(&mut first).await;
@@ -361,6 +662,24 @@ async fn run_reconnect_scenario() -> Vec<String> {
         transcript.record("cancellation.released".to_owned());
         cancel.notify_one();
         drop(final_backoff);
+
+        let mut sixth = next_connection(&mut attempts).await;
+        let sixth_hello = next_hello(&mut sixth).await;
+        assert_hello(
+            &sixth_hello,
+            "rmsg_00000000000000000000000007",
+            "rbt_00000000000000000000000001",
+            6,
+        );
+        complete_handshake(&sixth, &mut sleep_requests, &sixth_hello).await;
+        let replayed_rejection = next_outbound(&mut sixth.outbound).await;
+        assert_eq!(
+            decode_text(&replayed_rejection, "shutdown rejection replay")["type"],
+            "assignment_rejected"
+        );
+        service_finished
+            .await
+            .expect("service dropped before shutdown replay completed");
     };
 
     let (service_result, ()) = tokio::join!(service, peer);
@@ -471,7 +790,7 @@ impl EstablishedRuntime {
             BOOT_ID.to_owned(),
             fixture_lease_clock(),
         ));
-        run_established(
+        let result = run_established(
             ConnectionDependencies::new(
                 &self.config,
                 self.frame_source.as_ref(),
@@ -487,7 +806,12 @@ impl EstablishedRuntime {
             reader,
             writer,
         )
-        .await
+        .await;
+        assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settle_cleanup();
+        result
     }
 }
 

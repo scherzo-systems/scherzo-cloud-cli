@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::future::{Future, ready};
 use std::io::{BufRead, Read as _, Write};
@@ -459,6 +459,7 @@ impl ProcessFixture {
                 OsString::from("CODEX_FIXTURE_RESPONSE"),
                 OsString::from(match scenario {
                     "exact-limit"
+                    | "async-before-final"
                     | "failure-after-output"
                     | "interruption-after-output"
                     | "nonzero-after-output" => "12345",
@@ -1000,6 +1001,24 @@ fn completed_provisional_response(output: &mut impl Write) -> Value {
     item
 }
 
+fn completed_async_response(output: &mut impl Write, id: &str, text: &str) -> Value {
+    send_item_started(
+        output,
+        id,
+        "agentMessage",
+        json!({"text": "", "phase": null, "delivery": "async"}),
+    );
+    let item = json!({
+        "id": id,
+        "type": "agentMessage",
+        "text": text,
+        "phase": "final_answer",
+        "delivery": "async",
+    });
+    send_item_completed(output, item.clone());
+    item
+}
+
 fn send_turn_terminal(
     output: &mut impl Write,
     status: &str,
@@ -1032,8 +1051,8 @@ fn send_result_turn(
     item_id: &str,
     candidate: Option<&str>,
     status: &str,
+    mut items: Vec<Value>,
 ) {
-    let mut items = Vec::new();
     if let Some(candidate) = candidate {
         write_server_frame(
             output,
@@ -1533,12 +1552,19 @@ fn codex_process_fixture() {
 
     if matches!(
         scenario.as_str(),
-        "cancellation-blocked" | "cancellation-after-output" | "cancellation-stubborn"
+        "cancellation-blocked"
+            | "cancellation-after-output"
+            | "cancellation-after-async"
+            | "cancellation-stubborn"
     ) {
-        let items = if scenario == "cancellation-after-output" {
-            vec![completed_provisional_response(&mut output)]
-        } else {
-            vec![]
+        let items = match scenario.as_str() {
+            "cancellation-after-output" => vec![completed_provisional_response(&mut output)],
+            "cancellation-after-async" => vec![completed_async_response(
+                &mut output,
+                "async-cancel",
+                "must not survive cancellation",
+            )],
+            _ => vec![],
         };
         std::fs::write(std::env::var_os("CODEX_FIXTURE_READY").unwrap(), b"ready\n").unwrap();
         let interrupt = read_client_frame(&mut input, &mut capture);
@@ -1572,8 +1598,21 @@ fn codex_process_fixture() {
             "result-root-number" => Some(result_envelope(json!(7))),
             "result-root-boolean" => Some(result_envelope(json!(true))),
             "result-root-null" => Some(result_envelope(json!(null))),
-            "result-missing" => None,
+            "result-async-before-final" => Some(result_envelope(json!(7))),
+            "result-missing" | "result-async-only" => None,
             _ => panic!("unknown result scenario"),
+        };
+        let items = if matches!(
+            scenario.as_str(),
+            "result-async-before-final" | "result-async-only"
+        ) {
+            vec![completed_async_response(
+                &mut output,
+                "result-async",
+                "not a structured result",
+            )]
+        } else {
+            vec![]
         };
         send_result_turn(
             &mut output,
@@ -1581,6 +1620,7 @@ fn codex_process_fixture() {
             "result-first",
             first_candidate.as_deref(),
             "completed",
+            items,
         );
         if scenario == "result-settlement-blocked" {
             let mut trailing = Vec::new();
@@ -1590,13 +1630,13 @@ fn codex_process_fixture() {
                 std::thread::park();
             }
         }
-        if scenario.starts_with("result-root-") {
+        if scenario.starts_with("result-root-") || scenario == "result-async-before-final" {
             let mut trailing = Vec::new();
             input.read_to_end(&mut trailing).unwrap();
             assert!(trailing.is_empty());
             return;
         }
-        if scenario != "result-missing" {
+        if scenario != "result-missing" && scenario != "result-async-only" {
             let correction = read_client_frame(&mut input, &mut capture);
             assert_eq!(correction["id"], 6);
             assert_eq!(correction["method"], "turn/start");
@@ -1650,6 +1690,7 @@ fn codex_process_fixture() {
                 "result-second",
                 candidate.as_deref(),
                 status,
+                vec![],
             );
         }
         let mut trailing = Vec::new();
@@ -1729,6 +1770,7 @@ fn codex_process_fixture() {
             | "failure-after-start-authentication"
             | "failure-after-start-stubborn"
             | "failure-after-partial-output"
+            | "failure-after-async"
             | "retry-exhausted"
             | "truncated-provider-stream"
     ) {
@@ -1768,6 +1810,12 @@ fn codex_process_fixture() {
         let mut items = Vec::new();
         if scenario == "failure-after-partial-output" {
             items.push(completed_provisional_response(&mut output));
+        } else if scenario == "failure-after-async" {
+            items.push(completed_async_response(
+                &mut output,
+                "async-failure",
+                "must not survive failure",
+            ));
         }
         if scenario == "failure-after-start-stubborn" {
             materialize_stubborn_descendant();
@@ -1812,7 +1860,37 @@ fn codex_process_fixture() {
         return;
     }
 
-    let send_message = !matches!(scenario.as_str(), "absent" | "delta-only");
+    if scenario == "metadata-nonsettling" {
+        write_server_frame(
+            &mut output,
+            json!({
+                "method": "project/changed",
+                "params": {"projectId": "project-1", "changeType": "updated"},
+                "emittedAtMs": 20,
+            }),
+        );
+        write_server_frame(
+            &mut output,
+            json!({
+                "method": "autoApprovalReview/strictReviewRequired",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": TURN_ID,
+                    "startedAtMs": 19,
+                },
+                "emittedAtMs": 20,
+            }),
+        );
+    }
+    let mut prefixed_items = Vec::new();
+    if scenario == "async-before-final" || scenario == "async-only" {
+        prefixed_items.push(completed_async_response(
+            &mut output,
+            "async-message",
+            "non-authoritative async message",
+        ));
+    }
+    let send_message = !matches!(scenario.as_str(), "absent" | "delta-only" | "async-only");
     if scenario == "delta-only" {
         send_item_started(
             &mut output,
@@ -1886,18 +1964,17 @@ fn codex_process_fixture() {
         "interruption-after-output" => "interrupted",
         _ => "completed",
     };
-    let items = if send_message {
+    let mut items = prefixed_items;
+    if send_message {
         let response = if scenario == "empty" {
             ""
         } else {
             response.as_str()
         };
-        vec![
+        items.push(
             json!({"id": "message-1", "type": "agentMessage", "text": response, "phase": "final_answer"}),
-        ]
-    } else {
-        vec![]
-    };
+        );
+    }
     write_server_frame(
         &mut output,
         json!({"method": "turn/completed", "params": {
@@ -1918,7 +1995,7 @@ struct ProviderRequest {
 }
 
 enum LoopbackProviderResponse {
-    Completed(String),
+    Completed(VecDeque<String>),
     ServerError,
 }
 
@@ -1932,7 +2009,21 @@ struct LoopbackResponsesProvider {
 impl LoopbackResponsesProvider {
     async fn start(response: &str) -> Self {
         Self::start_with_response_release(
-            LoopbackProviderResponse::Completed(response.to_owned()),
+            LoopbackProviderResponse::Completed(VecDeque::from([response.to_owned()])),
+            None,
+        )
+        .await
+    }
+
+    async fn start_sequence(responses: &[&str]) -> Self {
+        assert!(!responses.is_empty());
+        Self::start_with_response_release(
+            LoopbackProviderResponse::Completed(
+                responses
+                    .iter()
+                    .map(|response| (*response).to_owned())
+                    .collect(),
+            ),
             None,
         )
         .await
@@ -1954,7 +2045,7 @@ impl LoopbackResponsesProvider {
         let (release, released) = oneshot::channel();
         (
             Self::start_with_response_release(
-                LoopbackProviderResponse::Completed(response.to_owned()),
+                LoopbackProviderResponse::Completed(VecDeque::from([response.to_owned()])),
                 Some(released),
             )
             .await,
@@ -1971,6 +2062,7 @@ impl LoopbackResponsesProvider {
         let (requests, request) = mpsc::unbounded_channel();
         let (stop, mut shutdown) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let mut response = response;
             let mut response_release = response_release;
             loop {
                 let accepted = tokio::select! {
@@ -1979,7 +2071,8 @@ impl LoopbackResponsesProvider {
                     accepted = listener.accept() => accepted,
                 };
                 let (stream, _) = accepted.unwrap();
-                if serve_provider_request(stream, &requests, &response, &mut response_release).await
+                if serve_provider_request(stream, &requests, &mut response, &mut response_release)
+                    .await
                 {
                     break;
                 }
@@ -2006,7 +2099,7 @@ impl LoopbackResponsesProvider {
 async fn serve_provider_request(
     mut stream: TcpStream,
     requests: &mpsc::UnboundedSender<ProviderRequest>,
-    response: &LoopbackProviderResponse,
+    response: &mut LoopbackProviderResponse,
     response_release: &mut Option<oneshot::Receiver<()>>,
 ) -> bool {
     let mut bytes = Vec::new();
@@ -2063,7 +2156,8 @@ async fn serve_provider_request(
         response_release.await.unwrap();
     }
     let (status, content_type, payload) = match response {
-        LoopbackProviderResponse::Completed(response) => {
+        LoopbackProviderResponse::Completed(responses) => {
+            let response = responses.pop_front().expect("one loopback response");
             let events = [
                 json!({
                     "type": "response.created",
@@ -2140,7 +2234,10 @@ async fn serve_provider_request(
         Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
         Err(error) => panic!("loopback provider shutdown failed: {error:?}"),
     }
-    true
+    match response {
+        LoopbackProviderResponse::Completed(responses) => responses.is_empty(),
+        LoopbackProviderResponse::ServerError => true,
+    }
 }
 
 pub(super) mod normal {
@@ -2499,6 +2596,28 @@ pub(super) mod normal {
     }
 
     #[tokio::test]
+    async fn project_and_strict_review_metadata_do_not_settle_the_process() {
+        with_watchdog(async {
+            let fixture = ProcessFixture::new("metadata-nonsettling", AgentValueMode::None, 1024);
+            let observations = fixture.observations.clone();
+            let (_, outcome, started) = run_fixture(fixture).await;
+            assert_completed_without_value(outcome, started);
+            assert_eq!(
+                observations
+                    .snapshot()
+                    .iter()
+                    .filter(|observation| matches!(
+                        observation.observation(),
+                        AgentObservation::UnrecognizedHarnessEvent { .. }
+                    ))
+                    .count(),
+                2,
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn ordinary_no_value_turn_has_the_same_clean_settlement_boundary() {
         with_watchdog(async {
             let fixture = ProcessFixture::new("no-value", AgentValueMode::None, 5);
@@ -2539,7 +2658,7 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
     async fn ephemeral_thread_preserves_native_resources_and_cleans_sqlite_state() {
         with_watchdog(async {
             let (mut provider, release_response) =
@@ -2597,11 +2716,37 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
-    async fn structured_result_uses_authoritative_validation_and_settles() {
+    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
+    async fn no_value_mode_settles_and_cleans_transient_state() {
         with_watchdog(async {
             let (mut provider, release_response) =
-                LoopbackResponsesProvider::start_blocked(r#"{"result":"7"}"#).await;
+                LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, AgentValueMode::None);
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let (fixture, outcome, started) =
+                release_provider_and_settle(&mut provider, release_response, run).await;
+
+            assert!(started, "exact Codex outcome: {outcome:?}");
+            assert_eq!(
+                outcome,
+                AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+            );
+            assert_transient_sqlite_cleaned(&fixture);
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
+    async fn structured_result_is_corrected_once_and_settles() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_sequence(&[
+                r#"{"result":"-1"}"#,
+                r#"{"result":"7"}"#,
+            ])
+            .await;
             let fixture = ProcessFixture::with_exact_binary(
                 provider.address,
                 result_mode(json!({
@@ -2612,12 +2757,14 @@ pub(super) mod exact_binary {
             );
             let run = tokio::spawn(run_fixture(fixture));
 
-            let (_, outcome, started) =
-                release_provider_and_settle(&mut provider, release_response, run).await;
+            for _ in 0..2 {
+                assert_eq!(provider.next_request().await.path, "/responses");
+            }
+            let (_, outcome, started) = run.await.unwrap();
 
             assert!(started, "exact Codex outcome: {outcome:?}");
             let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-                panic!("exact Codex must complete one structured result: {outcome:?}");
+                panic!("exact Codex must complete one corrected result: {outcome:?}");
             };
             assert_eq!(result.value(), &json!(7));
             provider.shutdown().await;
@@ -2626,7 +2773,7 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
     async fn native_provider_failure_settles_without_a_value() {
         with_watchdog(async {
             let (mut provider, release_response) =
@@ -2651,7 +2798,7 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.148.0 executable"]
+    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
     async fn cancellation_interrupts_the_native_turn_and_quiesces() {
         with_watchdog(async {
             let (mut provider, release_response) =
@@ -2695,7 +2842,7 @@ pub(super) mod response_authority {
     #[tokio::test]
     async fn only_the_bounded_settled_completed_message_commits() {
         with_watchdog(async {
-            for scenario in ["absent", "empty"] {
+            for scenario in ["absent", "empty", "async-only"] {
                 let (outcome, started) = run_response_fixture(scenario).await;
                 assert!(started);
                 assert_eq!(
@@ -2710,6 +2857,14 @@ pub(super) mod response_authority {
             let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
             else {
                 panic!("exact-limit response must complete");
+            };
+            assert_eq!(response.as_str(), "12345");
+
+            let (outcome, started) = run_response_fixture("async-before-final").await;
+            assert!(started);
+            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
+            else {
+                panic!("the ordinary final response after async delivery must complete");
             };
             assert_eq!(response.as_str(), "12345");
 
@@ -2781,6 +2936,37 @@ pub(super) mod structured_result {
                 };
                 assert_eq!(result.value(), &expected, "{scenario}");
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn async_delivery_is_excluded_from_structured_result_authority() {
+        with_watchdog(async {
+            let fixture = ProcessFixture::new(
+                "result-async-before-final",
+                result_mode(positive_integer_schema()),
+                1024,
+            );
+            let (_, outcome, started) = run_fixture(fixture).await;
+            assert!(started, "{outcome:?}");
+            let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+                panic!("the ordinary structured result after async delivery must complete");
+            };
+            assert_eq!(result.value(), &json!(7));
+
+            let fixture = ProcessFixture::new(
+                "result-async-only",
+                result_mode(positive_integer_schema()),
+                1024,
+            );
+            let (_, outcome, started) = run_fixture(fixture).await;
+            assert_started_failure(
+                "result-async-only",
+                outcome,
+                started,
+                AgentFailureCause::MissingResult,
+            );
         })
         .await;
     }
@@ -3082,6 +3268,11 @@ pub(super) mod failure_ordering {
                     AgentHarnessFailureDetail::ModelError,
                 ),
                 (
+                    "failure-after-async",
+                    true,
+                    AgentHarnessFailureDetail::ModelError,
+                ),
+                (
                     "retry-exhausted",
                     true,
                     AgentHarnessFailureDetail::ModelOutputTruncated,
@@ -3268,6 +3459,16 @@ pub(super) mod cancellation {
         assert_fixture_quiescent(&fixture);
     }
 
+    async fn assert_active_cancellation_discards_response(scenario: &str) {
+        let fixture = ProcessFixture::new(scenario, response_mode(), 1024);
+        let mut running = RunningCancellationFixture::start(fixture);
+        running.await_started().await;
+        wait_for_fixture_file(&running.fixture.ready).await;
+        running.cancel();
+        let (fixture, outcome) = running.finish().await;
+        assert_cancelled_without_native_rollout(&fixture, outcome);
+    }
+
     #[tokio::test]
     async fn pre_start_and_active_turn_cancellation_use_the_native_boundary() {
         with_watchdog(async {
@@ -3285,6 +3486,8 @@ pub(super) mod cancellation {
                 "turn/interrupt",
             );
             assert_cancelled_without_native_rollout(&fixture, outcome);
+
+            assert_active_cancellation_discards_response("cancellation-after-async").await;
 
             let fixture =
                 ProcessFixture::new("cancellation-pending-request", AgentValueMode::None, 1024);
@@ -3308,13 +3511,7 @@ pub(super) mod cancellation {
     #[tokio::test]
     async fn cancellation_discards_partial_output_and_force_cleans_stubborn_descendants() {
         with_watchdog(async {
-            let fixture = ProcessFixture::new("cancellation-after-output", response_mode(), 1024);
-            let mut running = RunningCancellationFixture::start(fixture);
-            running.await_started().await;
-            wait_for_fixture_file(&running.fixture.ready).await;
-            running.cancel();
-            let (fixture, outcome) = running.finish().await;
-            assert_cancelled_without_native_rollout(&fixture, outcome);
+            assert_active_cancellation_discards_response("cancellation-after-output").await;
 
             let fixture = ProcessFixture::new("cancellation-stubborn", AgentValueMode::None, 1024);
             let mut running = RunningCancellationFixture::start(fixture);

@@ -16,7 +16,8 @@
         "maximumParallelSteps": 1,
         "cancellationGraceSeconds": 1
       },
-      "source": {
+      "sourceBranch": "main",
+      "workflowDefinitionSource": {
         "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
         "objectFormat": "sha1",
         "commitOid": "0123456789abcdef0123456789abcdef01234567",
@@ -24,8 +25,15 @@
         "workflowSourceClosureDigest": {
           "algorithm": "sha256",
           "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        },
-        "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+        }
+      },
+      "primaryWorkspaceSource": {
+        "kind": "connected_repository",
+        "providerKind": "github",
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+        "materializationContract": "git_full_clone_v1"
       }
     },
     "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",

@@ -175,24 +175,19 @@
         "value"
       ]
     },
-    "ExecutionSource": {
+    "WorkflowDefinitionSource": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "repositoryConnectionId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
+          "$ref": "#/$defs/repositoryConnectionId"
         },
         "objectFormat": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 16
+          "const": "sha1"
         },
         "commitOid": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128
+          "pattern": "^[0-9a-f]{40}$"
         },
         "workflowPath": {
           "type": "string",
@@ -200,29 +195,7 @@
           "maxLength": 4096
         },
         "workflowSourceClosureDigest": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "algorithm": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 16
-            },
-            "value": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128
-            }
-          },
-          "required": [
-            "algorithm",
-            "value"
-          ]
-        },
-        "checkoutCredentialReference": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
+          "$ref": "#/$defs/WorkflowSourceClosureDigest"
         }
       },
       "required": [
@@ -230,8 +203,40 @@
         "objectFormat",
         "commitOid",
         "workflowPath",
-        "workflowSourceClosureDigest",
-        "checkoutCredentialReference"
+        "workflowSourceClosureDigest"
+      ]
+    },
+    "PrimaryWorkspaceSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "connected_repository"
+        },
+        "providerKind": {
+          "const": "github"
+        },
+        "repositoryConnectionId": {
+          "$ref": "#/$defs/repositoryConnectionId"
+        },
+        "objectFormat": {
+          "const": "sha1"
+        },
+        "commitOid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "materializationContract": {
+          "const": "git_full_clone_v1"
+        }
+      },
+      "required": [
+        "kind",
+        "providerKind",
+        "repositoryConnectionId",
+        "objectFormat",
+        "commitOid",
+        "materializationContract"
       ]
     },
     "ExecutionSpec": {
@@ -247,15 +252,25 @@
         "executionLimits": {
           "$ref": "#/$defs/ExecutionLimits"
         },
-        "source": {
-          "$ref": "#/$defs/ExecutionSource"
+        "sourceBranch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "workflowDefinitionSource": {
+          "$ref": "#/$defs/WorkflowDefinitionSource"
+        },
+        "primaryWorkspaceSource": {
+          "$ref": "#/$defs/PrimaryWorkspaceSource"
         }
       },
       "required": [
         "executionSpecId",
         "schemaVersion",
         "executionLimits",
-        "source"
+        "sourceBranch",
+        "workflowDefinitionSource",
+        "primaryWorkspaceSource"
       ]
     },
     "ExecutionLeasePolicy": {
@@ -316,6 +331,7 @@
         "invalid_source_projection",
         "unsupported_source_object_format",
         "source_commit_mismatch",
+        "source_commit_unavailable",
         "source_checkout_dirty",
         "workflow_source_digest_mismatch",
         "workflow_source_invalid",

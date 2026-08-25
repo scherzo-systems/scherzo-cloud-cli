@@ -841,7 +841,7 @@ async fn pinned_claude_code_08_correlates_a_nominal_thinking_envelope_before_tex
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.234 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.241 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.

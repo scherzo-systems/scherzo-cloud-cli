@@ -61,22 +61,33 @@ pub(crate) fn deterministic_frame_source() -> Arc<dyn FrameSource> {
 }
 
 struct ControlledShutdown {
-    notification: Arc<Notify>,
+    requests: mpsc::UnboundedReceiver<()>,
 }
 
 impl Shutdown for ControlledShutdown {
     fn wait(&mut self) -> ShutdownFuture<'_> {
-        Box::pin(self.notification.notified())
+        Box::pin(async {
+            let _ = self.requests.recv().await;
+        })
     }
 }
 
-pub(crate) fn controlled_shutdown() -> (Box<dyn Shutdown>, Arc<Notify>) {
-    let notification = Arc::new(Notify::new());
+#[derive(Clone)]
+pub(crate) struct ControlledShutdownTrigger {
+    requests: mpsc::UnboundedSender<()>,
+}
+
+impl ControlledShutdownTrigger {
+    pub(crate) fn notify_one(&self) {
+        let _ = self.requests.send(());
+    }
+}
+
+pub(crate) fn controlled_shutdown() -> (Box<dyn Shutdown>, ControlledShutdownTrigger) {
+    let (requests, receiver) = mpsc::unbounded_channel();
     (
-        Box::new(ControlledShutdown {
-            notification: Arc::clone(&notification),
-        }),
-        notification,
+        Box::new(ControlledShutdown { requests: receiver }),
+        ControlledShutdownTrigger { requests },
     )
 }
 
@@ -587,7 +598,8 @@ pub(crate) fn assignment_offer() -> Message {
                         "maximumParallelSteps": 1,
                         "cancellationGraceSeconds": 1
                     },
-                    "source": {
+                    "sourceBranch": "main",
+                    "workflowDefinitionSource": {
                         "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
                         "objectFormat": "sha1",
                         "commitOid": "0123456789abcdef0123456789abcdef01234567",
@@ -595,8 +607,15 @@ pub(crate) fn assignment_offer() -> Message {
                         "workflowSourceClosureDigest": {
                             "algorithm": "sha256",
                             "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        },
-                        "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+                        }
+                    },
+                    "primaryWorkspaceSource": {
+                        "kind": "connected_repository",
+                        "providerKind": "github",
+                        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "objectFormat": "sha1",
+                        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+                        "materializationContract": "git_full_clone_v1"
                     }
                 }
             }

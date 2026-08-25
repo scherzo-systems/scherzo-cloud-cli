@@ -94,7 +94,7 @@ fn output(bytes: &[u8]) -> CommandOutput {
 #[test]
 fn stable_releases_in_range_with_every_capability_construct_pinned_installations() {
     let executable = std::env::current_exe().unwrap();
-    for version in ["2.1.234", "2.1.235"] {
+    for version in ["2.1.234", "2.1.241"] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{version} (Claude Code)\n").as_bytes()),

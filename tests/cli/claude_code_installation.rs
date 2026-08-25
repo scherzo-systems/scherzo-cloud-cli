@@ -139,7 +139,7 @@ fn runner_startup_discovers_claude_before_rejecting_invalid_operator_configurati
         &runner_directory,
         "https://not-a-websocket.example.test/v1/runner/connect",
     );
-    let fixture = ClaudeCodeFixture::new("2.1.235 (Claude Code)", COMPLETE_HELP, true);
+    let fixture = ClaudeCodeFixture::new("2.1.241 (Claude Code)", COMPLETE_HELP, true);
 
     let output = run_with_env(
         &["runner", "serve", "--config", config_path.as_str()],
@@ -160,7 +160,7 @@ fn doctor_reports_the_compatible_claude_code_snapshot_without_ambient_values() {
         quote(ambient_config.path().to_str().unwrap())
     );
     let fixture = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.235 (Claude Code)",
+        "2.1.241 (Claude Code)",
         COMPLETE_HELP,
         true,
         "exit 97",
@@ -188,9 +188,9 @@ fn doctor_reports_the_compatible_claude_code_snapshot_without_ambient_values() {
     let check = &report["checks"][0];
     assert_eq!(check["id"], CLAUDE_CODE_CHECK_ID);
     assert_eq!(check["status"], "pass");
-    assert_eq!(check["details"]["version"], "2.1.235");
+    assert_eq!(check["details"]["version"], "2.1.241");
     assert_eq!(check["details"]["supportedRange"], ">=2.1.234 <2.2.0");
-    assert_eq!(check["details"]["qualificationVersion"], "2.1.234");
+    assert_eq!(check["details"]["qualificationVersion"], "2.1.241");
     assert_eq!(check["details"]["profile"], "ClaudeCodeStreamJsonV1");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
@@ -314,7 +314,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         assert_eq!(report_code(&output), expected_code);
         let details = &report(&output)["checks"][0]["details"];
         assert_eq!(details["supportedRange"], ">=2.1.234 <2.2.0");
-        assert_eq!(details["qualificationVersion"], "2.1.234");
+        assert_eq!(details["qualificationVersion"], "2.1.241");
         if expected_code == "unsupported_claude_code_version" {
             assert_eq!(
                 details["version"],
@@ -338,7 +338,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
 #[test]
 fn doctor_reports_pi_and_claude_code_independently_for_every_installation_combination() {
     let pi = PiFixture::new("0.84.2", PI_COMPLETE_HELP, true);
-    let claude = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.241 (Claude Code)", COMPLETE_HELP, true);
     let empty = tempfile::tempdir().unwrap();
     let pi_only = pi.path_directory();
     let claude_only = claude.path_directory();

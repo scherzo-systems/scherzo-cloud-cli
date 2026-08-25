@@ -160,6 +160,11 @@ pub(crate) enum ExecutionSpecInvalidReason {
     InvalidSourceProjection,
     UnsupportedSourceObjectFormat,
     SourceCommitMismatch,
+    #[allow(
+        dead_code,
+        reason = "reserved for provider-confirmed absence; current materialization never infers it from Git diagnostics"
+    )]
+    SourceCommitUnavailable,
     SourceCheckoutDirty,
     WorkflowSourceDigestMismatch,
     WorkflowSourceInvalid,
@@ -175,6 +180,7 @@ impl ExecutionSpecInvalidReason {
             Self::InvalidSourceProjection => "invalid_source_projection",
             Self::UnsupportedSourceObjectFormat => "unsupported_source_object_format",
             Self::SourceCommitMismatch => "source_commit_mismatch",
+            Self::SourceCommitUnavailable => "source_commit_unavailable",
             Self::SourceCheckoutDirty => "source_checkout_dirty",
             Self::WorkflowSourceDigestMismatch => "workflow_source_digest_mismatch",
             Self::WorkflowSourceInvalid => "workflow_source_invalid",
@@ -214,13 +220,22 @@ pub(crate) struct WorkflowSourceClosureDigestV1RunnerProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExecutionSourceV1RunnerProjection {
+pub(crate) struct WorkflowDefinitionSourceV1RunnerProjection {
     pub(crate) repository_connection_id: String,
     pub(crate) object_format: String,
     pub(crate) commit_oid: String,
     pub(crate) workflow_path: String,
     pub(crate) workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection,
-    pub(crate) checkout_credential_reference: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrimaryWorkspaceSourceV1RunnerProjection {
+    pub(crate) kind: String,
+    pub(crate) provider_kind: String,
+    pub(crate) repository_connection_id: String,
+    pub(crate) object_format: String,
+    pub(crate) commit_oid: String,
+    pub(crate) materialization_contract: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,7 +243,9 @@ pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) execution_spec_id: String,
     pub(crate) schema_version: u64,
     pub(crate) execution_limits: ExecutionLimitsV1RunnerProjection,
-    pub(crate) source: ExecutionSourceV1RunnerProjection,
+    pub(crate) source_branch: String,
+    pub(crate) workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection,
+    pub(crate) primary_workspace_source: PrimaryWorkspaceSourceV1RunnerProjection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -930,30 +947,83 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let cancellation_grace_seconds =
                 u64::try_from(execution_spec.execution_limits.cancellation_grace_seconds.0)
                     .map_err(|_| DecodeError::InvalidFrame("cancellationGraceSeconds"))?;
-            let source = ExecutionSourceV1RunnerProjection {
+            let workflow_definition_source = WorkflowDefinitionSourceV1RunnerProjection {
                 repository_connection_id: execution_spec
-                    .source
+                    .workflow_definition_source
                     .repository_connection_id
                     .to_string(),
-                object_format: execution_spec.source.object_format.to_string(),
-                commit_oid: execution_spec.source.commit_oid.to_string(),
-                workflow_path: execution_spec.source.workflow_path.to_string(),
+                object_format: execution_spec
+                    .workflow_definition_source
+                    .object_format
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame(
+                        "workflowDefinitionSource.objectFormat",
+                    ))?
+                    .to_owned(),
+                commit_oid: execution_spec
+                    .workflow_definition_source
+                    .commit_oid
+                    .to_string(),
+                workflow_path: execution_spec
+                    .workflow_definition_source
+                    .workflow_path
+                    .to_string(),
                 workflow_source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection {
                     algorithm: execution_spec
-                        .source
+                        .workflow_definition_source
                         .workflow_source_closure_digest
                         .algorithm
-                        .to_string(),
+                        .as_str()
+                        .ok_or(DecodeError::InvalidFrame(
+                            "workflowDefinitionSource.workflowSourceClosureDigest.algorithm",
+                        ))?
+                        .to_owned(),
                     value: execution_spec
-                        .source
+                        .workflow_definition_source
                         .workflow_source_closure_digest
                         .value
                         .to_string(),
                 },
-                checkout_credential_reference: execution_spec
-                    .source
-                    .checkout_credential_reference
+            };
+            let primary_workspace_source = PrimaryWorkspaceSourceV1RunnerProjection {
+                kind: execution_spec
+                    .primary_workspace_source
+                    .kind
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame("primaryWorkspaceSource.kind"))?
+                    .to_owned(),
+                provider_kind: execution_spec
+                    .primary_workspace_source
+                    .provider_kind
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame(
+                        "primaryWorkspaceSource.providerKind",
+                    ))?
+                    .to_owned(),
+                repository_connection_id: execution_spec
+                    .primary_workspace_source
+                    .repository_connection_id
                     .to_string(),
+                object_format: execution_spec
+                    .primary_workspace_source
+                    .object_format
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame(
+                        "primaryWorkspaceSource.objectFormat",
+                    ))?
+                    .to_owned(),
+                commit_oid: execution_spec
+                    .primary_workspace_source
+                    .commit_oid
+                    .to_string(),
+                materialization_contract: execution_spec
+                    .primary_workspace_source
+                    .materialization_contract
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame(
+                        "primaryWorkspaceSource.materializationContract",
+                    ))?
+                    .to_owned(),
             };
             Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
@@ -969,7 +1039,9 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                         maximum_parallel_steps,
                         cancellation_grace_seconds,
                     },
-                    source,
+                    source_branch: execution_spec.source_branch.to_string(),
+                    workflow_definition_source,
+                    primary_workspace_source,
                 }),
             }))
         }
@@ -1772,24 +1844,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_source_values_reach_closed_semantic_admission() {
+    fn malformed_source_values_are_rejected_by_protocol_decoding() {
         let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer.json"
         )))
         .unwrap();
-        offer["payload"]["executionSpec"]["source"]["commitOid"] = json!("not-an-oid");
-        offer["payload"]["executionSpec"]["source"]["objectFormat"] = json!("sha256");
+        offer["payload"]["executionSpec"]["workflowDefinitionSource"]["commitOid"] =
+            json!("not-an-oid");
+        offer["payload"]["executionSpec"]["primaryWorkspaceSource"]["providerKind"] =
+            json!("unknown");
         let encoded = serde_json::to_vec(&offer).unwrap();
 
-        let decoded = decode_cloud_frame(&encoded)
-            .expect("malformed immutable source must receive a semantic rejection");
-        assert!(matches!(
-            decoded,
-            CloudFrame::AssignmentOffer { execution_spec, .. }
-                if execution_spec.source.commit_oid == "not-an-oid"
-                    && execution_spec.source.object_format == "sha256"
-        ));
+        assert!(decode_cloud_frame(&encoded).is_err());
     }
 
     #[test]

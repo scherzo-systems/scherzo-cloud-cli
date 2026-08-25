@@ -1,6 +1,10 @@
 use std::fmt;
 use std::fs;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 use url::Url;
 
@@ -37,6 +41,8 @@ pub(crate) struct Config {
     assignment: AssignmentConfig,
     #[cfg(test)]
     fixture_materialized_source: Option<(PathBuf, PathBuf)>,
+    #[cfg(test)]
+    fixture_work_root: Option<Arc<tempfile::TempDir>>,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
@@ -115,6 +121,8 @@ impl Config {
             assignment,
             #[cfg(test)]
             fixture_materialized_source: None,
+            #[cfg(test)]
+            fixture_work_root: None,
             pi_installation: None,
             claude_code_installation: None,
             codex_installation: None,
@@ -149,6 +157,7 @@ impl Config {
             control_socket_path: None,
             assignment,
             fixture_materialized_source: None,
+            fixture_work_root: None,
             pi_installation: None,
             claude_code_installation: None,
             codex_installation: None,
@@ -162,8 +171,13 @@ impl Config {
         allow_insecure_http: bool,
     ) -> Result<Self, ConfigError> {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let assignment = AssignmentConfig::new(&manifest.join("tests"))?;
-        Self::new(gateway_url, credential, allow_insecure_http, assignment).map(|config| {
+        let work_root =
+            Arc::new(tempfile::tempdir().map_err(|_| ConfigError::WorkRootUnavailable)?);
+        fs::set_permissions(work_root.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|_| ConfigError::WorkRootUnavailable)?;
+        let assignment = AssignmentConfig::new(work_root.path())?;
+        Self::new(gateway_url, credential, allow_insecure_http, assignment).map(|mut config| {
+            config.fixture_work_root = Some(work_root);
             config.with_materialized_source_fixture(
                 manifest.join("tests"),
                 PathBuf::from("missing-workflow-fixture.yaml"),

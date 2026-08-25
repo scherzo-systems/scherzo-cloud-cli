@@ -1,5 +1,8 @@
 name: Check
 
+env:
+  DEVENV_TUI: "false"
+
 on:
   push:
     branches-ignore:

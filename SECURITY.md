@@ -153,7 +153,7 @@ environment, inherited `PATH` only for launcher interpreter resolution, fixed up
 nonessential-traffic disables, and deterministic no-color controls. It requires a
 canonical stable version in `>=2.1.234 <2.2.0` and the closed non-model capabilities used
 by the production adapter. The repository's exact qualification package remains
-`2.1.234`; accepting the range does not claim exact-binary conformance for every release
+`2.1.241`; accepting the range does not claim exact-binary conformance for every release
 or host. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
@@ -161,7 +161,7 @@ Claude Code; or expose any of those values in doctor output.
 The operator-selected CodexAppServerV1 check applies the same first-executable,
 canonical-path, no-fallback rule to executable name `codex`. Its isolated version and
 generated-schema probes use fresh private native and XDG directories, accept only stable
-`>=0.147.0 <0.149.0`, and require the maintained App Server schema capability, including
+`>=0.147.0 <0.150.0`, and require the maintained App Server schema capability, including
 the ephemeral-thread contract. The validator does not read ambient `CODEX_HOME`, provider
 credentials, or
 native configuration; start an App Server thread; query a provider; or expose any such
@@ -223,8 +223,15 @@ credentials, translate model settings, or fall back to Pi or Claude Code. Local 
 Runner Serve admission validate and pin only a workflow-selected Codex installation;
 command-only, Pi-only, and Claude-only workflows do not require it.
 
-Each invocation creates one fresh ephemeral thread and one owner-private transient SQLite
-directory beneath private invocation staging. The directory remains outside the workflow
+Each invocation creates one fresh ephemeral thread with no native project assignment and
+one owner-private transient SQLite directory beneath private invocation staging. Absent
+or null startup `projectId` is admitted; non-null assignment and thread project updates
+fail closed. Bounded global project changes and matching strict-review notices remain
+observable metadata only. Agent messages marked for async delivery likewise have no
+response, structured-result, approval, persistence, or settlement authority even when
+Codex labels their phase `final_answer`.
+
+The transient SQLite directory remains outside the workflow
 execution root and ambient `CODEX_HOME`, stays live through settlement and process-group
 quiescence, and is then removed. Scherzo retains no native thread transcript or
 Codex-native state. App Server events remain the only native workflow, result, failure,

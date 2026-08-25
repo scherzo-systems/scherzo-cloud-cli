@@ -1,21 +1,28 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tempfile::TempDir;
 use tokio::sync::{Notify, mpsc};
 
 use super::Sleeper;
 use super::artifact_delivery::{
     ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
 };
-use super::config::{AssignmentConfig, Config};
+#[cfg(test)]
+use super::config::AssignmentConfig;
+use super::config::Config;
 use super::execution::{AssignmentProcessGuards, ExecutionJob};
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
+#[cfg(test)]
+use super::workspace::PendingRelease;
+use super::workspace::{
+    AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, WorkRootLease,
+};
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
@@ -34,8 +41,9 @@ use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner_protocol::{
     AssignmentDecline, ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
-    ExecutionSpecV1RunnerProjection, MAXIMUM_ENCODED_FRAME_BYTES, RunnerEnvelope, RunnerFrame,
-    RunnerUnableReason, encode_runner_frame,
+    ExecutionSpecV1RunnerProjection, MAXIMUM_ENCODED_FRAME_BYTES,
+    PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope, RunnerFrame, RunnerUnableReason,
+    WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
 };
 
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
@@ -572,6 +580,14 @@ impl ObservationOutbox {
         self.lock().entries.iter().any(|entry| entry.id == id)
     }
 
+    fn replay_obligations_dispatched(&self) -> bool {
+        self.lock()
+            .entries
+            .iter()
+            .filter(|entry| entry.replayable)
+            .all(|entry| entry.encoded)
+    }
+
     pub(super) fn notification(&self) -> Arc<Notify> {
         Arc::clone(&self.changed)
     }
@@ -700,16 +716,10 @@ struct AssignmentIdentity {
     project_id: String,
     attempt_id: String,
     execution_spec_id: String,
+    source_branch: String,
     repository_connection_id: String,
     source_object_format: String,
     source_commit_oid: String,
-}
-
-pub(super) struct AssignmentRoot {
-    pub(super) _temporary: TempDir,
-    pub(super) execution: PathBuf,
-    pub(super) private: PathBuf,
-    pub(super) source: PathBuf,
 }
 
 pub(super) struct AcceptedAssignment {
@@ -827,7 +837,19 @@ struct PreparingAssignment {
 struct FinishingAssignment {
     identity: AssignmentIdentity,
     final_observation_id: u64,
-    _retained_root: Option<AssignmentRoot>,
+    root: Option<AssignmentRoot>,
+}
+
+enum ReleaseAfter {
+    Idle,
+    Reporting(Box<AssignmentIdentity>),
+}
+
+struct ReleasingAssignment {
+    assignment_id: String,
+    after: ReleaseAfter,
+    #[cfg(test)]
+    pending: PendingRelease,
 }
 
 enum LocalSlot {
@@ -835,24 +857,30 @@ enum LocalSlot {
     Accepted(Box<AcceptedAssignment>),
     Running(Box<RunningAssignment>),
     Finishing(FinishingAssignment),
+    Releasing(ReleasingAssignment),
 }
 
 pub(super) enum ManagerEvent {
     Prepared {
         offer: Box<AssignmentOffer>,
-        admission: Box<Result<AcceptedAssignment, AssignmentDecline>>,
+        admission: Box<Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>>>,
     },
     Finished {
         assignment_id: String,
         final_observation_id: Option<u64>,
         final_delivery_deadline: Option<LeaseInstant>,
         lease_clock_failed: bool,
-        retained_root: Option<AssignmentRoot>,
+        retained_root: Option<Box<AssignmentRoot>>,
+        quiescence: ProcessQuiescence,
     },
     FinalGraceElapsed {
         assignment_id: String,
         final_observation_id: u64,
         continue_reporting: bool,
+    },
+    CleanupFinished {
+        assignment_id: String,
+        result: CleanupResult,
     },
     LeaseClockFailed,
 }
@@ -875,26 +903,33 @@ impl AdmissionRuntime {
         root: AssignmentRoot,
         workflow: crate::execution::workflow::resolution::ResolvedWorkflow,
         git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
-    ) -> Result<AcceptedAssignment, AssignmentDecline> {
-        let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
-        let cloud_git_capture = git_capture.is_some();
-        let context = build_execution_context(
-            &offer.execution_spec,
-            &root.execution,
-            git_capture,
-            &self.environment,
-            self.pi_installation.as_ref(),
-            self.claude_code_installation.as_ref(),
-            self.codex_installation.as_ref(),
-        )?;
-        let admitted = admit_runner_workflow(workflow, ResolvedImports::default(), context)
-            .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
-        let requirements = admitted.capacity().resolved.requirements;
-        let transition_budget = self.outbox.reserve(
-            usize::try_from(admitted.capacity().maximum_transitions)
-                .map_err(|_| environment_unavailable())?,
-            requirements.encoded_outbox_bytes,
-        )?;
+    ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
+        let prepared = (|| {
+            let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
+            let cloud_git_capture = git_capture.is_some();
+            let context = build_execution_context(
+                &offer.execution_spec,
+                &root.execution,
+                git_capture,
+                &self.environment,
+                self.pi_installation.as_ref(),
+                self.claude_code_installation.as_ref(),
+                self.codex_installation.as_ref(),
+            )?;
+            let admitted = admit_runner_workflow(workflow, ResolvedImports::default(), context)
+                .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
+            let requirements = admitted.capacity().resolved.requirements;
+            let transition_budget = self.outbox.reserve(
+                usize::try_from(admitted.capacity().maximum_transitions)
+                    .map_err(|_| environment_unavailable())?,
+                requirements.encoded_outbox_bytes,
+            )?;
+            Ok((admitted, transition_budget))
+        })();
+        let (admitted, transition_budget) = match prepared {
+            Ok(prepared) => prepared,
+            Err(decline) => return Err(Box::new((root, decline))),
+        };
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity {
                 assignment_id: offer.assignment_id.clone(),
@@ -902,13 +937,22 @@ impl AdmissionRuntime {
                 project_id: offer.project_id.clone(),
                 attempt_id: offer.attempt_id.clone(),
                 execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+                source_branch: offer.execution_spec.source_branch.clone(),
                 repository_connection_id: offer
                     .execution_spec
-                    .source
+                    .primary_workspace_source
                     .repository_connection_id
                     .clone(),
-                source_object_format: offer.execution_spec.source.object_format.clone(),
-                source_commit_oid: offer.execution_spec.source.commit_oid.clone(),
+                source_object_format: offer
+                    .execution_spec
+                    .primary_workspace_source
+                    .object_format
+                    .clone(),
+                source_commit_oid: offer
+                    .execution_spec
+                    .primary_workspace_source
+                    .commit_oid
+                    .clone(),
             },
             root,
             admitted,
@@ -920,12 +964,11 @@ impl AdmissionRuntime {
 }
 
 pub(super) struct AssignmentManager {
-    config: AssignmentConfig,
+    work_root: Arc<WorkRootLease>,
     pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
     claude_code_installation:
         Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
     codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
-    boot_id: String,
     environment: EnvironmentSnapshot,
     lease_clock: LeaseClock,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
@@ -940,30 +983,47 @@ pub(super) struct AssignmentManager {
     events: mpsc::UnboundedReceiver<ManagerEvent>,
     event_sender: mpsc::UnboundedSender<ManagerEvent>,
     shutting_down: bool,
+    shutdown_cleanup_deadline: Option<LeaseInstant>,
     lease_clock_failed: bool,
     lease_clock_failure_report: Option<u64>,
+    cleanup_failed: bool,
+    deferred_successor: Option<AssignmentOffer>,
     guard_processes: bool,
 }
 
 impl AssignmentManager {
     #[cfg(test)]
     pub(super) fn new(config: &Config, boot_id: String, lease_clock: LeaseClock) -> Self {
+        let work_root = fixture_work_root(config, &boot_id);
         Self::new_inner(
             config,
             boot_id,
             lease_clock,
             Arc::new(super::TokioSleeper),
+            work_root,
             false,
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_sleeper(
         config: &Config,
         boot_id: String,
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
-        Self::new_inner(config, boot_id, lease_clock, sleeper, true)
+        let work_root = fixture_work_root(config, &boot_id);
+        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, true)
+    }
+
+    pub(super) fn new_with_sleeper_and_work_root(
+        config: &Config,
+        boot_id: String,
+        lease_clock: LeaseClock,
+        sleeper: Arc<dyn Sleeper>,
+        work_root: Arc<WorkRootLease>,
+    ) -> Self {
+        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, true)
     }
 
     #[cfg(test)]
@@ -973,7 +1033,8 @@ impl AssignmentManager {
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
-        Self::new_inner(config, boot_id, lease_clock, sleeper, false)
+        let work_root = fixture_work_root(config, &boot_id);
+        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, false)
     }
 
     fn new_inner(
@@ -981,6 +1042,7 @@ impl AssignmentManager {
         boot_id: String,
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
+        work_root: Arc<WorkRootLease>,
         guard_processes: bool,
     ) -> Self {
         let (event_sender, events) = mpsc::unbounded_channel();
@@ -993,11 +1055,10 @@ impl AssignmentManager {
             allow_insecure_artifact_uploads,
         );
         Self {
-            config: config.assignment().clone(),
+            work_root,
             pi_installation: config.pi_installation().cloned(),
             claude_code_installation: config.claude_code_installation().cloned(),
             codex_installation: config.codex_installation().cloned(),
-            boot_id: boot_id.clone(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
             lease_clock,
             source_broker: HttpSourceCredentialBroker::new(
@@ -1018,8 +1079,11 @@ impl AssignmentManager {
             events,
             event_sender,
             shutting_down: false,
+            shutdown_cleanup_deadline: None,
             lease_clock_failed: false,
             lease_clock_failure_report: None,
+            cleanup_failed: false,
+            deferred_successor: None,
             guard_processes,
         }
     }
@@ -1050,6 +1114,13 @@ impl AssignmentManager {
         offer: AssignmentOffer,
     ) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        self.handle_offer_after_drain(offer)
+    }
+
+    fn handle_offer_after_drain(
+        &mut self,
+        offer: AssignmentOffer,
+    ) -> Result<(), AssignmentManagerFailure> {
         if let Some(LocalSlot::Preparing(preparing)) = &self.slot {
             if preparing.offer.assignment_id == offer.assignment_id {
                 return if same_assignment(&preparing.offer, &offer) {
@@ -1077,6 +1148,53 @@ impl AssignmentManager {
         }) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
+        if let Some(deferred) = &self.deferred_successor {
+            if deferred.assignment_id == offer.assignment_id {
+                return if same_assignment(deferred, &offer) {
+                    Ok(())
+                } else {
+                    Err(AssignmentManagerFailure::ConflictingOffer)
+                };
+            }
+            if deferred.effect_id == offer.effect_id {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+        }
+
+        if self.cleanup_failed {
+            self.make_decision_room()?;
+            let response = rejected(&offer, environment_unavailable());
+            return self.retain_decision(offer, response);
+        }
+        if matches!(self.slot, Some(LocalSlot::Releasing(_))) {
+            if self.deferred_successor.is_none() {
+                self.deferred_successor = Some(offer);
+                return Ok(());
+            }
+            self.make_decision_room()?;
+            let response = rejected(&offer, AssignmentDecline::CapacityUnavailable);
+            return self.retain_decision(offer, response);
+        }
+        if matches!(
+            &self.slot,
+            Some(LocalSlot::Finishing(finishing))
+                if finishing.identity.assignment_id != offer.assignment_id
+        ) {
+            let Some(LocalSlot::Finishing(finishing)) = self.slot.take() else {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            };
+            self.retire_assignment_observations(&finishing.identity.assignment_id);
+            if let Some(root) = finishing.root {
+                self.deferred_successor = Some(offer);
+                self.begin_assignment_cleanup(
+                    finishing.identity.assignment_id,
+                    root,
+                    ProcessQuiescence::Proven,
+                    ReleaseAfter::Idle,
+                );
+                return Ok(());
+            }
+        }
 
         if self.shutting_down {
             self.make_decision_room()?;
@@ -1094,6 +1212,39 @@ impl AssignmentManager {
         self.begin_source_admission(offer)
     }
 
+    fn prepare_offer_root(
+        &mut self,
+        offer: &AssignmentOffer,
+    ) -> Result<Option<AssignmentRoot>, AssignmentManagerFailure> {
+        if let Err(decline) = self.validate_admission_prerequisites(offer) {
+            self.retain_decision(offer.clone(), rejected(offer, decline))?;
+            return Ok(None);
+        }
+        match self.prepare_execution_root(&offer.assignment_id) {
+            Ok(root) => Ok(Some(root)),
+            Err(decline) => {
+                self.retain_decision(offer.clone(), rejected(offer, decline))?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn reject_and_cleanup(
+        &mut self,
+        offer: AssignmentOffer,
+        root: AssignmentRoot,
+        decline: AssignmentDecline,
+    ) -> Result<(), AssignmentManagerFailure> {
+        self.retain_decision(offer.clone(), rejected(&offer, decline))?;
+        self.begin_assignment_cleanup(
+            offer.assignment_id,
+            root,
+            ProcessQuiescence::Proven,
+            ReleaseAfter::Idle,
+        );
+        Ok(())
+    }
+
     fn begin_source_admission(
         &mut self,
         offer: AssignmentOffer,
@@ -1102,24 +1253,14 @@ impl AssignmentManager {
         if self.fixture_materialized_source.is_some() {
             return self.admit_materialized_source_fixture(offer);
         }
-        if let Err(decline) = self.validate_admission_prerequisites(&offer) {
-            return self.retain_decision(offer.clone(), rejected(&offer, decline));
-        }
-        let root = match self.prepare_execution_root(&offer.assignment_id) {
-            Ok(root) => root,
-            Err(decline) => {
-                return self.retain_decision(offer.clone(), rejected(&offer, decline));
-            }
+        let Some(root) = self.prepare_offer_root(&offer)? else {
+            return Ok(());
         };
-        let source = offer.execution_spec.source.clone();
+        let source = super::source::MaterializationRequest::from_validated(&offer.execution_spec);
         let Some(broker) = self.source_broker.clone() else {
-            return self.retain_decision(
-                offer.clone(),
-                rejected(
-                    &offer,
-                    AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
-                ),
-            );
+            let decline =
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable);
+            return self.reject_and_cleanup(offer, root, decline);
         };
 
         let cancellation = CaptureCancellation::default();
@@ -1129,31 +1270,46 @@ impl AssignmentManager {
         let runtime = self.admission_runtime();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
+        let shared_root = Arc::new(Mutex::new(Some(root)));
+        let worker_root = Arc::clone(&shared_root);
         let worker = std::thread::Builder::new()
             .name("runner-source-preparation".to_owned())
             .spawn(move || {
-                let admission = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let materialized = super::source::materialize(
+                let root = worker_root
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let Some(mut root) = root else {
+                    wake.wake();
+                    return;
+                };
+                let workspace_path = root.workspace.path();
+                let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::source::materialize(
                         broker,
                         &environment,
                         &worker_offer.assignment_id,
                         &source,
                         &worker_cancellation,
-                        &root.source,
+                        &workspace_path,
                         &root.execution,
                         &root.private,
                     )
-                    .map_err(materialization_decline)?;
-                    let mut root = root;
-                    root.execution = materialized.execution_root;
-                    runtime.finish(
-                        &worker_offer,
-                        root,
-                        materialized.workflow,
-                        materialized.git_capture,
-                    )
-                }))
-                .unwrap_or_else(|_| Err(environment_unavailable()));
+                    .map_err(materialization_decline)
+                }));
+                let admission = match preparation {
+                    Ok(Ok(materialized)) => {
+                        root.execution = materialized.execution_root;
+                        runtime.finish(
+                            &worker_offer,
+                            root,
+                            materialized.workflow,
+                            materialized.git_capture,
+                        )
+                    }
+                    Ok(Err(decline)) => Err(Box::new((root, decline))),
+                    Err(_) => Err(Box::new((root, environment_unavailable()))),
+                };
                 let _ = sender.send(ManagerEvent::Prepared {
                     offer: Box::new(worker_offer),
                     admission: Box::new(admission),
@@ -1161,8 +1317,15 @@ impl AssignmentManager {
                 wake.wake();
             });
         if worker.is_err() {
-            return self
-                .retain_decision(offer.clone(), rejected(&offer, environment_unavailable()));
+            let root = shared_root
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let Some(root) = root else {
+                self.cleanup_failed = true;
+                return Err(AssignmentManagerFailure::DecisionCapacity);
+            };
+            return self.reject_and_cleanup(offer, root, environment_unavailable());
         }
         self.slot = Some(LocalSlot::Preparing(PreparingAssignment {
             offer,
@@ -1176,40 +1339,42 @@ impl AssignmentManager {
         &mut self,
         offer: AssignmentOffer,
     ) -> Result<(), AssignmentManagerFailure> {
-        let admission = self
-            .validate_admission_prerequisites(&offer)
-            .and_then(|()| {
-                let root = self.prepare_execution_root(&offer.assignment_id)?;
-                let (source_root, workflow_path) = self
-                    .fixture_materialized_source
-                    .as_ref()
-                    .expect("fixture source is present");
-                let workflow = resolution::resolve(source_root, workflow_path).map_err(|_| {
-                    AssignmentDecline::ExecutionSpecInvalid(
-                        ExecutionSpecInvalidReason::WorkflowSourceInvalid,
-                    )
-                })?;
-                self.admission_runtime()
-                    .finish(&offer, root, workflow, None)
-            });
-        let response = match admission {
+        let Some(root) = self.prepare_offer_root(&offer)? else {
+            return Ok(());
+        };
+        let (source_root, workflow_path) = self
+            .fixture_materialized_source
+            .as_ref()
+            .expect("fixture source is present");
+        let workflow = match resolution::resolve(source_root, workflow_path) {
+            Ok(workflow) => workflow,
+            Err(_) => {
+                let decline = AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+                );
+                return self.reject_and_cleanup(offer, root, decline);
+            }
+        };
+        match self
+            .admission_runtime()
+            .finish(&offer, root, workflow, None)
+        {
             Ok(accepted) => {
                 self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
-                AssignmentDecision::Accepted {
+                let response = AssignmentDecision::Accepted {
                     effect_id: offer.effect_id.clone(),
                     assignment_id: offer.assignment_id.clone(),
                     offered_execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+                };
+                if let Err(failure) = self.retain_decision(offer, response) {
+                    self.slot = None;
+                    return Err(failure);
                 }
             }
-            Err(decline) => rejected(&offer, decline),
-        };
-        let accepted = matches!(response, AssignmentDecision::Accepted { .. });
-        if let Err(failure) = self.retain_decision(offer, response) {
-            self.slot = None;
-            return Err(failure);
-        }
-        if !accepted {
-            self.slot = None;
+            Err(failure) => {
+                let (root, decline) = *failure;
+                self.reject_and_cleanup(offer, root, decline)?;
+            }
         }
         Ok(())
     }
@@ -1262,8 +1427,8 @@ impl AssignmentManager {
         }
         let Some(causal_lease) = self.decisions[index].causal_lease.clone() else {
             let identity = accepted.identity.clone();
-            drop(accepted);
-            self.finish_before_execution(identity, "execution_lease_expired")?;
+            let root = accepted.root;
+            self.finish_before_execution(identity, root, "execution_lease_expired")?;
             return Ok(None);
         };
         let cancellation_grace = accepted.admitted.execution().cancellation().grace();
@@ -1272,8 +1437,8 @@ impl AssignmentManager {
                 Ok(authority) => authority,
                 Err(GrantValidationFailure::MissingBasis) => {
                     let identity = accepted.identity.clone();
-                    drop(accepted);
-                    self.finish_before_execution(identity, "execution_lease_expired")?;
+                    let root = accepted.root;
+                    self.finish_before_execution(identity, root, "execution_lease_expired")?;
                     return Ok(None);
                 }
                 Err(GrantValidationFailure::Arithmetic) => {
@@ -1294,8 +1459,8 @@ impl AssignmentManager {
             Ok(std::cmp::Ordering::Less) => {}
             Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
                 let identity = accepted.identity.clone();
-                drop(accepted);
-                self.finish_before_execution(identity, "execution_lease_expired")?;
+                let root = accepted.root;
+                self.finish_before_execution(identity, root, "execution_lease_expired")?;
                 return Ok(None);
             }
             Err(_) => {
@@ -1486,22 +1651,34 @@ impl AssignmentManager {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             };
             preparing.cancellation.cancel();
-            let offer = preparing.offer;
+            let offer = preparing.offer.clone();
             let response = rejected(
                 &offer,
                 AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
             );
             self.retain_decision(offer, response)?;
             self.retire_assignment_observations(assignment_id);
+            self.slot = Some(LocalSlot::Preparing(preparing));
+            return Ok(());
+        }
+        if matches!(
+            &self.slot,
+            Some(LocalSlot::Accepted(accepted))
+                if accepted.identity.assignment_id == assignment_id
+        ) {
+            let Some(LocalSlot::Accepted(accepted)) = self.slot.take() else {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            };
+            self.retire_assignment_observations(assignment_id);
+            self.begin_assignment_cleanup(
+                assignment_id.to_owned(),
+                accepted.root,
+                ProcessQuiescence::Proven,
+                ReleaseAfter::Idle,
+            );
             return Ok(());
         }
         match &mut self.slot {
-            Some(LocalSlot::Accepted(accepted))
-                if accepted.identity.assignment_id == assignment_id =>
-            {
-                self.slot = None;
-                self.retire_assignment_observations(assignment_id);
-            }
             Some(LocalSlot::Running(running))
                 if running.identity.assignment_id == assignment_id
                     && reason == "execution_lease_expired" =>
@@ -1544,8 +1721,18 @@ impl AssignmentManager {
                 &self.slot,
                 Some(LocalSlot::Finishing(finishing)) if finishing.final_observation_id == id
             ) {
-                self.slot = None;
+                let Some(LocalSlot::Finishing(finishing)) = self.slot.take() else {
+                    return;
+                };
                 self.reporting = None;
+                if let Some(root) = finishing.root {
+                    self.begin_assignment_cleanup(
+                        finishing.identity.assignment_id,
+                        root,
+                        ProcessQuiescence::Proven,
+                        ReleaseAfter::Idle,
+                    );
+                }
             } else if self
                 .reporting
                 .as_ref()
@@ -1559,6 +1746,7 @@ impl AssignmentManager {
 
     pub(super) fn mark_observation_encoded(&self, id: u64) {
         self.outbox.mark_encoded(id);
+        self.outbox.wake();
     }
 
     pub(super) fn handle_artifact_response(
@@ -1591,6 +1779,15 @@ impl AssignmentManager {
 
     pub(super) fn begin_shutdown(&mut self) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        let cleanup_deadline = match self.shutdown_cleanup_deadline {
+            Some(deadline) => deadline,
+            None => self
+                .lease_clock
+                .now()
+                .and_then(|now| now.checked_add(super::SHUTDOWN_CLEANUP_START_TIMEOUT))
+                .map_err(|_| AssignmentManagerFailure::LeaseClock)?,
+        };
+        self.shutdown_cleanup_deadline = Some(cleanup_deadline);
         self.shutting_down = true;
         let Some(slot) = self.slot.take() else {
             self.outbox.wake();
@@ -1603,8 +1800,8 @@ impl AssignmentManager {
             }
             LocalSlot::Accepted(accepted) => {
                 let identity = accepted.identity.clone();
-                drop(accepted);
-                self.finish_before_execution(identity, "graceful_shutdown")?;
+                let root = accepted.root;
+                self.finish_before_execution(identity, root, "graceful_shutdown")?;
             }
             LocalSlot::Running(running) => {
                 running.cancellation.request_cancellation(
@@ -1613,16 +1810,119 @@ impl AssignmentManager {
                 self.slot = Some(LocalSlot::Running(running));
             }
             LocalSlot::Finishing(finishing) => {
+                self.start_final_grace(
+                    finishing.identity.assignment_id.clone(),
+                    finishing.final_observation_id,
+                    cleanup_deadline,
+                    false,
+                )
+                .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
                 self.slot = Some(LocalSlot::Finishing(finishing));
+            }
+            LocalSlot::Releasing(releasing) => {
+                self.slot = Some(LocalSlot::Releasing(releasing));
             }
         }
         self.outbox.wake();
         Ok(())
     }
 
+    fn cleanup_retained_root(
+        &mut self,
+        assignment_id: String,
+        root: Option<AssignmentRoot>,
+        quiescence: ProcessQuiescence,
+        after: ReleaseAfter,
+    ) {
+        if let Some(root) = root {
+            self.begin_assignment_cleanup(assignment_id, root, quiescence, after);
+        } else if let ReleaseAfter::Reporting(identity) = after {
+            self.reporting = Some(*identity);
+        }
+    }
+
+    fn begin_assignment_cleanup(
+        &mut self,
+        assignment_id: String,
+        root: AssignmentRoot,
+        quiescence: ProcessQuiescence,
+        after: ReleaseAfter,
+    ) {
+        let pending = root.release_pending(quiescence);
+        self.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
+            assignment_id: assignment_id.clone(),
+            after,
+            #[cfg(test)]
+            pending: pending.clone(),
+        }));
+        let sender = self.event_sender.clone();
+        let wake = self.outbox.clone();
+        #[cfg(test)]
+        if tokio::runtime::Handle::try_current().is_err() {
+            let pending = pending.clone();
+            let assignment_id = assignment_id.clone();
+            let sender = sender.clone();
+            let wake = wake.clone();
+            std::thread::Builder::new()
+                .name("runner-test-cleanup-completion".to_owned())
+                .spawn(move || {
+                    let result = pending.wait();
+                    let _ = sender.send(ManagerEvent::CleanupFinished {
+                        assignment_id,
+                        result,
+                    });
+                    wake.wake();
+                })
+                .expect("spawn cleanup completion for synchronous manager test");
+            return;
+        }
+        tokio::spawn(async move {
+            let result = pending.wait_async().await;
+            let _ = sender.send(ManagerEvent::CleanupFinished {
+                assignment_id,
+                result,
+            });
+            wake.wake();
+        });
+    }
+
+    fn finish_cleanup(&mut self, assignment_id: String, result: CleanupResult) {
+        let Some(LocalSlot::Releasing(releasing)) = self.slot.take() else {
+            return;
+        };
+        if releasing.assignment_id != assignment_id {
+            self.slot = Some(LocalSlot::Releasing(releasing));
+            return;
+        }
+        match releasing.after {
+            ReleaseAfter::Idle => {}
+            ReleaseAfter::Reporting(identity) => self.reporting = Some(*identity),
+        }
+        match result {
+            CleanupResult::Released => {
+                if let Some(successor) = self.deferred_successor.take()
+                    && let Err(failure) = self.handle_offer_after_drain(successor)
+                {
+                    self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
+                }
+            }
+            CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
+                self.cleanup_failed = true;
+                if let Some(successor) = self.deferred_successor.take() {
+                    let response = rejected(&successor, environment_unavailable());
+                    if let Err(failure) = self.retain_decision(successor, response) {
+                        self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
+                    }
+                }
+            }
+        }
+        self.outbox.wake();
+    }
+
     fn finish_before_execution(
         &mut self,
         identity: AssignmentIdentity,
+        root: AssignmentRoot,
         reason: &str,
     ) -> Result<(), AssignmentManagerFailure> {
         let final_observation_id = self
@@ -1638,12 +1938,13 @@ impl AssignmentManager {
         self.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity: identity.clone(),
             final_observation_id,
-            _retained_root: None,
+            root: Some(root),
         }));
         let deadline = self
             .lease_clock
             .now()
             .and_then(|now| now.checked_add(FINAL_ACKNOWLEDGEMENT_GRACE))
+            .and_then(|deadline| self.clamp_to_shutdown_cleanup_deadline(deadline))
             .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
         self.start_final_grace(identity.assignment_id, final_observation_id, deadline, true)
             .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
@@ -1664,14 +1965,32 @@ impl AssignmentManager {
     pub(super) fn lease_clock_failure_ready_to_exit(&mut self) -> bool {
         self.drain_events();
         self.lease_clock_failed
+            && !matches!(self.slot, Some(LocalSlot::Releasing(_)))
             && self
                 .lease_clock_failure_report
                 .is_none_or(|id| self.outbox.is_encoded(id) || !self.outbox.contains(id))
     }
 
+    pub(super) fn cleanup_failure_ready_to_exit(&mut self) -> bool {
+        self.drain_events();
+        self.cleanup_failed
+            && !matches!(self.slot, Some(LocalSlot::Releasing(_)))
+            && self.deferred_successor.is_none()
+            && self.outbox.replay_obligations_dispatched()
+    }
+
     pub(super) fn shutdown_complete(&mut self) -> bool {
         self.drain_events();
-        self.slot.is_none() && self.reporting.is_none()
+        self.slot.is_none()
+            && self.reporting.is_none()
+            && self.outbox.replay_obligations_dispatched()
+    }
+
+    pub(super) fn shutdown_waiting_only_for_cleanup(&mut self) -> bool {
+        self.drain_events();
+        self.shutting_down
+            && matches!(self.slot, Some(LocalSlot::Releasing(_)))
+            && self.outbox.replay_obligations_dispatched()
     }
 
     pub(super) fn status_counts(&mut self) -> AssignmentCounts {
@@ -1681,7 +2000,7 @@ impl AssignmentManager {
             Some(LocalSlot::Preparing(_)) => counts.preparing = 1,
             Some(LocalSlot::Accepted(_)) => counts.accepted = 1,
             Some(LocalSlot::Running(_)) => counts.running = 1,
-            Some(LocalSlot::Finishing(_)) => counts.finishing = 1,
+            Some(LocalSlot::Finishing(_) | LocalSlot::Releasing(_)) => counts.finishing = 1,
             None if self.reporting.is_some() => counts.reporting = 1,
             None => {}
         }
@@ -1705,28 +2024,56 @@ impl AssignmentManager {
                         continue;
                     }
                     if preparing.cancellation.is_cancelled() {
+                        let root = match *admission {
+                            Ok(accepted) => accepted.root,
+                            Err(failure) => failure.0,
+                        };
+                        self.begin_assignment_cleanup(
+                            offer.assignment_id.clone(),
+                            root,
+                            ProcessQuiescence::Proven,
+                            ReleaseAfter::Idle,
+                        );
                         continue;
                     }
-                    let response = match *admission {
+                    match *admission {
                         Ok(accepted) => {
                             self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
-                            AssignmentDecision::Accepted {
+                            let response = AssignmentDecision::Accepted {
                                 effect_id: offer.effect_id.clone(),
                                 assignment_id: offer.assignment_id.clone(),
                                 offered_execution_spec_id: offer
                                     .execution_spec
                                     .execution_spec_id
                                     .clone(),
+                            };
+                            if let Err(failure) = self.retain_decision(*offer, response) {
+                                self.lease_clock_failed |=
+                                    failure == AssignmentManagerFailure::LeaseClock;
+                                if let Some(LocalSlot::Accepted(accepted)) = self.slot.take() {
+                                    self.begin_assignment_cleanup(
+                                        accepted.identity.assignment_id.clone(),
+                                        accepted.root,
+                                        ProcessQuiescence::Proven,
+                                        ReleaseAfter::Idle,
+                                    );
+                                }
                             }
                         }
-                        Err(decline) => rejected(&offer, decline),
-                    };
-                    let accepted = matches!(response, AssignmentDecision::Accepted { .. });
-                    if let Err(failure) = self.retain_decision(*offer, response) {
-                        self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
-                        self.slot = None;
-                    } else if !accepted {
-                        self.slot = None;
+                        Err(failure) => {
+                            let (root, decline) = *failure;
+                            let response = rejected(&offer, decline);
+                            if let Err(failure) = self.retain_decision(*offer, response) {
+                                self.lease_clock_failed |=
+                                    failure == AssignmentManagerFailure::LeaseClock;
+                            }
+                            self.begin_assignment_cleanup(
+                                preparing.offer.assignment_id,
+                                root,
+                                ProcessQuiescence::Proven,
+                                ReleaseAfter::Idle,
+                            );
+                        }
                     }
                 }
                 ManagerEvent::Finished {
@@ -1735,6 +2082,7 @@ impl AssignmentManager {
                     final_delivery_deadline,
                     lease_clock_failed,
                     retained_root,
+                    quiescence,
                 } => {
                     let Some(LocalSlot::Running(running)) = self.slot.take() else {
                         continue;
@@ -1744,22 +2092,74 @@ impl AssignmentManager {
                         continue;
                     }
                     let identity = running.identity;
+                    let retained_root = retained_root.map(|root| *root);
+                    if quiescence == ProcessQuiescence::Failed {
+                        let after = if final_observation_id.is_some() {
+                            ReleaseAfter::Reporting(Box::new(identity))
+                        } else {
+                            self.retire_assignment_observations(&assignment_id);
+                            ReleaseAfter::Idle
+                        };
+                        if let Some(root) = retained_root {
+                            self.begin_assignment_cleanup(
+                                assignment_id,
+                                root,
+                                ProcessQuiescence::Failed,
+                                after,
+                            );
+                        } else {
+                            self.cleanup_failed = true;
+                            self.outbox.wake();
+                        }
+                        continue;
+                    }
                     let Some(final_observation_id) = final_observation_id else {
                         self.retire_assignment_observations(&assignment_id);
                         self.lease_clock_failed |= lease_clock_failed;
+                        self.cleanup_retained_root(
+                            assignment_id,
+                            retained_root,
+                            quiescence,
+                            ReleaseAfter::Idle,
+                        );
                         self.outbox.wake();
                         continue;
                     };
                     if lease_clock_failed {
                         self.begin_lease_clock_failure_reporting(final_observation_id);
-                        self.reporting = Some(identity);
+                        self.cleanup_retained_root(
+                            assignment_id,
+                            retained_root,
+                            quiescence,
+                            ReleaseAfter::Reporting(Box::new(identity)),
+                        );
                         continue;
                     }
                     let Some(final_delivery_deadline) = final_delivery_deadline else {
                         self.retire_assignment_observations(&assignment_id);
+                        self.cleanup_retained_root(
+                            assignment_id,
+                            retained_root,
+                            quiescence,
+                            ReleaseAfter::Idle,
+                        );
                         self.outbox.wake();
                         continue;
                     };
+                    let final_delivery_deadline =
+                        match self.clamp_to_shutdown_cleanup_deadline(final_delivery_deadline) {
+                            Ok(deadline) => deadline,
+                            Err(_) => {
+                                self.begin_lease_clock_failure_reporting(final_observation_id);
+                                self.cleanup_retained_root(
+                                    assignment_id,
+                                    retained_root,
+                                    quiescence,
+                                    ReleaseAfter::Reporting(Box::new(identity)),
+                                );
+                                continue;
+                            }
+                        };
                     let deadline_pending = match self
                         .lease_clock
                         .now()
@@ -1768,21 +2168,31 @@ impl AssignmentManager {
                         Ok(std::cmp::Ordering::Less) => true,
                         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
                         Err(_) => {
-                            self.lease_clock_failed = true;
-                            self.reporting = Some(identity);
-                            self.outbox.wake();
+                            self.begin_lease_clock_failure_reporting(final_observation_id);
+                            self.cleanup_retained_root(
+                                assignment_id,
+                                retained_root,
+                                quiescence,
+                                ReleaseAfter::Reporting(Box::new(identity)),
+                            );
                             continue;
                         }
                     };
                     if !deadline_pending {
                         self.retire_assignment_observations(&assignment_id);
+                        self.cleanup_retained_root(
+                            assignment_id,
+                            retained_root,
+                            quiescence,
+                            ReleaseAfter::Idle,
+                        );
                         self.outbox.wake();
                         continue;
                     }
                     self.slot = Some(LocalSlot::Finishing(FinishingAssignment {
                         identity: identity.clone(),
                         final_observation_id,
-                        _retained_root: retained_root,
+                        root: retained_root,
                     }));
                     if self
                         .start_final_grace(
@@ -1807,15 +2217,30 @@ impl AssignmentManager {
                     if finishing.identity.assignment_id == assignment_id
                         && finishing.final_observation_id == final_observation_id
                     {
-                        if continue_reporting {
-                            self.reporting = Some(finishing.identity);
+                        let after = if continue_reporting {
+                            ReleaseAfter::Reporting(Box::new(finishing.identity))
                         } else {
                             self.retire_assignment_observations(&assignment_id);
+                            ReleaseAfter::Idle
+                        };
+                        if let Some(root) = finishing.root {
+                            self.begin_assignment_cleanup(
+                                assignment_id,
+                                root,
+                                ProcessQuiescence::Proven,
+                                after,
+                            );
+                        } else if let ReleaseAfter::Reporting(identity) = after {
+                            self.reporting = Some(*identity);
                         }
                     } else {
                         self.slot = Some(LocalSlot::Finishing(finishing));
                     }
                 }
+                ManagerEvent::CleanupFinished {
+                    assignment_id,
+                    result,
+                } => self.finish_cleanup(assignment_id, result),
                 ManagerEvent::LeaseClockFailed => {
                     self.lease_clock_failed = true;
                     if let Some(LocalSlot::Running(running)) = &mut self.slot {
@@ -1823,6 +2248,19 @@ impl AssignmentManager {
                     }
                 }
             }
+        }
+    }
+
+    fn clamp_to_shutdown_cleanup_deadline(
+        &self,
+        deadline: LeaseInstant,
+    ) -> Result<LeaseInstant, LeaseClockError> {
+        let Some(cleanup_deadline) = self.shutdown_cleanup_deadline else {
+            return Ok(deadline);
+        };
+        match deadline.checked_cmp(cleanup_deadline)? {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(deadline),
+            std::cmp::Ordering::Greater => Ok(cleanup_deadline),
         }
     }
 
@@ -1853,21 +2291,13 @@ impl AssignmentManager {
     }
 
     fn apply_successor_fences(&mut self, successor_assignment_id: &str) {
-        let predecessor = match &self.slot {
-            Some(LocalSlot::Finishing(finishing))
-                if finishing.identity.assignment_id != successor_assignment_id =>
-            {
-                Some(finishing.identity.clone())
-            }
-            _ => self
-                .reporting
-                .as_ref()
-                .filter(|identity| identity.assignment_id != successor_assignment_id)
-                .cloned(),
-        };
+        let predecessor = self
+            .reporting
+            .as_ref()
+            .filter(|identity| identity.assignment_id != successor_assignment_id)
+            .cloned();
         if let Some(predecessor) = predecessor {
             self.retire_assignment_observations(&predecessor.assignment_id);
-            self.slot = None;
             self.reporting = None;
         }
         let rejected_assignments: Vec<_> = self
@@ -1908,7 +2338,7 @@ impl AssignmentManager {
             Some(LocalSlot::Finishing(finishing)) => {
                 Some(finishing.identity.assignment_id.as_str())
             }
-            Some(LocalSlot::Preparing(_)) | None => None,
+            Some(LocalSlot::Preparing(_) | LocalSlot::Releasing(_)) | None => None,
         };
         let Some(index) = self.decisions.iter().position(|decision| {
             decision.response_observation_id.is_none()
@@ -2005,31 +2435,18 @@ impl AssignmentManager {
     }
 
     fn prepare_execution_root(
-        &self,
+        &mut self,
         assignment_id: &str,
     ) -> Result<AssignmentRoot, AssignmentDecline> {
-        let boot_root = self.config.work_root().join(&self.boot_id);
-        fs::create_dir_all(&boot_root).map_err(|_| environment_unavailable())?;
-        let canonical_boot_root =
-            fs::canonicalize(&boot_root).map_err(|_| environment_unavailable())?;
-        if canonical_boot_root.parent() != Some(self.config.work_root()) {
-            return Err(environment_unavailable());
+        match self.work_root.create_assignment(assignment_id) {
+            Ok(root) => Ok(root),
+            Err(AssignmentRootCreationError::Unavailable) => Err(environment_unavailable()),
+            Err(AssignmentRootCreationError::CleanupFailed) => {
+                self.cleanup_failed = true;
+                self.outbox.wake();
+                Err(environment_unavailable())
+            }
         }
-        let temporary = tempfile::Builder::new()
-            .prefix(&format!("{assignment_id}-"))
-            .tempdir_in(&canonical_boot_root)
-            .map_err(|_| environment_unavailable())?;
-        let execution = temporary.path().join("execution");
-        let private = temporary.path().join("private");
-        let source = temporary.path().join("source");
-        fs::create_dir(&execution).map_err(|_| environment_unavailable())?;
-        fs::create_dir(&private).map_err(|_| environment_unavailable())?;
-        Ok(AssignmentRoot {
-            _temporary: temporary,
-            execution,
-            private,
-            source,
-        })
     }
 
     #[cfg(test)]
@@ -2105,6 +2522,19 @@ impl AssignmentManager {
     }
 
     #[cfg(test)]
+    pub(super) fn settle_cleanup(&mut self) {
+        let pending = match &self.slot {
+            Some(LocalSlot::Releasing(releasing)) => {
+                Some((releasing.assignment_id.clone(), releasing.pending.clone()))
+            }
+            _ => None,
+        };
+        if let Some((assignment_id, pending)) = pending {
+            self.finish_cleanup(assignment_id, pending.wait());
+        }
+    }
+
+    #[cfg(test)]
     fn active_step_count(&self) -> Option<usize> {
         match &self.slot {
             Some(LocalSlot::Accepted(accepted)) => {
@@ -2112,6 +2542,14 @@ impl AssignmentManager {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+fn fixture_work_root(config: &Config, boot_id: &str) -> Arc<WorkRootLease> {
+    match WorkRootLease::acquire(config.assignment().work_root(), boot_id) {
+        Ok(work_root) => work_root,
+        Err(error) => panic!("acquire isolated test work root: {error}"),
     }
 }
 
@@ -2226,36 +2664,57 @@ fn validate_execution_spec(
     {
         return Err(invalid_execution_limits());
     }
-    let source = &execution_spec.source;
-    if source.object_format != "sha1" {
+    let workflow = &execution_spec.workflow_definition_source;
+    let primary = &execution_spec.primary_workspace_source;
+    if workflow.object_format != "sha1" || primary.object_format != "sha1" {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
         ));
     }
-    let valid_connection = source
+    let valid_workflow_connection = workflow
         .repository_connection_id
         .parse::<crate::runner_protocol::generated::RepositoryConnectionId>()
         .is_ok();
-    let valid_path = !source.workflow_path.is_empty()
-        && source.workflow_path.chars().count() <= 4096
-        && !source.workflow_path.starts_with('/')
-        && !source.workflow_path.contains('\0')
-        && source
+    let valid_primary_connection = primary
+        .repository_connection_id
+        .parse::<crate::runner_protocol::generated::RepositoryConnectionId>()
+        .is_ok();
+    let valid_path = !workflow.workflow_path.is_empty()
+        && workflow.workflow_path.chars().count() <= 4096
+        && !workflow.workflow_path.starts_with('/')
+        && !workflow.workflow_path.contains('\0')
+        && workflow
             .workflow_path
             .split('/')
             .all(|component| !matches!(component, "" | "." | ".."));
-    if !valid_connection
-        || source.checkout_credential_reference != source.repository_connection_id
-        || !lowercase_hex(&source.commit_oid, 40)
+    if execution_spec.source_branch.is_empty()
+        || execution_spec.source_branch.chars().count() > 1024
+        || primary.kind != "connected_repository"
+        || primary.provider_kind != "github"
+        || primary.materialization_contract != "git_full_clone_v1"
+        || !valid_workflow_connection
+        || !valid_primary_connection
+        || !validate_source_identity_pair(workflow, primary)
+        || !lowercase_hex(&workflow.commit_oid, 40)
+        || !lowercase_hex(&primary.commit_oid, 40)
         || !valid_path
-        || source.workflow_source_closure_digest.algorithm != "sha256"
-        || !lowercase_hex(&source.workflow_source_closure_digest.value, 64)
+        || workflow.workflow_source_closure_digest.algorithm != "sha256"
+        || !lowercase_hex(&workflow.workflow_source_closure_digest.value, 64)
     {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::InvalidSourceProjection,
         ));
     }
     Ok(())
+}
+
+fn validate_source_identity_pair(
+    workflow: &WorkflowDefinitionSourceV1RunnerProjection,
+    primary: &PrimaryWorkspaceSourceV1RunnerProjection,
+) -> bool {
+    workflow.repository_connection_id == primary.repository_connection_id
+        && workflow.object_format == primary.object_format
+        && workflow.commit_oid == primary.commit_oid
 }
 
 fn lowercase_hex(value: &str, length: usize) -> bool {
@@ -2368,8 +2827,10 @@ fn start_matches_offer(start: &AssignmentStart, offer: &AssignmentOffer) -> bool
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::ffi::{OsStr, OsString};
-    use std::io::{Read as _, Write as _};
+    use std::fs;
+    use std::io::{self, Read as _, Write as _};
     use std::net::TcpStream as StandardTcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
@@ -2391,15 +2852,17 @@ mod tests {
     use crate::runner::service::lease_clock::{
         ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
     };
-    use crate::runner::service::source::{
-        CredentialBrokerFailure, CredentialOperation, ProviderCredential,
-    };
+    use crate::runner::service::source::{CredentialBrokerFailure, ProviderCredential};
     use crate::runner::service::test_support::{fixture_lease_clock, with_watchdog};
+    use crate::runner::service::workspace::{
+        CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkspaceFilesystem,
+    };
     use crate::runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
         ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse, CloudFrame,
-        ExecutionLimitsV1RunnerProjection, ExecutionSourceV1RunnerProjection,
-        WorkflowSourceClosureDigestV1RunnerProjection, decode_cloud_frame,
+        ExecutionLimitsV1RunnerProjection, PrimaryWorkspaceSourceV1RunnerProjection,
+        WorkflowDefinitionSourceV1RunnerProjection, WorkflowSourceClosureDigestV1RunnerProjection,
+        decode_cloud_frame,
     };
 
     const NOW: &str = "2026-07-23T00:00:00Z";
@@ -2546,7 +3009,7 @@ for argument in "$@"; do
   previous=$argument
 done
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.234"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.241"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -2568,8 +3031,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fn issue(
             &self,
             _assignment_id: &str,
-            _repository_connection_id: &str,
-            _operation: CredentialOperation,
             cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -2592,12 +3053,68 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fn issue(
             &self,
             _assignment_id: &str,
-            _repository_connection_id: &str,
-            _operation: CredentialOperation,
             _cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
+    }
+
+    // Manager tests need a bool-scripted remover coupled to their admission fixture;
+    // the filesystem module keeps its richer partial-removal script local.
+    // jscpd:ignore-start
+    struct CleanupRemover {
+        outcomes: Mutex<VecDeque<bool>>,
+        calls: AtomicUsize,
+    }
+
+    impl CleanupRemover {
+        fn new(outcomes: impl IntoIterator<Item = bool>) -> Arc<Self> {
+            Arc::new(Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl TreeRemover for CleanupRemover {
+        fn remove_tree(&self, path: &Path) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.outcomes.lock().unwrap().pop_front().unwrap_or(true) {
+                fs::remove_dir_all(path)
+            } else {
+                Err(io::Error::other("injected cleanup failure"))
+            }
+        }
+    }
+    // jscpd:ignore-end
+
+    struct CleanupSleepRequest {
+        duration: Duration,
+        release: std::sync::mpsc::SyncSender<()>,
+    }
+
+    struct GatedCleanupSleeper {
+        requests: std::sync::mpsc::Sender<CleanupSleepRequest>,
+    }
+
+    impl CleanupSleeper for GatedCleanupSleeper {
+        fn sleep(&self, duration: Duration, cancellation: &CleanupCancellation) -> bool {
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            if self
+                .requests
+                .send(CleanupSleepRequest { duration, release })
+                .is_err()
+            {
+                return false;
+            }
+            released.recv().is_ok() && !cancellation.is_cancelled()
+        }
+    }
+
+    struct CleanupHook;
+
+    impl WorkRootHook for CleanupHook {
+        fn before_child_enumeration(&self) {}
     }
 
     fn run_command_fixture() {
@@ -2650,15 +3167,16 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     maximum_parallel_steps: 1,
                     cancellation_grace_seconds: 1,
                 },
-                source: production_source(),
+                source_branch: "main".to_owned(),
+                workflow_definition_source: production_workflow_definition_source(),
+                primary_workspace_source: production_primary_workspace_source(),
             },
         }
     }
 
-    fn production_source() -> ExecutionSourceV1RunnerProjection {
-        let connection = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();
-        ExecutionSourceV1RunnerProjection {
-            repository_connection_id: connection.clone(),
+    fn production_workflow_definition_source() -> WorkflowDefinitionSourceV1RunnerProjection {
+        WorkflowDefinitionSourceV1RunnerProjection {
+            repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             object_format: "sha1".to_owned(),
             commit_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             workflow_path: "workflows/build.yaml".to_owned(),
@@ -2667,7 +3185,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
             },
-            checkout_credential_reference: connection,
+        }
+    }
+
+    fn production_primary_workspace_source() -> PrimaryWorkspaceSourceV1RunnerProjection {
+        PrimaryWorkspaceSourceV1RunnerProjection {
+            kind: "connected_repository".to_owned(),
+            provider_kind: "github".to_owned(),
+            repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            object_format: "sha1".to_owned(),
+            commit_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            materialization_contract: "git_full_clone_v1".to_owned(),
         }
     }
 
@@ -2694,11 +3222,59 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentObservation::Decision(AssignmentDecision::Rejected { decline, .. })
                 if *decline == expected
         ));
+        manager.settle_cleanup();
         assert!(manager.slot.is_none());
     }
 
     fn manager_fixture(workflow: &str) -> (tempfile::TempDir, AssignmentManager) {
         manager_fixture_with_harnesses(workflow, None, None, None)
+    }
+
+    fn base_manager_config(workflow: &str) -> (tempfile::TempDir, PathBuf, Config) {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let work = temporary.path().join("work");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&work).unwrap();
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(source.join("workflow.yaml"), workflow).unwrap();
+        fs::write(source.join("system.md"), "System.\n").unwrap();
+        let assignment = AssignmentConfig::new(&work).unwrap();
+        let config = Config::new(
+            "wss://gateway.example.test/v1/runner/connect",
+            test_credential(),
+            false,
+            assignment,
+        )
+        .unwrap();
+        (temporary, source, config)
+    }
+
+    fn manager_fixture_with_cleanup(
+        workflow: &str,
+        remover: Arc<dyn TreeRemover>,
+        cleanup_sleeper: Arc<dyn CleanupSleeper>,
+    ) -> (tempfile::TempDir, AssignmentManager) {
+        let (temporary, source, config) = base_manager_config(workflow);
+        let boot_id = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned();
+        let work_root = WorkRootLease::acquire_with(
+            config.assignment().work_root(),
+            &boot_id,
+            WorkspaceFilesystem::injected(remover, cleanup_sleeper, Arc::new(CleanupHook)),
+        )
+        .unwrap();
+        let sleeper: Arc<dyn Sleeper> = Arc::new(crate::runner::service::TokioSleeper);
+        let mut manager = AssignmentManager::new_inner(
+            &config,
+            boot_id,
+            fixture_lease_clock(),
+            sleeper,
+            work_root,
+            false,
+        );
+        manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
+        manager.retain_lease_policy(&policy()).unwrap();
+        (temporary, manager)
     }
 
     fn manager_fixture_with_pi(
@@ -2714,21 +3290,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         claude_code_source: Option<&str>,
         codex_source: Option<&str>,
     ) -> (tempfile::TempDir, AssignmentManager) {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("source");
-        let work = temporary.path().join("work");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&work).unwrap();
-        fs::write(source.join("workflow.yaml"), workflow).unwrap();
-        fs::write(source.join("system.md"), "System.\n").unwrap();
-        let assignment = AssignmentConfig::new(&work).unwrap();
-        let mut config = Config::new(
-            "wss://gateway.example.test/v1/runner/connect",
-            test_credential(),
-            false,
-            assignment,
-        )
-        .unwrap();
+        let (temporary, source, mut config) = base_manager_config(workflow);
         if let Some(pi_source) = pi_source {
             let executable = install_fixture_executable(&temporary, "pi-fixture", pi_source);
             config = config.with_pi_installation(ValidatedPiInstallation::fixture(executable));
@@ -2999,6 +3561,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 final_delivery_deadline: Some(final_delivery_deadline),
                 lease_clock_failed: false,
                 retained_root: None,
+                quiescence: ProcessQuiescence::Proven,
             })
             .unwrap();
         final_observation_id
@@ -3103,6 +3666,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 ..
             })
         ));
+        manager.settle_cleanup();
         assert!(manager.slot.is_none());
     }
 
@@ -3356,7 +3920,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut unsupported = offer("bg");
-        unsupported.execution_spec.source.object_format = "sha256".to_owned();
+        unsupported
+            .execution_spec
+            .workflow_definition_source
+            .object_format = "sha256".to_owned();
         assert_offer_declined(
             &mut manager,
             unsupported,
@@ -3367,10 +3934,27 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut malformed = offer("bh");
-        malformed.execution_spec.source.commit_oid = "not-an-oid".to_owned();
+        malformed
+            .execution_spec
+            .workflow_definition_source
+            .commit_oid = "not-an-oid".to_owned();
         assert_offer_declined(
             &mut manager,
             malformed,
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::InvalidSourceProjection,
+            ),
+        );
+
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let mut mismatched = offer("bj");
+        mismatched
+            .execution_spec
+            .primary_workspace_source
+            .commit_oid = "1123456789abcdef0123456789abcdef01234567".to_owned();
+        assert_offer_declined(
+            &mut manager,
+            mismatched,
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::InvalidSourceProjection,
             ),
@@ -3411,12 +3995,24 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 "offer_expired",
             )
             .unwrap();
-        assert!(manager.slot.is_none());
+        assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
         assert!(
             stopped_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .is_ok()
         );
+        let preparation_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while matches!(manager.slot, Some(LocalSlot::Preparing(_))) {
+            manager.pending_observations(&BTreeSet::new(), 10);
+            assert!(
+                std::time::Instant::now() < preparation_deadline,
+                "cancelled source preparation did not reach cleanup"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
+        manager.settle_cleanup();
+        assert!(manager.slot.is_none());
 
         manager.handle_offer(offered).unwrap();
         assert_eq!(broker.calls.load(Ordering::Relaxed), 1);
@@ -3454,6 +4050,218 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             offered,
             AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
         );
+    }
+
+    struct CleanupAssignmentFixture {
+        _temporary: tempfile::TempDir,
+        manager: AssignmentManager,
+        remover: Arc<CleanupRemover>,
+        requests: std::sync::mpsc::Receiver<CleanupSleepRequest>,
+        predecessor_root: PathBuf,
+        successor: AssignmentOffer,
+    }
+
+    fn gated_cleanup_manager(
+        outcomes: impl IntoIterator<Item = bool>,
+    ) -> (
+        tempfile::TempDir,
+        AssignmentManager,
+        Arc<CleanupRemover>,
+        std::sync::mpsc::Receiver<CleanupSleepRequest>,
+    ) {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let remover = CleanupRemover::new(outcomes);
+        let (requests, cleanup_requests) = std::sync::mpsc::channel();
+        let sleeper = Arc::new(GatedCleanupSleeper { requests });
+        let (temporary, manager) = manager_fixture_with_cleanup(workflow, remover.clone(), sleeper);
+        (temporary, manager, remover, cleanup_requests)
+    }
+
+    fn cleanup_assignment_fixture(
+        outcomes: impl IntoIterator<Item = bool>,
+    ) -> CleanupAssignmentFixture {
+        let (temporary, mut manager, remover, cleanup_requests) = gated_cleanup_manager(outcomes);
+        let predecessor = offer("bg");
+        let successor = offer("bh");
+        manager.handle_offer(predecessor.clone()).unwrap();
+        let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+        manager.acknowledge_observation(acceptance);
+        let predecessor_root = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => {
+                accepted.root.execution.parent().unwrap().to_owned()
+            }
+            _ => panic!("predecessor must be accepted"),
+        };
+        manager
+            .handle_release(
+                &predecessor.assignment_id,
+                &predecessor.run_id,
+                &predecessor.attempt_id,
+                "stale_or_invalid_acceptance",
+            )
+            .unwrap();
+        manager.handle_offer(successor.clone()).unwrap();
+        CleanupAssignmentFixture {
+            _temporary: temporary,
+            manager,
+            remover,
+            requests: cleanup_requests,
+            predecessor_root,
+            successor,
+        }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "timeouts only bound failure to reach deterministic cleanup-sleep handshakes"
+    )]
+    fn release_all_cleanup_retries(requests: &std::sync::mpsc::Receiver<CleanupSleepRequest>) {
+        for expected in [100, 250, 500, 1_000, 2_000] {
+            let request = requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("cleanup did not request its deterministic retry prefix");
+            assert_eq!(request.duration, Duration::from_millis(expected));
+            request.release.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the timeout only bounds failure to reach the deterministic cleanup-sleep handshake"
+    )]
+    fn recovered_cleanup_holds_capacity_then_admits_the_deferred_successor() {
+        let CleanupAssignmentFixture {
+            _temporary,
+            mut manager,
+            remover,
+            requests,
+            predecessor_root,
+            successor,
+        } = cleanup_assignment_fixture([false, true, true]);
+        assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
+        assert_eq!(
+            manager
+                .deferred_successor
+                .as_ref()
+                .map(|offer| offer.assignment_id.as_str()),
+            Some(successor.assignment_id.as_str())
+        );
+        assert!(
+            manager
+                .decisions
+                .iter()
+                .all(|decision| decision.offer.assignment_id != successor.assignment_id)
+        );
+
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup did not request its deterministic retry delay");
+        assert_eq!(request.duration, Duration::from_millis(100));
+        request.release.send(()).unwrap();
+        manager.settle_cleanup();
+
+        assert!(!predecessor_root.exists());
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 3);
+        assert!(!manager.cleanup_failed);
+        assert!(matches!(
+            &manager.slot,
+            Some(LocalSlot::Accepted(accepted))
+                if accepted.assignment_id() == successor.assignment_id
+        ));
+    }
+
+    #[test]
+    fn exhausted_cleanup_quarantines_and_rejects_the_deferred_successor() {
+        let CleanupAssignmentFixture {
+            _temporary,
+            mut manager,
+            remover,
+            requests,
+            predecessor_root,
+            successor,
+        } = cleanup_assignment_fixture([false; 6]);
+        release_all_cleanup_retries(&requests);
+        manager.settle_cleanup();
+
+        assert!(predecessor_root.exists());
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 6);
+        assert!(manager.cleanup_failed);
+        let pending = manager.pending_observations(&BTreeSet::new(), 10);
+        let successor_rejection = pending.iter().find(|entry| {
+            matches!(
+                &entry.observation,
+                AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                    assignment_id,
+                    decline: AssignmentDecline::RunnerUnable(
+                        RunnerUnableReason::ExecutionEnvironmentUnavailable
+                    ),
+                    ..
+                }) if assignment_id == &successor.assignment_id
+            )
+        });
+        assert!(successor_rejection.is_some());
+        assert!(!manager.cleanup_failure_ready_to_exit());
+        for observation in pending {
+            manager.mark_observation_encoded(observation.id);
+        }
+        assert!(manager.cleanup_failure_ready_to_exit());
+    }
+
+    #[test]
+    fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
+        let (_temporary, mut manager, remover, requests) = gated_cleanup_manager([false; 6]);
+        let predecessor = offer("bg");
+        let successor = offer("bh");
+        manager.handle_offer(predecessor).unwrap();
+        let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+        manager.acknowledge_observation(acceptance);
+        let accepted = match manager.slot.take() {
+            Some(LocalSlot::Accepted(accepted)) => accepted,
+            _ => panic!("predecessor must be accepted"),
+        };
+        let identity = accepted.identity.clone();
+        let root_path = accepted.root.execution.parent().unwrap().to_owned();
+        let final_observation_id = enqueue_finished(&manager, &identity);
+        manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
+            identity: identity.clone(),
+            final_observation_id,
+            root: Some(accepted.root),
+        }));
+        manager
+            .event_sender
+            .send(ManagerEvent::FinalGraceElapsed {
+                assignment_id: identity.assignment_id,
+                final_observation_id,
+                continue_reporting: true,
+            })
+            .unwrap();
+        manager.pending_observations(&BTreeSet::new(), 10);
+        manager.handle_offer(successor.clone()).unwrap();
+
+        release_all_cleanup_retries(&requests);
+        manager.settle_cleanup();
+
+        assert!(root_path.exists());
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 6);
+        let pending = manager.pending_observations(&BTreeSet::new(), 10);
+        assert!(pending.iter().any(|entry| matches!(
+            &entry.observation,
+            AssignmentObservation::Execution {
+                report: ExecutionReport::Finished { outcome, .. },
+                ..
+            } if outcome == &json!({ "outcome": "succeeded" })
+        )));
+        assert!(pending.iter().any(|entry| matches!(
+            &entry.observation,
+            AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                assignment_id,
+                decline: AssignmentDecline::RunnerUnable(
+                    RunnerUnableReason::ExecutionEnvironmentUnavailable
+                ),
+                ..
+            }) if assignment_id == &successor.assignment_id
+        )));
     }
 
     #[test]
@@ -3610,6 +4418,7 @@ steps:
                 "stale_or_invalid_acceptance",
             )
             .unwrap();
+        manager.settle_cleanup();
 
         assert!(manager.slot.is_none());
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 10), vec![]);
@@ -3641,6 +4450,43 @@ steps:
                 ..
             } if reason == "graceful_shutdown"
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_starts_finishing_cleanup_before_the_five_second_reserve() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        manager.handle_offer(offer("bg")).unwrap();
+        let accepted = match manager.slot.take() {
+            Some(LocalSlot::Accepted(accepted)) => accepted,
+            _ => panic!("assignment should be accepted"),
+        };
+        let root_path = accepted.root.execution.parent().unwrap().to_owned();
+        let final_observation_id = enqueue_finished(&manager, &accepted.identity);
+        manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
+            identity: accepted.identity,
+            final_observation_id,
+            root: Some(accepted.root),
+        }));
+        let (lease_clock, _control, mut waits) = controlled_lease_clock();
+        manager.lease_clock = lease_clock;
+
+        manager.begin_shutdown().unwrap();
+        let notification = manager.notification();
+        let elapsed = notification.notified();
+        tokio::pin!(elapsed);
+        lease_wait_request(
+            &mut waits,
+            crate::runner::service::SHUTDOWN_CLEANUP_START_TIMEOUT,
+        )
+        .await
+        .release();
+        elapsed.await;
+        manager.pending_observations(&BTreeSet::new(), 10);
+        manager.settle_cleanup();
+
+        assert!(!root_path.exists());
+        assert!(manager.shutdown_complete());
     }
 
     #[test]
@@ -4185,6 +5031,7 @@ steps:
                 final_delivery_deadline: None,
                 lease_clock_failed: false,
                 retained_root: None,
+                quiescence: ProcessQuiescence::Proven,
             })
             .unwrap();
 
@@ -4869,7 +5716,7 @@ steps:
             manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
                 identity,
                 final_observation_id,
-                _retained_root: None,
+                root: None,
             }));
         }
 
@@ -4890,7 +5737,7 @@ steps:
         manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity: identity.clone(),
             final_observation_id,
-            _retained_root: None,
+            root: None,
         }));
         manager
             .event_sender
@@ -4911,7 +5758,7 @@ steps:
         manager.slot = Some(LocalSlot::Finishing(FinishingAssignment {
             identity,
             final_observation_id,
-            _retained_root: None,
+            root: None,
         }));
         manager.handle_offer(offer("bh")).unwrap();
         assert_eq!(manager.outbox.len(), 2);

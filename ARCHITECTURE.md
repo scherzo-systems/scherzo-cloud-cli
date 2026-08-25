@@ -88,7 +88,7 @@ select another harness candidate.
 Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
 `ValidatedPiInstallation`. Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.234`. Codex maps stable `>=0.147.0 <0.149.0`
+qualifies exact release `2.1.241`. Codex maps stable `>=0.147.0 <0.150.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission

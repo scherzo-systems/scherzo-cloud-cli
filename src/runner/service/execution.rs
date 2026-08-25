@@ -3,6 +3,8 @@ use std::future::Future;
 use std::ops::Add;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
+
+use futures_util::FutureExt as _;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -119,7 +121,7 @@ impl AssignmentProcessGuards {
         }
     }
 
-    fn is_quiescent(&self) -> bool {
+    pub(super) fn is_quiescent(&self) -> bool {
         let state = self.lock();
         #[cfg(test)]
         if let Some(quiescent) = &state.quiescence_fixture {
@@ -300,7 +302,34 @@ impl ExecutionJob {
     }
 
     pub(super) fn spawn(self) {
-        tokio::spawn(self.run());
+        let assignment_id = self.accepted.assignment_id().to_owned();
+        let root = self.accepted.root.clone();
+        let process_guards = self.accepted.process_guards.clone();
+        let manager_events = self.manager_events.clone();
+        let outbox = self.outbox.clone();
+        tokio::spawn(async move {
+            if std::panic::AssertUnwindSafe(self.run())
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                process_guards.begin_forced_containment();
+                let quiescence = if process_guards.is_quiescent() {
+                    super::workspace::ProcessQuiescence::Proven
+                } else {
+                    super::workspace::ProcessQuiescence::Failed
+                };
+                let _ = manager_events.send(ManagerEvent::Finished {
+                    assignment_id,
+                    final_observation_id: None,
+                    final_delivery_deadline: None,
+                    lease_clock_failed: false,
+                    retained_root: Some(Box::new(root)),
+                    quiescence,
+                });
+                outbox.wake();
+            }
+        });
     }
 
     async fn run(self) {
@@ -316,13 +345,19 @@ impl ExecutionJob {
                 Err(_) => completion.lease_clock_failed = true,
             }
         }
+        let quiescence = if self.accepted.process_guards.is_quiescent() {
+            super::workspace::ProcessQuiescence::Proven
+        } else {
+            super::workspace::ProcessQuiescence::Failed
+        };
         let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
             final_observation_id: completion.final_observation_id,
             final_delivery_deadline: completion.final_delivery_deadline,
             lease_clock_failed: completion.lease_clock_failed,
-            retained_root: Some(retained_root),
+            retained_root: Some(Box::new(retained_root)),
+            quiescence,
         });
         self.outbox.wake();
     }
@@ -861,7 +896,7 @@ impl ExecutionJob {
             return None;
         }
         Some(WorkflowRunResult {
-            run_directory: self.accepted.root.private.clone(),
+            run_directory: self.accepted.root.private.path().to_owned(),
             attempt_number: 1,
             workflow_path: execution.provenance.workflow_path,
             source_root: execution.provenance.source_root,
@@ -3421,7 +3456,7 @@ mod tests {
             Arc::from("/execution/worktree"),
             Arc::from("scherzo-loopback"),
             Arc::from("00000000-0000-4000-8000-000000000001"),
-            Arc::from("2.1.234"),
+            Arc::from("2.1.241"),
             AgentValueKind::None,
             NonZeroU64::new(1024).unwrap(),
         );
@@ -3431,7 +3466,7 @@ mod tests {
             "\"session_id\":\"00000000-0000-4000-8000-000000000001\",",
             "\"model\":\"scherzo-loopback\",",
             "\"permissionMode\":\"bypassPermissions\",",
-            "\"claude_code_version\":\"2.1.234\"}\n",
+            "\"claude_code_version\":\"2.1.241\"}\n",
         );
         parser.push_stdout(initialization.as_bytes(), drop).unwrap();
         let AgentOutcome::Failed(failure) = parser.finish(true) else {

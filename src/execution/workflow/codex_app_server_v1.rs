@@ -191,18 +191,25 @@ struct ActiveItem {
 struct CompletedItem {
     kind: Arc<str>,
     agent_message: Option<CompletedAgentMessage>,
+    value_eligible: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CompletedAgentMessage {
     text: Arc<str>,
     phase: Option<AgentMessagePhase>,
+    delivery: Option<AgentMessageDelivery>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentMessagePhase {
     Commentary,
     FinalAnswer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentMessageDelivery {
+    Async,
 }
 
 #[derive(Clone, Debug)]
@@ -1014,6 +1021,7 @@ impl CodexAppServerV1Parser {
             || optional_string(thread, "forkedFromId") != Some(None)
             || optional_string(thread, "parentThreadId") != Some(None)
             || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
+            || optional_string(thread, "projectId") != Some(None)
             || !required_array(thread, "turns").is_some_and(<[_]>::is_empty)
             || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
             || required_string(thread, "modelProvider") != Some(provider)
@@ -1111,6 +1119,20 @@ impl CodexAppServerV1Parser {
                 Ok(ParserProgress::default())
             }
             "turn/completed" => self.parse_turn_completed(params),
+            "project/changed" => {
+                self.parse_project_changed(params)?;
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
+            "thread/project/updated" => {
+                self.reject_thread_project_update(params)?;
+                Ok(ParserProgress::default())
+            }
+            "autoApprovalReview/strictReviewRequired" => {
+                self.parse_strict_review_required(object, params)?;
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
             "configWarning" => {
                 let summary = required_nonempty_string(params, "summary")
                     .ok_or_else(|| self.failure_for_current_phase())?;
@@ -1213,6 +1235,7 @@ impl CodexAppServerV1Parser {
             || required_bool(thread, "ephemeral") != Some(true)
             || optional_string(thread, "path") != Some(None)
             || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
+            || optional_string(thread, "projectId") != Some(None)
             || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
         {
             return Err(self.failure_for_current_phase());
@@ -1272,13 +1295,17 @@ impl CodexAppServerV1Parser {
         if active.kind.as_ref() != kind || self.completed_items.contains_key(&id) {
             return Err(self.failure_for_current_phase());
         }
-        let agent_message = if kind == "agentMessage" {
+        let (agent_message, value_eligible) = if kind == "agentMessage" {
             let message = self.parse_completed_agent_message(item)?;
+            let value_eligible = message.delivery != Some(AgentMessageDelivery::Async);
+            if !value_eligible {
+                self.invalidate_earlier_value_candidates();
+            }
             self.retain_agent_message(message.text.len())?;
             self.select_response_candidate(&message)?;
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::MessageCompleted));
-            Some(message)
+            (Some(message), value_eligible)
         } else {
             match kind {
                 "reasoning" => self.observe_completed_reasoning(item)?,
@@ -1288,13 +1315,14 @@ impl CodexAppServerV1Parser {
                 "userMessage" => {}
                 _ => self.observe_unrecognized(value),
             }
-            None
+            (None, false)
         };
         self.completed_items.insert(
             id,
             CompletedItem {
                 kind: active.kind,
                 agent_message,
+                value_eligible,
             },
         );
         Ok(())
@@ -1315,17 +1343,36 @@ impl CodexAppServerV1Parser {
             }
             _ => return Err(self.failure_for_current_phase()),
         };
+        let delivery = match item.get("delivery") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(delivery)) if delivery == "async" => {
+                Some(AgentMessageDelivery::Async)
+            }
+            _ => return Err(self.failure_for_current_phase()),
+        };
         Ok(CompletedAgentMessage {
             text: Arc::from(text),
             phase,
+            delivery,
         })
+    }
+
+    fn invalidate_earlier_value_candidates(&mut self) {
+        for item in self.completed_items.values_mut() {
+            item.value_eligible = false;
+        }
+        self.selected_response = None;
+        self.final_answer_seen = false;
     }
 
     fn select_response_candidate(
         &mut self,
         message: &CompletedAgentMessage,
     ) -> Result<(), AgentFailureCause> {
-        if !self.values_enabled || self.value_kind != AgentValueKind::Response {
+        if !self.values_enabled
+            || self.value_kind != AgentValueKind::Response
+            || message.delivery == Some(AgentMessageDelivery::Async)
+        {
             return Ok(());
         }
         if message.phase == Some(AgentMessagePhase::Commentary) {
@@ -1587,6 +1634,53 @@ impl CodexAppServerV1Parser {
         Ok(())
     }
 
+    fn parse_project_changed(
+        &mut self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let project_id = required_nonempty_string(params, "projectId")
+            .ok_or_else(|| self.failure_for_current_phase())?;
+        if project_id.len() > MAXIMUM_IDENTITY_BYTES || project_id.chars().any(char::is_control) {
+            return Err(self.failure_for_current_phase());
+        }
+        if !matches!(
+            required_string(params, "changeType"),
+            Some("created" | "updated" | "deleted")
+        ) {
+            return Err(self.failure_for_current_phase());
+        }
+        Ok(())
+    }
+
+    fn reject_thread_project_update(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        self.require_thread(params)?;
+        if !params.contains_key("projectId") || optional_string(params, "projectId").is_none() {
+            return Err(self.failure_for_current_phase());
+        }
+        Err(self.failure_for_current_phase())
+    }
+
+    fn parse_strict_review_required(
+        &self,
+        notification: &Map<String, Value>,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        self.require_running_correlation(params)?;
+        let started_at = required_i64(params, "startedAtMs")
+            .filter(|started_at| *started_at >= 0)
+            .and_then(|started_at| u64::try_from(started_at).ok())
+            .ok_or_else(|| self.failure_for_current_phase())?;
+        let emitted_at = required_u64(notification, "emittedAtMs")
+            .ok_or_else(|| self.failure_for_current_phase())?;
+        if started_at > emitted_at {
+            return Err(self.failure_for_current_phase());
+        }
+        Ok(())
+    }
+
     fn parse_native_error(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
         self.require_active_turn_correlation(params)?;
         let error =
@@ -1718,7 +1812,10 @@ impl CodexAppServerV1Parser {
             }
             if let Some(message) = &completed.agent_message {
                 let summary = self.parse_completed_agent_message(item)?;
-                if summary.text != message.text || summary.phase != message.phase {
+                if summary.text != message.text
+                    || summary.phase != message.phase
+                    || summary.delivery != message.delivery
+                {
                     return Err(self.failure_for_current_phase());
                 }
             }
@@ -1735,11 +1832,12 @@ impl CodexAppServerV1Parser {
     }
 
     fn extract_result_candidate(&self) -> Result<Option<Arc<Value>>, AgentFailureCause> {
-        let mut candidates = self.completed_items.values().filter_map(|item| {
-            item.agent_message
-                .as_ref()
-                .filter(|message| message.phase != Some(AgentMessagePhase::Commentary))
-        });
+        let mut candidates = self
+            .completed_items
+            .values()
+            .filter(|item| item.value_eligible)
+            .filter_map(|item| item.agent_message.as_ref())
+            .filter(|message| message.phase != Some(AgentMessagePhase::Commentary));
         let Some(candidate) = candidates.next() else {
             return Ok(None);
         };

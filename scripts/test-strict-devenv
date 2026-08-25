@@ -24,6 +24,7 @@ chmod +x "$ambient_directory/$ambient_command"
 # shellcheck disable=SC2016
 if ! PATH="$ambient_directory:$PATH" \
   CARGO_TARGET_DIR="$cargo_target" \
+  DEVENV_TUI=false \
   SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
   "$boundary" shell -- bash -c '
     set -euo pipefail
@@ -32,6 +33,7 @@ if ! PATH="$ambient_directory:$PATH" \
     ambient_command=$3
     diagnostic=$4
     [[ ${CARGO_TARGET_DIR:-} == "$expected_target" ]]
+    [[ ${DEVENV_TUI:-} == false ]]
     [[ -z ${SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
     [[ :$PATH: != *":$ambient_directory:"* ]]
     ! command -v "$ambient_command" >/dev/null 2>&1

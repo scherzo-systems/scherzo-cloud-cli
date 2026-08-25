@@ -36,6 +36,7 @@ fi
 keep_variables=(
   CARGO_TARGET_DIR
   CI
+  DEVENV_TUI
   HOME
   SCHERZO_STRICT_DEVENV_BINARY
 )

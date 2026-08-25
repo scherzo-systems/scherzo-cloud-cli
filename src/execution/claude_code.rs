@@ -14,7 +14,7 @@ use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
 // jscpd:ignore-end
 
 pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
-pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.234";
+pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.241";
 const CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 234);
 const CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (2, 2, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 1] = ["--help"];

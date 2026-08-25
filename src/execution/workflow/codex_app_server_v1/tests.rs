@@ -460,6 +460,45 @@ fn matching_thread_notification_and_response_may_arrive_in_either_order() {
 }
 
 #[test]
+fn fresh_thread_accepts_absent_or_null_project_identity_and_rejects_assignment() {
+    let mut absent = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut absent);
+    effective_config(&mut absent, "native-provider");
+    feed(&mut absent, thread_start_response("native-provider")).unwrap();
+
+    let mut null = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut null);
+    effective_config(&mut null, "native-provider");
+    let mut notification = thread_started_notification();
+    notification["params"]["thread"]["projectId"] = Value::Null;
+    feed(&mut null, notification).unwrap();
+    let mut response = thread_start_response("native-provider");
+    response["result"]["thread"]["projectId"] = Value::Null;
+    feed(&mut null, response).unwrap();
+
+    for notification_first in [false, true] {
+        let mut assigned = parser(AgentValueKind::None, 1024, None);
+        initialize(&mut assigned);
+        effective_config(&mut assigned, "native-provider");
+        let failure = if notification_first {
+            let mut notification = thread_started_notification();
+            notification["params"]["thread"]["projectId"] = json!("project-1");
+            feed(&mut assigned, notification).unwrap_err()
+        } else {
+            let mut response = thread_start_response("native-provider");
+            response["result"]["thread"]["projectId"] = json!("project-1");
+            feed(&mut assigned, response).unwrap_err()
+        };
+        assert_eq!(
+            failure,
+            AgentFailureCause::HarnessSetupFailed {
+                stage: AgentHarnessSetupStage::ThreadStart,
+            }
+        );
+    }
+}
+
+#[test]
 fn thread_scoped_warning_may_precede_thread_response() {
     let mut matching = parser(AgentValueKind::None, 1024, None);
     initialize(&mut matching);
@@ -733,6 +772,393 @@ fn completed_final_answer_is_authoritative_and_deltas_are_observations_only() {
         panic!("exact-limit completed final answer must be authoritative");
     };
     assert_eq!(response.as_str(), "12345");
+}
+
+#[test]
+fn async_delivery_is_observable_but_has_no_response_or_result_authority() {
+    let async_item = |text: &str| {
+        json!({
+            "id": "async",
+            "type": "agentMessage",
+            "text": text,
+            "phase": "final_answer",
+            "delivery": "async",
+        })
+    };
+
+    let mut response = running_parser(AgentValueKind::Response, 5);
+    feed(&mut response, item_started("async", "agentMessage")).unwrap();
+    let (_, observations) = feed(
+        &mut response,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_item("not a bounded response"),
+            },
+        }),
+    )
+    .unwrap();
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::MessageCompleted,
+        }
+    )));
+    feed(
+        &mut response,
+        turn_completed(vec![async_item("not a bounded response")], "completed"),
+    )
+    .unwrap();
+    assert_eq!(
+        response.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::NoResponse)
+    );
+
+    let mut later_final = running_parser(AgentValueKind::Response, 5);
+    feed(&mut later_final, item_started("async", "agentMessage")).unwrap();
+    feed(
+        &mut later_final,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_item("ignore this"),
+            },
+        }),
+    )
+    .unwrap();
+    feed(&mut later_final, item_started("final", "agentMessage")).unwrap();
+    feed(
+        &mut later_final,
+        item_completed("final", "12345", json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut later_final,
+        turn_completed(
+            vec![
+                async_item("ignore this"),
+                json!({
+                    "id": "final",
+                    "type": "agentMessage",
+                    "text": "12345",
+                    "phase": "final_answer",
+                }),
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(selected)) =
+        later_final.finish(true)
+    else {
+        panic!("the later ordinary final message must remain authoritative");
+    };
+    assert_eq!(selected.as_str(), "12345");
+
+    let mut result = running_parser(AgentValueKind::Result, 1024);
+    feed(&mut result, item_started("async", "agentMessage")).unwrap();
+    feed(
+        &mut result,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_item("not a result envelope"),
+            },
+        }),
+    )
+    .unwrap();
+    feed(&mut result, item_started("result", "agentMessage")).unwrap();
+    let ordinary_result = result_envelope(json!(7));
+    feed(
+        &mut result,
+        item_completed("result", &ordinary_result, json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut result,
+        turn_completed(
+            vec![
+                async_item("not a result envelope"),
+                json!({
+                    "id": "result",
+                    "type": "agentMessage",
+                    "text": ordinary_result,
+                    "phase": "final_answer",
+                }),
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+    assert_eq!(result.take_result_candidate().unwrap().as_ref(), &json!(7));
+
+    let mut missing = running_parser(AgentValueKind::Result, 1024);
+    feed(&mut missing, item_started("async", "agentMessage")).unwrap();
+    feed(
+        &mut missing,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_item("not a result envelope"),
+            },
+        }),
+    )
+    .unwrap();
+    feed(
+        &mut missing,
+        turn_completed(vec![async_item("not a result envelope")], "completed"),
+    )
+    .unwrap();
+    assert_eq!(
+        missing.finish(true),
+        AgentOutcome::Failed(AgentFailureCause::MissingResult.into())
+    );
+}
+
+#[test]
+fn async_delivery_invalidates_earlier_value_candidates() {
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut parser, item_started("ordinary", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("ordinary", "must not commit", json!("final_answer")),
+    )
+    .unwrap();
+
+    let async_item = json!({
+        "id": "async",
+        "type": "agentMessage",
+        "text": "non-terminal update",
+        "phase": "final_answer",
+        "delivery": "async",
+    });
+    feed(&mut parser, item_started("async", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_item.clone(),
+            },
+        }),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![
+                json!({
+                    "id": "ordinary",
+                    "type": "agentMessage",
+                    "text": "must not commit",
+                    "phase": "final_answer",
+                }),
+                async_item,
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+
+    let mut result = running_parser(AgentValueKind::Result, 1024);
+    let ordinary_result = result_envelope(json!(7));
+    feed(&mut result, item_started("ordinary-result", "agentMessage")).unwrap();
+    feed(
+        &mut result,
+        item_completed("ordinary-result", &ordinary_result, json!("final_answer")),
+    )
+    .unwrap();
+    let async_result = json!({
+        "id": "async-result",
+        "type": "agentMessage",
+        "text": "non-terminal update",
+        "phase": "final_answer",
+        "delivery": "async",
+    });
+    feed(&mut result, item_started("async-result", "agentMessage")).unwrap();
+    feed(
+        &mut result,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": async_result.clone(),
+            },
+        }),
+    )
+    .unwrap();
+    feed(
+        &mut result,
+        turn_completed(
+            vec![
+                json!({
+                    "id": "ordinary-result",
+                    "type": "agentMessage",
+                    "text": ordinary_result,
+                    "phase": "final_answer",
+                }),
+                async_result,
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        (parser.finish(true), result.take_result_candidate()),
+        (
+            AgentOutcome::Completed(CompletedAgentInvocation::NoResponse),
+            None,
+        )
+    );
+}
+
+#[test]
+fn async_delivery_cannot_survive_native_failure() {
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut parser, item_started("async", "agentMessage")).unwrap();
+    let item = json!({
+        "id": "async",
+        "type": "agentMessage",
+        "text": "must not commit",
+        "phase": "final_answer",
+        "delivery": "async",
+    });
+    feed(
+        &mut parser,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": item.clone(),
+            },
+        }),
+    )
+    .unwrap();
+    feed(&mut parser, turn_completed(vec![item], "failed")).unwrap();
+    assert!(matches!(parser.finish(true), AgentOutcome::Failed(_)));
+}
+
+#[test]
+fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    for change_type in ["created", "updated", "deleted"] {
+        let (progress, observations) = feed(
+            &mut parser,
+            json!({
+                "method": "project/changed",
+                "params": {"projectId": "project-1", "changeType": change_type},
+                "emittedAtMs": 20,
+            }),
+        )
+        .unwrap();
+        assert_eq!(progress, ParserProgress::default());
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+    }
+    let (progress, observations) = feed(
+        &mut parser,
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 19,
+            },
+            "emittedAtMs": 20,
+        }),
+    )
+    .unwrap();
+    assert_eq!(progress, ParserProgress::default());
+    assert!(matches!(
+        observations.as_slice(),
+        [AgentObservation::UnrecognizedHarnessEvent { .. }]
+    ));
+    assert!(parser.take_outbound().is_none());
+
+    feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("final", "ordinary", json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![json!({
+                "id": "final",
+                "type": "agentMessage",
+                "text": "ordinary",
+                "phase": "final_answer",
+            })],
+            "completed",
+        ),
+    )
+    .unwrap();
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = parser.finish(true)
+    else {
+        panic!("metadata must not prevent the ordinary final response from settling");
+    };
+    assert_eq!(response.as_str(), "ordinary");
+
+    for invalid in [
+        json!({
+            "method": "project/changed",
+            "params": {"projectId": "project-1", "changeType": "renamed"},
+            "emittedAtMs": 20,
+        }),
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {"threadId": "other", "turnId": "turn-1", "startedAtMs": 19},
+            "emittedAtMs": 20,
+        }),
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {"threadId": "thread-1", "turnId": "other", "startedAtMs": 19},
+            "emittedAtMs": 20,
+        }),
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "startedAtMs": 21},
+            "emittedAtMs": 20,
+        }),
+    ] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        assert_eq!(
+            feed(&mut parser, invalid).unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed
+        );
+    }
+
+    for project_id in [Value::Null, json!("project-1")] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        assert_eq!(
+            feed(
+                &mut parser,
+                json!({
+                    "method": "thread/project/updated",
+                    "params": {"threadId": "thread-1", "projectId": project_id},
+                    "emittedAtMs": 20,
+                }),
+            )
+            .unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed
+        );
+    }
 }
 
 #[test]

@@ -13,6 +13,7 @@ mod lease_clock;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod workspace;
 
 use std::fmt;
 use std::future::Future;
@@ -78,10 +79,13 @@ impl Sequence {
     }
 }
 
-const SHUTDOWN_DELIVERY_AND_CLEANUP_RESERVE: std::time::Duration =
-    std::time::Duration::from_secs(15);
+const SHUTDOWN_DELIVERY_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
+const SHUTDOWN_CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+const SHUTDOWN_CLEANUP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    MAXIMUM_CANCELLATION_GRACE.as_secs() + SHUTDOWN_DELIVERY_RESERVE.as_secs(),
+);
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
-    MAXIMUM_CANCELLATION_GRACE.as_secs() + SHUTDOWN_DELIVERY_AND_CLEANUP_RESERVE.as_secs(),
+    SHUTDOWN_CLEANUP_START_TIMEOUT.as_secs() + SHUTDOWN_CLEANUP_RESERVE.as_secs(),
 );
 
 pub(crate) trait Sleeper: Send + Sync {
@@ -171,6 +175,7 @@ enum ActiveAttemptResult {
 enum ActiveEvent {
     ManualReload(ReloadRequest),
     StartupReload,
+    AssignmentNotification,
     Shutdown,
     Finished(Result<ConnectionProgress, ConnectionError>),
 }
@@ -252,6 +257,9 @@ pub(crate) enum ServiceError {
     Connection(ConnectionError),
     Control(ControlServerError),
     LeaseClock(LeaseClockError),
+    WorkRootInUse,
+    WorkRootIsolation,
+    WorkspaceCleanupFailed,
 }
 
 impl fmt::Display for ServiceError {
@@ -270,6 +278,11 @@ impl fmt::Display for ServiceError {
             }
             Self::Control(error) => write!(formatter, "start runner local control: {error}"),
             Self::LeaseClock(error) => write!(formatter, "runner lease clock failed: {error}"),
+            Self::WorkRootInUse => formatter.write_str("runner work root is already in use"),
+            Self::WorkRootIsolation => {
+                formatter.write_str("runner work-root isolation could not be established")
+            }
+            Self::WorkspaceCleanupFailed => formatter.write_str("runner workspace cleanup failed"),
         }
     }
 }
@@ -280,7 +293,10 @@ impl std::error::Error for ServiceError {
             Self::BuildRuntime
             | Self::AssignmentShutdown
             | Self::ShutdownForced
-            | Self::ShutdownDeadlineExceeded => None,
+            | Self::ShutdownDeadlineExceeded
+            | Self::WorkRootInUse
+            | Self::WorkRootIsolation
+            | Self::WorkspaceCleanupFailed => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::LeaseClock(error) => Some(error),
@@ -365,8 +381,35 @@ async fn run_service_loop(
 async fn run_connection_loop(
     dependencies: ConnectionLoopDependencies,
     connector: &dyn Connector,
+    backoff: Backoff,
+    shutdown: &mut dyn Shutdown,
+) -> Result<(), ServiceError> {
+    let config_lifetime = dependencies.config.clone();
+    let work_root = workspace::WorkRootLease::acquire(
+        config_lifetime.assignment().work_root(),
+        &dependencies.boot_id,
+    )
+    .map_err(work_root_service_error)?;
+    let result = run_connection_loop_with_work_root(
+        dependencies,
+        connector,
+        backoff,
+        shutdown,
+        Arc::clone(&work_root),
+    )
+    .await;
+    if result.is_err() {
+        work_root.cancel_cleanup();
+    }
+    result
+}
+
+async fn run_connection_loop_with_work_root(
+    dependencies: ConnectionLoopDependencies,
+    connector: &dyn Connector,
     mut backoff: Backoff,
     shutdown: &mut dyn Shutdown,
+    work_root: Arc<workspace::WorkRootLease>,
 ) -> Result<(), ServiceError> {
     let ConnectionLoopDependencies {
         mut config,
@@ -376,12 +419,15 @@ async fn run_connection_loop(
         lease_clock,
         boot_id,
     } = dependencies;
-    let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new_with_sleeper(
-        &config,
-        boot_id.clone(),
-        lease_clock,
-        Arc::clone(&sleeper),
-    )));
+    let assignment_manager = Arc::new(Mutex::new(
+        AssignmentManager::new_with_sleeper_and_work_root(
+            &config,
+            boot_id.clone(),
+            lease_clock,
+            Arc::clone(&sleeper),
+            Arc::clone(&work_root),
+        ),
+    ));
     let live_status = Arc::new(LiveStatus::new(
         boot_id.clone(),
         config.credential().credential_id().to_owned(),
@@ -432,6 +478,13 @@ async fn run_connection_loop(
         if assignment_manager
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cleanup_failure_ready_to_exit()
+        {
+            return Err(ServiceError::WorkspaceCleanupFailed);
+        }
+        if assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lease_clock_failure_ready_to_exit()
         {
             return Err(ServiceError::LeaseClock(LeaseClockError::ClockUnavailable));
@@ -442,7 +495,23 @@ async fn run_connection_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .shutdown_complete()
         {
-            return Ok(());
+            let Some(deadline) = shutdown_deadline.as_mut() else {
+                return Err(ServiceError::AssignmentShutdown);
+            };
+            return finish_shutdown_cleanup(&work_root, shutdown, deadline).await;
+        }
+        if shutting_down
+            && assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown_waiting_only_for_cleanup()
+        {
+            let Some(deadline) = shutdown_deadline.as_mut() else {
+                return Err(ServiceError::AssignmentShutdown);
+            };
+            wait_for_shutdown_progress(&assignment_manager, &work_root, shutdown, deadline, None)
+                .await?;
+            continue;
         }
         live_status.connecting();
         let promoted = promoted_attempt.take();
@@ -491,6 +560,14 @@ async fn run_connection_loop(
             };
             tokio::pin!(connection);
             loop {
+                if assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .cleanup_failure_ready_to_exit()
+                {
+                    cancel_attempt(&connection_event, &active_effect_event);
+                    return Err(ServiceError::WorkspaceCleanupFailed);
+                }
                 if shutting_down
                     && assignment_manager
                         .lock()
@@ -498,7 +575,10 @@ async fn run_connection_loop(
                         .shutdown_complete()
                 {
                     cancel_attempt(&connection_event, &active_effect_event);
-                    return Ok(());
+                    let Some(deadline) = shutdown_deadline.as_mut() else {
+                        return Err(ServiceError::AssignmentShutdown);
+                    };
+                    return finish_shutdown_cleanup(&work_root, shutdown, deadline).await;
                 }
                 let notification = assignment_manager
                     .lock()
@@ -535,6 +615,7 @@ async fn run_connection_loop(
                             ActiveEvent::StartupReload
                         }
                         _ = shutdown.wait() => ActiveEvent::Shutdown,
+                        () = &mut notified => ActiveEvent::AssignmentNotification,
                         result = &mut connection => ActiveEvent::Finished(result),
                     };
                     match event {
@@ -542,7 +623,9 @@ async fn run_connection_loop(
                             let (request, startup) = match event {
                                 ActiveEvent::ManualReload(request) => (Some(request), false),
                                 ActiveEvent::StartupReload => (None, true),
-                                ActiveEvent::Shutdown | ActiveEvent::Finished(_) => unreachable!(),
+                                ActiveEvent::AssignmentNotification
+                                | ActiveEvent::Shutdown
+                                | ActiveEvent::Finished(_) => unreachable!(),
                             };
                             if startup {
                                 startup_reload_pending = false;
@@ -577,6 +660,7 @@ async fn run_connection_loop(
                                 }
                             }
                         }
+                        ActiveEvent::AssignmentNotification => continue,
                         ActiveEvent::Shutdown => {
                             shutdown_deadline =
                                 Some(begin_shutdown(&live_status, &assignment_manager, &sleeper)?);
@@ -725,23 +809,17 @@ async fn run_connection_loop(
         }
         attempt = attempt.saturating_add(1);
         if shutting_down {
-            let notification = assignment_manager
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .notification();
             let Some(deadline) = shutdown_deadline.as_mut() else {
                 return Err(ServiceError::AssignmentShutdown);
             };
-            tokio::select! {
-                biased;
-                () = shutdown.wait() => {
-                    live_status.stopping();
-                    return Err(ServiceError::ShutdownForced);
-                },
-                () = deadline => return Err(ServiceError::ShutdownDeadlineExceeded),
-                () = notification.notified() => {}
-                () = sleeper.sleep(delay) => {}
-            }
+            wait_for_shutdown_progress(
+                &assignment_manager,
+                &work_root,
+                shutdown,
+                deadline,
+                Some(sleeper.sleep(delay)),
+            )
+            .await?;
         } else {
             tokio::select! {
                 Some(request) = reload_requests.recv() => {
@@ -780,6 +858,66 @@ async fn run_connection_loop(
                 }
                 _ = sleeper.sleep(delay) => {}
             }
+        }
+    }
+}
+
+async fn wait_for_shutdown_progress(
+    assignment_manager: &Mutex<AssignmentManager>,
+    work_root: &workspace::WorkRootLease,
+    shutdown: &mut dyn Shutdown,
+    deadline: &mut Pin<Box<dyn Future<Output = ()> + Send>>,
+    delay: Option<SleepFuture<'_>>,
+) -> Result<(), ServiceError> {
+    let notification = assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .notification();
+    let optional_delay = async move {
+        match delay {
+            Some(delay) => delay.await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(optional_delay);
+    tokio::select! {
+        biased;
+        () = shutdown.wait() => {
+            work_root.cancel_cleanup();
+            Err(ServiceError::ShutdownForced)
+        }
+        () = deadline.as_mut() => {
+            work_root.cancel_cleanup();
+            Err(ServiceError::ShutdownDeadlineExceeded)
+        }
+        () = notification.notified() => Ok(()),
+        () = &mut optional_delay => Ok(()),
+    }
+}
+
+async fn finish_shutdown_cleanup(
+    work_root: &workspace::WorkRootLease,
+    shutdown: &mut dyn Shutdown,
+    deadline: &mut Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> Result<(), ServiceError> {
+    let pending = work_root.release_boot_root_pending();
+    let completion = pending.wait_async();
+    tokio::pin!(completion);
+    tokio::select! {
+        biased;
+        () = shutdown.wait() => {
+            work_root.cancel_cleanup();
+            Err(ServiceError::ShutdownForced)
+        }
+        result = &mut completion => match result {
+            workspace::CleanupResult::Released => Ok(()),
+            workspace::CleanupResult::Quarantined(_) | workspace::CleanupResult::Preempted => {
+                Err(ServiceError::WorkspaceCleanupFailed)
+            }
+        },
+        () = deadline.as_mut() => {
+            work_root.cancel_cleanup();
+            Err(ServiceError::ShutdownDeadlineExceeded)
         }
     }
 }
@@ -1190,6 +1328,16 @@ fn finish_connection_event(
     event.finish(outcome);
 }
 
+const fn work_root_service_error(error: workspace::WorkRootError) -> ServiceError {
+    match error {
+        workspace::WorkRootError::WorkRootInUse => ServiceError::WorkRootInUse,
+        workspace::WorkRootError::UnsafeWorkRoot
+        | workspace::WorkRootError::AmbiguousOwnedRoot
+        | workspace::WorkRootError::StaleRootCleanupFailed
+        | workspace::WorkRootError::CreateBootRoot => ServiceError::WorkRootIsolation,
+    }
+}
+
 const fn sequence_overflow() -> ConnectionError {
     ConnectionError::terminal(
         ConnectionProgress::unacknowledged(),
@@ -1200,15 +1348,16 @@ const fn sequence_overflow() -> ConnectionError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::Notify;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::handshake::server::{
@@ -1221,16 +1370,22 @@ mod tests {
 
     use super::sequence_overflow;
     use super::test_support::{
-        FixtureSocket, SleepRelease, accept_fixture_socket, accept_fixture_socket_with_headers,
-        accept_opened_fixture_socket, assignment_offer, controlled_shutdown, controlled_sleeper,
-        deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
-        expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
-        observation_acknowledgement, offer_assignment_after_handshake, sleep_request,
+        ControlledShutdownTrigger, FixtureSocket, SleepRelease, accept_fixture_socket,
+        accept_fixture_socket_with_headers, accept_opened_fixture_socket, assignment_offer,
+        controlled_shutdown, controlled_sleeper, deterministic_frame_source,
+        effect_acknowledgement, effect_observation_acknowledgement, expect_close_frame,
+        expect_opening_hello, fixture_lease_clock, fixture_listener, observation_acknowledgement,
+        offer_assignment_after_handshake, scripted_connector, sleep_request,
         terminal_observation_acknowledgement, welcome, with_watchdog,
     };
+    use super::workspace::{
+        CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
+        WorkspaceFilesystem,
+    };
     use super::{
-        AssignmentConfig, Config, LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT,
-        Sequence, ServiceError, Sleeper, TokioSleeper, run_until_cancelled_with_dependencies,
+        AssignmentConfig, Config, ConnectionLoopDependencies, LiveStatus, ReloadDependencies,
+        ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError, Sleeper, TokioSleeper,
+        run_connection_loop_with_work_root, run_until_cancelled_with_dependencies,
     };
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
@@ -1243,6 +1398,102 @@ mod tests {
             SHUTDOWN_TIMEOUT,
             super::MAXIMUM_CANCELLATION_GRACE + Duration::from_secs(15)
         );
+    }
+
+    struct FailingBootRemover {
+        calls: AtomicUsize,
+    }
+
+    impl TreeRemover for FailingBootRemover {
+        fn remove_tree(&self, _path: &Path) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::other("injected boot cleanup failure"))
+        }
+    }
+
+    struct BlockingCleanupSleeper {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl CleanupSleeper for BlockingCleanupSleeper {
+        fn sleep(&self, _duration: Duration, cancellation: &CleanupCancellation) -> bool {
+            let _ = self.started.send(());
+            let result = cancellation.wait(Duration::from_secs(60));
+            let _ = self.cancelled.send(());
+            result
+        }
+    }
+
+    struct NoopWorkRootHook;
+
+    impl WorkRootHook for NoopWorkRootHook {
+        fn before_child_enumeration(&self) {}
+    }
+
+    #[tokio::test]
+    async fn second_signal_preempts_final_boot_root_retry() {
+        let config = Config::fixture(
+            "ws://127.0.0.1:1/v1/runner/connect",
+            test_credential(),
+            true,
+        )
+        .unwrap();
+        let frame_source = deterministic_frame_source();
+        let boot_id = frame_source.public_id("rbt_");
+        let (recorder, _capture) = test_recorder(&boot_id);
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let dependencies = ConnectionLoopDependencies::new(
+            config.clone(),
+            frame_source,
+            sleeper,
+            recorder,
+            fixture_lease_clock(),
+            boot_id.clone(),
+        );
+        let remover = Arc::new(FailingBootRemover {
+            calls: AtomicUsize::new(0),
+        });
+        let (started, mut cleanup_started) = tokio::sync::mpsc::unbounded_channel();
+        let (cancelled, mut cleanup_cancelled) = tokio::sync::mpsc::unbounded_channel();
+        let work_root = WorkRootLease::acquire_with(
+            config.assignment().work_root(),
+            &boot_id,
+            WorkspaceFilesystem::injected(
+                remover.clone(),
+                Arc::new(BlockingCleanupSleeper { started, cancelled }),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        let boot_path = work_root.boot_path().to_owned();
+        let (connector, _attempts) = scripted_connector(Default::default());
+        let (mut shutdown, shutdown_trigger) = controlled_shutdown();
+        shutdown_trigger.notify_one();
+        let service = run_connection_loop_with_work_root(
+            dependencies,
+            &connector,
+            super::Backoff::with_fixed_unit(1.0),
+            shutdown.as_mut(),
+            work_root,
+        );
+        let force = async {
+            cleanup_started
+                .recv()
+                .await
+                .expect("boot cleanup did not reach its retry wait");
+            shutdown_trigger.notify_one();
+            cleanup_cancelled
+                .recv()
+                .await
+                .expect("forced shutdown did not cancel boot cleanup");
+        };
+
+        let (result, ()) = tokio::join!(service, force);
+
+        assert!(matches!(result, Err(ServiceError::ShutdownForced)));
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 1);
+        assert!(boot_path.exists());
     }
 
     #[test]
@@ -1302,6 +1553,7 @@ mod tests {
             fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700)).unwrap();
             fs::create_dir(&source).unwrap();
             fs::create_dir(&work).unwrap();
+            fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(
                 source.join("workflow.yaml"),
                 "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
@@ -2090,6 +2342,8 @@ mod tests {
         let work = temporary.path().join("work");
         fs::create_dir(&source).expect("create materialized source fixture");
         fs::create_dir(&work).expect("create runner work root");
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700))
+            .expect("make runner work root private");
         fs::write(
             source.join("workflow.yaml"),
             "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
@@ -2143,7 +2397,7 @@ mod tests {
     ) -> (
         tokio::task::JoinHandle<Result<(), ServiceError>>,
         TestCapture,
-        Arc<Notify>,
+        ControlledShutdownTrigger,
     ) {
         let config = Config::fixture(endpoint, test_credential(), true).expect("configure gateway");
         spawn_configured_service(config, sleeper)
@@ -2155,7 +2409,7 @@ mod tests {
     ) -> (
         tokio::task::JoinHandle<Result<(), ServiceError>>,
         TestCapture,
-        Arc<Notify>,
+        ControlledShutdownTrigger,
     ) {
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, shutdown_trigger) = controlled_shutdown();
@@ -2172,7 +2426,7 @@ mod tests {
     struct AcceptedAssignmentService {
         _temporary: tempfile::TempDir,
         task: tokio::task::JoinHandle<Result<(), ServiceError>>,
-        shutdown_trigger: Arc<Notify>,
+        shutdown_trigger: ControlledShutdownTrigger,
         _sleep_requests: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
     }
 

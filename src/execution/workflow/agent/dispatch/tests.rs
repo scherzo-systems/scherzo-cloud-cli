@@ -232,7 +232,7 @@ async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fal
             &temporary,
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
             "/validated/claude",
-            "2.1.234",
+            "2.1.241",
             claude_code_config.clone(),
             ClaudeCodeStreamJsonV1ProtocolLimits::profile(),
         )),

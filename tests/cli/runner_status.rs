@@ -50,6 +50,7 @@ impl ServeStatusFixture {
         fs::set_permissions(&state_directory, Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&source).unwrap();
         fs::create_dir(&work).unwrap();
+        fs::set_permissions(&work, Permissions::from_mode(0o700)).unwrap();
         fs::write(
             source.join("workflow.yaml"),
             "schemaVersion: 1\nsteps: {}\n",
@@ -149,7 +150,7 @@ fn cloud_observation_ack(message_id: &str, sequence: u64) -> Message {
     )
 }
 
-fn cloud_assignment_offer_with_unsupported_source() -> Message {
+fn cloud_assignment_offer_with_mismatched_sources() -> Message {
     Message::Text(
         serde_json::json!({
             "protocolVersion": 1,
@@ -170,16 +171,24 @@ fn cloud_assignment_offer_with_unsupported_source() -> Message {
                         "maximumParallelSteps": 1,
                         "cancellationGraceSeconds": 1
                     },
-                    "source": {
+                    "sourceBranch": "main",
+                    "workflowDefinitionSource": {
                         "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
-                        "objectFormat": "unsupported",
+                        "objectFormat": "sha1",
                         "commitOid": "0123456789abcdef0123456789abcdef01234567",
                         "workflowPath": "workflow.yaml",
                         "workflowSourceClosureDigest": {
                             "algorithm": "sha256",
                             "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        },
-                        "checkoutCredentialReference": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+                        }
+                    },
+                    "primaryWorkspaceSource": {
+                        "kind": "connected_repository",
+                        "providerKind": "github",
+                        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "objectFormat": "sha1",
+                        "commitOid": "1123456789abcdef0123456789abcdef01234567",
+                        "materializationContract": "git_full_clone_v1"
                     }
                 },
                 "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
@@ -354,11 +363,11 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
                 // Hold the pending HTTP upgrade so any current-session frames
                 // must remain contiguous before the candidate hello is sent.
                 let (pending_stream, _) = listener.accept().await.unwrap();
-                // Keep this sequencing proof independent of source-provider I/O. An
-                // unsupported object format produces a synchronous structured rejection
+                // Keep this sequencing proof independent of source-provider I/O. A
+                // mismatched identity pair produces a synchronous structured rejection
                 // while the candidate handshake remains deliberately blocked.
                 current
-                    .send(cloud_assignment_offer_with_unsupported_source())
+                    .send(cloud_assignment_offer_with_mismatched_sources())
                     .await
                     .unwrap();
                 let mut latest_current_sequence = 0;
@@ -374,7 +383,7 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
                             frame["payload"]["decline"],
                             serde_json::json!({
                                 "type": "execution_spec_invalid",
-                                "reason": "unsupported_source_object_format"
+                                "reason": "invalid_source_projection"
                             })
                         );
                         break;

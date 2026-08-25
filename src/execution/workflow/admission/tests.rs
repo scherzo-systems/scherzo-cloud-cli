@@ -790,7 +790,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
         agent.installation().profile(),
         ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
     );
-    assert_eq!(agent.installation().version().as_str(), "2.1.234");
+    assert_eq!(agent.installation().version().as_str(), "2.1.241");
     assert_eq!(agent.configuration().model, "claude-opus-4-1");
     assert_eq!(agent.configuration().effort, ClaudeCodeEffort::XHigh);
     assert_eq!(
