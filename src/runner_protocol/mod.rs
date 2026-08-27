@@ -17,7 +17,8 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 pub(crate) mod generated;
 
 const PROTOCOL_SCHEMA: &str = include_str!("schema/runner-protocol-v1.schema.json");
-pub(crate) const MAXIMUM_ENCODED_FRAME_BYTES: usize = 65_536;
+pub(crate) const MAXIMUM_ORDINARY_FRAME_BYTES: usize = 65_536;
+pub(crate) const MAXIMUM_TERMINAL_FRAME_BYTES: usize = 33_554_432;
 const PROTOCOL_VERSION: i64 = 1;
 const PAYLOAD_VERSION: i64 = 1;
 const RUNNER_TO_CLOUD: &str = "runner_to_cloud";
@@ -239,6 +240,24 @@ pub(crate) struct PrimaryWorkspaceSourceV1RunnerProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionCapacityV1RunnerProjection {
+    pub(crate) execution_contract: String,
+    pub(crate) source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection,
+    // Runner admission consumes a closed wire projection rather than the resolver's
+    // computed type so protocol decoding cannot accidentally become capacity authority.
+    // jscpd:ignore-start
+    pub(crate) general_maximum_transitions: u64,
+    pub(crate) selected_maximum_transitions: u64,
+    pub(crate) maximum_invocations: u64,
+    pub(crate) maximum_retained_bytes_per_invocation: u64,
+    pub(crate) diagnostic_retention_bytes: u64,
+    pub(crate) native_session_retention_bytes: u64,
+    pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) encoded_outbox_bytes: u64,
+    // jscpd:ignore-end
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) execution_spec_id: String,
     pub(crate) schema_version: u64,
@@ -246,6 +265,7 @@ pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) source_branch: String,
     pub(crate) workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection,
     pub(crate) primary_workspace_source: PrimaryWorkspaceSourceV1RunnerProjection,
+    pub(crate) capacity: ExecutionCapacityV1RunnerProjection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -790,7 +810,18 @@ macro_rules! validated_cloud_envelope {
 }
 
 fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
+    if bytes.is_empty() || bytes.len() > MAXIMUM_TERMINAL_FRAME_BYTES {
+        return Err(DecodeError::InvalidFrame("size"));
+    }
     let value: Value = serde_json::from_slice(bytes).map_err(|_| DecodeError::InvalidJson)?;
+    let large_terminal = value.get("direction").and_then(Value::as_str) == Some(RUNNER_TO_CLOUD)
+        && matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("execution_finished" | "execution_interrupted")
+        );
+    if bytes.len() > MAXIMUM_ORDINARY_FRAME_BYTES && !large_terminal {
+        return Err(DecodeError::InvalidFrame("sizeClass"));
+    }
     validate_protocol_schema(&value)?;
     validate_closed_shape(&value)?;
     let generated = serde_json::from_value(value).map_err(|_| DecodeError::InvalidJson)?;
@@ -1025,6 +1056,35 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     ))?
                     .to_owned(),
             };
+            let capacity = execution_spec.capacity;
+            let encoded_outbox_bytes = u64::try_from(capacity.encoded_outbox_bytes)
+                .map_err(|_| DecodeError::InvalidFrame("encodedOutboxBytes"))?;
+            let capacity = ExecutionCapacityV1RunnerProjection {
+                execution_contract: capacity
+                    .execution_contract
+                    .as_str()
+                    .ok_or(DecodeError::InvalidFrame("executionContract"))?
+                    .to_owned(),
+                source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection {
+                    algorithm: capacity
+                        .source_closure_digest
+                        .algorithm
+                        .as_str()
+                        .ok_or(DecodeError::InvalidFrame("sourceClosureDigest.algorithm"))?
+                        .to_owned(),
+                    value: capacity.source_closure_digest.value.to_string(),
+                },
+                general_maximum_transitions: capacity.general_maximum_transitions.get(),
+                selected_maximum_transitions: capacity.selected_maximum_transitions.get(),
+                maximum_invocations: capacity.maximum_invocations.get(),
+                maximum_retained_bytes_per_invocation: capacity
+                    .maximum_retained_bytes_per_invocation
+                    .get(),
+                diagnostic_retention_bytes: capacity.diagnostic_retention_bytes.get(),
+                native_session_retention_bytes: capacity.native_session_retention_bytes.get(),
+                aggregate_retention_bytes: capacity.aggregate_retention_bytes.get(),
+                encoded_outbox_bytes,
+            };
             Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
@@ -1042,6 +1102,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     source_branch: execution_spec.source_branch.to_string(),
                     workflow_definition_source,
                     primary_workspace_source,
+                    capacity,
                 }),
             }))
         }
@@ -1567,7 +1628,15 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-transition-recovery.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/runner-execution-finished.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-recovery.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1679,6 +1748,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/invalid/delivery-open-diagnostic.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/invalid/runner-execution-finished-recovery-version.json"
         )),
     ];
 
@@ -1857,6 +1930,162 @@ mod tests {
         let encoded = serde_json::to_vec(&offer).unwrap();
 
         assert!(decode_cloud_frame(&encoded).is_err());
+    }
+
+    fn maximal_envelope() -> RunnerEnvelope {
+        RunnerEnvelope {
+            message_id: "rmsg_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            runner_id: "rnr_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            boot_id: "rbt_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            sequence: i64::MAX as u64,
+            sent_at: "9999-12-31T23:59:59.999999999Z".to_owned(),
+        }
+    }
+
+    fn maximal_diagnostic(kind: &str) -> Value {
+        json!({
+            "kind": kind,
+            "reference": "r".repeat(128),
+            "stream": {
+                "retainedBytes": 4194304,
+                "discardedBytes": 9223372036854775807_u64,
+                "truncated": true,
+                "fullyDrained": true,
+                "digest": { "algorithm": "sha256", "value": "f".repeat(64) },
+            }
+        })
+    }
+
+    fn maximal_recovery_terminal_frame() -> RunnerFrame {
+        let escaped = "\u{0001}".repeat(4_096);
+        let mut remaining_rounds = 232_u64;
+        let mut summaries = serde_json::Map::new();
+        let mut invocation_id = 1_u64;
+        for step_index in 0..24_u64 {
+            let rounds_for_step = remaining_rounds.min(10);
+            remaining_rounds -= rounds_for_step;
+            let rounds = (1..=rounds_for_step)
+                .map(|round| {
+                    let target_invocation = invocation_id;
+                    invocation_id += 1;
+                    let handler_invocation = invocation_id;
+                    invocation_id += 1;
+                    json!({
+                        "number": round,
+                        "failedExecution": {
+                            "executionNumber": round,
+                            "invocationId": target_invocation,
+                            "failure": {
+                                "phase": "execution",
+                                "cause": { "code": "command_exit", "exitCode": 2147483647 }
+                            }
+                        },
+                        "handler": {
+                            "kind": "cmd",
+                            "invocationId": handler_invocation,
+                            "outcome": "recheck",
+                            "summary": escaped,
+                            "reason": escaped,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            summaries.insert(
+                format!("step{step_index}"),
+                json!({
+                    "schemaVersion": 1,
+                    "configuredRetries": rounds_for_step,
+                    "handlerKind": "cmd",
+                    "rounds": rounds,
+                    "termination": {
+                        "kind": "exhausted",
+                        "executionNumber": rounds_for_step + 1,
+                    }
+                }),
+            );
+        }
+        assert_eq!(remaining_rounds, 0);
+        RunnerFrame::ExecutionFinished {
+            envelope: maximal_envelope(),
+            assignment_id: "asn_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            attempt_id: "atm_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            final_execution_event_sequence: i64::MAX as u64,
+            outcome: json!({
+                "outcome": "failed",
+                "failure": {
+                    "node": { "id": "step23", "role": "step" },
+                    "failure": {
+                        "phase": "execution",
+                        "cause": "command_unsuccessful_exit",
+                        "exitCode": 2147483647,
+                    }
+                },
+                "recoverySummaries": summaries,
+            }),
+            artifact_delivery: json!({
+                "outcome": "prepared",
+                "artifactSetId": "ats_07zzzzzzzzzzzzzzzzzzzzzzzz",
+            }),
+        }
+    }
+
+    #[test]
+    fn canonical_maximal_recovery_frame_has_published_exact_size() {
+        const PUBLISHED_SIZE: usize = 11_464_571;
+        const PUBLISHED_SETTLING_SIZE: usize = 1_979;
+        let encoded = encode_runner_frame(&maximal_recovery_terminal_frame()).unwrap();
+        assert_eq!(encoded.len(), PUBLISHED_SIZE);
+        assert!(encoded.len() < MAXIMUM_TERMINAL_FRAME_BYTES);
+
+        let settling = RunnerFrame::ExecutionTransition {
+            envelope: maximal_envelope(),
+            assignment_id: "asn_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            attempt_id: "atm_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            execution_event_sequence: i64::MAX as u64,
+            workflow_event: json!({
+                "eventVersion": 1,
+                "eventType": "step_state_changed",
+                "transitionSequence": 1286,
+                "stepId": "step23",
+                "role": "step",
+                "failurePolicy": "required",
+                "from": "running",
+                "to": "failed",
+                "failure": {
+                    "phase": "execution",
+                    "cause": "command_unsuccessful_exit",
+                    "exitCode": 2147483647,
+                },
+                "invocationEvidence": {
+                    "invocationId": 1286,
+                    "role": "target",
+                    "targetExecution": 11,
+                    "state": "settled",
+                    "startedAt": "9999-12-31T23:59:59.999999998Z",
+                    "finishedAt": "9999-12-31T23:59:59.999999999Z",
+                    "durationMilliseconds": 9223372036854775807_u64,
+                    "usage": {
+                        "inputTokens": 9223372036854775807_u64,
+                        "outputTokens": 9223372036854775807_u64,
+                    },
+                    "diagnostics": [
+                        maximal_diagnostic("command_stdout"),
+                        maximal_diagnostic("command_stderr"),
+                    ],
+                    "diagnosticReference": "r".repeat(128),
+                }
+            }),
+        };
+        let settling = encode_runner_frame(&settling).unwrap();
+        assert_eq!(settling.len(), PUBLISHED_SETTLING_SIZE);
+        assert!(settling.len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
+
+        let mut one_byte_over = encoded;
+        one_byte_over.resize(MAXIMUM_TERMINAL_FRAME_BYTES + 1, b' ');
+        assert!(matches!(
+            decode_frame(&one_byte_over),
+            Err(DecodeError::InvalidFrame("size"))
+        ));
     }
 
     #[test]

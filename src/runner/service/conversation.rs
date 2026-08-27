@@ -15,7 +15,9 @@ use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError, FrameSource,
     OpeningHello, opening_hello, run_established,
 };
-use super::source::{CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker};
+use super::source::{
+    CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
+};
 use super::test_support::{
     DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
@@ -36,6 +38,14 @@ impl SourceCredentialBroker for UnavailableSourceBroker {
         _assignment_id: &str,
         _cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
+
+    fn commit_availability(
+        &self,
+        _assignment_id: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
         Err(CredentialBrokerFailure::Unavailable)
     }
 }

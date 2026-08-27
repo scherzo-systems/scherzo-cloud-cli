@@ -129,6 +129,18 @@ impl ArtifactSet {
             .as_object_mut()
             .unwrap()
             .remove("executionRoot");
+        result["execution"]["capacity"] = json!({
+            "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+            "sourceClosureDigest": { "algorithm": "sha256", "value": "1".repeat(64) },
+            "generalMaximumTransitions": 8,
+            "selectedMaximumTransitions": 7,
+            "maximumInvocations": 1,
+            "maximumRetainedBytesPerInvocation": 4_194_304,
+            "diagnosticRetentionBytes": 8_388_608,
+            "nativeSessionRetentionBytes": 4_194_304,
+            "aggregateRetentionBytes": 12_582_912,
+            "encodedOutboxBytes": 38_141_952
+        });
         self.replace_result(&result);
     }
 }

@@ -25,9 +25,9 @@ const GENERATED_EXTENSION: &str = include_str!(concat!(
     "/src/execution/workflow/pi-json-v1-extension/fixtures/generated/pi-json-v1-extension.ts"
 ));
 
-fn retained(bytes: &[u8]) -> RetainedResultSchema {
+fn retained(bytes: &[u8]) -> RetainedJsonSchema {
     let document = Arc::new(serde_json::from_slice(bytes).unwrap());
-    RetainedResultSchema::compile(Arc::from(bytes), document).unwrap()
+    RetainedJsonSchema::compile(Arc::from(bytes), document).unwrap()
 }
 
 #[derive(Clone)]
@@ -172,7 +172,7 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
 }
 
 #[test]
-fn unproven_native_regex_paths_use_the_permissive_result_schema_only() {
+fn unproven_native_regex_paths_use_the_permissive_json_schema_only() {
     let schema = retained(
         serde_json::to_vec(&json!({
             "$schema": JSON_SCHEMA_DIALECT,

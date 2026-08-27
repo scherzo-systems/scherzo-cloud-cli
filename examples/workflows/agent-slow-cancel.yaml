@@ -22,7 +22,8 @@ steps:
           - file: prompts/slow-cancel.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
 exports:
   response:

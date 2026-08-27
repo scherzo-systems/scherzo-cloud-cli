@@ -17,5 +17,6 @@ steps:
           - ref: imports.prompt
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json

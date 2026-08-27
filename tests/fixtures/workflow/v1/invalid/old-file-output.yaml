@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      report:
+        kind: file
+        path: report.bin
+        mediaType: application/octet-stream

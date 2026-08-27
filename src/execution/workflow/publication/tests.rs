@@ -97,7 +97,7 @@ impl PublicationFixture {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
         self.artifacts
-            .capture_files(&[CaptureDeclaration::new(
+            .capture_files(&[CaptureDeclaration::file(
                 identity,
                 Path::new(relative_path),
                 media_type,
@@ -182,6 +182,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
         content_digest: fixture.content_digest.clone(),
         execution_root: fixture.execution_root.clone(),
         maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
+        cloud_capacity: None,
         timing: WorkflowRunTiming {
             started_at: timestamp_fixture("2026-08-02T12:01:44Z"),
             finished_at: timestamp_fixture("2026-08-02T12:01:45.25Z"),
@@ -305,10 +306,25 @@ fn staging_paths(parent: &Path) -> Vec<PathBuf> {
 fn prepares_metadata_only_and_carrier_cloud_results() {
     let fixture = PublicationFixture::new();
     let mut run = run_fixture(&fixture);
+    run.cloud_capacity = Some(CloudExecutionCapacityV1 {
+        execution_contract: "workflow_v1_inputless_cloud_artifacts@1".to_owned(),
+        source_closure_digest: DigestV1 {
+            algorithm: run.content_digest.algorithm.as_str().to_owned(),
+            value: run.content_digest.value.clone(),
+        },
+        general_maximum_transitions: 8,
+        selected_maximum_transitions: 7,
+        maximum_invocations: 1,
+        maximum_retained_bytes_per_invocation: 4_194_304,
+        diagnostic_retention_bytes: 8_388_608,
+        native_session_retention_bytes: 4_194_304,
+        aggregate_retention_bytes: 12_582_912,
+        encoded_outbox_bytes: 38_141_952,
+    });
     run.exports.insert(
         "agentResponse".to_owned(),
         ExportValue::Available {
-            output: CapturedValue::Text(Arc::from("response")),
+            output: CapturedValue::text(Arc::from("response")),
         },
     );
     run.export_sources.insert(
@@ -318,7 +334,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     run.exports.insert(
         "agentResult".to_owned(),
         ExportValue::Available {
-            output: CapturedValue::Json(Arc::new(serde_json::json!({ "ok": true }))),
+            output: CapturedValue::json_fixture(Arc::new(serde_json::json!({ "ok": true }))),
         },
     );
     run.export_sources.insert(
@@ -481,13 +497,13 @@ fn publishes_text_json_and_file_exports_with_typed_canonical_metadata() {
         (
             "response".to_owned(),
             ExportValue::Available {
-                output: CapturedValue::Text(Arc::from("agent response\n")),
+                output: CapturedValue::text(Arc::from("agent response\n")),
             },
         ),
         (
             "result".to_owned(),
             ExportValue::Available {
-                output: CapturedValue::Json(Arc::new(serde_json::json!({"z": 2, "a": 1}))),
+                output: CapturedValue::json_fixture(Arc::new(serde_json::json!({"z": 2, "a": 1}))),
             },
         ),
     ]);
@@ -543,8 +559,8 @@ fn aliases_share_one_carrier_for_each_existing_kind() {
     let ExportValue::Available { output: file } = run.exports.remove("reportA").unwrap() else {
         panic!("reportA must be available");
     };
-    let text = Arc::<str>::from("shared response\n");
-    let json = Arc::new(serde_json::json!({"answer": 42}));
+    let text = CapturedValue::text(Arc::from("shared response\n"));
+    let json = CapturedValue::json_fixture(Arc::new(serde_json::json!({"answer": 42})));
     run.exports = BTreeMap::from([
         (
             "aFile".to_owned(),
@@ -568,27 +584,17 @@ fn aliases_share_one_carrier_for_each_existing_kind() {
         (
             "dText".to_owned(),
             ExportValue::Available {
-                output: CapturedValue::Text(Arc::clone(&text)),
+                output: text.clone(),
             },
         ),
-        (
-            "eText".to_owned(),
-            ExportValue::Available {
-                output: CapturedValue::Text(text),
-            },
-        ),
+        ("eText".to_owned(), ExportValue::Available { output: text }),
         (
             "fJson".to_owned(),
             ExportValue::Available {
-                output: CapturedValue::Json(Arc::clone(&json)),
+                output: json.clone(),
             },
         ),
-        (
-            "gJson".to_owned(),
-            ExportValue::Available {
-                output: CapturedValue::Json(json),
-            },
-        ),
+        ("gJson".to_owned(), ExportValue::Available { output: json }),
     ]);
     run.export_sources = BTreeMap::from([
         (
@@ -918,7 +924,7 @@ fn close_failures_retain_a_distinct_publication_phase_and_remove_staging() {
     run.exports.insert(
         "reportA".to_owned(),
         ExportValue::Available {
-            output: CapturedValue::Text(Arc::from("in-memory text")),
+            output: CapturedValue::text(Arc::from("in-memory text")),
         },
     );
     run.export_sources.insert(
@@ -1043,7 +1049,7 @@ fn replaced_staged_exports_directory_is_rejected() {
 }
 
 #[test]
-fn identical_result_republication_is_inert() {
+fn semantic_outputs_publication_idempotence_accepts_identical_replay() {
     let fixture = PublicationFixture::new();
     let run = run_fixture(&fixture);
     let destination = fixture.destination("identical-republication");
@@ -1069,7 +1075,7 @@ fn identical_result_republication_is_inert() {
 }
 
 #[test]
-fn conflicting_result_republication_fails_closed() {
+fn semantic_outputs_publication_idempotence_preserves_first_conflict() {
     let fixture = PublicationFixture::new();
     let mut run = run_fixture(&fixture);
     let destination = fixture.destination("conflicting-republication");

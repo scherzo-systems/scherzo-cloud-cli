@@ -28,7 +28,7 @@ use crate::execution::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
     AgentInvocationStaging, AgentObservation, AgentObservationEnvelope, AgentObservationSink,
     AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver,
-    AgentValueMode, CompletedAgentInvocation, RetainedResultSchema, StagedAgentAttachment,
+    AgentValueMode, CompletedAgentInvocation, RetainedJsonSchema, StagedAgentAttachment,
     WorkflowRunId, agent_start_channel, agent_terminal_channel, failed_agent_outcome,
     invoke_agent_adapter,
 };
@@ -634,7 +634,7 @@ fn result_value_mode(document: Value) -> AgentValueMode {
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&document).unwrap());
     AgentValueMode::Result {
         output: Arc::from("result"),
-        schema: RetainedResultSchema::compile(bytes, Arc::new(document)).unwrap(),
+        schema: RetainedJsonSchema::compile(bytes, Arc::new(document)).unwrap(),
     }
 }
 

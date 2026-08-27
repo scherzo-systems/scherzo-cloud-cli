@@ -1,0 +1,10 @@
+schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      summary:
+        kind: text
+        path: summary.txt

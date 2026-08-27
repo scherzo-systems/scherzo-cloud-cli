@@ -21,7 +21,8 @@
         },
         "failure": {
           "phase": "output_capture",
-          "cause": "output_git_workspace_dirty"
+          "cause": "output_git_workspace_dirty",
+          "output": "changes"
         }
       }
     },

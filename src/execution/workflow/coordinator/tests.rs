@@ -674,6 +674,7 @@ steps:
     outputs:
       result:
         kind: file
+        from: path
         path: result.txt
         mediaType: text/plain
 "#;

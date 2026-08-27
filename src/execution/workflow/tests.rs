@@ -73,13 +73,13 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
     assert_eq!(
         plan_body.common.outputs["plan"],
-        Output::AgentResult {
+        Output::JsonAgentResult {
             schema: "schemas/change-plan.schema.json".to_owned()
         }
     );
     assert_eq!(
         plan_body.common.outputs["artifact"],
-        Output::File {
+        Output::FilePath {
             path: "artifacts/plan.txt".to_owned(),
             media_type: "text/plain".to_owned(),
         }
@@ -124,7 +124,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
     assert_eq!(
         implement_body.common.outputs["response"],
-        Output::AgentResponse
+        Output::TextAgentResponse
     );
 
     let test = &workflow.steps["test"];
@@ -149,7 +149,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
     assert_eq!(
         test_body.common.outputs["report"],
-        Output::File {
+        Output::FilePath {
             path: "packages/api/artifacts/test-report.xml".to_owned(),
             media_type: "application/junit+xml".to_owned(),
         }

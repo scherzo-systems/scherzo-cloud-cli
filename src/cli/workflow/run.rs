@@ -1606,6 +1606,7 @@ fn build_run_result(
         content_digest: execution.content_digest,
         execution_root: admitted.execution().root().to_owned(),
         maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
+        cloud_capacity: None,
         timing: run_timing,
         outcome: execution.outcome,
         cancellation,

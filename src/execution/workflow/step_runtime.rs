@@ -1030,6 +1030,10 @@ where
                 parse_recovery_decision(result.canonical_json())
                     .map_err(RecoveryHandlerFailure::AgentResultInvalid)
             }
+            #[cfg(test)]
+            AgentOutcome::Completed(CompletedAgentInvocation::RawResult(result)) => {
+                parse_recovery_decision(&result).map_err(RecoveryHandlerFailure::AgentResultInvalid)
+            }
             AgentOutcome::Completed(
                 CompletedAgentInvocation::NoValue
                 | CompletedAgentInvocation::NoResponse
@@ -1642,7 +1646,10 @@ where
         let body = match StepBody::from(definition) {
             StepBody::Command(command) => {
                 if command.common.outputs.values().any(|output| {
-                    !matches!(&output.definition, Output::File { .. } | Output::GitBranch)
+                    matches!(
+                        &output.definition,
+                        Output::TextAgentResponse | Output::JsonAgentResult { .. }
+                    )
                 }) {
                     return Err(StepStartFailure::OutputsUnsupported);
                 }
@@ -1959,7 +1966,7 @@ impl CaptureWorker {
             .filter(|(_, output)| {
                 matches!(
                     output.definition,
-                    Output::AgentResponse | Output::AgentResult { .. }
+                    Output::TextAgentResponse | Output::JsonAgentResult { .. }
                 )
             })
             .map(|(output_identity, _)| output_identity.clone())
@@ -1967,7 +1974,7 @@ impl CaptureWorker {
         let required_results = common
             .outputs
             .iter()
-            .filter(|(_, output)| matches!(output.definition, Output::AgentResult { .. }))
+            .filter(|(_, output)| matches!(output.definition, Output::JsonAgentResult { .. }))
             .map(|(output_identity, _)| output_identity.clone())
             .collect::<BTreeSet<_>>();
         if !provisional_values.is_subset(&declared_values)
@@ -1981,13 +1988,35 @@ impl CaptureWorker {
             .outputs
             .iter()
             .filter_map(|(output_identity, output)| match &output.definition {
-                Output::File { path, media_type } => Some(GitAwareCaptureDeclaration::File(
-                    CaptureDeclaration::new(output_identity, Path::new(path), media_type),
-                )),
-                Output::GitBranch => Some(GitAwareCaptureDeclaration::GitBranch(output_identity)),
-                Output::AgentResponse | Output::AgentResult { .. } => None,
+                Output::TextPath { path } => Some(Some(GitAwareCaptureDeclaration::File(
+                    CaptureDeclaration::text(output_identity, Path::new(path)),
+                ))),
+                Output::JsonPath { path, .. } => Some(
+                    self.admitted
+                        .workflow()
+                        .json_schema(step, output_identity)
+                        .map(|schema| {
+                            GitAwareCaptureDeclaration::File(CaptureDeclaration::json(
+                                output_identity,
+                                Path::new(path),
+                                schema,
+                            ))
+                        }),
+                ),
+                Output::FilePath { path, media_type } => {
+                    Some(Some(GitAwareCaptureDeclaration::File(
+                        CaptureDeclaration::file(output_identity, Path::new(path), media_type),
+                    )))
+                }
+                Output::GitBranchWorkspace => {
+                    Some(Some(GitAwareCaptureDeclaration::GitBranch(output_identity)))
+                }
+                Output::TextAgentResponse | Output::JsonAgentResult { .. } => None,
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+            .ok_or(CaptureWorkerFailure::Failed(
+                OutputCaptureFailure::UnsupportedOutput,
+            ))?;
         if declarations
             .iter()
             .any(|declaration| matches!(declaration, GitAwareCaptureDeclaration::GitBranch(_)))
@@ -3087,10 +3116,14 @@ fn completed_agent_outputs(
         (None, CompletedAgentInvocation::NoValue)
         | (Some(_), CompletedAgentInvocation::NoResponse) => return Ok(BTreeMap::new()),
         (Some(output), CompletedAgentInvocation::Response(response)) => {
-            (output, CapturedValue::Text(response.into_text()))
+            (output, CapturedValue::text(response.into_text()))
         }
         (Some(output), CompletedAgentInvocation::Result(result)) => {
-            (output, CapturedValue::Json(result.into_value()))
+            (output, CapturedValue::json(result))
+        }
+        #[cfg(test)]
+        (_, CompletedAgentInvocation::RawResult(_)) => {
+            return Err(AgentFailureCause::HarnessProtocolFailed);
         }
         (
             None,

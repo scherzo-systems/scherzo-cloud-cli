@@ -426,6 +426,7 @@ async fn run_connection_loop_with_work_root(
             lease_clock,
             Arc::clone(&sleeper),
             Arc::clone(&work_root),
+            Arc::clone(&recorder),
         ),
     ));
     let live_status = Arc::new(LiveStatus::new(
@@ -1658,6 +1659,7 @@ mod tests {
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
             fixture_lease_clock(),
             Arc::new(TokioSleeper),
+            Arc::clone(&recorder),
         )));
         let status = Arc::new(LiveStatus::new(
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),

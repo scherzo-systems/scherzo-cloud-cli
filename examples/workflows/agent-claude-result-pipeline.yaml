@@ -28,7 +28,8 @@ steps:
           - file: prompts/claude-pipeline-extract.md
     outputs:
       facts:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schemas/project-facts.schema.json
 
   summarize:
@@ -43,7 +44,8 @@ steps:
           - ref: outputs.extract.facts
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
 exports:
   facts:

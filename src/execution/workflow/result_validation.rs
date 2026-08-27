@@ -22,6 +22,7 @@ use super::admission::{CancellationReason, CancellationSource, MAXIMUM_AGENT_RES
 use super::agent::PositiveDuration;
 use super::canonical_json::{self, CanonicalJsonError};
 use super::coordinator::CoordinatorClock;
+use super::value::CapturedJson;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const INTERNAL_WORKER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_RESULT_VALIDATION_WORKER";
@@ -33,20 +34,20 @@ const MAXIMUM_JSON_ESCAPE_BYTES_PER_INPUT_BYTE: u64 = 6;
 const WORKER_RESPONSE_JSON_OVERHEAD: u64 = br#"{"decision":"rejected","feedback":""}"#.len() as u64;
 
 #[derive(Clone)]
-pub(crate) struct RetainedResultSchema {
+pub(crate) struct RetainedJsonSchema {
     bytes: Arc<[u8]>,
     document: Arc<Value>,
     validator: Arc<Validator>,
 }
 
-impl RetainedResultSchema {
+impl RetainedJsonSchema {
     pub(crate) fn compile(
         bytes: Arc<[u8]>,
         document: Arc<Value>,
-    ) -> Result<Self, ResultSchemaSupportFailure> {
+    ) -> Result<Self, JsonSchemaSupportFailure> {
         inspect_supported_schema(&document)?;
         let validator =
-            compile_validator(&document).map_err(|_| ResultSchemaSupportFailure::Schema)?;
+            compile_validator(&document).map_err(|_| JsonSchemaSupportFailure::Schema)?;
         Ok(Self {
             bytes,
             document,
@@ -61,63 +62,35 @@ impl RetainedResultSchema {
     pub(crate) fn document(&self) -> &Value {
         &self.document
     }
+
+    pub(crate) fn is_valid(&self, value: &Value) -> bool {
+        self.validator.is_valid(value)
+    }
 }
 
-impl fmt::Debug for RetainedResultSchema {
+impl fmt::Debug for RetainedJsonSchema {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RetainedResultSchema")
+            .debug_struct("RetainedJsonSchema")
             .field("bytes", &self.bytes)
             .field("document", &self.document)
             .finish_non_exhaustive()
     }
 }
 
-impl PartialEq for RetainedResultSchema {
+impl PartialEq for RetainedJsonSchema {
     fn eq(&self, other: &Self) -> bool {
         self.bytes == other.bytes && self.document == other.document
     }
 }
 
-impl Eq for RetainedResultSchema {}
+impl Eq for RetainedJsonSchema {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResultSchemaSupportFailure {
+pub(crate) enum JsonSchemaSupportFailure {
     Dialect,
     Reference,
     Schema,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundedSchemaValidAgentResult {
-    value: Arc<Value>,
-    canonical_json: Arc<[u8]>,
-}
-
-impl BoundedSchemaValidAgentResult {
-    fn from_authoritative_validation(value: Arc<Value>, canonical_json: Arc<[u8]>) -> Self {
-        Self {
-            value,
-            canonical_json,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fixture(value: Arc<Value>, canonical_json: Arc<[u8]>) -> Self {
-        Self::from_authoritative_validation(value, canonical_json)
-    }
-
-    pub(crate) fn value(&self) -> &Value {
-        &self.value
-    }
-
-    pub(crate) fn into_value(self) -> Arc<Value> {
-        self.value
-    }
-
-    pub(crate) fn canonical_json(&self) -> &[u8] {
-        &self.canonical_json
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +101,7 @@ pub(crate) enum ResultValidationOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResultValidationDecision {
-    Valid(BoundedSchemaValidAgentResult),
+    Valid(CapturedJson),
     Rejected { feedback: Arc<str> },
     Fatal(ResultValidationFatal),
 }
@@ -146,7 +119,7 @@ pub(crate) enum ResultValidationFatal {
 }
 
 pub(crate) struct AuthoritativeResultValidator<Clock, Worker> {
-    schema: RetainedResultSchema,
+    schema: RetainedJsonSchema,
     maximum_candidate_bytes: NonZeroU64,
     maximum_feedback_bytes: NonZeroU64,
     deadline: PositiveDuration,
@@ -160,7 +133,7 @@ where
     Worker: ResultValidationWorker,
 {
     pub(crate) fn new(
-        schema: RetainedResultSchema,
+        schema: RetainedJsonSchema,
         maximum_candidate_bytes: NonZeroU64,
         maximum_feedback_bytes: NonZeroU64,
         deadline: PositiveDuration,
@@ -308,10 +281,7 @@ where
 
         match decision {
             Ok(ValidationWorkerDecision::Valid) => ResultValidationDecision::Valid(
-                BoundedSchemaValidAgentResult::from_authoritative_validation(
-                    candidate,
-                    canonical_json,
-                ),
+                CapturedJson::from_validated(candidate, canonical_json, self.schema.clone()),
             ),
             Ok(ValidationWorkerDecision::Rejected { feedback }) => {
                 ResultValidationDecision::Rejected { feedback }
@@ -336,7 +306,7 @@ pub(crate) trait RunningResultValidation: Send + 'static {
 
 #[derive(Clone)]
 pub(crate) struct ValidationWorkerRequest {
-    schema: RetainedResultSchema,
+    schema: RetainedJsonSchema,
     candidate: Arc<Value>,
     canonical_json: Arc<[u8]>,
     maximum_feedback_bytes: NonZeroU64,
@@ -526,8 +496,7 @@ fn run_internal_worker_io(input: &mut impl Read, output: &mut impl Write) -> Res
         return Err(());
     }
     let document = Arc::new(serde_json::from_slice::<Value>(&schema_bytes).map_err(|_| ())?);
-    let schema =
-        RetainedResultSchema::compile(Arc::from(schema_bytes), document).map_err(|_| ())?;
+    let schema = RetainedJsonSchema::compile(Arc::from(schema_bytes), document).map_err(|_| ())?;
     let candidate = serde_json::from_slice::<Value>(&candidate_bytes).map_err(|_| ())?;
     let response = match evaluate_candidate(&schema, &candidate, feedback_limit)? {
         ValidationWorkerDecision::Valid => WorkerResponse::Valid,
@@ -554,7 +523,7 @@ fn read_frame(input: &mut impl Read, maximum_bytes: u64) -> Result<Vec<u8>, ()> 
 }
 
 fn evaluate_candidate(
-    schema: &RetainedResultSchema,
+    schema: &RetainedJsonSchema,
     candidate: &Value,
     maximum_feedback_bytes: u64,
 ) -> Result<ValidationWorkerDecision, ()> {
@@ -654,12 +623,12 @@ fn compile_validator(schema: &Value) -> Result<Validator, ()> {
         .map_err(|_| ())
 }
 
-fn inspect_supported_schema(schema: &Value) -> Result<(), ResultSchemaSupportFailure> {
+fn inspect_supported_schema(schema: &Value) -> Result<(), JsonSchemaSupportFailure> {
     let Some(root) = schema.as_object() else {
-        return Err(ResultSchemaSupportFailure::Dialect);
+        return Err(JsonSchemaSupportFailure::Dialect);
     };
     if root.get("$schema").and_then(Value::as_str) != Some(JSON_SCHEMA_DIALECT) {
-        return Err(ResultSchemaSupportFailure::Dialect);
+        return Err(JsonSchemaSupportFailure::Dialect);
     }
 
     let mut inspection = SchemaInspection::default();
@@ -686,23 +655,23 @@ impl<'a> SchemaInspection<'a> {
         schema: &'a Value,
         pointer: &str,
         root: bool,
-    ) -> Result<(), ResultSchemaSupportFailure> {
+    ) -> Result<(), JsonSchemaSupportFailure> {
         self.schema_locations.insert(pointer.to_owned());
         let Some(object) = schema.as_object() else {
             return Ok(());
         };
 
         if (!root && object.contains_key("$schema")) || object.contains_key("$vocabulary") {
-            return Err(ResultSchemaSupportFailure::Dialect);
+            return Err(JsonSchemaSupportFailure::Dialect);
         }
         if !root && object.contains_key("$id") {
-            return Err(ResultSchemaSupportFailure::Reference);
+            return Err(JsonSchemaSupportFailure::Reference);
         }
 
         for keyword in ["$ref", "$dynamicRef"] {
             if let Some(reference) = object.get(keyword).and_then(Value::as_str) {
                 if !reference.starts_with('#') {
-                    return Err(ResultSchemaSupportFailure::Reference);
+                    return Err(JsonSchemaSupportFailure::Reference);
                 }
                 self.references.push(reference);
             }
@@ -762,7 +731,7 @@ impl<'a> SchemaInspection<'a> {
         &mut self,
         value: &'a Value,
         pointer: &str,
-    ) -> Result<(), ResultSchemaSupportFailure> {
+    ) -> Result<(), JsonSchemaSupportFailure> {
         if value.is_object() || value.is_boolean() {
             self.walk(value, pointer, false)?;
         }
@@ -782,13 +751,13 @@ impl<'a> SchemaInspection<'a> {
         }
     }
 
-    fn validate_references(self) -> Result<(), ResultSchemaSupportFailure> {
+    fn validate_references(self) -> Result<(), JsonSchemaSupportFailure> {
         if self
             .anchors
             .values()
             .any(|target| matches!(target, AnchorTarget::Ambiguous))
         {
-            return Err(ResultSchemaSupportFailure::Reference);
+            return Err(JsonSchemaSupportFailure::Reference);
         }
         for reference in self.references {
             let fragment = decode_uri_fragment(&reference[1..])?;
@@ -797,17 +766,17 @@ impl<'a> SchemaInspection<'a> {
             }
             if fragment.starts_with('/') {
                 if !self.schema_locations.contains(&fragment) {
-                    return Err(ResultSchemaSupportFailure::Reference);
+                    return Err(JsonSchemaSupportFailure::Reference);
                 }
             } else if !matches!(self.anchors.get(&fragment), Some(AnchorTarget::Unique(_))) {
-                return Err(ResultSchemaSupportFailure::Reference);
+                return Err(JsonSchemaSupportFailure::Reference);
             }
         }
         Ok(())
     }
 }
 
-fn decode_uri_fragment(fragment: &str) -> Result<String, ResultSchemaSupportFailure> {
+fn decode_uri_fragment(fragment: &str) -> Result<String, JsonSchemaSupportFailure> {
     let bytes = fragment.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0_usize;
@@ -820,15 +789,15 @@ fn decode_uri_fragment(fragment: &str) -> Result<String, ResultSchemaSupportFail
         let high = bytes
             .get(index + 1)
             .and_then(|byte| hex_value(*byte))
-            .ok_or(ResultSchemaSupportFailure::Reference)?;
+            .ok_or(JsonSchemaSupportFailure::Reference)?;
         let low = bytes
             .get(index + 2)
             .and_then(|byte| hex_value(*byte))
-            .ok_or(ResultSchemaSupportFailure::Reference)?;
+            .ok_or(JsonSchemaSupportFailure::Reference)?;
         decoded.push((high << 4) | low);
         index += 3;
     }
-    String::from_utf8(decoded).map_err(|_| ResultSchemaSupportFailure::Reference)
+    String::from_utf8(decoded).map_err(|_| JsonSchemaSupportFailure::Reference)
 }
 
 fn hex_value(byte: u8) -> Option<u8> {

@@ -239,6 +239,70 @@
         "materializationContract"
       ]
     },
+    "ExecutionCapacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "executionContract": {
+          "const": "workflow_v1_inputless_cloud_artifacts@1"
+        },
+        "sourceClosureDigest": {
+          "$ref": "#/$defs/WorkflowSourceClosureDigest"
+        },
+        "generalMaximumTransitions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1286
+        },
+        "selectedMaximumTransitions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1030
+        },
+        "maximumInvocations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 488
+        },
+        "maximumRetainedBytesPerInvocation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304
+        },
+        "diagnosticRetentionBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 134217728
+        },
+        "nativeSessionRetentionBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        "aggregateRetentionBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 201326592
+        },
+        "encodedOutboxBytes": {
+          "type": "integer",
+          "minimum": 33554432,
+          "maximum": 105185280
+        }
+      },
+      "required": [
+        "executionContract",
+        "sourceClosureDigest",
+        "generalMaximumTransitions",
+        "selectedMaximumTransitions",
+        "maximumInvocations",
+        "maximumRetainedBytesPerInvocation",
+        "diagnosticRetentionBytes",
+        "nativeSessionRetentionBytes",
+        "aggregateRetentionBytes",
+        "encodedOutboxBytes"
+      ]
+    },
     "ExecutionSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -262,6 +326,9 @@
         },
         "primaryWorkspaceSource": {
           "$ref": "#/$defs/PrimaryWorkspaceSource"
+        },
+        "capacity": {
+          "$ref": "#/$defs/ExecutionCapacity"
         }
       },
       "required": [
@@ -270,7 +337,8 @@
         "executionLimits",
         "sourceBranch",
         "workflowDefinitionSource",
-        "primaryWorkspaceSource"
+        "primaryWorkspaceSource",
+        "capacity"
       ]
     },
     "ExecutionLeasePolicy": {
@@ -967,6 +1035,7 @@
         "starting",
         "running",
         "capturing_outputs",
+        "recovering",
         "cancelling",
         "succeeded",
         "failed",
@@ -2374,7 +2443,310 @@
         },
         {
           "$ref": "#/$defs/ForceAbortAcceptedEvent"
+        },
+        {
+          "$ref": "#/$defs/RecoveryProgressTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/RecoverySettlingTransitionEvent"
         }
+      ]
+    },
+    "RecoveryFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "enum": ["start", "execution", "output_capture"]
+        },
+        "cause": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "input": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "collectionIndex": { "$ref": "#/$defs/nonnegativeSequence" },
+            "output": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "exitCode": {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "protocolRejection": {
+              "$ref": "#/$defs/AgentProtocolRejectionDiagnostic"
+            }
+          },
+          "required": ["code"]
+        }
+      },
+      "required": ["phase", "cause"]
+    },
+    "RecoveryHandlerFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": { "enum": ["start", "execution"] },
+        "cause": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "enum": [
+                "context_unavailable", "handler_unavailable",
+                "working_directory_unavailable", "command_preparation_failed",
+                "command_launch_failed", "command_wait_failed",
+                "command_exit_failed", "process_quiescence_failed",
+                "result_missing", "result_symbolic_link", "result_not_regular",
+                "result_unavailable", "result_too_large", "decision_invalid",
+                "agent_input_failed", "agent_failed", "agent_result_missing",
+                "agent_result_invalid", "settlement_failed"
+              ]
+            },
+            "exitCode": {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "decisionRejection": {
+              "enum": [
+                "input_too_large", "invalid_utf8", "invalid_json",
+                "duplicate_key", "unknown_field", "unsupported_schema_version",
+                "unknown_decision", "empty_summary", "summary_too_long",
+                "empty_reason", "reason_too_long"
+              ]
+            }
+          },
+          "required": ["code"]
+        }
+      },
+      "required": ["phase", "cause"]
+    },
+    "RecoveryHandlerSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["cmd", "agent"] },
+        "invocationId": { "$ref": "#/$defs/positiveSequence" },
+        "outcome": { "enum": ["recheck", "gave_up", "failed", "cancelled"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "failure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+      },
+      "required": ["kind", "invocationId", "outcome"]
+    },
+    "RecoveryRoundSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "number": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "failedExecution": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "invocationId": { "$ref": "#/$defs/positiveSequence" },
+            "failure": { "$ref": "#/$defs/RecoveryFailure" }
+          },
+          "required": ["executionNumber", "invocationId", "failure"]
+        },
+        "handler": { "$ref": "#/$defs/RecoveryHandlerSummary" }
+      },
+      "required": ["number", "failedExecution"]
+    },
+    "RecoveryTermination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["recovered", "exhausted"] },
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+          },
+          "required": ["kind", "executionNumber"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "gave_up" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 }
+          },
+          "required": ["kind", "round"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "handler_failed" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "handlerFailure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+          },
+          "required": ["kind", "round", "handlerFailure"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "cancelled" },
+            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "activeRole": { "enum": ["target", "recovery_handler"] },
+            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+          },
+          "required": ["kind", "round", "activeRole"]
+        }
+      ]
+    },
+    "StepRecoverySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "configuredRetries": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "handlerKind": { "enum": ["cmd", "agent"] },
+        "rounds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": { "$ref": "#/$defs/RecoveryRoundSummary" }
+        },
+        "termination": { "$ref": "#/$defs/RecoveryTermination" }
+      },
+      "required": ["schemaVersion", "configuredRetries", "rounds", "termination"]
+    },
+    "RecoverySummaries": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 256,
+      "propertyNames": { "$ref": "#/$defs/stepId" },
+      "additionalProperties": { "$ref": "#/$defs/StepRecoverySummary" }
+    },
+    "RecoveryDiagnosticStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retainedBytes": { "type": "integer", "minimum": 0, "maximum": 4194304 },
+        "discardedBytes": { "$ref": "#/$defs/nonnegativeSequence" },
+        "truncated": { "type": "boolean" },
+        "fullyDrained": { "type": "boolean" },
+        "digest": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "value": { "$ref": "#/$defs/sha256" }
+          },
+          "required": ["algorithm", "value"]
+        }
+      },
+      "required": [
+        "retainedBytes", "discardedBytes", "truncated", "fullyDrained", "digest"
+      ]
+    },
+    "InvocationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "invocationId": { "$ref": "#/$defs/positiveSequence" },
+        "role": { "enum": ["target", "recovery_handler"] },
+        "targetExecution": { "type": "integer", "minimum": 1, "maximum": 11 },
+        "recoveryRound": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "state": { "enum": ["settled", "cancelled"] },
+        "startedAt": { "$ref": "#/$defs/utcTimestamp" },
+        "finishedAt": { "$ref": "#/$defs/utcTimestamp" },
+        "durationMilliseconds": { "$ref": "#/$defs/nonnegativeSequence" },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "inputTokens": { "$ref": "#/$defs/nonnegativeSequence" },
+            "outputTokens": { "$ref": "#/$defs/nonnegativeSequence" }
+          },
+          "required": ["inputTokens", "outputTokens"]
+        },
+        "diagnostics": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "command_stdout", "command_stderr",
+                  "agent_harness_stdout", "agent_harness_stderr"
+                ]
+              },
+              "reference": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "stream": { "$ref": "#/$defs/RecoveryDiagnosticStream" }
+            },
+            "required": ["kind", "reference", "stream"]
+          }
+        },
+        "diagnosticReference": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      },
+      "required": [
+        "invocationId", "role", "state", "startedAt", "finishedAt",
+        "durationMilliseconds", "usage"
+      ]
+    },
+    "RecoveryProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "configuredRetries": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "activeRole": { "enum": ["target", "recovery_handler"] },
+        "activeInvocationId": { "$ref": "#/$defs/positiveSequence" },
+        "targetExecution": { "type": "integer", "minimum": 1, "maximum": 11 },
+        "recoveryRound": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "handlerKind": { "enum": ["cmd", "agent"] },
+        "handlerState": { "enum": ["starting", "running"] },
+        "decision": { "enum": ["recheck", "gave_up"] }
+      },
+      "required": ["configuredRetries", "activeRole", "activeInvocationId"]
+    },
+    "RecoveryProgressTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": { "const": 1 },
+        "eventType": { "const": "step_state_changed" },
+        "transitionSequence": { "$ref": "#/$defs/positiveSequence" },
+        "stepId": { "$ref": "#/$defs/stepId" },
+        "role": { "const": "step" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
+        "from": { "$ref": "#/$defs/StepStateKind" },
+        "to": { "$ref": "#/$defs/StepStateKind" },
+        "recoveryProgress": { "$ref": "#/$defs/RecoveryProgress" }
+      },
+      "required": [
+        "eventVersion", "eventType", "transitionSequence", "stepId", "role",
+        "failurePolicy", "from", "to", "recoveryProgress"
+      ]
+    },
+    "RecoverySettlingTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": { "const": 1 },
+        "eventType": { "const": "step_state_changed" },
+        "transitionSequence": { "$ref": "#/$defs/positiveSequence" },
+        "stepId": { "$ref": "#/$defs/stepId" },
+        "role": { "const": "step" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
+        "from": { "$ref": "#/$defs/StepStateKind" },
+        "to": { "$ref": "#/$defs/StepStateKind" },
+        "failure": { "$ref": "#/$defs/StepFailureEvidence" },
+        "reason": { "$ref": "#/$defs/OrdinaryCancellationReason" },
+        "recoveryProgress": { "$ref": "#/$defs/RecoveryProgress" },
+        "invocationEvidence": { "$ref": "#/$defs/InvocationEvidence" }
+      },
+      "required": [
+        "eventVersion", "eventType", "transitionSequence", "stepId", "role",
+        "failurePolicy", "from", "to", "invocationEvidence"
       ]
     },
     "WorkflowTerminalOutcome": {
@@ -2388,6 +2760,9 @@
             },
             "finalization": {
               "$ref": "#/$defs/FinalizationSummary"
+            },
+            "recoverySummaries": {
+              "$ref": "#/$defs/RecoverySummaries"
             }
           },
           "required": [
@@ -2406,6 +2781,9 @@
             },
             "failure": {
               "$ref": "#/$defs/WorkflowFailure"
+            },
+            "recoverySummaries": {
+              "$ref": "#/$defs/RecoverySummaries"
             }
           },
           "required": [
@@ -3821,54 +4199,74 @@
       ]
     },
     "OutputCaptureStepFailureEvidence": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "phase": {
-          "const": "output_capture"
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": { "const": "output_capture" },
+            "cause": {
+              "enum": [
+                "output_step_unavailable",
+                "output_unsupported",
+                "output_task_unavailable"
+              ]
+            }
+          },
+          "required": ["phase", "cause"]
         },
-        "cause": {
-          "enum": [
-            "output_step_unavailable",
-            "output_unsupported",
-            "output_absolute_path",
-            "output_lexical_escape",
-            "output_empty_path",
-            "output_missing",
-            "output_symbolic_link",
-            "output_not_directory",
-            "output_not_regular_file",
-            "output_source_unavailable",
-            "output_file_count_limit_exceeded",
-            "output_file_size_limit_exceeded",
-            "output_total_size_limit_exceeded",
-            "output_git_carrier_count_limit_exceeded",
-            "output_git_carrier_size_limit_exceeded",
-            "output_total_git_carrier_size_limit_exceeded",
-            "output_carrier_producer_unavailable",
-            "output_git_execution_root_rebound",
-            "output_git_head_unavailable",
-            "output_git_baseline_not_ancestor",
-            "output_git_cleanliness_unavailable",
-            "output_git_workspace_dirty",
-            "output_git_tree_unavailable",
-            "output_git_required_objects_unavailable",
-            "output_git_source_authority_changed",
-            "output_git_structure_limit_exceeded",
-            "output_git_command_timed_out",
-            "output_git_bundle_generation_failed",
-            "output_git_bundle_profile_invalid",
-            "output_git_bundle_verification_failed",
-            "output_git_workspace_changed",
-            "output_git_temporary_storage_unavailable",
-            "output_staging_unavailable",
-            "output_task_unavailable"
-          ]
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": { "const": "output_capture" },
+            "cause": {
+              "enum": [
+                "output_absolute_path",
+                "output_lexical_escape",
+                "output_empty_path",
+                "output_missing",
+                "output_symbolic_link",
+                "output_not_directory",
+                "output_not_regular_file",
+                "output_source_unavailable",
+                "output_invalid_utf8",
+                "output_invalid_json",
+                "output_duplicate_json_member",
+                "output_json_schema_mismatch",
+                "output_file_count_limit_exceeded",
+                "output_file_size_limit_exceeded",
+                "output_total_size_limit_exceeded",
+                "output_git_carrier_count_limit_exceeded",
+                "output_git_carrier_size_limit_exceeded",
+                "output_total_git_carrier_size_limit_exceeded",
+                "output_carrier_producer_unavailable",
+                "output_git_execution_root_rebound",
+                "output_git_head_unavailable",
+                "output_git_baseline_not_ancestor",
+                "output_git_cleanliness_unavailable",
+                "output_git_workspace_dirty",
+                "output_git_tree_unavailable",
+                "output_git_required_objects_unavailable",
+                "output_git_source_authority_changed",
+                "output_git_structure_limit_exceeded",
+                "output_git_command_timed_out",
+                "output_git_bundle_generation_failed",
+                "output_git_bundle_profile_invalid",
+                "output_git_bundle_verification_failed",
+                "output_git_workspace_changed",
+                "output_git_temporary_storage_unavailable",
+                "output_staging_unavailable"
+              ]
+            },
+            "output": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z][A-Za-z0-9]*$"
+            }
+          },
+          "required": ["phase", "cause", "output"]
         }
-      },
-      "required": [
-        "phase",
-        "cause"
       ]
     },
     "artifactSetId": {

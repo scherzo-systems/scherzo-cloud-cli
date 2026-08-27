@@ -19,6 +19,7 @@ use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
 use crate::execution::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 use crate::execution::workflow::runtime::TransitionSequence;
+use crate::execution::workflow::validated::WorkflowValueType;
 
 #[derive(Clone)]
 struct AcceptThenBlockObservationSink {
@@ -156,7 +157,7 @@ fn result_mode() -> AgentValueMode {
     }));
     AgentValueMode::Result {
         output: Arc::from("result"),
-        schema: RetainedResultSchema::compile(
+        schema: RetainedJsonSchema::compile(
             Arc::from(
                 br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
                     .as_slice(),
@@ -394,8 +395,10 @@ async fn scripted_adapter_completes_each_value_mode_with_its_typed_value() {
     let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = result else {
         panic!("result mode must produce a schema-valid result");
     };
+    assert_eq!(result.value_type(), WorkflowValueType::Json);
     assert_eq!(result.value()["verdict"], "accepted");
     assert_eq!(result.canonical_json(), br#"{"verdict":"accepted"}"#);
+    assert_eq!(result.schema().document()["type"], "object");
 }
 
 #[tokio::test]

@@ -105,7 +105,7 @@ impl Fixture {
         fs::write(self.execution_root.join(path), bytes).unwrap();
         let mut captured = self
             .artifacts
-            .capture_files(&[CaptureDeclaration::new(name, Path::new(path), media_type)])
+            .capture_files(&[CaptureDeclaration::file(name, Path::new(path), media_type)])
             .unwrap();
         CapturedValue::file(captured.remove(name).unwrap())
     }
@@ -125,8 +125,8 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
         b"mutated source",
     )
     .unwrap();
-    let response = CapturedValue::Text(Arc::from("agent response"));
-    let json = CapturedValue::Json(Arc::new(json!({
+    let response = CapturedValue::text(Arc::from("agent response"));
+    let json = CapturedValue::json_fixture(Arc::new(json!({
         "z": 1,
         "a": [3, {"x": true}]
     })));
@@ -416,7 +416,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     );
 
     let total_fixture = Fixture::new(1, 8, 4, 5);
-    let response = CapturedValue::Text(Arc::from("def"));
+    let response = CapturedValue::text(Arc::from("def"));
     assert_preparation_failure(
         total_fixture.inputs.materialize(
             &BTreeMap::from([
@@ -437,7 +437,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     );
 
     let mismatch_fixture = Fixture::new(1, 8, 8, 16);
-    let json = CapturedValue::Json(Arc::new(json!({"ok": true})));
+    let json = CapturedValue::json_fixture(Arc::new(json!({"ok": true})));
     assert_preparation_failure(
         mismatch_fixture.inputs.materialize(
             &BTreeMap::from([(

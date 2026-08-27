@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::PiJsonV1ProtocolLimits;
 use crate::execution::workflow::agent::{
-    AgentInvocationIdentity, PositiveDuration, RetainedResultSchema,
+    AgentInvocationIdentity, PositiveDuration, RetainedJsonSchema,
 };
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::schema_common::lowercase_hex;
@@ -51,7 +51,7 @@ impl PreparedResultBridge {
     pub(super) fn prepare<Clock: CoordinatorClock>(
         identity: &AgentInvocationIdentity,
         staging_directory: &Path,
-        schema: &RetainedResultSchema,
+        schema: &RetainedJsonSchema,
         limits: PiJsonV1ProtocolLimits,
         receive_deadline: PositiveDuration,
         clock: Clock,
@@ -586,7 +586,7 @@ struct TransportSchema {
     used_regex_fallback: bool,
 }
 
-fn derive_transport_schema(schema: &RetainedResultSchema) -> Result<TransportSchema, ()> {
+fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, ()> {
     let synthetic_resource_id = || {
         format!(
             "{RESOURCE_ID_PREFIX}{}",

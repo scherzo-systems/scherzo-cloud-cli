@@ -492,7 +492,15 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::ConflictingAgentValueOutputs => (
             "conflicting_agent_value_outputs",
-            "Declare either one agent response output or one agent result output, not both.",
+            "Declare at most one native agent output.",
+        ),
+        ValidationFailureKind::ExcessWorkspaceOutput => (
+            "excess_workspace_output",
+            "Declare at most one workspace output on a node.",
+        ),
+        ValidationFailureKind::DuplicateOutputPath => (
+            "duplicate_output_path",
+            "Give every path-backed output on a node a distinct path.",
         ),
         ValidationFailureKind::AdvisoryDataDependency => (
             "advisory_data_dependency",

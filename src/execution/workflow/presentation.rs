@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
-use super::document::{FailurePolicy, Output};
+use super::document::FailurePolicy;
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
@@ -836,9 +836,7 @@ struct PresentationStep {
 #[derive(Clone, Copy)]
 enum StepSuccessPresentation {
     Command,
-    AgentResponse,
-    AgentResult,
-    AgentWithoutValue,
+    Agent,
 }
 
 impl PresentationDefinition {
@@ -860,26 +858,10 @@ impl PresentationDefinition {
                         success: StepSuccessPresentation::Command,
                         outputs: presentation_outputs(&command.common.outputs),
                     },
-                    ValidatedStep::Agent(agent) => {
-                        let success = agent
-                            .common
-                            .outputs
-                            .values()
-                            .find_map(|output| match output.definition {
-                                Output::AgentResponse => {
-                                    Some(StepSuccessPresentation::AgentResponse)
-                                }
-                                Output::AgentResult { .. } => {
-                                    Some(StepSuccessPresentation::AgentResult)
-                                }
-                                Output::File { .. } | Output::GitBranch => None,
-                            })
-                            .unwrap_or(StepSuccessPresentation::AgentWithoutValue);
-                        PresentationStep {
-                            success,
-                            outputs: presentation_outputs(&agent.common.outputs),
-                        }
-                    }
+                    ValidatedStep::Agent(agent) => PresentationStep {
+                        success: StepSuccessPresentation::Agent,
+                        outputs: presentation_outputs(&agent.common.outputs),
+                    },
                 };
                 (id.clone(), presentation)
             })
@@ -904,12 +886,16 @@ fn presentation_outputs(
     outputs
         .iter()
         .map(|(name, output)| {
-            let detail = match &output.definition {
-                Output::AgentResponse => "agent_response".to_owned(),
-                Output::AgentResult { schema } => format!("agent_result → {schema}"),
-                Output::File { path, .. } => format!("file → {path}"),
-                Output::GitBranch => "git_branch".to_owned(),
-            };
+            let detail = match output.value_type {
+                super::validated::WorkflowValueType::Text => "text",
+                super::validated::WorkflowValueType::Json => "json",
+                super::validated::WorkflowValueType::File => "file",
+                super::validated::WorkflowValueType::GitBranch => "git_branch",
+                super::validated::WorkflowValueType::AttachmentCollection => {
+                    unreachable!("outputs cannot be attachment collections")
+                }
+            }
+            .to_owned();
             (name.clone(), visible_text(&detail))
         })
         .collect()
@@ -1926,6 +1912,7 @@ fn observed_recovery_detail(observed: Option<ObservedStepTransition>) -> Option<
         handler_kind,
         handler_state,
         decision,
+        ..
     } = observed?
     else {
         return None;
@@ -2084,6 +2071,10 @@ fn failure_cause(cause: &StepFailureCause) -> String {
                     CaptureFailureKind::NotDirectory => "output parent not directory",
                     CaptureFailureKind::NotRegularFile => "output not regular file",
                     CaptureFailureKind::SourceUnavailable => "output source unavailable",
+                    CaptureFailureKind::InvalidTextEncoding => "output invalid UTF-8",
+                    CaptureFailureKind::InvalidJson => "output invalid JSON",
+                    CaptureFailureKind::DuplicateJsonMember => "output duplicate JSON member",
+                    CaptureFailureKind::JsonSchemaMismatch => "output JSON schema mismatch",
                     CaptureFailureKind::FileCountLimitExceeded => "captured file count limit",
                     CaptureFailureKind::FileSizeLimitExceeded => "captured file size limit",
                     CaptureFailureKind::TotalSizeLimitExceeded => "captured total size limit",
@@ -2121,16 +2112,12 @@ fn completion_detail(detail: String, duration: Option<Duration>) -> String {
 }
 
 fn success_detail(presentation: StepSuccessPresentation, output_count: usize) -> String {
-    let base = match presentation {
-        StepSuccessPresentation::Command => "exit 0",
-        StepSuccessPresentation::AgentResponse => "response captured",
-        StepSuccessPresentation::AgentResult => "result captured",
-        StepSuccessPresentation::AgentWithoutValue => "no requested agent value",
-    };
-    match output_count {
-        0 => base.to_owned(),
-        1 => format!("{base} · 1 output"),
-        count => format!("{base} · {count} outputs"),
+    match (presentation, output_count) {
+        (StepSuccessPresentation::Command, 0) => "exit 0".to_owned(),
+        (StepSuccessPresentation::Command, 1) => "exit 0 · 1 output".to_owned(),
+        (StepSuccessPresentation::Command, count) => format!("exit 0 · {count} outputs"),
+        (StepSuccessPresentation::Agent, 1) => "1 output committed".to_owned(),
+        (StepSuccessPresentation::Agent, count) => format!("{count} outputs committed"),
     }
 }
 

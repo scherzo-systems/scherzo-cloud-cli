@@ -1,0 +1,13 @@
+schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      report:
+        kind: file
+        from: path
+        path: report.bin
+        mediaType: application/octet-stream
+        schema: schemas/result.schema.json

@@ -183,7 +183,7 @@ impl Fixture {
         let admitted = admit_workflow(resolved, imports, context).unwrap();
         let artifacts = ArtifactStaging::create(admitted.execution(), &staging_parent).unwrap();
         let captured = artifacts
-            .capture_files(&[CaptureDeclaration::new(
+            .capture_files(&[CaptureDeclaration::file(
                 "file",
                 Path::new("artifact-source.bin"),
                 "application/x-captured",
@@ -200,11 +200,11 @@ impl Fixture {
         let upstream = BTreeMap::from([
             (
                 output_source("responseProducer", "response", WorkflowValueType::Text),
-                CapturedValue::Text(Arc::from("@ upstream response")),
+                CapturedValue::text(Arc::from("@ upstream response")),
             ),
             (
                 output_source("resultProducer", "result", WorkflowValueType::Json),
-                CapturedValue::Json(Arc::new(json!({"z": 2, "a": 1}))),
+                CapturedValue::json_fixture(Arc::new(json!({"z": 2, "a": 1}))),
             ),
             (
                 output_source("fileProducer", "file", WorkflowValueType::File),
@@ -259,10 +259,10 @@ fn workflow_source(mode: ConsumerValueMode, attachment_splices: usize) -> String
     let consumer_output = match mode {
         ConsumerValueMode::None => String::new(),
         ConsumerValueMode::Response => {
-            "    outputs:\n      response:\n        kind: agent_response\n".to_owned()
+            "    outputs:\n      response:\n        kind: text\n        from: agent_response\n".to_owned()
         }
         ConsumerValueMode::Result => {
-            "    outputs:\n      result:\n        kind: agent_result\n        schema: schemas/result.json\n"
+            "    outputs:\n      result:\n        kind: json\n        from: agent_result\n        schema: schemas/result.json\n"
                 .to_owned()
         }
     };
@@ -287,7 +287,8 @@ steps:
           - file: prompts/message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   resultProducer:
     kind: agent
     agent:
@@ -298,7 +299,8 @@ steps:
           - file: prompts/message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schemas/result.json
   fileProducer:
     kind: cmd
@@ -307,6 +309,7 @@ steps:
     outputs:
       file:
         kind: file
+        from: path
         path: artifact-source.bin
         mediaType: application/x-captured
   consumer:
@@ -583,7 +586,7 @@ fn expanded_attachment_splices_are_bounded_before_staging() {
 
 #[test]
 fn attachment_budget_counts_exact_canonical_json_bytes() {
-    let value = json!({"z": 2, "a": 1});
+    let canonical = br#"{"a":1,"z":2}"#;
     let mut attachments = Vec::new();
     let mut budget = AttachmentBudget {
         count: 0,
@@ -604,7 +607,7 @@ fn attachment_budget_counts_exact_canonical_json_bytes() {
     budget
         .push(
             PlannedAgentAttachment {
-                payload: PlannedAttachment::Json(&value),
+                payload: PlannedAttachment::CanonicalJson(canonical),
                 media_type: Arc::from("application/json"),
                 diagnostic_source_name: None,
             },

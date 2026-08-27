@@ -77,6 +77,21 @@
           "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
           "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
           "executionSpec": {
+            "capacity": {
+              "aggregateRetentionBytes": 12582912,
+              "diagnosticRetentionBytes": 8388608,
+              "encodedOutboxBytes": 38141952,
+              "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+              "generalMaximumTransitions": 8,
+              "maximumInvocations": 1,
+              "maximumRetainedBytesPerInvocation": 4194304,
+              "nativeSessionRetentionBytes": 4194304,
+              "selectedMaximumTransitions": 7,
+              "sourceClosureDigest": {
+                "algorithm": "sha256",
+                "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              }
+            },
             "executionLimits": {
               "cancellationGraceSeconds": 1,
               "maximumParallelSteps": 1

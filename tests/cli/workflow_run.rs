@@ -436,6 +436,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: produced.txt
         mediaType: text/plain
   consume:
@@ -448,6 +449,7 @@ steps:
     outputs:
       result:
         kind: file
+        from: path
         path: exported.txt
         mediaType: text/plain
 exports:
@@ -476,7 +478,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.answer.response
@@ -504,6 +507,7 @@ steps:
     outputs:
       changes:
         kind: git_branch
+        from: workspace
 exports:
   changes:
     ref: outputs.implement.changes
@@ -612,7 +616,8 @@ steps:
           - file: message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json
 exports:
   result:
@@ -659,7 +664,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.answer.response
@@ -686,7 +692,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.answer.response
@@ -734,7 +741,8 @@ steps:
           - file: message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json
 exports:
   result:
@@ -768,7 +776,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   claudeAnswer:
     kind: agent
     dependsOn: [piAnswer]
@@ -780,7 +789,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   claudeResponse:
     ref: outputs.claudeAnswer.response
@@ -821,7 +831,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   claudeAnswer:
     kind: agent
     dependsOn: [piAnswer]
@@ -833,7 +844,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   codexAnswer:
     kind: agent
     dependsOn: [claudeAnswer]
@@ -845,7 +857,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   claudeResponse:
     ref: outputs.claudeAnswer.response
@@ -897,6 +910,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.json
         mediaType: application/json
   package:
@@ -1083,6 +1097,7 @@ finalizers:
     outputs:
       payload:
         kind: file
+        from: path
         path: payload.json
         mediaType: application/json
   consume:
@@ -1096,6 +1111,7 @@ finalizers:
     outputs:
       receipt:
         kind: file
+        from: path
         path: receipt.json
         mediaType: application/json
 exports:
@@ -1193,10 +1209,12 @@ steps:
     outputs:
       first:
         kind: file
+        from: path
         path: first.bin
         mediaType: application/octet-stream
       second:
         kind: file
+        from: path
         path: second.bin
         mediaType: application/octet-stream
 exports:
@@ -1260,6 +1278,7 @@ steps:
     outputs:
       changes:
         kind: git_branch
+        from: workspace
 exports:
   changes:
     ref: outputs.mutate.changes
@@ -1286,7 +1305,7 @@ exports:
 }
 
 #[test]
-fn changed_git_branch_aliases_publish_one_valid_bundle_with_mixed_outputs() {
+fn semantic_outputs_workspace_command_mixed_success() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
 steps:
@@ -1297,17 +1316,15 @@ steps:
     outputs:
       changes:
         kind: git_branch
-      changesAgain:
-        kind: git_branch
+        from: workspace
       report:
         kind: file
+        from: path
         path: report.txt
         mediaType: text/plain
 exports:
   changesAlias:
     ref: outputs.produce.changes
-  changesDistinct:
-    ref: outputs.produce.changesAgain
   changesPrimary:
     ref: outputs.produce.changes
   report:
@@ -1330,7 +1347,6 @@ exports:
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let result = &terminal["result"];
     let alias = &result["exports"]["changesAlias"];
-    let distinct = &result["exports"]["changesDistinct"];
     assert_eq!(alias, &result["exports"]["changesPrimary"]);
     assert_eq!(alias["kind"], "git_branch");
     assert_eq!(alias["artifactVersion"], 1);
@@ -1338,11 +1354,7 @@ exports:
     assert_ne!(alias["baseOid"], alias["headOid"]);
     assert_eq!(alias["carrier"]["path"], "exports/0001");
     assert_eq!(alias["carrier"]["mediaType"], "application/vnd.git.bundle");
-    assert_eq!(distinct["baseOid"], alias["baseOid"]);
-    assert_eq!(distinct["headOid"], alias["headOid"]);
-    assert_eq!(distinct["treeOid"], alias["treeOid"]);
-    assert_eq!(distinct["carrier"]["path"], "exports/0002");
-    assert_eq!(result["exports"]["report"]["path"], "exports/0004");
+    assert_eq!(result["exports"]["report"]["path"], "exports/0003");
     let artifact = attempt_result(&destination);
     let files = fs::read_dir(artifact.join("exports"))
         .unwrap()
@@ -1350,7 +1362,7 @@ exports:
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         files,
-        std::collections::BTreeSet::from(["0001".into(), "0002".into(), "0004".into()])
+        std::collections::BTreeSet::from(["0001".into(), "0003".into()])
     );
     let mut complete_set = result.clone();
     complete_set["exports"]["unavailable"] = serde_json::json!({
@@ -1435,6 +1447,7 @@ steps:
     outputs:
       changes:
         kind: git_branch
+        from: workspace
 exports:
   changes:
     ref: outputs.inspect.changes
@@ -1474,7 +1487,52 @@ exports:
 }
 
 #[test]
-fn agent_step_captures_and_publishes_a_changed_git_branch() {
+fn semantic_outputs_workspace_finalizer_success() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  ordinary:
+    kind: cmd
+    command:
+      argv: ["true"]
+finalizers:
+  publish:
+    kind: cmd
+    when: [succeeded]
+    command:
+      argv: ["/bin/sh", "-c", "set -eu; printf 'finalizer change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m finalizer-change"]
+    outputs:
+      changes:
+        kind: git_branch
+        from: workspace
+exports:
+  changes:
+    ref: outputs.publish.changes
+"#,
+    );
+    initialize_git_repository(bundle.execution_root());
+    let destination = bundle.result("finalizer-git-branch");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = result_json(&destination);
+    let branch = &result["exports"]["changes"];
+    assert_eq!(branch["kind"], "git_branch");
+    assert_ne!(branch["baseOid"], branch["headOid"]);
+    assert!(branch.get("from").is_none());
+    assert_eq!(branch["carrier"]["path"], "exports/0001");
+}
+
+#[test]
+fn semantic_outputs_workspace_agent_success() {
     let execution = format!(
         "printf 'agent change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m agent-change; {}",
         response_pi_execution()
@@ -2660,6 +2718,7 @@ steps:
     outputs:
       seed:
         kind: file
+        from: path
         path: seed.txt
         mediaType: text/plain
   noValue:
@@ -2676,6 +2735,7 @@ steps:
     outputs:
       file:
         kind: file
+        from: path
         path: agent-file.txt
         mediaType: text/plain
   response:
@@ -2691,7 +2751,8 @@ steps:
           - ref: outputs.noValue.file
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   oversizedResponse:
     kind: agent
     dependsOn: [response]
@@ -2703,7 +2764,8 @@ steps:
           - file: message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   result:
     kind: agent
     dependsOn: [oversizedResponse]
@@ -2715,7 +2777,8 @@ steps:
           - ref: outputs.response.response
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json
   oversized:
     kind: agent
@@ -2728,7 +2791,8 @@ steps:
           - file: oversized-message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: oversized-result.schema.json
 exports:
   file:
@@ -3244,7 +3308,7 @@ fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch(
         let cwd_field = cwd.map_or_else(String::new, |cwd| format!("    cwd: {cwd}\n"));
         let output_path = cwd.map_or("command-ran", |_| "nested/command-ran");
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  rebind:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"set -eu; mv \\\"$ROOT_PATH\\\" \\\"$MOVED_ROOT\\\"; mkdir \\\"$ROOT_PATH\\\"; mkdir \\\"$ROOT_PATH/nested\\\"; mkdir \\\"$MOVED_ROOT/nested\\\"\"]\n  affected:\n    kind: cmd\n    dependsOn: [rebind]\n{cwd_field}    command:\n      argv: [\"sh\", \"-c\", \"printf ran > command-ran\"]\n    outputs:\n      marker:\n        kind: file\n        path: {output_path}\n        mediaType: text/plain\n"
+            "schemaVersion: 1\nsteps:\n  rebind:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"set -eu; mv \\\"$ROOT_PATH\\\" \\\"$MOVED_ROOT\\\"; mkdir \\\"$ROOT_PATH\\\"; mkdir \\\"$ROOT_PATH/nested\\\"; mkdir \\\"$MOVED_ROOT/nested\\\"\"]\n  affected:\n    kind: cmd\n    dependsOn: [rebind]\n{cwd_field}    command:\n      argv: [\"sh\", \"-c\", \"printf ran > command-ran\"]\n    outputs:\n      marker:\n        kind: file\n        from: path\n        path: {output_path}\n        mediaType: text/plain\n"
         );
         let bundle = RunBundle::new(&source);
         let normalized_execution_root = fs::canonicalize(&bundle.execution_root).unwrap();
@@ -3411,6 +3475,7 @@ steps:
     outputs:
       prompt:
         kind: file
+        from: path
         path: prompt.txt
         mediaType: text/plain
 exports:
@@ -3461,6 +3526,7 @@ steps:
     outputs:
       attachment:
         kind: file
+        from: path
         path: attachment.bin
         mediaType: application/octet-stream
 exports:

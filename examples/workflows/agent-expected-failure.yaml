@@ -22,4 +22,5 @@ steps:
           - file: prompts/basic-agent-question.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response

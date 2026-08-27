@@ -20,20 +20,20 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
     AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentRenewal,
-    AssignmentStart, PendingAssignmentObservation, WelcomePolicyFailure,
+    AssignmentStart, PendingAssignmentObservation, RetainedObservationFrame, WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::service::control::LiveStatus;
 use crate::runner::service::{Sequence, Sleeper};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use crate::runner_protocol::{
-    CloudFrame, MAXIMUM_ENCODED_FRAME_BYTES, RunnerEnvelope, RunnerFrame, decode_cloud_frame,
-    encode_runner_frame,
+    CloudFrame, MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES, RunnerEnvelope,
+    RunnerFrame, decode_cloud_frame, encode_runner_frame,
 };
 
 const SUBPROTOCOL: &str = "scherzo.runner.v1";
-const MAX_INBOUND_MESSAGE_BYTES: usize = MAXIMUM_ENCODED_FRAME_BYTES;
-const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAXIMUM_ENCODED_FRAME_BYTES;
+const MAX_INBOUND_MESSAGE_BYTES: usize = MAXIMUM_ORDINARY_FRAME_BYTES;
+const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAXIMUM_TERMINAL_FRAME_BYTES;
 const OBSERVATION_WINDOW: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2195,25 +2195,51 @@ where
         },
         None => PendingObservationKind::AssignmentObservation { id: pending.id },
     };
-    let emission = next_sequence.lock_emission().await;
-    let envelope = next_envelope(config, frame_source, boot_id, next_sequence, progress)?;
+    let emission = if pending.retained_frame.is_none() {
+        Some(next_sequence.lock_emission().await)
+    } else {
+        None
+    };
+    let envelope = match &pending.retained_frame {
+        Some(retained) => retained.envelope.clone(),
+        None => next_envelope(config, frame_source, boot_id, next_sequence, progress)?,
+    };
     let sequence = envelope.sequence;
     let message_id = envelope.message_id.clone();
-    let frame = pending.observation.runner_frame(envelope);
-    let encoded = encode_runner_frame(&frame).map_err(|_| {
-        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
-    })?;
+    let frame = pending.observation.runner_frame(envelope.clone());
+    let encoded = match pending.retained_frame {
+        Some(retained) => retained.encoded,
+        None => {
+            let encoded = encode_runner_frame(&frame).map_err(|_| {
+                ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
+            })?;
+            let encoded = String::from_utf8(encoded).map_err(|_| {
+                ConnectionError::terminal(
+                    *progress,
+                    ConnectionCause::EncodeEffectAcknowledgementUtf8,
+                )
+            })?;
+            std::sync::Arc::<str>::from(encoded)
+        }
+    };
     if encoded.len() > MAX_OUTBOUND_MESSAGE_BYTES {
         return Err(ConnectionError::terminal(
             *progress,
             ConnectionCause::EncodeEffectAcknowledgement,
         ));
     }
-    let encoded = std::str::from_utf8(&encoded).map_err(|_| {
-        ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgementUtf8)
-    })?;
+    assignment_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain_observation_frame(
+            pending.id,
+            RetainedObservationFrame {
+                envelope: envelope.clone(),
+                encoded: std::sync::Arc::clone(&encoded),
+            },
+        );
     writer
-        .send(Message::Text(encoded.into()))
+        .send(Message::Text(encoded.as_ref().into()))
         .await
         .map_err(|_| {
             ConnectionError::retryable(*progress, ConnectionCause::SendEffectAcknowledgement)
@@ -2617,7 +2643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_replays_only_unacknowledged_semantics_with_fresh_identity() {
+    async fn reconnect_replays_unacknowledged_terminal_with_same_identity() {
         let context = EstablishedTestContext::new();
         {
             let assignments = context.assignment_manager.lock().unwrap();
@@ -2648,23 +2674,17 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let second: serde_json::Value = serde_json::from_str(
-                first_outbound
-                    .recv()
-                    .await
-                    .expect("second observation")
-                    .to_text()
-                    .unwrap(),
-            )
-            .unwrap();
+            let second = first_outbound.recv().await.expect("second observation");
+            let second_frame = second.to_text().unwrap().to_owned();
+            let second: serde_json::Value = serde_json::from_str(&second_frame).unwrap();
             first_inbound.send(observation_acknowledgement(
                 first["messageId"].as_str().unwrap(),
                 first["sequence"].as_u64().unwrap(),
             ));
             first_inbound.send(Message::Close(None));
-            second
+            (second, second_frame)
         };
-        let (first_result, original) =
+        let (first_result, (original, original_frame)) =
             with_watchdog(async { tokio::join!(first_connection, first_peer) })
                 .await
                 .expect("first connection timed out");
@@ -2693,32 +2713,36 @@ mod tests {
                 .expect("replacement opening hello");
             second_inbound.send(welcome());
             second_inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
-            let replay: serde_json::Value = serde_json::from_str(
-                second_outbound
-                    .recv()
-                    .await
-                    .expect("replayed observation")
-                    .to_text()
-                    .unwrap(),
-            )
-            .unwrap();
+            let replay = second_outbound.recv().await.expect("replayed observation");
+            let replay_frame = replay.to_text().unwrap().to_owned();
+            let replay: serde_json::Value = serde_json::from_str(&replay_frame).unwrap();
             second_inbound.send(Message::Close(None));
-            replay
+            (replay, replay_frame)
         };
-        let (second_result, replay) =
+        let (second_result, (replay, replay_frame)) =
             with_watchdog(async { tokio::join!(second_connection, second_peer) })
                 .await
                 .expect("replacement connection timed out");
         second_result.expect("replacement connection failed");
 
         assert_eq!(
+            replay_frame, original_frame,
+            "unacknowledged replay must preserve the exact encoded frame"
+        );
+        assert_eq!(
             serde_json::to_string(&replay["payload"]).unwrap(),
             original_payload,
             "replay must preserve the complete finalization payload"
         );
-        assert_ne!(replay["messageId"], original["messageId"]);
-        assert_eq!(replay["sequence"], 4);
-        assert_eq!(next_sequence, 5);
+        assert_eq!(
+            replay["messageId"], original["messageId"],
+            "unacknowledged replay must preserve its durable message identity"
+        );
+        assert_eq!(
+            replay["sequence"], original["sequence"],
+            "unacknowledged replay must preserve its durable boot sequence"
+        );
+        assert_eq!(next_sequence, 4, "exact replay must not consume a sequence");
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ steps:
     outputs:
       repaired:
         kind: file
+        from: path
         path: repaired.txt
         mediaType: text/plain
 exports:

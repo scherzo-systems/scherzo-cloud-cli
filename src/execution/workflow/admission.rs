@@ -800,11 +800,6 @@ impl WorkflowExecutionContract {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryExecutionGuard {
-    Runner,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdmittedWorkflowCapacity {
     pub(crate) resolved: WorkflowCapacity,
@@ -1100,7 +1095,6 @@ pub(crate) struct AdmittedWorkflow {
     agent_steps: Arc<BTreeMap<String, AdmittedHarness>>,
     recovery_handlers: Arc<BTreeMap<String, AdmittedHarness>>,
     capacity: AdmittedWorkflowCapacity,
-    recovery_execution_guard: Option<RecoveryExecutionGuard>,
     git_capture: Option<Arc<GitCaptureContext>>,
 }
 
@@ -1135,10 +1129,6 @@ impl AdmittedWorkflow {
 
     pub(crate) fn capacity(&self) -> &AdmittedWorkflowCapacity {
         &self.capacity
-    }
-
-    pub(crate) fn recovery_execution_guard(&self) -> Option<RecoveryExecutionGuard> {
-        self.recovery_execution_guard
     }
 
     pub(crate) fn has_recovery(&self) -> bool {
@@ -1289,7 +1279,6 @@ pub(crate) fn admit_runner_workflow(
         imports,
         context,
         WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1,
-        Some(RecoveryExecutionGuard::Runner),
     )
 }
 
@@ -1303,7 +1292,6 @@ pub(crate) fn admit_workflow(
         imports,
         context,
         WorkflowExecutionContract::General,
-        None,
     )
 }
 
@@ -1312,7 +1300,6 @@ fn admit_workflow_for(
     imports: ResolvedImports,
     context: ExecutionContext,
     execution_contract: WorkflowExecutionContract,
-    recovery_execution_guard: Option<RecoveryExecutionGuard>,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
     let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
     if workflow.required_imports().prompt && imports.prompt().is_none() {
@@ -1511,7 +1498,6 @@ fn admit_workflow_for(
         agent_steps: Arc::new(agent_steps),
         recovery_handlers: Arc::new(recovery_handlers),
         capacity,
-        recovery_execution_guard,
         git_capture,
     })
 }

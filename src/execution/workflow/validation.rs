@@ -35,6 +35,8 @@ pub(crate) enum ValidationFailureKind {
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
     ConflictingAgentValueOutputs,
+    ExcessWorkspaceOutput,
+    DuplicateOutputPath,
     AdvisoryDataDependency,
     InvalidExportTarget,
     AdvisoryExportTarget,
@@ -498,7 +500,7 @@ fn infer_reference_prerequisite(
         ValueReference::Output(reference) => {
             let (producer_role, producer_body, output) =
                 declared_output(document, reference, location.clone())?;
-            if matches!(output, Output::GitBranch) {
+            if matches!(output, Output::GitBranchWorkspace) {
                 return Err(ValidationFailure::new(
                     ValidationFailureKind::TerminalOutputReference,
                     location,
@@ -577,10 +579,40 @@ fn validate_node_outputs(
     role: WorkflowNodeRole,
     body: &NodeBody,
 ) -> Result<(), ValidationFailure> {
+    let common = common_node(body);
+    let mut paths = BTreeSet::new();
+    let mut workspace_count = 0;
+    for (output_name, output) in &common.outputs {
+        if let Some(path) = output_path(output)
+            && !paths.insert(path)
+        {
+            return Err(output_failure(
+                ValidationFailureKind::DuplicateOutputPath,
+                name,
+                role,
+                output_name,
+            ));
+        }
+        if matches!(output, Output::GitBranchWorkspace) {
+            workspace_count += 1;
+            if workspace_count > 1 {
+                return Err(output_failure(
+                    ValidationFailureKind::ExcessWorkspaceOutput,
+                    name,
+                    role,
+                    output_name,
+                ));
+            }
+        }
+    }
+
     match body {
         NodeBody::Command(command) => {
             for (output_name, output) in &command.common.outputs {
-                if !matches!(output, Output::File { .. } | Output::GitBranch) {
+                if matches!(
+                    output,
+                    Output::TextAgentResponse | Output::JsonAgentResult { .. }
+                ) {
                     return Err(output_failure(
                         ValidationFailureKind::IllegalCommandOutput,
                         name,
@@ -595,7 +627,7 @@ fn validate_node_outputs(
             let mut result_count = 0;
             for (output_name, output) in &agent.common.outputs {
                 let failure_kind = match output {
-                    Output::AgentResponse => {
+                    Output::TextAgentResponse => {
                         response_count += 1;
                         if response_count > 1 {
                             Some(ValidationFailureKind::ExcessAgentResponseOutput)
@@ -604,7 +636,7 @@ fn validate_node_outputs(
                                 .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
                         }
                     }
-                    Output::AgentResult { .. } => {
+                    Output::JsonAgentResult { .. } => {
                         result_count += 1;
                         if result_count > 1 {
                             Some(ValidationFailureKind::ExcessAgentResultOutput)
@@ -613,7 +645,10 @@ fn validate_node_outputs(
                                 .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
                         }
                     }
-                    Output::File { .. } | Output::GitBranch => None,
+                    Output::TextPath { .. }
+                    | Output::JsonPath { .. }
+                    | Output::FilePath { .. }
+                    | Output::GitBranchWorkspace => None,
                 };
                 if let Some(kind) = failure_kind {
                     return Err(output_failure(kind, name, role, output_name));
@@ -622,6 +657,17 @@ fn validate_node_outputs(
         }
     }
     Ok(())
+}
+
+fn output_path(output: &Output) -> Option<&str> {
+    match output {
+        Output::TextPath { path }
+        | Output::JsonPath { path, .. }
+        | Output::FilePath { path, .. } => Some(path),
+        Output::TextAgentResponse | Output::JsonAgentResult { .. } | Output::GitBranchWorkspace => {
+            None
+        }
+    }
 }
 
 fn output_failure(
@@ -1131,10 +1177,10 @@ fn node_output_location(name: &str, role: WorkflowNodeRole, output: &str) -> Val
 
 fn output_value_type(output: &Output) -> WorkflowValueType {
     match output {
-        Output::AgentResponse => WorkflowValueType::Text,
-        Output::AgentResult { .. } => WorkflowValueType::Json,
-        Output::File { .. } => WorkflowValueType::File,
-        Output::GitBranch => WorkflowValueType::GitBranch,
+        Output::TextPath { .. } | Output::TextAgentResponse => WorkflowValueType::Text,
+        Output::JsonPath { .. } | Output::JsonAgentResult { .. } => WorkflowValueType::Json,
+        Output::FilePath { .. } => WorkflowValueType::File,
+        Output::GitBranchWorkspace => WorkflowValueType::GitBranch,
     }
 }
 

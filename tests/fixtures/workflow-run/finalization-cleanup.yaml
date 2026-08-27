@@ -17,6 +17,7 @@ finalizers:
     outputs:
       receipt:
         kind: file
+        from: path
         path: receipt.json
         mediaType: application/json
   notify:

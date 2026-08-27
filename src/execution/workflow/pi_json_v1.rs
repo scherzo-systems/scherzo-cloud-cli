@@ -13,7 +13,7 @@ use super::admission::CancellationReason;
 use super::agent::{
     AgentDiagnosticLevel, AgentFailure, AgentFailureCause, AgentHarnessFailureDetail,
     AgentLifecycleMilestone, AgentObservation, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
 use super::strict_json;
@@ -143,7 +143,7 @@ pub(crate) struct AcceptedPiJsonV1Result {
     call_id: Arc<str>,
     tool_name: Arc<str>,
     arguments: Arc<Value>,
-    result: BoundedSchemaValidAgentResult,
+    result: CapturedJson,
 }
 
 impl AcceptedPiJsonV1Result {
@@ -151,7 +151,7 @@ impl AcceptedPiJsonV1Result {
         call_id: Arc<str>,
         tool_name: Arc<str>,
         arguments: Arc<Value>,
-        result: BoundedSchemaValidAgentResult,
+        result: CapturedJson,
     ) -> Self {
         Self {
             call_id,

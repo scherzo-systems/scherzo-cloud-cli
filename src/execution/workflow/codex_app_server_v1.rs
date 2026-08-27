@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentHarnessSetupStage,
     AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation,
 };
 use super::strict_json;
@@ -322,7 +322,7 @@ pub(super) struct CodexAppServerV1Parser {
     native_error: Option<NativeErrorObservation>,
     truncated_provider_stream_seen: bool,
     pending_result_candidate: Option<Arc<Value>>,
-    accepted_result: Option<BoundedSchemaValidAgentResult>,
+    accepted_result: Option<CapturedJson>,
     native_terminal: Option<NativeTerminal>,
     failure: Option<AgentFailureCause>,
     observations: Vec<AgentObservation>,
@@ -461,7 +461,7 @@ impl CodexAppServerV1Parser {
 
     pub(super) fn accept_result(
         &mut self,
-        result: BoundedSchemaValidAgentResult,
+        result: CapturedJson,
     ) -> Result<ParserProgress, AgentFailureCause> {
         if !self.result_validation_is_ready() {
             return self.fail_current_phase();
@@ -2226,7 +2226,7 @@ impl CodexAppServerV1Parser {
             "effort": self.effort.as_ref(),
         });
         if self.value_kind == AgentValueKind::Result {
-            params["outputSchema"] = weak_result_schema();
+            params["outputSchema"] = weak_json_schema();
         }
         self.queue_request(self.turn_start_request, "turn/start", params)
     }
@@ -2378,7 +2378,7 @@ fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
     strict_json::from_str(&envelope.0).map_err(|_| ())
 }
 
-fn weak_result_schema() -> Value {
+fn weak_json_schema() -> Value {
     json!({
         "type": "object",
         "properties": {

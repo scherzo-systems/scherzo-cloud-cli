@@ -64,6 +64,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.txt
         mediaType: text/plain
   consume:
@@ -74,6 +75,7 @@ steps:
     outputs:
       receipt:
         kind: file
+        from: path
         path: receipt.txt
         mediaType: text/plain
 ",
@@ -585,6 +587,17 @@ async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
         active: ActiveStepInvocation::RecoveryHandler {
             round: RecoveryRoundNumber::fixture(1),
         },
+        active_invocation_id: ActionId {
+            transition_sequence: TransitionSequence(2),
+        },
+        settled_invocation: Some((
+            ActionId {
+                transition_sequence: TransitionSequence(1),
+            },
+            ActiveStepInvocation::Target {
+                execution_number: TargetExecutionNumber::fixture(1),
+            },
+        )),
         configured_rounds: 2,
         handler_kind: Some(RecoveryHandlerKind::Command),
         handler_state: Some(RecoveryHandlerActivity::Running),
@@ -606,6 +619,17 @@ async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
         active: ActiveStepInvocation::Target {
             execution_number: TargetExecutionNumber::fixture(2),
         },
+        active_invocation_id: ActionId {
+            transition_sequence: TransitionSequence(3),
+        },
+        settled_invocation: Some((
+            ActionId {
+                transition_sequence: TransitionSequence(2),
+            },
+            ActiveStepInvocation::RecoveryHandler {
+                round: RecoveryRoundNumber::fixture(1),
+            },
+        )),
         configured_rounds: 2,
         handler_kind: Some(RecoveryHandlerKind::Command),
         handler_state: None,
@@ -783,6 +807,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         content_digest: workflow.content_digest.clone(),
         execution_root: workflow.source.source_root.clone(),
         maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
+        cloud_capacity: None,
         timing: WorkflowRunTiming {
             started_at: point(base, 0).utc,
             finished_at: point(base, 90).utc,
@@ -799,7 +824,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "report".to_owned(),
-                        CapturedValue::Text(Arc::from("captured")),
+                        CapturedValue::text(Arc::from("captured")),
                     )]),
                 },
                 timing: Some(WorkflowStepTiming {
@@ -818,7 +843,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 state: StepState::Succeeded {
                     outputs: BTreeMap::from([(
                         "receipt".to_owned(),
-                        CapturedValue::Text(Arc::from("captured")),
+                        CapturedValue::text(Arc::from("captured")),
                     )]),
                 },
                 timing: Some(WorkflowStepTiming {

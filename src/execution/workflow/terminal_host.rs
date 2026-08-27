@@ -2464,6 +2464,7 @@ fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<Inspecto
             handler_kind,
             handler_state,
             decision,
+            ..
         } => Some(InspectorField::new(
             "recovery",
             recovery_progress_detail(
@@ -2529,11 +2530,15 @@ fn output_disposition(
 }
 
 fn output_description(output: &WorkflowOutput) -> (&'static str, String) {
+    (semantic_output_kind(output), "—".to_owned())
+}
+
+fn semantic_output_kind(output: &WorkflowOutput) -> &'static str {
     match output {
-        WorkflowOutput::AgentResponse => ("agent_response", "—".to_owned()),
-        WorkflowOutput::AgentResult { schema } => ("agent_result", visible_text(schema)),
-        WorkflowOutput::File { path, .. } => ("file", visible_text(path)),
-        WorkflowOutput::GitBranch => ("git_branch", "—".to_owned()),
+        WorkflowOutput::TextPath { .. } | WorkflowOutput::TextAgentResponse => "text",
+        WorkflowOutput::JsonPath { .. } | WorkflowOutput::JsonAgentResult { .. } => "json",
+        WorkflowOutput::FilePath { .. } => "file",
+        WorkflowOutput::GitBranchWorkspace => "git_branch",
     }
 }
 
@@ -2878,6 +2883,7 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
             handler_kind,
             handler_state,
             decision,
+            ..
         }) => Some(recovery_progress_detail(
             *active,
             *configured_rounds,
@@ -5963,7 +5969,7 @@ mod tests {
                     None,
                     WorkflowRunOutputDisposition::Pending,
                 ),
-                ["pending", "file", "report.txt"].as_slice(),
+                ["pending", "file", "—"].as_slice(),
             ),
             (
                 direct_command_step(
@@ -6128,7 +6134,7 @@ mod tests {
             let name = format!("report-{index}");
             outputs.insert(
                 name.clone(),
-                Output::File {
+                Output::FilePath {
                     path: format!("{name}.txt"),
                     media_type: "text/plain".to_owned(),
                 },
@@ -6176,7 +6182,7 @@ mod tests {
         let dependencies_y = row_containing(&rows, "depends on");
         let outputs_y = row_containing(&rows, "OUTPUTS");
         let summary_y = row_containing(&rows, "✓  report  file");
-        let detail_y = row_containing(&rows, "report.txt");
+        let detail_y = summary_y + 1;
 
         assert_eq!(cwd_y, command_y + 1);
         assert_eq!(started_y, cwd_y + 1);
@@ -6185,6 +6191,7 @@ mod tests {
         assert!(rows[outputs_y - 1].contains('─'));
         assert_eq!(summary_y, outputs_y + 2);
         assert_eq!(detail_y, summary_y + 1);
+        assert!(rows[detail_y].contains('—'));
         assert!(rows[detail_y + 1].replace('│', "").trim().is_empty());
         assert!(rows[summary_y].contains("captured"));
         let (marker_x, marker_y) = buffer_position(&buffer, "✓  report");
@@ -7281,6 +7288,7 @@ finalizers:
             content_digest: workflow.content_digest.clone(),
             execution_root: workflow.source.source_root.clone(),
             maximum_parallel_steps: NonZeroUsize::new(1).unwrap(),
+            cloud_capacity: None,
             timing: WorkflowRunTiming {
                 started_at: started.utc,
                 finished_at: started.utc + duration,
@@ -7681,7 +7689,7 @@ finalizers:
         timing: Option<WorkflowRunElapsed>,
         output_disposition: WorkflowRunOutputDisposition,
     ) -> WorkflowRunStepView {
-        let output = Output::File {
+        let output = Output::FilePath {
             path: "report.txt".to_owned(),
             media_type: "text/plain".to_owned(),
         };

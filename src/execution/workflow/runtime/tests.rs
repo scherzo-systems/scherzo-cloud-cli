@@ -505,7 +505,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     fs::create_dir(&execution_root).unwrap();
     fs::write(
         source_root.join("workflow.yaml"),
-        "schemaVersion: 1\nsteps:\n  zeta:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  alpha:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        path: report.txt\n        mediaType: text/plain\n",
+        "schemaVersion: 1\nsteps:\n  zeta:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  alpha:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        from: path\n        path: report.txt\n        mediaType: text/plain\n",
     )
     .unwrap();
     let admitted = admit_workflow(
@@ -559,6 +559,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.txt
         mediaType: text/plain
 ",
@@ -4358,6 +4359,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.txt
         mediaType: text/plain
 "#,

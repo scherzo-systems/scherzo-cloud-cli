@@ -616,6 +616,21 @@ pub(crate) fn assignment_offer() -> Message {
                         "objectFormat": "sha1",
                         "commitOid": "0123456789abcdef0123456789abcdef01234567",
                         "materializationContract": "git_full_clone_v1"
+                    },
+                    "capacity": {
+                        "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+                        "sourceClosureDigest": {
+                            "algorithm": "sha256",
+                            "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        },
+                        "generalMaximumTransitions": 8,
+                        "selectedMaximumTransitions": 7,
+                        "maximumInvocations": 1,
+                        "maximumRetainedBytesPerInvocation": 4194304,
+                        "diagnosticRetentionBytes": 8388608,
+                        "nativeSessionRetentionBytes": 4194304,
+                        "aggregateRetentionBytes": 12582912,
+                        "encodedOutboxBytes": 38141952
                     }
                 }
             }

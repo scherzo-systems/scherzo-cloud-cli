@@ -25,7 +25,7 @@ use crate::execution::workflow::admission::{CancellationReason, CancellationSour
 use crate::execution::workflow::agent::{
     AgentInvocation, AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext,
     AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver, AgentValueMode,
-    PositiveDuration, RetainedResultSchema, StagedAgentAttachment, agent_start_channel,
+    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, agent_start_channel,
     agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
@@ -502,7 +502,7 @@ async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation(
         let schema_bytes = Arc::<[u8]>::from(serde_json::to_vec(&schema_document).unwrap());
         let value_mode = AgentValueMode::Result {
             output: Arc::from("result"),
-            schema: RetainedResultSchema::compile(schema_bytes, Arc::new(schema_document)).unwrap(),
+            schema: RetainedJsonSchema::compile(schema_bytes, Arc::new(schema_document)).unwrap(),
         };
         let limits = conformance_limits();
         let observations = RecordingObservationSink::default();

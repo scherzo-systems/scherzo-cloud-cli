@@ -23,7 +23,6 @@ use super::agent::{
 };
 use super::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
-use super::canonical_json;
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::codex::CodexConfig;
@@ -44,7 +43,7 @@ use super::recovery::{
     MAXIMUM_RECOVERY_DECISION_BYTES, RECOVERY_AGENT_INSTRUCTIONS, RECOVERY_CONTEXT_VARIABLE,
     RECOVERY_DECISION_SCHEMA_JSON, recovery_handler_cwd,
 };
-use super::result_validation::RetainedResultSchema;
+use super::result_validation::RetainedJsonSchema;
 use super::step_runtime::{WorkingDirectoryFailure, resolve_working_directory};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedMessageSource,
@@ -581,7 +580,6 @@ enum AgentMaterializationBoundaryInternal {
 
 enum PlannedAttachment<'a> {
     Bytes(&'a [u8]),
-    Json(&'a Value),
     CanonicalJson(&'a [u8]),
     Artifact(&'a CapturedArtifact),
 }
@@ -829,7 +827,7 @@ where
         serde_json::from_str::<Value>(RECOVERY_DECISION_SCHEMA_JSON)
             .map_err(|_| start_error(AgentInputStartFailure::InvalidValueMode))?,
     );
-    let schema = RetainedResultSchema::compile(
+    let schema = RetainedJsonSchema::compile(
         Arc::from(RECOVERY_DECISION_SCHEMA_JSON.as_bytes()),
         schema_document,
     )
@@ -1200,7 +1198,7 @@ fn resolve_attachments<'a>(
             )));
             let attachment = match (value_type, value) {
                 (WorkflowValueType::Json, CapturedValue::Json(value)) => PlannedAgentAttachment {
-                    payload: PlannedAttachment::Json(value),
+                    payload: PlannedAttachment::CanonicalJson(value.carrier()),
                     media_type: Arc::from("application/json"),
                     diagnostic_source_name,
                 },
@@ -1255,15 +1253,6 @@ fn planned_attachment_size(
             .ok_or_else(|| {
                 start_error(AgentInputStartFailure::AttachmentBytesLimitExceeded { maximum })
             }),
-        PlannedAttachment::Json(value) => match canonical_json::encoded_size(value, remaining) {
-            Ok(bytes) => Ok(bytes),
-            Err(canonical_json::CanonicalJsonError::SizeLimitExceeded) => Err(start_error(
-                AgentInputStartFailure::AttachmentBytesLimitExceeded { maximum },
-            )),
-            Err(canonical_json::CanonicalJsonError::SerializationFailed) => {
-                Err(start_error(AgentInputStartFailure::InputsUnavailable))
-            }
-        },
         PlannedAttachment::CanonicalJson(bytes) => u64::try_from(bytes.len())
             .ok()
             .filter(|bytes| *bytes <= remaining)
@@ -1287,13 +1276,13 @@ fn resolve_value_mode(
     let mut mode = None;
     for (output, definition) in &step.common.outputs {
         let candidate = match &definition.definition {
-            Output::AgentResponse => Some(AgentValueMode::Response {
+            Output::TextAgentResponse => Some(AgentValueMode::Response {
                 output: Arc::from(output.as_str()),
             }),
-            Output::AgentResult { .. } => {
+            Output::JsonAgentResult { .. } => {
                 let schema = admitted
                     .workflow()
-                    .result_schema(step_name, output)
+                    .json_schema(step_name, output)
                     .cloned()
                     .ok_or_else(|| {
                         start_error(AgentInputStartFailure::ResultSchemaUnavailable {
@@ -1305,7 +1294,10 @@ fn resolve_value_mode(
                     schema,
                 })
             }
-            Output::File { .. } | Output::GitBranch => None,
+            Output::TextPath { .. }
+            | Output::JsonPath { .. }
+            | Output::FilePath { .. }
+            | Output::GitBranchWorkspace => None,
         };
         if let Some(candidate) = candidate {
             if mode.is_some() {
@@ -1385,7 +1377,6 @@ fn stage_attachments(
         let mut destination = create_payload_file(&view.attachment_directory, &payload_name)?;
         let write_result = match &attachment.payload {
             PlannedAttachment::Bytes(bytes) => write_bytes(&mut destination, bytes, cancellation),
-            PlannedAttachment::Json(value) => write_json(&mut destination, value, cancellation),
             PlannedAttachment::CanonicalJson(bytes) => {
                 write_bytes(&mut destination, bytes, cancellation)
             }
@@ -1451,16 +1442,6 @@ fn write_bytes(
         destination.write_all(chunk).map_err(|_| staging_error())?;
     }
     check_cancellation(cancellation)
-}
-
-fn write_json(
-    destination: &mut File,
-    value: &Value,
-    cancellation: &CancellationSource,
-) -> Result<(), AgentInputMaterializationError> {
-    let mut writer = CancellationWriter::new(destination, cancellation);
-    let result = canonical_json::to_writer(&mut writer, value);
-    writer.finish(result.map_err(io::Error::other))
 }
 
 fn write_artifact(

@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn accepts_supported_cloud_outputs() {
         let accepted = contract_result(
-            "schemaVersion: 1\nsteps:\n  capture:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      branch:\n        kind: git_branch\nexports:\n  branch:\n    ref: outputs.capture.branch\n",
+            "schemaVersion: 1\nsteps:\n  capture:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      branch:\n        kind: git_branch\n        from: workspace\nexports:\n  branch:\n    ref: outputs.capture.branch\n",
         )
         .unwrap();
         assert_eq!(accepted.definition.exports.len(), 1);

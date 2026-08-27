@@ -400,7 +400,6 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         resolved.capacity.requirements.general_maximum_transitions
     );
     assert_eq!(local.capacity().resolved, resolved.capacity);
-    assert_eq!(local.recovery_execution_guard(), None);
     assert_eq!(local.recovery_handlers().len(), 1);
 
     let runner = admit_runner_workflow(
@@ -425,10 +424,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         runner.capacity().execution_contract.as_str(),
         "workflow_v1_inputless_cloud_artifacts@1"
     );
-    assert_eq!(
-        runner.recovery_execution_guard(),
-        Some(RecoveryExecutionGuard::Runner)
-    );
+    assert!(runner.has_recovery());
 }
 
 #[test]

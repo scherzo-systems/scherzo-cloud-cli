@@ -29,7 +29,8 @@ steps:
           - file: prompts/plan-message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   implement:
     kind: agent
     dependsOn: [plan]
@@ -41,7 +42,8 @@ steps:
           - ref: outputs.plan.response
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   review:
     kind: agent
     dependsOn: [implement]
@@ -53,7 +55,8 @@ steps:
           - ref: outputs.implement.response
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.review.response

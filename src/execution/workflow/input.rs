@@ -10,11 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use rustix::fs::{AtFlags, Mode, chmodat, mkdirat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
-use serde_json::Value;
 
 use super::admission::{AdmittedExecutionContext, ResolvedAttachment};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging};
-use super::canonical_json;
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
 #[cfg(test)]
 use super::private_staging::CleanupBlocker;
@@ -492,7 +490,7 @@ impl InputStaging {
                     let destination = root.join(&relative_path);
                     let manifest = match (*expected_type, value) {
                         (WorkflowValueType::Text, CapturedValue::Text(text)) => {
-                            write_bytes_read_only(&destination, text.as_bytes())
+                            write_bytes_read_only(&destination, text.carrier())
                                 .map_err(|_| staging_for_input(input_identity))?;
                             ManifestInput::scalar(
                                 "text",
@@ -501,7 +499,7 @@ impl InputStaging {
                             )
                         }
                         (WorkflowValueType::Json, CapturedValue::Json(json)) => {
-                            write_canonical_json_read_only(&destination, json).map_err(|_| {
+                            write_bytes_read_only(&destination, json.carrier()).map_err(|_| {
                                 InputPreparationFailure::for_input(
                                     input_identity,
                                     InputPreparationFailureKind::StagingUnavailable,
@@ -702,14 +700,10 @@ impl MaterializationPlan {
                 } => {
                     let size = match (*expected_type, value) {
                         (WorkflowValueType::Text, CapturedValue::Text(text)) => {
-                            byte_length(text.as_bytes(), input_identity)?
+                            byte_length(text.carrier(), input_identity)?
                         }
                         (WorkflowValueType::Json, CapturedValue::Json(json)) => {
-                            canonical_json_size(
-                                json,
-                                staging.inner.maximum_value_bytes,
-                                input_identity,
-                            )?
+                            byte_length(json.carrier(), input_identity)?
                         }
                         (WorkflowValueType::File, CapturedValue::File(file)) => file.size(),
                         _ => {
@@ -780,30 +774,6 @@ struct ManifestItem {
     #[serde(rename = "mediaType")]
     media_type: String,
     path: String,
-}
-
-fn canonical_json_size(
-    value: &Value,
-    maximum: u64,
-    input_identity: &str,
-) -> Result<u64, InputPreparationFailure> {
-    canonical_json::encoded_size(value, maximum).map_err(|failure| {
-        let kind = match failure {
-            canonical_json::CanonicalJsonError::SizeLimitExceeded => {
-                InputPreparationFailureKind::ValueSizeLimitExceeded
-            }
-            canonical_json::CanonicalJsonError::SerializationFailed => {
-                InputPreparationFailureKind::SourceUnavailable
-            }
-        };
-        InputPreparationFailure::for_input(input_identity, kind)
-    })
-}
-
-fn write_canonical_json_read_only(path: &Path, value: &Value) -> io::Result<()> {
-    let mut destination = create_payload_file(path)?;
-    canonical_json::to_writer(&mut destination, value).map_err(io::Error::other)?;
-    finish_payload_file(destination)
 }
 
 fn add_value_count(

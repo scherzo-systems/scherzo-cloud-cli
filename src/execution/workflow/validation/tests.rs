@@ -50,6 +50,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.json
         mediaType: application/json
   summarize:
@@ -115,6 +116,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.json
         mediaType: application/json
 exports:
@@ -210,6 +212,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: one.txt
         mediaType: text/plain
   two:
@@ -222,6 +225,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: two.txt
         mediaType: text/plain
 ";
@@ -501,6 +505,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: value.txt
         mediaType: text/plain
 ";
@@ -525,6 +530,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: alpha.txt
         mediaType: text/plain
   beta:
@@ -534,6 +540,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: beta.txt
         mediaType: text/plain
   middle:
@@ -589,6 +596,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: value.txt
         mediaType: text/plain
   middle:
@@ -638,6 +646,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: value.txt
         mediaType: text/plain
 exports:
@@ -704,9 +713,11 @@ steps:
           - file: prompts/message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
       file:
         kind: file
+        from: path
         path: artifact.bin
         mediaType: application/octet-stream
   resultProducer:
@@ -719,7 +730,8 @@ steps:
           - file: prompts/message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schemas/result.json
   consumer:
     kind: agent
@@ -786,13 +798,16 @@ steps:
           - file: prompts/message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
       file:
         kind: file
+        from: path
         path: artifact.bin
         mediaType: application/octet-stream
       ignored:
         kind: file
+        from: path
         path: ignored.bin
         mediaType: application/octet-stream
   resultProducer:
@@ -805,7 +820,8 @@ steps:
           - file: prompts/message.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schemas/result.json
   consumer:
     kind: agent
@@ -988,6 +1004,7 @@ steps:
     outputs:
       changes:
         kind: git_branch
+        from: workspace
 ";
     let exported = format!("{producer}exports:\n  changes:\n    ref: outputs.produce.changes\n");
     let workflow = validate_yaml(&exported).unwrap();
@@ -1025,7 +1042,7 @@ steps:
         ),
     ] {
         let agent = format!(
-            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      changes:\n        kind: git_branch\n  consume:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n{message}\n"
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      changes:\n        kind: git_branch\n        from: workspace\n  consume:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n{message}\n"
         );
         assert_failure(
             &agent,
@@ -1033,6 +1050,64 @@ steps:
             location,
         );
     }
+}
+
+#[test]
+fn semantic_outputs_definition_rejects_duplicate_paths_and_excess_workspace_sources() {
+    let duplicate_path = r#"schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      first:
+        kind: text
+        from: path
+        path: value
+      second:
+        kind: file
+        from: path
+        path: value
+        mediaType: application/octet-stream
+"#;
+    assert_failure(
+        duplicate_path,
+        ValidationFailureKind::DuplicateOutputPath,
+        ValidationLocation::StepOutput {
+            step: "produce".to_owned(),
+            output: "second".to_owned(),
+        },
+    );
+
+    let excess_workspace = r#"schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      first:
+        kind: git_branch
+        from: workspace
+      second:
+        kind: git_branch
+        from: workspace
+"#;
+    assert_failure(
+        excess_workspace,
+        ValidationFailureKind::ExcessWorkspaceOutput,
+        ValidationLocation::StepOutput {
+            step: "produce".to_owned(),
+            output: "second".to_owned(),
+        },
+    );
+
+    let equal_paths_in_different_nodes = duplicate_path.replace(
+        "      second:\n        kind: file\n        from: path\n        path: value\n        mediaType: application/octet-stream\n",
+        "  consume:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      second:\n        kind: file\n        from: path\n        path: value\n        mediaType: application/octet-stream\n",
+    );
+    assert!(validate_yaml(&equal_paths_in_different_nodes).is_ok());
 }
 
 #[test]
@@ -1047,7 +1122,7 @@ fn output_kind_and_agent_cardinality_rules_are_enforced() {
     command_step
         .common
         .outputs
-        .insert("response".to_owned(), Output::AgentResponse);
+        .insert("response".to_owned(), Output::TextAgentResponse);
     let failure = super::validate(command).unwrap_err();
     assert_eq!(failure.kind(), ValidationFailureKind::IllegalCommandOutput);
     assert_eq!(
@@ -1077,9 +1152,11 @@ steps:
           - file: prompts/message.md
     outputs:
       first:
-        kind: agent_response
+        kind: text
+        from: agent_response
       second:
-        kind: agent_response
+        kind: text
+        from: agent_response
 ";
     assert_failure(
         two_responses,
@@ -1091,8 +1168,8 @@ steps:
     );
 
     let two_results = two_responses.replace(
-        "kind: agent_response",
-        "kind: agent_result\n        schema: schemas/result.json",
+        "kind: text\n        from: agent_response",
+        "kind: json\n        from: agent_result\n        schema: schemas/result.json",
     );
     assert_failure(
         &two_results,
@@ -1104,8 +1181,8 @@ steps:
     );
 
     let conflicting_values = two_responses.replacen(
-        "kind: agent_response",
-        "kind: agent_result\n        schema: schemas/result.json",
+        "kind: text\n        from: agent_response",
+        "kind: json\n        from: agent_result\n        schema: schemas/result.json",
         1,
     );
     assert_failure(
@@ -1129,6 +1206,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.txt
         mediaType: text/plain
 exports:
@@ -1228,7 +1306,7 @@ finalizers:
 }
 
 #[test]
-fn valid_finalizers_resolve_separate_role_aware_graphs() {
+fn semantic_outputs_ordinary_finalizer_parity() {
     let source = "schemaVersion: 1
 steps:
   later:
@@ -1241,6 +1319,7 @@ steps:
     outputs:
       value:
         kind: file
+        from: path
         path: value.json
         mediaType: application/json
 finalizers:
@@ -1263,6 +1342,7 @@ finalizers:
     outputs:
       result:
         kind: file
+        from: path
         path: result.json
         mediaType: application/json
 exports:
@@ -1271,7 +1351,7 @@ exports:
 ";
     let source = source.replace(
         "    command: { argv: [\"true\"] }\n  cleanup:",
-        "    command: { argv: [\"true\"] }\n    outputs:\n      result:\n        kind: file\n        path: report.json\n        mediaType: application/json\n  cleanup:",
+        "    command: { argv: [\"true\"] }\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: report.json\n        mediaType: application/json\n  cleanup:",
     );
     let workflow = validate_yaml(&source).unwrap();
 
@@ -1390,13 +1470,13 @@ finalizers:
     inputs: { value: { ref: outputs.two.value } }
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: one.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: one.txt, mediaType: text/plain }
   two:
     kind: cmd
     inputs: { value: { ref: outputs.one.value } }
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: two.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: two.txt, mediaType: text/plain }
 ";
     assert_failure(
         data_cycle,
@@ -1418,7 +1498,7 @@ finalizers:
     kind: cmd
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: value.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: value.txt, mediaType: text/plain }
 ";
     assert_failure(
         ordinary_reads_finalizer,
@@ -1440,7 +1520,7 @@ finalizers:
     when: [succeeded]
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: value.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: value.txt, mediaType: text/plain }
   consume:
     kind: cmd
     inputs: { value: { ref: outputs.produce.value } }
@@ -1462,7 +1542,7 @@ steps:
     failurePolicy: advisory
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: value.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: value.txt, mediaType: text/plain }
 finalizers:
   consume:
     kind: cmd
@@ -1514,7 +1594,7 @@ finalizers:
     when: [TRIGGER]
     command: { argv: [\"true\"] }
     outputs:
-      value: { kind: file, path: value.txt, mediaType: text/plain }
+      value: { kind: file, from: path, path: value.txt, mediaType: text/plain }
 exports:
   value: { ref: outputs.report.value }
 ";

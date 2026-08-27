@@ -22,7 +22,8 @@ steps:
           - file: prompts/parallel-alpha.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
   beta:
     kind: agent
@@ -34,7 +35,8 @@ steps:
           - file: prompts/parallel-beta.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
   gamma:
     kind: agent
@@ -46,7 +48,8 @@ steps:
           - file: prompts/parallel-gamma.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
   combine:
     kind: agent
@@ -61,7 +64,8 @@ steps:
           - ref: outputs.gamma.response
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
 exports:
   response:

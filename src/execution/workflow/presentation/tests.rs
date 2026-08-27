@@ -256,6 +256,7 @@ impl Fixture {
             content_digest: self.digest.clone(),
             execution_root: self.execution_root.clone(),
             maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
+            cloud_capacity: None,
             timing: WorkflowRunTiming {
                 started_at,
                 finished_at: timestamp("2026-08-02T12:01:45.25Z"),
@@ -870,6 +871,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.txt
         mediaType: text/plain
 ",
@@ -906,9 +908,7 @@ steps:
 
     let output = stdout.text();
     assert!(
-        output
-            .find("produce    output      report · file → report.txt")
-            .unwrap()
+        output.find("produce    output      report · file").unwrap()
             < output
                 .find("produce    done        exit 0 · 1 output after 2.2s")
                 .unwrap()
@@ -916,7 +916,7 @@ steps:
 }
 
 #[tokio::test]
-async fn agent_success_uses_declared_value_kind_in_live_and_summary_details() {
+async fn agent_success_uses_semantic_output_count_in_live_and_summary_details() {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     std::fs::create_dir(&source_root).unwrap();
@@ -941,7 +941,8 @@ steps:
           - file: message.md
     outputs:
       plan:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schema.json
 ",
     )
@@ -974,8 +975,8 @@ steps:
         .await;
 
     let output = stdout.text();
-    assert!(output.contains("plan       output      plan · agent_result → schema.json"));
-    assert!(output.contains("plan       done        result captured · 1 output"));
+    assert!(output.contains("plan       output      plan · json"));
+    assert!(output.contains("plan       done        1 output committed"));
 
     let step = WorkflowRunStep {
         id: "plan".to_owned(),
@@ -985,7 +986,7 @@ steps:
         state: StepState::Succeeded {
             outputs: BTreeMap::from([(
                 "plan".to_owned(),
-                CapturedValue::Json(Arc::new(Value::Object(serde_json::Map::new()))),
+                CapturedValue::json_fixture(Arc::new(Value::Object(serde_json::Map::new()))),
             )]),
         },
         timing: None,
@@ -993,8 +994,8 @@ steps:
         recovery: None,
         invocations: Vec::new(),
     };
-    let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::AgentResult).unwrap();
-    assert_eq!(summary_detail, "result captured · 1 output");
+    let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::Agent).unwrap();
+    assert_eq!(summary_detail, "1 output committed");
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@ use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
 use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_workflow_capacity};
-use super::result_validation::{ResultSchemaSupportFailure, RetainedResultSchema};
+use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
 use super::schema_common::lowercase_hex;
 use super::validated::{
     RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
@@ -150,7 +150,7 @@ pub(crate) struct WorkflowSourceProvenance {
 pub(crate) struct ResolvedWorkflow {
     pub(crate) definition: ValidatedWorkflow,
     pub(crate) source_closure: BTreeMap<String, Arc<[u8]>>,
-    result_schemas: BTreeMap<(String, String), RetainedResultSchema>,
+    json_schemas: BTreeMap<(String, String), RetainedJsonSchema>,
     pub(crate) source: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
     pub(crate) capacity: WorkflowCapacity,
@@ -170,9 +170,8 @@ impl ResolvedWorkflow {
             .is_ok_and(|digest| digest == self.content_digest && self.capacity.is_bound_to(&digest))
     }
 
-    pub(crate) fn result_schema(&self, step: &str, output: &str) -> Option<&RetainedResultSchema> {
-        self.result_schemas
-            .get(&(step.to_owned(), output.to_owned()))
+    pub(crate) fn json_schema(&self, step: &str, output: &str) -> Option<&RetainedJsonSchema> {
+        self.json_schemas.get(&(step.to_owned(), output.to_owned()))
     }
 
     pub(crate) fn requires_git_capture(&self) -> bool {
@@ -192,7 +191,7 @@ impl ResolvedWorkflow {
                 };
                 outputs
                     .values()
-                    .any(|output| matches!(output.definition, Output::GitBranch))
+                    .any(|output| matches!(output.definition, Output::GitBranchWorkspace))
             })
     }
 }
@@ -288,7 +287,7 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         ));
     };
-    let result_schemas = resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
+    let json_schemas = resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
 
     let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
@@ -311,7 +310,7 @@ fn resolve_loaded_workflow(
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
-        result_schemas,
+        json_schemas,
         source: WorkflowSourceProvenance {
             source_root,
             workflow_path: workflow_source.canonical_path,
@@ -582,8 +581,8 @@ fn resolve_static_sources(
     definition: &mut ValidatedWorkflow,
     workflow_directory: &Path,
     sources: &mut SourceResolver,
-) -> Result<BTreeMap<(String, String), RetainedResultSchema>, ResolutionFailure> {
-    let mut result_schemas = BTreeMap::new();
+) -> Result<BTreeMap<(String, String), RetainedJsonSchema>, ResolutionFailure> {
+    let mut json_schemas = BTreeMap::new();
     let ValidatedWorkflow {
         steps,
         recoveries,
@@ -611,7 +610,7 @@ fn resolve_static_sources(
             step,
             workflow_directory,
             sources,
-            &mut result_schemas,
+            &mut json_schemas,
         )?;
     }
     for (node_name, finalizer) in finalizers {
@@ -621,10 +620,10 @@ fn resolve_static_sources(
             &mut finalizer.body,
             workflow_directory,
             sources,
-            &mut result_schemas,
+            &mut json_schemas,
         )?;
     }
-    Ok(result_schemas)
+    Ok(json_schemas)
 }
 
 fn resolve_node_static_sources(
@@ -633,47 +632,53 @@ fn resolve_node_static_sources(
     node: &mut ValidatedStep,
     workflow_directory: &Path,
     sources: &mut SourceResolver,
-    result_schemas: &mut BTreeMap<(String, String), RetainedResultSchema>,
+    json_schemas: &mut BTreeMap<(String, String), RetainedJsonSchema>,
 ) -> Result<(), ResolutionFailure> {
-    let ValidatedStep::Agent(agent_node) = node else {
-        return Ok(());
+    if let ValidatedStep::Agent(agent_node) = node {
+        let system_location = match role {
+            WorkflowNodeRole::Step => ResolutionLocation::SystemPrompt {
+                step: node_name.to_owned(),
+            },
+            WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerSystemPrompt {
+                finalizer: node_name.to_owned(),
+            },
+        };
+        agent_node.agent.system_prompt = resolve_text_source(
+            &agent_node.agent.system_prompt,
+            workflow_directory,
+            sources,
+            system_location,
+        )?;
+
+        resolve_message_files(
+            node_name,
+            role,
+            &mut agent_node.agent.message.text,
+            MessageFileKind::Text,
+            workflow_directory,
+            sources,
+        )?;
+        resolve_message_files(
+            node_name,
+            role,
+            &mut agent_node.agent.message.attachments,
+            MessageFileKind::Attachment,
+            workflow_directory,
+            sources,
+        )?;
+    }
+
+    let outputs = match node {
+        ValidatedStep::Command(node) => &mut node.common.outputs,
+        ValidatedStep::Agent(node) => &mut node.common.outputs,
     };
-
-    let system_location = match role {
-        WorkflowNodeRole::Step => ResolutionLocation::SystemPrompt {
-            step: node_name.to_owned(),
-        },
-        WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerSystemPrompt {
-            finalizer: node_name.to_owned(),
-        },
-    };
-    agent_node.agent.system_prompt = resolve_text_source(
-        &agent_node.agent.system_prompt,
-        workflow_directory,
-        sources,
-        system_location,
-    )?;
-
-    resolve_message_files(
-        node_name,
-        role,
-        &mut agent_node.agent.message.text,
-        MessageFileKind::Text,
-        workflow_directory,
-        sources,
-    )?;
-    resolve_message_files(
-        node_name,
-        role,
-        &mut agent_node.agent.message.attachments,
-        MessageFileKind::Attachment,
-        workflow_directory,
-        sources,
-    )?;
-
-    for (output_name, output) in &mut agent_node.common.outputs {
-        let Output::AgentResult { schema } = &mut output.definition else {
-            continue;
+    for (output_name, output) in outputs {
+        let schema = match &mut output.definition {
+            Output::JsonPath { schema, .. } | Output::JsonAgentResult { schema } => schema,
+            Output::TextPath { .. }
+            | Output::TextAgentResponse
+            | Output::FilePath { .. }
+            | Output::GitBranchWorkspace => continue,
         };
         let location = match role {
             WorkflowNodeRole::Step => ResolutionLocation::ResultSchema {
@@ -686,9 +691,9 @@ fn resolve_node_static_sources(
             },
         };
         let (canonical_path, retained) =
-            resolve_result_schema(schema, workflow_directory, sources, location)?;
+            resolve_json_schema(schema, workflow_directory, sources, location)?;
         *schema = canonical_path;
-        result_schemas.insert((node_name.to_owned(), output_name.clone()), retained);
+        json_schemas.insert((node_name.to_owned(), output_name.clone()), retained);
     }
     Ok(())
 }
@@ -773,12 +778,12 @@ fn resolve_binary_source(
         .map(|loaded| loaded.canonical_path)
 }
 
-fn resolve_result_schema(
+fn resolve_json_schema(
     source_path: &str,
     workflow_directory: &Path,
     sources: &mut SourceResolver,
     location: ResolutionLocation,
-) -> Result<(String, RetainedResultSchema), ResolutionFailure> {
+) -> Result<(String, RetainedJsonSchema), ResolutionFailure> {
     let loaded = load_utf8_static_source(
         source_path,
         workflow_directory,
@@ -793,15 +798,15 @@ fn resolve_result_schema(
         )
     })?);
     let retained =
-        RetainedResultSchema::compile(Arc::clone(&loaded.bytes), schema).map_err(|failure| {
+        RetainedJsonSchema::compile(Arc::clone(&loaded.bytes), schema).map_err(|failure| {
             let kind = match failure {
-                ResultSchemaSupportFailure::Dialect => {
+                JsonSchemaSupportFailure::Dialect => {
                     ResolutionFailureKind::InvalidResultSchemaDialect
                 }
-                ResultSchemaSupportFailure::Reference => {
+                JsonSchemaSupportFailure::Reference => {
                     ResolutionFailureKind::InvalidResultSchemaReference
                 }
-                ResultSchemaSupportFailure::Schema => ResolutionFailureKind::InvalidResultSchema,
+                JsonSchemaSupportFailure::Schema => ResolutionFailureKind::InvalidResultSchema,
             };
             ResolutionFailure::new(kind, location)
         })?;

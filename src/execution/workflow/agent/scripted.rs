@@ -9,9 +9,10 @@ use super::{
     AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInvocation,
     AgentInvocationIdentity, AgentObservation, AgentObservationEmissionError, AgentObservationSink,
     AgentOutcome, AgentStartCallback, AgentStartReportError, AgentTerminalCallback,
-    AgentTerminalReportError, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    AgentTerminalReportError, AgentValueKind, AgentValueMode, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome,
 };
+use crate::execution::workflow::canonical_json;
 use crate::execution::workflow::claude_code::ClaudeCodeConfig;
 use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
 use crate::execution::workflow::codex::CodexConfig;
@@ -533,17 +534,7 @@ where
             CompletedAgentInvocation::Response(BoundedAgentResponse::from_bounded(value))
         }
         ScriptedAgentValue::Result(value) => {
-            let bytes = serde_json::to_vec(value.as_ref())
-                .map_err(|_| ScriptedAgentError::WrongValueMode)?;
-            if u64::try_from(bytes.len()).map_or(true, |bytes| {
-                bytes > invocation.limits().maximum_result_bytes().get()
-            }) {
-                return Err(ScriptedAgentError::ValueTooLarge);
-            }
-            CompletedAgentInvocation::Result(BoundedSchemaValidAgentResult::fixture(
-                value,
-                Arc::from(bytes),
-            ))
+            CompletedAgentInvocation::Result(captured_json(invocation, value)?)
         }
         ScriptedAgentValue::RawResult(bytes) => {
             if u64::try_from(bytes.len()).map_or(true, |bytes| {
@@ -551,14 +542,36 @@ where
             }) {
                 return Err(ScriptedAgentError::ValueTooLarge);
             }
-            let value = serde_json::from_slice(bytes.as_ref())
-                .map(Arc::new)
+            serde_json::from_slice::<Value>(&bytes)
                 .map_err(|_| ScriptedAgentError::WrongValueMode)?;
-            CompletedAgentInvocation::Result(BoundedSchemaValidAgentResult::fixture(value, bytes))
+            CompletedAgentInvocation::RawResult(bytes)
         }
     };
     *provisional = Some(completed);
     Ok(())
+}
+
+fn captured_json<Configuration, ProtocolLimits, Sink>(
+    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
+    value: Arc<Value>,
+) -> Result<CapturedJson, ScriptedAgentError>
+where
+    Sink: AgentObservationSink,
+{
+    let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
+        return Err(ScriptedAgentError::WrongValueMode);
+    };
+    let carrier =
+        canonical_json::to_bounded_bytes(&value, invocation.limits().maximum_result_bytes().get())
+            .map_err(|failure| match failure {
+                canonical_json::CanonicalJsonError::SizeLimitExceeded => {
+                    ScriptedAgentError::ValueTooLarge
+                }
+                canonical_json::CanonicalJsonError::SerializationFailed => {
+                    ScriptedAgentError::WrongValueMode
+                }
+            })?;
+    Ok(CapturedJson::from_validated(value, carrier, schema.clone()))
 }
 
 fn completed_outcome<Configuration, ProtocolLimits, Sink>(
@@ -571,7 +584,8 @@ where
     match (invocation.value_mode().kind(), provisional) {
         (AgentValueKind::None, None) => AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
         (AgentValueKind::Response, Some(completed @ CompletedAgentInvocation::Response(_)))
-        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::Result(_))) => {
+        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::Result(_)))
+        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::RawResult(_))) => {
             AgentOutcome::Completed(completed)
         }
         (AgentValueKind::Response, None) => {

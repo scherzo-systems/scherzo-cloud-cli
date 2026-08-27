@@ -28,7 +28,6 @@ use super::agent::{AgentFailure, AgentFailureCause, AgentProtocolRejectionDiagno
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind, StagedCarrier};
 use super::artifact_set;
-use super::canonical_json;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
 use super::execution_root::open_directory;
@@ -118,6 +117,7 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) content_digest: WorkflowContentDigest,
     pub(crate) execution_root: PathBuf,
     pub(crate) maximum_parallel_steps: NonZeroUsize,
+    pub(crate) cloud_capacity: Option<CloudExecutionCapacityV1>,
     pub(crate) timing: WorkflowRunTiming,
     pub(crate) outcome: RunOutcome<StepFailureCause>,
     pub(crate) cancellation: Option<WorkflowRunCancellation>,
@@ -395,6 +395,25 @@ pub(crate) enum WorkflowProvenanceV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CloudExecutionCapacityV1 {
+    pub(crate) execution_contract: String,
+    pub(crate) source_closure_digest: DigestV1,
+    // Portable results and Runner frames are independently closed schemas; keeping this
+    // flat projection explicit prevents either wire contract from becoming the other's ABI.
+    // jscpd:ignore-start
+    pub(crate) general_maximum_transitions: u64,
+    pub(crate) selected_maximum_transitions: u64,
+    pub(crate) maximum_invocations: u64,
+    pub(crate) maximum_retained_bytes_per_invocation: u64,
+    pub(crate) diagnostic_retention_bytes: u64,
+    pub(crate) native_session_retention_bytes: u64,
+    pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) encoded_outbox_bytes: u64,
+    // jscpd:ignore-end
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowExecutionV1 {
     #[serde(
         default,
@@ -403,6 +422,12 @@ pub(crate) struct WorkflowExecutionV1 {
     )]
     pub(crate) execution_root: Option<String>,
     pub(crate) maximum_parallel_steps: usize,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) capacity: Option<CloudExecutionCapacityV1>,
     pub(crate) started_at: String,
     pub(crate) finished_at: String,
     pub(crate) duration_milliseconds: u64,
@@ -937,6 +962,10 @@ pub(crate) enum FailureCodeV1 {
     OutputParentNotDirectory,
     OutputNotRegularFile,
     OutputSourceUnavailable,
+    OutputInvalidUtf8,
+    OutputInvalidJson,
+    OutputDuplicateJsonMember,
+    OutputJsonSchemaMismatch,
     CapturedFileCountLimit,
     CapturedFileSizeLimit,
     CapturedTotalSizeLimit,
@@ -1416,13 +1445,15 @@ fn cloud_available_export(
             "text",
             "text/plain; charset=utf-8",
             &path,
-            Arc::from(text.as_bytes()),
+            Arc::from(text.carrier()),
         )?,
-        CapturedValue::Json(value) => {
-            let mut encoded = Vec::new();
-            canonical_json::to_writer(&mut encoded, value).map_err(|_| export_write_error(name))?;
-            byte_backed_cloud_export(name, "json", "application/json", &path, Arc::from(encoded))?
-        }
+        CapturedValue::Json(value) => byte_backed_cloud_export(
+            name,
+            "json",
+            "application/json",
+            &path,
+            Arc::from(value.carrier()),
+        )?,
         CapturedValue::GitBranch(branch) => {
             let branch_metadata = branch.metadata();
             let carrier = branch.carrier().map(|carrier| GitBranchCarrierV1 {
@@ -1736,13 +1767,7 @@ fn unavailable_export(
 }
 
 fn captured_type_matches(value_type: WorkflowValueType, output: &CapturedValue) -> bool {
-    matches!(
-        (value_type, output),
-        (WorkflowValueType::File, CapturedValue::File(_))
-            | (WorkflowValueType::Text, CapturedValue::Text(_))
-            | (WorkflowValueType::Json, CapturedValue::Json(_))
-            | (WorkflowValueType::GitBranch, CapturedValue::GitBranch(_))
-    )
+    value_type == output.value_type()
 }
 
 fn write_available_export(
@@ -1792,24 +1817,12 @@ fn write_available_export(
         CapturedValue::Text(text) => (
             "text",
             "text/plain; charset=utf-8".to_owned(),
-            u64::try_from(text.len()).map_err(|_| {
-                LocalPublicationError::for_export(
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::UnsupportedExport,
-                    name,
-                )
-            })?,
+            semantic_export_size(text.carrier(), name)?,
         ),
         CapturedValue::Json(value) => (
             "json",
             "application/json".to_owned(),
-            canonical_json::encoded_size(value, u64::MAX).map_err(|_| {
-                LocalPublicationError::for_export(
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::UnsupportedExport,
-                    name,
-                )
-            })?,
+            semantic_export_size(value.carrier(), name)?,
         ),
         CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
             return Err(LocalPublicationError::for_export(
@@ -1831,9 +1844,10 @@ fn write_available_export(
         };
         match output {
             CapturedValue::Text(text) => hashing
-                .write_all(text.as_bytes())
+                .write_all(text.carrier())
                 .map_err(|_| export_write_error(name))?,
-            CapturedValue::Json(value) => canonical_json::to_writer(&mut hashing, value)
+            CapturedValue::Json(value) => hashing
+                .write_all(value.carrier())
                 .map_err(|_| export_write_error(name))?,
             CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
                 return Err(LocalPublicationError::for_export(
@@ -1980,6 +1994,16 @@ fn expose_staged_carrier(
     )
 }
 
+fn semantic_export_size(carrier: &[u8], export: &str) -> Result<u64, LocalPublicationError> {
+    u64::try_from(carrier.len()).map_err(|_| {
+        LocalPublicationError::for_export(
+            LocalPublicationPhase::ExportCopy,
+            LocalPublicationFailureKind::UnsupportedExport,
+            export,
+        )
+    })
+}
+
 fn export_write_error(export: &str) -> LocalPublicationError {
     LocalPublicationError::for_export(
         LocalPublicationPhase::ExportCopy,
@@ -2059,6 +2083,7 @@ fn build_result_with_provenance(
         execution: WorkflowExecutionV1 {
             execution_root: None,
             maximum_parallel_steps: run.maximum_parallel_steps.get(),
+            capacity: run.cloud_capacity.clone(),
             started_at: timestamp(run.timing.started_at)?,
             finished_at: timestamp(run.timing.finished_at)?,
             duration_milliseconds: duration_milliseconds(run.timing.duration)?,
@@ -2716,6 +2741,10 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
                 CaptureFailureKind::NotDirectory => FailureCodeV1::OutputParentNotDirectory,
                 CaptureFailureKind::NotRegularFile => FailureCodeV1::OutputNotRegularFile,
                 CaptureFailureKind::SourceUnavailable => FailureCodeV1::OutputSourceUnavailable,
+                CaptureFailureKind::InvalidTextEncoding => FailureCodeV1::OutputInvalidUtf8,
+                CaptureFailureKind::InvalidJson => FailureCodeV1::OutputInvalidJson,
+                CaptureFailureKind::DuplicateJsonMember => FailureCodeV1::OutputDuplicateJsonMember,
+                CaptureFailureKind::JsonSchemaMismatch => FailureCodeV1::OutputJsonSchemaMismatch,
                 CaptureFailureKind::FileCountLimitExceeded => FailureCodeV1::CapturedFileCountLimit,
                 CaptureFailureKind::FileSizeLimitExceeded => FailureCodeV1::CapturedFileSizeLimit,
                 CaptureFailureKind::TotalSizeLimitExceeded => FailureCodeV1::CapturedTotalSizeLimit,

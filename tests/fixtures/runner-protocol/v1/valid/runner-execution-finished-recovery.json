@@ -1,0 +1,60 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abg",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 7,
+  "sentAt": "2026-07-23T00:00:02Z",
+  "type": "execution_finished",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abk",
+    "finalExecutionEventSequence": 6,
+    "outcome": {
+      "outcome": "failed",
+      "failure": {
+        "node": {
+          "id": "verify",
+          "role": "step"
+        },
+        "failure": {
+          "phase": "execution",
+          "cause": "command_unsuccessful_exit",
+          "exitCode": 1
+        }
+      },
+      "recoverySummaries": {
+        "verify": {
+          "schemaVersion": 1,
+          "configuredRetries": 1,
+          "rounds": [
+            {
+              "number": 1,
+              "failedExecution": {
+                "executionNumber": 1,
+                "invocationId": 1,
+                "failure": {
+                  "phase": "execution",
+                  "cause": {
+                    "code": "command_exit",
+                    "exitCode": 1
+                  }
+                }
+              }
+            }
+          ],
+          "termination": {
+            "kind": "exhausted",
+            "executionNumber": 2
+          }
+        }
+      }
+    },
+    "artifactDelivery": {
+      "outcome": "prepared",
+      "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abm"
+    }
+  }
+}

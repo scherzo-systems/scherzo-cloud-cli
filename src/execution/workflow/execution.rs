@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::{Future, ready};
 
-use super::admission::{AdmittedWorkflow, RecoveryExecutionGuard};
+use super::admission::AdmittedWorkflow;
 use super::artifact::ArtifactStaging;
 use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
 use super::diagnostic::StepDiagnosticLog;
@@ -87,7 +87,7 @@ fn observed_step_transition<Deadline>(
     event: &TransitionEvent<StepFailureCause, Deadline>,
     state: &RuntimeState<StepFailureCause, CapturedValue, Deadline>,
 ) -> Option<ObservedStepTransition> {
-    let TransitionEvent::Step { step, to, .. } = event else {
+    let TransitionEvent::Step { step, from, to, .. } = event else {
         return None;
     };
     let runtime = state.steps.get(step)?;
@@ -102,7 +102,23 @@ fn observed_step_transition<Deadline>(
         .as_ref()
         .filter(|recovery| !recovery.rounds.is_empty())
         && let Some(active) = runtime.active_invocation
+        && let Some(active_invocation_id) = runtime.current_action
     {
+        let settled_invocation = if matches!(
+            from,
+            StepStateKind::Running | StepStateKind::CapturingOutputs
+        ) {
+            recovery.rounds.last().map(|round| {
+                (
+                    round.failed_execution.invocation,
+                    super::runtime::ActiveStepInvocation::Target {
+                        execution_number: round.failed_execution.execution_number,
+                    },
+                )
+            })
+        } else {
+            None
+        };
         let handler_state = match runtime.state {
             StepState::Recovering { handler, .. } => Some(handler),
             _ => None,
@@ -126,6 +142,8 @@ fn observed_step_transition<Deadline>(
         });
         return Some(ObservedStepTransition::Recovery {
             active,
+            active_invocation_id,
+            settled_invocation,
             configured_rounds: recovery.configured_rounds,
             handler_kind: recovery.handler_kind,
             handler_state,
@@ -193,11 +211,6 @@ where
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
     // jscpd:ignore-end
 {
-    if admitted.has_recovery()
-        && admitted.recovery_execution_guard() == Some(RecoveryExecutionGuard::Runner)
-    {
-        return Err(CoordinationError::RunnerRecoveryExecutionGuardActive);
-    }
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
     let coordinated = execute_workflow_observed(

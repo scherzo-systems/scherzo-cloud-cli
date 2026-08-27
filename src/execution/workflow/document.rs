@@ -126,10 +126,12 @@ pub(crate) struct OutputReference {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Output {
-    AgentResponse,
-    AgentResult { schema: String },
-    File { path: String, media_type: String },
-    GitBranch,
+    TextPath { path: String },
+    TextAgentResponse,
+    JsonPath { path: String, schema: String },
+    JsonAgentResult { schema: String },
+    FilePath { path: String, media_type: String },
+    GitBranchWorkspace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

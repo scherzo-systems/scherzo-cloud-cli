@@ -27,7 +27,8 @@ use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationSource, EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle,
-    ResolvedImports, admit_runner_workflow, default_execution_policy_limits,
+    ResolvedImports, WorkflowCapacityBudget, admit_runner_workflow,
+    default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
@@ -41,7 +42,7 @@ use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner_protocol::{
     AssignmentDecline, ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
-    ExecutionSpecV1RunnerProjection, MAXIMUM_ENCODED_FRAME_BYTES,
+    ExecutionSpecV1RunnerProjection, MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES,
     PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope, RunnerFrame, RunnerUnableReason,
     WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
 };
@@ -51,6 +52,15 @@ pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 105_185_280;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
+
+fn encoded_outbox_reservation(selected_maximum_transitions: u64) -> Option<u64> {
+    selected_maximum_transitions
+        .checked_add(u64::try_from(OBSERVATION_RESERVE_BASE).ok()?)?
+        .checked_mul(u64::try_from(MAXIMUM_ORDINARY_FRAME_BYTES).ok()?)?
+        .checked_add(
+            u64::try_from(MAXIMUM_TERMINAL_FRAME_BYTES - MAXIMUM_ORDINARY_FRAME_BYTES).ok()?,
+        )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentOffer {
@@ -391,9 +401,16 @@ impl AssignmentObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RetainedObservationFrame {
+    pub(super) envelope: RunnerEnvelope,
+    pub(super) encoded: Arc<str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PendingAssignmentObservation {
     pub(super) id: u64,
     pub(super) observation: AssignmentObservation,
+    pub(super) retained_frame: Option<RetainedObservationFrame>,
 }
 
 impl PendingAssignmentObservation {
@@ -408,8 +425,11 @@ impl PendingAssignmentObservation {
 struct ObservationEntry {
     id: u64,
     observation: AssignmentObservation,
+    encoded_bytes: usize,
+    large_terminal: bool,
     replayable: bool,
     encoded: bool,
+    retained_frame: Option<RetainedObservationFrame>,
 }
 
 struct ObservationOutboxState {
@@ -448,13 +468,17 @@ impl ObservationOutbox {
         transition_entries: usize,
         encoded_outbox_bytes: u64,
     ) -> Result<usize, AssignmentDecline> {
-        if encoded_outbox_bytes > self.maximum_encoded_bytes {
-            return Err(environment_unavailable());
-        }
         let reservation = transition_entries
             .checked_add(OBSERVATION_RESERVE_BASE)
             .ok_or_else(environment_unavailable)?;
-        if reservation > MAXIMUM_SERVICE_OBSERVATIONS {
+        let required_bytes = encoded_outbox_reservation(
+            u64::try_from(transition_entries).map_err(|_| environment_unavailable())?,
+        )
+        .ok_or_else(environment_unavailable)?;
+        if encoded_outbox_bytes != required_bytes
+            || required_bytes > self.maximum_encoded_bytes
+            || reservation > MAXIMUM_SERVICE_OBSERVATIONS
+        {
             return Err(environment_unavailable());
         }
         let mut state = self.lock();
@@ -479,12 +503,31 @@ impl ObservationOutbox {
         let encoded = encode_runner_frame(&observation.runner_frame(sizing_envelope))
             .map_err(|_| OutboxFailure::Encoding)?;
         // Leave room for the longest service-generated sequence and RFC 3339 timestamp.
-        if encoded.len().saturating_add(64) > MAXIMUM_ENCODED_FRAME_BYTES {
+        let encoded_bytes = encoded
+            .len()
+            .checked_add(64)
+            .ok_or(OutboxFailure::Encoding)?;
+        let large_terminal = encoded_bytes > MAXIMUM_ORDINARY_FRAME_BYTES;
+        if encoded_bytes > MAXIMUM_TERMINAL_FRAME_BYTES
+            || (large_terminal && !observation.is_terminal())
+        {
             return Err(OutboxFailure::Encoding);
         }
 
         let mut state = self.lock();
-        if state.entries.len() == MAXIMUM_SERVICE_OBSERVATIONS {
+        let retained_bytes = state.entries.iter().try_fold(0_u64, |total, entry| {
+            total.checked_add(u64::try_from(entry.encoded_bytes).ok()?)
+        });
+        if state.entries.len() == MAXIMUM_SERVICE_OBSERVATIONS
+            || retained_bytes
+                .and_then(|total| total.checked_add(u64::try_from(encoded_bytes).ok()?))
+                .is_none_or(|total| total > self.maximum_encoded_bytes)
+            || (large_terminal
+                && state.entries.iter().any(|entry| {
+                    entry.large_terminal
+                        && entry.observation.assignment_id() == observation.assignment_id()
+                }))
+        {
             return Err(OutboxFailure::Capacity);
         }
         let id = state.next_id;
@@ -495,8 +538,11 @@ impl ObservationOutbox {
         state.entries.push_back(ObservationEntry {
             id,
             observation,
+            encoded_bytes,
+            large_terminal,
             replayable: true,
             encoded: false,
+            retained_frame: None,
         });
         drop(state);
         self.changed.notify_waiters();
@@ -516,6 +562,7 @@ impl ObservationOutbox {
             .map(|entry| PendingAssignmentObservation {
                 id: entry.id,
                 observation: entry.observation.clone(),
+                retained_frame: entry.retained_frame.clone(),
             })
             .collect()
     }
@@ -524,6 +571,14 @@ impl ObservationOutbox {
         let mut state = self.lock();
         let index = state.entries.iter().position(|entry| entry.id == id)?;
         state.entries.remove(index).map(|entry| entry.observation)
+    }
+
+    fn retain_frame(&self, id: u64, retained_frame: RetainedObservationFrame) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|entry| entry.id == id)
+            && entry.retained_frame.is_none()
+        {
+            entry.retained_frame = Some(retained_frame);
+        }
     }
 
     fn mark_encoded(&self, id: u64) {
@@ -905,6 +960,7 @@ impl AdmissionRuntime {
         git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
     ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
         let prepared = (|| {
+            validate_carried_capacity(&offer.execution_spec, &workflow)?;
             let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
             let cloud_git_capture = git_capture.is_some();
             let context = build_execution_context(
@@ -918,11 +974,14 @@ impl AdmissionRuntime {
             )?;
             let admitted = admit_runner_workflow(workflow, ResolvedImports::default(), context)
                 .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
-            let requirements = admitted.capacity().resolved.requirements;
+            let carried = &offer.execution_spec.capacity;
+            if admitted.capacity().maximum_transitions != carried.selected_maximum_transitions {
+                return Err(capacity_binding_invalid());
+            }
             let transition_budget = self.outbox.reserve(
-                usize::try_from(admitted.capacity().maximum_transitions)
+                usize::try_from(carried.selected_maximum_transitions)
                     .map_err(|_| environment_unavailable())?,
-                requirements.encoded_outbox_bytes,
+                carried.encoded_outbox_bytes,
             )?;
             Ok((admitted, transition_budget))
         })();
@@ -1002,6 +1061,7 @@ impl AssignmentManager {
             Arc::new(super::TokioSleeper),
             work_root,
             false,
+            None,
         )
     }
 
@@ -1011,9 +1071,18 @@ impl AssignmentManager {
         boot_id: String,
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
+        recorder: Arc<crate::runner::telemetry::Recorder>,
     ) -> Self {
         let work_root = fixture_work_root(config, &boot_id);
-        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, true)
+        Self::new_inner(
+            config,
+            boot_id,
+            lease_clock,
+            sleeper,
+            work_root,
+            true,
+            Some(recorder),
+        )
     }
 
     pub(super) fn new_with_sleeper_and_work_root(
@@ -1022,8 +1091,17 @@ impl AssignmentManager {
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
         work_root: Arc<WorkRootLease>,
+        recorder: Arc<crate::runner::telemetry::Recorder>,
     ) -> Self {
-        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, true)
+        Self::new_inner(
+            config,
+            boot_id,
+            lease_clock,
+            sleeper,
+            work_root,
+            true,
+            Some(recorder),
+        )
     }
 
     #[cfg(test)]
@@ -1034,7 +1112,15 @@ impl AssignmentManager {
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
         let work_root = fixture_work_root(config, &boot_id);
-        Self::new_inner(config, boot_id, lease_clock, sleeper, work_root, false)
+        Self::new_inner(
+            config,
+            boot_id,
+            lease_clock,
+            sleeper,
+            work_root,
+            false,
+            None,
+        )
     }
 
     fn new_inner(
@@ -1044,6 +1130,7 @@ impl AssignmentManager {
         sleeper: Arc<dyn Sleeper>,
         work_root: Arc<WorkRootLease>,
         guard_processes: bool,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
     ) -> Self {
         let (event_sender, events) = mpsc::unbounded_channel();
         let outbox = ObservationOutbox::new();
@@ -1067,6 +1154,10 @@ impl AssignmentManager {
                 &boot_id,
             )
             .ok()
+            .map(|broker| match &recorder {
+                Some(recorder) => broker.with_recorder(Arc::clone(recorder)),
+                None => broker,
+            })
             .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>),
             #[cfg(test)]
             fixture_materialized_source: config.fixture_materialized_source().cloned(),
@@ -1355,9 +1446,11 @@ impl AssignmentManager {
                 return self.reject_and_cleanup(offer, root, decline);
             }
         };
+        let mut fixture_offer = offer.clone();
+        align_fixture_capacity(&mut fixture_offer.execution_spec, &workflow);
         match self
             .admission_runtime()
-            .finish(&offer, root, workflow, None)
+            .finish(&fixture_offer, root, workflow, None)
         {
             Ok(accepted) => {
                 self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
@@ -1742,6 +1835,14 @@ impl AssignmentManager {
             }
         }
         self.outbox.wake();
+    }
+
+    pub(super) fn retain_observation_frame(
+        &self,
+        id: u64,
+        retained_frame: RetainedObservationFrame,
+    ) {
+        self.outbox.retain_frame(id, retained_frame);
     }
 
     pub(super) fn mark_observation_encoded(&self, id: u64) {
@@ -2546,6 +2647,72 @@ impl AssignmentManager {
 }
 
 #[cfg(test)]
+fn align_fixture_capacity(
+    execution_spec: &mut ExecutionSpecV1RunnerProjection,
+    workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
+) {
+    let digest = &workflow.capacity.source_closure_digest;
+    let requirements = workflow.capacity.requirements;
+    let projected_digest = crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+        algorithm: digest.algorithm.as_str().to_owned(),
+        value: digest.value.clone(),
+    };
+    execution_spec
+        .workflow_definition_source
+        .workflow_source_closure_digest = projected_digest.clone();
+    execution_spec.capacity = crate::runner_protocol::ExecutionCapacityV1RunnerProjection {
+        execution_contract: "workflow_v1_inputless_cloud_artifacts@1".to_owned(),
+        source_closure_digest: projected_digest,
+        general_maximum_transitions: requirements.general_maximum_transitions,
+        selected_maximum_transitions: requirements.cloud_maximum_transitions,
+        maximum_invocations: requirements.maximum_invocations,
+        maximum_retained_bytes_per_invocation: requirements.maximum_retained_bytes_per_invocation,
+        diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
+        native_session_retention_bytes: requirements.native_session_retention_bytes,
+        aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+        encoded_outbox_bytes: requirements.encoded_outbox_bytes,
+    };
+}
+
+fn validate_carried_capacity(
+    execution_spec: &ExecutionSpecV1RunnerProjection,
+    workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
+) -> Result<(), AssignmentDecline> {
+    let carried = &execution_spec.capacity;
+    let resolved = workflow.capacity.requirements;
+    let digest = &workflow.capacity.source_closure_digest;
+    if carried.source_closure_digest.algorithm != digest.algorithm.as_str()
+        || carried.source_closure_digest.value != digest.value
+        || carried.source_closure_digest
+            != execution_spec
+                .workflow_definition_source
+                .workflow_source_closure_digest
+    {
+        return Err(AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch,
+        ));
+    }
+    if carried.execution_contract != "workflow_v1_inputless_cloud_artifacts@1"
+        || carried.general_maximum_transitions != resolved.general_maximum_transitions
+        || carried.selected_maximum_transitions != resolved.cloud_maximum_transitions
+        || carried.maximum_invocations != resolved.maximum_invocations
+        || carried.maximum_retained_bytes_per_invocation
+            != resolved.maximum_retained_bytes_per_invocation
+        || carried.diagnostic_retention_bytes != resolved.diagnostic_retention_bytes
+        || carried.native_session_retention_bytes != resolved.native_session_retention_bytes
+        || carried.aggregate_retention_bytes != resolved.aggregate_retention_bytes
+        || carried.encoded_outbox_bytes != resolved.encoded_outbox_bytes
+    {
+        return Err(capacity_binding_invalid());
+    }
+    Ok(())
+}
+
+fn capacity_binding_invalid() -> AssignmentDecline {
+    AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowAdmissionInvalid)
+}
+
+#[cfg(test)]
 fn fixture_work_root(config: &Config, boot_id: &str) -> Arc<WorkRootLease> {
     match WorkRootLease::acquire(config.assignment().work_root(), boot_id) {
         Ok(work_root) => work_root,
@@ -2574,13 +2741,21 @@ fn build_execution_context(
     } else {
         ExecutionRootLifecycle::EngineOwnedEphemeral
     };
+    let capacity = &execution_spec.capacity;
     let context = ExecutionContext::new(
         root.to_owned(),
         lifecycle,
         default_execution_policy_limits(maximum_parallel_steps),
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
-    );
+    )
+    .with_capacity_budget(WorkflowCapacityBudget {
+        maximum_invocations: capacity.maximum_invocations,
+        diagnostic_retention_bytes: capacity.diagnostic_retention_bytes,
+        native_session_retention_bytes: capacity.native_session_retention_bytes,
+        aggregate_retention_bytes: capacity.aggregate_retention_bytes,
+        encoded_outbox_bytes: capacity.encoded_outbox_bytes,
+    });
     let context = match git_capture {
         Some(projection) => context.with_cloud_git_capture(projection),
         None => context,
@@ -2666,6 +2841,7 @@ fn validate_execution_spec(
     }
     let workflow = &execution_spec.workflow_definition_source;
     let primary = &execution_spec.primary_workspace_source;
+    let capacity = &execution_spec.capacity;
     if workflow.object_format != "sha1" || primary.object_format != "sha1" {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
@@ -2700,6 +2876,27 @@ fn validate_execution_spec(
         || !valid_path
         || workflow.workflow_source_closure_digest.algorithm != "sha256"
         || !lowercase_hex(&workflow.workflow_source_closure_digest.value, 64)
+        || capacity.execution_contract != "workflow_v1_inputless_cloud_artifacts@1"
+        || capacity.source_closure_digest != workflow.workflow_source_closure_digest
+        || capacity.general_maximum_transitions == 0
+        || capacity.general_maximum_transitions > 1_286
+        || capacity.selected_maximum_transitions == 0
+        || capacity.selected_maximum_transitions > 1_030
+        || capacity.maximum_invocations == 0
+        || capacity.maximum_invocations > 488
+        || capacity.maximum_retained_bytes_per_invocation == 0
+        || capacity.maximum_retained_bytes_per_invocation > 4_194_304
+        || capacity.diagnostic_retention_bytes < capacity.maximum_retained_bytes_per_invocation
+        || capacity.diagnostic_retention_bytes > 134_217_728
+        || capacity.native_session_retention_bytes < capacity.maximum_retained_bytes_per_invocation
+        || capacity.native_session_retention_bytes > 67_108_864
+        || capacity
+            .diagnostic_retention_bytes
+            .checked_add(capacity.native_session_retention_bytes)
+            != Some(capacity.aggregate_retention_bytes)
+        || capacity.aggregate_retention_bytes > 201_326_592
+        || encoded_outbox_reservation(capacity.selected_maximum_transitions)
+            != Some(capacity.encoded_outbox_bytes)
     {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::InvalidSourceProjection,
@@ -2742,7 +2939,9 @@ fn materialization_decline(failure: MaterializationFailure) -> AssignmentDecline
         MaterializationFailure::WorkflowDigestMismatch => {
             ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch
         }
-        MaterializationFailure::ProviderUnavailable | MaterializationFailure::AssignmentFenced => {
+        MaterializationFailure::ProviderUnavailable
+        | MaterializationFailure::RepositoryUnavailable
+        | MaterializationFailure::AssignmentFenced => {
             return AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable);
         }
         MaterializationFailure::EnvironmentUnavailable => return environment_unavailable(),
@@ -2852,7 +3051,9 @@ mod tests {
     use crate::runner::service::lease_clock::{
         ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
     };
-    use crate::runner::service::source::{CredentialBrokerFailure, ProviderCredential};
+    use crate::runner::service::source::{
+        CommitAvailability, CredentialBrokerFailure, ProviderCredential,
+    };
     use crate::runner::service::test_support::{fixture_lease_clock, with_watchdog};
     use crate::runner::service::workspace::{
         CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkspaceFilesystem,
@@ -2860,9 +3061,9 @@ mod tests {
     use crate::runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
         ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse, CloudFrame,
-        ExecutionLimitsV1RunnerProjection, PrimaryWorkspaceSourceV1RunnerProjection,
-        WorkflowDefinitionSourceV1RunnerProjection, WorkflowSourceClosureDigestV1RunnerProjection,
-        decode_cloud_frame,
+        ExecutionCapacityV1RunnerProjection, ExecutionLimitsV1RunnerProjection,
+        PrimaryWorkspaceSourceV1RunnerProjection, WorkflowDefinitionSourceV1RunnerProjection,
+        WorkflowSourceClosureDigestV1RunnerProjection, decode_cloud_frame,
     };
 
     const NOW: &str = "2026-07-23T00:00:00Z";
@@ -3045,6 +3246,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             }
             Err(CredentialBrokerFailure::Fenced)
         }
+
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Fenced)
+        }
     }
 
     struct UnavailableSourceBroker;
@@ -3055,6 +3264,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             _assignment_id: &str,
             _cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
     }
@@ -3170,7 +3387,25 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 source_branch: "main".to_owned(),
                 workflow_definition_source: production_workflow_definition_source(),
                 primary_workspace_source: production_primary_workspace_source(),
+                capacity: production_capacity(),
             },
+        }
+    }
+
+    fn production_capacity() -> ExecutionCapacityV1RunnerProjection {
+        let source_closure_digest =
+            production_workflow_definition_source().workflow_source_closure_digest;
+        ExecutionCapacityV1RunnerProjection {
+            execution_contract: "workflow_v1_inputless_cloud_artifacts@1".to_owned(),
+            source_closure_digest,
+            general_maximum_transitions: 8,
+            selected_maximum_transitions: 7,
+            maximum_invocations: 1,
+            maximum_retained_bytes_per_invocation: 4_194_304,
+            diagnostic_retention_bytes: 8_388_608,
+            native_session_retention_bytes: 4_194_304,
+            aggregate_retention_bytes: 12_582_912,
+            encoded_outbox_bytes: 38_141_952,
         }
     }
 
@@ -3271,6 +3506,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             sleeper,
             work_root,
             false,
+            None,
         );
         manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
         manager.retain_lease_policy(&policy()).unwrap();
@@ -3880,6 +4116,21 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[test]
+    fn shared_assignment_offer_fixture_reaches_source_admission() {
+        let tokio_tungstenite::tungstenite::Message::Text(raw) =
+            crate::runner::service::test_support::assignment_offer()
+        else {
+            panic!("assignment offer fixture was not text");
+        };
+        let CloudFrame::AssignmentOffer { execution_spec, .. } =
+            decode_cloud_frame(raw.as_bytes()).unwrap()
+        else {
+            panic!("assignment offer fixture decoded as another frame");
+        };
+        assert_eq!(validate_execution_spec(&execution_spec), Ok(()));
+    }
+
+    #[test]
     fn secure_runner_endpoint_disallows_insecure_artifact_uploads() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, manager) = manager_fixture(workflow);
@@ -3905,7 +4156,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     #[test]
     fn admits_file_exports_for_cloud_delivery() {
-        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n        kind: file\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         manager.handle_offer(offer("bg")).unwrap();
         let pending = manager.pending_observations(&BTreeSet::new(), 1);
@@ -4030,6 +4281,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::SourceCommitMismatch,
             )
+        );
+        assert_eq!(
+            materialization_decline(MaterializationFailure::RepositoryUnavailable),
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
         );
         assert_eq!(
             materialization_decline(MaterializationFailure::EnvironmentUnavailable),
@@ -5578,6 +5833,40 @@ steps:
     }
 
     #[tokio::test]
+    async fn runner_executes_recovery_and_reports_exact_summary_and_invocations() {
+        let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();
+        let workflow = format!(
+            "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: {failing_argv}\n"
+        );
+        let reports = execute_fixture_workflow(&workflow, None, 2).await;
+
+        let evidence = reports
+            .iter()
+            .filter_map(|report| match report {
+                ExecutionReport::Transition { workflow_event, .. } => {
+                    workflow_event.get("invocationEvidence")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|value| value["role"] == "target"));
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["recoveryProgress"]["targetExecution"] == 2
+        )));
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "failed"
+                    && outcome["recoverySummaries"]["verify"]["schemaVersion"] == 1
+                    && outcome["recoverySummaries"]["verify"]["termination"]["kind"] == "exhausted"
+                    && outcome["recoverySummaries"]["verify"]["rounds"].as_array().map(Vec::len) == Some(1)
+        ));
+    }
+
+    #[tokio::test]
     async fn outputless_finalizers_emit_roles_phase_and_authoritative_summary() {
         let successful_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
         let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();
@@ -5677,7 +5966,7 @@ steps:
                         "eventVersion": 1,
                         "eventType": "step_state_changed",
                         "transitionSequence": 1,
-                        "stepId": "x".repeat(MAXIMUM_ENCODED_FRAME_BYTES),
+                        "stepId": "x".repeat(MAXIMUM_TERMINAL_FRAME_BYTES),
                         "failurePolicy": "required",
                         "from": "pending",
                         "to": "starting",
@@ -5688,6 +5977,68 @@ steps:
         );
         // jscpd:ignore-end
         assert_eq!(outbox.len(), 0);
+    }
+
+    #[test]
+    fn outbox_accepts_only_one_large_terminal_per_assignment() {
+        let escaped = "\u{0001}".repeat(4_096);
+        let rounds = (1..=2)
+            .map(|number| {
+                json!({
+                    "number": number,
+                    "failedExecution": {
+                        "executionNumber": number,
+                        "invocationId": number,
+                        "failure": {
+                            "phase": "execution",
+                            "cause": { "code": "command_exit", "exitCode": 1 }
+                        }
+                    },
+                    "handler": {
+                        "kind": "cmd",
+                        "invocationId": number + 2,
+                        "outcome": "recheck",
+                        "summary": escaped,
+                        "reason": escaped,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let report = ExecutionReport::Finished {
+            final_execution_event_sequence: 1,
+            outcome: json!({
+                "outcome": "failed",
+                "failure": {
+                    "node": { "id": "verify", "role": "step" },
+                    "failure": {
+                        "phase": "execution",
+                        "cause": "command_unsuccessful_exit",
+                        "exitCode": 1,
+                    }
+                },
+                "recoverySummaries": {
+                    "verify": {
+                        "schemaVersion": 1,
+                        "configuredRetries": 2,
+                        "handlerKind": "cmd",
+                        "rounds": rounds,
+                        "termination": { "kind": "exhausted", "executionNumber": 3 },
+                    }
+                }
+            }),
+            artifact_delivery: json!({
+                "outcome": "prepared",
+                "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
+            }),
+        };
+        let observation = AssignmentObservation::Execution {
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            report,
+        };
+        let outbox = ObservationOutbox::new();
+        assert!(outbox.enqueue(observation.clone()).is_ok());
+        assert_eq!(outbox.enqueue(observation), Err(OutboxFailure::Capacity));
     }
 
     #[test]

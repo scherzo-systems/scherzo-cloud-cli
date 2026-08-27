@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::execution::workflow::agent::{AgentOutcome, BoundedSchemaValidAgentResult};
+use crate::execution::workflow::agent::{AgentOutcome, CapturedJson};
 
 const CWD: &str = "/execution/worktree";
 const RESPONSE_SUCCESS: &[u8] = include_bytes!("fixtures/response-success.jsonl");
@@ -157,10 +157,7 @@ fn accept_result(parser: &mut PiJsonV1Parser, call_id: &str, arguments: Arc<Valu
             Arc::from(call_id),
             Arc::from("scherzo_result_fixed"),
             arguments,
-            BoundedSchemaValidAgentResult::fixture(
-                Arc::new(json!({"answer": 42})),
-                Arc::from(br#"{"answer":42}"#.as_slice()),
-            ),
+            CapturedJson::fixture(Arc::new(json!({"answer": 42}))),
         ))
         .unwrap();
 }

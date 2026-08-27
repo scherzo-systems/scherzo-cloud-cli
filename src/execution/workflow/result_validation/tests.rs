@@ -644,13 +644,13 @@ async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
     }
 }
 
-fn retained_schema(document: Value) -> RetainedResultSchema {
+fn retained_schema(document: Value) -> RetainedJsonSchema {
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&document).unwrap());
-    RetainedResultSchema::compile(bytes, Arc::new(document)).unwrap()
+    RetainedJsonSchema::compile(bytes, Arc::new(document)).unwrap()
 }
 
 fn validator<Clock, Worker>(
-    schema: RetainedResultSchema,
+    schema: RetainedJsonSchema,
     maximum_candidate_bytes: u64,
     clock: Clock,
     worker: Worker,

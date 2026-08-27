@@ -53,6 +53,8 @@ pub(crate) struct CommandOutputClosedObservation {
 pub(crate) enum ObservedStepTransition {
     Recovery {
         active: ActiveStepInvocation,
+        active_invocation_id: ActionId,
+        settled_invocation: Option<(ActionId, ActiveStepInvocation)>,
         configured_rounds: u8,
         handler_kind: Option<RecoveryHandlerKind>,
         handler_state: Option<RecoveryHandlerActivity>,

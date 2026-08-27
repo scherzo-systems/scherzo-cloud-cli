@@ -390,6 +390,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.txt
         mediaType: text/plain
 exports:
@@ -512,7 +513,7 @@ steps:
 }
 
 #[tokio::test]
-async fn output_capture_failure_cleans_up_then_reruns_the_complete_target() {
+async fn semantic_outputs_recovery_reruns_complete_target() {
     with_watchdog(async {
         let source = r#"schemaVersion: 1
 steps:
@@ -542,6 +543,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.txt
         mediaType: text/plain
 exports:
@@ -861,7 +863,7 @@ printf consumer-standard-output
 printf consumer-standard-error >&2
 "#;
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n      attachments:\n        ref: imports.attachments\n    command:\n      argv: {}\n    outputs:\n      produced:\n        kind: file\n        path: produced.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      artifact:\n        ref: outputs.produce.produced\n    command:\n      argv: {}\n    outputs:\n      delivered:\n        kind: file\n        path: exported.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.consume.delivered\n",
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n      attachments:\n        ref: imports.attachments\n    command:\n      argv: {}\n    outputs:\n      produced:\n        kind: file\n        from: path\n        path: produced.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      artifact:\n        ref: outputs.produce.produced\n    command:\n      argv: {}\n    outputs:\n      delivered:\n        kind: file\n        from: path\n        path: exported.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.consume.delivered\n",
             serde_json::to_string(&["sh", "-c", producer_script]).unwrap(),
             serde_json::to_string(&["sh", "-c", consumer_script]).unwrap(),
         );
@@ -948,7 +950,7 @@ async fn failure_stops_new_work_but_retains_the_successful_sibling_output() {
         let sibling_script = fixture_script(0, "sibling", true);
         let queued_script = fixture_script(0, "queued", false);
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  aFail:\n    kind: cmd\n    command:\n      argv: {}\n  bSibling:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      retained:\n        kind: file\n        path: retained.txt\n        mediaType: text/plain\n  cFailChild:\n    kind: cmd\n    dependsOn: [aFail]\n    command:\n      argv: {}\n  zQueued:\n    kind: cmd\n    command:\n      argv: {}\n  zzQueuedChild:\n    kind: cmd\n    dependsOn: [zQueued]\n    command:\n      argv: {}\nexports:\n  retained:\n    ref: outputs.bSibling.retained\n",
+            "schemaVersion: 1\nsteps:\n  aFail:\n    kind: cmd\n    command:\n      argv: {}\n  bSibling:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      retained:\n        kind: file\n        from: path\n        path: retained.txt\n        mediaType: text/plain\n  cFailChild:\n    kind: cmd\n    dependsOn: [aFail]\n    command:\n      argv: {}\n  zQueued:\n    kind: cmd\n    command:\n      argv: {}\n  zzQueuedChild:\n    kind: cmd\n    dependsOn: [zQueued]\n    command:\n      argv: {}\nexports:\n  retained:\n    ref: outputs.bSibling.retained\n",
             command_argv(&fail_script, &executable, &fixture_args),
             command_argv(&sibling_script, &executable, &fixture_args),
             command_argv(&queued_script, &executable, &fixture_args),
@@ -1887,7 +1889,7 @@ async fn cancellation_waits_for_recovery_agent_quiescence_and_rejects_late_decis
 }
 
 #[tokio::test]
-async fn agent_response_and_file_commit_atomically_before_command_data_flow() {
+async fn semantic_outputs_atomic_mixed_success() {
     with_watchdog(async {
         let source = format!(
             r#"schemaVersion: 1
@@ -1902,9 +1904,20 @@ async fn agent_response_and_file_commit_atomically_before_command_data_flow() {
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
+      summary:
+        kind: text
+        from: path
+        path: summary.txt
+      data:
+        kind: json
+        from: path
+        path: data.json
+        schema: result.schema.json
       artifact:
         kind: file
+        from: path
         path: agent.txt
         mediaType: text/plain
   consume:
@@ -1912,16 +1925,25 @@ async fn agent_response_and_file_commit_atomically_before_command_data_flow() {
     inputs:
       response:
         ref: outputs.produce.response
+      summary:
+        ref: outputs.produce.summary
+      data:
+        ref: outputs.produce.data
     command:
-      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$SCHERZO_STEP_INPUTS/values/response\" || true; printf '%s' \"$value\" > consumed.txt"]
+      argv: ["/bin/sh", "-c", "printf consumed > consumed.txt"]
     outputs:
       consumed:
         kind: file
+        from: path
         path: consumed.txt
         mediaType: text/plain
 exports:
   response:
     ref: outputs.produce.response
+  summary:
+    ref: outputs.produce.summary
+  data:
+    ref: outputs.produce.data
   artifact:
     ref: outputs.produce.artifact
   consumed:
@@ -1930,7 +1952,13 @@ exports:
         );
         let fixture = execution_fixture_with_source_files(
             &source,
-            &[("prompt.md", b"produce the declared outputs")],
+            &[
+                ("prompt.md", b"produce the declared outputs"),
+                (
+                    "result.schema.json",
+                    br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                ),
+            ],
             ResolvedImports::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
@@ -1938,6 +1966,16 @@ exports:
             1024,
         );
         fs::write(fixture.execution_root.join("agent.txt"), b"agent artifact").unwrap();
+        fs::write(
+            fixture.execution_root.join("summary.txt"),
+            b"\xef\xbb\xbfline one\r\nline two\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.execution_root.join("data.json"),
+            br#"{ "z": 2, "a": 1 }"#,
+        )
+        .unwrap();
         let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
@@ -1982,10 +2020,19 @@ exports:
         let StepState::Succeeded { outputs } = &result.steps["produce"] else {
             panic!("agent producer did not succeed");
         };
-        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs.len(), 4);
         assert!(matches!(
             &outputs["response"],
             CapturedValue::Text(value) if value.as_ref() == "agent response"
+        ));
+        assert!(matches!(
+            &outputs["summary"],
+            CapturedValue::Text(value)
+                if value.carrier() == b"\xef\xbb\xbfline one\r\nline two\n"
+        ));
+        assert!(matches!(
+            &outputs["data"],
+            CapturedValue::Json(value) if value.carrier() == br#"{"a":1,"z":2}"#
         ));
         let ExportValue::Available { output } = &result.exports["consumed"] else {
             panic!("downstream command output was unavailable");
@@ -1995,7 +2042,7 @@ exports:
             .artifacts
             .copy_to(output.as_file().unwrap().handle(), &mut consumed)
             .unwrap();
-        assert_eq!(consumed, b"agent response");
+        assert_eq!(consumed, b"consumed");
         let ExportValue::Available { output } = &result.exports["artifact"] else {
             panic!("agent file output was unavailable");
         };
@@ -2026,7 +2073,8 @@ async fn structured_agent_result_flows_only_through_its_explicit_command_binding
           - file: prompt.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json
   consume:
     kind: cmd
@@ -2038,6 +2086,7 @@ async fn structured_agent_result_flows_only_through_its_explicit_command_binding
     outputs:
       consumed:
         kind: file
+        from: path
         path: consumed.json
         mediaType: application/json
 exports:
@@ -2116,7 +2165,7 @@ exports:
 }
 
 #[tokio::test]
-async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph() {
+async fn semantic_outputs_command_and_agent_path_matrix() {
     with_watchdog(async {
         let source = format!(
             r#"schemaVersion: 1
@@ -2131,7 +2180,8 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
   bResult:
     kind: agent
     agent:
@@ -2142,15 +2192,26 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
           - file: prompt.md
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: result.schema.json
-  cFile:
+  cPath:
     kind: cmd
     command:
       argv: ["/bin/sh", "-c", "true"]
     outputs:
+      text:
+        kind: text
+        from: path
+        path: path.txt
+      json:
+        kind: json
+        from: path
+        path: path.json
+        schema: result.schema.json
       artifact:
         kind: file
+        from: path
         path: upstream.txt
         mediaType: text/plain
   zConsumer:
@@ -2161,9 +2222,11 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
       message:
         text:
           - ref: outputs.aResponse.response
+          - ref: outputs.cPath.text
         attachments:
           - ref: outputs.bResult.result
-          - ref: outputs.cFile.artifact
+          - ref: outputs.cPath.json
+          - ref: outputs.cPath.artifact
 "#
         );
         let fixture = execution_fixture_with_source_files(
@@ -2182,6 +2245,16 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
             1024,
         );
         fs::write(fixture.execution_root.join("upstream.txt"), b"file exact").unwrap();
+        fs::write(
+            fixture.execution_root.join("path.txt"),
+            b"path text\r\nwith trailing newline\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.execution_root.join("path.json"),
+            br#"{ "z": 2, "a": 1 }"#,
+        )
+        .unwrap();
         let (adapter, mut control) = scripted_agent_dispatcher();
         let agents = agent_runtime(&fixture, adapter);
         let artifacts = fixture.artifacts.clone();
@@ -2242,16 +2315,24 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
             ),
         };
         assert_eq!(consumer.identity().step(), "zConsumer");
-        assert_eq!(consumer.message(), "response exact");
-        assert_eq!(consumer.attachments().len(), 2);
+        assert_eq!(
+            consumer.message(),
+            "response exact\n\npath text\r\nwith trailing newline\n"
+        );
+        assert_eq!(consumer.attachments().len(), 3);
         assert_eq!(consumer.attachments()[0].media_type(), "application/json");
         assert_eq!(
             fs::read(consumer.attachments()[0].path()).unwrap(),
             br#"{"a":1,"z":2}"#
         );
-        assert_eq!(consumer.attachments()[1].media_type(), "text/plain");
+        assert_eq!(consumer.attachments()[1].media_type(), "application/json");
         assert_eq!(
             fs::read(consumer.attachments()[1].path()).unwrap(),
+            br#"{"a":1,"z":2}"#
+        );
+        assert_eq!(consumer.attachments()[2].media_type(), "text/plain");
+        assert_eq!(
+            fs::read(consumer.attachments()[2].path()).unwrap(),
             b"file exact"
         );
         consumer.control().start().await.unwrap();
@@ -2269,7 +2350,7 @@ async fn agent_consumes_committed_agent_and_file_outputs_through_runtime_graph()
 }
 
 #[tokio::test]
-async fn failed_agent_file_capture_commits_neither_response_nor_file() {
+async fn semantic_outputs_atomic_mixed_failure() {
     with_watchdog(async {
         let source = format!(
             r#"schemaVersion: 1
@@ -2284,9 +2365,11 @@ async fn failed_agent_file_capture_commits_neither_response_nor_file() {
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
       missing:
         kind: file
+        from: path
         path: missing.txt
         mediaType: text/plain
   consume:
@@ -2342,13 +2425,21 @@ exports:
         started.control().complete().await.unwrap();
 
         let result = execution.await.unwrap().unwrap();
-        assert!(matches!(
-            result.steps["produce"],
-            StepState::Failed {
-                phase: FailurePhase::OutputCapture,
-                ..
-            }
-        ));
+        let StepState::Failed {
+            phase: FailurePhase::OutputCapture,
+            cause:
+                StepFailureCause::OutputCapture(
+                    super::super::step_runtime::OutputCaptureFailure::Capture(failure),
+                ),
+        } = &result.steps["produce"]
+        else {
+            panic!("agent producer did not report the exact capture failure");
+        };
+        assert_eq!(failure.output_identity(), "missing");
+        assert_eq!(
+            failure.kind(),
+            crate::execution::workflow::artifact::CaptureFailureKind::Missing
+        );
         assert_eq!(
             result.steps["consume"],
             StepState::Blocked {
@@ -2364,6 +2455,9 @@ exports:
             ExportValue::Unavailable { .. }
         ));
         assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+        assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
+        assert_eq!(fixture.artifacts.budget_usage(), (0, 0));
+        assert_eq!(fixture.artifacts.reservation_usage(), (0, 0));
     })
     .await;
 }
@@ -2505,7 +2599,8 @@ async fn committed_agent_completion_wins_a_later_cancellation_before_delivery_fi
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.complete.response
@@ -2593,9 +2688,11 @@ async fn agent_failure_stops_pending_command_but_keeps_active_agent_outputs() {
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
       artifact:
         kind: file
+        from: path
         path: retained.txt
         mediaType: text/plain
   cActive:
@@ -2735,9 +2832,11 @@ async fn cancellation_discards_provisional_agent_value_and_waits_for_adapter_qui
           - file: prompt.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
       artifact:
         kind: file
+        from: path
         path: side-effect.txt
         mediaType: text/plain
   pending:

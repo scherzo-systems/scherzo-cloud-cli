@@ -288,48 +288,75 @@
       },
       "required": ["profile", "systemPrompt", "message"]
     },
-    "AgentResponseOutput": {
+    "TextPathOutput": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "agent_response" }
+        "kind": { "const": "text" },
+        "from": { "const": "path" },
+        "path": { "$ref": "#/$defs/RuntimeRelativePath" }
       },
-      "required": ["kind"]
+      "required": ["kind", "from", "path"]
     },
-    "AgentResultOutput": {
+    "TextAgentResponseOutput": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "agent_result" },
+        "kind": { "const": "text" },
+        "from": { "const": "agent_response" }
+      },
+      "required": ["kind", "from"]
+    },
+    "JsonPathOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "json" },
+        "from": { "const": "path" },
+        "path": { "$ref": "#/$defs/RuntimeRelativePath" },
         "schema": { "$ref": "#/$defs/SourceRelativePath" }
       },
-      "required": ["kind", "schema"]
+      "required": ["kind", "from", "path", "schema"]
     },
-    "FileOutput": {
+    "JsonAgentResultOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "json" },
+        "from": { "const": "agent_result" },
+        "schema": { "$ref": "#/$defs/SourceRelativePath" }
+      },
+      "required": ["kind", "from", "schema"]
+    },
+    "FilePathOutput": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "file" },
+        "from": { "const": "path" },
         "path": { "$ref": "#/$defs/RuntimeRelativePath" },
         "mediaType": { "$ref": "#/$defs/MediaType" }
       },
-      "required": ["kind", "path", "mediaType"]
+      "required": ["kind", "from", "path", "mediaType"]
     },
-    "GitBranchOutput": {
+    "GitBranchWorkspaceOutput": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "git_branch" }
+        "kind": { "const": "git_branch" },
+        "from": { "const": "workspace" }
       },
-      "required": ["kind"]
+      "required": ["kind", "from"]
     },
     "CommandOutputs": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": {
         "oneOf": [
-          { "$ref": "#/$defs/FileOutput" },
-          { "$ref": "#/$defs/GitBranchOutput" }
+          { "$ref": "#/$defs/TextPathOutput" },
+          { "$ref": "#/$defs/JsonPathOutput" },
+          { "$ref": "#/$defs/FilePathOutput" },
+          { "$ref": "#/$defs/GitBranchWorkspaceOutput" }
         ]
       }
     },
@@ -338,10 +365,12 @@
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": {
         "oneOf": [
-          { "$ref": "#/$defs/AgentResponseOutput" },
-          { "$ref": "#/$defs/AgentResultOutput" },
-          { "$ref": "#/$defs/FileOutput" },
-          { "$ref": "#/$defs/GitBranchOutput" }
+          { "$ref": "#/$defs/TextPathOutput" },
+          { "$ref": "#/$defs/TextAgentResponseOutput" },
+          { "$ref": "#/$defs/JsonPathOutput" },
+          { "$ref": "#/$defs/JsonAgentResultOutput" },
+          { "$ref": "#/$defs/FilePathOutput" },
+          { "$ref": "#/$defs/GitBranchWorkspaceOutput" }
         ]
       }
     },

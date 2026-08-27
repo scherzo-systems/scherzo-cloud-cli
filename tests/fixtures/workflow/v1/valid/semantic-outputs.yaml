@@ -1,0 +1,54 @@
+schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  pathAndWorkspace:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      summary:
+        kind: text
+        from: path
+        path: artifacts/summary.txt
+      result:
+        kind: json
+        from: path
+        path: artifacts/result.json
+        schema: schemas/result.schema.json
+      report:
+        kind: file
+        from: path
+        path: artifacts/report.bin
+        mediaType: application/octet-stream
+      changes:
+        kind: git_branch
+        from: workspace
+  nativeResponse:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text: [{ file: prompts/message.md }]
+    outputs:
+      response:
+        kind: text
+        from: agent_response
+  nativeResult:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text: [{ file: prompts/message.md }]
+    outputs:
+      result:
+        kind: json
+        from: agent_result
+        schema: schemas/result.schema.json

@@ -28,10 +28,12 @@ steps:
           - ref: imports.attachments
     outputs:
       plan:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: schemas/change-plan.schema.json
       artifact:
         kind: file
+        from: path
         path: artifacts/plan.txt
         mediaType: text/plain
 
@@ -50,7 +52,8 @@ steps:
           - ref: outputs.plan.artifact
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 
   test:
     kind: cmd
@@ -65,6 +68,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: packages/api/artifacts/test-report.xml
         mediaType: application/junit+xml
 

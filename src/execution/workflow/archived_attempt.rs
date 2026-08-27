@@ -1676,10 +1676,10 @@ fn export_media_type<'a>(
     }
     .ok_or(())?;
     Ok(match &output.definition {
-        Output::File { media_type, .. } => media_type,
-        Output::AgentResponse => "text/plain; charset=utf-8",
-        Output::AgentResult { .. } => "application/json",
-        Output::GitBranch => "application/vnd.git.bundle",
+        Output::TextPath { .. } | Output::TextAgentResponse => "text/plain; charset=utf-8",
+        Output::JsonPath { .. } | Output::JsonAgentResult { .. } => "application/json",
+        Output::FilePath { media_type, .. } => media_type,
+        Output::GitBranchWorkspace => "application/vnd.git.bundle",
     })
 }
 

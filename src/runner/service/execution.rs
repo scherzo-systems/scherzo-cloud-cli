@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use futures_util::FutureExt as _;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use ring::digest::{SHA256, digest};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -34,6 +37,7 @@ use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::execution::{NoopCommitPort, execute_workflow};
 use crate::execution::workflow::input::{InputPreparationFailureKind, InputStaging};
+use crate::execution::workflow::invocation_accounting::InvocationAccountingLog;
 use crate::execution::workflow::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
 };
@@ -43,13 +47,17 @@ use crate::execution::workflow::process_group::{
     terminate_authenticated_process_group,
 };
 use crate::execution::workflow::publication::{
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
-    prepare_cloud_workflow_result, summary_disposition_matches,
+    CloudExecutionCapacityV1, DigestV1, RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1,
+    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
+    RecoveryInvocationV1, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
+    WorkflowRunTiming, WorkflowStepTiming, command_output_v1, prepare_cloud_workflow_result,
+    step_recovery_summary_v1, summary_disposition_matches,
 };
 use crate::execution::workflow::runtime::{
-    FailurePhase, FinalizationGate, FinalizationSummary, FinalizerResult, NotRunReason, RunOutcome,
-    SchedulingGate, StepFailure, StepState, StepStateKind, TransitionEvent, WorkflowState,
+    ActionId, ActiveStepInvocation, FailurePhase, FinalizationGate, FinalizationSummary,
+    FinalizerResult, NotRunReason, RunOutcome, SchedulingGate, StepFailure, StepState,
+    StepStateKind, TransitionEvent, WorkflowState,
 };
 use crate::execution::workflow::step_runtime::{
     AgentExecution, CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure,
@@ -509,6 +517,8 @@ impl ExecutionJob {
             ));
         }
 
+        let diagnostics = StepDiagnosticLog::default();
+        let accounting = InvocationAccountingLog::default();
         let observer = RunnerExecutionObserver::new(
             assignment_id.to_owned(),
             attempt_id.to_owned(),
@@ -516,8 +526,11 @@ impl ExecutionJob {
             self.outbox.clone(),
             post_stop_fence.clone(),
             cancellation.clone(),
+            RunnerInvocationEvidence {
+                diagnostics: diagnostics.clone(),
+                accounting: accounting.clone(),
+            },
         );
-        let diagnostics = StepDiagnosticLog::default();
         let process_guard_registry = self
             .accepted
             .process_guards
@@ -545,11 +558,12 @@ impl ExecutionJob {
                     "runner_internal_failure",
                 ));
             };
-            let agents = AgentExecution::enabled(
+            let agents = AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_id)),
                 agent_staging.clone(),
                 diagnostic_sessions,
                 dispatcher,
+                accounting.clone(),
             );
             // Enabled and disabled execution carry distinct static dispatcher types;
             // keeping each engine call explicit avoids a dynamic adapter boundary.
@@ -745,10 +759,17 @@ impl ExecutionJob {
             .finalization_summary
             .as_ref()
             .map(finalization_summary);
+        let recovery_summaries = terminal_recovery_summaries(&result.recoveries);
         let report = match result.outcome {
             RunOutcome::Succeeded => ExecutionReport::Finished {
                 final_execution_event_sequence: last_sequence,
-                outcome: terminal_outcome("succeeded", None, None, finalization),
+                outcome: terminal_outcome(
+                    "succeeded",
+                    None,
+                    None,
+                    finalization,
+                    recovery_summaries.clone(),
+                ),
                 artifact_delivery,
             },
             RunOutcome::Failed {
@@ -760,6 +781,7 @@ impl ExecutionJob {
                     Some(workflow_failure(&primary_failure)),
                     None,
                     finalization,
+                    recovery_summaries,
                 ),
                 artifact_delivery,
             },
@@ -773,6 +795,7 @@ impl ExecutionJob {
                     None,
                     Some("execution_lease_expired"),
                     finalization,
+                    None,
                 ),
                 artifact_delivery,
             },
@@ -786,6 +809,7 @@ impl ExecutionJob {
                     None,
                     Some("runner_shutdown"),
                     finalization,
+                    None,
                 ),
                 artifact_delivery,
             },
@@ -820,9 +844,12 @@ impl ExecutionJob {
         let cancellation =
             observed_workflow_cancellation(&execution.outcome, observer.cancellation())?;
         let mut states = execution.steps;
+        let mut recoveries = execution.recoveries;
         let mut steps = Vec::with_capacity(states.len());
         for id in &workflow.definition.presentation_order {
             let state = states.remove(id)?;
+            let recovery_state = recoveries.remove(id)?;
+            let recovery = step_recovery_summary_v1(recovery_state.as_ref()).ok()?;
             let (kind, failure_policy) =
                 workflow_step_kind_policy(workflow.definition.steps.get(id)?);
             steps.push(WorkflowRunStep {
@@ -835,8 +862,8 @@ impl ExecutionJob {
                 command_output: (kind == WorkflowRunStepKind::Command)
                     .then(|| diagnostics.get(id))
                     .flatten(),
-                recovery: None,
-                invocations: Vec::new(),
+                recovery,
+                invocations: observer.invocations_for_step(id),
             });
         }
         let finalization = match (
@@ -859,6 +886,9 @@ impl ExecutionJob {
                     if summary.failure_policy != failure_policy
                         || !summary_disposition_matches(&summary.disposition, &state)
                     {
+                        return None;
+                    }
+                    if recoveries.remove(id)?.is_some() {
                         return None;
                     }
                     finalizers.push(WorkflowRunStep {
@@ -892,7 +922,7 @@ impl ExecutionJob {
             }
             (true, Some(_)) | (false, None) => return None,
         };
-        if !states.is_empty() {
+        if !states.is_empty() || !recoveries.is_empty() {
             return None;
         }
         Some(WorkflowRunResult {
@@ -908,6 +938,7 @@ impl ExecutionJob {
                 .execution()
                 .limits()
                 .maximum_parallel_steps(),
+            cloud_capacity: Some(cloud_execution_capacity(&self.accepted.admitted)),
             timing: WorkflowRunTiming {
                 started_at: started_at.utc,
                 finished_at: finished_at.utc,
@@ -1118,6 +1149,29 @@ impl ExecutionJob {
                 reason: reason.to_owned(),
             },
         )
+    }
+}
+
+pub(super) fn cloud_execution_capacity(
+    admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
+) -> CloudExecutionCapacityV1 {
+    let capacity = admitted.capacity();
+    let requirements = capacity.resolved.requirements;
+    let digest = &capacity.resolved.source_closure_digest;
+    CloudExecutionCapacityV1 {
+        execution_contract: capacity.execution_contract.as_str().to_owned(),
+        source_closure_digest: DigestV1 {
+            algorithm: digest.algorithm.as_str().to_owned(),
+            value: digest.value.clone(),
+        },
+        general_maximum_transitions: requirements.general_maximum_transitions,
+        selected_maximum_transitions: capacity.maximum_transitions,
+        maximum_invocations: requirements.maximum_invocations,
+        maximum_retained_bytes_per_invocation: requirements.maximum_retained_bytes_per_invocation,
+        diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
+        native_session_retention_bytes: requirements.native_session_retention_bytes,
+        aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+        encoded_outbox_bytes: requirements.encoded_outbox_bytes,
     }
 }
 
@@ -1612,7 +1666,14 @@ struct RunnerExecutionObserver {
     outbox: ObservationOutbox,
     post_stop_fence: PostStopFence,
     cancellation: crate::execution::workflow::admission::CancellationSource,
+    invocation_evidence: RunnerInvocationEvidence,
     state: Arc<Mutex<ObserverState>>,
+}
+
+#[derive(Clone, Default)]
+struct RunnerInvocationEvidence {
+    diagnostics: StepDiagnosticLog,
+    accounting: InvocationAccountingLog,
 }
 
 struct ObserverState {
@@ -1622,7 +1683,16 @@ struct ObserverState {
     terminal_state: Option<WorkflowState<StepFailureCause>>,
     cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
     step_timings: BTreeMap<String, RunnerStepTiming>,
+    active_invocations: BTreeMap<String, RunnerActiveInvocation>,
+    settled_invocations: BTreeMap<u64, (String, RecoveryInvocationV1)>,
     faulted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RunnerActiveInvocation {
+    id: ActionId,
+    role: ActiveStepInvocation,
+    started_at: RunnerExecutionInstant,
 }
 
 #[derive(Clone, Copy)]
@@ -1639,6 +1709,7 @@ impl RunnerExecutionObserver {
         outbox: ObservationOutbox,
         post_stop_fence: PostStopFence,
         cancellation: crate::execution::workflow::admission::CancellationSource,
+        invocation_evidence: RunnerInvocationEvidence,
     ) -> Self {
         Self {
             assignment_id,
@@ -1647,6 +1718,7 @@ impl RunnerExecutionObserver {
             outbox,
             post_stop_fence,
             cancellation,
+            invocation_evidence,
             state: Arc::new(Mutex::new(ObserverState {
                 transition_count: 0,
                 last_sequence: 0,
@@ -1654,6 +1726,8 @@ impl RunnerExecutionObserver {
                 terminal_state: None,
                 cancellation: None,
                 step_timings: BTreeMap::new(),
+                active_invocations: BTreeMap::new(),
+                settled_invocations: BTreeMap::new(),
                 faulted: false,
             })),
         }
@@ -1679,6 +1753,15 @@ impl RunnerExecutionObserver {
         self.lock().cancellation
     }
 
+    fn invocations_for_step(&self, step: &str) -> Vec<RecoveryInvocationV1> {
+        self.lock()
+            .settled_invocations
+            .values()
+            .filter(|(settled_step, _)| settled_step == step)
+            .map(|(_, invocation)| invocation.clone())
+            .collect()
+    }
+
     fn step_timing(&self, step: &str) -> Option<WorkflowStepTiming> {
         let timing = *self.lock().step_timings.get(step)?;
         let finished_at = timing.finished_at?;
@@ -1690,11 +1773,132 @@ impl RunnerExecutionObserver {
         })
     }
 
+    fn invocation_evidence(
+        &self,
+        step: &str,
+        invocation: RunnerActiveInvocation,
+        finished_at: RunnerExecutionInstant,
+        cancelled: bool,
+    ) -> Option<RecoveryInvocationV1> {
+        let usage = self
+            .invocation_evidence
+            .accounting
+            .usage(invocation.id)
+            .unwrap_or_default();
+        let native = self
+            .invocation_evidence
+            .accounting
+            .native_session(invocation.id);
+        let diagnostics = self
+            .invocation_evidence
+            .diagnostics
+            .get_invocation(step, invocation.id)
+            .and_then(|diagnostic| command_output_v1(&diagnostic).ok())
+            .map(|output| {
+                let (stdout_kind, stderr_kind) = if native.is_some() {
+                    (
+                        RecoveryDiagnosticKindV1::AgentHarnessStdout,
+                        RecoveryDiagnosticKindV1::AgentHarnessStderr,
+                    )
+                } else {
+                    (
+                        RecoveryDiagnosticKindV1::CommandStdout,
+                        RecoveryDiagnosticKindV1::CommandStderr,
+                    )
+                };
+                vec![
+                    RecoveryInvocationDiagnosticV1 {
+                        kind: stdout_kind,
+                        reference: format!(
+                            "runner/invocations/{}/stdout",
+                            invocation.id.transition_sequence.get()
+                        ),
+                        stream: output.stdout,
+                    },
+                    RecoveryInvocationDiagnosticV1 {
+                        kind: stderr_kind,
+                        reference: format!(
+                            "runner/invocations/{}/stderr",
+                            invocation.id.transition_sequence.get()
+                        ),
+                        stream: output.stderr,
+                    },
+                ]
+            })
+            .unwrap_or_default();
+        let diagnostic_reference =
+            native.map(|session| format!("runner/native-sessions/{}", session.diagnostic_identity));
+        let (role, target_execution, recovery_round) = match invocation.role {
+            ActiveStepInvocation::Target { execution_number } => (
+                RecoveryInvocationRoleV1::Target,
+                Some(execution_number.get()),
+                None,
+            ),
+            ActiveStepInvocation::RecoveryHandler { round } => (
+                RecoveryInvocationRoleV1::RecoveryHandler,
+                None,
+                Some(round.get()),
+            ),
+        };
+        Some(RecoveryInvocationV1 {
+            invocation_id: invocation.id.transition_sequence.get(),
+            role,
+            target_execution,
+            recovery_round,
+            state: if cancelled {
+                RecoveryInvocationStateV1::Cancelled
+            } else {
+                RecoveryInvocationStateV1::Settled
+            },
+            started_at: format_utc(invocation.started_at.utc),
+            finished_at: format_utc(finished_at.utc),
+            duration_milliseconds: u64::try_from(
+                finished_at
+                    .monotonic
+                    .saturating_duration_since(invocation.started_at.monotonic)
+                    .as_millis(),
+            )
+            .ok()?,
+            usage: RecoveryInvocationUsageV1 {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            },
+            diagnostics,
+            diagnostic_reference,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ObserverState> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn settle_runner_invocation(
+    observer: &RunnerExecutionObserver,
+    state: &mut ObserverState,
+    step: &str,
+    invocation: RunnerActiveInvocation,
+    finished_at: RunnerExecutionInstant,
+    cancelled: bool,
+    evidence: &mut Option<RecoveryInvocationV1>,
+) -> bool {
+    let Some(settled) = observer.invocation_evidence(step, invocation, finished_at, cancelled)
+    else {
+        return false;
+    };
+    if let Some((known_step, known)) = state.settled_invocations.get(&settled.invocation_id) {
+        return known_step == step && known == &settled;
+    }
+    if evidence.is_some() {
+        return false;
+    }
+    *evidence = Some(settled.clone());
+    state
+        .settled_invocations
+        .insert(settled.invocation_id, (step.to_owned(), settled));
+    true
 }
 
 impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
@@ -1765,7 +1969,86 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 state.faulted = true;
                 return;
             }
-            let workflow_event = workflow_event(&transition);
+            let mut invocation_evidence = None;
+            if let TransitionEvent::Step { step, to, .. } = &transition.event {
+                let cancelled = *to == StepStateKind::Cancelled;
+                if let Some(ObservedStepTransition::Recovery {
+                    active,
+                    active_invocation_id,
+                    settled_invocation,
+                    ..
+                }) = &transition.step
+                {
+                    if let Some(previous) = state.active_invocations.get(step).copied()
+                        && previous.id != *active_invocation_id
+                    {
+                        state.active_invocations.remove(step);
+                        if !settle_runner_invocation(
+                            &observer,
+                            &mut state,
+                            step,
+                            previous,
+                            observed_at,
+                            false,
+                            &mut invocation_evidence,
+                        ) {
+                            state.faulted = true;
+                            return;
+                        }
+                    }
+                    if let Some((id, role)) = settled_invocation
+                        && !state
+                            .settled_invocations
+                            .contains_key(&id.transition_sequence.get())
+                    {
+                        let started_at = state
+                            .step_timings
+                            .get(step)
+                            .map_or(observed_at, |timing| timing.started_at);
+                        if !settle_runner_invocation(
+                            &observer,
+                            &mut state,
+                            step,
+                            RunnerActiveInvocation {
+                                id: *id,
+                                role: *role,
+                                started_at,
+                            },
+                            observed_at,
+                            false,
+                            &mut invocation_evidence,
+                        ) {
+                            state.faulted = true;
+                            return;
+                        }
+                    }
+                    state.active_invocations.entry(step.clone()).or_insert(
+                        RunnerActiveInvocation {
+                            id: *active_invocation_id,
+                            role: *active,
+                            started_at: observed_at,
+                        },
+                    );
+                }
+                if matches!(
+                    to,
+                    StepStateKind::Succeeded | StepStateKind::Failed | StepStateKind::Cancelled
+                ) && let Some(active) = state.active_invocations.remove(step)
+                    && !settle_runner_invocation(
+                        &observer,
+                        &mut state,
+                        step,
+                        active,
+                        observed_at,
+                        cancelled,
+                        &mut invocation_evidence,
+                    )
+                {
+                    state.faulted = true;
+                    return;
+                }
+            }
+            let workflow_event = workflow_event(&transition, invocation_evidence.as_ref());
             let enqueued = observer.outbox.enqueue(AssignmentObservation::Execution {
                 assignment_id: observer.assignment_id.clone(),
                 attempt_id: observer.attempt_id.clone(),
@@ -1845,11 +2128,31 @@ fn is_lease_loss_terminal_transition(
     )
 }
 
+fn terminal_recovery_summaries(
+    recoveries: &BTreeMap<
+        String,
+        Option<crate::execution::workflow::runtime::StepRecoveryState<StepFailureCause>>,
+    >,
+) -> Option<Value> {
+    let summaries = recoveries
+        .iter()
+        .filter_map(|(step, recovery)| {
+            step_recovery_summary_v1(recovery.as_ref())
+                .ok()
+                .flatten()
+                .and_then(|summary| serde_json::to_value(summary).ok())
+                .map(|summary| (step.clone(), summary))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    (!summaries.is_empty()).then_some(Value::Object(summaries))
+}
+
 fn terminal_outcome(
     outcome: &str,
     failure: Option<Value>,
     reason: Option<&str>,
     finalization: Option<Value>,
+    recovery_summaries: Option<Value>,
 ) -> Value {
     let mut object = serde_json::Map::from_iter([("outcome".to_owned(), json!(outcome))]);
     if let Some(failure) = failure {
@@ -1860,6 +2163,9 @@ fn terminal_outcome(
     }
     if let Some(finalization) = finalization {
         object.insert("finalization".to_owned(), finalization);
+    }
+    if let Some(recovery_summaries) = recovery_summaries {
+        object.insert("recoverySummaries".to_owned(), recovery_summaries);
     }
     Value::Object(object)
 }
@@ -1953,8 +2259,39 @@ fn finalizer_result(result: &FinalizerResult<StepFailureCause>) -> Value {
     Value::Object(object)
 }
 
-fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) -> Value {
-    match &transition.event {
+fn distributed_invocation_evidence(invocation: &RecoveryInvocationV1) -> Option<Value> {
+    let mut value = serde_json::to_value(invocation).ok()?;
+    let object = value.as_object_mut()?;
+    let Some(diagnostics) = object.get_mut("diagnostics") else {
+        return Some(value);
+    };
+    for diagnostic in diagnostics.as_array_mut()? {
+        let stream = diagnostic
+            .as_object_mut()?
+            .get_mut("stream")?
+            .as_object_mut()?;
+        let encoded = stream.remove("data")?.as_str()?.to_owned();
+        stream.remove("encoding")?;
+        let bytes = BASE64_STANDARD.decode(encoded).ok()?;
+        let digest = digest(&SHA256, &bytes);
+        let value = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        stream.insert(
+            "digest".to_owned(),
+            json!({ "algorithm": "sha256", "value": value }),
+        );
+    }
+    Some(value)
+}
+
+fn workflow_event(
+    transition: &TransitionObservation<RunnerExecutionInstant>,
+    invocation_evidence: Option<&RecoveryInvocationV1>,
+) -> Value {
+    let mut event = match &transition.event {
         TransitionEvent::Step {
             sequence,
             step,
@@ -1975,8 +2312,65 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
             ]);
             if let Some(observed) = &transition.step {
                 match observed {
-                    ObservedStepTransition::Recovery { .. }
-                    | ObservedStepTransition::OutputsCommitted { .. } => {}
+                    ObservedStepTransition::Recovery {
+                        active,
+                        active_invocation_id,
+                        configured_rounds,
+                        handler_kind,
+                        handler_state,
+                        decision,
+                        ..
+                    } => {
+                        let mut progress = serde_json::Map::from_iter([
+                            ("configuredRetries".to_owned(), json!(configured_rounds)),
+                            (
+                                "activeInvocationId".to_owned(),
+                                json!(active_invocation_id.transition_sequence.get()),
+                            ),
+                        ]);
+                        match active {
+                            ActiveStepInvocation::Target { execution_number } => {
+                                progress.insert("activeRole".to_owned(), json!("target"));
+                                progress.insert(
+                                    "targetExecution".to_owned(),
+                                    json!(execution_number.get()),
+                                );
+                            }
+                            ActiveStepInvocation::RecoveryHandler { round } => {
+                                progress.insert("activeRole".to_owned(), json!("recovery_handler"));
+                                progress.insert("recoveryRound".to_owned(), json!(round.get()));
+                            }
+                        }
+                        if let Some(kind) = handler_kind {
+                            progress.insert(
+                                "handlerKind".to_owned(),
+                                json!(match kind {
+                                    crate::execution::workflow::runtime::RecoveryHandlerKind::Command => "cmd",
+                                    crate::execution::workflow::runtime::RecoveryHandlerKind::Agent => "agent",
+                                }),
+                            );
+                        }
+                        if let Some(handler_state) = handler_state {
+                            progress.insert(
+                                "handlerState".to_owned(),
+                                json!(match handler_state {
+                                    crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting => "starting",
+                                    crate::execution::workflow::runtime::RecoveryHandlerActivity::Running => "running",
+                                }),
+                            );
+                        }
+                        if let Some(decision) = decision {
+                            progress.insert(
+                                "decision".to_owned(),
+                                json!(match decision {
+                                    crate::execution::workflow::runtime::RecoveryDecisionKind::Recheck => "recheck",
+                                    crate::execution::workflow::runtime::RecoveryDecisionKind::GaveUp => "gave_up",
+                                }),
+                            );
+                        }
+                        event.insert("recoveryProgress".to_owned(), Value::Object(progress));
+                    }
+                    ObservedStepTransition::OutputsCommitted { .. } => {}
                     ObservedStepTransition::Failed { phase, cause } => {
                         event.insert("failure".to_owned(), failure_evidence(*phase, cause));
                     }
@@ -2033,7 +2427,16 @@ fn workflow_event(transition: &TransitionObservation<RunnerExecutionInstant>) ->
             "transitionSequence": sequence.get(),
             "reason": cancellation_reason(*reason),
         }),
+    };
+    if let Some(invocation_evidence) = invocation_evidence
+        && let Value::Object(object) = &mut event
+    {
+        object.insert(
+            "invocationEvidence".to_owned(),
+            distributed_invocation_evidence(invocation_evidence).unwrap_or(Value::Null),
+        );
     }
+    event
 }
 
 fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant>) -> Value {
@@ -2164,7 +2567,12 @@ fn failure_evidence(phase: FailurePhase, cause: &StepFailureCause) -> Value {
             failure_value("execution", code, exit_code, protocol_rejection)
         }
         (FailurePhase::OutputCapture, StepFailureCause::OutputCapture(cause)) => {
-            failure_value("output_capture", output_capture_failure(cause), None, None)
+            let (code, output) = output_capture_failure(cause);
+            let mut evidence = failure_value("output_capture", code, None, None);
+            if let Some(output) = output {
+                evidence["output"] = Value::String(output.to_owned());
+            }
+            evidence
         }
         _ => failure_value("start", "step_unavailable", None, None),
     }
@@ -2322,13 +2730,18 @@ fn agent_failure(failure: &AgentFailure) -> &'static str {
     }
 }
 
-fn output_capture_failure(failure: &OutputCaptureFailure) -> &'static str {
+fn output_capture_failure(failure: &OutputCaptureFailure) -> (&'static str, Option<&str>) {
     match failure {
-        OutputCaptureFailure::StepUnavailable => "output_step_unavailable",
-        OutputCaptureFailure::UnsupportedOutput => "output_unsupported",
-        OutputCaptureFailure::Capture(failure) => capture_failure(failure.kind()),
-        OutputCaptureFailure::Git { failure, .. } => git_capture_failure(failure),
-        OutputCaptureFailure::TaskUnavailable => "output_task_unavailable",
+        OutputCaptureFailure::StepUnavailable => ("output_step_unavailable", None),
+        OutputCaptureFailure::UnsupportedOutput => ("output_unsupported", None),
+        OutputCaptureFailure::Capture(failure) => (
+            capture_failure(failure.kind()),
+            Some(failure.output_identity()),
+        ),
+        OutputCaptureFailure::Git { output, failure } => {
+            (git_capture_failure(failure), Some(output))
+        }
+        OutputCaptureFailure::TaskUnavailable => ("output_task_unavailable", None),
     }
 }
 
@@ -2371,6 +2784,10 @@ fn capture_failure(failure: CaptureFailureKind) -> &'static str {
         CaptureFailureKind::NotDirectory => "output_not_directory",
         CaptureFailureKind::NotRegularFile => "output_not_regular_file",
         CaptureFailureKind::SourceUnavailable => "output_source_unavailable",
+        CaptureFailureKind::InvalidTextEncoding => "output_invalid_utf8",
+        CaptureFailureKind::InvalidJson => "output_invalid_json",
+        CaptureFailureKind::DuplicateJsonMember => "output_duplicate_json_member",
+        CaptureFailureKind::JsonSchemaMismatch => "output_json_schema_mismatch",
         CaptureFailureKind::FileCountLimitExceeded => "output_file_count_limit_exceeded",
         CaptureFailureKind::FileSizeLimitExceeded => "output_file_size_limit_exceeded",
         CaptureFailureKind::TotalSizeLimitExceeded => "output_total_size_limit_exceeded",
@@ -2507,7 +2924,9 @@ mod tests {
     };
     use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-    use crate::runner_protocol::{RunnerEnvelope, encode_runner_frame};
+    use crate::runner_protocol::{
+        MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, encode_runner_frame,
+    };
 
     fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
         LeaseAuthority {
@@ -2888,6 +3307,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_settlement_attaches_one_bounded_invocation_evidence() {
+        let outbox = ObservationOutbox::new();
+        let observer = RunnerExecutionObserver::new(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            4,
+            outbox.clone(),
+            PostStopFence::new(),
+            crate::execution::workflow::admission::CancellationSource::new(),
+            RunnerInvocationEvidence::default(),
+        );
+        let target = ActionId {
+            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(1),
+        };
+        let handler = ActionId {
+            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(2),
+        };
+        observer
+            .observe(ExecutionObservation::Transition(TransitionObservation {
+                event: TransitionEvent::Step {
+                    sequence: crate::execution::workflow::runtime::TransitionSequence(1),
+                    step: "verify".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                    failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
+                    from: StepStateKind::Pending,
+                    to: StepStateKind::Starting,
+                },
+                step: None,
+            }))
+            .await;
+        observer
+            .observe(ExecutionObservation::Transition(TransitionObservation {
+                event: TransitionEvent::Step {
+                    sequence: crate::execution::workflow::runtime::TransitionSequence(2),
+                    step: "verify".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                    failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
+                    from: StepStateKind::Running,
+                    to: StepStateKind::Recovering,
+                },
+                step: Some(ObservedStepTransition::Recovery {
+                    active: ActiveStepInvocation::RecoveryHandler {
+                        round: crate::execution::workflow::runtime::RecoveryRoundNumber::fixture(1),
+                    },
+                    active_invocation_id: handler,
+                    settled_invocation: Some((
+                        target,
+                        ActiveStepInvocation::Target {
+                            execution_number:
+                                crate::execution::workflow::runtime::TargetExecutionNumber::fixture(
+                                    1,
+                                ),
+                        },
+                    )),
+                    configured_rounds: 1,
+                    handler_kind: Some(
+                        crate::execution::workflow::runtime::RecoveryHandlerKind::Command,
+                    ),
+                    handler_state: Some(
+                        crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting,
+                    ),
+                    decision: None,
+                }),
+            }))
+            .await;
+
+        let observations = outbox.pending(&BTreeSet::new(), 4);
+        let AssignmentObservation::Execution {
+            report: ExecutionReport::Transition { workflow_event, .. },
+            ..
+        } = &observations[1].observation
+        else {
+            panic!("recovery transition was not enqueued");
+        };
+        assert_eq!(
+            workflow_event["recoveryProgress"]["activeRole"],
+            "recovery_handler"
+        );
+        assert_eq!(workflow_event["invocationEvidence"]["invocationId"], 1);
+        assert_eq!(workflow_event["invocationEvidence"]["role"], "target");
+        assert!(serde_json::to_vec(workflow_event).unwrap().len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
+    }
+
+    #[tokio::test]
     async fn post_stop_fence_rejects_late_success_but_allows_lease_terminal() {
         let outbox = ObservationOutbox::new();
         let fence = PostStopFence::new();
@@ -2898,6 +3401,7 @@ mod tests {
             outbox.clone(),
             fence.clone(),
             crate::execution::workflow::admission::CancellationSource::new(),
+            RunnerInvocationEvidence::default(),
         );
         fence.fence();
         observer
@@ -2948,6 +3452,7 @@ mod tests {
             ObservationOutbox::new(),
             fence,
             cancellation.clone(),
+            RunnerInvocationEvidence::default(),
         );
         observer
             .observe(ExecutionObservation::Transition(TransitionObservation {
@@ -3014,7 +3519,7 @@ mod tests {
         };
 
         assert_eq!(
-            workflow_event(&transition),
+            workflow_event(&transition, None),
             json!({
                 "eventVersion": 1,
                 "eventType": "step_state_changed",
@@ -3293,7 +3798,7 @@ mod tests {
             ),
         ] {
             assert_eq!(input_preparation_failure(kind), expected);
-            assert_encoded_evidence("start", expected, None);
+            assert_encoded_evidence("start", expected, None, None);
         }
         for (kind, expected) in [
             (CaptureFailureKind::AbsolutePath, "output_absolute_path"),
@@ -3344,7 +3849,7 @@ mod tests {
             ),
         ] {
             assert_eq!(capture_failure(kind), expected);
-            assert_encoded_evidence("output_capture", expected, None);
+            assert_encoded_evidence("output_capture", expected, None, Some("value"));
         }
         for (failure, expected) in [
             (
@@ -3416,7 +3921,12 @@ mod tests {
                 None,
             );
         }
-        assert_encoded_evidence("output_capture", "output_git_command_timed_out", None);
+        assert_encoded_evidence(
+            "output_capture",
+            "output_git_command_timed_out",
+            None,
+            Some("branch"),
+        );
     }
 
     fn assert_agent_protocol_rejection_evidence(failure: AgentFailure) -> Value {
@@ -3613,10 +4123,27 @@ mod tests {
         exit_code: Option<i32>,
     ) {
         let evidence = failure_evidence(phase, &cause);
-        assert_eq!(
-            evidence,
-            failure_value(expected_phase, expected_cause, exit_code, None)
-        );
+        let mut expected = failure_value(expected_phase, expected_cause, exit_code, None);
+        let output = match &cause {
+            StepFailureCause::OutputCapture(OutputCaptureFailure::Capture(failure)) => {
+                Some(failure.output_identity())
+            }
+            StepFailureCause::OutputCapture(OutputCaptureFailure::Git { output, .. }) => {
+                Some(output.as_str())
+            }
+            StepFailureCause::Start(_)
+            | StepFailureCause::Execution(_)
+            | StepFailureCause::OutputCapture(
+                OutputCaptureFailure::StepUnavailable
+                | OutputCaptureFailure::UnsupportedOutput
+                | OutputCaptureFailure::TaskUnavailable,
+            )
+            | StepFailureCause::RecoveryHandler(_) => None,
+        };
+        if let Some(output) = output {
+            expected["output"] = Value::String(output.to_owned());
+        }
+        assert_eq!(evidence, expected);
         let failure = StepFailure {
             role: WorkflowNodeRole::Step,
             step: "step".to_owned(),
@@ -3626,8 +4153,16 @@ mod tests {
         assert_encoded_evidence_value(expected_phase, evidence, workflow_failure(&failure));
     }
 
-    fn assert_encoded_evidence(phase: &str, cause: &str, exit_code: Option<i32>) {
-        let evidence = failure_value(phase, cause, exit_code, None);
+    fn assert_encoded_evidence(
+        phase: &str,
+        cause: &str,
+        exit_code: Option<i32>,
+        output: Option<&str>,
+    ) {
+        let mut evidence = failure_value(phase, cause, exit_code, None);
+        if let Some(output) = output {
+            evidence["output"] = Value::String(output.to_owned());
+        }
         let terminal = json!({
             "node": { "id": "step", "role": "step" },
             "failure": evidence.clone(),

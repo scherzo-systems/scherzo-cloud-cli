@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailure, AgentFailureCause, AgentHarnessFailureDetail,
     AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, BoundedSchemaValidAgentResult,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
 use super::strict_json;
@@ -336,7 +336,7 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     exchange_structured_output_candidates: u64,
     completed_result_exchange: Option<CompletedResultExchange>,
     result_decision_pending: bool,
-    accepted_result: Option<BoundedSchemaValidAgentResult>,
+    accepted_result: Option<CapturedJson>,
     native_failure: Option<AgentHarnessFailureDetail>,
     retry_active: bool,
     observations: Vec<AgentObservation>,
@@ -432,10 +432,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    pub(crate) fn accept_result(
-        &mut self,
-        result: BoundedSchemaValidAgentResult,
-    ) -> Result<(), AgentFailureCause> {
+    pub(crate) fn accept_result(&mut self, result: CapturedJson) -> Result<(), AgentFailureCause> {
         if self.value_kind != AgentValueKind::Result
             || !self.result_decision_pending
             || self.accepted_result.is_some()

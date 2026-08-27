@@ -667,9 +667,9 @@ async fn run_reconnect_scenario() -> Vec<String> {
         let sixth_hello = next_hello(&mut sixth).await;
         assert_hello(
             &sixth_hello,
-            "rmsg_00000000000000000000000007",
+            "rmsg_00000000000000000000000006",
             "rbt_00000000000000000000000001",
-            6,
+            5,
         );
         complete_handshake(&sixth, &mut sleep_requests, &sixth_hello).await;
         let replayed_rejection = next_outbound(&mut sixth.outbound).await;

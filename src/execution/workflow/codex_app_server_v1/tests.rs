@@ -189,7 +189,7 @@ fn thread_response(parser: &mut CodexAppServerV1Parser, provider: &str) {
     assert_eq!(turn["params"]["model"], "scherzo-loopback");
     assert_eq!(turn["params"]["effort"], "high");
     if parser.value_kind == AgentValueKind::Result {
-        assert_eq!(turn["params"]["outputSchema"], weak_result_schema());
+        assert_eq!(turn["params"]["outputSchema"], weak_json_schema());
     } else {
         assert!(turn["params"].get("outputSchema").is_none());
     }
@@ -1486,7 +1486,7 @@ fn one_rejection_queues_one_same_thread_correction_then_exhausts() {
                 correction["params"]["input"],
                 json!([{"type": "text", "text": "bounded authoritative feedback"}]),
             );
-            assert_eq!(correction["params"]["outputSchema"], weak_result_schema());
+            assert_eq!(correction["params"]["outputSchema"], weak_json_schema());
             feed(
                 &mut parser,
                 json!({"id": 6, "result": {"turn": {"id": "turn-2", "items": [], "status": "inProgress"}}}),

@@ -28,7 +28,7 @@ use crate::execution::workflow::agent::{
     AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessContext,
     AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiveError,
     AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES,
-    PositiveDuration, RetainedResultSchema, StagedAgentAttachment, WorkflowRunId,
+    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId,
     agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::execution::workflow::coordinator::CoordinatorClock;
@@ -623,7 +623,7 @@ fn count_result_mode() -> AgentValueMode {
         "additionalProperties": false
     });
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&document).unwrap());
-    let schema = RetainedResultSchema::compile(bytes, Arc::new(document)).unwrap();
+    let schema = RetainedJsonSchema::compile(bytes, Arc::new(document)).unwrap();
     AgentValueMode::Result {
         output: Arc::from("result"),
         schema,

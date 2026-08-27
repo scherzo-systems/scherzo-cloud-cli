@@ -58,6 +58,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.txt
         mediaType: text/plain
   agent:
@@ -74,7 +75,8 @@ steps:
           - ref: outputs.prepare.artifact
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: ../schemas/result.schema.json
   consume:
     kind: cmd
@@ -367,7 +369,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         .expect("workflow should be readable");
     conflicting_agent_values.replace_workflow(&source.replace(
         "    outputs:\n      result:",
-        "    outputs:\n      response:\n        kind: agent_response\n      result:",
+        "    outputs:\n      response:\n        kind: text\n        from: agent_response\n      result:",
     ));
 
     let missing = WorkflowBundle::valid();

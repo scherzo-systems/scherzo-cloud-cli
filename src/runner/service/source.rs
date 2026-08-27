@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use opentelemetry::KeyValue;
 use reqwest::StatusCode;
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
 use serde::Deserialize;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
@@ -24,10 +26,9 @@ use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
 use crate::runner_protocol::ExecutionSpecV1RunnerProjection;
 
-const SOURCE_CREDENTIAL_RESPONSE_LIMIT: usize = 128 * 1024;
+const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const FETCH_DIAGNOSTIC_LIMIT: u64 = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(super) trait SourceCredentialBroker: Send + Sync {
@@ -36,11 +37,26 @@ pub(super) trait SourceCredentialBroker: Send + Sync {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure>;
+
+    fn commit_availability(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure>;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CommitAvailability {
+    CommitAvailable,
+    CommitUnavailable,
+    RepositoryUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CredentialBrokerFailure {
     Unavailable,
+    RepositoryUnavailable,
     Fenced,
     InvalidResponse,
 }
@@ -71,9 +87,11 @@ impl Drop for ProviderSecret {
 
 #[derive(Clone)]
 pub(super) struct HttpSourceCredentialBroker {
-    endpoint: Url,
+    credential_endpoint: Url,
+    availability_endpoint: Url,
     runner_credential: Credential,
     boot_id: Arc<str>,
+    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
 }
 
 impl HttpSourceCredentialBroker {
@@ -88,14 +106,39 @@ impl HttpSourceCredentialBroker {
             "ws" => endpoint.set_scheme("http")?,
             _ => return Err(()),
         }
-        endpoint.set_path("/v1/runner/source-credentials");
         endpoint.set_query(None);
         endpoint.set_fragment(None);
+        let mut credential_endpoint = endpoint.clone();
+        credential_endpoint.set_path("/v1/runner/source-credentials");
+        let mut availability_endpoint = endpoint;
+        availability_endpoint.set_path("/v1/runner/source-commit-availability");
         Ok(Self {
-            endpoint,
+            credential_endpoint,
+            availability_endpoint,
             runner_credential: runner_credential.clone(),
             boot_id: Arc::from(boot_id),
+            recorder: None,
         })
+    }
+
+    pub(super) fn with_recorder(
+        mut self,
+        recorder: Arc<crate::runner::telemetry::Recorder>,
+    ) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    fn report_repository_unavailable(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "runner.source_authority",
+                [KeyValue::new(
+                    crate::runner::telemetry::attribute::ERROR_TYPE,
+                    "source_repository_unavailable",
+                )],
+            );
+        }
     }
 }
 
@@ -108,16 +151,38 @@ struct CredentialResponse {
     expires_at: String,
 }
 
-struct CredentialRequest<'a> {
-    assignment_id: &'a str,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DependencyResponse {
+    schema_version: u64,
+    reason: DependencyReason,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DependencyReason {
+    RepositoryUnavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitAvailabilityResponse {
+    schema_version: u64,
+    availability: CommitAvailability,
+}
+
+struct BrokerResponse {
+    status: StatusCode,
+    encoded: ProviderSecret,
 }
 
 impl HttpSourceCredentialBroker {
-    fn issue_current(
+    fn request_current(
         &self,
-        request: CredentialRequest<'_>,
+        endpoint: &Url,
+        assignment_id: &str,
         cancellation: &CaptureCancellation,
-    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+    ) -> Result<BrokerResponse, CredentialBrokerFailure> {
         ensure_broker_current(cancellation)?;
         crate::tls::install_provider();
         let client = reqwest::Client::builder()
@@ -125,18 +190,18 @@ impl HttpSourceCredentialBroker {
             .build()
             .map_err(|_| CredentialBrokerFailure::Unavailable)?;
         let request = client
-            .post(self.endpoint.clone())
+            .post(endpoint.clone())
             .bearer_auth(self.runner_credential.bearer_value())
             .json(&serde_json::json!({
                 "schemaVersion": 1,
                 "bootId": self.boot_id.as_ref(),
-                "assignmentId": request.assignment_id,
+                "assignmentId": assignment_id,
             }));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| CredentialBrokerFailure::Unavailable)?;
-        let (status, encoded) = runtime.block_on(async {
+        runtime.block_on(async {
             let mut response = tokio::select! {
                 result = request.send() => {
                     result.map_err(|_| CredentialBrokerFailure::Unavailable)?
@@ -146,8 +211,26 @@ impl HttpSourceCredentialBroker {
                 }
             };
             let status = response.status();
+            if response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                != Some("private, no-store")
+            {
+                return Err(CredentialBrokerFailure::InvalidResponse);
+            }
+            let has_json = matches!(status, StatusCode::OK | StatusCode::FAILED_DEPENDENCY);
+            if has_json
+                && response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    != Some("application/json")
+            {
+                return Err(CredentialBrokerFailure::InvalidResponse);
+            }
             let mut encoded = ProviderSecret(Vec::new());
-            if status == StatusCode::OK {
+            if has_json {
                 loop {
                     let chunk = tokio::select! {
                         result = response.chunk() => {
@@ -160,24 +243,41 @@ impl HttpSourceCredentialBroker {
                     let Some(chunk) = chunk else {
                         break;
                     };
-                    if encoded.0.len().saturating_add(chunk.len())
-                        > SOURCE_CREDENTIAL_RESPONSE_LIMIT
-                    {
+                    if encoded.0.len().saturating_add(chunk.len()) > SOURCE_BROKER_RESPONSE_LIMIT {
                         return Err(CredentialBrokerFailure::InvalidResponse);
                     }
                     encoded.0.extend_from_slice(&chunk);
                 }
             }
-            Ok((status, encoded))
-        })?;
-        if status == StatusCode::CONFLICT {
-            return Err(CredentialBrokerFailure::Fenced);
-        }
-        if status != StatusCode::OK {
-            return Err(CredentialBrokerFailure::Unavailable);
+            Ok(BrokerResponse { status, encoded })
+        })
+    }
+
+    fn issue_current(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        let response =
+            self.request_current(&self.credential_endpoint, assignment_id, cancellation)?;
+        match response.status {
+            StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
+            StatusCode::FAILED_DEPENDENCY => {
+                let dependency: DependencyResponse = serde_json::from_slice(&response.encoded.0)
+                    .map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+                if dependency.schema_version != 1
+                    || !matches!(dependency.reason, DependencyReason::RepositoryUnavailable)
+                {
+                    return Err(CredentialBrokerFailure::InvalidResponse);
+                }
+                self.report_repository_unavailable();
+                return Err(CredentialBrokerFailure::RepositoryUnavailable);
+            }
+            StatusCode::OK => {}
+            _ => return Err(CredentialBrokerFailure::Unavailable),
         }
         ensure_broker_current(cancellation)?;
-        let parsed: CredentialResponse = serde_json::from_slice(&encoded.0)
+        let parsed: CredentialResponse = serde_json::from_slice(&response.encoded.0)
             .map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
         let CredentialResponse {
             schema_version,
@@ -209,6 +309,30 @@ impl HttpSourceCredentialBroker {
             expires_at,
         })
     }
+
+    fn commit_availability_current(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        let response =
+            self.request_current(&self.availability_endpoint, assignment_id, cancellation)?;
+        match response.status {
+            StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
+            StatusCode::OK => {}
+            _ => return Err(CredentialBrokerFailure::Unavailable),
+        }
+        ensure_broker_current(cancellation)?;
+        let parsed: CommitAvailabilityResponse = serde_json::from_slice(&response.encoded.0)
+            .map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+        if parsed.schema_version != 1 {
+            return Err(CredentialBrokerFailure::InvalidResponse);
+        }
+        if parsed.availability == CommitAvailability::RepositoryUnavailable {
+            self.report_repository_unavailable();
+        }
+        Ok(parsed.availability)
+    }
 }
 
 impl SourceCredentialBroker for HttpSourceCredentialBroker {
@@ -217,36 +341,53 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-        ensure_broker_current(cancellation)?;
         let broker = self.clone();
         let assignment_id = assignment_id.to_owned();
         let worker_cancellation = cancellation.clone();
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("runner-source-credential".to_owned())
-            .spawn(move || {
-                let result = broker.issue_current(
-                    CredentialRequest {
-                        assignment_id: &assignment_id,
-                    },
-                    &worker_cancellation,
-                );
-                let _ = sender.send(result);
-            })
-            .map_err(|_| CredentialBrokerFailure::Unavailable)?;
-        loop {
-            ensure_broker_current(cancellation)?;
-            match receiver.try_recv() {
-                Ok(result) => {
-                    ensure_broker_current(cancellation)?;
-                    return result;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    crate::timing::sleep(PROCESS_POLL_INTERVAL);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(CredentialBrokerFailure::Unavailable);
-                }
+        run_broker_worker("runner-source-credential", cancellation, move || {
+            broker.issue_current(&assignment_id, &worker_cancellation)
+        })
+    }
+
+    fn commit_availability(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        let broker = self.clone();
+        let assignment_id = assignment_id.to_owned();
+        let worker_cancellation = cancellation.clone();
+        run_broker_worker("runner-source-verification", cancellation, move || {
+            broker.commit_availability_current(&assignment_id, &worker_cancellation)
+        })
+    }
+}
+
+fn run_broker_worker<T: Send + 'static>(
+    name: &'static str,
+    cancellation: &CaptureCancellation,
+    worker: impl FnOnce() -> Result<T, CredentialBrokerFailure> + Send + 'static,
+) -> Result<T, CredentialBrokerFailure> {
+    ensure_broker_current(cancellation)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = sender.send(worker());
+        })
+        .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+    loop {
+        ensure_broker_current(cancellation)?;
+        match receiver.try_recv() {
+            Ok(result) => {
+                ensure_broker_current(cancellation)?;
+                return result;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                crate::timing::sleep(PROCESS_POLL_INTERVAL);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(CredentialBrokerFailure::Unavailable);
             }
         }
     }
@@ -299,6 +440,7 @@ fn validate_repository_url(raw: &str) -> Result<String, CredentialBrokerFailure>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MaterializationFailure {
     ProviderUnavailable,
+    RepositoryUnavailable,
     AssignmentFenced,
     EnvironmentUnavailable,
     CommitUnavailable,
@@ -409,8 +551,9 @@ pub(super) fn materialize(
         fetch_pinned_commit(
             source_root,
             environment,
-            private_root,
             &askpass,
+            broker.as_ref(),
+            assignment_id,
             &request.commit_oid,
             cancellation,
         )?;
@@ -468,6 +611,9 @@ fn ensure_current(cancellation: &CaptureCancellation) -> Result<(), Materializat
 fn map_broker_failure(failure: CredentialBrokerFailure) -> MaterializationFailure {
     match failure {
         CredentialBrokerFailure::Fenced => MaterializationFailure::AssignmentFenced,
+        CredentialBrokerFailure::RepositoryUnavailable => {
+            MaterializationFailure::RepositoryUnavailable
+        }
         CredentialBrokerFailure::Unavailable | CredentialBrokerFailure::InvalidResponse => {
             MaterializationFailure::ProviderUnavailable
         }
@@ -525,8 +671,9 @@ fn verify_remote_object_format(
 fn fetch_pinned_commit(
     root: &Path,
     environment: &EnvironmentSnapshot,
-    private_root: &Path,
     askpass: &EphemeralAskpass,
+    broker: &dyn SourceCredentialBroker,
+    assignment_id: &str,
     commit_oid: &str,
     cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
@@ -550,12 +697,6 @@ fn fetch_pinned_commit(
         return Ok(());
     }
 
-    let mut diagnostic = tempfile::tempfile_in(private_root)
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    let stderr = diagnostic
-        .try_clone()
-        .map(Stdio::from)
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
     let mut command = git_command(
         root,
         environment,
@@ -572,7 +713,7 @@ fn fetch_pinned_commit(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr);
+        .stderr(Stdio::null());
     let status = run_managed_source_git(
         &mut command,
         cancellation,
@@ -581,24 +722,15 @@ fn fetch_pinned_commit(
     if status.success() {
         return Ok(());
     }
-    let diagnostic_length = diagnostic
-        .metadata()
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
-        .len();
-    diagnostic
-        .seek(SeekFrom::Start(
-            diagnostic_length.saturating_sub(FETCH_DIAGNOSTIC_LIMIT),
-        ))
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    let mut bytes = Vec::new();
-    diagnostic
-        .take(FETCH_DIAGNOSTIC_LIMIT)
-        .read_to_end(&mut bytes)
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    if provider_reports_missing_object(&bytes, commit_oid) {
-        Err(MaterializationFailure::CommitUnavailable)
-    } else {
-        Err(MaterializationFailure::ProviderUnavailable)
+    match broker
+        .commit_availability(assignment_id, cancellation)
+        .map_err(map_broker_failure)?
+    {
+        CommitAvailability::CommitAvailable => Err(MaterializationFailure::ProviderUnavailable),
+        CommitAvailability::CommitUnavailable => Err(MaterializationFailure::CommitUnavailable),
+        CommitAvailability::RepositoryUnavailable => {
+            Err(MaterializationFailure::RepositoryUnavailable)
+        }
     }
 }
 
@@ -620,20 +752,6 @@ fn commit_is_available(
         MaterializationFailure::EnvironmentUnavailable,
     )
     .map(|status| status.success())
-}
-
-fn provider_reports_missing_object(diagnostic: &[u8], commit_oid: &str) -> bool {
-    [
-        format!("upload-pack: not our ref {commit_oid}"),
-        format!("Server does not allow request for unadvertised object {commit_oid}"),
-        format!("couldn't find remote ref {commit_oid}"),
-    ]
-    .iter()
-    .any(|evidence| {
-        diagnostic
-            .windows(evidence.len())
-            .any(|window| window == evidence.as_bytes())
-    })
 }
 
 fn verify_fetched_commit(
@@ -658,7 +776,7 @@ fn verify_fetched_commit(
         cancellation,
     )?;
     if object_type != b"commit\n" {
-        return Err(MaterializationFailure::CommitUnavailable);
+        return Err(MaterializationFailure::CommitMismatch);
     }
     Ok(())
 }
@@ -982,6 +1100,7 @@ fn fixture_credential(repository_url: String, token: &str) -> ProviderCredential
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::ffi::OsStrExt as _;
     use std::process::Command;
@@ -993,7 +1112,7 @@ mod tests {
     use super::*;
     use crate::execution::workflow::admission::{
         CancellationPolicy, CancellationSource, ExecutionContext, ExecutionRootLifecycle,
-        ResolvedImports, admit_workflow, default_execution_policy_limits,
+        ResolvedImports, admit_runner_workflow, default_execution_policy_limits,
     };
     use crate::execution::workflow::artifact::ArtifactStaging;
     use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -1006,11 +1125,19 @@ mod tests {
     use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::execution::workflow::value::CapturedValue;
     use crate::runner::credential::test_credential;
+    use crate::runner::telemetry::test_recorder;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FixtureBrokerCall {
+        Checkout,
+        CommitAvailability,
+    }
 
     struct FixtureBroker {
         repository_url: String,
         token: String,
-        calls: Mutex<usize>,
+        availability: CommitAvailability,
+        calls: Mutex<Vec<FixtureBrokerCall>>,
     }
 
     impl SourceCredentialBroker for FixtureBroker {
@@ -1020,8 +1147,21 @@ mod tests {
             cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
             ensure_broker_current(cancellation)?;
-            *self.calls.lock().unwrap() += 1;
+            self.calls.lock().unwrap().push(FixtureBrokerCall::Checkout);
             Ok(fixture_credential(self.repository_url.clone(), &self.token))
+        }
+
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            ensure_broker_current(cancellation)?;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(FixtureBrokerCall::CommitAvailability);
+            Ok(self.availability)
         }
     }
 
@@ -1066,12 +1206,29 @@ mod tests {
             let bare_repository = temporary.path().join("repository.git");
             assert!(
                 fixture_git_command()
-                    .args(["clone", "--quiet", "--bare"])
+                    .args(["clone", "--quiet", "--mirror"])
                     .arg(repository)
                     .arg(&bare_repository)
                     .status()
                     .unwrap()
                     .success()
+            );
+            let retained_refs = fixture_git_command()
+                .current_dir(&bare_repository)
+                .args([
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/scherzo-retained",
+                ])
+                .output()
+                .unwrap();
+            assert!(retained_refs.status.success());
+            for retained_ref in String::from_utf8(retained_refs.stdout).unwrap().lines() {
+                run_fixture_git(&bare_repository, &["update-ref", "-d", retained_ref]);
+            }
+            run_fixture_git(
+                &bare_repository,
+                &["config", "uploadpack.allowAnySHA1InWant", "true"],
             );
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let address = listener.local_addr().unwrap();
@@ -1471,10 +1628,23 @@ mod tests {
     }
 
     fn fixture_broker(repository_url: String, token: &str) -> Arc<FixtureBroker> {
+        fixture_broker_with_availability(
+            repository_url,
+            token,
+            CommitAvailability::CommitUnavailable,
+        )
+    }
+
+    fn fixture_broker_with_availability(
+        repository_url: String,
+        token: &str,
+        availability: CommitAvailability,
+    ) -> Arc<FixtureBroker> {
         Arc::new(FixtureBroker {
             repository_url,
             token: token.to_owned(),
-            calls: Mutex::new(0),
+            availability,
+            calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -1485,6 +1655,29 @@ mod tests {
             "fixture-provider-token",
         );
         (assignment, broker)
+    }
+
+    fn missing_commit_fixture(
+        availability: CommitAvailability,
+    ) -> (
+        RepositoryFixture,
+        tempfile::TempDir,
+        MaterializationRequest,
+        Arc<FixtureBroker>,
+    ) {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let fixture = repository_fixture(workflow);
+        let mut projection = projection(&fixture);
+        projection.commit_oid = "0".repeat(40);
+        let assignment = empty_assignment();
+        let broker = fixture_broker_with_availability(
+            Url::from_file_path(&fixture.repository)
+                .unwrap()
+                .to_string(),
+            "fixture-provider-token",
+            availability,
+        );
+        (fixture, assignment, projection, broker)
     }
 
     fn fixture_environment() -> EnvironmentSnapshot {
@@ -1637,7 +1830,7 @@ mod tests {
     #[test]
     fn materializes_the_exact_detached_clean_commit_and_removes_credential_helpers() {
         const TOKEN: &str = "fixture-provider-token";
-        let workflow = "schemaVersion: 1\nsteps:\n  capture:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      first:\n        kind: git_branch\n      second:\n        kind: git_branch\nexports:\n  alias:\n    ref: outputs.capture.first\n  first:\n    ref: outputs.capture.first\n  second:\n    ref: outputs.capture.second\n";
+        let workflow = "schemaVersion: 1\nsteps:\n  capture:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      first:\n        kind: git_branch\n        from: workspace\nexports:\n  alias:\n    ref: outputs.capture.first\n  first:\n    ref: outputs.capture.first\n";
         let fixture = repository_fixture(workflow);
         let projection = projection(&fixture);
         let assignment = empty_assignment();
@@ -1658,7 +1851,10 @@ mod tests {
         );
         assert!(materialized.git_capture.is_some());
         assert!(!assignment.path().join("execution").exists());
-        assert_eq!(*broker.calls.lock().unwrap(), 1);
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            [FixtureBrokerCall::Checkout]
+        );
         assert_credential_material_removed(&assignment, TOKEN);
         let request_evidence = server.evidence();
         assert!(request_evidence.challenges > 0);
@@ -1760,7 +1956,8 @@ mod tests {
         )
         .with_cloud_git_capture(materialized.git_capture.unwrap());
         let admitted =
-            admit_workflow(materialized.workflow, ResolvedImports::default(), context).unwrap();
+            admit_runner_workflow(materialized.workflow, ResolvedImports::default(), context)
+                .unwrap();
         let git = admitted.git_capture().unwrap();
         assert_eq!(admitted.execution().root(), expected_root);
         assert_eq!(
@@ -1784,9 +1981,8 @@ mod tests {
                 .remove(identity)
                 .unwrap()
         };
-        let prepare = |first: CapturedValue, second: CapturedValue| {
-            let outputs =
-                BTreeMap::from([("first".to_owned(), first), ("second".to_owned(), second)]);
+        let prepare = |first: CapturedValue| {
+            let outputs = BTreeMap::from([("first".to_owned(), first)]);
             let exports = admitted
                 .workflow()
                 .definition
@@ -1809,6 +2005,9 @@ mod tests {
                 content_digest: admitted.workflow().content_digest.clone(),
                 execution_root: admitted.execution().root().to_owned(),
                 maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
+                cloud_capacity: Some(crate::runner::service::execution::cloud_execution_capacity(
+                    &admitted,
+                )),
                 timing: WorkflowRunTiming {
                     started_at: OffsetDateTime::UNIX_EPOCH,
                     finished_at: OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND,
@@ -1847,11 +2046,11 @@ mod tests {
             .unwrap()
         };
 
-        let zero_delta = prepare(capture("first"), capture("second"));
+        let zero_delta = prepare(capture("first"));
         assert!(zero_delta.carriers.is_empty());
         let zero_result: serde_json::Value =
             serde_json::from_slice(&zero_delta.result_json).unwrap();
-        for name in ["alias", "first", "second"] {
+        for name in ["alias", "first"] {
             let export = &zero_result["exports"][name];
             assert_eq!(export["baseOid"], fixture.commit);
             assert_eq!(export["headOid"], fixture.commit);
@@ -1887,14 +2086,14 @@ mod tests {
         .unwrap()
         .trim()
         .to_owned();
-        let changed = prepare(capture("first"), capture("second"));
+        let changed = prepare(capture("first"));
         assert_eq!(
             changed
                 .carriers
                 .iter()
                 .map(|carrier| carrier.portable_owner_path.as_str())
                 .collect::<Vec<_>>(),
-            ["exports/0001", "exports/0003"]
+            ["exports/0001"]
         );
         let changed_result: serde_json::Value =
             serde_json::from_slice(&changed.result_json).unwrap();
@@ -1908,11 +2107,7 @@ mod tests {
             changed_result["exports"]["first"]["carrier"]["path"],
             "exports/0001"
         );
-        assert_eq!(
-            changed_result["exports"]["second"]["carrier"]["path"],
-            "exports/0003"
-        );
-        for name in ["alias", "first", "second"] {
+        for name in ["alias", "first"] {
             let export = &changed_result["exports"][name];
             assert_eq!(export["baseOid"], fixture.commit);
             assert_eq!(export["headOid"], changed_head);
@@ -1941,7 +2136,10 @@ mod tests {
             )
             .unwrap();
         assert!(validation.is_valid());
-        assert_eq!(*broker.calls.lock().unwrap(), 1);
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            [FixtureBrokerCall::Checkout]
+        );
     }
 
     #[test]
@@ -2040,6 +2238,48 @@ mod tests {
     }
 
     #[test]
+    fn retained_unadvertised_commit_remains_eligible_without_provider_absence_inference() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let fixture = repository_fixture(workflow);
+        run_fixture_git(
+            &fixture.repository,
+            &[
+                "update-ref",
+                "refs/scherzo-retained/pinned",
+                &fixture.commit,
+            ],
+        );
+        run_fixture_git(
+            &fixture.repository,
+            &["reset", "--hard", &fixture.parent_commit],
+        );
+        let projection = projection(&fixture);
+        let assignment = empty_assignment();
+        let server = AuthenticatedGitServer::start(
+            &fixture.repository,
+            &assignment.path().join("private"),
+            "retained-provider-token",
+            "retained-provider-token",
+            None,
+        );
+        let broker = fixture_broker(server.repository_url.clone(), "retained-provider-token");
+
+        let materialized =
+            materialization_result(&assignment, Arc::clone(&broker), &projection).unwrap();
+
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            [FixtureBrokerCall::Checkout]
+        );
+        assert_eq!(
+            materialized
+                .workflow
+                .source_bytes("workflows/workflow.yaml"),
+            Some(workflow.as_bytes())
+        );
+    }
+
+    #[test]
     fn rejects_a_non_commit_pinned_oid_as_an_integrity_failure() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let fixture = repository_fixture(workflow);
@@ -2054,21 +2294,47 @@ mod tests {
 
         assert!(matches!(
             materialization_result(&assignment, broker, &projection),
-            Err(MaterializationFailure::CommitUnavailable)
+            Err(MaterializationFailure::CommitMismatch)
         ));
     }
 
     #[test]
-    fn missing_pinned_commit_is_an_immutable_source_failure() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let fixture = repository_fixture(workflow);
-        let mut projection = projection(&fixture);
-        projection.commit_oid = "0".repeat(40);
-        let (assignment, broker) = assignment_fixture(&fixture.repository);
+    fn missing_pinned_commit_requires_authoritative_provider_absence() {
+        let (_fixture, assignment, projection, broker) =
+            missing_commit_fixture(CommitAvailability::CommitUnavailable);
+
+        assert_eq!(
+            materialization_result(&assignment, Arc::clone(&broker), &projection).map(|_| ()),
+            Err(MaterializationFailure::CommitUnavailable)
+        );
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            [
+                FixtureBrokerCall::Checkout,
+                FixtureBrokerCall::CommitAvailability,
+            ]
+        );
+    }
+
+    #[test]
+    fn available_commit_after_generic_fetch_failure_remains_retryable() {
+        let (_fixture, assignment, projection, broker) =
+            missing_commit_fixture(CommitAvailability::CommitAvailable);
 
         assert_eq!(
             materialization_result(&assignment, broker, &projection).map(|_| ()),
-            Err(MaterializationFailure::CommitUnavailable)
+            Err(MaterializationFailure::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn repository_unavailability_never_becomes_commit_unavailability() {
+        let (_fixture, assignment, projection, broker) =
+            missing_commit_fixture(CommitAvailability::RepositoryUnavailable);
+
+        assert_eq!(
+            materialization_result(&assignment, broker, &projection).map(|_| ()),
+            Err(MaterializationFailure::RepositoryUnavailable)
         );
     }
 
@@ -2140,6 +2406,136 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    fn source_broker_response_fixture(
+        status: &str,
+        body: &str,
+    ) -> (
+        Url,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            request_sender
+                .send(
+                    String::from_utf8(request[header_end..header_end + content_length].to_vec())
+                        .unwrap(),
+                )
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nCache-Control: private, no-store\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (
+            Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap(),
+            request_receiver,
+            server,
+        )
+    }
+
+    #[test]
+    fn broker_maps_repository_dependency_to_sanitized_retryable_result() {
+        let (endpoint, request, server) = source_broker_response_fixture(
+            "424 Failed Dependency",
+            r#"{"schemaVersion":1,"reason":"repository_unavailable"}"#,
+        );
+        let (recorder, capture) = test_recorder("rbt_fixture");
+        let broker = HttpSourceCredentialBroker::new(
+            &endpoint,
+            &test_credential(),
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+        )
+        .unwrap()
+        .with_recorder(recorder);
+
+        let result = broker.issue(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            &CaptureCancellation::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CredentialBrokerFailure::RepositoryUnavailable)
+        ));
+        let document: serde_json::Value = serde_json::from_str(&request.recv().unwrap()).unwrap();
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            })
+        );
+        server.join().unwrap();
+        let records = capture.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["event.name"], "runner.source_authority");
+        assert_eq!(
+            records[0][crate::runner::telemetry::attribute::ERROR_TYPE],
+            "source_repository_unavailable"
+        );
+    }
+
+    #[test]
+    fn availability_broker_consumes_only_closed_provider_neutral_results() {
+        let (endpoint, request, server) = source_broker_response_fixture(
+            "200 OK",
+            r#"{"schemaVersion":1,"availability":"repository_unavailable"}"#,
+        );
+        let broker = HttpSourceCredentialBroker::new(
+            &endpoint,
+            &test_credential(),
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+        )
+        .unwrap();
+
+        assert_eq!(
+            broker.commit_availability(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &CaptureCancellation::default(),
+            ),
+            Ok(CommitAvailability::RepositoryUnavailable)
+        );
+        let document: serde_json::Value = serde_json::from_str(&request.recv().unwrap()).unwrap();
+        assert!(document.get("commitOid").is_none());
+        assert!(document.get("repositoryConnectionId").is_none());
+        server.join().unwrap();
     }
 
     #[test]

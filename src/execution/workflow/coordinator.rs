@@ -687,7 +687,6 @@ pub(crate) enum CoordinationError {
     OccurrenceIdentityCapacityExceeded,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
-    RunnerRecoveryExecutionGuardActive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

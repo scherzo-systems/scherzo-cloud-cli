@@ -11,7 +11,7 @@ use super::archived_attempt::{
     ArchivedStep, ArchivedStepDetail, ArchivedStepState, ArchivedWorkflowOutcome,
     LoadedLocalArchivedAttempt, LocalArchivedAttempt,
 };
-use super::document::{FailurePolicy, Output};
+use super::document::FailurePolicy;
 use super::presentation::{human_duration, styled_terminal_text as styled};
 use super::presentation_feed::{WorkflowPresentationStep, normalize_terminal_scalar};
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
@@ -299,21 +299,10 @@ fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationSt
     match &step.detail {
         ArchivedStepDetail::Succeeded => match definition {
             WorkflowPresentationStep::Command { .. } => "exit 0".to_owned(),
-            WorkflowPresentationStep::Agent { outputs, .. } => {
-                if outputs
-                    .values()
-                    .any(|output| matches!(output, Output::AgentResponse))
-                {
-                    "response captured".to_owned()
-                } else if outputs
-                    .values()
-                    .any(|output| matches!(output, Output::AgentResult { .. }))
-                {
-                    "result captured".to_owned()
-                } else {
-                    "no requested agent value".to_owned()
-                }
-            }
+            WorkflowPresentationStep::Agent { outputs, .. } => match outputs.len() {
+                1 => "1 output committed".to_owned(),
+                count => format!("{count} outputs committed"),
+            },
         },
         ArchivedStepDetail::Failed(failure) => archived_failure_detail(failure),
         ArchivedStepDetail::Blocked { dependency } => {
@@ -707,7 +696,10 @@ mod tests {
     use crate::execution::workflow::archived_attempt::{
         ArchivedAttemptIneligible, ArchivedAttemptOperationalError, ArchivedExecution,
     };
-    use crate::execution::workflow::presentation_feed::WorkflowPresentationDefinition;
+    use crate::execution::workflow::document::Output;
+    use crate::execution::workflow::presentation_feed::{
+        AgentPresentationHarness, WorkflowPresentationDefinition,
+    };
     use crate::execution::workflow::resolution::{ContentDigestAlgorithm, WorkflowContentDigest};
 
     #[test]
@@ -745,6 +737,42 @@ mod tests {
         }
         assert!(!plain.contains('\u{1b}'));
         assert!(render_plain(&attempt, true).unwrap().contains('\u{1b}'));
+    }
+
+    #[test]
+    fn archived_agent_success_is_source_neutral() {
+        let step = ArchivedStep {
+            id: "agent".to_owned(),
+            role: WorkflowNodeRole::Step,
+            failure_policy: FailurePolicy::Required,
+            state: ArchivedStepState::Succeeded,
+            started_at: None,
+            duration: None,
+            detail: ArchivedStepDetail::Succeeded,
+            command_output: None,
+            recovery: None,
+            invocations: Vec::new(),
+        };
+        let detail = |output| {
+            let definition = WorkflowPresentationStep::Agent {
+                profile: "fixture".to_owned(),
+                harness: AgentPresentationHarness::Codex {
+                    model: "fixture/model".to_owned(),
+                    effort: "low".to_owned(),
+                },
+                failure_policy: FailurePolicy::Required,
+                direct_dependencies: Vec::new(),
+                outputs: BTreeMap::from([("value".to_owned(), output)]),
+            };
+            archived_step_detail(&step, &definition)
+        };
+
+        let native = detail(Output::TextAgentResponse);
+        let path = detail(Output::TextPath {
+            path: "value.txt".to_owned(),
+        });
+        assert_eq!(native, "1 output committed");
+        assert_eq!(native, path);
     }
 
     #[test]

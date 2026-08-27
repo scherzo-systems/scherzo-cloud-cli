@@ -121,28 +121,33 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataErr
 }
 
 pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
-    let origin_profile_valid = match &result.workflow.provenance {
-        WorkflowProvenanceV1::Local { source_root } => {
-            is_canonical_absolute_path(source_root)
-                && result
-                    .execution
-                    .execution_root
-                    .as_deref()
-                    .is_some_and(is_canonical_absolute_path)
-        }
-        WorkflowProvenanceV1::Cloud {
-            project_id,
-            repository_connection_id,
-            object_format,
-            commit_oid,
-        } => {
-            valid_typed_id(project_id, "prj_")
-                && valid_typed_id(repository_connection_id, "rpc_")
-                && object_format == "sha1"
-                && is_lowercase_hex(commit_oid, 40)
-                && result.execution.execution_root.is_none()
-        }
-    };
+    let origin_profile_valid =
+        match &result.workflow.provenance {
+            WorkflowProvenanceV1::Local { source_root } => {
+                is_canonical_absolute_path(source_root)
+                    && result
+                        .execution
+                        .execution_root
+                        .as_deref()
+                        .is_some_and(is_canonical_absolute_path)
+                    && result.execution.capacity.is_none()
+            }
+            WorkflowProvenanceV1::Cloud {
+                project_id,
+                repository_connection_id,
+                object_format,
+                commit_oid,
+            } => {
+                valid_typed_id(project_id, "prj_")
+                    && valid_typed_id(repository_connection_id, "rpc_")
+                    && object_format == "sha1"
+                    && is_lowercase_hex(commit_oid, 40)
+                    && result.execution.execution_root.is_none()
+                    && result.execution.capacity.as_ref().is_some_and(|capacity| {
+                        valid_cloud_capacity(capacity, &result.workflow.digest)
+                    })
+            }
+        };
     if result.schema_version != 1
         || result.attempt_number == 0
         || !origin_profile_valid
@@ -316,6 +321,38 @@ fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
                 step.state,
                 WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
             ))
+}
+
+fn valid_cloud_capacity(
+    capacity: &super::publication::CloudExecutionCapacityV1,
+    workflow_digest: &super::publication::DigestV1,
+) -> bool {
+    capacity.execution_contract == "workflow_v1_inputless_cloud_artifacts@1"
+        && capacity.source_closure_digest == *workflow_digest
+        && capacity.general_maximum_transitions >= 1
+        && capacity.general_maximum_transitions <= 1_286
+        && capacity.selected_maximum_transitions >= 1
+        && capacity.selected_maximum_transitions <= 1_030
+        && capacity.maximum_invocations >= 1
+        && capacity.maximum_invocations <= 488
+        && capacity.maximum_retained_bytes_per_invocation >= 1
+        && capacity.maximum_retained_bytes_per_invocation <= 4_194_304
+        && capacity.diagnostic_retention_bytes >= capacity.maximum_retained_bytes_per_invocation
+        && capacity.diagnostic_retention_bytes <= 134_217_728
+        && capacity.native_session_retention_bytes >= capacity.maximum_retained_bytes_per_invocation
+        && capacity.native_session_retention_bytes <= 67_108_864
+        && capacity
+            .diagnostic_retention_bytes
+            .checked_add(capacity.native_session_retention_bytes)
+            == Some(capacity.aggregate_retention_bytes)
+        && capacity.aggregate_retention_bytes <= 201_326_592
+        && capacity
+            .selected_maximum_transitions
+            .checked_add(64)
+            .and_then(|entries| entries.checked_mul(65_536))
+            .and_then(|ordinary| ordinary.checked_add(33_554_432 - 65_536))
+            == Some(capacity.encoded_outbox_bytes)
+        && capacity.encoded_outbox_bytes <= 105_185_280
 }
 
 fn validate_finalization(
@@ -874,6 +911,10 @@ pub(crate) fn is_output_failure_code(code: FailureCodeV1) -> bool {
             | FailureCodeV1::OutputParentNotDirectory
             | FailureCodeV1::OutputNotRegularFile
             | FailureCodeV1::OutputSourceUnavailable
+            | FailureCodeV1::OutputInvalidUtf8
+            | FailureCodeV1::OutputInvalidJson
+            | FailureCodeV1::OutputDuplicateJsonMember
+            | FailureCodeV1::OutputJsonSchemaMismatch
             | FailureCodeV1::CapturedFileCountLimit
             | FailureCodeV1::CapturedFileSizeLimit
             | FailureCodeV1::CapturedTotalSizeLimit
@@ -937,6 +978,10 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::OutputParentNotDirectory
         | FailureCodeV1::OutputNotRegularFile
         | FailureCodeV1::OutputSourceUnavailable
+        | FailureCodeV1::OutputInvalidUtf8
+        | FailureCodeV1::OutputInvalidJson
+        | FailureCodeV1::OutputDuplicateJsonMember
+        | FailureCodeV1::OutputJsonSchemaMismatch
         | FailureCodeV1::CapturedFileCountLimit
         | FailureCodeV1::CapturedFileSizeLimit
         | FailureCodeV1::CapturedTotalSizeLimit

@@ -252,8 +252,11 @@ does not read Scherzo human or runner credentials and does not contact Scherzo C
 admitted agent harness may use the provider and other host authority selected by its
 closed profile and inherited environment.
 
-Command and agent steps may declare `kind: git_branch`. Such an output is export-only in
-Workflow V1 and cannot bind a downstream command input or agent message. Before any step
+Workflow V1 outputs declare semantic `kind` separately from acquisition `from`. The six
+rows are `text/path`, `text/agent_response`, `json/path`, `json/agent_result`,
+`file/path`, and `git_branch/workspace`; consumers and exports observe only the semantic
+kind. A Git branch output is export-only and cannot bind a downstream command input or
+agent message. Before any step
 starts, local admission requires the execution root to be exactly one SHA-1 Git worktree
 root and pins its current commit as the baseline. Successful capture requires a clean
 committed head descended from that baseline. A changed head publishes one Git bundle

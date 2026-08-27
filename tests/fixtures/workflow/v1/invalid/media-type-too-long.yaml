@@ -7,5 +7,6 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: artifact.bin
         mediaType: application/x;a=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

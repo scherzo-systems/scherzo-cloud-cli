@@ -23,7 +23,8 @@
       "to": "failed",
       "failure": {
         "phase": "output_capture",
-        "cause": "output_file_size_limit_exceeded"
+        "cause": "output_file_size_limit_exceeded",
+        "output": "report"
       }
     }
   }

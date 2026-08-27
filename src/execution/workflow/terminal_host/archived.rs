@@ -729,12 +729,7 @@ fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
 }
 
 fn archived_output_description(output: &WorkflowOutput) -> (&'static str, String) {
-    match output {
-        WorkflowOutput::AgentResponse => ("agent_response", "—".to_owned()),
-        WorkflowOutput::AgentResult { schema } => ("agent_result", safe_text(schema)),
-        WorkflowOutput::File { path, .. } => ("file", safe_text(path)),
-        WorkflowOutput::GitBranch => ("git_branch", "—".to_owned()),
-    }
+    (super::semantic_output_kind(output), "—".to_owned())
 }
 
 fn archived_command(definition: &WorkflowPresentationStep) -> Option<String> {
@@ -803,10 +798,14 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
 fn normalize_outputs(outputs: &mut std::collections::BTreeMap<String, WorkflowOutput>) {
     for output in outputs.values_mut() {
         match output {
-            WorkflowOutput::AgentResponse => {}
-            WorkflowOutput::AgentResult { schema } => *schema = safe_text(schema),
-            WorkflowOutput::GitBranch => {}
-            WorkflowOutput::File {
+            WorkflowOutput::TextAgentResponse | WorkflowOutput::GitBranchWorkspace => {}
+            WorkflowOutput::TextPath { path } => *path = safe_text(path),
+            WorkflowOutput::JsonPath { path, schema } => {
+                *path = safe_text(path);
+                *schema = safe_text(schema);
+            }
+            WorkflowOutput::JsonAgentResult { schema } => *schema = safe_text(schema),
+            WorkflowOutput::FilePath {
                 path, media_type, ..
             } => {
                 *path = safe_text(path);
@@ -1496,7 +1495,6 @@ mod tests {
             "printf payload",
             "report",
             "file",
-            "report.txt",
             "1 output committed",
         ] {
             assert!(
@@ -1886,7 +1884,7 @@ mod tests {
             direct_dependencies: Vec::new(),
             outputs: BTreeMap::from([(
                 "report".to_owned(),
-                Output::File {
+                Output::FilePath {
                     path: "report.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
                 },

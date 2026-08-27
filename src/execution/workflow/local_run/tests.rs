@@ -1126,7 +1126,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
 #[test]
 fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
     let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    failurePolicy: advisory\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        path: report.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    failurePolicy: advisory\n    inputs:\n      report:\n        ref: outputs.first.report\n    command:\n      argv: [\"true\"]\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    failurePolicy: advisory\n    command:\n      argv: [\"true\"]\n    outputs:\n      report:\n        kind: file\n        from: path\n        path: report.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    failurePolicy: advisory\n    inputs:\n      report:\n        ref: outputs.first.report\n    command:\n      argv: [\"true\"]\n",
     );
     let run_path = fixture.run_path("archive-advisory-success");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
@@ -1570,7 +1570,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
     let media_type = format!("{prefix}{}", "\u{1}".repeat(control_count));
     let source_media_type = format!("{prefix}{}", "\\u0001".repeat(control_count));
     let mut source = format!(
-        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      payload:\n        kind: file\n        path: payload.bin\n        mediaType: \"{source_media_type}\"\nexports:\n"
+        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      payload:\n        kind: file\n        from: path\n        path: payload.bin\n        mediaType: \"{source_media_type}\"\nexports:\n"
     );
     for index in 0..4_096 {
         let name = format!("e{}{index:04}", "a".repeat(59));
@@ -1683,7 +1683,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
 #[test]
 fn archived_attempt_enforces_alias_source_identity() {
     let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      one:\n        kind: file\n        path: one.bin\n        mediaType: application/octet-stream\n      two:\n        kind: file\n        path: two.bin\n        mediaType: application/octet-stream\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\nexports:\n  a:\n    ref: outputs.first.one\n  b:\n    ref: outputs.first.one\n  c:\n    ref: outputs.first.two\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      one:\n        kind: file\n        from: path\n        path: one.bin\n        mediaType: application/octet-stream\n      two:\n        kind: file\n        from: path\n        path: two.bin\n        mediaType: application/octet-stream\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\nexports:\n  a:\n    ref: outputs.first.one\n  b:\n    ref: outputs.first.one\n  c:\n    ref: outputs.first.two\n",
     );
     let run_path = fixture.run_path("archive-alias-identity");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
@@ -1804,7 +1804,7 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
 #[test]
 fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: [\"true\"]\n    outputs:\n      artifact:\n        kind: file\n        path: artifact.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: [\"true\"]\n    outputs:\n      artifact:\n        kind: file\n        from: path\n        path: artifact.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
     );
     let run_path = fixture.run_path("archive-failure-identities");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();

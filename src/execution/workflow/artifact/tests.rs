@@ -6,6 +6,10 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 
 use super::*;
+use crate::execution::workflow::canonical_json;
+use crate::execution::workflow::result_validation::RetainedJsonSchema;
+use crate::execution::workflow::strict_json;
+use crate::execution::workflow::value::{CapturedJson, CapturedText, SemanticCarrierError};
 
 struct CaptureFixture {
     _temporary: tempfile::TempDir,
@@ -80,7 +84,7 @@ impl CaptureFixture {
         let declarations = declarations
             .iter()
             .map(|(identity, path)| {
-                CaptureDeclaration::new(identity, Path::new(path), "application/octet-stream")
+                CaptureDeclaration::file(identity, Path::new(path), "application/octet-stream")
             })
             .collect::<Vec<_>>();
         self.store.capture_files(&declarations)
@@ -425,13 +429,348 @@ fn failed_capture(result: Result<CaptureCandidateSet, CaptureAttemptFailure>) ->
     }
 }
 
+fn retained_json_schema() -> RetainedJsonSchema {
+    let document = Arc::new(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object"
+    }));
+    RetainedJsonSchema::compile(
+        Arc::from(
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
+                .as_slice(),
+        ),
+        document,
+    )
+    .unwrap()
+}
+
+#[test]
+fn path_capture_profiles_are_closed_over_semantic_policy() {
+    let schema = retained_json_schema();
+    let profiles = [
+        PathCaptureProfile::Text,
+        PathCaptureProfile::Json { schema: &schema },
+        PathCaptureProfile::File {
+            media_type: "application/octet-stream",
+        },
+    ];
+
+    assert_eq!(profiles[0].value_type(), WorkflowValueType::Text);
+    assert_eq!(profiles[0].media_type(), "text/plain; charset=utf-8");
+    assert_eq!(profiles[1].value_type(), WorkflowValueType::Json);
+    assert_eq!(profiles[1].media_type(), "application/json");
+    assert_eq!(profiles[1].json_schema(), Some(&schema));
+    assert_eq!(profiles[2].value_type(), WorkflowValueType::File);
+    assert_eq!(profiles[2].media_type(), "application/octet-stream");
+    assert_eq!(profiles[2].json_schema(), None);
+}
+
+#[test]
+fn semantic_outputs_path_capture_decodes_values_and_classifies_content_failures() {
+    let fixture = CaptureFixture::with_limits(3, 256, 768);
+    fs::write(
+        fixture.execution_root.join("summary.txt"),
+        b"\xef\xbb\xbfline one\r\nline two\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.execution_root.join("result.json"),
+        br#"{ "z": 2, "a": 1 }"#,
+    )
+    .unwrap();
+    fs::write(fixture.execution_root.join("report.bin"), b"report").unwrap();
+    let schema = retained_json_schema();
+    let declarations = [
+        CaptureDeclaration::text("summary", Path::new("summary.txt")),
+        CaptureDeclaration::json("result", Path::new("result.json"), &schema),
+        CaptureDeclaration::file(
+            "report",
+            Path::new("report.bin"),
+            "application/octet-stream",
+        ),
+    ];
+
+    let outputs = fixture
+        .store
+        .capture_file_candidates(&declarations, &CaptureCancellation::default())
+        .unwrap()
+        .commit();
+
+    assert!(matches!(
+        &outputs["summary"],
+        CapturedValue::Text(value)
+            if value.carrier() == b"\xef\xbb\xbfline one\r\nline two\n"
+    ));
+    assert!(matches!(
+        &outputs["result"],
+        CapturedValue::Json(value) if value.carrier() == br#"{"a":1,"z":2}"#
+    ));
+    assert!(matches!(&outputs["report"], CapturedValue::File(_)));
+    drop(outputs);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+
+    let text_fixture = CaptureFixture::with_limits(1, 64, 64);
+    fs::write(text_fixture.execution_root.join("value"), b"\xff").unwrap();
+    let text_failure = failed_capture(text_fixture.store.capture_file_candidates(
+        &[CaptureDeclaration::text("text", Path::new("value"))],
+        &CaptureCancellation::default(),
+    ));
+    assert_eq!(text_failure.output_identity(), "text");
+    assert_eq!(text_failure.kind(), CaptureFailureKind::InvalidTextEncoding);
+    assert_eq!(text_fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(text_fixture.store.staged_artifact_count(), 0);
+
+    for (bytes, expected) in [
+        (b"{".as_slice(), CaptureFailureKind::InvalidJson),
+        (
+            br#"{"value":1,"value":2}"#.as_slice(),
+            CaptureFailureKind::DuplicateJsonMember,
+        ),
+        (b"[]".as_slice(), CaptureFailureKind::JsonSchemaMismatch),
+    ] {
+        let json_fixture = CaptureFixture::with_limits(1, 64, 64);
+        fs::write(json_fixture.execution_root.join("value"), bytes).unwrap();
+        let failure = failed_capture(json_fixture.store.capture_file_candidates(
+            &[CaptureDeclaration::json(
+                "json",
+                Path::new("value"),
+                &schema,
+            )],
+            &CaptureCancellation::default(),
+        ));
+        assert_eq!(failure.output_identity(), "json");
+        assert_eq!(failure.kind(), expected);
+        assert_eq!(json_fixture.store.reservation_usage(), (0, 0));
+        assert_eq!(json_fixture.store.staged_artifact_count(), 0);
+    }
+}
+
+#[test]
+fn semantic_outputs_text_source_equivalence() {
+    let fixture = CaptureFixture::with_limits(2, 128, 256);
+    let text_source = fixture.execution_root.join("summary.txt");
+    let json_source = fixture.execution_root.join("result.json");
+    let text_bytes = b"\xef\xbb\xbfline one\r\nline two\n";
+    let json_source_bytes = br#"{ "z": 2, "a": 1 }"#;
+    fs::write(&text_source, text_bytes).unwrap();
+    fs::write(&json_source, json_source_bytes).unwrap();
+
+    let text_backing = fixture.capture("summary.txt").unwrap();
+    let retained_text_bytes = Arc::<[u8]>::from(fixture.read(&text_backing));
+    let path_text =
+        CapturedText::from_bounded_carrier(retained_text_bytes, text_backing.into_capture_lease())
+            .unwrap();
+
+    let json_backing = fixture.capture("result.json").unwrap();
+    let retained_json_source = fixture.read(&json_backing);
+    let json_value = Arc::new(strict_json::from_slice(&retained_json_source).unwrap());
+    let canonical = canonical_json::to_bounded_bytes(&json_value, 128).unwrap();
+    let schema = retained_json_schema();
+    let path_json = CapturedJson::from_bounded_carrier(
+        Arc::clone(&json_value),
+        Arc::clone(&canonical),
+        schema.clone(),
+        json_backing.into_capture_lease(),
+    )
+    .unwrap();
+
+    assert_eq!(path_text.value_type(), WorkflowValueType::Text);
+    assert_eq!(path_text.carrier(), text_bytes);
+    assert_eq!(path_text.as_str().as_bytes(), text_bytes);
+    assert_eq!(path_json.value_type(), WorkflowValueType::Json);
+    assert_eq!(path_json.value(), json_value.as_ref());
+    assert_eq!(path_json.carrier(), br#"{"a":1,"z":2}"#);
+    assert_eq!(path_json.schema(), &schema);
+    assert_eq!(
+        fixture.store.budget_usage(),
+        (
+            2,
+            u64::try_from(text_bytes.len() + json_source_bytes.len()).unwrap()
+        )
+    );
+
+    let native_text = CapturedText::new(Arc::from(path_text.as_str()));
+    let native_json = CapturedJson::from_validated(json_value, canonical, schema);
+    assert_eq!(path_text, native_text);
+    assert_eq!(path_json, native_json);
+    for (value, expected_type) in [
+        (
+            CapturedValue::Text(path_text.clone()),
+            WorkflowValueType::Text,
+        ),
+        (
+            CapturedValue::Json(path_json.clone()),
+            WorkflowValueType::Json,
+        ),
+    ] {
+        assert_eq!(value.value_type(), expected_type);
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("art_"));
+        assert!(!debug.contains(fixture.staging_path().to_str().unwrap()));
+    }
+
+    fs::write(&text_source, b"replacement text").unwrap();
+    fs::write(&json_source, br#"{"replacement":true}"#).unwrap();
+    assert_eq!(path_text.carrier(), text_bytes);
+    assert_eq!(path_json.carrier(), br#"{"a":1,"z":2}"#);
+
+    let last_text_owner = path_text.clone();
+    drop(path_text);
+    assert_eq!(fixture.store.budget_usage().0, 2);
+    drop(last_text_owner);
+    assert_eq!(fixture.store.budget_usage().0, 1);
+    drop(path_json);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+#[test]
+fn semantic_outputs_json_source_equivalence() {
+    let fixture = CaptureFixture::with_limits(1, 128, 128);
+    fs::write(
+        fixture.execution_root.join("result.json"),
+        br#"{ "z": 2, "a": 1 }"#,
+    )
+    .unwrap();
+    let schema = retained_json_schema();
+    let outputs = fixture
+        .store
+        .capture_file_candidates(
+            &[CaptureDeclaration::json(
+                "result",
+                Path::new("result.json"),
+                &schema,
+            )],
+            &CaptureCancellation::default(),
+        )
+        .unwrap()
+        .commit();
+    let CapturedValue::Json(path_value) = &outputs["result"] else {
+        panic!("path JSON lost its semantic kind");
+    };
+    let native_value = CapturedJson::from_validated(
+        Arc::new(serde_json::json!({"z": 2, "a": 1})),
+        Arc::from(br#"{"a":1,"z":2}"#.as_slice()),
+        schema,
+    );
+
+    assert_eq!(path_value, &native_value);
+    assert_eq!(path_value.carrier(), br#"{"a":1,"z":2}"#);
+    drop(outputs);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+}
+
+#[test]
+fn semantic_carrier_construction_failures_release_the_exact_capture_debit() {
+    let fixture = CaptureFixture::with_limits(1, 64, 64);
+    fs::write(fixture.execution_root.join("value.bin"), b"\xff").unwrap();
+    let invalid_text = fixture.capture("value.bin").unwrap();
+    assert_eq!(fixture.store.budget_usage(), (1, 1));
+
+    let failure = CapturedText::from_bounded_carrier(
+        Arc::from(b"\xff".as_slice()),
+        invalid_text.into_capture_lease(),
+    )
+    .unwrap_err();
+
+    assert_eq!(failure, SemanticCarrierError::InvalidTextEncoding);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+
+    fs::write(
+        fixture.execution_root.join("value.bin"),
+        br#"{"z":2,"a":1}"#,
+    )
+    .unwrap();
+    let invalid_json = fixture.capture("value.bin").unwrap();
+    assert_eq!(fixture.store.budget_usage(), (1, 13));
+    let value = Arc::new(serde_json::json!({"z": 2, "a": 1}));
+    let failure = CapturedJson::from_bounded_carrier(
+        value,
+        Arc::from(br#"{"z":2,"a":1}"#.as_slice()),
+        retained_json_schema(),
+        invalid_json.into_capture_lease(),
+    )
+    .unwrap_err();
+
+    assert_eq!(failure, SemanticCarrierError::InvalidCanonicalJson);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
+#[test]
+fn successful_cleanup_releases_semantic_budget_after_final_drop_cleanup_failure() {
+    let fixture = CaptureFixture::with_limits(1, 64, 64);
+    fs::write(fixture.execution_root.join("summary.txt"), b"committed").unwrap();
+    let backing = fixture.capture("summary.txt").unwrap();
+    let bytes = Arc::<[u8]>::from(fixture.read(&backing));
+    let text = CapturedText::from_bounded_carrier(bytes, backing.into_capture_lease()).unwrap();
+    assert_eq!(fixture.store.budget_usage(), (1, 9));
+
+    fixture.store.block_artifact_unlinks();
+    drop(text);
+    assert_eq!(fixture.store.staged_artifact_count(), 1);
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    let failure = fixture.capture("summary.txt").unwrap_err();
+    assert_eq!(failure.kind(), CaptureFailureKind::StagingUnavailable);
+
+    fixture.store.release().unwrap();
+
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+    assert_eq!(
+        fixture.store.budget_usage(),
+        (0, 0),
+        "successful centralized cleanup must release the semantic lease debit"
+    );
+}
+
+#[test]
+fn cancelling_a_provisional_semantic_value_releases_its_reservation_and_lease() {
+    let fixture = CaptureFixture::with_limits(1, 64, 64);
+    fs::write(fixture.execution_root.join("summary.txt"), b"candidate").unwrap();
+    let cancellation = CaptureCancellation::default();
+    let declarations = [CaptureDeclaration::file(
+        "summary",
+        Path::new("summary.txt"),
+        "text/plain; charset=utf-8",
+    )];
+    let mut candidates = fixture
+        .store
+        .capture_file_candidates(&declarations, &cancellation)
+        .unwrap();
+    let file = candidates
+        .outputs
+        .remove("summary")
+        .unwrap()
+        .into_file()
+        .unwrap();
+    let bytes = Arc::<[u8]>::from(fixture.read(&file));
+    let text = CapturedText::from_bounded_carrier(bytes, file.into_capture_lease()).unwrap();
+    candidates
+        .outputs
+        .insert("summary".to_owned(), CapturedValue::Text(text));
+    assert_eq!(fixture.store.reservation_usage(), (1, 9));
+
+    cancellation.cancel();
+    assert!(matches!(
+        cancellation.check(),
+        Err(CaptureAttemptFailure::Cancelled)
+    ));
+    candidates.abort();
+
+    assert_eq!(fixture.store.reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.budget_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 0);
+}
+
 #[test]
 fn mixed_candidates_commit_and_release_independent_typed_carriers() {
     let fixture = CaptureFixture::with_all_limits(2, 4, 6, 2, 5, 7);
     fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
     let mut producer = BytesCarrierProducer(b"git!!".to_vec());
     let mut declarations = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "report",
             Path::new("report.bin"),
             "application/octet-stream",
@@ -535,7 +874,7 @@ fn aborting_a_mixed_candidate_releases_both_reservations_and_carriers() {
     fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
     let mut producer = BytesCarrierProducer(b"git".to_vec());
     let mut declarations = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "report",
             Path::new("report.bin"),
             "application/octet-stream",
@@ -590,7 +929,7 @@ fn git_overflow_rolls_back_both_ledgers_without_borrowing_file_capacity() {
     fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
     let mut oversized = BytesCarrierProducer(b"git!".to_vec());
     let mut mixed = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "report",
             Path::new("report.bin"),
             "application/octet-stream",
@@ -633,7 +972,7 @@ fn git_overflow_rolls_back_both_ledgers_without_borrowing_file_capacity() {
     fs::write(fixture.execution_root.join("next.bin"), b"x").unwrap();
     let mut one_more = BytesCarrierProducer(b"x".to_vec());
     let mut total_overflow = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "next",
             Path::new("next.bin"),
             "application/octet-stream",
@@ -674,7 +1013,7 @@ fn git_count_failure_acquires_neither_ledger() {
     fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();
     let mut next_producer = BytesCarrierProducer(b"b".to_vec());
     let mut mixed = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "report",
             Path::new("report.bin"),
             "application/octet-stream",
@@ -725,7 +1064,7 @@ fn carrier_stream_cancellation_rolls_back_a_mixed_candidate_set() {
         cancellation: cancellation.clone(),
     };
     let mut declarations = [
-        CaptureCandidateDeclaration::File(CaptureDeclaration::new(
+        CaptureCandidateDeclaration::File(CaptureDeclaration::file(
             "report",
             Path::new("report.bin"),
             "application/octet-stream",

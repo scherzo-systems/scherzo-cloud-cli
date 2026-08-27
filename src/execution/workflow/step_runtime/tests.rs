@@ -651,7 +651,7 @@ async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() 
         // Hold the producer at the fixture boundary so it cannot exit before
         // the direct test runtime authenticates its process-group identity.
         let mut source = format!(
-            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      report:\n        kind: file\n        path: report.bin\n        mediaType: application/fixture\n",
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      report:\n        kind: file\n        from: path\n        path: report.bin\n        mediaType: application/fixture\n",
             serde_json::to_string(&argv).unwrap()
         );
         for step in ["alpha", "beta"] {
@@ -787,7 +787,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
 }
 
 #[tokio::test]
-async fn cancellation_winning_before_capture_completion_discards_staged_artifacts() {
+async fn semantic_outputs_capture_cancellation_discards_stale_delivery() {
     let PreparedFixtureCommand {
         _temporary,
         cwd,
@@ -873,7 +873,7 @@ async fn cancellation_winning_before_capture_completion_discards_staged_artifact
 }
 
 #[tokio::test]
-async fn queued_capture_cancellation_prevents_source_access_and_is_idempotent() {
+async fn semantic_outputs_capture_cancellation_prevents_source_access() {
     with_watchdog(async {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -889,6 +889,7 @@ steps:
     outputs:
       alphaOutput:
         kind: file
+        from: path
         path: alpha.bin
         mediaType: application/octet-stream
   beta:
@@ -898,6 +899,7 @@ steps:
     outputs:
       betaOutput:
         kind: file
+        from: path
         path: beta.bin
         mediaType: application/octet-stream
 "#;
@@ -975,7 +977,7 @@ steps:
 }
 
 #[tokio::test]
-async fn active_capture_force_abort_replaces_graceful_action_before_quiescence() {
+async fn semantic_outputs_capture_cancellation_during_copy_quiesces() {
     with_watchdog(async {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -990,6 +992,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.bin
         mediaType: application/octet-stream
 "#;
@@ -1095,6 +1098,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.bin
         mediaType: application/octet-stream
 exports:
@@ -1213,6 +1217,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.bin
         mediaType: application/octet-stream
 "#;
@@ -1268,7 +1273,7 @@ steps:
 
         assert_eq!(artifacts.staging.staged_artifact_count(), 1);
         assert_eq!(artifacts.staging.reservation_usage(), (0, 0));
-        let retry = artifacts.staging.capture_files(&[CaptureDeclaration::new(
+        let retry = artifacts.staging.capture_files(&[CaptureDeclaration::file(
             "retry",
             Path::new("report.bin"),
             "application/octet-stream",
@@ -1470,10 +1475,12 @@ steps:
     outputs:
       alpha:
         kind: file
+        from: path
         path: alpha.txt
         mediaType: text/plain
       beta:
         kind: file
+        from: path
         path: beta.json
         mediaType: application/json
 exports:
@@ -1598,6 +1605,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: report.txt
         mediaType: text/plain
 "#;
@@ -1675,6 +1683,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: prior.bin
         mediaType: application/prior
   failing:
@@ -1685,10 +1694,12 @@ steps:
     outputs:
       candidate:
         kind: file
+        from: path
         path: candidate.bin
         mediaType: application/candidate
       missing:
         kind: file
+        from: path
         path: missing.bin
         mediaType: application/missing
 exports:
@@ -1853,6 +1864,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: alpha.bin
         mediaType: application/alpha
   beta:
@@ -1862,6 +1874,7 @@ steps:
     outputs:
       artifact:
         kind: file
+        from: path
         path: beta.bin
         mediaType: application/beta
 "#;
@@ -2450,7 +2463,7 @@ async fn unavailable_captured_input_fails_preparation_without_launching_command(
             .chain(arguments.iter().map(String::as_str))
             .collect::<Vec<_>>();
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"unused\"]\n    outputs:\n      report:\n        kind: file\n        path: report.bin\n        mediaType: application/fixture\n  consume:\n    kind: cmd\n    dependsOn: [produce]\n    inputs:\n      artifact:\n        ref: outputs.produce.report\n    command:\n      argv: {}\n",
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"unused\"]\n    outputs:\n      report:\n        kind: file\n        from: path\n        path: report.bin\n        mediaType: application/fixture\n  consume:\n    kind: cmd\n    dependsOn: [produce]\n    inputs:\n      artifact:\n        ref: outputs.produce.report\n    command:\n      argv: {}\n",
             serde_json::to_string(&argv).unwrap()
         );
         let admitted = admit_fixture(
@@ -2465,7 +2478,7 @@ async fn unavailable_captured_input_fails_preparation_without_launching_command(
         let foreign_store =
             ArtifactStaging::create(admitted.execution(), foreign_parent.path()).unwrap();
         let mut foreign_outputs = foreign_store
-            .capture_files(&[crate::execution::workflow::artifact::CaptureDeclaration::new(
+            .capture_files(&[crate::execution::workflow::artifact::CaptureDeclaration::file(
                 "report",
                 Path::new("report.bin"),
                 "application/fixture",
@@ -3504,7 +3517,7 @@ async fn prepare_fixture_command_with_options(
     let mut source = workflow_source(&[("task", Some("work"), &argv_references)]);
     if declare_output {
         source.push_str(
-            "    outputs:\n      report:\n        kind: file\n        path: work/report.txt\n        mediaType: text/plain\n",
+            "    outputs:\n      report:\n        kind: file\n        from: path\n        path: work/report.txt\n        mediaType: text/plain\n",
         );
     }
     let environment =
@@ -3945,7 +3958,8 @@ steps:
           - file: workflow.yaml
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 "#,
     )
     .unwrap();

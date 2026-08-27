@@ -11,6 +11,7 @@ use super::*;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
 use crate::execution::workflow::validated::{
     ValidatedHarness, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
+    WorkflowValueType,
 };
 
 const WORKFLOW_PATH: &str = "workflows/complete.yaml";
@@ -42,10 +43,12 @@ steps:
           - file: ../attachments/data.bin
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: ../schemas/result.schema.json
       artifact:
         kind: file
+        from: path
         path: runtime/does-not-exist/artifact.bin
         mediaType: application/octet-stream
 exports:
@@ -83,6 +86,118 @@ impl FixtureBundle {
     fn resolve(&self) -> Result<ResolvedWorkflow, ResolutionFailure> {
         resolve_workflow_file(&self.root, &self.workflow_path())
     }
+}
+
+#[test]
+fn semantic_outputs_definition_accepts_exact_six_rows_and_retains_json_schemas() {
+    let bundle = FixtureBundle::new();
+    let source = r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+steps:
+  paths:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      summary:
+        kind: text
+        from: path
+        path: summary.txt
+      data:
+        kind: json
+        from: path
+        path: data.json
+        schema: ../schemas/result.schema.json
+      report:
+        kind: file
+        from: path
+        path: report.bin
+        mediaType: application/octet-stream
+      changes:
+        kind: git_branch
+        from: workspace
+  response:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: ../prompts/system.md
+      message:
+        text: [{ file: ../prompts/message.md }]
+    outputs:
+      response:
+        kind: text
+        from: agent_response
+  result:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: ../prompts/system.md
+      message:
+        text: [{ file: ../prompts/message.md }]
+    outputs:
+      result:
+        kind: json
+        from: agent_result
+        schema: ../schemas/result.schema.json
+"#;
+    fs::write(bundle.workflow_path(), source).unwrap();
+
+    let resolved = bundle.resolve().unwrap();
+    let ValidatedStep::Command(paths) = &resolved.definition.steps["paths"] else {
+        panic!("paths must remain a command step");
+    };
+    assert_eq!(
+        paths
+            .common
+            .outputs
+            .values()
+            .map(|output| output.value_type)
+            .collect::<Vec<_>>(),
+        [
+            WorkflowValueType::GitBranch,
+            WorkflowValueType::Json,
+            WorkflowValueType::File,
+            WorkflowValueType::Text,
+        ]
+    );
+    assert!(matches!(
+        paths.common.outputs["summary"].definition,
+        Output::TextPath { .. }
+    ));
+    assert!(matches!(
+        paths.common.outputs["data"].definition,
+        Output::JsonPath { .. }
+    ));
+    assert!(matches!(
+        paths.common.outputs["report"].definition,
+        Output::FilePath { .. }
+    ));
+    assert!(matches!(
+        paths.common.outputs["changes"].definition,
+        Output::GitBranchWorkspace
+    ));
+    let ValidatedStep::Agent(response) = &resolved.definition.steps["response"] else {
+        panic!("response must remain an agent step");
+    };
+    let ValidatedStep::Agent(result) = &resolved.definition.steps["result"] else {
+        panic!("result must remain an agent step");
+    };
+    assert!(matches!(
+        response.common.outputs["response"].definition,
+        Output::TextAgentResponse
+    ));
+    assert!(matches!(
+        result.common.outputs["result"].definition,
+        Output::JsonAgentResult { .. }
+    ));
+    assert!(resolved.json_schema("paths", "data").is_some());
+    assert!(resolved.json_schema("result", "result").is_some());
 }
 
 #[test]
@@ -154,12 +269,12 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
     );
     assert_eq!(
         agent.common.outputs["result"].definition,
-        Output::AgentResult {
+        Output::JsonAgentResult {
             schema: "schemas/result.schema.json".to_owned(),
         }
     );
     assert_eq!(agent.common.cwd.as_deref(), Some("runtime/does-not-exist"));
-    let retained_schema = resolved.result_schema("agent", "result").unwrap();
+    let retained_schema = resolved.json_schema("agent", "result").unwrap();
     assert_eq!(retained_schema.bytes(), RESULT_SCHEMA);
     assert_eq!(retained_schema.document()["type"], "object");
 
@@ -310,7 +425,7 @@ fn finalizer_static_sources_join_the_same_immutable_closure() {
     .unwrap();
     let workflow = WORKFLOW.replace(
         "exports:\n",
-        "finalizers:\n  report:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: ../prompts/finalizer-system.md\n      message:\n        text:\n          - file: ../prompts/finalizer-message.md\n        attachments:\n          - file: ../attachments/finalizer.bin\n          - ref: finalization.context\n    outputs:\n      result:\n        kind: agent_result\n        schema: ../schemas/finalizer.schema.json\n      changes:\n        kind: git_branch\nexports:\n",
+        "finalizers:\n  report:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: ../prompts/finalizer-system.md\n      message:\n        text:\n          - file: ../prompts/finalizer-message.md\n        attachments:\n          - file: ../attachments/finalizer.bin\n          - ref: finalization.context\n    outputs:\n      result:\n        kind: json\n        from: agent_result\n        schema: ../schemas/finalizer.schema.json\n      changes:\n        kind: git_branch\n        from: workspace\nexports:\n",
     );
     fs::write(bundle.workflow_path(), workflow).unwrap();
 
@@ -343,12 +458,12 @@ fn finalizer_static_sources_join_the_same_immutable_closure() {
     );
     assert_eq!(
         finalizer.common.outputs["result"].definition,
-        Output::AgentResult {
+        Output::JsonAgentResult {
             schema: "schemas/finalizer.schema.json".to_owned(),
         }
     );
     assert_eq!(
-        resolved.result_schema("report", "result").unwrap().bytes(),
+        resolved.json_schema("report", "result").unwrap().bytes(),
         RESULT_SCHEMA
     );
 }
@@ -681,7 +796,7 @@ fn non_utf8_canonical_components_are_rejected() {
 }
 
 #[test]
-fn required_text_and_result_schema_contracts_are_validated() {
+fn required_text_and_json_schema_contracts_are_validated() {
     let system_encoding = FixtureBundle::new();
     fs::write(system_encoding.root.join("prompts/system.md"), [0xff]).unwrap();
     assert_failure_kind(
@@ -773,13 +888,13 @@ fn self_contained_schema_resources_and_fragment_references_resolve() {
 
     for schema in accepted {
         let bundle = FixtureBundle::new();
-        write_result_schema(&bundle, &schema);
+        write_json_schema(&bundle, &schema);
         bundle.resolve().unwrap();
     }
 }
 
 #[test]
-fn unsupported_schema_resources_and_references_fail_at_the_result_schema_location() {
+fn unsupported_schema_resources_and_references_fail_at_the_json_schema_location() {
     let invalid_references = [
         serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$ref": "other.json"}),
         serde_json::json!({"$schema": JSON_SCHEMA_DIALECT, "$dynamicRef": "https://example.invalid/schema#node"}),
@@ -800,7 +915,7 @@ fn unsupported_schema_resources_and_references_fail_at_the_result_schema_locatio
     ];
 
     for schema in invalid_references {
-        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaReference);
+        assert_json_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaReference);
     }
 }
 
@@ -821,7 +936,7 @@ fn nested_dialects_vocabularies_and_unsupported_patterns_are_rejected() {
         }),
     ];
     for schema in invalid_dialects {
-        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaDialect);
+        assert_json_schema_failure(schema, ResolutionFailureKind::InvalidResultSchemaDialect);
     }
 
     for schema in [
@@ -832,11 +947,11 @@ fn nested_dialects_vocabularies_and_unsupported_patterns_are_rejected() {
             "patternProperties": {"(?<=a)b": {"type": "string"}}
         }),
     ] {
-        assert_result_schema_failure(schema, ResolutionFailureKind::InvalidResultSchema);
+        assert_json_schema_failure(schema, ResolutionFailureKind::InvalidResultSchema);
     }
 
     let literal_pattern = FixtureBundle::new();
-    write_result_schema(
+    write_json_schema(
         &literal_pattern,
         &serde_json::json!({
             "$schema": JSON_SCHEMA_DIALECT,
@@ -847,9 +962,9 @@ fn nested_dialects_vocabularies_and_unsupported_patterns_are_rejected() {
     literal_pattern.resolve().unwrap();
 }
 
-fn assert_result_schema_failure(schema: Value, kind: ResolutionFailureKind) {
+fn assert_json_schema_failure(schema: Value, kind: ResolutionFailureKind) {
     let bundle = FixtureBundle::new();
-    write_result_schema(&bundle, &schema);
+    write_json_schema(&bundle, &schema);
     assert_failure(
         bundle.resolve(),
         kind,
@@ -860,7 +975,7 @@ fn assert_result_schema_failure(schema: Value, kind: ResolutionFailureKind) {
     );
 }
 
-fn write_result_schema(bundle: &FixtureBundle, schema: &Value) {
+fn write_json_schema(bundle: &FixtureBundle, schema: &Value) {
     fs::write(
         bundle.root.join("schemas/result.schema.json"),
         serde_json::to_vec(schema).unwrap(),

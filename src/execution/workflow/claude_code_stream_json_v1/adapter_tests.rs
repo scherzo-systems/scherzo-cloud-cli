@@ -27,7 +27,7 @@ use crate::execution::workflow::admission::{
 use crate::execution::workflow::agent::{
     AgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationLimits,
     AgentInvocationStaging, AgentProcessContext, AgentPrompt, AgentStartReceiver,
-    AgentTerminalReceiver, AgentValueMode, PositiveDuration, RetainedResultSchema,
+    AgentTerminalReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
     StagedAgentAttachment, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::execution::workflow::agent_diagnostics::{
@@ -585,7 +585,7 @@ struct ResultProcessFixture {
 
 impl ResultProcessFixture {
     fn new(
-        schema: RetainedResultSchema,
+        schema: RetainedJsonSchema,
         first: ResultExchangeFixture,
         second: Option<ResultExchangeFixture>,
         mode: ResultFixtureMode,
@@ -870,12 +870,12 @@ fn framed_result_values(values: &[Value]) -> Vec<u8> {
     bytes
 }
 
-fn retained_schema(schema: Value) -> RetainedResultSchema {
+fn retained_schema(schema: Value) -> RetainedJsonSchema {
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&schema).unwrap());
-    RetainedResultSchema::compile(bytes, Arc::new(schema)).unwrap()
+    RetainedJsonSchema::compile(bytes, Arc::new(schema)).unwrap()
 }
 
-fn type_schema(root_type: &str) -> RetainedResultSchema {
+fn type_schema(root_type: &str) -> RetainedJsonSchema {
     retained_schema(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": root_type,

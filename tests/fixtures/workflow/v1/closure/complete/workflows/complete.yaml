@@ -29,7 +29,8 @@ steps:
           - file: ../attachments/data.bin
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: ../schemas/result.schema.json
 finalizers:
   report:
@@ -44,7 +45,8 @@ finalizers:
           - file: ../attachments/finalizer.bin
     outputs:
       result:
-        kind: agent_result
+        kind: json
+        from: agent_result
         schema: ../schemas/finalizer.schema.json
 exports:
   result:

@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      changes:
+        kind: git_branch

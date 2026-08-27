@@ -174,20 +174,60 @@ enum HarnessDto {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 enum OutputDto {
-    #[serde(rename = "agent_response")]
-    AgentResponse,
-    #[serde(rename = "agent_result")]
-    AgentResult { schema: String },
+    #[serde(rename = "text")]
+    Text {
+        #[serde(rename = "from")]
+        source: TextOutputSourceDto,
+        path: Option<String>,
+    },
+    #[serde(rename = "json")]
+    Json {
+        #[serde(rename = "from")]
+        source: JsonOutputSourceDto,
+        path: Option<String>,
+        schema: String,
+    },
     #[serde(rename = "file")]
     File {
+        #[serde(rename = "from")]
+        source: PathOutputSourceDto,
         path: String,
         #[serde(rename = "mediaType")]
         media_type: String,
     },
     #[serde(rename = "git_branch")]
-    GitBranch,
+    GitBranch {
+        #[serde(rename = "from")]
+        source: WorkspaceOutputSourceDto,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TextOutputSourceDto {
+    Path,
+    AgentResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonOutputSourceDto {
+    Path,
+    AgentResult,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PathOutputSourceDto {
+    Path,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceOutputSourceDto {
+    Workspace,
 }
 
 #[derive(Deserialize)]
@@ -278,7 +318,7 @@ impl FinalizerDto {
 impl CommandNodeDto {
     fn into_body(self) -> Option<NodeBody> {
         Some(NodeBody::Command(CommandNode {
-            common: self.common.into_common_node(),
+            common: self.common.into_common_node()?,
             inputs: parse_references(self.inputs)?,
             argv: self.command.argv,
         }))
@@ -288,25 +328,25 @@ impl CommandNodeDto {
 impl AgentNodeDto {
     fn into_body(self) -> Option<NodeBody> {
         Some(NodeBody::Agent(AgentNode {
-            common: self.common.into_common_node(),
+            common: self.common.into_common_node()?,
             agent: self.agent.into_agent()?,
         }))
     }
 }
 
 impl CommonNodeDto {
-    fn into_common_node(self) -> CommonNode {
+    fn into_common_node(self) -> Option<CommonNode> {
         let outputs = self
             .outputs
             .into_iter()
-            .map(|(name, output)| (name, output.into_output()))
-            .collect();
+            .map(|(name, output)| output.into_output().map(|output| (name, output)))
+            .collect::<Option<_>>()?;
 
-        CommonNode {
+        Some(CommonNode {
             failure_policy: self.failure_policy,
             cwd: self.cwd,
             outputs,
-        }
+        })
     }
 }
 
@@ -394,12 +434,35 @@ fn message_sources(sources: Vec<MessageSourceDto>) -> Option<Vec<MessageSource>>
 }
 
 impl OutputDto {
-    fn into_output(self) -> Output {
+    fn into_output(self) -> Option<Output> {
         match self {
-            Self::AgentResponse => Output::AgentResponse,
-            Self::AgentResult { schema } => Output::AgentResult { schema },
-            Self::File { path, media_type } => Output::File { path, media_type },
-            Self::GitBranch => Output::GitBranch,
+            Self::Text {
+                source: TextOutputSourceDto::Path,
+                path: Some(path),
+            } => Some(Output::TextPath { path }),
+            Self::Text {
+                source: TextOutputSourceDto::AgentResponse,
+                path: None,
+            } => Some(Output::TextAgentResponse),
+            Self::Json {
+                source: JsonOutputSourceDto::Path,
+                path: Some(path),
+                schema,
+            } => Some(Output::JsonPath { path, schema }),
+            Self::Json {
+                source: JsonOutputSourceDto::AgentResult,
+                path: None,
+                schema,
+            } => Some(Output::JsonAgentResult { schema }),
+            Self::File {
+                source: PathOutputSourceDto::Path,
+                path,
+                media_type,
+            } => Some(Output::FilePath { path, media_type }),
+            Self::GitBranch {
+                source: WorkspaceOutputSourceDto::Workspace,
+            } => Some(Output::GitBranchWorkspace),
+            Self::Text { .. } | Self::Json { .. } => None,
         }
     }
 }

@@ -102,9 +102,9 @@ must resolve inside it.
 | --- | --- |
 | `agent.systemPrompt` | YAML directory; retained UTF-8 file inside the source root. |
 | Message `{ file: ... }` | YAML directory; retained file inside the source root; text files are UTF-8. |
-| `agent_result.schema` | YAML directory; retained, self-contained Draft 2020-12 schema inside the source root. |
+| JSON output `schema` | YAML directory; retained, self-contained Draft 2020-12 schema inside the source root. |
 | Node `cwd` | Execution root; defaults to that root and cannot contain `..`. |
-| `file` output `path` | Execution root, not node `cwd`; cannot contain `..`. |
+| Path output `path` | Execution root, not node `cwd`; cannot contain `..`. |
 
 Static paths may use `..` only when normalization and symbolic-link resolution remain
 inside the source root. Runtime paths may not use parent traversal. Static source bytes
@@ -168,7 +168,8 @@ steps:
           - ref: imports.attachments
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 ```
 
 `profile`, `systemPrompt`, and nonempty `message.text` are required. Text entries are
@@ -177,15 +178,18 @@ validation checks syntax only; it does not install a harness or query a provider
 
 ## Outputs and finalizers
 
-| Output `kind` | Producer | Meaning |
-| --- | --- | --- |
-| `agent_response` | agent | Bounded UTF-8 final response. |
-| `agent_result` | agent | JSON validated against the required static `schema`. |
-| `file` | command or agent | One execution-root-relative regular file with `mediaType`. |
-| `git_branch` | command or agent | Captured Git branch artifact; export-only in V1. |
+| Semantic `kind` | Acquisition `from` | Producer | Required fields |
+| --- | --- | --- | --- |
+| `text` | `path` | command or agent | `path` |
+| `text` | `agent_response` | agent | none |
+| `json` | `path` | command or agent | `path`, `schema` |
+| `json` | `agent_result` | agent | `schema` |
+| `file` | `path` | command or agent | `path`, `mediaType` |
+| `git_branch` | `workspace` | command or agent | none |
 
-An agent may declare one agent value: either one `agent_response` or one `agent_result`.
-Commands may declare only file and Git-branch outputs. An `agent_result` schema must be a
+Every output contains both discriminators and matches exactly one row. A node may declare
+any number of distinct paths, at most one native agent source, and at most one workspace
+source. Commands cannot use native agent sources. Every JSON schema must be a
 self-contained UTF-8 JSON Schema Draft 2020-12 document with this root dialect:
 
 ```json
@@ -232,6 +236,7 @@ steps:
     outputs:
       report:
         kind: file
+        from: path
         path: artifacts/report.json
         mediaType: application/json
 
@@ -244,9 +249,9 @@ steps:
       argv: ["./scripts/summarize.sh"]
     outputs:
       summary:
-        kind: file
+        kind: text
+        from: path
         path: artifacts/summary.txt
-        mediaType: text/plain
 
 finalizers:
   cleanup:

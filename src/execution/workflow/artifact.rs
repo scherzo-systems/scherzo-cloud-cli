@@ -19,13 +19,17 @@ use rustix::fs::{
 use rustix::io::Errno;
 
 use super::admission::AdmittedExecutionContext;
+use super::canonical_json::{self, CanonicalJsonError};
 use super::execution_root::{AdmittedExecutionRoot, directory_open_flags, open_directory};
 use super::private_staging::{
     StagingLifecycle, cleanup_staging, mark_cleanup_failed as mark_staging_cleanup_failed,
     same_file,
 };
+use super::result_validation::RetainedJsonSchema;
 use super::schema_common::lowercase_hex;
-use super::value::CapturedValue;
+use super::strict_json;
+use super::validated::WorkflowValueType;
+use super::value::{CapturedJson, CapturedText, CapturedValue};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
@@ -147,6 +151,10 @@ pub(crate) enum CaptureFailureKind {
     NotDirectory,
     NotRegularFile,
     SourceUnavailable,
+    InvalidTextEncoding,
+    InvalidJson,
+    DuplicateJsonMember,
+    JsonSchemaMismatch,
     FileCountLimitExceeded,
     FileSizeLimitExceeded,
     TotalSizeLimitExceeded,
@@ -253,9 +261,8 @@ impl ArtifactLease {
 
 impl Drop for ArtifactLease {
     fn drop(&mut self) {
-        if let Some(store) = self.store.upgrade()
-            && store.remove_artifact(&self.artifact_identity)
-        {
+        if let Some(store) = self.store.upgrade() {
+            store.remove_artifact(&self.artifact_identity);
             self.release_budget(&store);
         }
     }
@@ -328,6 +335,17 @@ impl PartialEq for StagedCarrier {
 
 impl Eq for StagedCarrier {}
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct CaptureLease {
+    carrier: StagedCarrier,
+}
+
+impl CaptureLease {
+    pub(super) fn carrier(&self) -> &StagedCarrier {
+        &self.carrier
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapturedArtifact {
     carrier: StagedCarrier,
@@ -356,6 +374,12 @@ impl CapturedArtifact {
 
     pub(crate) fn carrier(&self) -> &StagedCarrier {
         &self.carrier
+    }
+
+    pub(super) fn into_capture_lease(self) -> CaptureLease {
+        CaptureLease {
+            carrier: self.carrier,
+        }
     }
 }
 
@@ -606,7 +630,10 @@ impl CaptureReservation {
             usage.captured_count += count;
             usage.captured_bytes += bytes;
         }
-        for carrier in outputs.values().filter_map(CapturedValue::carrier) {
+        for carrier in outputs
+            .values()
+            .filter_map(CapturedValue::private_capture_carrier)
+        {
             carrier.handle.lease.commit_budget();
         }
         self.active = false;
@@ -631,15 +658,67 @@ impl Drop for CaptureReservation {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PathCaptureProfile<'a> {
+    Text,
+    Json { schema: &'a RetainedJsonSchema },
+    File { media_type: &'a str },
+}
+
+impl<'a> PathCaptureProfile<'a> {
+    pub(crate) const fn value_type(self) -> WorkflowValueType {
+        match self {
+            Self::Text => WorkflowValueType::Text,
+            Self::Json { .. } => WorkflowValueType::Json,
+            Self::File { .. } => WorkflowValueType::File,
+        }
+    }
+
+    fn media_type(self) -> &'a str {
+        match self {
+            Self::Text => "text/plain; charset=utf-8",
+            Self::Json { .. } => "application/json",
+            Self::File { media_type } => media_type,
+        }
+    }
+
+    pub(crate) const fn json_schema(self) -> Option<&'a RetainedJsonSchema> {
+        match self {
+            Self::Json { schema } => Some(schema),
+            Self::Text | Self::File { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CaptureDeclaration<'a> {
     output_identity: &'a str,
     declared_path: &'a Path,
-    media_type: &'a str,
+    profile: PathCaptureProfile<'a>,
 }
 
 impl<'a> CaptureDeclaration<'a> {
-    pub(crate) fn new(
+    pub(crate) fn text(output_identity: &'a str, declared_path: &'a Path) -> Self {
+        Self {
+            output_identity,
+            declared_path,
+            profile: PathCaptureProfile::Text,
+        }
+    }
+
+    pub(crate) fn json(
+        output_identity: &'a str,
+        declared_path: &'a Path,
+        schema: &'a RetainedJsonSchema,
+    ) -> Self {
+        Self {
+            output_identity,
+            declared_path,
+            profile: PathCaptureProfile::Json { schema },
+        }
+    }
+
+    pub(crate) fn file(
         output_identity: &'a str,
         declared_path: &'a Path,
         media_type: &'a str,
@@ -647,7 +726,7 @@ impl<'a> CaptureDeclaration<'a> {
         Self {
             output_identity,
             declared_path,
-            media_type,
+            profile: PathCaptureProfile::File { media_type },
         }
     }
 }
@@ -1070,12 +1149,20 @@ impl ArtifactStaging {
                         self.stage(
                             Arc::clone(&output_identity),
                             declaration.declared_path,
-                            Arc::from(declaration.media_type),
+                            Arc::from(declaration.profile.media_type()),
                             bounds,
                             cancellation,
                         )
+                        .and_then(|file| {
+                            self.semantic_path_value(
+                                &output_identity,
+                                file,
+                                declaration.profile,
+                                bounds,
+                            )
+                        })
                     })
-                    .map(|file| (CapturedValue::file(file), Some(CarrierBudgetClass::File))),
+                    .map(|value| (value, Some(CarrierBudgetClass::File))),
                 CaptureCandidateDeclaration::GitBranch(declaration) => {
                     let carrier = match declaration.producer.as_deref_mut() {
                         Some(producer) => self
@@ -1118,7 +1205,7 @@ impl ArtifactStaging {
                     return Err(CaptureAttemptFailure::Cancelled);
                 }
             };
-            let size = value.carrier().map(StagedCarrier::size);
+            let size = value.private_capture_carrier().map(StagedCarrier::size);
             captured.insert(output_identity.to_string(), value);
             if let Some((class, size)) = budget_class.zip(size)
                 && let Err(kind) = reservation.reserve_bytes(class, size)
@@ -1138,6 +1225,98 @@ impl ArtifactStaging {
             outputs: captured,
             reservation: Some(reservation),
         })
+    }
+
+    fn semantic_path_value(
+        &self,
+        output_identity: &Arc<str>,
+        file: CapturedArtifact,
+        profile: PathCaptureProfile<'_>,
+        bounds: CaptureBounds,
+    ) -> Result<CapturedValue, CaptureAttemptFailure> {
+        if matches!(profile, PathCaptureProfile::File { .. }) {
+            return Ok(CapturedValue::file(file));
+        }
+        let mut source = Vec::new();
+        self.copy_to(file.handle(), &mut source).map_err(|_| {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(output_identity),
+                CaptureFailureKind::StagingUnavailable,
+            ))
+        })?;
+        match profile {
+            PathCaptureProfile::Text => {
+                if std::str::from_utf8(&source).is_err() {
+                    return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::InvalidTextEncoding,
+                    )));
+                }
+                let carrier = Arc::<[u8]>::from(source);
+                CapturedText::from_bounded_carrier(carrier, file.into_capture_lease())
+                    .map(CapturedValue::Text)
+                    .map_err(|_| {
+                        CaptureAttemptFailure::Capture(CaptureFailure::new(
+                            Arc::clone(output_identity),
+                            CaptureFailureKind::InvalidTextEncoding,
+                        ))
+                    })
+            }
+            PathCaptureProfile::Json { schema } => {
+                if std::str::from_utf8(&source).is_err() {
+                    return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::InvalidTextEncoding,
+                    )));
+                }
+                let value = serde_json::from_slice::<serde_json::Value>(&source).map_err(|_| {
+                    CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::InvalidJson,
+                    ))
+                })?;
+                if strict_json::from_slice(&source).is_err() {
+                    return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::DuplicateJsonMember,
+                    )));
+                }
+                if !schema.is_valid(&value) {
+                    return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::JsonSchemaMismatch,
+                    )));
+                }
+                let value = Arc::new(value);
+                let carrier = canonical_json::to_bounded_bytes(&value, bounds.maximum_bytes)
+                    .map_err(|failure| {
+                        let kind = match failure {
+                            CanonicalJsonError::SizeLimitExceeded => bounds.overflow_kind,
+                            CanonicalJsonError::SerializationFailed => {
+                                CaptureFailureKind::StagingUnavailable
+                            }
+                        };
+                        CaptureAttemptFailure::Capture(CaptureFailure::new(
+                            Arc::clone(output_identity),
+                            kind,
+                        ))
+                    })?;
+                CapturedJson::from_bounded_carrier(
+                    value,
+                    carrier,
+                    schema.clone(),
+                    file.into_capture_lease(),
+                )
+                .map(CapturedValue::Json)
+                .map_err(|_| {
+                    CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(output_identity),
+                        CaptureFailureKind::StagingUnavailable,
+                    ))
+                })
+            }
+            PathCaptureProfile::File { .. } => unreachable!("file profiles return above"),
+        }
     }
 
     fn capture_bounds(
@@ -1816,7 +1995,10 @@ impl ArtifactStaging {
 impl ArtifactStagingInner {
     fn remove_capture_set(&self, captured: &BTreeMap<String, CapturedValue>) -> bool {
         let mut rollback_complete = true;
-        for carrier in captured.values().filter_map(CapturedValue::carrier) {
+        for carrier in captured
+            .values()
+            .filter_map(CapturedValue::private_capture_carrier)
+        {
             rollback_complete &=
                 self.remove_artifact_while_active(&carrier.handle.artifact_identity);
         }
@@ -1833,13 +2015,17 @@ impl ArtifactStagingInner {
     }
 
     fn remove_artifact(&self, artifact_identity: &str) -> bool {
-        let Ok(lifecycle) = self.lifecycle.read() else {
+        let Ok(mut lifecycle) = self.lifecycle.write() else {
             return false;
         };
         if *lifecycle == StagingLifecycle::Released {
             return true;
         }
-        self.remove_artifact_while_active(artifact_identity)
+        let removed = self.remove_artifact_while_active(artifact_identity);
+        if !removed && *lifecycle == StagingLifecycle::Active {
+            *lifecycle = StagingLifecycle::CleanupFailed;
+        }
+        removed
     }
 
     fn remove_artifact_while_active(&self, artifact_identity: &str) -> bool {

@@ -14,8 +14,9 @@ use super::agent_diagnostics::AgentDiagnosticSession;
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
 use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
-pub(crate) use super::result_validation::{BoundedSchemaValidAgentResult, RetainedResultSchema};
+pub(crate) use super::result_validation::RetainedJsonSchema;
 use super::runtime::ActionId;
+pub(crate) use super::value::CapturedJson;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct WorkflowRunId(Arc<str>);
@@ -237,7 +238,7 @@ pub(crate) enum AgentValueMode {
     },
     Result {
         output: Arc<str>,
-        schema: RetainedResultSchema,
+        schema: RetainedJsonSchema,
     },
 }
 
@@ -763,7 +764,9 @@ pub(crate) enum CompletedAgentInvocation {
     NoValue,
     NoResponse,
     Response(BoundedAgentResponse),
-    Result(BoundedSchemaValidAgentResult),
+    Result(CapturedJson),
+    #[cfg(test)]
+    RawResult(Arc<[u8]>),
 }
 
 impl CompletedAgentInvocation {
@@ -772,6 +775,8 @@ impl CompletedAgentInvocation {
             Self::NoValue => AgentValueKind::None,
             Self::NoResponse | Self::Response(_) => AgentValueKind::Response,
             Self::Result(_) => AgentValueKind::Result,
+            #[cfg(test)]
+            Self::RawResult(_) => AgentValueKind::Result,
         }
     }
 }

@@ -17,7 +17,8 @@ steps:
           - file: prompts/implement-message.md
     outputs:
       response:
-        kind: agent_response
+        kind: text
+        from: agent_response
 exports:
   response:
     ref: outputs.implement.response
