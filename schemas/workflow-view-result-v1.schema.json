@@ -3,8 +3,12 @@
   "$id": "https://scherzo.dev/contracts/workflow-view-result-v1.schema.json",
   "title": "Scherzo Cloud Workflow View Result Schema 1",
   "oneOf": [
-    { "$ref": "#/$defs/ViewSuccess" },
-    { "$ref": "#/$defs/ViewError" }
+    {
+      "$ref": "#/$defs/ViewSuccess"
+    },
+    {
+      "$ref": "#/$defs/ViewError"
+    }
   ],
   "$defs": {
     "AbsolutePath": {
@@ -17,10 +21,18 @@
       "minLength": 1,
       "not": {
         "anyOf": [
-          { "pattern": "^/" },
-          { "pattern": "(?:^|/)\\.\\.(?:/|$)" },
-          { "pattern": "\\\\" },
-          { "pattern": "[\\u0000-\\u001f]" }
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "(?:^|/)\\.\\.(?:/|$)"
+          },
+          {
+            "pattern": "\\\\"
+          },
+          {
+            "pattern": "[\\u0000-\\u001f]"
+          }
         ]
       }
     },
@@ -37,17 +49,31 @@
     "Digest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["algorithm", "value"],
+      "required": [
+        "algorithm",
+        "value"
+      ],
       "properties": {
-        "algorithm": { "const": "sha256" },
-        "value": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        "algorithm": {
+          "const": "sha256"
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
       }
     },
     "NodeRole": {
-      "enum": ["step", "finalizer"]
+      "enum": [
+        "step",
+        "finalizer"
+      ]
     },
     "FailurePolicy": {
-      "enum": ["required", "advisory"]
+      "enum": [
+        "required",
+        "advisory"
+      ]
     },
     "CancellationReason": {
       "enum": [
@@ -153,33 +179,68 @@
     "PiProtocolRejectionDetail": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reason", "stage", "state"],
+      "required": [
+        "reason",
+        "stage",
+        "state"
+      ],
       "properties": {
         "reason": {
           "enum": [
-            "frame_too_large", "frame_decode_failed", "frame_not_object",
-            "session_header_invalid", "session_event_repeated", "event_after_settlement",
-            "event_after_result_acceptance", "event_shape_invalid", "event_transition_invalid",
-            "result_correlation_invalid", "terminal_invariant_invalid",
-            "end_of_stream_invariant_invalid", "partial_frame_at_end_of_stream",
+            "frame_too_large",
+            "frame_decode_failed",
+            "frame_not_object",
+            "session_header_invalid",
+            "session_event_repeated",
+            "event_after_settlement",
+            "event_after_result_acceptance",
+            "event_shape_invalid",
+            "event_transition_invalid",
+            "result_correlation_invalid",
+            "terminal_invariant_invalid",
+            "end_of_stream_invariant_invalid",
+            "partial_frame_at_end_of_stream",
             "retained_state_limit_exceeded"
           ]
         },
         "stage": {
           "enum": [
-            "frame_read", "frame_decode", "session_header", "event_envelope",
-            "event_payload", "result_correlation", "terminal_validation", "end_of_stream"
+            "frame_read",
+            "frame_decode",
+            "session_header",
+            "event_envelope",
+            "event_payload",
+            "result_correlation",
+            "terminal_validation",
+            "end_of_stream"
           ]
         },
         "outerEvent": {
           "enum": [
-            "session", "agent_start", "agent_end", "agent_settled", "turn_start",
-            "turn_end", "message_start", "message_update", "message_end",
-            "tool_execution_start", "tool_execution_update", "tool_execution_end",
-            "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end",
-            "summarization_retry_scheduled", "summarization_retry_attempt_start",
-            "summarization_retry_finished", "queue_update", "entry_appended",
-            "session_info_changed", "thinking_level_changed", "bash_execution_update",
+            "session",
+            "agent_start",
+            "agent_end",
+            "agent_settled",
+            "turn_start",
+            "turn_end",
+            "message_start",
+            "message_update",
+            "message_end",
+            "tool_execution_start",
+            "tool_execution_update",
+            "tool_execution_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "compaction_start",
+            "compaction_end",
+            "summarization_retry_scheduled",
+            "summarization_retry_attempt_start",
+            "summarization_retry_finished",
+            "queue_update",
+            "entry_appended",
+            "session_info_changed",
+            "thinking_level_changed",
+            "bash_execution_update",
             "unrecognized"
           ]
         },
@@ -187,15 +248,28 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "sessionHeaderSeen", "agentStarted", "terminalCandidateRetained",
-            "resultAccepted", "settled"
+            "sessionHeaderSeen",
+            "agentStarted",
+            "terminalCandidateRetained",
+            "resultAccepted",
+            "settled"
           ],
           "properties": {
-            "sessionHeaderSeen": { "type": "boolean" },
-            "agentStarted": { "type": "boolean" },
-            "terminalCandidateRetained": { "type": "boolean" },
-            "resultAccepted": { "type": "boolean" },
-            "settled": { "type": "boolean" }
+            "sessionHeaderSeen": {
+              "type": "boolean"
+            },
+            "agentStarted": {
+              "type": "boolean"
+            },
+            "terminalCandidateRetained": {
+              "type": "boolean"
+            },
+            "resultAccepted": {
+              "type": "boolean"
+            },
+            "settled": {
+              "type": "boolean"
+            }
           }
         }
       }
@@ -203,84 +277,201 @@
     "ClaudeProtocolRejectionDetail": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reason", "stage", "state"],
+      "required": [
+        "reason",
+        "stage",
+        "state"
+      ],
       "properties": {
         "reason": {
           "enum": [
-            "frame_too_large", "frame_decode_failed", "frame_not_object",
-            "initialization_invalid", "exchange_initialization_missing",
-            "exchange_lifecycle_invalid", "event_envelope_invalid",
-            "session_correlation_invalid", "stream_event_envelope_invalid",
-            "active_stream_parent_mismatch", "message_start_invalid",
-            "message_transition_invalid", "content_block_start_invalid",
-            "content_block_delta_invalid", "content_block_stop_invalid",
-            "content_block_index_mismatch", "content_block_type_transition_invalid",
-            "content_block_correlation_invalid", "assistant_event_invalid", "user_event_invalid",
-            "system_event_invalid", "tool_progress_event_invalid", "result_correlation_invalid",
-            "terminal_drain_event_invalid", "end_of_stream_invariant_invalid",
-            "partial_frame_at_end_of_stream", "retained_state_limit_exceeded"
+            "frame_too_large",
+            "frame_decode_failed",
+            "frame_not_object",
+            "initialization_invalid",
+            "exchange_initialization_missing",
+            "exchange_lifecycle_invalid",
+            "event_envelope_invalid",
+            "session_correlation_invalid",
+            "stream_event_envelope_invalid",
+            "active_stream_parent_mismatch",
+            "message_start_invalid",
+            "message_transition_invalid",
+            "content_block_start_invalid",
+            "content_block_delta_invalid",
+            "content_block_stop_invalid",
+            "content_block_index_mismatch",
+            "content_block_type_transition_invalid",
+            "content_block_correlation_invalid",
+            "assistant_event_invalid",
+            "user_event_invalid",
+            "system_event_invalid",
+            "tool_progress_event_invalid",
+            "result_correlation_invalid",
+            "terminal_drain_event_invalid",
+            "end_of_stream_invariant_invalid",
+            "partial_frame_at_end_of_stream",
+            "retained_state_limit_exceeded"
           ]
         },
         "stage": {
           "enum": [
-            "frame_read", "frame_decode", "initialization", "exchange_lifecycle",
-            "event_envelope", "session_correlation", "stream_event_envelope",
-            "active_stream_parent", "message_start", "message_transition",
-            "content_block_start", "content_block_delta", "content_block_stop",
-            "assistant_event", "user_event", "system_event", "tool_progress_event",
-            "result_correlation", "terminal_drain", "end_of_stream"
+            "frame_read",
+            "frame_decode",
+            "initialization",
+            "exchange_lifecycle",
+            "event_envelope",
+            "session_correlation",
+            "stream_event_envelope",
+            "active_stream_parent",
+            "message_start",
+            "message_transition",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "assistant_event",
+            "user_event",
+            "system_event",
+            "tool_progress_event",
+            "result_correlation",
+            "terminal_drain",
+            "end_of_stream"
           ]
         },
         "outerEvent": {
           "enum": [
-            "system", "stream_event", "assistant", "user", "rate_limit_event",
-            "tool_progress", "result", "unrecognized"
+            "system",
+            "stream_event",
+            "assistant",
+            "user",
+            "rate_limit_event",
+            "tool_progress",
+            "result",
+            "unrecognized"
           ]
         },
         "streamEvent": {
           "enum": [
-            "message_start", "content_block_start", "content_block_delta",
-            "content_block_stop", "message_delta", "message_stop", "unrecognized"
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "unrecognized"
           ]
         },
-        "contentIndex": { "type": "integer", "minimum": 0 },
-        "contentBlock": { "enum": ["text", "thinking", "tool_use", "unrecognized"] },
+        "contentIndex": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contentBlock": {
+          "enum": [
+            "text",
+            "thinking",
+            "tool_use",
+            "unrecognized"
+          ]
+        },
         "state": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "initialized", "exchangeInitialized", "exchangeActive", "completedExchanges",
-            "activeMessage", "finalMainMessage", "exchangeStructuredOutputCandidates",
-            "completedResultExchange", "resultDecisionPending", "resultAccepted",
-            "nativeFailure", "retryActive"
+            "initialized",
+            "exchangeInitialized",
+            "exchangeActive",
+            "completedExchanges",
+            "activeMessage",
+            "finalMainMessage",
+            "exchangeStructuredOutputCandidates",
+            "completedResultExchange",
+            "resultDecisionPending",
+            "resultAccepted",
+            "nativeFailure",
+            "retryActive"
           ],
           "properties": {
-            "initialized": { "type": "boolean" },
-            "exchangeInitialized": { "type": "boolean" },
-            "exchangeActive": { "type": "boolean" },
-            "completedExchanges": { "type": "integer", "minimum": 0 },
-            "activeMessage": { "enum": ["none", "main", "subagent"] },
-            "nextContentIndex": { "type": "integer", "minimum": 0 },
-            "completedContentBlocks": { "type": "integer", "minimum": 0 },
+            "initialized": {
+              "type": "boolean"
+            },
+            "exchangeInitialized": {
+              "type": "boolean"
+            },
+            "exchangeActive": {
+              "type": "boolean"
+            },
+            "completedExchanges": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "activeMessage": {
+              "enum": [
+                "none",
+                "main",
+                "subagent"
+              ]
+            },
+            "nextContentIndex": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completedContentBlocks": {
+              "type": "integer",
+              "minimum": 0
+            },
             "openContentBlock": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "contentIndex"],
+              "required": [
+                "kind",
+                "contentIndex"
+              ],
               "properties": {
-                "kind": { "enum": ["text", "thinking", "tool_use", "unrecognized"] },
-                "contentIndex": { "type": "integer", "minimum": 0 }
+                "kind": {
+                  "enum": [
+                    "text",
+                    "thinking",
+                    "tool_use",
+                    "unrecognized"
+                  ]
+                },
+                "contentIndex": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               }
             },
-            "terminalMessageDeltaSeen": { "type": "boolean" },
-            "finalMainMessage": { "type": "boolean" },
-            "exchangeStructuredOutputCandidates": { "type": "integer", "minimum": 0 },
-            "completedResultExchange": {
-              "enum": ["none", "candidate", "ambiguous_candidate", "missing_candidate", "native_failure"]
+            "terminalMessageDeltaSeen": {
+              "type": "boolean"
             },
-            "resultDecisionPending": { "type": "boolean" },
-            "resultAccepted": { "type": "boolean" },
-            "nativeFailure": { "type": "boolean" },
-            "retryActive": { "type": "boolean" }
+            "finalMainMessage": {
+              "type": "boolean"
+            },
+            "exchangeStructuredOutputCandidates": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completedResultExchange": {
+              "enum": [
+                "none",
+                "candidate",
+                "ambiguous_candidate",
+                "missing_candidate",
+                "native_failure"
+              ]
+            },
+            "resultDecisionPending": {
+              "type": "boolean"
+            },
+            "resultAccepted": {
+              "type": "boolean"
+            },
+            "nativeFailure": {
+              "type": "boolean"
+            },
+            "retryActive": {
+              "type": "boolean"
+            }
           }
         }
       }
@@ -290,21 +481,41 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["schemaVersion", "profile", "detail"],
+          "required": [
+            "schemaVersion",
+            "profile",
+            "detail"
+          ],
           "properties": {
-            "schemaVersion": { "const": 1 },
-            "profile": { "const": "PiJsonV1" },
-            "detail": { "$ref": "#/$defs/PiProtocolRejectionDetail" }
+            "schemaVersion": {
+              "const": 1
+            },
+            "profile": {
+              "const": "PiJsonV1"
+            },
+            "detail": {
+              "$ref": "#/$defs/PiProtocolRejectionDetail"
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["schemaVersion", "profile", "detail"],
+          "required": [
+            "schemaVersion",
+            "profile",
+            "detail"
+          ],
           "properties": {
-            "schemaVersion": { "const": 1 },
-            "profile": { "const": "ClaudeCodeStreamJsonV1" },
-            "detail": { "$ref": "#/$defs/ClaudeProtocolRejectionDetail" }
+            "schemaVersion": {
+              "const": 1
+            },
+            "profile": {
+              "const": "ClaudeCodeStreamJsonV1"
+            },
+            "detail": {
+              "$ref": "#/$defs/ClaudeProtocolRejectionDetail"
+            }
           }
         }
       ]
@@ -312,83 +523,196 @@
     "FailureCause": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code"],
+      "required": [
+        "code"
+      ],
       "properties": {
-        "code": { "$ref": "#/$defs/FailureCode" },
-        "input": { "type": "string", "minLength": 1 },
-        "collectionIndex": { "type": "integer", "minimum": 0 },
-        "output": { "type": "string", "minLength": 1 },
-        "exitCode": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
-        "protocolRejection": { "$ref": "#/$defs/ProtocolRejection" }
+        "code": {
+          "$ref": "#/$defs/FailureCode"
+        },
+        "input": {
+          "type": "string",
+          "minLength": 1
+        },
+        "collectionIndex": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exitCode": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "protocolRejection": {
+          "$ref": "#/$defs/ProtocolRejection"
+        }
       }
     },
     "Failure": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["phase", "cause"],
+      "required": [
+        "phase",
+        "cause"
+      ],
       "properties": {
-        "phase": { "enum": ["start", "execution", "output_capture"] },
-        "cause": { "$ref": "#/$defs/FailureCause" }
+        "phase": {
+          "enum": [
+            "start",
+            "execution",
+            "output_capture"
+          ]
+        },
+        "cause": {
+          "$ref": "#/$defs/FailureCause"
+        }
       }
     },
     "DiagnosticStream": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "encoding", "data", "retainedBytes", "discardedBytes", "truncated", "fullyDrained"
+        "encoding",
+        "data",
+        "retainedBytes",
+        "discardedBytes",
+        "truncated",
+        "fullyDrained"
       ],
       "properties": {
-        "encoding": { "const": "base64" },
+        "encoding": {
+          "const": "base64"
+        },
         "data": {
           "type": "string",
           "contentEncoding": "base64",
           "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
         },
-        "retainedBytes": { "type": "integer", "minimum": 0, "maximum": 4194304 },
-        "discardedBytes": { "type": "integer", "minimum": 0 },
-        "truncated": { "type": "boolean" },
-        "fullyDrained": { "type": "boolean" }
+        "retainedBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4194304
+        },
+        "discardedBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "fullyDrained": {
+          "type": "boolean"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "discardedBytes": { "const": 0 } }, "required": ["discardedBytes"] },
-          "then": { "properties": { "truncated": { "const": false } } },
-          "else": { "properties": { "truncated": { "const": true } } }
+          "if": {
+            "properties": {
+              "discardedBytes": {
+                "const": 0
+              }
+            },
+            "required": [
+              "discardedBytes"
+            ]
+          },
+          "then": {
+            "properties": {
+              "truncated": {
+                "const": false
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "truncated": {
+                "const": true
+              }
+            }
+          }
         }
       ]
     },
     "CommandOutput": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["stdout", "stderr"],
+      "required": [
+        "stdout",
+        "stderr"
+      ],
       "properties": {
-        "stdout": { "$ref": "#/$defs/DiagnosticStream" },
-        "stderr": { "$ref": "#/$defs/DiagnosticStream" }
+        "stdout": {
+          "$ref": "#/$defs/DiagnosticStream"
+        },
+        "stderr": {
+          "$ref": "#/$defs/DiagnosticStream"
+        }
       }
     },
     "RecoveryHandlerFailure": {
-      "type": "object", "additionalProperties": false, "required": ["phase", "cause"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "cause"
+      ],
       "properties": {
-        "phase": { "enum": ["start", "execution"] },
+        "phase": {
+          "enum": [
+            "start",
+            "execution"
+          ]
+        },
         "cause": {
-          "type": "object", "additionalProperties": false, "required": ["code"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code"
+          ],
           "properties": {
             "code": {
               "enum": [
-                "context_unavailable", "handler_unavailable", "working_directory_unavailable",
-                "command_preparation_failed", "command_launch_failed", "command_wait_failed",
-                "command_exit_failed", "process_quiescence_failed", "result_missing",
-                "result_symbolic_link", "result_not_regular", "result_unavailable",
-                "result_too_large", "decision_invalid", "agent_input_failed", "agent_failed",
-                "agent_result_missing", "agent_result_invalid", "settlement_failed"
+                "context_unavailable",
+                "handler_unavailable",
+                "working_directory_unavailable",
+                "command_preparation_failed",
+                "command_launch_failed",
+                "command_wait_failed",
+                "command_exit_failed",
+                "process_quiescence_failed",
+                "result_missing",
+                "result_symbolic_link",
+                "result_not_regular",
+                "result_unavailable",
+                "result_too_large",
+                "decision_invalid",
+                "agent_input_failed",
+                "agent_failed",
+                "agent_result_missing",
+                "agent_result_invalid",
+                "settlement_failed"
               ]
             },
-            "exitCode": { "type": "integer" },
+            "exitCode": {
+              "type": "integer"
+            },
             "decisionRejection": {
               "enum": [
-                "input_too_large", "invalid_utf8", "invalid_json", "duplicate_key",
-                "unknown_field", "unsupported_schema_version", "unknown_decision",
-                "empty_summary", "summary_too_long", "empty_reason", "reason_too_long"
+                "input_too_large",
+                "invalid_utf8",
+                "invalid_json",
+                "duplicate_key",
+                "unknown_field",
+                "unsupported_schema_version",
+                "unknown_decision",
+                "empty_summary",
+                "summary_too_long",
+                "empty_reason",
+                "reason_too_long"
               ]
             }
           }
@@ -396,335 +720,674 @@
       }
     },
     "RecoveryHandler": {
-      "type": "object", "additionalProperties": false,
-      "required": ["kind", "invocationId", "outcome"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "invocationId",
+        "outcome"
+      ],
       "properties": {
-        "kind": { "enum": ["cmd", "agent"] },
-        "invocationId": { "type": "integer", "minimum": 1 },
-        "outcome": { "enum": ["recheck", "gave_up", "failed", "cancelled"] },
-        "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
-        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 },
-        "failure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+        "kind": {
+          "enum": [
+            "cmd",
+            "agent"
+          ]
+        },
+        "invocationId": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "outcome": {
+          "enum": [
+            "recheck",
+            "gave_up",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "failure": {
+          "$ref": "#/$defs/RecoveryHandlerFailure"
+        }
       }
     },
     "RecoveryRound": {
-      "type": "object", "additionalProperties": false,
-      "required": ["number", "failedExecution"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "failedExecution"
+      ],
       "properties": {
-        "number": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
         "failedExecution": {
-          "type": "object", "additionalProperties": false,
-          "required": ["executionNumber", "invocationId", "failure"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "executionNumber",
+            "invocationId",
+            "failure"
+          ],
           "properties": {
-            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 10 },
-            "invocationId": { "type": "integer", "minimum": 1 },
-            "failure": { "$ref": "#/$defs/Failure" }
+            "executionNumber": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "invocationId": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "failure": {
+              "$ref": "#/$defs/Failure"
+            }
           }
         },
-        "handler": { "$ref": "#/$defs/RecoveryHandler" }
+        "handler": {
+          "$ref": "#/$defs/RecoveryHandler"
+        }
       }
     },
     "RecoveryTermination": {
       "oneOf": [
         {
-          "type": "object", "additionalProperties": false,
-          "required": ["kind", "executionNumber"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "executionNumber"
+          ],
           "properties": {
-            "kind": { "enum": ["recovered", "exhausted"] },
-            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+            "kind": {
+              "enum": [
+                "recovered",
+                "exhausted"
+              ]
+            },
+            "executionNumber": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 11
+            }
           }
         },
         {
-          "type": "object", "additionalProperties": false,
-          "required": ["kind", "round"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "round"
+          ],
           "properties": {
-            "kind": { "const": "gave_up" },
-            "round": { "type": "integer", "minimum": 1, "maximum": 10 }
+            "kind": {
+              "const": "gave_up"
+            },
+            "round": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            }
           }
         },
         {
-          "type": "object", "additionalProperties": false,
-          "required": ["kind", "round", "handlerFailure"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "round",
+            "handlerFailure"
+          ],
           "properties": {
-            "kind": { "const": "handler_failed" },
-            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
-            "handlerFailure": { "$ref": "#/$defs/RecoveryHandlerFailure" }
+            "kind": {
+              "const": "handler_failed"
+            },
+            "round": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "handlerFailure": {
+              "$ref": "#/$defs/RecoveryHandlerFailure"
+            }
           }
         },
         {
-          "type": "object", "additionalProperties": false,
-          "required": ["kind", "round", "activeRole"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "round",
+            "activeRole"
+          ],
           "properties": {
-            "kind": { "const": "cancelled" },
-            "round": { "type": "integer", "minimum": 1, "maximum": 10 },
-            "activeRole": { "enum": ["target", "recovery_handler"] },
-            "executionNumber": { "type": "integer", "minimum": 1, "maximum": 11 }
+            "kind": {
+              "const": "cancelled"
+            },
+            "round": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "activeRole": {
+              "enum": [
+                "target",
+                "recovery_handler"
+              ]
+            },
+            "executionNumber": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 11
+            }
           }
         }
       ]
     },
     "StepRecovery": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schemaVersion", "configuredRetries", "rounds", "termination"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "configuredRetries",
+        "rounds",
+        "termination"
+      ],
       "properties": {
-        "schemaVersion": { "const": 1 },
-        "configuredRetries": { "type": "integer", "minimum": 1, "maximum": 10 },
-        "handlerKind": { "enum": ["cmd", "agent"] },
-        "rounds": {
-          "type": "array", "minItems": 1, "maxItems": 10,
-          "items": { "$ref": "#/$defs/RecoveryRound" }
+        "schemaVersion": {
+          "const": 1
         },
-        "termination": { "$ref": "#/$defs/RecoveryTermination" }
+        "configuredRetries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "handlerKind": {
+          "enum": [
+            "cmd",
+            "agent"
+          ]
+        },
+        "rounds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/RecoveryRound"
+          }
+        },
+        "termination": {
+          "$ref": "#/$defs/RecoveryTermination"
+        }
       }
     },
     "RecoveryInvocation": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "required": [
-        "invocationId", "role", "state", "startedAt", "finishedAt",
-        "durationMilliseconds", "usage"
+        "invocationId",
+        "role",
+        "state",
+        "startedAt",
+        "finishedAt",
+        "durationMilliseconds",
+        "usage"
       ],
       "properties": {
-        "invocationId": { "type": "integer", "minimum": 1 },
-        "role": { "enum": ["target", "recovery_handler"] },
-        "targetExecution": { "type": "integer", "minimum": 1, "maximum": 11 },
-        "recoveryRound": { "type": "integer", "minimum": 1, "maximum": 10 },
-        "state": { "enum": ["settled", "cancelled"] },
-        "startedAt": { "$ref": "#/$defs/Timestamp" },
-        "finishedAt": { "$ref": "#/$defs/Timestamp" },
-        "durationMilliseconds": { "type": "integer", "minimum": 0 },
-        "usage": {
-          "type": "object", "additionalProperties": false,
-          "required": ["inputTokens", "outputTokens"],
-          "properties": {
-            "inputTokens": { "type": "integer", "minimum": 0 },
-            "outputTokens": { "type": "integer", "minimum": 0 }
-          }
+        "invocationId": {
+          "type": "integer",
+          "minimum": 1
         },
-        "diagnostics": {
-          "type": "array", "maxItems": 2,
-          "items": {
-            "type": "object", "additionalProperties": false,
-            "required": ["kind", "reference", "stream"],
-            "properties": {
-              "kind": {
-                "enum": ["command_stdout", "command_stderr", "agent_harness_stdout", "agent_harness_stderr"]
-              },
-              "reference": { "type": "string", "minLength": 1 },
-              "stream": { "$ref": "#/$defs/DiagnosticStream" }
+        "role": {
+          "enum": [
+            "target",
+            "recovery_handler"
+          ]
+        },
+        "targetExecution": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 11
+        },
+        "recoveryRound": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "state": {
+          "enum": [
+            "settled",
+            "cancelled"
+          ]
+        },
+        "startedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "finishedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "durationMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inputTokens",
+            "outputTokens"
+          ],
+          "properties": {
+            "inputTokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outputTokens": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         },
-        "diagnosticReference": { "type": "string", "minLength": 1 }
+        "diagnostics": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "reference",
+              "stream"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "command_stdout",
+                  "command_stderr",
+                  "agent_harness_stdout",
+                  "agent_harness_stderr"
+                ]
+              },
+              "reference": {
+                "type": "string",
+                "minLength": 1
+              },
+              "stream": {
+                "$ref": "#/$defs/DiagnosticStream"
+              }
+            }
+          }
+        },
+        "diagnosticReference": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "WorkflowStep": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "role", "kind", "failurePolicy", "state"],
+      "required": [
+        "id",
+        "role",
+        "kind",
+        "failurePolicy",
+        "state"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/Identifier" },
-        "role": { "$ref": "#/$defs/NodeRole" },
-        "kind": { "enum": ["cmd", "agent"] },
-        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
-        "state": { "enum": ["succeeded", "failed", "blocked", "not_run", "cancelled"] },
-        "startedAt": { "$ref": "#/$defs/Timestamp" },
-        "durationMilliseconds": { "type": "integer", "minimum": 0 },
-        "failure": { "$ref": "#/$defs/Failure" },
-        "dependency": { "$ref": "#/$defs/Identifier" },
-        "reason": {
+        "id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "role": {
+          "$ref": "#/$defs/NodeRole"
+        },
+        "kind": {
           "enum": [
-            "failure_stop", "user_request", "termination_request", "caller_output_failure",
-            "runner_shutdown", "execution_lease_expired", "finalization_force_abort",
-            "input_unavailable", "finalizer_trigger_not_selected"
+            "cmd",
+            "agent"
           ]
         },
-        "unavailableReferences": {
+        "failurePolicy": {
+          "$ref": "#/$defs/FailurePolicy"
+        },
+        "state": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "blocked",
+            "not_run",
+            "cancelled"
+          ]
+        },
+        "startedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "durationMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commandOutput": {
+          "$ref": "#/$defs/CommandOutput"
+        },
+        "recovery": {
+          "$ref": "#/$defs/StepRecovery"
+        },
+        "invocations": {
           "type": "array",
           "minItems": 1,
-          "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$" }
+          "items": {
+            "$ref": "#/$defs/RecoveryInvocation"
+          }
         },
-        "commandOutput": { "$ref": "#/$defs/CommandOutput" },
-        "recovery": { "$ref": "#/$defs/StepRecovery" },
-        "invocations": {
-          "type": "array", "minItems": 1,
-          "items": { "$ref": "#/$defs/RecoveryInvocation" }
+        "detail": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FailureDetail"
+            },
+            {
+              "$ref": "#/$defs/BlockedDetail"
+            },
+            {
+              "$ref": "#/$defs/FailureStopDetail"
+            },
+            {
+              "$ref": "#/$defs/FinalizerTriggerNotSelectedDetail"
+            },
+            {
+              "$ref": "#/$defs/RuntimeCancellationDetail"
+            }
+          ]
         }
       },
       "allOf": [
         {
-          "if": { "properties": { "kind": { "const": "agent" } }, "required": ["kind"] },
-          "then": { "not": { "required": ["commandOutput"] } }
-        },
-        {
-          "if": { "properties": { "state": { "enum": ["succeeded", "failed"] } }, "required": ["state"] },
-          "then": { "required": ["startedAt", "durationMilliseconds"] }
-        },
-        {
-          "if": { "properties": { "state": { "enum": ["blocked", "not_run"] } }, "required": ["state"] },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "agent"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
           "then": {
             "not": {
-              "anyOf": [
-                { "required": ["startedAt"] },
-                { "required": ["durationMilliseconds"] },
-                { "required": ["commandOutput"] }
-              ]
-            }
-          }
-        },
-        {
-          "if": { "properties": { "state": { "const": "succeeded" } }, "required": ["state"] },
-          "then": {
-            "not": {
-              "anyOf": [
-                { "required": ["failure"] }, { "required": ["dependency"] },
-                { "required": ["reason"] }, { "required": ["unavailableReferences"] }
-              ]
-            }
-          }
-        },
-        {
-          "if": { "properties": { "state": { "const": "failed" } }, "required": ["state"] },
-          "then": {
-            "required": ["failure"],
-            "not": {
-              "anyOf": [
-                { "required": ["dependency"] }, { "required": ["reason"] },
-                { "required": ["unavailableReferences"] }
+              "required": [
+                "commandOutput"
               ]
             }
           }
         },
         {
           "if": {
-            "properties": { "role": { "const": "step" }, "state": { "const": "blocked" } },
-            "required": ["role", "state"]
+            "properties": {
+              "state": {
+                "enum": [
+                  "succeeded",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
           },
           "then": {
-            "required": ["dependency"],
+            "required": [
+              "startedAt",
+              "durationMilliseconds"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "blocked",
+                  "not_run"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
             "not": {
               "anyOf": [
-                { "required": ["failure"] }, { "required": ["reason"] },
-                { "required": ["unavailableReferences"] }
+                {
+                  "required": [
+                    "startedAt"
+                  ]
+                },
+                {
+                  "required": [
+                    "durationMilliseconds"
+                  ]
+                },
+                {
+                  "required": [
+                    "commandOutput"
+                  ]
+                }
               ]
             }
           }
         },
         {
           "if": {
-            "properties": { "role": { "const": "finalizer" }, "state": { "const": "blocked" } },
-            "required": ["role", "state"]
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "state"
+            ]
           },
           "then": {
-            "required": ["reason", "unavailableReferences"],
-            "properties": { "reason": { "const": "input_unavailable" } },
-            "not": { "anyOf": [{ "required": ["failure"] }, { "required": ["dependency"] }] }
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/FailureDetail"
+              }
+            }
           }
         },
         {
-          "if": { "properties": { "state": { "const": "not_run" } }, "required": ["state"] },
+          "if": {
+            "properties": {
+              "state": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
           "then": {
-            "required": ["reason"],
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/BlockedDetail"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/RuntimeCancellationDetail"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "pending",
+                  "starting",
+                  "running",
+                  "capturing_outputs",
+                  "succeeded"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
             "not": {
-              "anyOf": [
-                { "required": ["failure"] }, { "required": ["dependency"] },
-                { "required": ["unavailableReferences"] }
+              "required": [
+                "detail"
               ]
             }
           }
         },
         {
           "if": {
-            "properties": { "role": { "const": "step" }, "state": { "const": "not_run" } },
-            "required": ["role", "state"]
+            "properties": {
+              "role": {
+                "const": "step"
+              },
+              "state": {
+                "const": "not_run"
+              }
+            },
+            "required": [
+              "role",
+              "state"
+            ]
           },
-          "then": { "properties": { "reason": { "const": "failure_stop" } } }
-        },
-        {
-          "if": {
-            "properties": { "role": { "const": "finalizer" }, "state": { "const": "not_run" } },
-            "required": ["role", "state"]
-          },
-          "then": { "properties": { "reason": { "const": "finalizer_trigger_not_selected" } } }
-        },
-        {
-          "if": { "properties": { "state": { "const": "cancelled" } }, "required": ["state"] },
           "then": {
-            "required": ["reason"],
-            "properties": { "reason": { "$ref": "#/$defs/CancellationReason" } },
-            "not": {
-              "anyOf": [
-                { "required": ["failure"] }, { "required": ["dependency"] },
-                { "required": ["unavailableReferences"] }
-              ]
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/FailureStopDetail"
+              }
             }
           }
         },
         {
-          "if": { "required": ["recovery"] },
-          "then": { "required": ["invocations"] },
-          "else": { "not": { "required": ["invocations"] } }
-        },
-        {
-          "if": { "properties": { "role": { "const": "finalizer" } }, "required": ["role"] },
-          "then": {
-            "not": { "anyOf": [{ "required": ["recovery"] }, { "required": ["invocations"] }] }
-          }
-        },
-        {
           "if": {
-            "properties": { "kind": { "const": "cmd" }, "state": { "const": "succeeded" } },
-            "required": ["kind", "state"]
+            "properties": {
+              "role": {
+                "const": "finalizer"
+              },
+              "state": {
+                "const": "not_run"
+              }
+            },
+            "required": [
+              "role",
+              "state"
+            ]
           },
-          "then": { "required": ["commandOutput"] }
+          "then": {
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/FinalizerTriggerNotSelectedDetail"
+              }
+            }
+          }
         }
       ]
-    },
-    "PrimaryFailure": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["node", "phase", "cause"],
-      "properties": {
-        "node": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["id", "role"],
-          "properties": {
-            "id": { "$ref": "#/$defs/Identifier" },
-            "role": { "$ref": "#/$defs/NodeRole" }
-          }
-        },
-        "phase": { "enum": ["start", "execution", "output_capture"] },
-        "cause": { "$ref": "#/$defs/FailureCause" }
-      }
     },
     "Cancellation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reason", "forceStopDeadline"],
+      "required": [
+        "reason",
+        "forceStopDeadline"
+      ],
       "properties": {
         "reason": {
           "enum": [
-            "user_request", "termination_request", "caller_output_failure",
-            "runner_shutdown", "execution_lease_expired"
+            "user_request",
+            "termination_request",
+            "caller_output_failure",
+            "runner_shutdown",
+            "execution_lease_expired"
           ]
         },
-        "forceStopDeadline": { "$ref": "#/$defs/Timestamp" }
+        "forceStopDeadline": {
+          "$ref": "#/$defs/Timestamp"
+        }
       }
     },
     "Finalization": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["trigger", "finalizers", "issues", "forceAbort"],
+      "required": [
+        "trigger",
+        "finalizers",
+        "issues",
+        "forceAbort"
+      ],
       "properties": {
-        "trigger": { "enum": ["succeeded", "failed", "cancelled"] },
+        "trigger": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
         "finalizers": {
           "type": "array",
           "minItems": 1,
           "items": {
             "allOf": [
-              { "$ref": "#/$defs/WorkflowStep" },
-              { "properties": { "role": { "const": "finalizer" } } }
+              {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              {
+                "properties": {
+                  "role": {
+                    "const": "finalizer"
+                  }
+                }
+              }
             ]
           }
         },
@@ -733,183 +1396,398 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["node", "impact"],
+            "required": [
+              "node",
+              "impact"
+            ],
             "properties": {
               "node": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["id", "role"],
+                "required": [
+                  "id",
+                  "role"
+                ],
                 "properties": {
-                  "id": { "$ref": "#/$defs/Identifier" },
-                  "role": { "const": "finalizer" }
+                  "id": {
+                    "$ref": "#/$defs/Identifier"
+                  },
+                  "role": {
+                    "const": "finalizer"
+                  }
                 }
               },
-              "impact": { "$ref": "#/$defs/FailurePolicy" }
+              "impact": {
+                "$ref": "#/$defs/FailurePolicy"
+              }
             }
           }
         },
         "cancellation": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["reason"],
+          "required": [
+            "reason"
+          ],
           "properties": {
-            "reason": { "$ref": "#/$defs/CancellationReason" },
-            "forceStopDeadline": { "$ref": "#/$defs/Timestamp" }
+            "reason": {
+              "$ref": "#/$defs/CancellationReason"
+            },
+            "forceStopDeadline": {
+              "$ref": "#/$defs/Timestamp"
+            }
           }
         },
-        "forceAbort": { "type": "boolean" }
+        "forceAbort": {
+          "type": "boolean"
+        }
       }
     },
     "AvailableExport": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "kind", "mediaType", "path", "sizeBytes", "digest"],
+      "required": [
+        "state",
+        "kind",
+        "mediaType",
+        "path",
+        "sizeBytes",
+        "digest"
+      ],
       "properties": {
-        "state": { "const": "available" },
-        "kind": { "enum": ["file", "text", "json"] },
-        "mediaType": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "path": { "type": "string", "pattern": "^exports/[0-9]{4,}$" },
-        "sizeBytes": { "type": "integer", "minimum": 0 },
-        "digest": { "$ref": "#/$defs/Digest" }
+        "state": {
+          "const": "available"
+        },
+        "kind": {
+          "enum": [
+            "file",
+            "text",
+            "json"
+          ]
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^exports/[0-9]{4,}$"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        }
       }
     },
     "GitCarrier": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "mediaType", "sizeBytes", "digest"],
+      "required": [
+        "path",
+        "mediaType",
+        "sizeBytes",
+        "digest"
+      ],
       "properties": {
-        "path": { "type": "string", "pattern": "^exports/[0-9]{4,}$" },
-        "mediaType": { "const": "application/vnd.git.bundle" },
-        "sizeBytes": { "type": "integer", "minimum": 0 },
-        "digest": { "$ref": "#/$defs/Digest" }
+        "path": {
+          "type": "string",
+          "pattern": "^exports/[0-9]{4,}$"
+        },
+        "mediaType": {
+          "const": "application/vnd.git.bundle"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        }
       }
     },
     "GitBranchExport": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "state", "kind", "artifactVersion", "objectFormat", "baseOid", "headOid", "treeOid"
+        "state",
+        "kind",
+        "artifactVersion",
+        "objectFormat",
+        "baseOid",
+        "headOid",
+        "treeOid"
       ],
       "properties": {
-        "state": { "const": "available" },
-        "kind": { "const": "git_branch" },
-        "artifactVersion": { "const": 1 },
-        "objectFormat": { "const": "sha1" },
-        "baseOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "headOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "treeOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "carrier": { "$ref": "#/$defs/GitCarrier" }
+        "state": {
+          "const": "available"
+        },
+        "kind": {
+          "const": "git_branch"
+        },
+        "artifactVersion": {
+          "const": 1
+        },
+        "objectFormat": {
+          "const": "sha1"
+        },
+        "baseOid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "headOid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "treeOid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "carrier": {
+          "$ref": "#/$defs/GitCarrier"
+        }
       }
     },
     "UnavailableExport": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "reason"],
+      "required": [
+        "state",
+        "reason"
+      ],
       "properties": {
-        "state": { "const": "unavailable" },
+        "state": {
+          "const": "unavailable"
+        },
         "reason": {
           "enum": [
-            "source_failed", "source_blocked", "source_input_unavailable",
-            "source_not_run", "source_trigger_not_selected", "source_cancelled"
+            "source_failed",
+            "source_blocked",
+            "source_input_unavailable",
+            "source_not_run",
+            "source_trigger_not_selected",
+            "source_cancelled"
           ]
         }
       }
     },
     "Export": {
       "oneOf": [
-        { "$ref": "#/$defs/AvailableExport" },
-        { "$ref": "#/$defs/GitBranchExport" },
-        { "$ref": "#/$defs/UnavailableExport" }
+        {
+          "$ref": "#/$defs/AvailableExport"
+        },
+        {
+          "$ref": "#/$defs/GitBranchExport"
+        },
+        {
+          "$ref": "#/$defs/UnavailableExport"
+        }
       ]
     },
     "WorkflowResult": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "schemaVersion", "attemptNumber", "workflow", "execution", "commandOutputPolicy",
-        "outcome", "steps", "exports"
+        "schemaVersion",
+        "attemptNumber",
+        "workflow",
+        "execution",
+        "commandOutputPolicy",
+        "outcome",
+        "steps",
+        "exports"
       ],
       "properties": {
-        "schemaVersion": { "const": 1 },
-        "attemptNumber": { "type": "integer", "minimum": 1 },
+        "schemaVersion": {
+          "const": 1
+        },
+        "attemptNumber": {
+          "type": "integer",
+          "minimum": 1
+        },
         "workflow": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["path", "provenance", "digest"],
+          "required": [
+            "path",
+            "provenance",
+            "digest"
+          ],
           "properties": {
-            "path": { "$ref": "#/$defs/RelativePath" },
+            "path": {
+              "$ref": "#/$defs/RelativePath"
+            },
             "provenance": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "sourceRoot"],
+              "required": [
+                "kind",
+                "sourceRoot"
+              ],
               "properties": {
-                "kind": { "const": "local" },
-                "sourceRoot": { "$ref": "#/$defs/AbsolutePath" }
+                "kind": {
+                  "const": "local"
+                },
+                "sourceRoot": {
+                  "$ref": "#/$defs/AbsolutePath"
+                }
               }
             },
-            "digest": { "$ref": "#/$defs/Digest" }
+            "digest": {
+              "$ref": "#/$defs/Digest"
+            }
           }
         },
         "execution": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "executionRoot", "maximumParallelSteps", "startedAt", "finishedAt",
+            "executionRoot",
+            "maximumParallelSteps",
+            "startedAt",
+            "finishedAt",
             "durationMilliseconds"
           ],
           "properties": {
-            "executionRoot": { "$ref": "#/$defs/AbsolutePath" },
-            "maximumParallelSteps": { "type": "integer", "minimum": 1, "maximum": 256 },
-            "startedAt": { "$ref": "#/$defs/Timestamp" },
-            "finishedAt": { "$ref": "#/$defs/Timestamp" },
-            "durationMilliseconds": { "type": "integer", "minimum": 0 }
+            "executionRoot": {
+              "$ref": "#/$defs/AbsolutePath"
+            },
+            "maximumParallelSteps": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "startedAt": {
+              "$ref": "#/$defs/Timestamp"
+            },
+            "finishedAt": {
+              "$ref": "#/$defs/Timestamp"
+            },
+            "durationMilliseconds": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         },
         "commandOutputPolicy": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["encoding", "maximumRetainedBytesPerStream"],
+          "required": [
+            "encoding",
+            "maximumRetainedBytesPerStream"
+          ],
           "properties": {
-            "encoding": { "const": "base64" },
-            "maximumRetainedBytesPerStream": { "const": 4194304 }
+            "encoding": {
+              "const": "base64"
+            },
+            "maximumRetainedBytesPerStream": {
+              "const": 4194304
+            }
           }
         },
-        "outcome": { "enum": ["succeeded", "failed", "cancelled"] },
-        "primaryFailure": { "$ref": "#/$defs/PrimaryFailure" },
-        "cancellation": { "$ref": "#/$defs/Cancellation" },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "cancellation": {
+          "$ref": "#/$defs/Cancellation"
+        },
         "steps": {
           "type": "array",
           "minItems": 1,
           "maxItems": 256,
           "items": {
             "allOf": [
-              { "$ref": "#/$defs/WorkflowStep" },
-              { "properties": { "role": { "const": "step" } } }
+              {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              {
+                "properties": {
+                  "role": {
+                    "const": "step"
+                  }
+                }
+              }
             ]
           }
         },
-        "finalization": { "$ref": "#/$defs/Finalization" },
+        "finalization": {
+          "$ref": "#/$defs/Finalization"
+        },
         "exports": {
           "type": "object",
           "maxProperties": 4096,
-          "propertyNames": { "$ref": "#/$defs/Identifier" },
-          "additionalProperties": { "$ref": "#/$defs/Export" }
+          "propertyNames": {
+            "$ref": "#/$defs/Identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Export"
+          }
+        },
+        "primaryIssue": {
+          "$ref": "#/$defs/PrimaryIssue"
         }
       },
       "allOf": [
         {
-          "if": { "properties": { "outcome": { "const": "failed" } }, "required": ["outcome"] },
-          "then": { "required": ["primaryFailure"] },
-          "else": { "not": { "required": ["primaryFailure"] } }
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "required": [
+              "primaryIssue"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "primaryIssue"
+              ]
+            }
+          }
         },
         {
-          "if": { "properties": { "outcome": { "const": "cancelled" } }, "required": ["outcome"] },
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
           "then": {
             "anyOf": [
-              { "required": ["cancellation"] },
               {
-                "required": ["finalization"],
-                "properties": { "finalization": { "required": ["cancellation"] } }
+                "required": [
+                  "cancellation"
+                ]
+              },
+              {
+                "required": [
+                  "finalization"
+                ],
+                "properties": {
+                  "finalization": {
+                    "required": [
+                      "cancellation"
+                    ]
+                  }
+                }
               }
             ]
           }
@@ -920,65 +1798,201 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "schemaVersion", "command", "outcome", "exitStatus", "runDirectory",
-        "currentAttemptNumber", "attemptNumber", "selection", "trigger", "attemptState",
-        "resultDirectory", "result"
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "runDirectory",
+        "currentAttemptNumber",
+        "attemptNumber",
+        "selection",
+        "trigger",
+        "attemptState",
+        "resultDirectory",
+        "result"
       ],
       "properties": {
-        "schemaVersion": { "const": 1 },
-        "command": { "const": "scherzo-cloud workflow view" },
-        "outcome": { "const": "view" },
-        "exitStatus": { "const": 0 },
-        "runDirectory": { "$ref": "#/$defs/AbsolutePath" },
-        "currentAttemptNumber": { "type": "integer", "minimum": 1 },
-        "attemptNumber": { "type": "integer", "minimum": 1 },
-        "selection": { "enum": ["current", "historical"] },
-        "trigger": { "enum": ["initial", "explicit_retry"] },
-        "attemptState": { "enum": ["succeeded", "workflow_failed", "cancelled"] },
-        "resultDirectory": { "$ref": "#/$defs/AbsolutePath" },
-        "result": { "$ref": "#/$defs/WorkflowResult" }
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "const": "scherzo-cloud workflow view"
+        },
+        "outcome": {
+          "const": "view"
+        },
+        "exitStatus": {
+          "const": 0
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "currentAttemptNumber": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attemptNumber": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "selection": {
+          "enum": [
+            "current",
+            "historical"
+          ]
+        },
+        "trigger": {
+          "enum": [
+            "initial",
+            "explicit_retry"
+          ]
+        },
+        "attemptState": {
+          "enum": [
+            "succeeded",
+            "workflow_failed",
+            "cancelled"
+          ]
+        },
+        "resultDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "result": {
+          "$ref": "#/$defs/WorkflowResult"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "attemptState": { "const": "succeeded" } }, "required": ["attemptState"] },
-          "then": { "properties": { "result": { "properties": { "outcome": { "const": "succeeded" } } } } }
+          "if": {
+            "properties": {
+              "attemptState": {
+                "const": "succeeded"
+              }
+            },
+            "required": [
+              "attemptState"
+            ]
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "outcome": {
+                    "const": "succeeded"
+                  }
+                }
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "attemptState": { "const": "workflow_failed" } }, "required": ["attemptState"] },
-          "then": { "properties": { "result": { "properties": { "outcome": { "const": "failed" } } } } }
+          "if": {
+            "properties": {
+              "attemptState": {
+                "const": "workflow_failed"
+              }
+            },
+            "required": [
+              "attemptState"
+            ]
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "outcome": {
+                    "const": "failed"
+                  }
+                }
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "attemptState": { "const": "cancelled" } }, "required": ["attemptState"] },
-          "then": { "properties": { "result": { "properties": { "outcome": { "const": "cancelled" } } } } }
+          "if": {
+            "properties": {
+              "attemptState": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "attemptState"
+            ]
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "outcome": {
+                    "const": "cancelled"
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     },
     "ViewError": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schemaVersion", "command", "outcome", "exitStatus", "error"],
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "error"
+      ],
       "properties": {
-        "schemaVersion": { "const": 1 },
-        "command": { "const": "scherzo-cloud workflow view" },
-        "outcome": { "const": "error" },
-        "exitStatus": { "const": 1 },
-        "runDirectory": { "$ref": "#/$defs/AbsolutePath" },
-        "attemptNumber": { "type": "integer", "minimum": 1 },
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "const": "scherzo-cloud workflow view"
+        },
+        "outcome": {
+          "const": "error"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "attemptNumber": {
+          "type": "integer",
+          "minimum": 1
+        },
         "error": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["code", "message"],
+          "required": [
+            "code",
+            "message"
+          ],
           "properties": {
             "code": {
               "enum": [
-                "run_directory_unavailable", "run_directory_invalid", "lock_query_failed",
-                "status_snapshot_unstable", "published_result_unavailable",
-                "published_result_invalid", "retained_workflow_invalid", "attempt_unknown",
-                "attempt_nonterminal", "attempt_interrupted", "attempt_rejected",
-                "attempt_publication_failed", "attempt_unpublished"
+                "run_directory_unavailable",
+                "run_directory_invalid",
+                "lock_query_failed",
+                "status_snapshot_unstable",
+                "published_result_unavailable",
+                "published_result_invalid",
+                "retained_workflow_invalid",
+                "attempt_unknown",
+                "attempt_nonterminal",
+                "attempt_interrupted",
+                "attempt_rejected",
+                "attempt_publication_failed",
+                "attempt_unpublished"
               ]
             },
-            "message": { "type": "string", "minLength": 1, "maxLength": 256 }
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
           }
         }
       },
@@ -990,18 +2004,508 @@
                 "properties": {
                   "code": {
                     "enum": [
-                      "attempt_unknown", "attempt_nonterminal", "attempt_interrupted",
-                      "attempt_rejected", "attempt_publication_failed", "attempt_unpublished"
+                      "attempt_unknown",
+                      "attempt_nonterminal",
+                      "attempt_interrupted",
+                      "attempt_rejected",
+                      "attempt_publication_failed",
+                      "attempt_unpublished"
                     ]
                   }
                 },
-                "required": ["code"]
+                "required": [
+                  "code"
+                ]
               }
             },
-            "required": ["error"]
+            "required": [
+              "error"
+            ]
           },
-          "then": { "required": ["runDirectory", "attemptNumber"] },
-          "else": { "not": { "required": ["attemptNumber"] } }
+          "then": {
+            "required": [
+              "runDirectory",
+              "attemptNumber"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "attemptNumber"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "FailureDetail": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "start"
+            },
+            "code": {
+              "enum": [
+                "step_unavailable",
+                "preparation_task_unavailable",
+                "inputs_unavailable",
+                "outputs_unsupported",
+                "agent_runtime_unavailable",
+                "agent_step_unavailable",
+                "agent_admission_unavailable",
+                "agent_inputs_unavailable",
+                "agent_input_missing_upstream",
+                "agent_input_type_mismatch",
+                "agent_source_unavailable",
+                "agent_source_text_invalid",
+                "agent_result_schema_unavailable",
+                "agent_value_mode_invalid",
+                "agent_attachment_count_limit",
+                "agent_attachment_bytes_limit",
+                "artifact_staging_mismatch",
+                "agent_staging_mismatch",
+                "agent_input_staging_unavailable",
+                "execution_root_rebound",
+                "working_directory_unavailable",
+                "working_directory_escape",
+                "working_directory_not_directory",
+                "command_argv_invalid",
+                "command_path_unconfigured",
+                "executable_not_found",
+                "executable_unavailable",
+                "command_launch_not_found",
+                "command_launch_permission_denied",
+                "command_launch_invalid_input",
+                "command_launch_failed"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "enum": [
+                "start",
+                "execution"
+              ]
+            },
+            "code": {
+              "enum": [
+                "harness_start_failed",
+                "harness_input_too_large",
+                "harness_failed",
+                "harness_protocol_failed",
+                "missing_response",
+                "missing_result",
+                "result_validation_limit_exceeded",
+                "captured_value_too_large",
+                "result_settlement_failed"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "start"
+            },
+            "code": {
+              "enum": [
+                "input_invalid_name"
+              ]
+            },
+            "input": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "phase",
+            "code",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "start"
+            },
+            "code": {
+              "enum": [
+                "input_value_count_limit",
+                "input_value_size_limit",
+                "input_total_size_limit",
+                "input_collection_ordinal_limit",
+                "input_type_mismatch",
+                "input_source_unavailable",
+                "input_staging_unavailable",
+                "input_live_limit"
+              ]
+            },
+            "input": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "collectionIndex": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "execution"
+            },
+            "code": {
+              "enum": [
+                "command_exit"
+              ]
+            },
+            "exitCode": {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647,
+              "not": {
+                "const": 0
+              }
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "execution"
+            },
+            "code": {
+              "enum": [
+                "command_wait_failed"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "output_capture"
+            },
+            "code": {
+              "enum": [
+                "step_unavailable",
+                "output_unsupported",
+                "capture_task_unavailable"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "output_capture"
+            },
+            "code": {
+              "enum": [
+                "output_path_absolute",
+                "output_path_escape",
+                "output_path_empty",
+                "output_missing",
+                "output_symbolic_link",
+                "output_parent_not_directory",
+                "output_not_regular_file",
+                "output_source_unavailable",
+                "output_invalid_utf8",
+                "output_invalid_json",
+                "output_duplicate_json_member",
+                "output_json_schema_mismatch",
+                "captured_file_count_limit",
+                "captured_file_size_limit",
+                "captured_total_size_limit",
+                "captured_git_carrier_count_limit",
+                "captured_git_carrier_size_limit",
+                "captured_total_git_carrier_size_limit",
+                "output_staging_unavailable",
+                "git_execution_root_rebound",
+                "git_head_unavailable",
+                "git_baseline_not_ancestor",
+                "git_cleanliness_unavailable",
+                "git_workspace_dirty",
+                "git_tree_unavailable",
+                "git_required_objects_unavailable",
+                "git_source_authority_changed",
+                "git_structure_limit_exceeded",
+                "git_command_timed_out",
+                "git_bundle_generation_failed",
+                "git_bundle_profile_invalid",
+                "git_bundle_verification_failed",
+                "git_workspace_changed",
+                "git_temporary_storage_unavailable"
+              ]
+            },
+            "output": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "phase",
+            "code",
+            "output"
+          ]
+        }
+      ]
+    },
+    "Prerequisite": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "control"
+            },
+            "node": {
+              "$ref": "#/$defs/Identifier"
+            }
+          },
+          "required": [
+            "kind",
+            "node"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "condition"
+            },
+            "ref": {
+              "type": "string",
+              "pattern": "^outputs\\.[^.]+\\.[^.]+$",
+              "minLength": 5,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "kind",
+            "ref"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "body"
+            },
+            "ref": {
+              "type": "string",
+              "pattern": "^outputs\\.[^.]+\\.[^.]+$",
+              "minLength": 5,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "kind",
+            "ref"
+          ]
+        }
+      ]
+    },
+    "BlockedDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "prerequisites_unsatisfied"
+        },
+        "prerequisites": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/Prerequisite"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "prerequisites"
+      ]
+    },
+    "FailureStopDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "failure_stop"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "FinalizerTriggerNotSelectedDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "finalizer_trigger_not_selected"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "OrdinaryCancellationDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/OrdinaryCancellationReason"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "OrdinaryCancellationReason": {
+      "enum": [
+        "user_request",
+        "termination_request",
+        "caller_output_failure",
+        "runner_shutdown",
+        "execution_lease_expired"
+      ]
+    },
+    "RuntimeCancellationReason": {
+      "enum": [
+        "user_request",
+        "termination_request",
+        "caller_output_failure",
+        "runner_shutdown",
+        "execution_lease_expired",
+        "finalization_force_abort"
+      ]
+    },
+    "RuntimeCancellationDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RuntimeCancellationReason"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "stepId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+    },
+    "WorkflowNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stepId"
+        },
+        "role": {
+          "$ref": "#/$defs/NodeRole"
+        }
+      },
+      "required": [
+        "id",
+        "role"
+      ]
+    },
+    "PrimaryIssue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "node": {
+              "$ref": "#/$defs/WorkflowNode"
+            },
+            "state": {
+              "const": "failed"
+            },
+            "detail": {
+              "$ref": "#/$defs/FailureDetail"
+            }
+          },
+          "required": [
+            "node",
+            "state",
+            "detail"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "node": {
+              "$ref": "#/$defs/WorkflowNode"
+            },
+            "state": {
+              "const": "blocked"
+            },
+            "detail": {
+              "$ref": "#/$defs/BlockedDetail"
+            }
+          },
+          "required": [
+            "node",
+            "state",
+            "detail"
+          ]
         }
       ]
     }

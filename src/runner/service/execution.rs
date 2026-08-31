@@ -25,18 +25,16 @@ use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
 use crate::execution::workflow::admission::CancellationReason;
+use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
-use crate::execution::workflow::agent::{
-    AgentFailure, AgentFailureCause, AgentHarnessFailureDetail, AgentInputKind,
-    AgentProtocolRejectionDiagnostic, WorkflowRunId,
-};
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
-use crate::execution::workflow::agent_input::{AgentInputStaging, AgentInputStartFailure};
-use crate::execution::workflow::artifact::{ArtifactStaging, CaptureFailureKind};
+use crate::execution::workflow::agent_input::AgentInputStaging;
+use crate::execution::workflow::artifact::ArtifactStaging;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
+use crate::execution::workflow::evidence::PrimaryIssue;
 use crate::execution::workflow::execution::{NoopCommitPort, execute_workflow};
-use crate::execution::workflow::input::{InputPreparationFailureKind, InputStaging};
+use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::invocation_accounting::InvocationAccountingLog;
 use crate::execution::workflow::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
@@ -55,15 +53,10 @@ use crate::execution::workflow::publication::{
     step_recovery_summary_v1, summary_disposition_matches,
 };
 use crate::execution::workflow::runtime::{
-    ActionId, ActiveStepInvocation, FailurePhase, FinalizationGate, FinalizationSummary,
-    FinalizerResult, NotRunReason, RunOutcome, SchedulingGate, StepFailure, StepState,
-    StepStateKind, TransitionEvent, WorkflowState,
+    ActionId, ActiveStepInvocation, FinalizationGate, FinalizationSummary, FinalizerResult,
+    RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
-use crate::execution::workflow::step_runtime::{
-    AgentExecution, CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure,
-    OutputCaptureFailure, StepExecutionFailure, StepFailureCause, StepStartFailure,
-    WorkingDirectoryFailure,
-};
+use crate::execution::workflow::step_runtime::{AgentExecution, StepFailureCause};
 use crate::execution::workflow::validated::WorkflowNodeRole;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -772,13 +765,11 @@ impl ExecutionJob {
                 ),
                 artifact_delivery,
             },
-            RunOutcome::Failed {
-                primary_failure, ..
-            } => ExecutionReport::Finished {
+            RunOutcome::Failed { primary_issue, .. } => ExecutionReport::Finished {
                 final_execution_event_sequence: last_sequence,
                 outcome: terminal_outcome(
                     "failed",
-                    Some(workflow_failure(&primary_failure)),
+                    Some(workflow_issue(&primary_issue)),
                     None,
                     finalization,
                     recovery_summaries,
@@ -1176,7 +1167,7 @@ pub(super) fn cloud_execution_capacity(
 }
 
 fn observed_workflow_cancellation(
-    outcome: &RunOutcome<StepFailureCause>,
+    outcome: &RunOutcome,
     cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
 ) -> Option<Option<WorkflowRunCancellation>> {
     match (cancellation, outcome) {
@@ -1246,7 +1237,11 @@ fn artifact_delivery_result(delivery: &ArtifactDeliveryOutcome) -> Value {
             "code": failure.code,
         }),
         ArtifactDeliveryOutcome::Delivered { .. } | ArtifactDeliveryOutcome::AuthorityLost => {
-            unreachable!("only a closed whole-set delivery can be terminal")
+            json!({
+                "outcome": "failed",
+                "phase": "confirmation",
+                "code": "delivery_internal_failure",
+            })
         }
     }
 }
@@ -1680,7 +1675,7 @@ struct ObserverState {
     transition_count: usize,
     last_sequence: u64,
     terminal_sequence: Option<u64>,
-    terminal_state: Option<WorkflowState<StepFailureCause>>,
+    terminal_state: Option<WorkflowState>,
     cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
     step_timings: BTreeMap<String, RunnerStepTiming>,
     active_invocations: BTreeMap<String, RunnerActiveInvocation>,
@@ -1741,7 +1736,7 @@ impl RunnerExecutionObserver {
         self.lock().terminal_sequence
     }
 
-    fn terminal_state(&self) -> Option<WorkflowState<StepFailureCause>> {
+    fn terminal_state(&self) -> Option<WorkflowState> {
         self.lock().terminal_state.clone()
     }
 
@@ -1914,19 +1909,20 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
             };
             let observed_at = RunnerExecutionClock.now();
             let phase_cancellation = match &transition.event {
-                TransitionEvent::Workflow {
-                    to: WorkflowState::Finalizing { .. },
-                    ..
-                } => observer
-                    .cancellation
-                    .cancellation_reason()
-                    .filter(|reason| {
-                        matches!(
-                            reason,
-                            CancellationReason::RunnerShutdown
-                                | CancellationReason::ExecutionLeaseExpired
-                        )
-                    }),
+                TransitionEvent::Workflow { to, .. }
+                    if matches!(to.as_ref(), WorkflowState::Finalizing { .. }) =>
+                {
+                    observer
+                        .cancellation
+                        .cancellation_reason()
+                        .filter(|reason| {
+                            matches!(
+                                reason,
+                                CancellationReason::RunnerShutdown
+                                    | CancellationReason::ExecutionLeaseExpired
+                            )
+                        })
+                }
                 _ => None,
             };
             let fence = observer.post_stop_fence.lock();
@@ -1955,13 +1951,13 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
             let terminal = match &transition.event {
                 TransitionEvent::Workflow { to, .. }
                     if matches!(
-                        to,
+                        to.as_ref(),
                         WorkflowState::Succeeded
                             | WorkflowState::Failed { .. }
                             | WorkflowState::Cancelled { .. }
                     ) =>
                 {
-                    Some(to.clone())
+                    Some(to.as_ref().clone())
                 }
                 _ => None,
             };
@@ -2119,12 +2115,13 @@ fn is_lease_loss_terminal_transition(
 ) -> bool {
     matches!(
         &transition.event,
-        TransitionEvent::Workflow {
-            to: WorkflowState::Cancelled {
-                reason: CancellationReason::ExecutionLeaseExpired,
-            },
-            ..
-        }
+        TransitionEvent::Workflow { to, .. }
+            if matches!(
+                to.as_ref(),
+                WorkflowState::Cancelled {
+                    reason: CancellationReason::ExecutionLeaseExpired,
+                }
+            )
     )
 }
 
@@ -2149,14 +2146,14 @@ fn terminal_recovery_summaries(
 
 fn terminal_outcome(
     outcome: &str,
-    failure: Option<Value>,
+    primary_issue: Option<Value>,
     reason: Option<&str>,
     finalization: Option<Value>,
     recovery_summaries: Option<Value>,
 ) -> Value {
     let mut object = serde_json::Map::from_iter([("outcome".to_owned(), json!(outcome))]);
-    if let Some(failure) = failure {
-        object.insert("failure".to_owned(), failure);
+    if let Some(primary_issue) = primary_issue {
+        object.insert("primaryIssue".to_owned(), primary_issue);
     }
     if let Some(reason) = reason {
         object.insert("reason".to_owned(), json!(reason));
@@ -2170,9 +2167,7 @@ fn terminal_outcome(
     Value::Object(object)
 }
 
-fn finalization_summary(
-    summary: &FinalizationSummary<StepFailureCause, RunnerExecutionInstant>,
-) -> Value {
+fn finalization_summary(summary: &FinalizationSummary<RunnerExecutionInstant>) -> Value {
     let finalizers = summary
         .finalizers
         .iter()
@@ -2184,7 +2179,7 @@ fn finalization_summary(
         .filter(|result| {
             matches!(
                 result.disposition,
-                StepState::Failed { .. } | StepState::InputUnavailable { .. }
+                StepState::Failed { .. } | StepState::Blocked { .. }
             )
         })
         .map(|result| {
@@ -2216,7 +2211,7 @@ fn finalization_summary(
     Value::Object(object)
 }
 
-fn finalizer_result(result: &FinalizerResult<StepFailureCause>) -> Value {
+fn finalizer_result(result: &FinalizerResult) -> Value {
     let mut object = serde_json::Map::from_iter([
         ("id".to_owned(), json!(result.finalizer)),
         ("role".to_owned(), json!("finalizer")),
@@ -2226,26 +2221,21 @@ fn finalizer_result(result: &FinalizerResult<StepFailureCause>) -> Value {
         StepState::Succeeded { .. } => {
             object.insert("state".to_owned(), json!("succeeded"));
         }
-        StepState::Failed { phase, cause } => {
+        StepState::Failed { detail } => {
             object.insert("state".to_owned(), json!("failed"));
-            object.insert("failure".to_owned(), failure_evidence(*phase, cause));
+            object.insert("detail".to_owned(), json!(detail));
         }
-        StepState::Blocked { dependency } => {
+        StepState::Blocked { detail } => {
             object.insert("state".to_owned(), json!("blocked"));
-            object.insert("dependency".to_owned(), json!(dependency));
+            object.insert("detail".to_owned(), json!(detail));
         }
-        StepState::InputUnavailable { references } => {
-            object.insert("state".to_owned(), json!("blocked"));
-            object.insert("reason".to_owned(), json!("input_unavailable"));
-            object.insert("unavailableReferences".to_owned(), json!(references));
-        }
-        StepState::NotRun { reason } => {
+        StepState::NotRun { detail } => {
             object.insert("state".to_owned(), json!("not_run"));
-            object.insert("reason".to_owned(), json!(not_run_reason(*reason)));
+            object.insert("detail".to_owned(), json!(detail));
         }
-        StepState::Cancelled { reason } => {
+        StepState::Cancelled { detail } => {
             object.insert("state".to_owned(), json!("cancelled"));
-            object.insert("reason".to_owned(), json!(cancellation_reason(*reason)));
+            object.insert("detail".to_owned(), json!(detail));
         }
         StepState::Pending
         | StepState::Starting
@@ -2371,22 +2361,18 @@ fn workflow_event(
                         event.insert("recoveryProgress".to_owned(), Value::Object(progress));
                     }
                     ObservedStepTransition::OutputsCommitted { .. } => {}
-                    ObservedStepTransition::Failed { phase, cause } => {
-                        event.insert("failure".to_owned(), failure_evidence(*phase, cause));
+                    ObservedStepTransition::Failed { detail } => {
+                        event.insert("detail".to_owned(), json!(detail));
                     }
-                    ObservedStepTransition::Blocked { dependency } => {
-                        event.insert("dependency".to_owned(), json!(dependency));
+                    ObservedStepTransition::Blocked { detail } => {
+                        event.insert("detail".to_owned(), json!(detail));
                     }
-                    ObservedStepTransition::InputUnavailable { references } => {
-                        event.insert("reason".to_owned(), json!("input_unavailable"));
-                        event.insert("unavailableReferences".to_owned(), json!(references));
+                    ObservedStepTransition::NotRun { detail } => {
+                        event.insert("detail".to_owned(), json!(detail));
                     }
-                    ObservedStepTransition::NotRun { reason } => {
-                        event.insert("reason".to_owned(), json!(not_run_reason(*reason)));
-                    }
-                    ObservedStepTransition::Cancelling { reason }
-                    | ObservedStepTransition::Cancelled { reason } => {
-                        event.insert("reason".to_owned(), json!(cancellation_reason(*reason)));
+                    ObservedStepTransition::Cancelling { detail }
+                    | ObservedStepTransition::Cancelled { detail } => {
+                        event.insert("detail".to_owned(), json!(detail));
                     }
                 }
             }
@@ -2439,23 +2425,23 @@ fn workflow_event(
     event
 }
 
-fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant>) -> Value {
+fn workflow_state(state: &WorkflowState<RunnerExecutionInstant>) -> Value {
     match state {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
         } => json!({ "state": "executing", "gate": "open" }),
         WorkflowState::Executing {
-            gate: SchedulingGate::FailureStopped { primary_failure },
+            gate: SchedulingGate::FailureStopped { primary_issue },
         } => json!({
             "state": "executing",
             "gate": "failure_stopped",
-            "primaryFailure": workflow_failure(primary_failure),
+            "primaryIssue": workflow_issue(primary_issue),
         }),
         WorkflowState::Executing {
             gate:
                 SchedulingGate::Cancelling {
                     reason,
-                    prior_failure: None,
+                    prior_issue: None,
                 },
         } => json!({
             "state": "executing",
@@ -2466,18 +2452,18 @@ fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant
             gate:
                 SchedulingGate::Cancelling {
                     reason,
-                    prior_failure: Some(prior_failure),
+                    prior_issue: Some(prior_issue),
                 },
         } => json!({
             "state": "executing",
             "gate": "cancelling",
             "reason": cancellation_reason(*reason),
-            "priorFailure": workflow_failure(prior_failure),
+            "priorIssue": workflow_issue(prior_issue),
         }),
         WorkflowState::Finalizing {
             trigger,
             gate,
-            primary_failure,
+            primary_issue,
         } => {
             let mut object = serde_json::Map::from_iter([
                 ("state".to_owned(), json!("finalizing")),
@@ -2503,28 +2489,25 @@ fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant
                     }
                 }
             }
-            if let Some(primary_failure) = primary_failure {
-                object.insert(
-                    "primaryFailure".to_owned(),
-                    workflow_failure(primary_failure),
-                );
+            if let Some(primary_issue) = primary_issue {
+                object.insert("primaryIssue".to_owned(), workflow_issue(primary_issue));
             }
             Value::Object(object)
         }
         WorkflowState::Succeeded => json!({ "state": "succeeded" }),
         WorkflowState::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation: None,
         } => json!({
             "state": "failed",
-            "primaryFailure": workflow_failure(primary_failure),
+            "primaryIssue": workflow_issue(primary_issue),
         }),
         WorkflowState::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation: Some(later_cancellation),
         } => json!({
             "state": "failed",
-            "primaryFailure": workflow_failure(primary_failure),
+            "primaryIssue": workflow_issue(primary_issue),
             "laterCancellation": cancellation_reason(*later_cancellation),
         }),
         WorkflowState::Cancelled { reason } => json!({
@@ -2534,11 +2517,8 @@ fn workflow_state(state: &WorkflowState<StepFailureCause, RunnerExecutionInstant
     }
 }
 
-fn workflow_failure(failure: &StepFailure<StepFailureCause>) -> Value {
-    json!({
-        "node": { "id": failure.step, "role": node_role(failure.role) },
-        "failure": failure_evidence(failure.phase, &failure.cause),
-    })
+fn workflow_issue(issue: &PrimaryIssue) -> Value {
+    json!(issue)
 }
 
 fn node_role(role: WorkflowNodeRole) -> &'static str {
@@ -2548,274 +2528,16 @@ fn node_role(role: WorkflowNodeRole) -> &'static str {
     }
 }
 
-fn failure_evidence(phase: FailurePhase, cause: &StepFailureCause) -> Value {
-    match (phase, cause) {
-        (FailurePhase::Start, StepFailureCause::Start(cause)) => {
-            let protocol_rejection = match cause {
-                StepStartFailure::Agent(failure) => failure.protocol_rejection(),
-                _ => None,
-            };
-            let (code, exit_code) = start_failure(cause);
-            failure_value("start", code, exit_code, protocol_rejection)
-        }
-        (FailurePhase::Execution, StepFailureCause::Execution(cause)) => {
-            let (code, exit_code) = execution_failure(cause);
-            let protocol_rejection = match cause {
-                StepExecutionFailure::Agent(failure) => failure.protocol_rejection(),
-                StepExecutionFailure::Command(_) => None,
-            };
-            failure_value("execution", code, exit_code, protocol_rejection)
-        }
-        (FailurePhase::OutputCapture, StepFailureCause::OutputCapture(cause)) => {
-            let (code, output) = output_capture_failure(cause);
-            let mut evidence = failure_value("output_capture", code, None, None);
-            if let Some(output) = output {
-                evidence["output"] = Value::String(output.to_owned());
-            }
-            evidence
-        }
-        _ => failure_value("start", "step_unavailable", None, None),
-    }
-}
-
-fn failure_value(
-    phase: &str,
-    cause: &str,
-    exit_code: Option<i32>,
-    protocol_rejection: Option<&AgentProtocolRejectionDiagnostic>,
-) -> Value {
-    match (exit_code, protocol_rejection) {
-        (Some(exit_code), None) => {
-            json!({ "phase": phase, "cause": cause, "exitCode": exit_code })
-        }
-        (None, Some(protocol_rejection)) => json!({
-            "phase": phase,
-            "cause": cause,
-            "protocolRejection": protocol_rejection,
-        }),
-        (None, None) => json!({ "phase": phase, "cause": cause }),
-        (Some(_), Some(_)) => unreachable!("agent protocol rejections have no command exit code"),
-    }
-}
-
-fn start_failure(failure: &StepStartFailure) -> (&'static str, Option<i32>) {
-    let cause = match failure {
-        StepStartFailure::StepUnavailable => "step_unavailable",
-        StepStartFailure::PreparationTaskUnavailable => "preparation_task_unavailable",
-        StepStartFailure::InputsUnavailable => "inputs_unavailable",
-        StepStartFailure::InputPreparation(failure) => input_preparation_failure(failure.kind()),
-        StepStartFailure::AgentInput(failure) => agent_input_failure(failure),
-        StepStartFailure::Agent(failure) => agent_failure(failure),
-        StepStartFailure::AgentRuntimeUnavailable => "agent_runtime_unavailable",
-        StepStartFailure::OutputsUnsupported => "outputs_unsupported",
-        StepStartFailure::WorkingDirectory(failure) => working_directory_failure(*failure),
-        StepStartFailure::CommandPreparation(failure) => match failure {
-            CommandPreparationFailure::InvalidArgv => "invalid_argv",
-            CommandPreparationFailure::PathNotConfigured => "path_not_configured",
-            CommandPreparationFailure::ExecutableNotFound => "executable_not_found",
-            CommandPreparationFailure::ExecutableUnavailable => "executable_unavailable",
-        },
-        StepStartFailure::CommandLaunch(failure) => match failure {
-            CommandLaunchFailure::NotFound => "command_not_found",
-            CommandLaunchFailure::PermissionDenied => "command_permission_denied",
-            CommandLaunchFailure::InvalidInput => "command_invalid_input",
-            CommandLaunchFailure::Other => "command_launch_failed",
-        },
-    };
-    (cause, None)
-}
-
-fn input_preparation_failure(failure: InputPreparationFailureKind) -> &'static str {
-    match failure {
-        InputPreparationFailureKind::InvalidInputName => "input_invalid_name",
-        InputPreparationFailureKind::ValueCountLimitExceeded => "input_value_count_limit_exceeded",
-        InputPreparationFailureKind::ValueSizeLimitExceeded => "input_value_size_limit_exceeded",
-        InputPreparationFailureKind::TotalSizeLimitExceeded => "input_total_size_limit_exceeded",
-        InputPreparationFailureKind::CollectionOrdinalLimitExceeded => {
-            "input_collection_ordinal_limit_exceeded"
-        }
-        InputPreparationFailureKind::ValueTypeMismatch => "input_value_type_mismatch",
-        InputPreparationFailureKind::SourceUnavailable => "input_source_unavailable",
-        InputPreparationFailureKind::StagingUnavailable => "input_staging_unavailable",
-        InputPreparationFailureKind::LiveLimitExceeded => "input_live_limit_exceeded",
-    }
-}
-
-fn agent_input_failure(failure: &AgentInputStartFailure) -> &'static str {
-    match failure {
-        AgentInputStartFailure::StepUnavailable => "agent_input_step_unavailable",
-        AgentInputStartFailure::AgentAdmissionUnavailable => "agent_admission_unavailable",
-        AgentInputStartFailure::InputsUnavailable => "agent_inputs_unavailable",
-        AgentInputStartFailure::MissingUpstreamValue { .. } => "agent_missing_upstream_value",
-        AgentInputStartFailure::ValueTypeMismatch { .. } => "agent_value_type_mismatch",
-        AgentInputStartFailure::RetainedSourceUnavailable { .. } => {
-            "agent_retained_source_unavailable"
-        }
-        AgentInputStartFailure::InvalidRetainedText { .. } => "agent_invalid_retained_text",
-        AgentInputStartFailure::ResultSchemaUnavailable { .. } => "agent_result_schema_unavailable",
-        AgentInputStartFailure::InvalidValueMode => "agent_invalid_value_mode",
-        AgentInputStartFailure::AttachmentCountLimitExceeded { .. } => {
-            "agent_attachment_count_limit_exceeded"
-        }
-        AgentInputStartFailure::AttachmentBytesLimitExceeded { .. } => {
-            "agent_attachment_bytes_limit_exceeded"
-        }
-        AgentInputStartFailure::WorkingDirectory(failure) => working_directory_failure(*failure),
-        AgentInputStartFailure::ArtifactStagingMismatch => "agent_artifact_staging_mismatch",
-        AgentInputStartFailure::AgentStagingMismatch => "agent_staging_mismatch",
-        AgentInputStartFailure::StagingUnavailable => "agent_staging_unavailable",
-    }
-}
-
-fn working_directory_failure(failure: WorkingDirectoryFailure) -> &'static str {
-    match failure {
-        WorkingDirectoryFailure::ExecutionRootRebound => "execution_root_rebound",
-        WorkingDirectoryFailure::Unavailable => "working_directory_unavailable",
-        WorkingDirectoryFailure::EscapesExecutionRoot => "working_directory_escape",
-        WorkingDirectoryFailure::NotDirectory => "working_directory_not_directory",
-    }
-}
-
-fn execution_failure(failure: &StepExecutionFailure) -> (&'static str, Option<i32>) {
-    match failure {
-        StepExecutionFailure::Command(CommandExecutionFailure::UnsuccessfulExit {
-            code: Some(code),
-        }) => ("command_unsuccessful_exit", Some(*code)),
-        StepExecutionFailure::Command(CommandExecutionFailure::UnsuccessfulExit { code: None }) => {
-            ("command_terminated", None)
-        }
-        StepExecutionFailure::Command(CommandExecutionFailure::Wait) => {
-            ("command_wait_failed", None)
-        }
-        StepExecutionFailure::Agent(failure) => (agent_failure(failure), None),
-    }
-}
-
-fn agent_failure(failure: &AgentFailure) -> &'static str {
-    match failure.cause() {
-        AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessSetupFailed { .. } => {
-            "agent_harness_start_failed"
-        }
-        AgentFailureCause::HarnessInputTooLarge {
-            input: AgentInputKind::SystemPrompt,
-            ..
-        } => "agent_system_prompt_too_large",
-        AgentFailureCause::HarnessInputTooLarge {
-            input: AgentInputKind::Message,
-            ..
-        } => "agent_message_too_large",
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelOutputTruncated,
-        } => "agent_harness_model_output_truncated",
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::UnexpectedTerminalToolUse,
-        } => "agent_harness_unexpected_terminal_tool_use",
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelError,
-        } => "agent_harness_model_error",
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelAborted,
-        } => "agent_harness_model_aborted",
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-        } => "agent_harness_unsuccessful_exit",
-        AgentFailureCause::HarnessProtocolFailed => "agent_harness_protocol_failed",
-        AgentFailureCause::MissingResponse => "agent_missing_response",
-        AgentFailureCause::MissingResult => "agent_missing_result",
-        AgentFailureCause::ResultValidationLimitExceeded { .. } => {
-            "agent_result_validation_limit_exceeded"
-        }
-        AgentFailureCause::CapturedValueTooLarge => "agent_captured_value_too_large",
-        AgentFailureCause::ResultSettlementFailed => "agent_result_settlement_failed",
-    }
-}
-
-fn output_capture_failure(failure: &OutputCaptureFailure) -> (&'static str, Option<&str>) {
-    match failure {
-        OutputCaptureFailure::StepUnavailable => ("output_step_unavailable", None),
-        OutputCaptureFailure::UnsupportedOutput => ("output_unsupported", None),
-        OutputCaptureFailure::Capture(failure) => (
-            capture_failure(failure.kind()),
-            Some(failure.output_identity()),
-        ),
-        OutputCaptureFailure::Git { output, failure } => {
-            (git_capture_failure(failure), Some(output))
-        }
-        OutputCaptureFailure::TaskUnavailable => ("output_task_unavailable", None),
-    }
-}
-
-fn git_capture_failure(
-    failure: &crate::execution::workflow::git_capture::GitCaptureFailure,
-) -> &'static str {
-    use crate::execution::workflow::git_capture::GitCaptureFailure;
-
-    match failure {
-        GitCaptureFailure::Cancelled
-        | GitCaptureFailure::StagingMismatch
-        | GitCaptureFailure::Artifact(_) => "output_staging_unavailable",
-        GitCaptureFailure::ExecutionRootRebound => "output_git_execution_root_rebound",
-        GitCaptureFailure::HeadUnavailable => "output_git_head_unavailable",
-        GitCaptureFailure::BaselineNotAncestor => "output_git_baseline_not_ancestor",
-        GitCaptureFailure::CleanlinessUnavailable => "output_git_cleanliness_unavailable",
-        GitCaptureFailure::WorkspaceDirty => "output_git_workspace_dirty",
-        GitCaptureFailure::TreeUnavailable => "output_git_tree_unavailable",
-        GitCaptureFailure::RequiredObjectsUnavailable => "output_git_required_objects_unavailable",
-        GitCaptureFailure::SourceAuthorityChanged => "output_git_source_authority_changed",
-        GitCaptureFailure::GitStructureLimitExceeded => "output_git_structure_limit_exceeded",
-        GitCaptureFailure::CommandTimedOut(_) => "output_git_command_timed_out",
-        GitCaptureFailure::BundleGenerationFailed => "output_git_bundle_generation_failed",
-        GitCaptureFailure::BundleProfileInvalid => "output_git_bundle_profile_invalid",
-        GitCaptureFailure::BundleVerificationFailed => "output_git_bundle_verification_failed",
-        GitCaptureFailure::WorkspaceChanged => "output_git_workspace_changed",
-        GitCaptureFailure::TemporaryStorageUnavailable => {
-            "output_git_temporary_storage_unavailable"
-        }
-    }
-}
-
-fn capture_failure(failure: CaptureFailureKind) -> &'static str {
-    match failure {
-        CaptureFailureKind::AbsolutePath => "output_absolute_path",
-        CaptureFailureKind::LexicalEscape => "output_lexical_escape",
-        CaptureFailureKind::EmptyPath => "output_empty_path",
-        CaptureFailureKind::Missing => "output_missing",
-        CaptureFailureKind::SymbolicLink => "output_symbolic_link",
-        CaptureFailureKind::NotDirectory => "output_not_directory",
-        CaptureFailureKind::NotRegularFile => "output_not_regular_file",
-        CaptureFailureKind::SourceUnavailable => "output_source_unavailable",
-        CaptureFailureKind::InvalidTextEncoding => "output_invalid_utf8",
-        CaptureFailureKind::InvalidJson => "output_invalid_json",
-        CaptureFailureKind::DuplicateJsonMember => "output_duplicate_json_member",
-        CaptureFailureKind::JsonSchemaMismatch => "output_json_schema_mismatch",
-        CaptureFailureKind::FileCountLimitExceeded => "output_file_count_limit_exceeded",
-        CaptureFailureKind::FileSizeLimitExceeded => "output_file_size_limit_exceeded",
-        CaptureFailureKind::TotalSizeLimitExceeded => "output_total_size_limit_exceeded",
-        CaptureFailureKind::GitCarrierCountLimitExceeded => {
-            "output_git_carrier_count_limit_exceeded"
-        }
-        CaptureFailureKind::GitCarrierSizeLimitExceeded => "output_git_carrier_size_limit_exceeded",
-        CaptureFailureKind::TotalGitCarrierSizeLimitExceeded => {
-            "output_total_git_carrier_size_limit_exceeded"
-        }
-        CaptureFailureKind::CarrierProducerUnavailable => "output_carrier_producer_unavailable",
-        CaptureFailureKind::StagingUnavailable => "output_staging_unavailable",
-    }
-}
-
-fn terminal_result_agrees(
-    terminal: Option<&WorkflowState<StepFailureCause>>,
-    outcome: &RunOutcome<StepFailureCause>,
-) -> bool {
+fn terminal_result_agrees(terminal: Option<&WorkflowState>, outcome: &RunOutcome) -> bool {
     match (terminal, outcome) {
         (Some(WorkflowState::Succeeded), RunOutcome::Succeeded) => true,
         (
             Some(WorkflowState::Failed {
-                primary_failure: left_failure,
+                primary_issue: left_failure,
                 later_cancellation: left_cancellation,
             }),
             RunOutcome::Failed {
-                primary_failure: right_failure,
+                primary_issue: right_failure,
                 later_cancellation: right_cancellation,
             },
         ) => left_failure == right_failure && left_cancellation == right_cancellation,
@@ -2840,13 +2562,6 @@ fn step_state_name(state: StepStateKind) -> &'static str {
         StepStateKind::Blocked => "blocked",
         StepStateKind::NotRun => "not_run",
         StepStateKind::Cancelled => "cancelled",
-    }
-}
-
-fn not_run_reason(reason: NotRunReason) -> &'static str {
-    match reason {
-        NotRunReason::FailureStop => "failure_stop",
-        NotRunReason::FinalizerTriggerNotSelected => "finalizer_trigger_not_selected",
     }
 }
 
@@ -2909,24 +2624,18 @@ impl CoordinatorClock for RunnerExecutionClock {
 
 #[cfg(test)]
 mod tests {
+    // Runner execution and artifact delivery intentionally own separate broker fixtures;
+    // their matching imports keep each test module independently readable.
+    // jscpd:ignore-start
     use std::collections::BTreeSet;
-    use std::num::NonZeroU64;
     use std::sync::Arc;
 
     use super::*;
-    use crate::execution::workflow::agent::{
-        AgentFailure, AgentOutcome, AgentValueKind, PositiveDuration,
-    };
-    use crate::execution::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1Parser;
-    use crate::execution::workflow::pi_json_v1::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
-    use crate::execution::workflow::validated::{
-        ResolvedOutputSource, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
-    };
+    use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-    use crate::runner_protocol::{
-        MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, encode_runner_frame,
-    };
+    use crate::runner_protocol::MAXIMUM_ORDINARY_FRAME_BYTES;
+    // jscpd:ignore-end
 
     fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
         LeaseAuthority {
@@ -3411,7 +3120,7 @@ mod tests {
                     from: WorkflowState::Executing {
                         gate: SchedulingGate::Open,
                     },
-                    to: WorkflowState::Succeeded,
+                    to: Box::new(WorkflowState::Succeeded),
                 },
                 step: None,
             }))
@@ -3425,12 +3134,12 @@ mod tests {
                 from: WorkflowState::Executing {
                     gate: SchedulingGate::Cancelling {
                         reason: CancellationReason::ExecutionLeaseExpired,
-                        prior_failure: None,
+                        prior_issue: None,
                     },
                 },
-                to: WorkflowState::Cancelled {
+                to: Box::new(WorkflowState::Cancelled {
                     reason: CancellationReason::ExecutionLeaseExpired,
-                },
+                }),
             },
             step: None,
         };
@@ -3461,15 +3170,15 @@ mod tests {
                     from: WorkflowState::Executing {
                         gate: SchedulingGate::Cancelling {
                             reason: CancellationReason::ExecutionLeaseExpired,
-                            prior_failure: None,
+                            prior_issue: None,
                         },
                     },
-                    to: WorkflowState::Finalizing {
+                    to: Box::new(WorkflowState::Finalizing {
                         trigger:
                             crate::execution::workflow::document::FinalizationTrigger::Cancelled,
                         gate: FinalizationGate::Open,
-                        primary_failure: None,
-                    },
+                        primary_issue: None,
+                    }),
                 },
                 step: None,
             }))
@@ -3514,7 +3223,10 @@ mod tests {
                 to: StepStateKind::Blocked,
             },
             step: Some(ObservedStepTransition::Blocked {
-                dependency: "analyze".to_owned(),
+                detail: crate::execution::workflow::evidence::BlockedDetail::new([
+                    crate::execution::workflow::evidence::Prerequisite::control("analyze").unwrap(),
+                ])
+                .unwrap(),
             }),
         };
 
@@ -3529,698 +3241,11 @@ mod tests {
                 "failurePolicy": "advisory",
                 "from": "pending",
                 "to": "blocked",
-                "dependency": "analyze",
+                "detail": {
+                    "code": "prerequisites_unsatisfied",
+                    "prerequisites": [{"kind": "control", "node": "analyze"}]
+                },
             })
         );
-    }
-
-    #[test]
-    fn closed_failure_vocabulary_projects_and_encodes() {
-        let source = ResolvedOutputSource {
-            node: WorkflowNode {
-                id: "upstream".to_owned(),
-                role: WorkflowNodeRole::Step,
-            },
-            output: "value".to_owned(),
-            value_type: WorkflowValueType::Text,
-        };
-        let mut start_failures = vec![
-            (StepStartFailure::StepUnavailable, "step_unavailable"),
-            (
-                StepStartFailure::PreparationTaskUnavailable,
-                "preparation_task_unavailable",
-            ),
-            (StepStartFailure::InputsUnavailable, "inputs_unavailable"),
-            (
-                StepStartFailure::AgentInput(Box::new(AgentInputStartFailure::StepUnavailable)),
-                "agent_input_step_unavailable",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::AgentAdmissionUnavailable,
-                )),
-                "agent_admission_unavailable",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(AgentInputStartFailure::InputsUnavailable)),
-                "agent_inputs_unavailable",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::MissingUpstreamValue {
-                        source: source.clone(),
-                    },
-                )),
-                "agent_missing_upstream_value",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(AgentInputStartFailure::ValueTypeMismatch {
-                    source: source.clone(),
-                })),
-                "agent_value_type_mismatch",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::RetainedSourceUnavailable {
-                        path: "source".to_owned(),
-                    },
-                )),
-                "agent_retained_source_unavailable",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::InvalidRetainedText {
-                        path: "source".to_owned(),
-                    },
-                )),
-                "agent_invalid_retained_text",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::ResultSchemaUnavailable {
-                        output: "result".to_owned(),
-                    },
-                )),
-                "agent_result_schema_unavailable",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(AgentInputStartFailure::InvalidValueMode)),
-                "agent_invalid_value_mode",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::AttachmentCountLimitExceeded { maximum: 1 },
-                )),
-                "agent_attachment_count_limit_exceeded",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::AttachmentBytesLimitExceeded { maximum: 1 },
-                )),
-                "agent_attachment_bytes_limit_exceeded",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::ArtifactStagingMismatch,
-                )),
-                "agent_artifact_staging_mismatch",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(
-                    AgentInputStartFailure::AgentStagingMismatch,
-                )),
-                "agent_staging_mismatch",
-            ),
-            (
-                StepStartFailure::AgentInput(Box::new(AgentInputStartFailure::StagingUnavailable)),
-                "agent_staging_unavailable",
-            ),
-            (
-                StepStartFailure::AgentRuntimeUnavailable,
-                "agent_runtime_unavailable",
-            ),
-            (StepStartFailure::OutputsUnsupported, "outputs_unsupported"),
-        ];
-        for (failure, expected) in [
-            (
-                WorkingDirectoryFailure::ExecutionRootRebound,
-                "execution_root_rebound",
-            ),
-            (
-                WorkingDirectoryFailure::Unavailable,
-                "working_directory_unavailable",
-            ),
-            (
-                WorkingDirectoryFailure::EscapesExecutionRoot,
-                "working_directory_escape",
-            ),
-            (
-                WorkingDirectoryFailure::NotDirectory,
-                "working_directory_not_directory",
-            ),
-        ] {
-            start_failures.push((StepStartFailure::WorkingDirectory(failure), expected));
-        }
-        for (failure, expected) in [
-            (CommandPreparationFailure::InvalidArgv, "invalid_argv"),
-            (
-                CommandPreparationFailure::PathNotConfigured,
-                "path_not_configured",
-            ),
-            (
-                CommandPreparationFailure::ExecutableNotFound,
-                "executable_not_found",
-            ),
-            (
-                CommandPreparationFailure::ExecutableUnavailable,
-                "executable_unavailable",
-            ),
-        ] {
-            start_failures.push((StepStartFailure::CommandPreparation(failure), expected));
-        }
-        for (failure, expected) in [
-            (CommandLaunchFailure::NotFound, "command_not_found"),
-            (
-                CommandLaunchFailure::PermissionDenied,
-                "command_permission_denied",
-            ),
-            (CommandLaunchFailure::InvalidInput, "command_invalid_input"),
-            (CommandLaunchFailure::Other, "command_launch_failed"),
-        ] {
-            start_failures.push((StepStartFailure::CommandLaunch(failure), expected));
-        }
-        for (failure, expected) in start_failures {
-            assert_projection(
-                FailurePhase::Start,
-                StepFailureCause::Start(failure),
-                "start",
-                expected,
-                None,
-            );
-        }
-
-        for (failure, expected) in agent_failures() {
-            assert_projection(
-                FailurePhase::Start,
-                StepFailureCause::Start(StepStartFailure::Agent(failure.clone().into())),
-                "start",
-                expected,
-                None,
-            );
-            assert_projection(
-                FailurePhase::Execution,
-                StepFailureCause::Execution(StepExecutionFailure::Agent(failure.into())),
-                "execution",
-                expected,
-                None,
-            );
-        }
-        for (failure, expected, exit_code) in [
-            (
-                CommandExecutionFailure::UnsuccessfulExit { code: Some(23) },
-                "command_unsuccessful_exit",
-                Some(23),
-            ),
-            (
-                CommandExecutionFailure::UnsuccessfulExit { code: None },
-                "command_terminated",
-                None,
-            ),
-            (CommandExecutionFailure::Wait, "command_wait_failed", None),
-        ] {
-            assert_projection(
-                FailurePhase::Execution,
-                StepFailureCause::Execution(StepExecutionFailure::Command(failure)),
-                "execution",
-                expected,
-                exit_code,
-            );
-        }
-        for (failure, expected) in [
-            (
-                OutputCaptureFailure::StepUnavailable,
-                "output_step_unavailable",
-            ),
-            (
-                OutputCaptureFailure::UnsupportedOutput,
-                "output_unsupported",
-            ),
-            (
-                OutputCaptureFailure::TaskUnavailable,
-                "output_task_unavailable",
-            ),
-        ] {
-            assert_projection(
-                FailurePhase::OutputCapture,
-                StepFailureCause::OutputCapture(failure),
-                "output_capture",
-                expected,
-                None,
-            );
-        }
-
-        for (kind, expected) in [
-            (
-                InputPreparationFailureKind::InvalidInputName,
-                "input_invalid_name",
-            ),
-            (
-                InputPreparationFailureKind::ValueCountLimitExceeded,
-                "input_value_count_limit_exceeded",
-            ),
-            (
-                InputPreparationFailureKind::ValueSizeLimitExceeded,
-                "input_value_size_limit_exceeded",
-            ),
-            (
-                InputPreparationFailureKind::TotalSizeLimitExceeded,
-                "input_total_size_limit_exceeded",
-            ),
-            (
-                InputPreparationFailureKind::CollectionOrdinalLimitExceeded,
-                "input_collection_ordinal_limit_exceeded",
-            ),
-            (
-                InputPreparationFailureKind::ValueTypeMismatch,
-                "input_value_type_mismatch",
-            ),
-            (
-                InputPreparationFailureKind::SourceUnavailable,
-                "input_source_unavailable",
-            ),
-            (
-                InputPreparationFailureKind::StagingUnavailable,
-                "input_staging_unavailable",
-            ),
-            (
-                InputPreparationFailureKind::LiveLimitExceeded,
-                "input_live_limit_exceeded",
-            ),
-        ] {
-            assert_eq!(input_preparation_failure(kind), expected);
-            assert_encoded_evidence("start", expected, None, None);
-        }
-        for (kind, expected) in [
-            (CaptureFailureKind::AbsolutePath, "output_absolute_path"),
-            (CaptureFailureKind::LexicalEscape, "output_lexical_escape"),
-            (CaptureFailureKind::EmptyPath, "output_empty_path"),
-            (CaptureFailureKind::Missing, "output_missing"),
-            (CaptureFailureKind::SymbolicLink, "output_symbolic_link"),
-            (CaptureFailureKind::NotDirectory, "output_not_directory"),
-            (
-                CaptureFailureKind::NotRegularFile,
-                "output_not_regular_file",
-            ),
-            (
-                CaptureFailureKind::SourceUnavailable,
-                "output_source_unavailable",
-            ),
-            (
-                CaptureFailureKind::FileCountLimitExceeded,
-                "output_file_count_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::FileSizeLimitExceeded,
-                "output_file_size_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::TotalSizeLimitExceeded,
-                "output_total_size_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::GitCarrierCountLimitExceeded,
-                "output_git_carrier_count_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::GitCarrierSizeLimitExceeded,
-                "output_git_carrier_size_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::TotalGitCarrierSizeLimitExceeded,
-                "output_total_git_carrier_size_limit_exceeded",
-            ),
-            (
-                CaptureFailureKind::CarrierProducerUnavailable,
-                "output_carrier_producer_unavailable",
-            ),
-            (
-                CaptureFailureKind::StagingUnavailable,
-                "output_staging_unavailable",
-            ),
-        ] {
-            assert_eq!(capture_failure(kind), expected);
-            assert_encoded_evidence("output_capture", expected, None, Some("value"));
-        }
-        for (failure, expected) in [
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::ExecutionRootRebound,
-                "output_git_execution_root_rebound",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::HeadUnavailable,
-                "output_git_head_unavailable",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::BaselineNotAncestor,
-                "output_git_baseline_not_ancestor",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::CleanlinessUnavailable,
-                "output_git_cleanliness_unavailable",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::WorkspaceDirty,
-                "output_git_workspace_dirty",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::TreeUnavailable,
-                "output_git_tree_unavailable",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::RequiredObjectsUnavailable,
-                "output_git_required_objects_unavailable",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::SourceAuthorityChanged,
-                "output_git_source_authority_changed",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::GitStructureLimitExceeded,
-                "output_git_structure_limit_exceeded",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::BundleGenerationFailed,
-                "output_git_bundle_generation_failed",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::BundleProfileInvalid,
-                "output_git_bundle_profile_invalid",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::BundleVerificationFailed,
-                "output_git_bundle_verification_failed",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::WorkspaceChanged,
-                "output_git_workspace_changed",
-            ),
-            (
-                crate::execution::workflow::git_capture::GitCaptureFailure::TemporaryStorageUnavailable,
-                "output_git_temporary_storage_unavailable",
-            ),
-        ] {
-            let failure = OutputCaptureFailure::Git {
-                output: "branch".to_owned(),
-                failure,
-            };
-            assert_projection(
-                FailurePhase::OutputCapture,
-                StepFailureCause::OutputCapture(failure),
-                "output_capture",
-                expected,
-                None,
-            );
-        }
-        assert_encoded_evidence(
-            "output_capture",
-            "output_git_command_timed_out",
-            None,
-            Some("branch"),
-        );
-    }
-
-    fn assert_agent_protocol_rejection_evidence(failure: AgentFailure) -> Value {
-        let expected = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-        let evidence = failure_evidence(
-            FailurePhase::Execution,
-            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
-        );
-        assert_eq!(evidence["cause"], "agent_harness_protocol_failed");
-        assert_eq!(evidence["protocolRejection"], expected);
-        expected
-    }
-
-    #[test]
-    fn runner_failure_evidence_carries_the_agent_protocol_rejection() {
-        let mut parser =
-            PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
-        let frames = concat!(
-            "{\"type\":\"session\",\"version\":3,",
-            "\"id\":\"00000000-0000-4000-8000-00000000000d\",",
-            "\"timestamp\":\"2026-07-30T12:00:00Z\",",
-            "\"cwd\":\"/execution/worktree\"}\n",
-            "{\"type\":\"agent_start\"}\n",
-            "{\"type\":\"agent_start\"}\n",
-        );
-        assert!(parser.push_stdout(frames.as_bytes(), drop).is_err());
-        let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
-        else {
-            panic!("invalid agent lifecycle must fail");
-        };
-        assert_agent_protocol_rejection_evidence(failure);
-    }
-
-    #[test]
-    fn runner_failure_evidence_carries_the_claude_protocol_rejection() {
-        let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
-            Arc::from("/execution/worktree"),
-            Arc::from("scherzo-loopback"),
-            Arc::from("00000000-0000-4000-8000-000000000001"),
-            Arc::from("2.1.241"),
-            AgentValueKind::None,
-            NonZeroU64::new(1024).unwrap(),
-        );
-        let initialization = concat!(
-            "{\"type\":\"system\",\"subtype\":\"init\",",
-            "\"cwd\":\"/execution/worktree\",",
-            "\"session_id\":\"00000000-0000-4000-8000-000000000001\",",
-            "\"model\":\"scherzo-loopback\",",
-            "\"permissionMode\":\"bypassPermissions\",",
-            "\"claude_code_version\":\"2.1.241\"}\n",
-        );
-        parser.push_stdout(initialization.as_bytes(), drop).unwrap();
-        let AgentOutcome::Failed(failure) = parser.finish(true) else {
-            panic!("incomplete Claude exchange must fail");
-        };
-        let expected = assert_agent_protocol_rejection_evidence(failure);
-        serde_json::from_value::<
-            crate::runner_protocol::generated::AgentProtocolRejectionDiagnostic,
-        >(expected.clone())
-        .unwrap();
-        assert_eq!(
-            expected["detail"]["reason"],
-            "end_of_stream_invariant_invalid"
-        );
-    }
-
-    #[test]
-    fn runner_failure_evidence_accepts_revised_pi_rejection() {
-        let events = [
-            json!({"type": "session", "version": 3, "id": "00000000-0000-4000-8000-00000000000d", "timestamp": "2026-07-30T12:00:00Z", "cwd": "/execution/worktree"}),
-            json!({"type": "agent_start"}),
-            json!({"type": "agent_start"}),
-        ];
-        let mut parser =
-            PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
-        for event in events {
-            let mut frame = serde_json::to_vec(&event).unwrap();
-            frame.push(b'\n');
-            if parser.push_stdout(&frame, drop).is_err() {
-                break;
-            }
-        }
-        let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
-        else {
-            panic!("contradictory agent lifecycle must fail");
-        };
-        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-        assert_eq!(rejection["detail"]["reason"], "event_transition_invalid");
-        assert_eq!(
-            rejection["detail"]["state"],
-            json!({
-                "sessionHeaderSeen": true,
-                "agentStarted": true,
-                "terminalCandidateRetained": false,
-                "resultAccepted": false,
-                "settled": false
-            })
-        );
-
-        let evidence = failure_evidence(
-            FailurePhase::Execution,
-            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure.clone())),
-        );
-        let terminal = workflow_failure(&StepFailure {
-            role: WorkflowNodeRole::Step,
-            step: "step".to_owned(),
-            phase: FailurePhase::Execution,
-            cause: StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
-        });
-
-        assert_encoded_evidence_value("execution", evidence, terminal);
-    }
-
-    fn agent_failures() -> Vec<(AgentFailureCause, &'static str)> {
-        vec![
-            (
-                AgentFailureCause::HarnessStartFailed,
-                "agent_harness_start_failed",
-            ),
-            (
-                AgentFailureCause::HarnessInputTooLarge {
-                    input: AgentInputKind::SystemPrompt,
-                    admitted_bytes: NonZeroU64::new(1).unwrap(),
-                    observed_bytes: 2,
-                },
-                "agent_system_prompt_too_large",
-            ),
-            (
-                AgentFailureCause::HarnessInputTooLarge {
-                    input: AgentInputKind::Message,
-                    admitted_bytes: NonZeroU64::new(1).unwrap(),
-                    observed_bytes: 2,
-                },
-                "agent_message_too_large",
-            ),
-            (
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelOutputTruncated,
-                },
-                "agent_harness_model_output_truncated",
-            ),
-            (
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::UnexpectedTerminalToolUse,
-                },
-                "agent_harness_unexpected_terminal_tool_use",
-            ),
-            (
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelError,
-                },
-                "agent_harness_model_error",
-            ),
-            (
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelAborted,
-                },
-                "agent_harness_model_aborted",
-            ),
-            (
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-                },
-                "agent_harness_unsuccessful_exit",
-            ),
-            (
-                AgentFailureCause::HarnessProtocolFailed,
-                "agent_harness_protocol_failed",
-            ),
-            (AgentFailureCause::MissingResponse, "agent_missing_response"),
-            (AgentFailureCause::MissingResult, "agent_missing_result"),
-            (
-                AgentFailureCause::ResultValidationLimitExceeded {
-                    deadline: PositiveDuration::new(Duration::from_secs(1)).unwrap(),
-                },
-                "agent_result_validation_limit_exceeded",
-            ),
-            (
-                AgentFailureCause::CapturedValueTooLarge,
-                "agent_captured_value_too_large",
-            ),
-            (
-                AgentFailureCause::ResultSettlementFailed,
-                "agent_result_settlement_failed",
-            ),
-        ]
-    }
-
-    fn assert_projection(
-        phase: FailurePhase,
-        cause: StepFailureCause,
-        expected_phase: &str,
-        expected_cause: &str,
-        exit_code: Option<i32>,
-    ) {
-        let evidence = failure_evidence(phase, &cause);
-        let mut expected = failure_value(expected_phase, expected_cause, exit_code, None);
-        let output = match &cause {
-            StepFailureCause::OutputCapture(OutputCaptureFailure::Capture(failure)) => {
-                Some(failure.output_identity())
-            }
-            StepFailureCause::OutputCapture(OutputCaptureFailure::Git { output, .. }) => {
-                Some(output.as_str())
-            }
-            StepFailureCause::Start(_)
-            | StepFailureCause::Execution(_)
-            | StepFailureCause::OutputCapture(
-                OutputCaptureFailure::StepUnavailable
-                | OutputCaptureFailure::UnsupportedOutput
-                | OutputCaptureFailure::TaskUnavailable,
-            )
-            | StepFailureCause::RecoveryHandler(_) => None,
-        };
-        if let Some(output) = output {
-            expected["output"] = Value::String(output.to_owned());
-        }
-        assert_eq!(evidence, expected);
-        let failure = StepFailure {
-            role: WorkflowNodeRole::Step,
-            step: "step".to_owned(),
-            phase,
-            cause,
-        };
-        assert_encoded_evidence_value(expected_phase, evidence, workflow_failure(&failure));
-    }
-
-    fn assert_encoded_evidence(
-        phase: &str,
-        cause: &str,
-        exit_code: Option<i32>,
-        output: Option<&str>,
-    ) {
-        let mut evidence = failure_value(phase, cause, exit_code, None);
-        if let Some(output) = output {
-            evidence["output"] = Value::String(output.to_owned());
-        }
-        let terminal = json!({
-            "node": { "id": "step", "role": "step" },
-            "failure": evidence.clone(),
-        });
-        assert_encoded_evidence_value(phase, evidence, terminal);
-    }
-
-    fn assert_encoded_evidence_value(phase: &str, evidence: Value, terminal: Value) {
-        let from = match phase {
-            "start" => "starting",
-            "execution" => "running",
-            "output_capture" => "capturing_outputs",
-            _ => unreachable!(),
-        };
-        let observations = [
-            AssignmentObservation::Execution {
-                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                report: ExecutionReport::Transition {
-                    execution_event_sequence: 1,
-                    workflow_event: json!({
-                        "eventVersion": 1,
-                        "eventType": "step_state_changed",
-                        "transitionSequence": 1,
-                        "stepId": "step",
-                        "role": "step",
-                        "failurePolicy": "required",
-                        "from": from,
-                        "to": "failed",
-                        "failure": evidence,
-                    }),
-                },
-            },
-            AssignmentObservation::Execution {
-                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                report: ExecutionReport::Finished {
-                    final_execution_event_sequence: 1,
-                    outcome: json!({
-                        "outcome": "failed",
-                        "failure": terminal,
-                    }),
-                    artifact_delivery: json!({
-                        "outcome": "prepared",
-                        "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
-                    }),
-                },
-            },
-        ];
-        for (index, observation) in observations.into_iter().enumerate() {
-            let frame = observation.runner_frame(RunnerEnvelope {
-                message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                sequence: u64::try_from(index + 1).unwrap(),
-                sent_at: "2026-07-23T00:00:00Z".to_owned(),
-            });
-            encode_runner_frame(&frame).expect("mapped failure must satisfy the runner protocol");
-        }
     }
 }

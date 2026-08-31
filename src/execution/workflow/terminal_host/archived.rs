@@ -7,8 +7,9 @@ use crate::execution::workflow::archived_attempt::{
 };
 use crate::execution::workflow::archived_presentation::{
     archived_cancellation_reason, archived_failure_detail, archived_finalization_trigger,
-    safe_path, safe_text,
+    blocked_detail, safe_path, safe_text,
 };
+use crate::execution::workflow::evidence::{NodeDetail, PrimaryIssueDetail};
 use crate::execution::workflow::presentation_feed::{
     NormalizedRetainedRecord, normalize_retained_prefix, normalize_terminal_shell_argument,
 };
@@ -321,7 +322,6 @@ impl ArchivedTerminalView {
                 trigger: Some(archived_finalization_trigger(finalization.trigger)),
             });
         let mut definitions = attempt.workflow.steps;
-        let expected_step_count = attempt.steps.len();
         let steps = attempt
             .steps
             .into_iter()
@@ -330,7 +330,6 @@ impl ArchivedTerminalView {
                 Some(ArchivedTerminalStepView::new(step, definition))
             })
             .collect::<Vec<_>>();
-        debug_assert_eq!(steps.len(), expected_step_count);
         Self {
             summary,
             steps,
@@ -438,29 +437,23 @@ impl StepProjection for ArchivedTerminalStepView {
                         .map(|_| self.with_recovery_detail(String::new())),
                 }
             }
-            ArchivedStepDetail::Failed(failure) => {
+            ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
                 Some(self.with_recovery_detail(issue_detail_for_step(
                     archived_failure_detail(failure),
                     &self.definition,
                     self.state,
                 )))
             }
-            ArchivedStepDetail::Blocked { dependency } => Some(issue_detail_for_step(
-                format!("blocked by {}", safe_text(dependency)),
-                &self.definition,
-                self.state,
-            )),
-            ArchivedStepDetail::InputUnavailable { references } => Some(issue_detail_for_step(
-                format!("inputs unavailable: {}", references.join(", ")),
-                &self.definition,
-                self.state,
-            )),
-            ArchivedStepDetail::NotRun => Some("failure_stop".to_owned()),
-            ArchivedStepDetail::TriggerNotSelected => {
-                Some("finalizer_trigger_not_selected".to_owned())
-            }
-            ArchivedStepDetail::Cancelled { reason } => {
-                Some(self.with_recovery_detail(archived_cancellation_reason(*reason).to_owned()))
+            ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail)) => Some(
+                issue_detail_for_step(blocked_detail(detail), &self.definition, self.state),
+            ),
+            ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => Some(
+                crate::execution::workflow::presentation::snake_case_debug(detail.code),
+            ),
+            ArchivedStepDetail::Evidence(NodeDetail::Cancellation(detail)) => {
+                Some(self.with_recovery_detail(
+                    crate::execution::workflow::presentation::snake_case_debug(detail.code),
+                ))
             }
         }
     }
@@ -494,34 +487,28 @@ impl StepProjection for ArchivedTerminalStepView {
                 output_count_detail(self.definition.outputs().len()),
                 Tone::Success,
             )),
-            ArchivedStepDetail::Failed(failure) => Some(InspectorField::new(
+            ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => Some(InspectorField::new(
                 "failure",
                 archived_failure_detail(failure),
                 Tone::Failure,
             )),
-            ArchivedStepDetail::Blocked { dependency } => Some(InspectorField::new(
-                "blocked by",
-                safe_text(dependency),
+            ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail)) => Some(InspectorField::new(
+                "prerequisites",
+                blocked_detail(detail),
                 Tone::Blocked,
             )),
-            ArchivedStepDetail::InputUnavailable { references } => Some(InspectorField::new(
-                "inputs unavailable",
-                references.join(", "),
-                Tone::Blocked,
-            )),
-            ArchivedStepDetail::NotRun => {
-                Some(InspectorField::new("not run", "failure_stop", Tone::Muted))
-            }
-            ArchivedStepDetail::TriggerNotSelected => Some(InspectorField::new(
+            ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => Some(InspectorField::new(
                 "not run",
-                "finalizer_trigger_not_selected",
+                crate::execution::workflow::presentation::snake_case_debug(detail.code),
                 Tone::Muted,
             )),
-            ArchivedStepDetail::Cancelled { reason } => Some(InspectorField::new(
-                "cancellation",
-                archived_cancellation_reason(*reason),
-                Tone::Blocked,
-            )),
+            ArchivedStepDetail::Evidence(NodeDetail::Cancellation(detail)) => {
+                Some(InspectorField::new(
+                    "cancellation",
+                    crate::execution::workflow::presentation::snake_case_debug(detail.code),
+                    Tone::Blocked,
+                ))
+            }
         }
     }
 
@@ -547,7 +534,9 @@ impl ArchivedTerminalStepView {
             return base;
         };
         let terminal_failure = match &self.detail {
-            ArchivedStepDetail::Failed(failure) => Some(archived_failure_detail(failure)),
+            ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
+                Some(archived_failure_detail(failure))
+            }
             _ => None,
         };
         let termination = super::super::presentation::terminal_recovery_detail(
@@ -647,17 +636,22 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
             tone: Tone::Muted,
         },
     ];
-    if let Some(primary) = &attempt.primary_failure {
+    if let Some(primary) = &attempt.primary_issue {
+        let detail = match &primary.detail {
+            PrimaryIssueDetail::Failed(detail) => archived_failure_detail(detail),
+            PrimaryIssueDetail::Blocked(detail) => blocked_detail(detail),
+        };
         lines.push(ArchivedSummaryLine {
             text: format!(
-                "primary failure {} {} · {}",
-                match primary.role {
+                "primary issue {} {} · {:?} · {}",
+                match primary.node.role {
                     crate::execution::workflow::validated::WorkflowNodeRole::Step => "step",
                     crate::execution::workflow::validated::WorkflowNodeRole::Finalizer =>
                         "finalizer",
                 },
-                safe_text(&primary.step),
-                archived_failure_detail(&primary.failure)
+                safe_text(&primary.node.id),
+                primary.state,
+                detail,
             ),
             tone: Tone::Failure,
         });
@@ -1462,11 +1456,13 @@ mod tests {
     use super::*;
     use crate::execution::workflow::archived_attempt::{
         ArchivedAttemptState, ArchivedAttemptTrigger, ArchivedCommandOutput, ArchivedExecution,
-        ArchivedFailure, ArchivedFailureCause, ArchivedFailurePhase, ArchivedPrimaryFailure,
+        ArchivedFailure,
     };
     use crate::execution::workflow::document::Output;
+    use crate::execution::workflow::evidence::{
+        FailureCode, FailureDetail, FailurePhase, NodeDetail, PrimaryIssue,
+    };
     use crate::execution::workflow::presentation_feed::WorkflowPresentationDefinition;
-    use crate::execution::workflow::publication::FailureCodeV1;
     use crate::execution::workflow::resolution::{ContentDigestAlgorithm, WorkflowContentDigest};
     use crate::execution::workflow::validated::WorkflowNodeRole;
 
@@ -1486,7 +1482,7 @@ mod tests {
             "result /tmp/archive-run/attempts/0002/r",
             "created 2026-08-06 12:00:00Z",
             "execution 2026-08-06 12:00:01Z → 2026-08-06 12:00:04Z · 3.0s",
-            "primary failure step verify · execution · command_exit · exit 17",
+            "primary issue step verify · Failed · execution · command_exit · exit 17",
             "▏ ✓ prepare",
             "× verify",
             "prepare   cmd",
@@ -1864,16 +1860,15 @@ mod tests {
 
     fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchivedAttempt {
         let started = timestamp("2026-08-06T12:00:01Z");
-        let failure = ArchivedFailure {
-            phase: ArchivedFailurePhase::Execution,
-            cause: ArchivedFailureCause {
-                code: FailureCodeV1::CommandExit,
-                input: None,
-                collection_index: None,
-                output: None,
-                exit_code: Some(17),
-            },
-        };
+        let failure: ArchivedFailure = FailureDetail::new(
+            FailurePhase::Execution,
+            FailureCode::CommandExit,
+            None,
+            None,
+            None,
+            Some(17),
+        )
+        .unwrap();
         let prepare_definition = WorkflowPresentationStep::Command {
             argv: vec![
                 "printf".to_owned(),
@@ -1935,11 +1930,13 @@ mod tests {
                 duration: Duration::from_secs(3),
             },
             outcome: ArchivedWorkflowOutcome::Failed,
-            primary_failure: Some(ArchivedPrimaryFailure {
-                step: "verify".to_owned(),
-                role: WorkflowNodeRole::Step,
-                failure: failure.clone(),
-            }),
+            primary_issue: Some(PrimaryIssue::failed(
+                crate::execution::workflow::validated::WorkflowNode {
+                    id: "verify".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                },
+                failure.clone(),
+            )),
             cancellation: None,
             finalization: None,
             steps: vec![
@@ -1962,7 +1959,7 @@ mod tests {
                     state: ArchivedStepState::Failed,
                     started_at: Some(started + Duration::from_secs(1)),
                     duration: Some(Duration::from_secs(2)),
-                    detail: ArchivedStepDetail::Failed(failure),
+                    detail: ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)),
                     command_output: None,
                     recovery: None,
                     invocations: Vec::new(),

@@ -130,7 +130,7 @@ impl ArtifactSet {
             .unwrap()
             .remove("executionRoot");
         result["execution"]["capacity"] = json!({
-            "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+            "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
             "sourceClosureDigest": { "algorithm": "sha256", "value": "1".repeat(64) },
             "generalMaximumTransitions": 8,
             "selectedMaximumTransitions": 7,
@@ -139,7 +139,7 @@ impl ArtifactSet {
             "diagnosticRetentionBytes": 8_388_608,
             "nativeSessionRetentionBytes": 4_194_304,
             "aggregateRetentionBytes": 12_582_912,
-            "encodedOutboxBytes": 38_141_952
+            "encodedOutboxBytes": 85_458_944
         });
         self.replace_result(&result);
     }

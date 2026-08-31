@@ -14,17 +14,6 @@
     "finalExecutionEventSequence": 6,
     "outcome": {
       "outcome": "failed",
-      "failure": {
-        "node": {
-          "id": "verify",
-          "role": "step"
-        },
-        "failure": {
-          "phase": "execution",
-          "cause": "command_unsuccessful_exit",
-          "exitCode": 1
-        }
-      },
       "recoverySummaries": {
         "verify": {
           "schemaVersion": 1,
@@ -49,6 +38,18 @@
             "kind": "exhausted",
             "executionNumber": 2
           }
+        }
+      },
+      "primaryIssue": {
+        "node": {
+          "id": "verify",
+          "role": "step"
+        },
+        "state": "failed",
+        "detail": {
+          "phase": "execution",
+          "code": "command_exit",
+          "exitCode": 1
         }
       }
     },

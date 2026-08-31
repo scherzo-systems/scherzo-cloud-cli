@@ -16,7 +16,10 @@ use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
-use super::adapter::{ClaudeCodeStreamJsonV1Adapter, native_project_slug, prepare_launch};
+use super::adapter::{
+    ClaudeCodeStreamJsonV1Adapter, NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC,
+    native_project_slug, prepare_launch,
+};
 use super::test_support::{
     FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
 };
@@ -815,12 +818,12 @@ fn result_exchange_transcript(
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": "Structured output provided successfully",
+                        "content": "structurally correlated acknowledgement",
                     }],
                 },
                 "parent_tool_use_id": null,
                 "session_id": SESSION,
-                "tool_use_result": "Structured output provided successfully",
+                "tool_use_result": "structurally correlated acknowledgement",
             }));
         }
         let next_index = fixture.structured_tool_count;
@@ -1551,7 +1554,7 @@ async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_resu
             run_result_fixture(post_work, PendingClock, InlineValidationWorker).await;
         assert_agent_failure(&post_work_outcome, AgentFailureCause::HarnessProtocolFailed);
         let AgentOutcome::Failed(post_work_failure) = post_work_outcome else {
-            unreachable!();
+            panic!("fixture outcome was not failed");
         };
         let rejection =
             serde_json::to_value(post_work_failure.protocol_rejection().unwrap()).unwrap();
@@ -1786,6 +1789,64 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
 }
 
 #[tokio::test]
+async fn a_scripted_harness_that_writes_nowhere_emits_the_named_capture_diagnostic() {
+    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+    let session = fixture.session_id.to_string();
+    let script = production_transcript_script(
+        &[json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "completed",
+            "result": "terminal convenience text",
+            "session_id": session,
+        })],
+        false,
+        0,
+        &session,
+    );
+    std::fs::write(
+        fixture.invocation.as_ref().unwrap().adapter().executable(),
+        script,
+    )
+    .unwrap();
+
+    let (fixture, outcome) = run_fixture(fixture).await;
+    assert_eq!(
+        outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+    assert!(!fixture.native_session.join("transcript.jsonl").exists());
+    let observations = fixture.observations.snapshot();
+    let quiescent = observations
+        .iter()
+        .position(|observation| {
+            matches!(
+                observation.observation(),
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::HarnessQuiescent,
+                }
+            )
+        })
+        .unwrap();
+    let diagnostic = observations
+        .iter()
+        .position(|observation| {
+            matches!(
+                observation.observation(),
+                AgentObservation::Diagnostic {
+                    level: AgentDiagnosticLevel::Warning,
+                    message,
+                } if message
+                    .strip_prefix(NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC)
+                    .is_some_and(|detail| detail.starts_with(":"))
+            )
+        })
+        .unwrap();
+    assert!(diagnostic > quiescent);
+}
+
+#[tokio::test]
 async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     enum Transcript {
         Malformed,
@@ -1933,7 +1994,7 @@ async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_meta
     assert!(started);
     assert_agent_failure(&outcome, AgentFailureCause::HarnessProtocolFailed);
     let AgentOutcome::Failed(failure) = &outcome else {
-        unreachable!();
+        panic!("fixture outcome was not failed");
     };
     let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
     assert_eq!(surfaced["profile"], "ClaudeCodeStreamJsonV1");

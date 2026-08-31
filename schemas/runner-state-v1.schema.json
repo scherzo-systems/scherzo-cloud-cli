@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.scherzo.dev/runner-state-v1.schema.json",
+  "title": "Scherzo Protected Runner State V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runnerId", "connectionUrl", "currentCredential", "updatedAt"],
+  "$defs": {
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "secret", "activationId", "enrolledAt"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "secret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "activationId": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "enrolledAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credentialId", "activationId", "promotedAt"],
+      "properties": {
+        "credentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "activationId": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "promotedAt": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "runnerId": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+    "connectionUrl": { "type": "string", "format": "uri", "pattern": "^wss?://[^#]+/v1/runner/connect$" },
+    "currentCredential": { "$ref": "#/$defs/credential" },
+    "pendingCredential": { "$ref": "#/$defs/credential" },
+    "lastPromotion": { "$ref": "#/$defs/promotion" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  }
+}

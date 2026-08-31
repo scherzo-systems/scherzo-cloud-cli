@@ -19,9 +19,10 @@ use super::connection::{
 use super::test_support::{
     ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection, ScriptedConnector,
     ScriptedInbound, ScriptedReader, ScriptedWriter, SleepRelease, assignment_offer,
-    controlled_shutdown, controlled_sleeper_with_transcript, deterministic_frame_source,
-    effect_observation_acknowledgement, fixture_lease_clock, observation_acknowledgement,
-    scripted_connector, scripted_duplex, sleep_request, welcome, with_watchdog,
+    assignment_prepare, controlled_shutdown, controlled_sleeper_with_transcript,
+    deterministic_frame_source, effect_observation_acknowledgement, fixture_lease_clock,
+    observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
+    with_watchdog,
 };
 use super::workspace::{
     CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
@@ -40,6 +41,7 @@ const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
 const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
 const EFFECT_ID: &str = "eff_01k0z6r1w8f4jy2m7q9v3x5abg";
+const PREPARE_EFFECT_ID: &str = "eff_01k0z6r1w8f4jy2m7q9v3x5abh";
 
 #[tokio::test]
 async fn established_connection_has_a_deterministic_transcript() {
@@ -243,6 +245,31 @@ async fn offer_rejected_assignment(
         decode_text(&effect_acknowledgement, "effect acknowledgement")["type"],
         "effect_acknowledged"
     );
+    let preparing = next_outbound(&mut connection.outbound).await;
+    assert_eq!(
+        decode_text(&preparing, "assignment preparation acknowledgement")["type"],
+        "assignment_preparing"
+    );
+    connection.inbound.send(assignment_prepare());
+    let prepare_acknowledgement = next_outbound(&mut connection.outbound).await;
+    assert_eq!(
+        decode_text(&prepare_acknowledgement, "prepare effect acknowledgement")["type"],
+        "effect_acknowledged"
+    );
+    for (preparation_sequence, phase) in [
+        (1, "source_materialization"),
+        (2, "input_download"),
+        (3, "workflow_admission"),
+    ] {
+        let progress = next_outbound(&mut connection.outbound).await;
+        let progress = decode_text(&progress, "assignment preparation progress");
+        assert_eq!(progress["type"], "assignment_preparation_progress");
+        assert_eq!(
+            progress["payload"]["preparationSequence"],
+            preparation_sequence
+        );
+        assert_eq!(progress["payload"]["phase"], phase);
+    }
     let rejection = next_outbound(&mut connection.outbound).await;
     assert_eq!(
         decode_text(&rejection, "assignment rejection")["type"],
@@ -428,10 +455,70 @@ async fn run_assignment_scenario() -> Vec<String> {
             acknowledgement_message_id,
             2,
         ));
+        let preparing = next_outbound(&mut fixture.outbound).await;
+        let preparing = decode_text(&preparing, "assignment preparation acknowledgement");
+        assert_eq!(preparing["type"], "assignment_preparing");
+        assert_eq!(preparing["sequence"], 3);
+        let preparing_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture.inbound.send(effect_observation_acknowledgement(
+            preparing["messageId"]
+                .as_str()
+                .expect("assignment preparation acknowledgement message ID"),
+            3,
+        ));
+
+        let prepare_effect_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture.inbound.send(assignment_prepare());
+        let prepare_acknowledgement = next_outbound(&mut fixture.outbound).await;
+        let prepare_acknowledgement =
+            decode_text(&prepare_acknowledgement, "prepare effect acknowledgement");
+        assert_eq!(prepare_acknowledgement["type"], "effect_acknowledged");
+        assert_eq!(prepare_acknowledgement["sequence"], 4);
+        assert_eq!(
+            prepare_acknowledgement["payload"]["effectId"],
+            PREPARE_EFFECT_ID
+        );
+        let prepare_acknowledgement_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture.inbound.send(effect_observation_acknowledgement(
+            prepare_acknowledgement["messageId"]
+                .as_str()
+                .expect("prepare effect acknowledgement message ID"),
+            4,
+        ));
+
+        let mut progress_silence_timers = Vec::new();
+        for (sequence, preparation_sequence, phase) in [
+            (5, 1, "source_materialization"),
+            (6, 2, "input_download"),
+            (7, 3, "workflow_admission"),
+        ] {
+            let progress = next_outbound(&mut fixture.outbound).await;
+            let progress = decode_text(&progress, "assignment preparation progress");
+            assert_eq!(progress["type"], "assignment_preparation_progress");
+            assert_eq!(progress["sequence"], sequence);
+            assert_eq!(
+                progress["payload"]["preparationSequence"],
+                preparation_sequence
+            );
+            assert_eq!(progress["payload"]["phase"], phase);
+            let progress_silence_timer =
+                sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+            fixture.inbound.send(effect_observation_acknowledgement(
+                progress["messageId"]
+                    .as_str()
+                    .expect("assignment preparation progress message ID"),
+                sequence,
+            ));
+            progress_silence_timers.push(progress_silence_timer);
+        }
+
         let semantic = next_outbound(&mut fixture.outbound).await;
         let semantic = decode_text(&semantic, "semantic assignment response");
         assert_eq!(semantic["type"], "assignment_rejected");
-        assert_eq!(semantic["sequence"], 3);
+        assert_eq!(semantic["sequence"], 8);
         assert_eq!(
             semantic["payload"]["decline"]["reason"],
             "workflow_source_invalid"
@@ -442,7 +529,7 @@ async fn run_assignment_scenario() -> Vec<String> {
             semantic["messageId"]
                 .as_str()
                 .expect("semantic assignment response message ID"),
-            3,
+            8,
         ));
         let stress_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
@@ -464,6 +551,10 @@ async fn run_assignment_scenario() -> Vec<String> {
         drop(first_silence_timer);
         drop(second_silence_timer);
         drop(assignment_silence_timer);
+        drop(preparing_silence_timer);
+        drop(prepare_effect_silence_timer);
+        drop(prepare_acknowledgement_silence_timer);
+        drop(progress_silence_timers);
         drop(semantic_silence_timer);
         drop(final_silence_timer);
     };
@@ -472,7 +563,7 @@ async fn run_assignment_scenario() -> Vec<String> {
     let outcome = outcome.expect("run deterministic established connection");
     assert!(outcome.opening_acknowledged);
     assert!(outcome.handshake_completed);
-    assert_eq!(next_sequence, 4);
+    assert_eq!(next_sequence, 9);
     transcript.record(
         "scenario.outcome:gateway-close:opening_acknowledged=true:handshake_completed=true"
             .to_owned(),
@@ -672,9 +763,34 @@ async fn run_reconnect_scenario() -> Vec<String> {
             5,
         );
         complete_handshake(&sixth, &mut sleep_requests, &sixth_hello).await;
-        let replayed_rejection = next_outbound(&mut sixth.outbound).await;
+        let replayed_preparing = next_outbound(&mut sixth.outbound).await;
         assert_eq!(
-            decode_text(&replayed_rejection, "shutdown rejection replay")["type"],
+            decode_text(&replayed_preparing, "preparation replay after reconnect")["type"],
+            "assignment_preparing"
+        );
+        sixth.inbound.send(assignment_prepare());
+        let prepare_acknowledgement = next_outbound(&mut sixth.outbound).await;
+        assert_eq!(
+            decode_text(&prepare_acknowledgement, "prepare effect acknowledgement")["type"],
+            "effect_acknowledged"
+        );
+        for (preparation_sequence, phase) in [
+            (1, "source_materialization"),
+            (2, "input_download"),
+            (3, "workflow_admission"),
+        ] {
+            let progress = next_outbound(&mut sixth.outbound).await;
+            let progress = decode_text(&progress, "assignment preparation progress");
+            assert_eq!(progress["type"], "assignment_preparation_progress");
+            assert_eq!(
+                progress["payload"]["preparationSequence"],
+                preparation_sequence
+            );
+            assert_eq!(progress["payload"]["phase"], phase);
+        }
+        let rejection = next_outbound(&mut sixth.outbound).await;
+        assert_eq!(
+            decode_text(&rejection, "shutdown preparation rejection")["type"],
             "assignment_rejected"
         );
         service_finished

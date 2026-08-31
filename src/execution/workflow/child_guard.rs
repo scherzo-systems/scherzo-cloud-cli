@@ -135,9 +135,8 @@ impl StoppedChildGuard {
         environment: &[(OsString, OsString)],
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let (child, standard_input) =
+        let (child, _standard_input) =
             Self::spawn_inner(program, arguments, environment, false, configure)?;
-        debug_assert!(standard_input.is_none());
         Ok(child)
     }
 

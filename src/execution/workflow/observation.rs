@@ -1,13 +1,12 @@
 use std::future::{Future, ready};
 use std::sync::Arc;
 
-use super::admission::CancellationReason;
 use super::agent::AgentObservationEnvelope;
+use super::evidence::{BlockedDetail, CancellationDetail, FailureDetail, NonExecutionDetail};
 use super::runtime::{
-    ActionId, ActiveStepInvocation, FailurePhase, NotRunReason, RecoveryDecisionKind,
-    RecoveryHandlerActivity, RecoveryHandlerKind, TransitionEvent,
+    ActionId, ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity,
+    RecoveryHandlerKind, TransitionEvent,
 };
-use super::step_runtime::StepFailureCause;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandOutputSource {
@@ -64,29 +63,25 @@ pub(crate) enum ObservedStepTransition {
         outputs: Vec<String>,
     },
     Failed {
-        phase: FailurePhase,
-        cause: StepFailureCause,
+        detail: FailureDetail,
     },
     Blocked {
-        dependency: String,
-    },
-    InputUnavailable {
-        references: Vec<String>,
+        detail: BlockedDetail,
     },
     NotRun {
-        reason: NotRunReason,
+        detail: NonExecutionDetail,
     },
     Cancelling {
-        reason: CancellationReason,
+        detail: CancellationDetail,
     },
     Cancelled {
-        reason: CancellationReason,
+        detail: CancellationDetail,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TransitionObservation<Deadline> {
-    pub(crate) event: TransitionEvent<StepFailureCause, Deadline>,
+    pub(crate) event: TransitionEvent<Deadline>,
     pub(crate) step: Option<ObservedStepTransition>,
 }
 

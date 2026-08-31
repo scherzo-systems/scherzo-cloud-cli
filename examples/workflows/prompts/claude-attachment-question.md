@@ -1,1 +1,1 @@
-Summarize the attached project brief in exactly two concise bullet points. Include the launch date, owner, and primary risk.
+Summarize the attached project brief and any update in exactly two concise bullet points. Include the launch date, owner, primary risk, and current mitigation status.

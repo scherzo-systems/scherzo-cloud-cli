@@ -53,7 +53,8 @@ const MAXIMUM_AGENT_RESULT_REJECTION_FEEDBACK_BYTES: u64 = 8 * 1024;
 const AGENT_RESULT_VALIDATION_DEADLINE: Duration = Duration::from_secs(60);
 const AGENT_RESULT_SETTLEMENT_GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CancellationReason {
     UserRequest,
     TerminationRequest,
@@ -464,11 +465,17 @@ async fn poll_watch_change<T: Clone>(
     .await
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ResolvedAttachment {
     media_type: Arc<str>,
     bytes: Arc<[u8]>,
     diagnostic_source_name: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for ResolvedAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedAttachment(<redacted>)")
+    }
 }
 
 impl ResolvedAttachment {
@@ -498,10 +505,16 @@ impl ResolvedAttachment {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct ResolvedImports {
     prompt: Option<Arc<str>>,
     attachments: Arc<[ResolvedAttachment]>,
+}
+
+impl std::fmt::Debug for ResolvedImports {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedImports(<redacted>)")
+    }
 }
 
 impl ResolvedImports {
@@ -769,7 +782,7 @@ impl WorkflowCapacityBudget {
             diagnostic_retention_bytes: 134_217_728,
             native_session_retention_bytes: 67_108_864,
             aggregate_retention_bytes: 201_326_592,
-            encoded_outbox_bytes: 105_185_280,
+            encoded_outbox_bytes: 353_632_256,
         }
     }
 
@@ -788,14 +801,14 @@ impl WorkflowCapacityBudget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkflowExecutionContract {
     General,
-    WorkflowV1InputlessCloudArtifactsV1,
+    WorkflowV1CloudInputsArtifactsV1,
 }
 
 impl WorkflowExecutionContract {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::General => "workflow_v1_general@1",
-            Self::WorkflowV1InputlessCloudArtifactsV1 => "workflow_v1_inputless_cloud_artifacts@1",
+            Self::WorkflowV1CloudInputsArtifactsV1 => "workflow_v1_cloud_inputs_artifacts@1",
         }
     }
 }
@@ -1131,6 +1144,11 @@ impl AdmittedWorkflow {
         &self.capacity
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_transition_ceiling(&mut self, maximum_transitions: u64) {
+        self.capacity.maximum_transitions = maximum_transitions;
+    }
+
     pub(crate) fn has_recovery(&self) -> bool {
         self.workflow
             .definition
@@ -1278,7 +1296,7 @@ pub(crate) fn admit_runner_workflow(
         workflow,
         imports,
         context,
-        WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1,
+        WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1,
     )
 }
 
@@ -1544,7 +1562,7 @@ fn admit_capacity(
             return Err(AdmissionFailure::new(kind, location));
         }
     }
-    if execution_contract == WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1
+    if execution_contract == WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1
         && budget.encoded_outbox_bytes < requirements.encoded_outbox_bytes
     {
         return Err(AdmissionFailure::new(
@@ -1554,7 +1572,7 @@ fn admit_capacity(
     }
     let maximum_transitions = match execution_contract {
         WorkflowExecutionContract::General => requirements.general_maximum_transitions,
-        WorkflowExecutionContract::WorkflowV1InputlessCloudArtifactsV1 => {
+        WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1 => {
             requirements.cloud_maximum_transitions
         }
     };
@@ -1759,24 +1777,15 @@ fn agent_invocation_limits<ProtocolLimits>(
 }
 
 fn positive_u64(value: u64) -> NonZeroU64 {
-    let Some(value) = NonZeroU64::new(value) else {
-        unreachable!("the fixed agent byte bounds are positive");
-    };
-    value
+    NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
 }
 
 fn positive_usize(value: usize) -> NonZeroUsize {
-    let Some(value) = NonZeroUsize::new(value) else {
-        unreachable!("the fixed agent count bounds are positive");
-    };
-    value
+    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
 }
 
 fn positive_duration(value: Duration) -> PositiveDuration {
-    let Some(value) = PositiveDuration::new(value) else {
-        unreachable!("the fixed agent duration bounds are positive");
-    };
-    value
+    PositiveDuration::new(value).unwrap_or(PositiveDuration::MIN)
 }
 
 fn canonical_execution_root(root: &Path) -> Result<AdmittedExecutionRoot, AdmissionFailure> {

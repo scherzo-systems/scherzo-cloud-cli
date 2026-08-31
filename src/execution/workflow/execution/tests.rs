@@ -37,6 +37,10 @@ use crate::execution::workflow::agent_input::AgentInputStaging;
 use crate::execution::workflow::artifact::{ArtifactReadFailure, ArtifactStaging};
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
+use crate::execution::workflow::evidence::{
+    BlockedDetail, CancellationDetail, FailureCode, NonExecutionCode, NonExecutionDetail,
+    Prerequisite,
+};
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::invocation_accounting::{InvocationAccountingLog, InvocationUsage};
 use crate::execution::workflow::observation::{
@@ -49,13 +53,9 @@ use crate::execution::workflow::recovery::{
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
-    ExportValue, FailurePhase, NotRunReason, RecoveryHandlerOutcome, StepState, StepStateKind,
-    TransitionEvent,
+    ExportValue, FailurePhase, RecoveryHandlerOutcome, StepState, StepStateKind, TransitionEvent,
 };
-use crate::execution::workflow::step_runtime::{
-    AgentExecution, CommandExecutionFailure, StepExecutionFailure, StepFailureCause,
-    StepStartFailure,
-};
+use crate::execution::workflow::step_runtime::{AgentExecution, StepFailureCause};
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
 const STDIN_FIXTURE_TEST_NAME: &str =
@@ -221,12 +221,9 @@ fn is_terminal_cancellation(observation: &ExecutionObservation<TestInstant>) -> 
     matches!(
         observation,
         ExecutionObservation::Transition(TransitionObservation {
-            event: TransitionEvent::Workflow {
-                to: WorkflowState::Cancelled { .. },
-                ..
-            },
+            event: TransitionEvent::Workflow { to, .. },
             ..
-        })
+        }) if matches!(to.as_ref(), WorkflowState::Cancelled { .. })
     )
 }
 
@@ -521,25 +518,15 @@ steps:
     kind: cmd
     recovery:
       retries: 1
-      handler:
-        kind: cmd
-        command:
-          argv:
-            - /bin/sh
-            - -c
-            - |
-              test ! -e artifact.txt
-              printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"restored generation precondition","reason":"rerun the complete target"}' > "$SCHERZO_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh
         - -c
         - |
-          printf x >> target-runs.txt
-          if test -f repaired.marker; then
+          if test -f target-runs.txt; then
             printf 'captured only from execution 2' > artifact.txt
           fi
+          printf x >> target-runs.txt
     outputs:
       artifact:
         kind: file
@@ -993,29 +980,31 @@ async fn failure_stops_new_work_but_retains_the_successful_sibling_output() {
         let result = execution.await.unwrap().unwrap();
         assert!(matches!(
             &result.steps["aFail"],
-            StepState::Failed {
-                phase: FailurePhase::Execution,
-                cause: StepFailureCause::Execution(StepExecutionFailure::Command(
-                    CommandExecutionFailure::UnsuccessfulExit { code: Some(23) }
-                )),
-            }
+            StepState::Failed { detail }
+                if detail.phase == FailurePhase::Execution
+                    && detail.code == FailureCode::CommandExit
+                    && detail.exit_code == Some(23)
         ));
         assert_eq!(
             result.steps["cFailChild"],
             StepState::Blocked {
-                dependency: "aFail".to_owned()
+                detail: BlockedDetail::new([Prerequisite::control("aFail").unwrap()]).unwrap(),
             }
         );
         assert_eq!(
             result.steps["zQueued"],
             StepState::NotRun {
-                reason: NotRunReason::FailureStop
+                detail: NonExecutionDetail::for_role(
+                    crate::execution::workflow::validated::WorkflowNodeRole::Step,
+                    NonExecutionCode::FailureStop,
+                )
+                .unwrap(),
             }
         );
         assert_eq!(
             result.steps["zzQueuedChild"],
             StepState::Blocked {
-                dependency: "zQueued".to_owned()
+                detail: BlockedDetail::new([Prerequisite::control("zQueued").unwrap()]).unwrap(),
             }
         );
         let ExportValue::Available { output } = &result.exports["retained"] else {
@@ -1090,13 +1079,13 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
         assert_eq!(
             result.steps["active"],
             StepState::Cancelled {
-                reason: CancellationReason::TerminationRequest
+                detail: CancellationDetail::new(CancellationReason::TerminationRequest),
             }
         );
         assert_eq!(
             result.steps["pending"],
             StepState::Cancelled {
-                reason: CancellationReason::TerminationRequest
+                detail: CancellationDetail::new(CancellationReason::TerminationRequest),
             }
         );
 
@@ -1203,13 +1192,15 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
                     to: StepStateKind::Cancelled,
                     ..
                 },
-                TransitionEvent::Workflow {
-                    to: WorkflowState::Cancelled {
+                TransitionEvent::Workflow { to, .. }
+            ] if *deadline == TestInstant(Duration::from_secs(1))
+                && step == "never"
+                && matches!(
+                    to.as_ref(),
+                    WorkflowState::Cancelled {
                         reason: CancellationReason::CallerOutputFailure
-                    },
-                    ..
-                }
-            ] if *deadline == TestInstant(Duration::from_secs(1)) && step == "never"
+                    }
+                )
         ));
     })
     .await;
@@ -2425,25 +2416,19 @@ exports:
         started.control().complete().await.unwrap();
 
         let result = execution.await.unwrap().unwrap();
-        let StepState::Failed {
-            phase: FailurePhase::OutputCapture,
-            cause:
-                StepFailureCause::OutputCapture(
-                    super::super::step_runtime::OutputCaptureFailure::Capture(failure),
-                ),
-        } = &result.steps["produce"]
-        else {
+        let StepState::Failed { detail } = &result.steps["produce"] else {
             panic!("agent producer did not report the exact capture failure");
         };
-        assert_eq!(failure.output_identity(), "missing");
-        assert_eq!(
-            failure.kind(),
-            crate::execution::workflow::artifact::CaptureFailureKind::Missing
-        );
+        assert_eq!(detail.phase, FailurePhase::OutputCapture);
+        assert_eq!(detail.code, FailureCode::OutputMissing);
+        assert_eq!(detail.output.as_deref(), Some("missing"));
         assert_eq!(
             result.steps["consume"],
             StepState::Blocked {
-                dependency: "produce".to_owned()
+                detail: BlockedDetail::new([
+                    Prerequisite::body("outputs.produce.response").unwrap()
+                ])
+                .unwrap(),
             }
         );
         assert!(matches!(
@@ -2791,13 +2776,13 @@ exports:
         assert_eq!(
             result.steps["zStopped"],
             StepState::Blocked {
-                dependency: "aFail".to_owned()
+                detail: BlockedDetail::new([Prerequisite::control("aFail").unwrap()]).unwrap(),
             }
         );
         assert_eq!(
             result.steps["cActive"],
             StepState::Cancelled {
-                reason: CancellationReason::RunnerShutdown
+                detail: CancellationDetail::new(CancellationReason::RunnerShutdown),
             }
         );
         assert!(matches!(
@@ -2906,13 +2891,13 @@ exports:
         assert_eq!(
             result.steps["active"],
             StepState::Cancelled {
-                reason: CancellationReason::UserRequest
+                detail: CancellationDetail::new(CancellationReason::UserRequest),
             }
         );
         assert_eq!(
             result.steps["pending"],
             StepState::Cancelled {
-                reason: CancellationReason::UserRequest
+                detail: CancellationDetail::new(CancellationReason::UserRequest),
             }
         );
         assert!(matches!(
@@ -2990,10 +2975,9 @@ async fn harness_start_failure_is_a_start_failure() {
         assert!(
             matches!(
                 &result.steps["task"],
-                StepState::Failed {
-                    phase: FailurePhase::Start,
-                    cause: StepFailureCause::Start(StepStartFailure::Agent(failure)),
-                } if matches!(failure.cause(), AgentFailureCause::HarnessStartFailed)
+                StepState::Failed { detail }
+                    if detail.phase == FailurePhase::Start
+                        && detail.code == FailureCode::HarnessStartFailed
             ),
             "a pre-start harness failure must not transition the step through running: {:?}",
             result.steps["task"]

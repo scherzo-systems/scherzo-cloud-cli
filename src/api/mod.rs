@@ -9,6 +9,7 @@ mod organizations;
 mod problem;
 mod runners;
 mod signup;
+mod source_reset_identity;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -38,6 +39,9 @@ pub(crate) use runners::{
     RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
+pub(crate) use source_reset_identity::{
+    SourceResetIdentityError, SourceResetIdentityOutcome, derive_source_reset_identity,
+};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
 // intact and contain the binary crate's visibility exception to this generated tree.
@@ -79,6 +83,34 @@ mod tests {
         let actions = problem.actions.expect("actions should be present");
 
         assert_eq!(actions, input["actions"].as_array().unwrap().to_owned());
+    }
+
+    #[test]
+    fn generated_create_run_accepts_nullable_input_set_identity() {
+        let omitted: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml"}),
+        )
+        .expect("omitted input set should decode");
+        let null: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml","inputSetId":null}),
+        )
+        .expect("null input set should decode");
+        let present: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml","inputSetId":"ris_fixture"}),
+        )
+        .expect("present input set should decode");
+
+        assert_eq!(omitted.input_set_id, None);
+        assert_eq!(null.input_set_id, None);
+        assert_eq!(present.input_set_id, Some(Some("ris_fixture".to_owned())));
+
+        let mut explicit_null = generated::models::CreateRunRequest::new(
+            "prj_fixture".to_owned(),
+            "workflow.yaml".to_owned(),
+        );
+        explicit_null.input_set_id = Some(None);
+        let encoded = serde_json::to_value(explicit_null).expect("null input set should encode");
+        assert_eq!(encoded["inputSetId"], serde_json::Value::Null);
     }
 
     #[test]

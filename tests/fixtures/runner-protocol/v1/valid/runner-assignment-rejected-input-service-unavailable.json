@@ -1,0 +1,19 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 4,
+  "sentAt": "2026-07-23T00:00:04Z",
+  "type": "assignment_rejected",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "decline": {
+      "type": "runner_unable",
+      "reason": "input_service_unavailable"
+    }
+  }
+}

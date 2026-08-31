@@ -1700,3 +1700,56 @@ finalizers:
         ValidationFailureKind::InvalidFinalizationContext
     );
 }
+
+#[test]
+fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
+    for finalizer in [false, true] {
+        for count in [1_024, 1_025] {
+            let mut outputs = String::new();
+            let mut inputs = String::new();
+            for index in 0..count {
+                let name = format!("value{index:04}");
+                outputs.push_str(&format!(
+                    "      {name}:\n        kind: text\n        from: path\n        path: {name}.txt\n"
+                ));
+                inputs.push_str(&format!(
+                    "      {name}:\n        ref: outputs.producer.{name}\n"
+                ));
+            }
+            let consumer = format!(
+                "    kind: cmd\n    inputs:\n{inputs}    command:\n      argv: [\"true\"]\n"
+            );
+            let source = if finalizer {
+                format!(
+                    "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n{outputs}finalizers:\n  consume:\n    when: [succeeded]\n{consumer}"
+                )
+            } else {
+                format!(
+                    "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n{outputs}  consume:\n{consumer}"
+                )
+            };
+            let resolved = validate_yaml(&source);
+            if count == 1_024 {
+                let workflow = resolved.unwrap();
+                let step = if finalizer {
+                    &workflow.finalizers["consume"].body
+                } else {
+                    &workflow.steps["consume"]
+                };
+                let common = match step {
+                    ValidatedStep::Command(command) => &command.common,
+                    ValidatedStep::Agent(agent) => &agent.common,
+                };
+                assert_eq!(common.evidence_prerequisites.len(), 1_024);
+                assert!(common.evidence_prerequisites.iter().all(|descriptor| {
+                    descriptor.kind() == super::super::evidence::PrerequisiteKind::Body
+                }));
+            } else {
+                assert_eq!(
+                    resolved.unwrap_err().kind(),
+                    ValidationFailureKind::TooManyPrerequisites
+                );
+            }
+        }
+    }
+}

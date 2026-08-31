@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "vectors": [
+    {
+      "name": "present-empty-prompt",
+      "manifest": {
+        "schemaVersion": 1,
+        "prompt": {
+          "sizeBytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "attachments": []
+      },
+      "canonical": "{\"attachments\":[],\"prompt\":{\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"sizeBytes\":0},\"schemaVersion\":1}",
+      "sha256": "972819fd8e5ed714f135044a6e350809a706b687b1afa48931c3c9bb63f8f0f0"
+    },
+    {
+      "name": "absent-prompt-zero-attachment",
+      "manifest": {
+        "schemaVersion": 1,
+        "prompt": null,
+        "attachments": [
+          {
+            "index": 0,
+            "displayName": null,
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      "canonical": "{\"attachments\":[{\"displayName\":null,\"index\":0,\"mediaType\":\"application/octet-stream\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"sizeBytes\":0}],\"prompt\":null,\"schemaVersion\":1}",
+      "sha256": "be1c9a534c94bc52413ac9ea5c7e99754a7a60c333bd9c4f413696402345c815"
+    },
+    {
+      "name": "ordered-unicode-attachments",
+      "manifest": {
+        "schemaVersion": 1,
+        "prompt": {
+          "sizeBytes": 3,
+          "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "attachments": [
+          {
+            "index": 0,
+            "displayName": "résumé \"α\".txt",
+            "mediaType": "text/plain; charset=utf-8",
+            "sizeBytes": 7,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          },
+          {
+            "index": 1,
+            "displayName": null,
+            "mediaType": "application/json",
+            "sizeBytes": 11,
+            "sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+          }
+        ]
+      },
+      "canonical": "{\"attachments\":[{\"displayName\":\"résumé \\\"α\\\".txt\",\"index\":0,\"mediaType\":\"text/plain; charset=utf-8\",\"sha256\":\"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\",\"sizeBytes\":7},{\"displayName\":null,\"index\":1,\"mediaType\":\"application/json\",\"sha256\":\"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\",\"sizeBytes\":11}],\"prompt\":{\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"sizeBytes\":3},\"schemaVersion\":1}",
+      "sha256": "7bf9f926beb6861773c1ea713701b9c502f99f142ca04f73f3cff6a23a7d6aaa"
+    },
+    {
+      "name": "inclusive-prompt-boundary",
+      "manifest": {
+        "schemaVersion": 1,
+        "prompt": {
+          "sizeBytes": 1048576,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "attachments": []
+      },
+      "canonical": "{\"attachments\":[],\"prompt\":{\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sizeBytes\":1048576},\"schemaVersion\":1}",
+      "sha256": "319c0a9f882d9f4759ffa432a00ac367e6a14560715df6ede07f063b52c5de13"
+    },
+    {
+      "name": "inclusive-aggregate-boundary",
+      "manifest": {
+        "schemaVersion": 1,
+        "prompt": null,
+        "attachments": [
+          {
+            "index": 0,
+            "displayName": null,
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 67108864,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "index": 1,
+            "displayName": null,
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 67108864,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          {
+            "index": 2,
+            "displayName": null,
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 67108864,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+          },
+          {
+            "index": 3,
+            "displayName": null,
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 67108864,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000003"
+          }
+        ]
+      },
+      "canonical": "{\"attachments\":[{\"displayName\":null,\"index\":0,\"mediaType\":\"application/octet-stream\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sizeBytes\":67108864},{\"displayName\":null,\"index\":1,\"mediaType\":\"application/octet-stream\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"sizeBytes\":67108864},{\"displayName\":null,\"index\":2,\"mediaType\":\"application/octet-stream\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"sizeBytes\":67108864},{\"displayName\":null,\"index\":3,\"mediaType\":\"application/octet-stream\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000003\",\"sizeBytes\":67108864}],\"prompt\":null,\"schemaVersion\":1}",
+      "sha256": "ab63ea1ebe575c04a248d0a7660222a5ab474642a3bad9fad1fb4cfc62cf88f9"
+    }
+  ]
+}

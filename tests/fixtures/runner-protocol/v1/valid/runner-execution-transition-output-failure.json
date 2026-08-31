@@ -21,9 +21,9 @@
       "failurePolicy": "required",
       "from": "capturing_outputs",
       "to": "failed",
-      "failure": {
+      "detail": {
         "phase": "output_capture",
-        "cause": "output_file_size_limit_exceeded",
+        "code": "captured_file_size_limit",
         "output": "report"
       }
     }

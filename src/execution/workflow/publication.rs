@@ -24,12 +24,13 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
-use super::agent::{AgentFailure, AgentFailureCause, AgentProtocolRejectionDiagnostic};
+use super::agent::{AgentFailure, AgentFailureCause};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind, StagedCarrier};
 use super::artifact_set;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
+use super::evidence::{NodeDetail, PrimaryIssue};
 use super::execution_root::open_directory;
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
@@ -38,8 +39,8 @@ use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
 use super::runtime::{
     ActiveStepInvocation, ExportSet, ExportUnavailableReason, ExportValue, FailurePhase,
-    NotRunReason, RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
-    RecoveryTerminalDisposition, RunOutcome, StepFailure, StepRecoveryState, StepState,
+    RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
+    RecoveryTerminalDisposition, RunOutcome, StepRecoveryState, StepState,
 };
 use super::schema_common::{lowercase_hex, utc_timestamp};
 use super::step_runtime::{
@@ -87,7 +88,7 @@ pub(crate) struct WorkflowRunStep {
     pub(crate) role: WorkflowNodeRole,
     pub(crate) kind: WorkflowRunStepKind,
     pub(crate) failure_policy: FailurePolicy,
-    pub(crate) state: StepState<StepFailureCause, CapturedValue>,
+    pub(crate) state: StepState<CapturedValue>,
     pub(crate) timing: Option<WorkflowStepTiming>,
     pub(crate) command_output: Option<StepDiagnostic>,
     pub(crate) recovery: Option<StepRecoverySummaryV1>,
@@ -119,7 +120,7 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) maximum_parallel_steps: NonZeroUsize,
     pub(crate) cloud_capacity: Option<CloudExecutionCapacityV1>,
     pub(crate) timing: WorkflowRunTiming,
-    pub(crate) outcome: RunOutcome<StepFailureCause>,
+    pub(crate) outcome: RunOutcome,
     pub(crate) cancellation: Option<WorkflowRunCancellation>,
     pub(crate) steps: Vec<WorkflowRunStep>,
     pub(crate) finalization: Option<WorkflowRunFinalization>,
@@ -149,53 +150,19 @@ pub(crate) struct PreparedCloudWorkflowResult {
 }
 
 pub(crate) fn summary_disposition_matches(
-    summarized: &StepState<StepFailureCause, ()>,
-    state: &StepState<StepFailureCause, CapturedValue>,
+    summarized: &StepState<()>,
+    state: &StepState<CapturedValue>,
 ) -> bool {
     match (summarized, state) {
         (StepState::Succeeded { .. }, StepState::Succeeded { .. }) => true,
-        (
-            StepState::Failed {
-                phase: left_phase,
-                cause: left_cause,
-            },
-            StepState::Failed {
-                phase: right_phase,
-                cause: right_cause,
-            },
-        ) => left_phase == right_phase && left_cause == right_cause,
-        (
-            StepState::Blocked {
-                dependency: left_dependency,
-            },
-            StepState::Blocked {
-                dependency: right_dependency,
-            },
-        ) => left_dependency == right_dependency,
-        (
-            StepState::InputUnavailable {
-                references: left_references,
-            },
-            StepState::InputUnavailable {
-                references: right_references,
-            },
-        ) => left_references == right_references,
-        (
-            StepState::NotRun {
-                reason: left_reason,
-            },
-            StepState::NotRun {
-                reason: right_reason,
-            },
-        ) => left_reason == right_reason,
-        (
-            StepState::Cancelled {
-                reason: left_reason,
-            },
-            StepState::Cancelled {
-                reason: right_reason,
-            },
-        ) => left_reason == right_reason,
+        (StepState::Failed { detail: left }, StepState::Failed { detail: right }) => left == right,
+        (StepState::Blocked { detail: left }, StepState::Blocked { detail: right }) => {
+            left == right
+        }
+        (StepState::NotRun { detail: left }, StepState::NotRun { detail: right }) => left == right,
+        (StepState::Cancelled { detail: left }, StepState::Cancelled { detail: right }) => {
+            left == right
+        }
         _ => false,
     }
 }
@@ -349,7 +316,7 @@ pub(crate) struct WorkflowResultV1 {
         deserialize_with = "deserialize_non_null_option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub(crate) primary_failure: Option<PrimaryFailureV1>,
+    pub(crate) primary_issue: Option<PrimaryIssue>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_option",
@@ -526,25 +493,7 @@ pub(crate) struct WorkflowStepV1 {
         deserialize_with = "deserialize_non_null_option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub(crate) failure: Option<FailureV1>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) dependency: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) reason: Option<StepReasonV1>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) unavailable_references: Option<Vec<String>>,
+    pub(crate) detail: Option<NodeDetail>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_option",
@@ -952,6 +901,7 @@ pub(crate) enum FailureCodeV1 {
     CommandLaunchFailed,
     CommandExit,
     CommandWaitFailed,
+    ExecutionTaskUnavailable,
     OutputUnsupported,
     CaptureTaskUnavailable,
     OutputPathAbsolute,
@@ -1018,12 +968,6 @@ pub(crate) struct FailureCauseV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) exit_code: Option<i32>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) protocol_rejection: Option<AgentProtocolRejectionDiagnostic>,
 }
 
 fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -1042,17 +986,8 @@ impl FailureCauseV1 {
             collection_index: None,
             output: None,
             exit_code: None,
-            protocol_rejection: None,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PrimaryFailureV1 {
-    pub(crate) node: WorkflowNodeV1,
-    pub(crate) phase: FailurePhaseV1,
-    pub(crate) cause: FailureCauseV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1484,35 +1419,38 @@ fn cloud_available_export(
             )
         }
     };
-    let carrier = body.map(|body| {
-        let (media_type, size_bytes, sha256) = match &metadata {
-            ExportV1::Available {
+    let carrier = match body {
+        Some(body) => {
+            let (media_type, size_bytes, sha256) = match &metadata {
+                ExportV1::Available {
+                    media_type,
+                    size_bytes,
+                    digest,
+                    ..
+                } => (media_type.clone(), *size_bytes, digest.value.clone()),
+                ExportV1::GitBranch {
+                    carrier: Some(carrier),
+                    ..
+                } => (
+                    carrier.media_type.clone(),
+                    carrier.size_bytes,
+                    carrier.digest.value.clone(),
+                ),
+                ExportV1::GitBranch { carrier: None, .. } | ExportV1::Unavailable { .. } => {
+                    return Err(invalid_run_result());
+                }
+            };
+            Some(CloudResultCarrier {
+                portable_owner_path: path,
+                idempotency_key,
                 media_type,
                 size_bytes,
-                digest,
-                ..
-            } => (media_type.clone(), *size_bytes, digest.value.clone()),
-            ExportV1::GitBranch {
-                carrier: Some(carrier),
-                ..
-            } => (
-                carrier.media_type.clone(),
-                carrier.size_bytes,
-                carrier.digest.value.clone(),
-            ),
-            ExportV1::GitBranch { carrier: None, .. } | ExportV1::Unavailable { .. } => {
-                unreachable!("a Cloud carrier body always has carrier metadata")
-            }
-        };
-        CloudResultCarrier {
-            portable_owner_path: path,
-            idempotency_key,
-            media_type,
-            size_bytes,
-            sha256,
-            body,
+                sha256,
+                body,
+            })
         }
-    });
+        None => None,
+    };
     Ok((metadata, carrier))
 }
 
@@ -2039,14 +1977,11 @@ fn build_result_with_provenance(
     provenance: WorkflowProvenanceV1,
     exports: BTreeMap<String, ExportV1>,
 ) -> Result<WorkflowResultV1, LocalPublicationError> {
-    let (outcome, primary_failure) = match &run.outcome {
+    let (outcome, primary_issue) = match &run.outcome {
         RunOutcome::Succeeded => (WorkflowOutcomeV1::Succeeded, None),
-        RunOutcome::Failed {
-            primary_failure, ..
-        } => (
-            WorkflowOutcomeV1::Failed,
-            Some(primary_failure_v1(primary_failure)?),
-        ),
+        RunOutcome::Failed { primary_issue, .. } => {
+            (WorkflowOutcomeV1::Failed, Some(primary_issue.clone()))
+        }
         RunOutcome::Cancelled { .. } => (WorkflowOutcomeV1::Cancelled, None),
     };
     let cancellation = run
@@ -2093,7 +2028,7 @@ fn build_result_with_provenance(
             maximum_retained_bytes_per_stream: super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         },
         outcome,
-        primary_failure,
+        primary_issue,
         cancellation,
         steps,
         finalization,
@@ -2118,9 +2053,10 @@ fn finalization_v1(
     let issues = finalizers
         .iter()
         .filter(|finalizer| {
-            finalizer.state == WorkflowStepStateV1::Failed
-                || (finalizer.state == WorkflowStepStateV1::Blocked
-                    && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+            matches!(
+                finalizer.state,
+                WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
+            )
         })
         .map(|finalizer| FinalizationIssueV1 {
             node: WorkflowNodeV1 {
@@ -2160,53 +2096,23 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         ),
         None => (None, None),
     };
-    let (state, failure, dependency, reason, unavailable_references) = match &step.state {
-        StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None, None, None, None),
-        StepState::Failed { phase, cause } => (
+    let (state, detail) = match &step.state {
+        StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None),
+        StepState::Failed { detail } => (
             WorkflowStepStateV1::Failed,
-            Some(failure_v1(*phase, cause)?),
-            None,
-            None,
-            None,
+            Some(NodeDetail::Failed(detail.clone())),
         ),
-        StepState::Blocked { dependency } => (
+        StepState::Blocked { detail } => (
             WorkflowStepStateV1::Blocked,
-            None,
-            Some(dependency.clone()),
-            None,
-            None,
+            Some(NodeDetail::Blocked(detail.clone())),
         ),
-        StepState::InputUnavailable { references } => (
-            WorkflowStepStateV1::Blocked,
-            None,
-            None,
-            Some(StepReasonV1::InputUnavailable),
-            Some(references.clone()),
-        ),
-        StepState::NotRun {
-            reason: NotRunReason::FailureStop,
-        } => (
+        StepState::NotRun { detail } => (
             WorkflowStepStateV1::NotRun,
-            None,
-            None,
-            Some(StepReasonV1::FailureStop),
-            None,
+            Some(NodeDetail::NotRun(*detail)),
         ),
-        StepState::NotRun {
-            reason: NotRunReason::FinalizerTriggerNotSelected,
-        } => (
-            WorkflowStepStateV1::NotRun,
-            None,
-            None,
-            Some(StepReasonV1::FinalizerTriggerNotSelected),
-            None,
-        ),
-        StepState::Cancelled { reason } => (
+        StepState::Cancelled { detail } => (
             WorkflowStepStateV1::Cancelled,
-            None,
-            None,
-            Some(cancellation_step_reason(*reason)),
-            None,
+            Some(NodeDetail::Cancellation(*detail)),
         ),
         StepState::Pending
         | StepState::Starting
@@ -2239,10 +2145,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         invocations: step.invocations.clone(),
         started_at,
         duration_milliseconds,
-        failure,
-        dependency,
-        reason,
-        unavailable_references,
+        detail,
         command_output,
     })
 }
@@ -2539,20 +2442,6 @@ fn recovery_decision_rejection_v1(
     }
 }
 
-fn primary_failure_v1(
-    failure: &StepFailure<StepFailureCause>,
-) -> Result<PrimaryFailureV1, LocalPublicationError> {
-    let failure_v1 = failure_v1(failure.phase, &failure.cause)?;
-    Ok(PrimaryFailureV1 {
-        node: WorkflowNodeV1 {
-            id: failure.step.clone(),
-            role: workflow_node_role(failure.role),
-        },
-        phase: failure_v1.phase,
-        cause: failure_v1.cause,
-    })
-}
-
 pub(super) fn failure_v1(
     phase: FailurePhase,
     cause: &StepFailureCause,
@@ -2683,9 +2572,7 @@ fn agent_input_failure_cause(failure: &AgentInputStartFailure) -> FailureCauseV1
 }
 
 fn agent_failure_cause(failure: &AgentFailure) -> FailureCauseV1 {
-    let mut cause = FailureCauseV1::code(agent_failure_code(failure.cause()));
-    cause.protocol_rejection = failure.protocol_rejection().cloned();
-    cause
+    FailureCauseV1::code(agent_failure_code(failure.cause()))
 }
 
 fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
@@ -2717,6 +2604,9 @@ fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
             FailureCauseV1::code(FailureCodeV1::CommandWaitFailed)
         }
         StepExecutionFailure::Agent(failure) => agent_failure_cause(failure),
+        StepExecutionFailure::TaskUnavailable => {
+            FailureCauseV1::code(FailureCodeV1::ExecutionTaskUnavailable)
+        }
     }
 }
 

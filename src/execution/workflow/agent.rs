@@ -270,6 +270,8 @@ pub(crate) enum AgentValueKind {
 pub(crate) struct PositiveDuration(Duration);
 
 impl PositiveDuration {
+    pub(crate) const MIN: Self = Self(Duration::from_nanos(1));
+
     pub(crate) fn new(duration: Duration) -> Option<Self> {
         (!duration.is_zero()).then_some(Self(duration))
     }

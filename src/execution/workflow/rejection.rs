@@ -518,6 +518,10 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "too_many_workflow_nodes",
             "Reduce the combined number of steps and finalizers to 256.",
         ),
+        ValidationFailureKind::TooManyPrerequisites => (
+            "too_many_workflow_node_prerequisites",
+            "Reduce this node to at most 1024 distinct prerequisites.",
+        ),
         ValidationFailureKind::DuplicateNodeId => (
             "duplicate_workflow_node_id",
             "Give every step and finalizer a globally unique ID.",

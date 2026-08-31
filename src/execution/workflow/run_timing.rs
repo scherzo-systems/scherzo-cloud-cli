@@ -110,13 +110,14 @@ impl RunTimingObservation {
                     .cancellation
                     .get_or_insert((*reason, deadline.deadline_utc()));
             }
-            TransitionEvent::Workflow {
-                to:
+            TransitionEvent::Workflow { to, .. }
+                if matches!(
+                    to.as_ref(),
                     WorkflowState::Succeeded
-                    | WorkflowState::Failed { .. }
-                    | WorkflowState::Cancelled { .. },
-                ..
-            } => {
+                        | WorkflowState::Failed { .. }
+                        | WorkflowState::Cancelled { .. }
+                ) =>
+            {
                 timing.terminal.get_or_insert(observed_at);
             }
             TransitionEvent::Step { .. }
@@ -154,7 +155,7 @@ fn observation_needs_timing_sample<Deadline>(observation: &ExecutionObservation<
         | TransitionEvent::FinalizationCancellationAccepted { .. }
         | TransitionEvent::ForceAbortAccepted { .. } => true,
         TransitionEvent::Workflow { to, .. } => matches!(
-            to,
+            to.as_ref(),
             WorkflowState::Succeeded
                 | WorkflowState::Failed { .. }
                 | WorkflowState::Cancelled { .. }

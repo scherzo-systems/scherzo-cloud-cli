@@ -460,7 +460,7 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
     .unwrap();
     assert!(failed_plain.status.success());
     assert!(failed_plain.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&failed_plain.stdout).contains("primary failure:"));
+    assert!(String::from_utf8_lossy(&failed_plain.stdout).contains("primary issue:"));
     assert_eq!(durable_files(&run_directory), settled_before);
 }
 

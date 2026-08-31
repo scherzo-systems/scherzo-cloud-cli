@@ -80,8 +80,8 @@
             "capacity": {
               "aggregateRetentionBytes": 12582912,
               "diagnosticRetentionBytes": 8388608,
-              "encodedOutboxBytes": 38141952,
-              "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+              "encodedOutboxBytes": 85458944,
+              "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
               "generalMaximumTransitions": 8,
               "maximumInvocations": 1,
               "maximumRetainedBytesPerInvocation": 4194304,
@@ -105,6 +105,7 @@
               "providerKind": "github",
               "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
             },
+            "runInputs": null,
             "schemaVersion": 1,
             "sourceBranch": "main",
             "workflowDefinitionSource": {
@@ -173,18 +174,15 @@
         "messageId": "«mid-3»",
         "payload": {
           "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
-          "decline": {
-            "reason": "source_service_unavailable",
-            "type": "runner_unable"
-          },
-          "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+          "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
+          "offeredExecutionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc"
         },
         "payloadVersion": 1,
         "protocolVersion": 1,
         "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
         "sentAt": "«ts-1»",
         "sequence": 5,
-        "type": "assignment_rejected"
+        "type": "assignment_preparing"
       }
     },
     {

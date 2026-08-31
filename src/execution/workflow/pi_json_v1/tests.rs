@@ -600,6 +600,38 @@ fn terminal_stop_reason_uses_the_native_mode_table() {
 }
 
 #[test]
+fn malformed_update_does_not_change_the_active_block() {
+    let pending = assistant(json!([]), "pending", 2);
+    let completed = assistant(json!([{"type": "text", "text": "ab"}]), "stop", 2);
+    let transcript = encoded(&[
+        session(),
+        json!({"type": "agent_start"}),
+        json!({"type": "message_start", "message": &pending}),
+        json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}),
+        json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "a"}}),
+        json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "wrong"}}),
+        json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "b"}}),
+        json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "ab"}}),
+        json!({"type": "message_end", "message": &completed}),
+        json!({"type": "turn_end", "message": &completed, "toolResults": []}),
+        json!({"type": "agent_end", "messages": [&completed], "willRetry": false}),
+        json!({"type": "agent_settled"}),
+    ]);
+
+    let replay = replay(&transcript, AgentValueKind::Response);
+    let streamed = replay
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::AssistantText { text } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(streamed, "ab");
+    assert_eq!(completed_response(&replay.outcome), "ab");
+}
+
+#[test]
 fn response_limit_is_enforced_incrementally_and_on_the_terminal_candidate() {
     let mut parser = PiJsonV1Parser::new(
         Arc::from(CWD),
@@ -679,6 +711,55 @@ fn retained_reconstruction_and_frame_bounds_remain_authoritative() {
     assert_eq!(
         oversized.push_ignoring(&[b'x'; 129]),
         Err(AgentFailureCause::HarnessStartFailed)
+    );
+}
+
+#[test]
+fn retained_delta_limit_accepts_the_exact_boundary() {
+    let maximum_retained_bytes = 512;
+    let limits = PiJsonV1ProtocolLimits {
+        maximum_frame_bytes: NonZeroU64::new(maximum_retained_bytes).unwrap(),
+    };
+    let mut parser = PiJsonV1Parser::new(
+        Arc::from(CWD),
+        AgentValueKind::None,
+        NonZeroU64::new(1024).unwrap(),
+        limits,
+        None,
+    );
+    let pending = assistant(json!([]), "pending", 2);
+    let ParsedMessage::Assistant(parsed) = parse_message(&pending, false).unwrap() else {
+        panic!("fixture must be an assistant message");
+    };
+    let retained_before_deltas = parsed
+        .retained_bytes()
+        .saturating_add(content_block_structure_bytes());
+    let accepted_deltas = maximum_retained_bytes - retained_before_deltas;
+    parser
+        .push_ignoring(&encoded(&[
+            session(),
+            json!({"type": "agent_start"}),
+            json!({"type": "message_start", "message": pending}),
+            json!({"type": "message_update", "usage": usage(), "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}),
+        ]))
+        .unwrap();
+    let delta = encoded(&[json!({
+        "type": "message_update",
+        "usage": usage(),
+        "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "x"}
+    })]);
+
+    for _ in 0..accepted_deltas {
+        parser.push_ignoring(&delta).unwrap();
+    }
+    assert_eq!(
+        parser.push_ignoring(&delta),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    let outcome = parser.finish(PiJsonV1ProcessCompletion::exited(false));
+    assert_eq!(
+        protocol_rejection(&outcome)["detail"]["reason"],
+        "retained_state_limit_exceeded"
     );
 }
 

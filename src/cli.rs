@@ -319,6 +319,7 @@ mod tests {
             "auth",
             "auth login",
             "auth logout",
+            "auth source-reset-identity-evidence",
             "auth status",
             "organization",
             "organization create",

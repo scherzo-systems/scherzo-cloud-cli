@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Continue through an advisory failure while blocking work that needs its missing output.
+
+steps:
+  analyze:
+    kind: cmd
+    failurePolicy: advisory
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'intentional advisory analysis failure' >&2; exit 9"
+    outputs:
+      report:
+        kind: file
+        from: path
+        path: analysis-report.txt
+        mediaType: text/plain
+
+  continueWithoutReport:
+    kind: cmd
+    dependsOn: [analyze]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'control-only continuation ran after the advisory failure'"
+
+  summarizeReport:
+    kind: cmd
+    failurePolicy: advisory
+    inputs:
+      report:
+        ref: outputs.analyze.report
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'this command cannot run because the report is unavailable'"

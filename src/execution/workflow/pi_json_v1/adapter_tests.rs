@@ -1483,7 +1483,7 @@ async fn run_and_surface_protocol_rejection(fixture: ProcessFixture) -> (Capture
     let run = run_success(fixture).await;
     assert_agent_failure(&run.outcome, AgentFailureCause::HarnessProtocolFailed);
     let AgentOutcome::Failed(failure) = &run.outcome else {
-        unreachable!();
+        panic!("fixture outcome was not failed");
     };
     let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
     (run, surfaced)
@@ -1885,7 +1885,7 @@ async fn wrong_bridge_identity_is_fatal_without_authoritative_acceptance() {
         let outcome = running.finish().await;
         assert_agent_failure(&outcome, AgentFailureCause::HarnessProtocolFailed);
         let AgentOutcome::Failed(failure) = outcome else {
-            unreachable!();
+            panic!("fixture outcome was not failed");
         };
         let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
         assert_eq!(rejection["detail"]["reason"], "result_correlation_invalid");

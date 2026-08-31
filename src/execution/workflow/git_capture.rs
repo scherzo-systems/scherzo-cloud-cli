@@ -462,22 +462,25 @@ impl GitCaptureContext {
                 .iter()
                 .map(|declaration| match declaration {
                     GitAwareCaptureDeclaration::File(declaration) => {
-                        CaptureCandidateDeclaration::File(*declaration)
+                        Ok(CaptureCandidateDeclaration::File(*declaration))
                     }
                     GitAwareCaptureDeclaration::GitBranch(identity) => {
-                        let producer = changed.then(|| {
-                            producers.next().unwrap_or_else(|| {
-                                unreachable!("every changed Git declaration has one producer")
-                            }) as &mut dyn CarrierProducer
-                        });
-                        CaptureCandidateDeclaration::GitBranch(GitBranchCaptureDeclaration::new(
-                            identity,
-                            metadata.clone(),
-                            producer,
+                        let producer = if changed {
+                            Some(
+                                producers
+                                    .next()
+                                    .ok_or(GitCaptureFailure::BundleProfileInvalid)?
+                                    as &mut dyn CarrierProducer,
+                            )
+                        } else {
+                            None
+                        };
+                        Ok(CaptureCandidateDeclaration::GitBranch(
+                            GitBranchCaptureDeclaration::new(identity, metadata.clone(), producer),
                         ))
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, GitCaptureFailure>>()?;
             artifacts.capture_candidates(&mut candidates, cancellation)
         };
         let production_failure = producers.into_iter().find_map(|producer| producer.failure);

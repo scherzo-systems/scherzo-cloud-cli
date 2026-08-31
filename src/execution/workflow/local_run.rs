@@ -25,9 +25,12 @@ use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
-use super::coordinator::{CommitPort, CommittedActionKind, CommittedReduction};
+use super::coordinator::{
+    CommitPort, CommittedActionKind, CommittedReduction, CoordinationDiagnostic,
+};
 use super::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use super::document::FailurePolicy;
+use super::evidence::{NodeDetail, NonExecutionCode};
 use super::execution_root::AdmittedExecutionRoot;
 use super::invocation_accounting::InvocationAccountingLog;
 use super::private_staging::{
@@ -39,8 +42,7 @@ use super::process_group::{
     terminate_authenticated_process_group,
 };
 use super::publication::{
-    CancellationReasonV1, FailureV1, FinalizationTriggerV1, StepReasonV1, cancellation_reason,
-    cancellation_step_reason, failure_v1, finalization_trigger,
+    CancellationReasonV1, FinalizationTriggerV1, cancellation_reason, finalization_trigger,
 };
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::runtime::{
@@ -66,7 +68,7 @@ const INITIAL_ATTEMPT_DIRECTORY: &str = "000001";
 const STAGING_ATTEMPTS: usize = 16;
 const PRIVATE_STAGING_ATTEMPTS: usize = 16;
 const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
-pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_PROMPT_BYTES: u64 = 1024 * 1024;
@@ -341,6 +343,12 @@ pub(super) struct AttemptStepV1 {
     pub(super) role: AttemptNodeRoleV1,
     pub(super) failure_policy: FailurePolicy,
     pub(super) state: AttemptStepStateV1,
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) detail: Option<NodeDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recovery: Option<DurableStepRecoveryV1>,
 }
@@ -486,6 +494,9 @@ pub(super) struct AttemptFinalizationCompleteV1 {
     pub(super) force_abort: bool,
 }
 
+// Completed finalizers and live attempt nodes remain distinct durable envelopes even
+// though both carry the same canonical detail union.
+// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct DurableFinalizerV1 {
@@ -493,13 +504,14 @@ pub(super) struct DurableFinalizerV1 {
     pub(super) role: AttemptNodeRoleV1,
     pub(super) failure_policy: FailurePolicy,
     pub(super) state: AttemptStepStateV1,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) failure: Option<FailureV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reason: Option<StepReasonV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) unavailable_references: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) detail: Option<NodeDetail>,
 }
+// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -644,6 +656,7 @@ struct LocalDiagnosticV1 {
 enum DiagnosticCodeV1 {
     StaleOccurrence,
     StatePersistenceFailure,
+    TransitionCapacityExceeded,
     ResultPublicationFailure,
     PrivateCleanupFailure,
 }
@@ -1188,11 +1201,25 @@ impl StateStore {
     {
         self.update(|state| {
             let now = timestamp(crate::timing::utc_now())?;
-            let attempt = current_attempt_mut(state)?;
-            if attempt.state.is_terminal() {
-                return Err(LocalRunDirectoryError::StateConflict);
+            let attempt_number = state.current_attempt_number;
+            {
+                let attempt = current_attempt_mut(state)?;
+                if attempt.state.is_terminal() {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                attempt.started_at.get_or_insert_with(|| now.clone());
+                if let Some(diagnostic) = commit.diagnostic {
+                    let code = match diagnostic {
+                        CoordinationDiagnostic::TransitionCapacityExceeded => {
+                            DiagnosticCodeV1::TransitionCapacityExceeded
+                        }
+                    };
+                    settle_interrupted_attempt(attempt, InterruptionCauseV1::ExecutorFault, true)?;
+                    append_diagnostic(state, attempt_number, code)?;
+                    return Ok(());
+                }
             }
-            attempt.started_at.get_or_insert_with(|| now.clone());
+            let attempt = current_attempt_mut(state)?;
             if commit.occurrence_accepted {
                 attempt.progress.accepted_occurrence_ordinal = commit.occurrence_ordinal.get();
             }
@@ -2252,6 +2279,7 @@ fn update_progress_nodes<Cause, Output>(
             .get(&node.id)
             .ok_or(LocalRunDirectoryError::StateConflict)?;
         node.state = attempt_step_state(&runtime.state);
+        node.detail = attempt_step_detail(&runtime.state);
     }
     Ok(())
 }
@@ -2372,7 +2400,7 @@ fn update_recovery_progress(
     Ok(())
 }
 
-fn attempt_step_state<Cause, Output>(state: &StepState<Cause, Output>) -> AttemptStepStateV1 {
+fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
     match state {
         StepState::Pending => AttemptStepStateV1::Pending,
         StepState::Starting => AttemptStepStateV1::Starting,
@@ -2382,16 +2410,35 @@ fn attempt_step_state<Cause, Output>(state: &StepState<Cause, Output>) -> Attemp
         StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
         StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
         StepState::Failed { .. } => AttemptStepStateV1::Failed,
-        StepState::Blocked { .. } | StepState::InputUnavailable { .. } => {
-            AttemptStepStateV1::Blocked
-        }
+        StepState::Blocked { .. } => AttemptStepStateV1::Blocked,
         StepState::NotRun { .. } => AttemptStepStateV1::NotRun,
         StepState::Cancelled { .. } => AttemptStepStateV1::Cancelled,
     }
 }
 
+// Durable state copies detail while the live view model copies it into observation
+// facts; keeping both projections explicit avoids coupling persistence to presentation.
+// jscpd:ignore-start
+fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> {
+    match state {
+        StepState::Failed { detail } => Some(NodeDetail::Failed(detail.clone())),
+        StepState::Blocked { detail } => Some(NodeDetail::Blocked(detail.clone())),
+        StepState::NotRun { detail } => Some(NodeDetail::NotRun(*detail)),
+        StepState::Cancelling { detail } | StepState::Cancelled { detail } => {
+            Some(NodeDetail::Cancellation(*detail))
+        }
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
+        | StepState::Succeeded { .. } => None,
+    }
+}
+// jscpd:ignore-end
+
 fn durable_finalization_summary<Deadline>(
-    summary: &FinalizationSummary<StepFailureCause, Deadline>,
+    summary: &FinalizationSummary<Deadline>,
 ) -> Result<AttemptFinalizationCompleteV1, LocalRunDirectoryError>
 where
     Deadline: DurableDeadline,
@@ -2400,36 +2447,27 @@ where
         .finalizers
         .iter()
         .map(|finalizer| {
-            let (state, failure, reason, unavailable_references) = match &finalizer.disposition {
-                StepState::Succeeded { .. } => (AttemptStepStateV1::Succeeded, None, None, None),
-                StepState::Failed { phase, cause } => (
+            let (state, detail) = match &finalizer.disposition {
+                StepState::Succeeded { .. } => (AttemptStepStateV1::Succeeded, None),
+                StepState::Failed { detail } => (
                     AttemptStepStateV1::Failed,
-                    Some(
-                        failure_v1(*phase, cause)
-                            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?,
-                    ),
-                    None,
-                    None,
+                    Some(NodeDetail::Failed(detail.clone())),
                 ),
-                StepState::InputUnavailable { references } => (
+                StepState::Blocked { detail } => (
                     AttemptStepStateV1::Blocked,
-                    None,
-                    Some(StepReasonV1::InputUnavailable),
-                    Some(references.clone()),
+                    Some(NodeDetail::Blocked(detail.clone())),
                 ),
-                StepState::NotRun {
-                    reason: super::runtime::NotRunReason::FinalizerTriggerNotSelected,
-                } => (
-                    AttemptStepStateV1::NotRun,
-                    None,
-                    Some(StepReasonV1::FinalizerTriggerNotSelected),
-                    None,
-                ),
-                StepState::Cancelled { reason } => (
+                StepState::NotRun { detail }
+                    if detail.code == NonExecutionCode::FinalizerTriggerNotSelected =>
+                {
+                    (
+                        AttemptStepStateV1::NotRun,
+                        Some(NodeDetail::NotRun(*detail)),
+                    )
+                }
+                StepState::Cancelled { detail } => (
                     AttemptStepStateV1::Cancelled,
-                    None,
-                    Some(cancellation_step_reason(*reason)),
-                    None,
+                    Some(NodeDetail::Cancellation(*detail)),
                 ),
                 StepState::Pending
                 | StepState::Starting
@@ -2437,19 +2475,16 @@ where
                 | StepState::CapturingOutputs
                 | StepState::Recovering { .. }
                 | StepState::Cancelling { .. }
-                | StepState::Blocked { .. }
-                | StepState::NotRun {
-                    reason: super::runtime::NotRunReason::FailureStop,
-                } => return Err(LocalRunDirectoryError::StateConflict),
+                | StepState::NotRun { .. } => {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
             };
             Ok(DurableFinalizerV1 {
                 id: finalizer.finalizer.clone(),
                 role: AttemptNodeRoleV1::Finalizer,
                 failure_policy: finalizer.failure_policy,
                 state,
-                failure,
-                reason,
-                unavailable_references,
+                detail,
             })
         })
         .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
@@ -2484,9 +2519,10 @@ fn durable_finalization_issues(
     finalizers
         .iter()
         .filter(|finalizer| {
-            finalizer.state == AttemptStepStateV1::Failed
-                || (finalizer.state == AttemptStepStateV1::Blocked
-                    && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+            matches!(
+                finalizer.state,
+                AttemptStepStateV1::Failed | AttemptStepStateV1::Blocked
+            )
         })
         .map(|finalizer| DurableFinalizationIssueV1 {
             finalizer_id: finalizer.id.clone(),
@@ -2525,7 +2561,6 @@ fn outstanding_actions<Cause, Output>(
                 | StepState::Succeeded { .. }
                 | StepState::Failed { .. }
                 | StepState::Blocked { .. }
-                | StepState::InputUnavailable { .. }
                 | StepState::NotRun { .. }
                 | StepState::Cancelled { .. } => {
                     return Some(Err(LocalRunDirectoryError::StateConflict));
@@ -3652,6 +3687,7 @@ fn fresh_progress_node(
         role,
         failure_policy,
         state: AttemptStepStateV1::Pending,
+        detail: None,
         recovery: None,
     })
 }
@@ -4175,6 +4211,7 @@ fn validate_attempt(
         if step.id.is_empty()
             || step.role != AttemptNodeRoleV1::Step
             || !step_ids.insert(step.id.as_str())
+            || !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
         {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
@@ -4343,6 +4380,11 @@ fn validate_attempt_finalization<'a>(
                     finalizer.role != AttemptNodeRoleV1::Finalizer
                         || finalizer.id.is_empty()
                         || !node_ids.insert(finalizer.id.as_str())
+                        || !attempt_step_detail_valid(
+                            finalizer.role,
+                            finalizer.state,
+                            finalizer.detail.as_ref(),
+                        )
                 })
             {
                 return Err(LocalRunDirectoryError::StateInvalid);
@@ -4390,9 +4432,10 @@ fn validate_attempt_finalization<'a>(
                 .finalizers
                 .iter()
                 .filter(|finalizer| {
-                    finalizer.state == AttemptStepStateV1::Failed
-                        || (finalizer.state == AttemptStepStateV1::Blocked
-                            && finalizer.reason == Some(StepReasonV1::InputUnavailable))
+                    matches!(
+                        finalizer.state,
+                        AttemptStepStateV1::Failed | AttemptStepStateV1::Blocked
+                    )
                 })
                 .map(|finalizer| (finalizer.id.as_str(), finalizer.failure_policy))
                 .collect::<Vec<_>>();
@@ -4443,56 +4486,51 @@ fn valid_finalization_interruption(
 }
 
 fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
-    match finalizer.state {
-        AttemptStepStateV1::Succeeded => {
-            finalizer.failure.is_none()
-                && finalizer.reason.is_none()
-                && finalizer.unavailable_references.is_none()
+    attempt_step_detail_valid(finalizer.role, finalizer.state, finalizer.detail.as_ref())
+        && matches!(
+            finalizer.state,
+            AttemptStepStateV1::Succeeded
+                | AttemptStepStateV1::Failed
+                | AttemptStepStateV1::Blocked
+                | AttemptStepStateV1::NotRun
+                | AttemptStepStateV1::Cancelled
+        )
+}
+
+fn attempt_step_detail_valid(
+    role: AttemptNodeRoleV1,
+    state: AttemptStepStateV1,
+    detail: Option<&NodeDetail>,
+) -> bool {
+    match (role, state, detail) {
+        (
+            _,
+            AttemptStepStateV1::Pending
+            | AttemptStepStateV1::Starting
+            | AttemptStepStateV1::Running
+            | AttemptStepStateV1::CapturingOutputs
+            | AttemptStepStateV1::Succeeded,
+            None,
+        ) => true,
+        (_, AttemptStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
+        (_, AttemptStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
+        (AttemptNodeRoleV1::Step, AttemptStepStateV1::NotRun, Some(NodeDetail::NotRun(detail))) => {
+            detail.code == NonExecutionCode::FailureStop
         }
-        AttemptStepStateV1::Failed => {
-            finalizer
-                .failure
-                .as_ref()
-                .is_some_and(|failure| super::result_metadata::validate_failure(failure).is_ok())
-                && finalizer.reason.is_none()
-                && finalizer.unavailable_references.is_none()
+        (
+            AttemptNodeRoleV1::Finalizer,
+            AttemptStepStateV1::NotRun,
+            Some(NodeDetail::NotRun(detail)),
+        ) => detail.code == NonExecutionCode::FinalizerTriggerNotSelected,
+        (
+            role,
+            AttemptStepStateV1::Cancelling | AttemptStepStateV1::Cancelled,
+            Some(NodeDetail::Cancellation(detail)),
+        ) => {
+            detail.code != super::admission::CancellationReason::FinalizationForceAbort
+                || role == AttemptNodeRoleV1::Finalizer
         }
-        AttemptStepStateV1::Blocked => {
-            finalizer.failure.is_none()
-                && finalizer.reason == Some(StepReasonV1::InputUnavailable)
-                && finalizer
-                    .unavailable_references
-                    .as_ref()
-                    .is_some_and(|references| {
-                        !references.is_empty()
-                            && references.windows(2).all(|pair| pair[0] < pair[1])
-                    })
-        }
-        AttemptStepStateV1::NotRun => {
-            finalizer.failure.is_none()
-                && finalizer.reason == Some(StepReasonV1::FinalizerTriggerNotSelected)
-                && finalizer.unavailable_references.is_none()
-        }
-        AttemptStepStateV1::Cancelled => {
-            finalizer.failure.is_none()
-                && matches!(
-                    finalizer.reason,
-                    Some(
-                        StepReasonV1::UserRequest
-                            | StepReasonV1::TerminationRequest
-                            | StepReasonV1::CallerOutputFailure
-                            | StepReasonV1::RunnerShutdown
-                            | StepReasonV1::ExecutionLeaseExpired
-                            | StepReasonV1::FinalizationForceAbort
-                    )
-                )
-                && finalizer.unavailable_references.is_none()
-        }
-        AttemptStepStateV1::Pending
-        | AttemptStepStateV1::Starting
-        | AttemptStepStateV1::Running
-        | AttemptStepStateV1::CapturingOutputs
-        | AttemptStepStateV1::Cancelling => false,
+        _ => false,
     }
 }
 

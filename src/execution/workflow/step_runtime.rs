@@ -118,6 +118,7 @@ pub(crate) enum CommandExecutionFailure {
 pub(crate) enum StepExecutionFailure {
     Command(CommandExecutionFailure),
     Agent(AgentFailure),
+    TaskUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,6 +377,8 @@ pub(crate) struct StepRuntime<
     capture_requests: mpsc::UnboundedSender<CaptureWorkerMessage>,
     tasks: OwnedTasks,
     process_guards: ProcessGuardRegistry,
+    #[cfg(test)]
+    panicking_step_tasks: Arc<Mutex<BTreeSet<String>>>,
 }
 
 struct CaptureRequest {
@@ -541,6 +544,8 @@ where
             capture_requests,
             tasks,
             process_guards,
+            #[cfg(test)]
+            panicking_step_tasks: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -554,6 +559,84 @@ where
         };
         self.execute_registered_step(step, action, BTreeMap::new(), cancellation)
             .await
+    }
+
+    fn spawn_step_task(
+        &self,
+        step: String,
+        action: ActionId,
+        kind: SpawnedStepTask,
+        future: impl Future<Output = Result<(), StepRuntimeError>> + Send + 'static,
+    ) {
+        let runtime = self.clone();
+        self.tasks.spawn(async move {
+            if tokio::spawn(future).await.is_err() {
+                let _ = runtime.settle_panicked_step_task(step, action, kind).await;
+            }
+        });
+    }
+
+    async fn settle_panicked_step_task(
+        &self,
+        step: String,
+        action: ActionId,
+        kind: SpawnedStepTask,
+    ) -> Result<(), StepRuntimeError> {
+        match (kind, self.with_work(|work| work.panic_settlement(action))) {
+            (_, StepTaskPanicSettlement::Cancelled(cancellation)) => {
+                self.finish_cancellation(action, cancellation).await
+            }
+            (SpawnedStepTask::Step, StepTaskPanicSettlement::Start) => {
+                self.settle_start_failure(
+                    step,
+                    action,
+                    StepStartFailure::PreparationTaskUnavailable,
+                )
+                .await
+            }
+            (SpawnedStepTask::Step, StepTaskPanicSettlement::Execution) => {
+                self.settle_agent_occurrence(
+                    action,
+                    DriverOccurrence::step_execution_failed(
+                        step,
+                        action,
+                        StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable),
+                    ),
+                )
+                .await
+            }
+            (SpawnedStepTask::RecoveryHandler { round }, StepTaskPanicSettlement::Start) => {
+                self.settle_recovery_start_failure(
+                    step,
+                    round,
+                    action,
+                    RecoveryHandlerFailure::SettlementFailed,
+                )
+                .await
+            }
+            (SpawnedStepTask::RecoveryHandler { round }, StepTaskPanicSettlement::Execution) => {
+                self.settle_recovery_completion(
+                    step,
+                    round,
+                    action,
+                    Err(RecoveryHandlerFailure::SettlementFailed),
+                )
+                .await
+            }
+            (_, StepTaskPanicSettlement::Gone) => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_step_task_panic(&self, step: &str) {
+        lock_registry(&self.panicking_step_tasks).insert(step.to_owned());
+    }
+
+    #[cfg(test)]
+    fn panic_if_step_task_injected(&self, step: &str) {
+        if lock_registry(&self.panicking_step_tasks).remove(step) {
+            panic!("injected step task panic");
+        }
     }
 
     async fn execute_registered_step(
@@ -836,7 +919,9 @@ where
             .report_recovery_handler_started(&step, round, action, &mut cancellation)
             .await
         {
-            Ok(StartDelivery::Published) => {}
+            Ok(StartDelivery::Published) => {
+                self.with_work(|work| work.record_started(action));
+            }
             Ok(StartDelivery::Cancelled(cancellation)) => {
                 let result = self
                     .cancel_launched(action, &mut launched, cancellation)
@@ -959,7 +1044,9 @@ where
                     .report_recovery_handler_started(&step, round, action, &mut cancellation)
                     .await
                 {
-                    Ok(StartDelivery::Published) => {}
+                    Ok(StartDelivery::Published) => {
+                        self.with_work(|work| work.record_started(action));
+                    }
                     Ok(StartDelivery::Cancelled(cancellation)) => {
                         let _ = tokio::join!(&mut invocation_task, &mut outcome);
                         drop(staging);
@@ -1227,7 +1314,9 @@ where
             .report_step_started(&step, action, &mut cancellation)
             .await;
         match start_delivery {
-            Ok(StartDelivery::Published) => {}
+            Ok(StartDelivery::Published) => {
+                self.with_work(|work| work.record_started(action));
+            }
             Ok(StartDelivery::Cancelled(cancellation)) => {
                 return self
                     .cancel_launched(action, &mut launched, cancellation)
@@ -1319,7 +1408,9 @@ where
                     .report_step_started(&step, action, &mut cancellation)
                     .await
                 {
-                    Ok(StartDelivery::Published) => {}
+                    Ok(StartDelivery::Published) => {
+                        self.with_work(|work| work.record_started(action));
+                    }
                     Ok(StartDelivery::Cancelled(cancellation)) => {
                         let _ = tokio::join!(&mut invocation_task, &mut outcome);
                         drop(staging);
@@ -1396,7 +1487,12 @@ where
                     StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
                 )
             }
-            AgentOutcome::Cancelled { .. } => unreachable!("cancelled outcomes settle above"),
+            AgentOutcome::Cancelled { .. } => {
+                drop(staging);
+                return self
+                    .settle_agent_cancellation(step, action, lifecycle_started, &mut cancellation)
+                    .await;
+            }
         };
         self.settle_agent_occurrence(action, occurrence).await
     }
@@ -1857,7 +1953,7 @@ where
         operation(&mut lock_registry(&self.capture_work))
     }
 
-    async fn quiesce_after_commit_failure(&self) {
+    async fn quiesce_active_work(&self) {
         self.admitted
             .execution()
             .cancellation()
@@ -1865,8 +1961,8 @@ where
             .request_cancellation(CancellationReason::RunnerShutdown);
         let mut clock = self.clock.clone();
         let deadline = clock.now();
-        let revocations = self.with_work(|work| work.revoke_all_for_commit_failure(deadline));
-        self.with_capture_work(CaptureWorkRegistry::revoke_all_for_commit_failure);
+        let revocations = self.with_work(|work| work.revoke_all(deadline));
+        self.with_capture_work(CaptureWorkRegistry::revoke_all);
         for (wake, interrupt) in revocations {
             if let Some(group) = interrupt {
                 let _ = interrupt_authenticated_process_group(&group);
@@ -2324,7 +2420,7 @@ impl CaptureWorkRegistry {
             .is_some_and(|work| work.revocation.is_some())
     }
 
-    fn revoke_all_for_commit_failure(&mut self) {
+    fn revoke_all(&mut self) {
         for (&action, work) in &mut self.active {
             if work.revocation.is_none() {
                 work.revocation = Some(CaptureRevocation {
@@ -2369,6 +2465,7 @@ enum WorkPhase {
     Prelaunch,
     Launching,
     Running,
+    Started,
     Completing,
 }
 
@@ -2482,6 +2579,27 @@ where
         }
     }
 
+    fn record_started(&mut self, action: ActionId) {
+        if let Some(work) = self.active.get_mut(&action) {
+            work.phase = WorkPhase::Started;
+        }
+    }
+
+    fn panic_settlement(&self, action: ActionId) -> StepTaskPanicSettlement<Deadline> {
+        let Some(work) = self.active.get(&action) else {
+            return StepTaskPanicSettlement::Gone;
+        };
+        if let Some(cancellation) = work.cancellation.clone() {
+            return StepTaskPanicSettlement::Cancelled(cancellation);
+        }
+        match work.phase {
+            WorkPhase::Prelaunch | WorkPhase::Launching | WorkPhase::Running => {
+                StepTaskPanicSettlement::Start
+            }
+            WorkPhase::Started | WorkPhase::Completing => StepTaskPanicSettlement::Execution,
+        }
+    }
+
     fn cancel(
         &mut self,
         step: String,
@@ -2508,7 +2626,9 @@ where
             deadline: deadline.clone(),
         });
         let interrupt = match (work.phase, work.process_group.clone()) {
-            (WorkPhase::Running, Some(process_group)) if !work.interrupt_sent => {
+            (WorkPhase::Running | WorkPhase::Started, Some(process_group))
+                if !work.interrupt_sent =>
+            {
                 work.interrupt_sent = true;
                 Some(process_group)
             }
@@ -2574,7 +2694,7 @@ where
         }
     }
 
-    fn revoke_all_for_commit_failure(
+    fn revoke_all(
         &mut self,
         deadline: Deadline,
     ) -> Vec<(
@@ -2594,7 +2714,9 @@ where
                 deadline: deadline.clone(),
             });
             let interrupt = match (work.phase, work.process_group.clone()) {
-                (WorkPhase::Running, Some(process_group)) if !work.interrupt_sent => {
+                (WorkPhase::Running | WorkPhase::Started, Some(process_group))
+                    if !work.interrupt_sent =>
+                {
                     work.interrupt_sent = true;
                     Some(process_group)
                 }
@@ -2676,6 +2798,19 @@ where
         }
         work.agent_deadline_finished.take()
     }
+}
+
+enum StepTaskPanicSettlement<Deadline> {
+    Start,
+    Execution,
+    Cancelled(CommandCancellation<Deadline>),
+    Gone,
+}
+
+#[derive(Clone, Copy)]
+enum SpawnedStepTask {
+    Step,
+    RecoveryHandler { round: RecoveryRoundNumber },
 }
 
 enum StartDelivery<Deadline> {
@@ -2781,12 +2916,19 @@ where
                     else {
                         return;
                     };
-                    let tasks = runtime.tasks.clone();
-                    tasks.spawn(async move {
-                        let _ = runtime
-                            .execute_registered_step(step, requested.id, inputs, cancellation)
-                            .await;
-                    });
+                    let execution = runtime.clone();
+                    runtime.spawn_step_task(
+                        step.clone(),
+                        requested.id,
+                        SpawnedStepTask::Step,
+                        async move {
+                            #[cfg(test)]
+                            execution.panic_if_step_task_injected(&step);
+                            execution
+                                .execute_registered_step(step, requested.id, inputs, cancellation)
+                                .await
+                        },
+                    );
                 }
                 // A recovery action intentionally has the same delivery deduplication shell as
                 // a target action but dispatches a graph-input-free physical invocation.
@@ -2801,18 +2943,25 @@ where
                     else {
                         return;
                     };
-                    let tasks = runtime.tasks.clone();
-                    tasks.spawn(async move {
-                        let _ = runtime
-                            .execute_recovery_handler(
-                                step,
-                                round,
-                                requested.id,
-                                history,
-                                cancellation,
-                            )
-                            .await;
-                    });
+                    let execution = runtime.clone();
+                    runtime.spawn_step_task(
+                        step.clone(),
+                        requested.id,
+                        SpawnedStepTask::RecoveryHandler { round },
+                        async move {
+                            #[cfg(test)]
+                            execution.panic_if_step_task_injected(&step);
+                            execution
+                                .execute_recovery_handler(
+                                    step,
+                                    round,
+                                    requested.id,
+                                    history,
+                                    cancellation,
+                                )
+                                .await
+                        },
+                    );
                 }
                 // jscpd:ignore-end
                 Action::CancelStep { step, deadline, .. } => {
@@ -3002,8 +3151,11 @@ where
     let result = Coordinator::new(admitted, receiver, clock, commits, actions)
         .run()
         .await;
-    if matches!(result, Err(CoordinationError::CommitFailed)) {
-        lifecycle.quiesce_after_commit_failure().await;
+    if matches!(
+        result,
+        Err(CoordinationError::CommitFailed | CoordinationError::TransitionCapacityExceeded)
+    ) {
+        lifecycle.quiesce_active_work().await;
     } else {
         lifecycle.shutdown().await;
     }

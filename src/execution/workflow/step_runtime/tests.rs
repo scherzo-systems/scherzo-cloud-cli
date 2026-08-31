@@ -31,10 +31,11 @@ use crate::execution::workflow::artifact::{
     CaptureDeclaration, CaptureFailure, CaptureFailureKind,
 };
 use crate::execution::workflow::coordinator::{
-    CommitPort, CommittedReduction, CoordinationError, CoordinatorClock,
+    CommitPort, CommittedReduction, CoordinationError, Coordinator, CoordinatorClock,
     DriverOccurrenceTestAcknowledgement, OccurrenceReceiver, occurrence_channel,
 };
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
+use crate::execution::workflow::evidence::FailureCode;
 use crate::execution::workflow::execution_root::ExecutionRootPrelaunchBoundary;
 use crate::execution::workflow::input::InputStaging;
 use crate::execution::workflow::resolution;
@@ -770,6 +771,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                 state: StepState::Running,
                 current_action: Some(started_action),
                 target_execution: Some(TargetExecutionNumber::FIRST),
+                target_invocation: Some(started_action),
                 active_invocation: Some(ActiveStepInvocation::Target {
                     execution_number: TargetExecutionNumber::FIRST,
                 }),
@@ -782,6 +784,44 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                 outputs: BTreeMap::new(),
             }
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn transition_capacity_failure_quiesces_a_running_step() {
+    with_watchdog(async {
+        let PreparedFixtureCommand {
+            _temporary,
+            listener,
+            mut admitted,
+            ..
+        } = prepare_fixture_command(ProgramForm::Absolute, 0).await;
+        admitted.set_transition_ceiling(1);
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let (commit_sender, _commits) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+        );
+        tokio::pin!(execution);
+        let result = tokio::select! {
+            result = &mut execution => result,
+            command = accept_report(&listener) => {
+                let (control, _report) = command;
+                let result = (&mut execution).await;
+                drop(control);
+                result
+            }
+        };
+        assert_eq!(result, Err(CoordinationError::TransitionCapacityExceeded));
     })
     .await;
 }
@@ -842,7 +882,9 @@ async fn semantic_outputs_capture_cancellation_discards_stale_delivery() {
     assert_eq!(
         cancelled.state.steps["task"].state,
         StepState::Cancelling {
-            reason: CancellationReason::UserRequest,
+            detail: super::super::evidence::CancellationDetail::new(
+                CancellationReason::UserRequest,
+            ),
         }
     );
     let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
@@ -1578,7 +1620,7 @@ exports:
         .find(|requested| matches!(requested.action, Action::FinishRun { .. }))
         .unwrap();
     let Action::FinishRun { exports, .. } = &finish.action else {
-        unreachable!();
+        panic!("fixture action did not finish the run");
     };
     let ExportValue::Available { output: alpha } = &exports["alphaExport"] else {
         panic!("alpha export was unavailable");
@@ -1897,7 +1939,7 @@ steps:
         .iter()
         .map(|requested| match &requested.action {
             Action::StartStep { step, .. } => (step.clone(), requested.id),
-            _ => unreachable!(),
+            _ => panic!("fixture action did not start a step"),
         })
         .collect::<BTreeMap<_, _>>();
     let alpha_running =
@@ -2265,6 +2307,57 @@ async fn assert_execution_root_rebinding_fails_before_spawn(command: RebindingCo
 }
 
 #[tokio::test]
+async fn panicked_spawned_step_task_fails_the_named_step() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let source = workflow_source(&[("task", None, &["/bin/true"])]);
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            &source,
+            EnvironmentSnapshot::default(),
+            1,
+        );
+        let artifacts = test_artifacts(&admitted);
+        let (occurrences, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+        let runtime = StepRuntime::new(
+            admitted.clone(),
+            artifacts.staging,
+            artifacts.inputs,
+            occurrences,
+            TestClock,
+        );
+        runtime.inject_step_task_panic("task");
+        let (commit_sender, _commits) = mpsc::unbounded_channel();
+        let result = Coordinator::new(
+            admitted,
+            receiver,
+            TestClock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+            runtime.clone(),
+        )
+        .run()
+        .await
+        .unwrap();
+        runtime.shutdown().await;
+
+        let WorkflowState::Failed { primary_issue, .. } = result.state.workflow else {
+            panic!("panicked task did not fail the workflow");
+        };
+        assert_eq!(primary_issue.node.id, "task");
+        let StepState::Failed { detail } = &result.state.steps["task"].state else {
+            panic!("panicked task did not retain step failure evidence");
+        };
+        assert_eq!(detail.code, FailureCode::PreparationTaskUnavailable);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn nonzero_exit_is_a_typed_execution_occurrence_with_the_start_action() {
     with_watchdog(async {
         let run = run_fixture_command(ProgramForm::Absolute, 23).await;
@@ -2366,18 +2459,14 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
         )
         .await
         .unwrap();
-        let WorkflowState::Failed {
-            primary_failure, ..
-        } = result.state.workflow
-        else {
+        let WorkflowState::Failed { primary_issue, .. } = result.state.workflow else {
             panic!("launch failure did not fail the workflow");
         };
-        assert_eq!(
-            primary_failure.cause,
-            StepFailureCause::Start(StepStartFailure::CommandLaunch(
-                CommandLaunchFailure::NotFound
-            ))
-        );
+        assert!(matches!(
+            primary_issue.detail,
+            super::super::evidence::PrimaryIssueDetail::Failed(ref detail)
+                if detail.code == super::super::evidence::FailureCode::CommandLaunchNotFound
+        ));
         assert_eq!(launch_artifacts.inputs.reservation_usage(), (0, 0, 0));
     })
     .await;

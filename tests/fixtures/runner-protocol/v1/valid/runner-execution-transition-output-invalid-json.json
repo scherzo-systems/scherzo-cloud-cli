@@ -21,9 +21,9 @@
       "failurePolicy": "required",
       "from": "capturing_outputs",
       "to": "failed",
-      "failure": {
+      "detail": {
         "phase": "output_capture",
-        "cause": "output_invalid_json",
+        "code": "output_invalid_json",
         "output": "value"
       }
     }

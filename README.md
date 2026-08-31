@@ -38,10 +38,11 @@ scherzo-cloud workflow validate \
 ```
 
 Ready-to-run command and agent bundles are available under
-[`examples/workflows/`](examples/workflows/). They cover basic DAGs, output presentation,
-expected failures, cancellation, structured agent results, attachments, and workflow
-finalizers. Definition validation is offline; running an agent example requires its
-selected harness and provider credentials and may consume billed tokens.
+[`examples/workflows/`](examples/workflows/). They cover basic DAGs, command input and
+output dataflow, recovery, advisory and required failures, cancellation, all three agent
+harnesses, structured agent results, attachments, and workflow finalizers. Definition
+validation is offline; running an agent example requires its selected harness and
+provider credentials and may consume billed tokens.
 
 `--source-root` is required and defines the complete directory boundary for the
 selected workflow YAML and all static prompts, message files, attachments, and result
@@ -171,6 +172,16 @@ as authority. They remain owner-private after every terminal outcome, are not in
 published attempt results, have no stable viewer or download interface, and disappear
 only when the owning durable run directory is removed.
 
+An ordinary command or agent step may declare `recovery.retries` from 1 through 10 and
+optionally one `cmd` or fresh `agent` handler. Without a handler, Scherzo immediately
+rechecks the unchanged target. A handler can only return the closed `recheck` or
+`gave_up` decision through its engine-owned private result transport; it is not a DAG
+node and publishes no output. Every target recheck and handler is a fresh physical
+invocation in the same execution root. Provisional target failures remain history, and
+only the target invocation supplying terminal success commits outputs. Repeated external
+effects are at-least-once: authors supply stable domain idempotency keys through existing
+explicit inputs or admitted environment, never from Scherzo invocation or round IDs.
+
 Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
 `--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
 completely before execution. Workflow commands always receive closed standard input;
@@ -281,7 +292,10 @@ scherzo-cloud workflow retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
 Status reads only the closed `run.json` and `state.json` contracts and an existing
-regular `run.lock`; it never scans `.private`, creates the lock, acquires execution
+regular `run.lock`. For activated step recovery, plain and JSON snapshots report the
+active or terminal target/handler role, round, target execution, decision, invocation
+accounting and usage, raw terminal disposition, output ownership, and retry eligibility.
+It never scans `.private`, creates the lock, acquires execution
 ownership, waits for an owner, signals child work, or reads standard input. Its
 non-acquiring lock query combines with two matching state revisions to distinguish an
 active owner, a settled run, an abandoned nonterminal attempt, and ownership that cannot
@@ -322,7 +336,8 @@ with each other. The command never opens `/dev/tty` or falls back after selectin
 TUI.
 
 The plain summary contains retained attempt and execution identity, lifecycle, duration,
-node disposition, direct typed causes, terminal counts, outcome, cancellation, and
+node disposition, direct typed causes, activated Recovery Summary Schema 1,
+per-invocation usage and output ownership, terminal counts, outcome, cancellation, and
 finalization facts. It does not replay events or print retained stdout or stderr,
 commands, exports, artifact contents, or agent observations, and it claims no ordering
 between retained streams.
@@ -451,7 +466,7 @@ a trusted external guide owns action selection, explanation, and approval.
 Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to
 the runner. The default set contains only `environment.command.git`. It executes the
 `git` resolved from the runner process's `PATH`, requires a parseable version at least
-`0.0.1`, and reports a pass or failure for that check. Select
+`2.29.0`, and reports a pass or failure for that check. Select
 `execution.harness.pi-json-v1` explicitly to check the `pi` inherited through the same
 operator-controlled `PATH`, select `execution.harness.claude-code-stream-json-v1` to 
 check `claude`, or `execution.harness.codex-app-server-v1` to check `codex` 
@@ -614,17 +629,29 @@ resource, credential, and secret isolation. Follow the harness rollout runbook, 
 the required native qualification boundary, service restart, selected-harness no-fallback
 recovery, and the separately deferred first credentialed production-runner canary.
 
+Runner protocol v1 implements exactly
+`workflow_v1_cloud_inputs_artifacts@1`, including ordinary-step recovery, every closed
+Workflow V1 output/export, and terminal recovery evidence. Assignment admission consumes
+the immutable resolver-carried transition, invocation, retention, and encoded-outbox
+capacity bound to the workflow source closure; Runner Serve does not re-derive formulas.
+Recovery transitions carry compact settling-invocation evidence, and the portable result
+owns the complete closed summary/history. All ordinary frames remain at most 64 KiB, and
+at most one terminal frame per assignment may use the 32 MiB terminal class.
+
 The runner reconnects after retryable network, timeout, rate-limit, Gateway restart, and
 server failures with jittered backoff while retaining boot-scoped assignment state.
 Credential rejection is terminal authentication; unsupported subprotocol or malformed
 Cloud protocol is terminal protocol. Terminal outcomes exit nonzero without exposing
-bearer material. The work root must be an existing directory. Every offer supplies a
-pinned source that the service materializes and verifies beneath that root. The service
-validates the welcomed execution-lease policy and local clock health and reserves its
-one local slot before reporting semantic acceptance. Transport
-receipt and semantic acceptance remain separate; execution requires a later start
-effect and remains bounded by the latest received execution lease across same-boot
-reconnects.
+bearer material. The work root must be an existing directory. An offer reserves one
+assignment-private root but starts no source or input work. After the matching prepare
+effect, Runner Serve checks out the pinned source, verifies the authoritative canonical
+Run Input manifest, downloads every member through fresh exact capabilities into random
+0600 temporary files without redirects, and admits the complete prompt and ordered
+attachments before semantic acceptance. The fixed preparation deadline is not extended
+by progress. Verified staging remains under the assignment root through execution and is
+removed or quarantined by the existing release path. Transport receipt and semantic
+acceptance remain separate; execution requires a later start effect and remains bounded
+by the latest received execution lease across same-boot reconnects.
 
 While the service runs, standard error contains newline-delimited JSON. Each outbound
 attempt completes one `runner.gateway_connection` event with safe runner and boot IDs,

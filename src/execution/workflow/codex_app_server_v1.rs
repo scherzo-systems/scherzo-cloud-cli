@@ -42,22 +42,24 @@ pub(crate) struct CodexAppServerV1ProtocolLimits {
 
 impl CodexAppServerV1ProtocolLimits {
     pub(crate) const fn profile() -> Self {
-        let Some(maximum_frame_bytes) = NonZeroU64::new(MAXIMUM_FRAME_BYTES) else {
-            unreachable!();
+        let maximum_frame_bytes = match NonZeroU64::new(MAXIMUM_FRAME_BYTES) {
+            Some(value) => value,
+            None => NonZeroU64::MIN,
         };
-        let Some(maximum_correlation_bytes) = NonZeroU64::new(MAXIMUM_CORRELATION_BYTES) else {
-            unreachable!();
+        let maximum_correlation_bytes = match NonZeroU64::new(MAXIMUM_CORRELATION_BYTES) {
+            Some(value) => value,
+            None => NonZeroU64::MIN,
         };
-        let Some(maximum_retained_agent_message_bytes) =
-            NonZeroU64::new(MAXIMUM_RETAINED_AGENT_MESSAGE_BYTES)
-        else {
-            unreachable!();
-        };
-        let Some(maximum_retained_diagnostic_bytes) =
-            NonZeroU64::new(MAXIMUM_RETAINED_DIAGNOSTIC_BYTES)
-        else {
-            unreachable!();
-        };
+        let maximum_retained_agent_message_bytes =
+            match NonZeroU64::new(MAXIMUM_RETAINED_AGENT_MESSAGE_BYTES) {
+                Some(value) => value,
+                None => NonZeroU64::MIN,
+            };
+        let maximum_retained_diagnostic_bytes =
+            match NonZeroU64::new(MAXIMUM_RETAINED_DIAGNOSTIC_BYTES) {
+                Some(value) => value,
+                None => NonZeroU64::MIN,
+            };
         Self {
             maximum_frame_bytes,
             maximum_correlation_bytes,

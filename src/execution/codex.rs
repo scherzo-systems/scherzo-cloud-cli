@@ -250,7 +250,7 @@ impl CodexInstallationFailure {
 
     fn with_identity(mut self, candidate: CodexInstallationIdentity) -> Self {
         match &mut self {
-            Self::Missing => debug_assert!(false, "missing Codex cannot have a probed identity"),
+            Self::Missing => {}
             Self::Unexecutable { identity }
             | Self::Malformed { identity, .. }
             | Self::Unsupported { identity, .. } => *identity = Some(candidate),

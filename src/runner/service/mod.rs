@@ -10,6 +10,7 @@ mod conversation;
 mod determinism_spike;
 mod execution;
 mod lease_clock;
+mod run_inputs;
 mod source;
 #[cfg(test)]
 mod test_support;
@@ -619,55 +620,49 @@ async fn run_connection_loop_with_work_root(
                         () = &mut notified => ActiveEvent::AssignmentNotification,
                         result = &mut connection => ActiveEvent::Finished(result),
                     };
-                    match event {
-                        event @ (ActiveEvent::ManualReload(_) | ActiveEvent::StartupReload) => {
-                            let (request, startup) = match event {
-                                ActiveEvent::ManualReload(request) => (Some(request), false),
-                                ActiveEvent::StartupReload => (None, true),
-                                ActiveEvent::AssignmentNotification
-                                | ActiveEvent::Shutdown
-                                | ActiveEvent::Finished(_) => unreachable!(),
-                            };
-                            if startup {
-                                startup_reload_pending = false;
-                            }
-                            match reload_dependencies
-                                .perform_while_connected(
-                                    &config,
-                                    &sequence,
-                                    attempt.saturating_add(1),
-                                    request,
-                                    &mut connection,
-                                    shutdown,
-                                )
-                                .await
-                            {
-                                ConnectedReloadResult::Continue => {}
-                                ConnectedReloadResult::Promoted(promoted) => {
-                                    cancel_attempt(&connection_event, &active_effect_event);
-                                    startup_reload_pending = false;
-                                    break ActiveAttemptResult::Promoted(promoted);
-                                }
-                                ConnectedReloadResult::Shutdown => {
-                                    shutdown_deadline = Some(begin_shutdown(
-                                        &live_status,
-                                        &assignment_manager,
-                                        &sleeper,
-                                    )?);
-                                    shutting_down = true;
-                                }
-                                ConnectedReloadResult::Finished(result) => {
-                                    break ActiveAttemptResult::Finished(result);
-                                }
-                            }
-                        }
-                        ActiveEvent::AssignmentNotification => continue,
+                    let reload = match event {
+                        ActiveEvent::ManualReload(request) => Some((Some(request), false)),
+                        ActiveEvent::StartupReload => Some((None, true)),
+                        ActiveEvent::AssignmentNotification => None,
                         ActiveEvent::Shutdown => {
                             shutdown_deadline =
                                 Some(begin_shutdown(&live_status, &assignment_manager, &sleeper)?);
                             shutting_down = true;
+                            None
                         }
                         ActiveEvent::Finished(result) => {
+                            break ActiveAttemptResult::Finished(result);
+                        }
+                    };
+                    let Some((request, startup)) = reload else {
+                        continue;
+                    };
+                    if startup {
+                        startup_reload_pending = false;
+                    }
+                    match reload_dependencies
+                        .perform_while_connected(
+                            &config,
+                            &sequence,
+                            attempt.saturating_add(1),
+                            request,
+                            &mut connection,
+                            shutdown,
+                        )
+                        .await
+                    {
+                        ConnectedReloadResult::Continue => {}
+                        ConnectedReloadResult::Promoted(promoted) => {
+                            cancel_attempt(&connection_event, &active_effect_event);
+                            startup_reload_pending = false;
+                            break ActiveAttemptResult::Promoted(promoted);
+                        }
+                        ConnectedReloadResult::Shutdown => {
+                            shutdown_deadline =
+                                Some(begin_shutdown(&live_status, &assignment_manager, &sleeper)?);
+                            shutting_down = true;
+                        }
+                        ConnectedReloadResult::Finished(result) => {
                             break ActiveAttemptResult::Finished(result);
                         }
                     }
@@ -966,7 +961,11 @@ impl ReloadDependencies {
         mut request: Option<ReloadRequest>,
     ) -> Option<PromotedAttempt> {
         let result = self.reload_candidate(config, sequence, attempt).await;
-        respond_to_reload(&mut request, &result);
+        let response = result
+            .as_ref()
+            .map(promoted_credential_id)
+            .map_err(|error| *error);
+        respond_to_reload(&mut request, response);
         result.ok()
     }
 
@@ -988,13 +987,17 @@ impl ReloadDependencies {
                 biased;
                 () = self.live_status.wait_until_connected() => {}
                 result = &mut *connection => {
-                    let failure = Err(ControlError::PendingConnectionFailed);
-                    respond_to_reload(&mut request, &failure);
+                    respond_to_reload(
+                        &mut request,
+                        Err(ControlError::PendingConnectionFailed),
+                    );
                     return ConnectedReloadResult::Finished(result);
                 }
                 _ = shutdown.wait() => {
-                    let failure = Err(ControlError::PendingConnectionFailed);
-                    respond_to_reload(&mut request, &failure);
+                    respond_to_reload(
+                        &mut request,
+                        Err(ControlError::PendingConnectionFailed),
+                    );
                     return ConnectedReloadResult::Shutdown;
                 }
             }
@@ -1005,39 +1008,37 @@ impl ReloadDependencies {
             biased;
             result = &mut preparation => result,
             result = &mut *connection => {
-                let failure = Err(ControlError::PendingConnectionFailed);
-                respond_to_reload(&mut request, &failure);
+                respond_to_reload(
+                    &mut request,
+                    Err(ControlError::PendingConnectionFailed),
+                );
                 return ConnectedReloadResult::Finished(result);
             }
             _ = shutdown.wait() => {
-                let failure = Err(ControlError::PendingConnectionFailed);
-                respond_to_reload(&mut request, &failure);
+                respond_to_reload(
+                    &mut request,
+                    Err(ControlError::PendingConnectionFailed),
+                );
                 return ConnectedReloadResult::Shutdown;
             }
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                let failure = Err(error);
-                respond_to_reload(&mut request, &failure);
+                respond_to_reload(&mut request, Err(error));
                 return ConnectedReloadResult::Continue;
             }
         };
         match self.commit_candidate(prepared).await {
             Ok(promoted) => {
-                let success = Ok(promoted);
-                respond_to_reload(&mut request, &success);
-                let Ok(promoted) = success else {
-                    unreachable!("successful reload result changed before installation")
-                };
+                respond_to_reload(&mut request, Ok(promoted_credential_id(&promoted)));
                 ConnectedReloadResult::Promoted(Box::new(promoted))
             }
             Err(error) => {
                 let recovery = self
                     .prepare_connection(config.clone(), sequence, attempt.saturating_add(1))
                     .await;
-                let failure = Err(error);
-                respond_to_reload(&mut request, &failure);
+                respond_to_reload(&mut request, Err(error));
                 match recovery {
                     Ok(recovered) => ConnectedReloadResult::Promoted(Box::new(recovered)),
                     Err(_) => ConnectedReloadResult::Continue,
@@ -1217,16 +1218,13 @@ fn candidate_control_error(connection_event: &Event, error: ConnectionError) -> 
     category
 }
 
-fn respond_to_reload(
-    request: &mut Option<ReloadRequest>,
-    result: &Result<PromotedAttempt, ControlError>,
-) {
+fn promoted_credential_id(promoted: &PromotedAttempt) -> String {
+    promoted.config.credential().credential_id().to_owned()
+}
+
+fn respond_to_reload(request: &mut Option<ReloadRequest>, result: Result<String, ControlError>) {
     if let Some(request) = request.take() {
-        let response = result
-            .as_ref()
-            .map(|promoted| promoted.config.credential().credential_id().to_owned())
-            .map_err(|error| *error);
-        let _ = request.response.send(response);
+        let _ = request.response.send(result);
     }
 }
 
@@ -1373,11 +1371,11 @@ mod tests {
     use super::test_support::{
         ControlledShutdownTrigger, FixtureSocket, SleepRelease, accept_fixture_socket,
         accept_fixture_socket_with_headers, accept_opened_fixture_socket, assignment_offer,
-        controlled_shutdown, controlled_sleeper, deterministic_frame_source,
-        effect_acknowledgement, effect_observation_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_lease_clock, fixture_listener, observation_acknowledgement,
-        offer_assignment_after_handshake, scripted_connector, sleep_request,
-        terminal_observation_acknowledgement, welcome, with_watchdog,
+        begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
+        deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
+        expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
+        observation_acknowledgement, offer_assignment_after_handshake, scripted_connector,
+        sleep_request, terminal_observation_acknowledgement, welcome, with_watchdog,
     };
     use super::workspace::{
         CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
@@ -1848,16 +1846,32 @@ mod tests {
                 .await
                 .unwrap();
             current.send(assignment_offer()).await.unwrap();
-            loop {
-                let Some(Ok(Message::Text(frame))) = current.next().await else {
-                    panic!("current connection closed before assignment acceptance");
-                };
-                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
-                if frame["type"] == "assignment_accepted" {
-                    accepted_sent.send(()).unwrap();
-                    break;
-                }
-            }
+            let offer_acknowledgement = effect_acknowledgement(&mut current).await;
+            acknowledge_runner_frame(
+                &mut current,
+                &offer_acknowledgement,
+                "acknowledge assignment offer",
+            )
+            .await;
+            let prepare_acknowledgement = begin_assignment_preparation(&mut current).await;
+            acknowledge_runner_frame(
+                &mut current,
+                &prepare_acknowledgement,
+                "acknowledge assignment prepare effect",
+            )
+            .await;
+            let _accepted =
+                next_semantic_assignment_frame(&mut current, "assignment_accepted").await;
+            current
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
+            let Some(Ok(Message::Pong(payload))) = with_watchdog(current.next()).await.unwrap()
+            else {
+                panic!("current connection did not cross the preparation acknowledgement barrier");
+            };
+            assert_eq!(payload.as_ref(), &[1, 2, 3]);
+            accepted_sent.send(()).unwrap();
 
             let mut pending = accept_fixture_socket(&listener).await;
             let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
@@ -1875,17 +1889,24 @@ mod tests {
                 .unwrap();
             while let Some(Ok(Message::Text(frame))) = pending.next().await {
                 let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                // Promotion can replay a preparation-progress observation whose
+                // acknowledgement was still buffered on the retired transport.
+                // Acknowledge every expected observation in FIFO order instead
+                // of assuming the accepted observation is replayed first.
                 if matches!(
                     frame["type"].as_str(),
-                    Some("assignment_accepted" | "assignment_interrupted")
+                    Some(
+                        "assignment_preparation_progress"
+                            | "assignment_accepted"
+                            | "assignment_interrupted"
+                    )
                 ) {
-                    pending
-                        .send(observation_acknowledgement(
-                            frame["messageId"].as_str().unwrap(),
-                            frame["sequence"].as_u64().unwrap(),
-                        ))
-                        .await
-                        .unwrap();
+                    acknowledge_runner_frame(
+                        &mut pending,
+                        &frame,
+                        "acknowledge replayed assignment observation",
+                    )
+                    .await;
                 }
                 if frame["type"] == "assignment_interrupted" {
                     break;
@@ -2022,12 +2043,25 @@ mod tests {
 
             let (pending_stream, _) = listener.accept().await.unwrap();
             current.send(assignment_offer()).await.unwrap();
-            let Some(Ok(Message::Text(current_observation))) = current.next().await else {
-                panic!("current connection omitted assignment observation");
-            };
-            let current_observation: serde_json::Value =
-                serde_json::from_str(&current_observation).unwrap();
-            let latest_current_sequence = current_observation["sequence"].as_u64().unwrap();
+            let offer_acknowledgement = effect_acknowledgement(&mut current).await;
+            acknowledge_runner_frame(
+                &mut current,
+                &offer_acknowledgement,
+                "acknowledge assignment offer",
+            )
+            .await;
+            let prepare_acknowledgement = begin_assignment_preparation(&mut current).await;
+            acknowledge_runner_frame(
+                &mut current,
+                &prepare_acknowledgement,
+                "acknowledge assignment prepare effect",
+            )
+            .await;
+            let rejection =
+                next_semantic_assignment_frame(&mut current, "assignment_rejected").await;
+            let latest_current_sequence = rejection["sequence"].as_u64().unwrap();
+            acknowledge_runner_frame(&mut current, &rejection, "acknowledge assignment rejection")
+                .await;
 
             let mut pending = accept_fixture_stream(pending_stream).await;
             let Some(Ok(Message::Text(pending_hello))) = pending.next().await else {
@@ -2358,6 +2392,39 @@ mod tests {
         (temporary, config)
     }
 
+    async fn acknowledge_runner_frame(
+        socket: &mut FixtureSocket,
+        frame: &serde_json::Value,
+        description: &str,
+    ) {
+        socket
+            .send(effect_observation_acknowledgement(
+                frame["messageId"].as_str().unwrap(),
+                frame["sequence"].as_u64().unwrap(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{description}: {error}"));
+    }
+
+    async fn next_semantic_assignment_frame(
+        socket: &mut FixtureSocket,
+        expected_type: &str,
+    ) -> serde_json::Value {
+        loop {
+            let Some(Ok(Message::Text(frame))) = socket.next().await else {
+                panic!("connection closed before {expected_type}");
+            };
+            let frame: serde_json::Value =
+                serde_json::from_str(&frame).expect("decode assignment observation");
+            if frame["type"] == "assignment_preparation_progress" {
+                acknowledge_runner_frame(socket, &frame, "acknowledge preparation progress").await;
+                continue;
+            }
+            assert_eq!(frame["type"], expected_type);
+            return frame;
+        }
+    }
+
     async fn accept_assignment_interruption(
         listener: &tokio::net::TcpListener,
         accepted_sent: tokio::sync::oneshot::Sender<()>,
@@ -2366,19 +2433,15 @@ mod tests {
         let effect =
             offer_assignment_after_handshake(&mut socket, "rmsg_00000000000000000000000002", 1)
                 .await;
-        socket
-            .send(effect_observation_acknowledgement(
-                effect["messageId"].as_str().unwrap(),
-                effect["sequence"].as_u64().unwrap(),
-            ))
-            .await
-            .expect("acknowledge offer receipt");
-        let Some(Ok(Message::Text(accepted))) = socket.next().await else {
-            panic!("fixture did not receive assignment acceptance");
-        };
-        let accepted: serde_json::Value =
-            serde_json::from_str(&accepted).expect("decode assignment acceptance");
-        assert_eq!(accepted["type"], "assignment_accepted");
+        acknowledge_runner_frame(&mut socket, &effect, "acknowledge offer receipt").await;
+        let prepare_acknowledgement = begin_assignment_preparation(&mut socket).await;
+        acknowledge_runner_frame(
+            &mut socket,
+            &prepare_acknowledgement,
+            "acknowledge assignment prepare effect",
+        )
+        .await;
+        let accepted = next_semantic_assignment_frame(&mut socket, "assignment_accepted").await;
         accepted_sent
             .send(())
             .expect("report assignment acceptance");
@@ -2486,17 +2549,31 @@ mod tests {
         capture: &TestCapture,
         effect_outcome: &str,
         effect_error_type: Option<&str>,
+        expected_effect_count: usize,
+        expected_event_count: usize,
     ) -> serde_json::Map<String, serde_json::Value> {
-        assert_eq!(capture.events().len(), 2);
-        let effect = capture.event("runner.effect_acknowledgement");
-        assert_eq!(effect["scherzo.outcome"], effect_outcome);
+        let events = capture.events();
+        assert_eq!(events.len(), expected_event_count);
+        let effect = events
+            .iter()
+            .find(|event| {
+                event["event.name"] == "runner.effect_acknowledgement"
+                    && event["scherzo.outcome"] == effect_outcome
+            })
+            .expect("captured effect acknowledgement outcome should exist");
         assert_eq!(
             effect.get("error.type").and_then(serde_json::Value::as_str),
             effect_error_type,
         );
-        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
+        assert_eq!(
+            capture.span_count("runner.effect_acknowledgement"),
+            expected_effect_count
+        );
         assert_eq!(capture.span_count("runner.gateway_connection"), 1);
-        capture.event("runner.gateway_connection")
+        events
+            .into_iter()
+            .find(|event| event["event.name"] == "runner.gateway_connection")
+            .expect("captured gateway connection should exist")
     }
 
     #[tokio::test]
@@ -2813,7 +2890,7 @@ mod tests {
             .expect("fixture server failed");
 
         let connection =
-            assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"));
+            assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"), 1, 2);
         assert_eq!(connection["scherzo.outcome"], "timeout");
         assert_eq!(connection["error.type"], "gateway_liveness_timeout");
 
@@ -2906,12 +2983,23 @@ mod tests {
         let (pending_sent, pending_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut socket = accept_opened_fixture_socket(&listener).await;
-            let _acknowledgement =
+            let offer_acknowledgement =
                 offer_assignment_after_handshake(&mut socket, "rmsg_00000000000000000000000002", 1)
                     .await;
+            acknowledge_runner_frame(
+                &mut socket,
+                &offer_acknowledgement,
+                "acknowledge assignment offer",
+            )
+            .await;
+            let _pending_prepare_acknowledgement = begin_assignment_preparation(&mut socket).await;
+            let rejection =
+                next_semantic_assignment_frame(&mut socket, "assignment_rejected").await;
+            acknowledge_runner_frame(&mut socket, &rejection, "acknowledge assignment rejection")
+                .await;
             pending_sent
                 .send(())
-                .expect("report pending effect acknowledgement");
+                .expect("report pending prepare effect acknowledgement");
             while let Some(Ok(_)) = socket.next().await {}
         });
 
@@ -2933,14 +3021,14 @@ mod tests {
             .expect("fixture server did not observe shutdown")
             .expect("fixture server failed");
 
-        let connection = assert_attempt_event_pair(&capture, "cancelled", None);
+        let connection = assert_attempt_event_pair(&capture, "cancelled", None, 2, 4);
+        assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
         assert_eq!(connection["scherzo.outcome"], "cancelled");
         assert_eq!(connection["scherzo.runner.opening_acknowledged"], true);
         assert_eq!(connection["scherzo.runner.handshake_completed"], true);
         assert!(connection.get("error.type").is_none());
         assert!(connection.get("scherzo.connection.failure_kind").is_none());
         assert!(connection.get("scherzo.connection.backoff_ms").is_none());
-        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 1);
         assert_eq!(capture.span_count("runner.gateway_connection"), 1);
     }
 }

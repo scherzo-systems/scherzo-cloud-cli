@@ -19,7 +19,7 @@ use super::{DecodeFailureKind, decode, validation};
 use crate::execution::workflow::document::Output;
 
 const CONTENT_CLOSURE_DOMAIN: &[u8] = b"scherzo.workflow.content-closure.v1\0";
-const MAX_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
 const SHA256_ALGORITHM: &str = "sha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::claude_code::ClaudeCodeConfig;
 use super::codex::CodexConfig;
 use super::document::{FailurePolicy, FinalizationTrigger, Output};
+use super::evidence::Prerequisite;
 use super::pi::PiConfig;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -25,13 +26,17 @@ pub(crate) struct RequiredImports {
     pub(crate) prompt: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum WorkflowNodeRole {
     Step,
     Finalizer,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowNode {
     pub(crate) id: String,
     pub(crate) role: WorkflowNodeRole,
@@ -112,6 +117,7 @@ pub(crate) struct ResolvedDirectPrerequisite {
 pub(crate) struct ValidatedCommonStep {
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) prerequisites: Vec<ResolvedDirectPrerequisite>,
+    pub(crate) evidence_prerequisites: Vec<Prerequisite>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, ValidatedOutput>,
 }

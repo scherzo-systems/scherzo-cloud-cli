@@ -632,7 +632,27 @@ fn settle_as_workflow_failed(run: &InitialLocalRun) {
             attempt.settled_at = Some(settled);
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.progress.steps[0].detail =
+                Some(crate::execution::workflow::evidence::NodeDetail::Failed(
+                    crate::execution::workflow::evidence::FailureDetail::new(
+                        crate::execution::workflow::evidence::FailurePhase::Execution,
+                        crate::execution::workflow::evidence::FailureCode::CommandExit,
+                        None,
+                        None,
+                        None,
+                        Some(23),
+                    )
+                    .unwrap(),
+                ));
             attempt.progress.steps[1].state = AttemptStepStateV1::Blocked;
+            attempt.progress.steps[1].detail =
+                Some(crate::execution::workflow::evidence::NodeDetail::Blocked(
+                    crate::execution::workflow::evidence::BlockedDetail::new([
+                        crate::execution::workflow::evidence::Prerequisite::control("first")
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ));
             attempt.result = AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
             };
@@ -709,6 +729,18 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
             attempt.settled_at = Some(settled);
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.progress.steps[0].detail =
+                Some(crate::execution::workflow::evidence::NodeDetail::Failed(
+                    crate::execution::workflow::evidence::FailureDetail::new(
+                        crate::execution::workflow::evidence::FailurePhase::Execution,
+                        crate::execution::workflow::evidence::FailureCode::CommandExit,
+                        None,
+                        None,
+                        None,
+                        Some(1),
+                    )
+                    .unwrap(),
+                ));
             attempt.finalization = Some(AttemptFinalizationV1::Complete(
                 AttemptFinalizationCompleteV1 {
                     complete: true,
@@ -718,9 +750,7 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
                         role: AttemptNodeRoleV1::Finalizer,
                         failure_policy: FailurePolicy::Required,
                         state: AttemptStepStateV1::Succeeded,
-                        failure: None,
-                        reason: None,
-                        unavailable_references: None,
+                        detail: None,
                     }],
                     issues: Vec::new(),
                     cancellation: None,
@@ -965,6 +995,13 @@ fn settle_as_cancelled(run: &LocalAttemptOwner) {
             });
             for step in &mut attempt.progress.steps {
                 step.state = AttemptStepStateV1::Cancelled;
+                step.detail = Some(
+                    crate::execution::workflow::evidence::NodeDetail::Cancellation(
+                        crate::execution::workflow::evidence::CancellationDetail::new(
+                            crate::execution::workflow::admission::CancellationReason::UserRequest,
+                        ),
+                    ),
+                );
             }
             attempt.result = AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
@@ -996,7 +1033,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
             "fullyDrained": true
         }
     });
-    let (outcome, mut steps, primary_failure) = match attempt.state {
+    let (outcome, mut steps, primary_issue) = match attempt.state {
         AttemptStateV1::Succeeded => (
             "succeeded",
             vec![
@@ -1031,9 +1068,10 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                     "state": "failed",
                     "startedAt": "2026-08-02T12:01:44Z",
                     "durationMilliseconds": 100,
-                    "failure": {
+                    "detail": {
                         "phase": "execution",
-                        "cause": { "code": "command_exit", "exitCode": 23 }
+                        "code": "command_exit",
+                        "exitCode": 23
                     },
                     "commandOutput": command_output
                 }),
@@ -1042,13 +1080,16 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                     "kind": "cmd",
                     "failurePolicy": "required",
                     "state": "blocked",
-                    "dependency": "first"
+                    "detail": {
+                        "code": "prerequisites_unsatisfied",
+                        "prerequisites": [{"kind": "control", "node": "first"}]
+                    }
                 }),
             ],
             Some(serde_json::json!({
                 "node": { "id": "first", "role": "step" },
-                "phase": "execution",
-                "cause": { "code": "command_exit", "exitCode": 23 }
+                "state": "failed",
+                "detail": { "phase": "execution", "code": "command_exit", "exitCode": 23 }
             })),
         ),
         AttemptStateV1::Cancelled => (
@@ -1059,14 +1100,14 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
                     "kind": "cmd",
                     "failurePolicy": "required",
                     "state": "cancelled",
-                    "reason": "user_request"
+                    "detail": { "code": "user_request" }
                 }),
                 serde_json::json!({
                     "id": "second",
                     "kind": "cmd",
                     "failurePolicy": "required",
                     "state": "cancelled",
-                    "reason": "user_request"
+                    "detail": { "code": "user_request" }
                 }),
             ],
             None,
@@ -1105,8 +1146,8 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
         "steps": steps,
         "exports": {}
     });
-    if let Some(primary_failure) = primary_failure {
-        result["primaryFailure"] = primary_failure;
+    if let Some(primary_issue) = primary_issue {
+        result["primaryIssue"] = primary_issue;
     }
     if let Some(cancellation) = &attempt.cancellation {
         result["cancellation"] = serde_json::json!({
@@ -1135,9 +1176,10 @@ fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
     let mut result = result_value(&result_directory);
     result["steps"][0]["failurePolicy"] = Value::String("advisory".to_owned());
     result["steps"][0]["state"] = Value::String("failed".to_owned());
-    result["steps"][0]["failure"] = serde_json::json!({
+    result["steps"][0]["detail"] = serde_json::json!({
         "phase": "execution",
-        "cause": { "code": "command_exit", "exitCode": 9 }
+        "code": "command_exit",
+        "exitCode": 9
     });
     result["steps"][1] = serde_json::json!({
         "id": "second",
@@ -1145,14 +1187,37 @@ fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
         "kind": "cmd",
         "failurePolicy": "advisory",
         "state": "blocked",
-        "dependency": "first"
+        "detail": {
+            "code": "prerequisites_unsatisfied",
+            "prerequisites": [{"kind": "body", "ref": "outputs.first.report"}]
+        }
     });
     overwrite_result(&result_directory, result);
     run.state
         .update(|state| {
             let progress = &mut current_attempt_mut(state)?.progress.steps;
             progress[0].state = AttemptStepStateV1::Failed;
+            progress[0].detail = Some(crate::execution::workflow::evidence::NodeDetail::Failed(
+                crate::execution::workflow::evidence::FailureDetail::new(
+                    crate::execution::workflow::evidence::FailurePhase::Execution,
+                    crate::execution::workflow::evidence::FailureCode::CommandExit,
+                    None,
+                    None,
+                    None,
+                    Some(9),
+                )
+                .unwrap(),
+            ));
             progress[1].state = AttemptStepStateV1::Blocked;
+            progress[1].detail = Some(crate::execution::workflow::evidence::NodeDetail::Blocked(
+                crate::execution::workflow::evidence::BlockedDetail::new([
+                    crate::execution::workflow::evidence::Prerequisite::body(
+                        "outputs.first.report",
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ));
             Ok(())
         })
         .unwrap();
@@ -1161,14 +1226,14 @@ fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
 
     assert_eq!(archived.state, ArchivedAttemptState::Succeeded);
     assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Succeeded);
-    assert!(archived.primary_failure.is_none());
+    assert!(archived.primary_issue.is_none());
     assert!(matches!(
         archived.steps[0].detail,
-        ArchivedStepDetail::Failed(_)
+        ArchivedStepDetail::Evidence(crate::execution::workflow::evidence::NodeDetail::Failed(_))
     ));
     assert!(matches!(
         archived.steps[1].detail,
-        ArchivedStepDetail::Blocked { ref dependency } if dependency == "first"
+        ArchivedStepDetail::Evidence(crate::execution::workflow::evidence::NodeDetail::Blocked(_))
     ));
     assert!(
         archived
@@ -1262,7 +1327,7 @@ fn archived_attempt_loads_failed_current_result_and_raw_stream_prefixes_read_onl
     assert_eq!(archived.steps.len(), 2);
     assert!(matches!(
         archived.steps[0].detail,
-        ArchivedStepDetail::Failed(_)
+        ArchivedStepDetail::Evidence(crate::execution::workflow::evidence::NodeDetail::Failed(_))
     ));
     let output = archived.steps[0].command_output.as_ref().unwrap();
     assert_eq!(output.stdout.bytes.as_ref(), [0_u8, 0xff, b'\n']);
@@ -1398,7 +1463,7 @@ fn archived_attempt_rejects_malformed_and_cross_document_mismatched_results() {
     invalid_values.push(value);
     let mut value = valid.clone();
     value["outcome"] = Value::String("succeeded".to_owned());
-    value.as_object_mut().unwrap().remove("primaryFailure");
+    value.as_object_mut().unwrap().remove("primaryIssue");
     invalid_values.push(value);
     let mut value = valid.clone();
     value["steps"].as_array_mut().unwrap().swap(0, 1);
@@ -1407,8 +1472,8 @@ fn archived_attempt_rejects_malformed_and_cross_document_mismatched_results() {
     value["steps"][0]["commandOutput"]["stdout"]["retainedBytes"] = Value::from(2);
     invalid_values.push(value);
     let mut value = valid.clone();
-    value["steps"][0]["failure"]["cause"]["code"] = Value::String("future_code".to_owned());
-    value["primaryFailure"]["cause"]["code"] = Value::String("future_code".to_owned());
+    value["steps"][0]["detail"]["code"] = Value::String("future_code".to_owned());
+    value["primaryIssue"]["detail"]["code"] = Value::String("future_code".to_owned());
     invalid_values.push(value);
 
     for value in invalid_values {
@@ -1469,8 +1534,12 @@ fn archived_attempt_loads_cancelled_commands_that_never_started() {
     assert_eq!(archived.state, ArchivedAttemptState::Cancelled);
     assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Cancelled);
     assert!(archived.steps.iter().all(|step| {
-        matches!(step.detail, ArchivedStepDetail::Cancelled { .. })
-            && step.started_at.is_none()
+        matches!(
+            step.detail,
+            ArchivedStepDetail::Evidence(
+                crate::execution::workflow::evidence::NodeDetail::Cancellation(_)
+            )
+        ) && step.started_at.is_none()
             && step.duration.is_none()
             && step.command_output.is_none()
     }));
@@ -1479,7 +1548,7 @@ fn archived_attempt_loads_cancelled_commands_that_never_started() {
 #[test]
 fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
-    for index in 0..25 {
+    for index in 0..256 {
         source.push_str(&format!(
             "  step{index}:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
         ));
@@ -1494,8 +1563,8 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
     let run_document = read_run(run.root_handle()).unwrap();
     let stream = serde_json::json!({
         "encoding": "base64",
-        "data": BASE64_STANDARD.encode(vec![b'x'; 65_536]),
-        "retainedBytes": 65_536,
+        "data": BASE64_STANDARD.encode(vec![b'x'; 131_072]),
+        "retainedBytes": 131_072,
         "discardedBytes": 0,
         "truncated": false,
         "fullyDrained": true
@@ -1560,7 +1629,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
 
     let archived = load_local_archived_attempt(&run_path, None)
         .expect("the result schema bounds streams independently, not the whole document");
-    assert_eq!(archived.steps.len(), 25);
+    assert_eq!(archived.steps.len(), 256);
 }
 
 #[test]
@@ -1659,8 +1728,8 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
             <= crate::execution::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES
     );
     assert!(
-        u64::try_from(result_bytes.len()).unwrap() > MAXIMUM_DURABLE_JSON_BYTES,
-        "the artifact metadata fixture must exceed the smaller run/state JSON budget"
+        u64::try_from(result_bytes.len()).unwrap() <= MAXIMUM_DURABLE_JSON_BYTES,
+        "maximal artifact metadata must fit the unified durable document budget"
     );
     let result_directory = run
         .run_directory()
@@ -1811,52 +1880,71 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     settle_as_workflow_failed(&run);
     let result_directory = publish_result_fixture(&fixture, &run);
     let original = result_value(&result_directory);
+    let set_failure_detail = |detail: crate::execution::workflow::evidence::FailureDetail| {
+        run.state
+            .update(|state| {
+                current_attempt_mut(state)?.progress.steps[0].detail = Some(
+                    crate::execution::workflow::evidence::NodeDetail::Failed(detail.clone()),
+                );
+                Ok(())
+            })
+            .unwrap();
+    };
 
     let mut invalid_name = original.clone();
-    let invalid_name_cause = serde_json::json!({
+    let invalid_name_detail = serde_json::json!({
+        "phase": "start",
         "code": "input_invalid_name",
         "input": "../escape"
     });
-    invalid_name["steps"][0]["failure"] = serde_json::json!({
-        "phase": "start",
-        "cause": invalid_name_cause.clone()
-    });
+    invalid_name["steps"][0]["detail"] = invalid_name_detail.clone();
     invalid_name["steps"][0]
         .as_object_mut()
         .unwrap()
         .remove("commandOutput");
-    invalid_name["primaryFailure"] = serde_json::json!({
+    invalid_name["primaryIssue"] = serde_json::json!({
         "node": { "id": "first", "role": "step" },
-        "phase": "start",
-        "cause": invalid_name_cause
+        "state": "failed",
+        "detail": invalid_name_detail
     });
     overwrite_result(&result_directory, invalid_name);
-    load_local_archived_attempt(&run_path, None)
-        .expect("an invalid-name failure preserves the offending producer identity");
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
 
     let mut input_failure = original.clone();
-    let declared_input_cause = serde_json::json!({
+    let declared_input_detail = serde_json::json!({
+        "phase": "start",
         "code": "input_value_size_limit",
         "input": "prompt"
     });
-    input_failure["steps"][0]["failure"] = serde_json::json!({
-        "phase": "start",
-        "cause": declared_input_cause.clone()
-    });
+    input_failure["steps"][0]["detail"] = declared_input_detail.clone();
     input_failure["steps"][0]
         .as_object_mut()
         .unwrap()
         .remove("commandOutput");
-    input_failure["primaryFailure"] = serde_json::json!({
+    input_failure["primaryIssue"] = serde_json::json!({
         "node": { "id": "first", "role": "step" },
-        "phase": "start",
-        "cause": declared_input_cause
+        "state": "failed",
+        "detail": declared_input_detail
     });
     overwrite_result(&result_directory, input_failure.clone());
+    set_failure_detail(
+        crate::execution::workflow::evidence::FailureDetail::new(
+            crate::execution::workflow::evidence::FailurePhase::Start,
+            crate::execution::workflow::evidence::FailureCode::InputValueSizeLimit,
+            Some("prompt".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+    );
     load_local_archived_attempt(&run_path, None).unwrap();
 
-    input_failure["steps"][0]["failure"]["cause"]["input"] = Value::String("fabricated".to_owned());
-    input_failure["primaryFailure"]["cause"]["input"] = Value::String("fabricated".to_owned());
+    input_failure["steps"][0]["detail"]["input"] = Value::String("fabricated".to_owned());
+    input_failure["primaryIssue"]["detail"]["input"] = Value::String("fabricated".to_owned());
     overwrite_result(&result_directory, input_failure);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
@@ -1864,23 +1952,21 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     );
 
     let mut indexed_scalar = original.clone();
-    let indexed_cause = serde_json::json!({
+    let indexed_detail = serde_json::json!({
+        "phase": "start",
         "code": "input_collection_ordinal_limit",
         "input": "prompt",
         "collectionIndex": 0
     });
-    indexed_scalar["steps"][0]["failure"] = serde_json::json!({
-        "phase": "start",
-        "cause": indexed_cause.clone()
-    });
+    indexed_scalar["steps"][0]["detail"] = indexed_detail.clone();
     indexed_scalar["steps"][0]
         .as_object_mut()
         .unwrap()
         .remove("commandOutput");
-    indexed_scalar["primaryFailure"] = serde_json::json!({
+    indexed_scalar["primaryIssue"] = serde_json::json!({
         "node": { "id": "first", "role": "step" },
-        "phase": "start",
-        "cause": indexed_cause
+        "state": "failed",
+        "detail": indexed_detail
     });
     overwrite_result(&result_directory, indexed_scalar);
     assert_archive_operational(
@@ -1889,25 +1975,33 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     );
 
     let mut output_failure = original;
-    let declared_output_cause = serde_json::json!({
+    let declared_output_detail = serde_json::json!({
+        "phase": "output_capture",
         "code": "output_missing",
         "output": "artifact"
     });
-    output_failure["steps"][0]["failure"] = serde_json::json!({
-        "phase": "output_capture",
-        "cause": declared_output_cause.clone()
-    });
-    output_failure["primaryFailure"] = serde_json::json!({
+    output_failure["steps"][0]["detail"] = declared_output_detail.clone();
+    output_failure["primaryIssue"] = serde_json::json!({
         "node": { "id": "first", "role": "step" },
-        "phase": "output_capture",
-        "cause": declared_output_cause
+        "state": "failed",
+        "detail": declared_output_detail
     });
     overwrite_result(&result_directory, output_failure.clone());
+    set_failure_detail(
+        crate::execution::workflow::evidence::FailureDetail::new(
+            crate::execution::workflow::evidence::FailurePhase::OutputCapture,
+            crate::execution::workflow::evidence::FailureCode::OutputMissing,
+            None,
+            None,
+            Some("artifact".to_owned()),
+            None,
+        )
+        .unwrap(),
+    );
     load_local_archived_attempt(&run_path, None).unwrap();
 
-    output_failure["steps"][0]["failure"]["cause"]["output"] =
-        Value::String("fabricated".to_owned());
-    output_failure["primaryFailure"]["cause"]["output"] = Value::String("fabricated".to_owned());
+    output_failure["steps"][0]["detail"]["output"] = Value::String("fabricated".to_owned());
+    output_failure["primaryIssue"]["detail"]["output"] = Value::String("fabricated".to_owned());
     overwrite_result(&result_directory, output_failure);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
@@ -1930,8 +2024,28 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             attempt.settled_at = Some(settled);
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
+            attempt.progress.steps[0].detail =
+                Some(crate::execution::workflow::evidence::NodeDetail::Failed(
+                    crate::execution::workflow::evidence::FailureDetail::new(
+                        crate::execution::workflow::evidence::FailurePhase::Execution,
+                        crate::execution::workflow::evidence::FailureCode::CommandExit,
+                        None,
+                        None,
+                        None,
+                        Some(23),
+                    )
+                    .unwrap(),
+                ));
             attempt.progress.steps[1].state = AttemptStepStateV1::Succeeded;
             attempt.progress.steps[2].state = AttemptStepStateV1::Blocked;
+            attempt.progress.steps[2].detail =
+                Some(crate::execution::workflow::evidence::NodeDetail::Blocked(
+                    crate::execution::workflow::evidence::BlockedDetail::new([
+                        crate::execution::workflow::evidence::Prerequisite::control("first")
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ));
             attempt.result = AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
             };
@@ -1979,10 +2093,10 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "failed",
-        "primaryFailure": {
+        "primaryIssue": {
             "node": { "id": "first", "role": "step" },
-            "phase": "execution",
-            "cause": { "code": "command_exit", "exitCode": 23 }
+            "state": "failed",
+            "detail": { "phase": "execution", "code": "command_exit", "exitCode": 23 }
         },
         "steps": [
             {
@@ -1993,9 +2107,10 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
                 "state": "failed",
                 "startedAt": "2026-08-02T12:01:44Z",
                 "durationMilliseconds": 100,
-                "failure": {
+                "detail": {
                     "phase": "execution",
-                    "cause": { "code": "command_exit", "exitCode": 23 }
+                    "code": "command_exit",
+                    "exitCode": 23
                 },
                 "commandOutput": command_output.clone()
             },
@@ -2015,7 +2130,10 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
                 "kind": "cmd",
                 "failurePolicy": "required",
                 "state": "blocked",
-                "dependency": "first"
+                "detail": {
+                    "code": "prerequisites_unsatisfied",
+                    "prerequisites": [{"kind": "control", "node": "first"}]
+                }
             }
         ],
         "exports": {}
@@ -2031,20 +2149,40 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
     // Both roots can already be active when `second` fails first. The consumer records
     // that then-terminal prerequisite even if lexicographically lower `first` fails later.
     let mut historical_blocker = valid.clone();
-    historical_blocker["primaryFailure"] = serde_json::json!({
+    historical_blocker["primaryIssue"] = serde_json::json!({
         "node": { "id": "second", "role": "step" },
-        "phase": "execution",
-        "cause": { "code": "command_exit", "exitCode": 29 }
+        "state": "failed",
+        "detail": { "phase": "execution", "code": "command_exit", "exitCode": 29 }
     });
     historical_blocker["steps"][1]["state"] = Value::String("failed".to_owned());
-    historical_blocker["steps"][1]["failure"] = serde_json::json!({
+    historical_blocker["steps"][1]["detail"] = serde_json::json!({
         "phase": "execution",
-        "cause": { "code": "command_exit", "exitCode": 29 }
+        "code": "command_exit",
+        "exitCode": 29
     });
-    historical_blocker["steps"][2]["dependency"] = Value::String("second".to_owned());
+    historical_blocker["steps"][2]["detail"]["prerequisites"] =
+        serde_json::json!([{"kind": "control", "node": "second"}]);
     run.state
         .update(|state| {
-            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::Failed;
+            let progress = &mut current_attempt_mut(state)?.progress.steps;
+            progress[1].state = AttemptStepStateV1::Failed;
+            progress[1].detail = Some(crate::execution::workflow::evidence::NodeDetail::Failed(
+                crate::execution::workflow::evidence::FailureDetail::new(
+                    crate::execution::workflow::evidence::FailurePhase::Execution,
+                    crate::execution::workflow::evidence::FailureCode::CommandExit,
+                    None,
+                    None,
+                    None,
+                    Some(29),
+                )
+                .unwrap(),
+            ));
+            progress[2].detail = Some(crate::execution::workflow::evidence::NodeDetail::Blocked(
+                crate::execution::workflow::evidence::BlockedDetail::new([
+                    crate::execution::workflow::evidence::Prerequisite::control("second").unwrap(),
+                ])
+                .unwrap(),
+            ));
             Ok(())
         })
         .unwrap();
@@ -2053,13 +2191,22 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
 
     run.state
         .update(|state| {
-            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::Succeeded;
+            let progress = &mut current_attempt_mut(state)?.progress.steps;
+            progress[1].state = AttemptStepStateV1::Succeeded;
+            progress[1].detail = None;
+            progress[2].detail = Some(crate::execution::workflow::evidence::NodeDetail::Blocked(
+                crate::execution::workflow::evidence::BlockedDetail::new([
+                    crate::execution::workflow::evidence::Prerequisite::control("first").unwrap(),
+                ])
+                .unwrap(),
+            ));
             Ok(())
         })
         .unwrap();
 
     let mut false_blocker = valid.clone();
-    false_blocker["steps"][2]["dependency"] = Value::String("second".to_owned());
+    false_blocker["steps"][2]["detail"]["prerequisites"] =
+        serde_json::json!([{"kind": "control", "node": "second"}]);
     overwrite_result(&result_directory, false_blocker);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
@@ -2071,7 +2218,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
     impossible_success
         .as_object_mut()
         .unwrap()
-        .remove("primaryFailure");
+        .remove("primaryIssue");
     overwrite_result(&result_directory, impossible_success);
     run.state
         .update(|state| {
@@ -2099,12 +2246,16 @@ fn archived_attempt_rejects_not_run_step_with_failed_dependency() {
         "kind": "cmd",
         "failurePolicy": "required",
         "state": "not_run",
-        "reason": "failure_stop"
+        "detail": { "code": "failure_stop" }
     });
     overwrite_result(&result_directory, result);
     run.state
         .update(|state| {
-            current_attempt_mut(state)?.progress.steps[1].state = AttemptStepStateV1::NotRun;
+            let step = &mut current_attempt_mut(state)?.progress.steps[1];
+            step.state = AttemptStepStateV1::NotRun;
+            step.detail = Some(crate::execution::workflow::evidence::NodeDetail::NotRun(
+                crate::execution::workflow::evidence::NonExecutionDetail::failure_stop(),
+            ));
             Ok(())
         })
         .unwrap();

@@ -21,25 +21,9 @@
       "failurePolicy": "advisory",
       "from": "running",
       "to": "failed",
-      "failure": {
+      "detail": {
         "phase": "execution",
-        "cause": "agent_harness_protocol_failed",
-        "protocolRejection": {
-          "schemaVersion": 1,
-          "profile": "PiJsonV1",
-          "detail": {
-            "reason": "event_transition_invalid",
-            "stage": "event_payload",
-            "outerEvent": "agent_end",
-            "state": {
-              "sessionHeaderSeen": true,
-              "agentStarted": true,
-              "terminalCandidateRetained": false,
-              "resultAccepted": false,
-              "settled": false
-            }
-          }
-        }
+        "code": "harness_protocol_failed"
       }
     }
   }

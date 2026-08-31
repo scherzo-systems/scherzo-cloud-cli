@@ -30,11 +30,12 @@ use super::{
 use crate::execution::claude_code::compatibility_profile_for_version;
 use crate::execution::workflow::admission::{CancellationReason, CancellationSource};
 use crate::execution::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
-    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
-    AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
-    AgentValueMode, OrderedAgentObservationSink, PositiveDuration, StagedAgentAttachment,
-    check_agent_input_bound, failed_agent_outcome, finish_agent_diagnostic_capture,
+    AgentAdapter, AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause,
+    AgentInputKind, AgentInvocation, AgentLifecycleMilestone, AgentObservation,
+    AgentObservationSink, AgentOutcome, AgentProcessDirective, AgentStartCallback,
+    AgentTerminalCallback, AgentValueKind, AgentValueMode, OrderedAgentObservationSink,
+    PositiveDuration, StagedAgentAttachment, check_agent_input_bound, failed_agent_outcome,
+    finish_agent_diagnostic_capture,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::execution::workflow::child_guard::StoppedChildGuard;
@@ -62,6 +63,8 @@ pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(10);
 const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
     "Result rejected: submit exactly one standalone structured result candidate.\n";
+pub(super) const NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC: &str =
+    "Claude Code native transcript capture missing";
 
 pub(crate) struct ClaudeCodeStreamJsonV1Adapter<
     Clock,
@@ -176,11 +179,7 @@ where
 {
     async fn invoke_inner<Sink>(
         &self,
-        mut invocation: AgentInvocation<
-            ClaudeCodeConfig,
-            ClaudeCodeStreamJsonV1ProtocolLimits,
-            Sink,
-        >,
+        invocation: AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
         started: &AgentStartCallback,
     ) -> AgentOutcome
     where
@@ -193,9 +192,15 @@ where
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let plan = match prepare_launch(&invocation) {
-            Ok(plan) => plan,
-            Err(cause) => return failed_agent_outcome(cause),
+        let (mut invocation, plan) = match tokio::task::spawn_blocking(move || {
+            let plan = prepare_launch(&invocation);
+            (invocation, plan)
+        })
+        .await
+        {
+            Ok((invocation, Ok(plan))) => (invocation, plan),
+            Ok((_, Err(cause))) => return failed_agent_outcome(cause),
+            Err(_) => return failed_agent_outcome(AgentFailureCause::HarnessStartFailed),
         };
         // jscpd:ignore-end
         // The shared validator is wired into a native exchange here, while Pi wires it
@@ -257,6 +262,17 @@ where
             invocation.limits().result_settlement_grace(),
         )
         .await;
+        if !plan.native_session_bridge.transcript_capture_verified() {
+            let _ = invocation
+                .observations()
+                .emit(AgentObservation::Diagnostic {
+                    level: AgentDiagnosticLevel::Warning,
+                    message: Arc::from(format!(
+                        "{NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC}: no transcript was written through the temporary history link"
+                    )),
+                })
+                .await;
+        }
         finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
             .await;
         outcome
@@ -268,7 +284,7 @@ pub(super) struct ClaudeCodeStreamJsonV1LaunchPlan {
     expected_cwd: Arc<str>,
     session_id: Arc<str>,
     input: Vec<u8>,
-    _native_session_bridge: ClaudeCodeNativeSessionBridge,
+    native_session_bridge: ClaudeCodeNativeSessionBridge,
     _system_prompt_file: tempfile::NamedTempFile,
 }
 
@@ -377,13 +393,15 @@ where
         expected_cwd,
         session_id,
         input,
-        _native_session_bridge: native_session_bridge,
+        native_session_bridge,
         _system_prompt_file: system_prompt_file,
     })
 }
 
 struct ClaudeCodeNativeSessionBridge {
     ambient_project_directory: OwnedFd,
+    transcript_target: PathBuf,
+    transcript_link_name: OsString,
     links: Vec<OwnedAmbientSessionLink>,
 }
 
@@ -418,6 +436,13 @@ impl ClaudeCodeNativeSessionBridge {
             return Err(AgentFailureCause::HarnessStartFailed);
         }
 
+        if !matches!(
+            fs::symlink_metadata(&transcript),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ) {
+            return Err(AgentFailureCause::HarnessStartFailed);
+        }
+
         let config = claude_code_config_directory(invocation, expected_cwd)?;
         let project = config.join("projects").join(native_project_slug(
             expected_cwd
@@ -433,13 +458,42 @@ impl ClaudeCodeNativeSessionBridge {
             fs::canonicalize(project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
         let ambient_project_directory =
             open_directory_path(&project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        let transcript_link_name = OsString::from(format!("{session_id}.jsonl"));
         let mut bridge = Self {
             ambient_project_directory,
+            transcript_target: transcript.clone(),
+            transcript_link_name: transcript_link_name.clone(),
             links: Vec::with_capacity(2),
         };
-        bridge.create_link(&transcript, OsString::from(format!("{session_id}.jsonl")))?;
+        bridge.create_link(&transcript, transcript_link_name)?;
         bridge.create_link(&resources, OsString::from(session_id))?;
         Ok(bridge)
+    }
+
+    fn transcript_capture_verified(&self) -> bool {
+        let Some(link) = self
+            .links
+            .iter()
+            .find(|link| link.name == self.transcript_link_name)
+        else {
+            return false;
+        };
+        self.owns_link(link)
+            && fs::metadata(&self.transcript_target)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    }
+
+    fn owns_link(&self, link: &OwnedAmbientSessionLink) -> bool {
+        statat(
+            &self.ambient_project_directory,
+            &link.name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_ok_and(|metadata| {
+            FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink
+                && metadata.st_dev == link.device
+                && metadata.st_ino == link.inode
+        })
     }
 
     fn create_link(&mut self, target: &Path, name: OsString) -> Result<(), AgentFailureCause> {
@@ -466,17 +520,7 @@ impl ClaudeCodeNativeSessionBridge {
 impl Drop for ClaudeCodeNativeSessionBridge {
     fn drop(&mut self) {
         for link in self.links.iter().rev() {
-            let Ok(metadata) = statat(
-                &self.ambient_project_directory,
-                &link.name,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) else {
-                continue;
-            };
-            if FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink
-                && metadata.st_dev == link.device
-                && metadata.st_ino == link.inode
-            {
+            if self.owns_link(link) {
                 let _ = unlinkat(
                     &self.ambient_project_directory,
                     &link.name,

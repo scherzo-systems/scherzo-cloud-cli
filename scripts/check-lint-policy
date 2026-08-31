@@ -162,6 +162,7 @@ for expected_code in \
   clippy::cast_possible_truncation \
   clippy::disallowed_macros \
   clippy::disallowed_methods \
+  clippy::unreachable \
   clippy::unwrap_used; do
   if ! grep --fixed-strings --line-regexp --quiet "$expected_code" <<<"$error_codes"; then
     echo "Clippy did not reject the representative $expected_code violation." >&2
@@ -217,11 +218,33 @@ macro_violation_files=$(
     | .file_name
   ' "$lint_output"
 )
-if ! grep --extended-regexp --quiet '(^|/)ordinary_production\.rs$' \
-  <<<"$macro_violation_files"; then
-  echo "Clippy did not reject representative direct production eprintln! use." >&2
+ordinary_production_macro_violations=$(
+  grep --extended-regexp --count '(^|/)ordinary_production\.rs$' \
+    <<<"$macro_violation_files"
+)
+if ((ordinary_production_macro_violations < 2)); then
+  echo "Clippy did not reject both direct production assert! and eprintln! use." >&2
   cat "$clippy_stderr" >&2
   exit 1
 fi
 
-printf 'Checked-in Rust lint policy rejects broad timing suppressions, direct elapsed-time reads and timeout delays, and production eprintln! use by default.\n'
+unreachable_violation_files=$(
+  jq -r '
+    select(
+      .reason == "compiler-message"
+      and .message.level == "error"
+      and .message.code.code == "clippy::unreachable"
+    )
+    | .message.spans[]
+    | select(.is_primary)
+    | .file_name
+  ' "$lint_output"
+)
+if ! grep --extended-regexp --quiet '(^|/)ordinary_production\.rs$' \
+  <<<"$unreachable_violation_files"; then
+  echo "Clippy did not reject representative direct production unreachable! use." >&2
+  cat "$clippy_stderr" >&2
+  exit 1
+fi
+
+printf 'Checked-in Rust lint policy rejects broad timing suppressions, direct elapsed-time reads and timeout delays, and production panic-only invariants and eprintln! use by default.\n'

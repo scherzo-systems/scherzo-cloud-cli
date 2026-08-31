@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
 schemaVersion: 1
 
-description: Hold an agent in a long-running tool call for cancellation testing.
+description: Cancel a long-running agent tool call and run a cancellation-only finalizer.
 
 agentProfiles:
   luna:
@@ -24,6 +24,16 @@ steps:
       response:
         kind: text
         from: agent_response
+
+finalizers:
+  cancellationReport:
+    kind: cmd
+    when: [cancelled]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\\n' 'cancellation-only finalizer ran'"
 
 exports:
   response:

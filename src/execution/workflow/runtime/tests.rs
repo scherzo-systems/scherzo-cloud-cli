@@ -59,6 +59,11 @@ fn definition(
                             })
                             .collect::<Vec<_>>()
                             .into(),
+                        evidence_prerequisites: dependencies
+                            .iter()
+                            .filter_map(|dependency| Prerequisite::control(*dependency).ok())
+                            .collect::<Vec<_>>()
+                            .into(),
                         inputs: BTreeMap::new(),
                         declared_outputs: outputs
                             .iter()
@@ -103,7 +108,7 @@ fn step_event(
     step: &str,
     from: StepStateKind,
     to: StepStateKind,
-) -> TransitionEvent<String, TestDeadline> {
+) -> TransitionEvent<TestDeadline> {
     TransitionEvent::Step {
         sequence: sequence(value),
         step: step.to_owned(),
@@ -116,17 +121,17 @@ fn step_event(
 
 fn workflow_event(
     value: u64,
-    from: WorkflowState<String, TestDeadline>,
-    to: WorkflowState<String, TestDeadline>,
-) -> TransitionEvent<String, TestDeadline> {
+    from: WorkflowState<TestDeadline>,
+    to: WorkflowState<TestDeadline>,
+) -> TransitionEvent<TestDeadline> {
     TransitionEvent::Workflow {
         sequence: sequence(value),
         from,
-        to,
+        to: Box::new(to),
     }
 }
 
-fn workflow_succeeded_event(value: u64) -> TransitionEvent<String, TestDeadline> {
+fn workflow_succeeded_event(value: u64) -> TransitionEvent<TestDeadline> {
     workflow_event(
         value,
         WorkflowState::Executing {
@@ -140,7 +145,7 @@ fn cancellation_event(
     value: u64,
     reason: CancellationReason,
     arbiter_tick: u64,
-) -> TransitionEvent<String, TestDeadline> {
+) -> TransitionEvent<TestDeadline> {
     TransitionEvent::CancellationAccepted {
         sequence: sequence(value),
         reason,
@@ -148,12 +153,37 @@ fn cancellation_event(
     }
 }
 
-fn failure(step: &str, phase: FailurePhase, cause: &str) -> StepFailure<String> {
-    StepFailure {
-        step: step.to_owned(),
-        role: WorkflowNodeRole::Step,
-        phase,
-        cause: cause.to_owned(),
+fn failure(step: &str, phase: FailurePhase, cause: &str) -> PrimaryIssue {
+    PrimaryIssue::failed(
+        WorkflowNode {
+            id: step.to_owned(),
+            role: WorkflowNodeRole::Step,
+        },
+        cause.to_owned().node_failure_detail(phase).unwrap(),
+    )
+}
+
+fn failed_state(phase: FailurePhase, cause: &str) -> StepState<String> {
+    StepState::Failed {
+        detail: cause.to_owned().node_failure_detail(phase).unwrap(),
+    }
+}
+
+fn blocked_state(prerequisites: impl IntoIterator<Item = Prerequisite>) -> StepState<String> {
+    StepState::Blocked {
+        detail: BlockedDetail::new(prerequisites).unwrap(),
+    }
+}
+
+fn not_run_state(role: WorkflowNodeRole, code: NonExecutionCode) -> StepState<String> {
+    StepState::NotRun {
+        detail: NonExecutionDetail::for_role(role, code).unwrap(),
+    }
+}
+
+fn cancelled_state(reason: CancellationReason) -> StepState<String> {
+    StepState::Cancelled {
+        detail: CancellationDetail::new(reason),
     }
 }
 
@@ -169,12 +199,12 @@ fn cancellation(
 
 fn cancelling_workflow(
     reason: CancellationReason,
-    prior_failure: Option<StepFailure<String>>,
-) -> WorkflowState<String, TestDeadline> {
+    prior_issue: Option<PrimaryIssue>,
+) -> WorkflowState<TestDeadline> {
     WorkflowState::Executing {
         gate: SchedulingGate::Cancelling {
             reason,
-            prior_failure,
+            prior_issue,
         },
     }
 }
@@ -231,15 +261,15 @@ fn cancel_action(
 
 fn finish_failed_action(
     value: u64,
-    primary_failure: StepFailure<String>,
+    primary_issue: PrimaryIssue,
     exports: ExportSet<String>,
 ) -> TestAction {
-    finish_failed_after_cancellation_action(value, primary_failure, None, exports)
+    finish_failed_after_cancellation_action(value, primary_issue, None, exports)
 }
 
 fn finish_failed_after_cancellation_action(
     value: u64,
-    primary_failure: StepFailure<String>,
+    primary_issue: PrimaryIssue,
     later_cancellation: Option<CancellationReason>,
     exports: ExportSet<String>,
 ) -> TestAction {
@@ -247,7 +277,7 @@ fn finish_failed_after_cancellation_action(
         id: action_id(value),
         action: Action::FinishRun {
             outcome: RunOutcome::Failed {
-                primary_failure,
+                primary_issue,
                 later_cancellation,
             },
             exports,
@@ -301,6 +331,7 @@ fn finalizer_definition(
                     role: WorkflowNodeRole::Step,
                     failure_policy: *policy,
                     prerequisites: Arc::from([]),
+                    evidence_prerequisites: Arc::from([]),
                     inputs: BTreeMap::new(),
                     declared_outputs: outputs.iter().map(|output| (*output).to_owned()).collect(),
                     recovery: None,
@@ -321,6 +352,17 @@ fn finalizer_definition(
                             control: true,
                             data: false,
                         })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    evidence_prerequisites: predecessors
+                        .iter()
+                        .filter_map(|producer| Prerequisite::control(*producer).ok())
+                        .chain(inputs.iter().filter_map(|(_, source)| {
+                            source
+                                .starts_with("outputs.")
+                                .then(|| Prerequisite::body(*source).ok())
+                                .flatten()
+                        }))
                         .collect::<Vec<_>>()
                         .into(),
                     inputs: inputs
@@ -595,23 +637,21 @@ steps:
             cause: "failed to start".to_owned(),
         },
     );
-    let primary_failure = failure("producer", FailurePhase::Start, "failed to start");
+    let primary_issue = failure("producer", FailurePhase::Start, "failed to start");
     assert_eq!(
         reduction.state.steps["consumer"].state,
-        StepState::Blocked {
-            dependency: "producer".to_owned(),
-        }
+        blocked_state([Prerequisite::body("outputs.producer.artifact").unwrap()])
     );
     assert_eq!(
         reduction.state.workflow,
         WorkflowState::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: None,
         }
     );
     assert_eq!(
         reduction.actions,
-        [finish_failed_action(5, primary_failure, ExportSet::new())]
+        [finish_failed_action(5, primary_issue, ExportSet::new())]
     );
 }
 
@@ -665,11 +705,11 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
     );
     assert_eq!(
         reduction.state.steps["aRoot"].state,
-        StepState::Cancelled { reason }
+        cancelled_state(reason)
     );
     assert_eq!(
         reduction.state.steps["bChild"].state,
-        StepState::Cancelled { reason }
+        cancelled_state(reason)
     );
     assert_eq!(
         reduction.state.workflow,
@@ -1278,10 +1318,8 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     assert_eq!(captured.events.last(), Some(&workflow_succeeded_event(5)));
     assert!(!captured.events.iter().any(|event| matches!(
         event,
-        TransitionEvent::Workflow {
-            to: WorkflowState::Finalizing { .. },
-            ..
-        }
+        TransitionEvent::Workflow { to, .. }
+            if matches!(to.as_ref(), WorkflowState::Finalizing { .. })
     )));
     assert_eq!(captured.actions, [finish_action(5, expected_exports)]);
     assert_eq!(
@@ -1481,10 +1519,10 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
             cause: "primary".to_owned(),
         },
     );
-    let primary_failure = failure("bFail", FailurePhase::Execution, "primary");
+    let primary_issue = failure("bFail", FailurePhase::Execution, "primary");
     let failure_stopped = WorkflowState::Executing {
         gate: SchedulingGate::FailureStopped {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
         },
     };
     assert_eq!(
@@ -1512,7 +1550,7 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
             deadline: deadline(8_888),
         },
     );
-    let cancelling = cancelling_workflow(reason, Some(primary_failure.clone()));
+    let cancelling = cancelling_workflow(reason, Some(primary_issue.clone()));
     assert_eq!(
         cancellation.events,
         [
@@ -1560,7 +1598,7 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
         ),
     ]);
     let terminal = WorkflowState::Failed {
-        primary_failure: primary_failure.clone(),
+        primary_issue: primary_issue.clone(),
         later_cancellation: Some(reason),
     };
     assert_eq!(
@@ -1579,7 +1617,7 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
         finished.actions,
         [finish_failed_after_cancellation_action(
             14,
-            primary_failure,
+            primary_issue,
             Some(reason),
             expected_exports.clone(),
         )]
@@ -1804,14 +1842,14 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
         let (state, occurrence, source_state, direct_sequence) = prepare_failure_phase(phase);
         let duplicate = occurrence.clone();
         let reduction = reduce(&state, occurrence);
-        let primary_failure = failure("aFail", phase, "reported cause");
+        let primary_issue = failure("aFail", phase, "reported cause");
         let failure_stopped = WorkflowState::Executing {
             gate: SchedulingGate::FailureStopped {
-                primary_failure: primary_failure.clone(),
+                primary_issue: primary_issue.clone(),
             },
         };
         let terminal = WorkflowState::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: None,
         };
 
@@ -1854,35 +1892,29 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
         );
         assert_eq!(
             reduction.state.steps["aFail"].state,
-            StepState::Failed {
-                phase,
-                cause: "reported cause".to_owned(),
-            }
+            failed_state(phase, "reported cause")
         );
         assert_eq!(
             reduction.state.steps["bStopped"].state,
-            StepState::NotRun {
-                reason: NotRunReason::FailureStop,
-            }
+            not_run_state(WorkflowNodeRole::Step, NonExecutionCode::FailureStop)
         );
         assert_eq!(
             reduction.state.steps["zJoin"].state,
-            StepState::Blocked {
-                dependency: "aFail".to_owned(),
-            }
+            blocked_state([
+                Prerequisite::control("aFail").unwrap(),
+                Prerequisite::control("bStopped").unwrap(),
+            ])
         );
         assert_eq!(
             reduction.state.steps["zzDescendant"].state,
-            StepState::Blocked {
-                dependency: "zJoin".to_owned(),
-            }
+            blocked_state([Prerequisite::control("zJoin").unwrap()])
         );
         assert_eq!(reduction.state.workflow, terminal);
         assert_eq!(
             reduction.actions,
             [finish_failed_action(
                 direct_sequence + 5,
-                primary_failure,
+                primary_issue,
                 ExportSet::new(),
             )]
         );
@@ -1899,7 +1931,7 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
 }
 
 #[test]
-fn later_active_failure_does_not_replace_the_primary_failure() {
+fn later_active_failure_does_not_replace_the_primary_issue() {
     let initialization = initialize_test(definition(
         &[("alpha", &[], &["result"]), ("zeta", &[], &["result"])],
         &[],
@@ -1942,10 +1974,10 @@ fn later_active_failure_does_not_replace_the_primary_failure() {
             cause: "first failure".to_owned(),
         },
     );
-    let primary_failure = failure("zeta", FailurePhase::Execution, "first failure");
+    let primary_issue = failure("zeta", FailurePhase::Execution, "first failure");
     let failure_stopped = WorkflowState::Executing {
         gate: SchedulingGate::FailureStopped {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
         },
     };
     assert_eq!(state.workflow, failure_stopped);
@@ -1971,7 +2003,7 @@ fn later_active_failure_does_not_replace_the_primary_failure() {
         },
     );
     let terminal = WorkflowState::Failed {
-        primary_failure: primary_failure.clone(),
+        primary_issue: primary_issue.clone(),
         later_cancellation: None,
     };
     assert_eq!(
@@ -1988,15 +2020,12 @@ fn later_active_failure_does_not_replace_the_primary_failure() {
     );
     assert_eq!(
         state.steps["alpha"].state,
-        StepState::Failed {
-            phase: FailurePhase::OutputCapture,
-            cause: "later failure".to_owned(),
-        }
+        failed_state(FailurePhase::OutputCapture, "later failure")
     );
     assert_eq!(state.workflow, terminal);
     assert_eq!(
         later.actions,
-        [finish_failed_action(9, primary_failure, ExportSet::new())]
+        [finish_failed_action(9, primary_issue, ExportSet::new())]
     );
 }
 
@@ -2070,7 +2099,7 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
             outputs: output_set(&[("result", "sibling committed")]),
         },
     );
-    let primary_failure = failure("aFail", FailurePhase::Execution, "branch failed");
+    let primary_issue = failure("aFail", FailurePhase::Execution, "branch failed");
     let expected_exports = BTreeMap::from([
         (
             "blockedExport".to_owned(),
@@ -2112,21 +2141,19 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
     );
     assert_eq!(
         state.steps["bSiblingChild"].state,
-        StepState::NotRun {
-            reason: NotRunReason::FailureStop,
-        }
+        not_run_state(WorkflowNodeRole::Step, NonExecutionCode::FailureStop)
     );
     assert_eq!(
         state.workflow,
         WorkflowState::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: None,
         }
     );
     assert_eq!(state.exports, Some(expected_exports.clone()));
     assert_eq!(
         captured.actions,
-        [finish_failed_action(12, primary_failure, expected_exports,)]
+        [finish_failed_action(12, primary_issue, expected_exports,)]
     );
     assert_eq!(
         failed
@@ -2240,6 +2267,10 @@ fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() 
         control: true,
         data: true,
     }]);
+    summarize.evidence_prerequisites = Arc::from([
+        Prerequisite::control("analyze").unwrap(),
+        Prerequisite::body("outputs.analyze.report").unwrap(),
+    ]);
     let initialization = initialize_test(runtime_definition);
     let mut state = initialization.state;
 
@@ -2262,9 +2293,7 @@ fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() 
     assert_step(&state, "analyze", StepStateKind::Failed);
     assert_eq!(
         state.steps["summarize"].state,
-        StepState::Blocked {
-            dependency: "analyze".to_owned(),
-        }
+        blocked_state([Prerequisite::body("outputs.analyze.report").unwrap()])
     );
     assert_step(&state, "package", StepStateKind::Starting);
     assert_eq!(
@@ -2339,18 +2368,18 @@ fn required_failure_remains_primary_after_an_advisory_failure() {
             cause: "required".to_owned(),
         },
     );
-    let primary_failure = failure("test", FailurePhase::Execution, "required");
+    let primary_issue = failure("test", FailurePhase::Execution, "required");
 
     assert_eq!(
         state.workflow,
         WorkflowState::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: None,
         }
     );
     assert_eq!(
         required.actions,
-        [finish_failed_action(8, primary_failure, ExportSet::new())]
+        [finish_failed_action(8, primary_issue, ExportSet::new())]
     );
 }
 
@@ -2572,14 +2601,11 @@ fn trace_succeeded_trigger_and_failed_release() {
             cause: "release failed".to_owned(),
         },
     );
-    let WorkflowState::Failed {
-        primary_failure, ..
-    } = &state.workflow
-    else {
+    let WorkflowState::Failed { primary_issue, .. } = &state.workflow else {
         panic!("required release failure did not fail the workflow");
     };
-    assert_eq!(primary_failure.role, WorkflowNodeRole::Finalizer);
-    assert_eq!(primary_failure.step, "release");
+    assert_eq!(primary_issue.node.role, WorkflowNodeRole::Finalizer);
+    assert_eq!(primary_issue.node.id, "release");
     assert!(matches!(
         finished.actions.as_slice(),
         [RequestedAction {
@@ -2789,17 +2815,19 @@ fn trace_failed_finalizer_output_producer_blocks_consumer_without_replacing_prim
             cause: "archive failed".into(),
         },
     );
-    let StepState::InputUnavailable { references } = &state.steps["notify"].state else {
+    let StepState::Blocked { detail } = &state.steps["notify"].state else {
         panic!("notify was not classified at the fixed point");
     };
-    assert_eq!(references, &["outputs.archive.receipt"]);
-    let WorkflowState::Failed {
-        primary_failure, ..
-    } = &state.workflow
-    else {
+    assert_eq!(
+        detail.prerequisites,
+        [Prerequisite::Body {
+            r#ref: "outputs.archive.receipt".to_owned(),
+        }]
+    );
+    let WorkflowState::Failed { primary_issue, .. } = &state.workflow else {
         panic!("archive was not primary");
     };
-    assert_eq!(primary_failure.step, "archive");
+    assert_eq!(primary_issue.node.id, "archive");
 }
 
 #[test]
@@ -2954,14 +2982,12 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
         WorkflowState::Finalizing {
             trigger: FinalizationTrigger::Cancelled,
             gate: FinalizationGate::Open,
-            primary_failure: None,
+            primary_issue: None,
         }
     );
     assert_eq!(
         state.steps["bOutput"].state,
-        StepState::InputUnavailable {
-            references: vec!["outputs.producer.resource".to_owned()],
-        }
+        blocked_state([Prerequisite::body("outputs.producer.resource").unwrap()])
     );
     let [
         RequestedAction {
@@ -3050,18 +3076,17 @@ fn finalizer_classification_precedes_bytewise_independent_selection() {
 
     assert_eq!(
         state.steps["aBlocked"].state,
-        StepState::InputUnavailable {
-            references: vec![
-                "outputs.source.alpha".to_owned(),
-                "outputs.source.zeta".to_owned(),
-            ],
-        }
+        blocked_state([
+            Prerequisite::body("outputs.source.alpha").unwrap(),
+            Prerequisite::body("outputs.source.zeta").unwrap(),
+        ])
     );
     assert_eq!(
         state.steps["mFiltered"].state,
-        StepState::NotRun {
-            reason: NotRunReason::FinalizerTriggerNotSelected,
-        }
+        not_run_state(
+            WorkflowNodeRole::Finalizer,
+            NonExecutionCode::FinalizerTriggerNotSelected,
+        )
     );
     assert_eq!(
         boundary
@@ -3216,7 +3241,7 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
                 deadline: Some(deadline(40)),
                 force_abort: true,
             },
-            primary_failure: None,
+            primary_issue: None,
         }
     );
     reduce_and_advance(
@@ -3235,6 +3260,12 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
         })
     );
     assert!(summary.force_abort);
+    assert_eq!(
+        state.steps["release"].state,
+        StepState::Cancelled {
+            detail: CancellationDetail::new(CancellationReason::FinalizationForceAbort),
+        }
+    );
 }
 
 #[test]
@@ -3649,19 +3680,19 @@ fn recovery_trace_gave_up_preserves_the_target_failure_and_starts_no_recheck() {
     );
     assert_eq!(
         state.steps["verify"].state,
-        StepState::Failed {
-            phase: FailurePhase::Execution,
-            cause: "verification failed".into(),
-        }
+        failed_state(FailurePhase::Execution, "verification failed")
     );
     let WorkflowState::Failed {
-        primary_failure,
+        primary_issue,
         later_cancellation: None,
     } = &state.workflow
     else {
         panic!("gave_up did not settle a required failure");
     };
-    assert_eq!(primary_failure.cause, "verification failed");
+    assert_eq!(
+        primary_issue.detail,
+        failure("verify", FailurePhase::Execution, "verification failed").detail,
+    );
     assert_eq!(
         state.steps["verify"]
             .recovery
@@ -3703,12 +3734,13 @@ fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
     );
     assert!(provisional.events.iter().all(|event| !matches!(
         event,
-        TransitionEvent::Workflow {
-            to: WorkflowState::Executing {
-                gate: SchedulingGate::FailureStopped { .. },
-            },
-            ..
-        }
+        TransitionEvent::Workflow { to, .. }
+            if matches!(
+                to.as_ref(),
+                WorkflowState::Executing {
+                    gate: SchedulingGate::FailureStopped { .. },
+                }
+            )
     )));
     let second = provisional.actions[0].id;
     reduce_and_advance(
@@ -3727,13 +3759,16 @@ fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
         },
     );
     let WorkflowState::Failed {
-        primary_failure,
+        primary_issue,
         later_cancellation: None,
     } = &state.workflow
     else {
         panic!("required exhaustion did not fail the workflow");
     };
-    assert_eq!(primary_failure.cause, "latest failure");
+    assert_eq!(
+        primary_issue.detail,
+        failure("compile", FailurePhase::Execution, "latest failure").detail,
+    );
     assert_eq!(
         state.steps["compile"]
             .recovery
@@ -3750,12 +3785,13 @@ fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
             .iter()
             .filter(|event| matches!(
                 event,
-                TransitionEvent::Workflow {
-                    to: WorkflowState::Executing {
-                        gate: SchedulingGate::FailureStopped { .. },
-                    },
-                    ..
-                }
+                TransitionEvent::Workflow { to, .. }
+                    if matches!(
+                        to.as_ref(),
+                        WorkflowState::Executing {
+                            gate: SchedulingGate::FailureStopped { .. },
+                        }
+                    )
             ))
             .count(),
         1
@@ -3958,19 +3994,19 @@ fn recovery_trace_agent_handler_execution_failure_preserves_target_precedence() 
         },
     );
     let WorkflowState::Failed {
-        primary_failure,
+        primary_issue,
         later_cancellation: None,
     } = &state.workflow
     else {
         panic!("handler failure did not settle the required target");
     };
-    assert_eq!(primary_failure.cause, "target failure");
+    assert_eq!(
+        primary_issue.detail,
+        failure("verify", FailurePhase::Execution, "target failure").detail,
+    );
     assert_eq!(
         state.steps["verify"].state,
-        StepState::Failed {
-            phase: FailurePhase::Execution,
-            cause: "target failure".into(),
-        }
+        failed_state(FailurePhase::Execution, "target failure")
     );
     let recovery = state.steps["verify"].recovery.as_ref().unwrap();
     assert!(matches!(
@@ -4255,6 +4291,7 @@ fn recovery_trace_output_capture_failure_only_authorizes_a_full_target_rerun() {
         recovery.rounds[0].failed_execution.phase,
         FailurePhase::OutputCapture
     );
+    assert_eq!(recovery.rounds[0].failed_execution.invocation, first);
     let handler = provisional.actions[0].id;
     reduce_and_advance(
         &mut state,

@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use crate::process::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
-const MINIMUM_VERSION: GitVersion = GitVersion(0, 0, 1);
+const MINIMUM_VERSION: GitVersion = GitVersion(2, 29, 0);
 const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_STDOUT_BYTES: usize = 8 * 1024;
 
@@ -309,8 +309,11 @@ mod tests {
         )));
 
         assert_eq!(outcome.status, Status::Pass);
-        assert_eq!(outcome.details["version"], "0.0.1");
-        assert_eq!(outcome.details["minimumVersion"], "0.0.1");
+        assert_eq!(outcome.details["version"], MINIMUM_VERSION.to_string());
+        assert_eq!(
+            outcome.details["minimumVersion"],
+            MINIMUM_VERSION.to_string()
+        );
     }
 
     #[test]
@@ -321,7 +324,7 @@ mod tests {
         assert_eq!(
             outcome.details,
             BTreeMap::from([
-                ("minimumVersion".to_owned(), "0.0.1".to_owned()),
+                ("minimumVersion".to_owned(), MINIMUM_VERSION.to_string()),
                 ("version".to_owned(), "0.0.0".to_owned()),
             ])
         );

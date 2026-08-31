@@ -285,8 +285,11 @@ steps:
             StepStateKind::CapturingOutputs,
             StepStateKind::Failed,
             Some(ObservedStepTransition::Failed {
-                phase: FailurePhase::Execution,
-                cause: cause.clone(),
+                detail: crate::execution::workflow::evidence::failure_detail(
+                    FailurePhase::Execution,
+                    &cause,
+                )
+                .unwrap(),
             }),
         ),
     );
@@ -340,11 +343,13 @@ steps:
                 to: StepStateKind::Failed,
                 ..
             },
-            step: Some(ObservedStepTransition::Failed {
-                phase: FailurePhase::Execution,
-                cause: observed,
-            }),
-        }) if observed == &cause
+            step: Some(ObservedStepTransition::Failed { detail }),
+        }) if detail
+            == &crate::execution::workflow::evidence::failure_detail(
+                FailurePhase::Execution,
+                &cause,
+            )
+            .unwrap()
     ));
 
     let PresentationRecordKind::ChildOutput(output_record) = &output[0].kind else {

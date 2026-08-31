@@ -21,9 +21,9 @@
       "failurePolicy": "required",
       "from": "capturing_outputs",
       "to": "failed",
-      "failure": {
+      "detail": {
         "phase": "output_capture",
-        "cause": "output_json_schema_mismatch",
+        "code": "output_json_schema_mismatch",
         "output": "value"
       }
     }

@@ -14,14 +14,15 @@
     "finalExecutionEventSequence": 2,
     "outcome": {
       "outcome": "failed",
-      "failure": {
+      "primaryIssue": {
         "node": {
           "id": "capture",
           "role": "step"
         },
-        "failure": {
+        "state": "failed",
+        "detail": {
           "phase": "output_capture",
-          "cause": "output_git_workspace_dirty",
+          "code": "git_workspace_dirty",
           "output": "changes"
         }
       }

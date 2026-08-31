@@ -1,5 +1,6 @@
 mod login;
 mod logout;
+mod source_reset_identity;
 mod status;
 
 use clap::{Args, Subcommand};
@@ -21,6 +22,8 @@ enum AuthCommand {
     Status(status::Command),
     #[command(about = logout::ABOUT)]
     Logout(logout::Command),
+    #[command(about = source_reset_identity::ABOUT)]
+    SourceResetIdentityEvidence(source_reset_identity::Command),
 }
 
 impl Command {
@@ -33,6 +36,7 @@ impl Command {
                 AuthCommand::Login(command) => command.execute(deployment),
                 AuthCommand::Status(command) => command.execute(deployment),
                 AuthCommand::Logout(command) => command.execute(deployment),
+                AuthCommand::SourceResetIdentityEvidence(command) => command.execute(deployment),
             },
         )
     }

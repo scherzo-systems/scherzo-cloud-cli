@@ -19,8 +19,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
-    AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentRenewal,
-    AssignmentStart, PendingAssignmentObservation, RetainedObservationFrame, WelcomePolicyFailure,
+    AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentPrepare,
+    AssignmentRenewal, AssignmentStart, PendingAssignmentObservation, RetainedObservationFrame,
+    WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::service::control::LiveStatus;
@@ -153,6 +154,27 @@ impl<'a> ProtocolLog<'a> {
                 envelope,
                 effect_id,
             } => (envelope, "effect_acknowledged", Some(effect_id), None),
+            RunnerFrame::AssignmentPreparing {
+                envelope,
+                effect_id,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "assignment_preparing",
+                Some(effect_id),
+                Some(assignment_id),
+            ),
+            RunnerFrame::AssignmentPreparationProgress {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "assignment_preparation_progress",
+                None,
+                Some(assignment_id),
+            ),
             RunnerFrame::AssignmentAccepted {
                 envelope,
                 effect_id,
@@ -364,6 +386,21 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_offer",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                ],
+            ),
+            CloudFrame::AssignmentPrepare {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (
+                envelope,
+                "assignment_prepare",
                 vec![
                     KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
                     KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
@@ -1213,6 +1250,7 @@ impl Drop for ObservationTransport<'_> {
 
 enum AssignmentManagerEffect {
     Offer(Box<AssignmentOffer>),
+    Prepare(AssignmentPrepare),
     Start(AssignmentStart),
     Renewal(AssignmentRenewal),
     Release {
@@ -1862,6 +1900,7 @@ where
                 .map_err(|cause| ConnectionError::terminal(progress, cause))?;
             }
             effect @ CloudFrame::AssignmentOffer { .. }
+            | effect @ CloudFrame::AssignmentPrepare { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
@@ -1967,6 +2006,30 @@ where
                 assignment_id,
                 run_id,
                 AssignmentManagerEffect::Offer(Box::new(offer)),
+            )
+        }
+        CloudFrame::AssignmentPrepare {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            execution_spec_id,
+            preparation_expires_at,
+            ..
+        } => {
+            let prepare = AssignmentPrepare {
+                effect_id: effect_id.clone(),
+                assignment_id: assignment_id.clone(),
+                run_id: run_id.clone(),
+                attempt_id,
+                execution_spec_id,
+                preparation_expires_at,
+            };
+            (
+                effect_id,
+                assignment_id,
+                run_id,
+                AssignmentManagerEffect::Prepare(prepare),
             )
         }
         CloudFrame::AssignmentStart {
@@ -2080,17 +2143,16 @@ where
             return Err(error);
         }
     };
-    let frame = RunnerFrame::EffectAcknowledged {
-        envelope,
-        effect_id,
-    };
     let pending = send_runner_frame(
         writer,
         protocol,
         progress,
         connection_event,
         &event,
-        frame,
+        EffectAcknowledgement {
+            envelope,
+            effect_id,
+        },
         PendingObservationKind::EffectReceipt,
     )
     .await?;
@@ -2102,6 +2164,9 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match manager_effect {
             AssignmentManagerEffect::Offer(offer) => manager.handle_offer(*offer).map(|_| None),
+            AssignmentManagerEffect::Prepare(prepare) => {
+                manager.handle_prepare(prepare).map(|_| None)
+            }
             AssignmentManagerEffect::Start(start) => manager.handle_start(start),
             AssignmentManagerEffect::Renewal(renewal) => {
                 manager.handle_renewal(renewal).map(|_| None)
@@ -2259,24 +2324,29 @@ where
     })
 }
 
+struct EffectAcknowledgement {
+    envelope: RunnerEnvelope,
+    effect_id: String,
+}
+
 async fn send_runner_frame<W>(
     writer: &mut W,
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
     event: &Event,
-    frame: RunnerFrame,
+    acknowledgement: EffectAcknowledgement,
     kind: PendingObservationKind,
 ) -> Result<PendingObservation, ConnectionError>
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    let envelope = match &frame {
-        RunnerFrame::EffectAcknowledged { envelope, .. } => envelope,
-        _ => unreachable!("effect sender received a semantic frame"),
+    let message_id = acknowledgement.envelope.message_id.clone();
+    let sequence = acknowledgement.envelope.sequence;
+    let frame = RunnerFrame::EffectAcknowledged {
+        envelope: acknowledgement.envelope,
+        effect_id: acknowledgement.effect_id,
     };
-    let message_id = envelope.message_id.clone();
-    let sequence = envelope.sequence;
     let encoded = encode_runner_frame(&frame).map_err(|_| {
         finish_effect_failure(event, ConnectionCause::EncodeEffectAcknowledgement);
         ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgement)
@@ -3458,18 +3528,18 @@ mod tests {
                 .send(assignment_offer())
                 .await
                 .expect("send assignment offer");
-            let effect_acknowledgement = effect_acknowledgement(&mut socket).await;
-            assert_eq!(effect_acknowledgement["type"], "effect_acknowledged");
+            let offer_acknowledgement = effect_acknowledgement(&mut socket).await;
+            assert_eq!(offer_acknowledgement["type"], "effect_acknowledged");
             assert_eq!(
-                effect_acknowledgement["messageId"],
+                offer_acknowledgement["messageId"],
                 "rmsg_00000000000000000000000001"
             );
-            assert_eq!(effect_acknowledgement["sentAt"], "2026-07-23T00:00:00Z");
+            assert_eq!(offer_acknowledgement["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
-                effect_acknowledgement["payload"]["effectId"],
+                offer_acknowledgement["payload"]["effectId"],
                 "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
             );
-            let acknowledgement_message_id = effect_acknowledgement["messageId"]
+            let acknowledgement_message_id = offer_acknowledgement["messageId"]
                 .as_str()
                 .expect("effect acknowledgement message ID");
             socket
@@ -3491,13 +3561,74 @@ mod tests {
                 ))
                 .await
                 .expect("send effect acknowledgement response");
+            let Some(Ok(Message::Text(preparing))) = socket.next().await else {
+                panic!("fixture did not receive assignment preparation acknowledgement");
+            };
+            let preparing: serde_json::Value = serde_json::from_str(&preparing)
+                .expect("decode assignment preparation acknowledgement");
+            assert_eq!(preparing["type"], "assignment_preparing");
+            assert_eq!(
+                preparing["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+            );
+            assert_eq!(
+                preparing["payload"]["offeredExecutionSpecId"],
+                "xsp_01k0z6r1w8f4jy2m7q9v3x5abc"
+            );
+            socket
+                .send(observation_acknowledgement(
+                    preparing["messageId"]
+                        .as_str()
+                        .expect("preparing acknowledgement message ID"),
+                    3,
+                ))
+                .await
+                .expect("send preparing acknowledgement response");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "protocolVersion": 1,
+                        "direction": "cloud_to_runner",
+                        "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abq",
+                        "sentAt": "2026-07-23T00:00:04Z",
+                        "type": "assignment_prepare",
+                        "payloadVersion": 1,
+                        "payload": {
+                            "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+                            "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+                            "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+                            "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                            "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                            "preparationExpiresAt": "2026-07-23T00:15:04Z"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send assignment prepare");
+            let prepare_acknowledgement = effect_acknowledgement(&mut socket).await;
+            assert_eq!(prepare_acknowledgement["type"], "effect_acknowledged");
+            assert_eq!(
+                prepare_acknowledgement["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abh"
+            );
+            socket
+                .send(observation_acknowledgement(
+                    prepare_acknowledgement["messageId"]
+                        .as_str()
+                        .expect("prepare acknowledgement message ID"),
+                    4,
+                ))
+                .await
+                .expect("send prepare acknowledgement response");
             socket
                 .send(Message::Text(
                     json!({
                         "protocolVersion": 1,
                         "direction": "cloud_to_runner",
                         "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abp",
-                        "sentAt": "2026-07-23T00:00:04Z",
+                        "sentAt": "2026-07-23T00:00:05Z",
                         "type": "assignment_release",
                         "payloadVersion": 1,
                         "payload": {
@@ -3512,13 +3643,58 @@ mod tests {
                     .into(),
                 ))
                 .await
-                .expect("send assignment release while semantic response is pending");
+                .expect("send assignment release while semantic responses are pending");
+            let Some(Ok(Message::Text(progress))) = socket.next().await else {
+                panic!("fixture did not receive assignment preparation progress");
+            };
+            let progress: serde_json::Value =
+                serde_json::from_str(&progress).expect("decode assignment preparation progress");
+            assert_eq!(progress["type"], "assignment_preparation_progress");
+            assert_eq!(progress["payload"]["preparationSequence"], 1);
+            assert_eq!(progress["payload"]["phase"], "source_materialization");
+            socket
+                .send(observation_acknowledgement(
+                    progress["messageId"]
+                        .as_str()
+                        .expect("preparation progress message ID"),
+                    5,
+                ))
+                .await
+                .expect("send preparation progress acknowledgement");
+            for (cloud_sequence, preparation_sequence, phase) in
+                [(6, 2, "input_download"), (7, 3, "workflow_admission")]
+            {
+                let Some(Ok(Message::Text(progress))) = socket.next().await else {
+                    panic!("fixture did not receive monotonic assignment preparation progress");
+                };
+                let progress: serde_json::Value = serde_json::from_str(&progress)
+                    .expect("decode monotonic assignment preparation progress");
+                assert_eq!(progress["type"], "assignment_preparation_progress");
+                assert_eq!(
+                    progress["payload"]["preparationSequence"],
+                    preparation_sequence
+                );
+                assert_eq!(progress["payload"]["phase"], phase);
+                socket
+                    .send(observation_acknowledgement(
+                        progress["messageId"]
+                            .as_str()
+                            .expect("monotonic preparation progress message ID"),
+                        cloud_sequence,
+                    ))
+                    .await
+                    .expect("send monotonic preparation progress acknowledgement");
+            }
             let Some(Ok(Message::Text(response))) = socket.next().await else {
                 panic!("fixture did not receive semantic assignment response");
             };
             let response: serde_json::Value =
                 serde_json::from_str(&response).expect("decode semantic assignment response");
             assert_eq!(response["type"], "assignment_rejected");
+            assert_eq!(
+                response["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abh"
+            );
             assert_eq!(
                 response["payload"]["decline"]["reason"],
                 "workflow_source_invalid"
@@ -3528,7 +3704,7 @@ mod tests {
                     response["messageId"]
                         .as_str()
                         .expect("semantic response message ID"),
-                    3,
+                    8,
                 ))
                 .await
                 .expect("send semantic response acknowledgement");
@@ -3548,7 +3724,7 @@ mod tests {
                     release_acknowledgement["messageId"]
                         .as_str()
                         .expect("release acknowledgement message ID"),
-                    4,
+                    9,
                 ))
                 .await
                 .expect("send release acknowledgement response");
@@ -3562,16 +3738,32 @@ mod tests {
         let outcome = outcome.expect("run fixture connection");
         assert!(outcome.opening_acknowledged);
         assert!(outcome.handshake_completed);
-        assert_eq!(outcome.cloud_text_frames_received, 7);
-        assert_eq!(outcome.runner_text_frames_sent, 4);
-        assert_eq!(outcome.effects_received, 2);
-        assert_eq!(outcome.effect_acknowledgements_confirmed, 2);
-        assert_eq!(next_sequence, 5);
+        assert_eq!(outcome.cloud_text_frames_received, 13);
+        assert_eq!(outcome.runner_text_frames_sent, 9);
+        assert_eq!(outcome.effects_received, 3);
+        assert_eq!(outcome.effect_acknowledgements_confirmed, 3);
+        assert_eq!(next_sequence, 10);
         server.await.expect("join fixture server");
 
-        let events = capture.events();
-        assert_eq!(events.len(), 2);
-        let event = &events[0];
+        let all_events = capture.events();
+        let preparation = all_events
+            .iter()
+            .find(|event| event["event.name"] == "runner.assignment_preparation")
+            .expect("assignment preparation event");
+        assert_eq!(preparation["scherzo.outcome"], "failure");
+        assert_eq!(
+            preparation["scherzo.assignment.preparation_phase"],
+            "workflow_admission"
+        );
+        let encoded_preparation =
+            serde_json::to_string(preparation).expect("encode preparation event");
+        assert!(!encoded_preparation.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
+        let events = all_events
+            .iter()
+            .filter(|event| event["event.name"] == "runner.effect_acknowledgement")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        let event = events[0];
         assert_eq!(event["event.name"], "runner.effect_acknowledgement");
         assert_eq!(event["scherzo.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abg");
         assert_eq!(
@@ -3589,11 +3781,18 @@ mod tests {
         assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
         assert_eq!(
             events[1]["scherzo.effect.id"],
-            "eff_01k0z6r1w8f4jy2m7q9v3x5abj"
+            "eff_01k0z6r1w8f4jy2m7q9v3x5abh"
         );
         assert_eq!(events[1]["scherzo.runner.sequence"], 4);
         assert_eq!(events[1]["scherzo.outcome"], "success");
-        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 2);
+        assert_eq!(
+            events[2]["scherzo.effect.id"],
+            "eff_01k0z6r1w8f4jy2m7q9v3x5abj"
+        );
+        assert_eq!(events[2]["scherzo.runner.sequence"], 9);
+        assert_eq!(events[2]["scherzo.outcome"], "success");
+        assert_eq!(capture.span_count("runner.effect_acknowledgement"), 3);
+        assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
 
         let protocol: Vec<_> = capture
             .records()
@@ -3608,10 +3807,21 @@ mod tests {
             ("pong", None),
             ("text", Some("assignment_offer")),
             ("text", Some("effect_acknowledged")),
+            ("text", Some("assignment_preparing")),
+            ("text", Some("observation_ack")),
+            ("text", Some("observation_ack")),
+            ("text", Some("assignment_prepare")),
+            ("text", Some("effect_acknowledged")),
+            ("text", Some("assignment_preparation_progress")),
+            ("text", Some("assignment_preparation_progress")),
+            ("text", Some("assignment_preparation_progress")),
             ("text", Some("assignment_rejected")),
             ("text", Some("observation_ack")),
             ("text", Some("assignment_release")),
             ("text", Some("effect_acknowledged")),
+            ("text", Some("observation_ack")),
+            ("text", Some("observation_ack")),
+            ("text", Some("observation_ack")),
             ("text", Some("observation_ack")),
             ("text", Some("observation_ack")),
             ("close", None),
@@ -3859,7 +4069,9 @@ mod tests {
             let mut socket = accept_fixture_socket(&listener).await;
             expect_opening_hello(&mut socket).await;
             socket
-                .send(Message::Text("x".repeat(65_537).into()))
+                .send(Message::Text(
+                    "x".repeat(super::MAX_INBOUND_MESSAGE_BYTES + 1).into(),
+                ))
                 .await
                 .expect("send oversized frame");
             while let Some(Ok(_)) = socket.next().await {}
@@ -4045,11 +4257,9 @@ mod tests {
         let (recorder, capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
-        let assignment_manager = Mutex::new(AssignmentManager::new(
-            config,
-            BOOT_ID.to_owned(),
-            fixture_lease_clock(),
-        ));
+        let mut manager = AssignmentManager::new(config, BOOT_ID.to_owned(), fixture_lease_clock());
+        manager.use_recorder_fixture(Arc::clone(&recorder));
+        let assignment_manager = Mutex::new(manager);
         let sequence = Sequence::new(*next_sequence);
         let result = run(
             ConnectionDependencies::new(

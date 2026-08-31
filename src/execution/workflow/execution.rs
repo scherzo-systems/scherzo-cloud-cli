@@ -23,12 +23,11 @@ use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowExecutionResult<Deadline = ()> {
-    pub(crate) outcome: RunOutcome<StepFailureCause>,
-    pub(crate) steps: BTreeMap<String, StepState<StepFailureCause, CapturedValue>>,
+    pub(crate) outcome: RunOutcome,
+    pub(crate) steps: BTreeMap<String, StepState<CapturedValue>>,
     pub(crate) recoveries:
         BTreeMap<String, Option<super::runtime::StepRecoveryState<StepFailureCause>>>,
-    pub(crate) finalization_summary:
-        Option<super::runtime::FinalizationSummary<StepFailureCause, Deadline>>,
+    pub(crate) finalization_summary: Option<super::runtime::FinalizationSummary<Deadline>>,
     pub(crate) exports: ExportSet<CapturedValue>,
     pub(crate) provenance: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
@@ -84,7 +83,7 @@ where
 }
 
 fn observed_step_transition<Deadline>(
-    event: &TransitionEvent<StepFailureCause, Deadline>,
+    event: &TransitionEvent<Deadline>,
     state: &RuntimeState<StepFailureCause, CapturedValue, Deadline>,
 ) -> Option<ObservedStepTransition> {
     let TransitionEvent::Step { step, from, to, .. } = event else {
@@ -156,30 +155,24 @@ fn observed_step_transition<Deadline>(
                 outputs: outputs.keys().cloned().collect(),
             })
         }
-        (StepStateKind::Failed, StepState::Failed { phase, cause }) => {
+        (StepStateKind::Failed, StepState::Failed { detail }) => {
             Some(ObservedStepTransition::Failed {
-                phase: *phase,
-                cause: cause.clone(),
+                detail: detail.clone(),
             })
         }
-        (StepStateKind::Blocked, StepState::Blocked { dependency }) => {
+        (StepStateKind::Blocked, StepState::Blocked { detail }) => {
             Some(ObservedStepTransition::Blocked {
-                dependency: dependency.clone(),
+                detail: detail.clone(),
             })
         }
-        (StepStateKind::Blocked, StepState::InputUnavailable { references }) => {
-            Some(ObservedStepTransition::InputUnavailable {
-                references: references.clone(),
-            })
+        (StepStateKind::NotRun, StepState::NotRun { detail }) => {
+            Some(ObservedStepTransition::NotRun { detail: *detail })
         }
-        (StepStateKind::NotRun, StepState::NotRun { reason }) => {
-            Some(ObservedStepTransition::NotRun { reason: *reason })
+        (StepStateKind::Cancelling, StepState::Cancelling { detail }) => {
+            Some(ObservedStepTransition::Cancelling { detail: *detail })
         }
-        (StepStateKind::Cancelling, StepState::Cancelling { reason }) => {
-            Some(ObservedStepTransition::Cancelling { reason: *reason })
-        }
-        (StepStateKind::Cancelled, StepState::Cancelled { reason }) => {
-            Some(ObservedStepTransition::Cancelled { reason: *reason })
+        (StepStateKind::Cancelled, StepState::Cancelled { detail }) => {
+            Some(ObservedStepTransition::Cancelled { detail: *detail })
         }
         _ => None,
     }
@@ -231,10 +224,10 @@ where
     let outcome = match coordinated.state.workflow {
         WorkflowState::Succeeded => RunOutcome::Succeeded,
         WorkflowState::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation,
         } => RunOutcome::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation,
         },
         WorkflowState::Cancelled { reason } => RunOutcome::Cancelled { reason },

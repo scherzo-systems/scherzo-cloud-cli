@@ -63,6 +63,113 @@ struct Expected {
 }
 
 #[test]
+fn condition_evidence_capacity_derives_every_frame_and_result_class() {
+    let maximum =
+        calculate_condition_evidence_capacity(super::super::resolution::MAX_SOURCE_CLOSURE_BYTES)
+            .unwrap();
+    assert_eq!(
+        maximum,
+        ConditionEvidenceCapacity {
+            maximum_json_escaped_pointer_bytes: 201_326_592,
+            condition_transition_bytes: MAXIMUM_CONDITION_TRANSITION_BYTES,
+            terminal_result_structure_bytes: MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES,
+            portable_result_bytes: MAXIMUM_PORTABLE_RESULT_BYTES,
+        }
+    );
+    assert_eq!(
+        maximum.portable_result_bytes,
+        maximum.terminal_result_structure_bytes
+            + super::super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+            + super::super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES
+    );
+
+    assert_eq!(
+        calculate_condition_evidence_capacity(
+            super::super::resolution::MAX_SOURCE_CLOSURE_BYTES + 1
+        ),
+        Err(ConditionCapacityFailure::SourceClosureCapacityExceeded)
+    );
+    for source_bytes in [u64::MAX, u64::MAX / 3, u64::MAX / 8 + 1] {
+        assert_eq!(
+            calculate_condition_evidence_capacity(source_bytes),
+            Err(ConditionCapacityFailure::ArithmeticOverflow)
+        );
+    }
+    assert_eq!(
+        portable_result_bound(u64::MAX),
+        Err(ConditionCapacityFailure::ArithmeticOverflow)
+    );
+    assert_eq!(condition_false_transition_bound(), Ok(33_871));
+
+    for source_bytes in [0, 1, 1_024, 1024 * 1024] {
+        let capacity = calculate_condition_evidence_capacity(source_bytes).unwrap();
+        assert_eq!(
+            capacity.maximum_json_escaped_pointer_bytes,
+            source_bytes * JSON_ESCAPED_POINTER_SOURCE_MULTIPLIER
+        );
+        let expected_transition_bytes = (source_bytes * 4).max(33_871);
+        assert_eq!(
+            capacity.condition_transition_bytes,
+            expected_transition_bytes
+        );
+        assert_eq!(
+            capacity.terminal_result_structure_bytes,
+            expected_transition_bytes * 2
+        );
+    }
+}
+
+#[test]
+fn condition_evidence_capacity_reserves_exact_outbox_classes() {
+    let entries = 10 + RUNNER_OBSERVATION_RESERVE;
+    let expected = (entries - 2 - 1) * RUNNER_ORDINARY_FRAME_BYTES + 1_000 + 2_000;
+    assert_eq!(
+        calculate_condition_outbox_reservation(10, 2, 1_000, 2_000),
+        Ok(expected)
+    );
+
+    let baseline = calculate_condition_outbox_reservation(
+        CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS,
+        0,
+        0,
+        RUNNER_TERMINAL_FRAME_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        baseline,
+        (CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS + RUNNER_OBSERVATION_RESERVE)
+            * RUNNER_ORDINARY_FRAME_BYTES
+            + RUNNER_TERMINAL_FRAME_BYTES
+            - RUNNER_ORDINARY_FRAME_BYTES
+    );
+
+    let maximum =
+        calculate_condition_evidence_capacity(super::super::resolution::MAX_SOURCE_CLOSURE_BYTES)
+            .unwrap();
+    assert!(
+        calculate_condition_outbox_reservation(
+            CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS,
+            256,
+            maximum.condition_transition_bytes,
+            maximum.terminal_result_structure_bytes,
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        calculate_condition_outbox_reservation(0, RUNNER_OBSERVATION_RESERVE, 0, 0),
+        Err(ConditionCapacityFailure::OutboxEntryCapacityExceeded)
+    );
+    assert_eq!(
+        calculate_condition_outbox_reservation(u64::MAX, 0, 0, 0),
+        Err(ConditionCapacityFailure::ArithmeticOverflow)
+    );
+    assert_eq!(
+        calculate_condition_outbox_reservation(1, 0, u64::MAX, 1),
+        Err(ConditionCapacityFailure::ArithmeticOverflow)
+    );
+}
+
+#[test]
 fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/workflow/v1/recovery-capacity-vectors.json");
@@ -93,7 +200,7 @@ fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
             "general" => {
                 validate_general_transition_bound(case.maximum_transitions, case.finalizers)
             }
-            "workflow_v1_inputless_cloud_artifacts@1" => {
+            "workflow_v1_cloud_inputs_artifacts@1" => {
                 validate_cloud_transition_bound(case.maximum_transitions, case.finalizers)
             }
             _ => panic!("unknown capacity contract in {}", case.name),

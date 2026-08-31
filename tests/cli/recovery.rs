@@ -218,6 +218,76 @@ fn local_handlerless_and_command_repair_publish_exact_recovery_evidence() {
 }
 
 #[test]
+fn semantic_outputs_output_capture_failure_runs_command_repair_before_recheck() {
+    let source = r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              test ! -e artifact.txt
+              printf repaired > repaired.marker
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"restored generation precondition","reason":"rerun the complete target"}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          printf x >> target-runs.txt
+          if test -f repaired.marker; then
+            printf 'captured only from execution 2' > artifact.txt
+          fi
+    outputs:
+      artifact:
+        kind: file
+        from: path
+        path: artifact.txt
+        mediaType: text/plain
+exports:
+  artifact:
+    ref: outputs.repair.artifact
+"#;
+    let bundle = RunBundle::new(source);
+    let run_directory = bundle.result("output-capture-repair");
+    let output = run(&json_run_args(&bundle, &run_directory));
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    let step = &terminal["result"]["steps"][0];
+    assert_eq!(step["state"], "succeeded");
+    assert_closed_recovery_step(step, Some("cmd"), 3);
+    assert_eq!(
+        step["recovery"]["rounds"][0]["failedExecution"]["failure"]["phase"],
+        "output_capture"
+    );
+    assert_eq!(
+        step["recovery"]["rounds"][0]["failedExecution"]["failure"]["cause"]["code"],
+        "output_missing"
+    );
+    assert_eq!(
+        fs::read(bundle.execution_root().join("target-runs.txt")).unwrap(),
+        b"xx"
+    );
+    assert_eq!(
+        fs::read(bundle.execution_root().join("artifact.txt")).unwrap(),
+        b"captured only from execution 2"
+    );
+}
+
+#[test]
 fn durable_recovery_is_authoritative_before_handler_and_recheck_launch() {
     let source = "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          argv:\n            - /bin/sh\n            - -c\n            - |\n              set -eu\n              role=false\n              active=false\n              while IFS= read -r line; do\n                case \"$line\" in *'\"role\": \"recovery_handler\"'*) role=true ;; esac\n                case \"$line\" in *'\"state\": \"active\"'*) active=true ;; esac\n              done < \"$RECOVERY_STATE\"\n              $role\n              $active\n              : > handler-observed-durable-state\n              : > repaired\n              printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"Durable handler state observed.\",\"reason\":\"The recheck can verify its own durable authorization.\"}' > \"$SCHERZO_RECOVERY_RESULT\"\n    command:\n      argv:\n        - /bin/sh\n        - -c\n        - |\n          set -eu\n          if [ ! -f repaired ]; then exit 75; fi\n          decision=false\n          execution=false\n          while IFS= read -r line; do\n            case \"$line\" in *'\"decision\": \"recheck\"'*) decision=true ;; esac\n            case \"$line\" in *'\"targetExecution\": 2'*) execution=true ;; esac\n          done < \"$RECOVERY_STATE\"\n          $decision\n          $execution\n          : > recheck-observed-durable-state\n";
     let bundle = RunBundle::new(source);
@@ -312,8 +382,8 @@ fn gave_up_and_handler_failure_preserve_the_raw_target_failure() {
         let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let step = &terminal["result"]["steps"][0];
         assert_eq!(step["state"], "failed");
-        assert_eq!(step["failure"]["cause"]["code"], "command_exit");
-        assert_eq!(step["failure"]["cause"]["exitCode"], 75);
+        assert_eq!(step["detail"]["code"], "command_exit");
+        assert_eq!(step["detail"]["exitCode"], 75);
         assert_eq!(step["recovery"]["termination"]["kind"], termination);
         assert_eq!(
             step["recovery"]["rounds"][0]["handler"]["outcome"],
@@ -332,7 +402,7 @@ fn exhaustion_remains_terminal_until_retry_starts_fresh_execution_one() {
     let initial: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
     let failed = &initial["result"]["steps"][0];
     assert_eq!(failed["state"], "failed");
-    assert_eq!(failed["failure"]["cause"]["exitCode"], 75);
+    assert_eq!(failed["detail"]["exitCode"], 75);
     assert_eq!(
         failed["recovery"]["termination"],
         serde_json::json!({

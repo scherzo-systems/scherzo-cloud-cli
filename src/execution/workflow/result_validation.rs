@@ -596,10 +596,7 @@ impl FeedbackBuilder {
 }
 
 fn clamp_nonzero(value: NonZeroU64, maximum: u64) -> NonZeroU64 {
-    let Some(value) = NonZeroU64::new(value.get().min(maximum)) else {
-        unreachable!("result-validation hard limits are positive");
-    };
-    value
+    NonZeroU64::new(value.get().min(maximum)).unwrap_or(NonZeroU64::MIN)
 }
 
 fn bounded_feedback(feedback: String, maximum_bytes: u64) -> Arc<str> {

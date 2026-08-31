@@ -480,7 +480,7 @@ fn dirty_index_worktree_untracked_and_submodule_states_fail_without_adapter_auth
             "untracked" => {
                 fs::write(fixture.repository.join("untracked.txt"), b"untracked\n").unwrap();
             }
-            _ => unreachable!(),
+            _ => panic!("unknown workspace mutation fixture"),
         }
         let before = repository_bytes(&fixture.repository);
         assert_eq!(

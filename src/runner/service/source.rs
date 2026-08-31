@@ -94,24 +94,29 @@ pub(super) struct HttpSourceCredentialBroker {
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
 }
 
+pub(super) fn private_runner_http_endpoint(endpoint: &Url, path: &str) -> Result<Url, ()> {
+    let mut endpoint = endpoint.clone();
+    match endpoint.scheme() {
+        "wss" => endpoint.set_scheme("https")?,
+        "ws" => endpoint.set_scheme("http")?,
+        _ => return Err(()),
+    }
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    endpoint.set_path(path);
+    Ok(endpoint)
+}
+
 impl HttpSourceCredentialBroker {
     pub(super) fn new(
         endpoint: &Url,
         runner_credential: &Credential,
         boot_id: &str,
     ) -> Result<Self, ()> {
-        let mut endpoint = endpoint.clone();
-        match endpoint.scheme() {
-            "wss" => endpoint.set_scheme("https")?,
-            "ws" => endpoint.set_scheme("http")?,
-            _ => return Err(()),
-        }
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
-        let mut credential_endpoint = endpoint.clone();
-        credential_endpoint.set_path("/v1/runner/source-credentials");
-        let mut availability_endpoint = endpoint;
-        availability_endpoint.set_path("/v1/runner/source-commit-availability");
+        let credential_endpoint =
+            private_runner_http_endpoint(endpoint, "/v1/runner/source-credentials")?;
+        let availability_endpoint =
+            private_runner_http_endpoint(endpoint, "/v1/runner/source-commit-availability")?;
         Ok(Self {
             credential_endpoint,
             availability_endpoint,
@@ -407,7 +412,7 @@ fn ensure_broker_current(
     clippy::disallowed_methods,
     reason = "the private credential-request runtime must yield while polling its fence"
 )]
-async fn wait_for_cancellation(cancellation: &CaptureCancellation) {
+pub(super) async fn wait_for_cancellation(cancellation: &CaptureCancellation) {
     while !cancellation.is_cancelled() {
         tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
     }
@@ -491,11 +496,17 @@ impl MaterializationRequest {
     }
 }
 
+pub(super) struct MaterializedCheckout {
+    request: MaterializationRequest,
+    source_root: PathBuf,
+    ordinary_execution_root: PathBuf,
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "source materialization binds explicit assignment authority and three confined roots"
+    reason = "source checkout binds explicit assignment authority and three confined roots"
 )]
-pub(super) fn materialize(
+pub(super) fn checkout(
     broker: Arc<dyn SourceCredentialBroker>,
     environment: &EnvironmentSnapshot,
     assignment_id: &str,
@@ -504,7 +515,7 @@ pub(super) fn materialize(
     source_root: &Path,
     ordinary_execution_root: &Path,
     private_root: &Path,
-) -> Result<MaterializedSource, MaterializationFailure> {
+) -> Result<MaterializedCheckout, MaterializationFailure> {
     if request.object_format != "sha1" {
         return Err(MaterializationFailure::UnsupportedObjectFormat);
     }
@@ -562,43 +573,94 @@ pub(super) fn materialize(
     ensure_current(cancellation)?;
     verify_fetched_commit(source_root, environment, request, cancellation)?;
     checkout_pinned_commit(source_root, environment, &request.commit_oid, cancellation)?;
-
     verify_checkout(source_root, environment, request, cancellation)?;
     ensure_current(cancellation)?;
-    let workflow = resolution::resolve(source_root, Path::new(&request.workflow_path))
-        .map_err(|_| MaterializationFailure::WorkflowUnavailable)?;
+    Ok(MaterializedCheckout {
+        request: request.clone(),
+        source_root: source_root.to_owned(),
+        ordinary_execution_root: ordinary_execution_root.to_owned(),
+    })
+}
+
+pub(super) fn resolve_checkout(
+    checkout: MaterializedCheckout,
+    cancellation: &CaptureCancellation,
+) -> Result<MaterializedSource, MaterializationFailure> {
     ensure_current(cancellation)?;
-    if workflow.source.workflow_path != request.workflow_path {
+    let workflow = resolution::resolve(
+        &checkout.source_root,
+        Path::new(&checkout.request.workflow_path),
+    )
+    .map_err(|_| MaterializationFailure::WorkflowUnavailable)?;
+    ensure_current(cancellation)?;
+    if workflow.source.workflow_path != checkout.request.workflow_path {
         return Err(MaterializationFailure::WorkflowUnavailable);
     }
     if workflow.content_digest.algorithm.as_str()
-        != request.workflow_source_closure_digest.algorithm
-        || workflow.content_digest.value != request.workflow_source_closure_digest.value
+        != checkout.request.workflow_source_closure_digest.algorithm
+        || workflow.content_digest.value != checkout.request.workflow_source_closure_digest.value
     {
         return Err(MaterializationFailure::WorkflowDigestMismatch);
     }
 
     if workflow.requires_git_capture() {
-        fs::remove_dir(ordinary_execution_root)
+        fs::remove_dir(&checkout.ordinary_execution_root)
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
         let git_capture = CloudGitCaptureProjection::new(
-            Arc::from(request.commit_oid.as_str()),
-            Arc::from(request.workflow_source_closure_digest.value.as_str()),
+            Arc::from(checkout.request.commit_oid.as_str()),
+            Arc::from(
+                checkout
+                    .request
+                    .workflow_source_closure_digest
+                    .value
+                    .as_str(),
+            ),
             cancellation.clone(),
         );
         Ok(MaterializedSource {
             workflow,
-            execution_root: source_root.to_owned(),
+            execution_root: checkout.source_root,
             git_capture: Some(git_capture),
         })
     } else {
         Ok(MaterializedSource {
             workflow,
-            execution_root: ordinary_execution_root.to_owned(),
+            execution_root: checkout.ordinary_execution_root,
             git_capture: None,
         })
     }
 }
+
+// The test-only composed seam intentionally repeats checkout's explicit confinement inputs.
+// jscpd:ignore-start
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the source unit seam composes checkout and workflow resolution"
+)]
+pub(super) fn materialize(
+    broker: Arc<dyn SourceCredentialBroker>,
+    environment: &EnvironmentSnapshot,
+    assignment_id: &str,
+    request: &MaterializationRequest,
+    cancellation: &CaptureCancellation,
+    source_root: &Path,
+    ordinary_execution_root: &Path,
+    private_root: &Path,
+) -> Result<MaterializedSource, MaterializationFailure> {
+    let checkout = checkout(
+        broker,
+        environment,
+        assignment_id,
+        request,
+        cancellation,
+        source_root,
+        ordinary_execution_root,
+        private_root,
+    )?;
+    resolve_checkout(checkout, cancellation)
+}
+// jscpd:ignore-end
 
 fn ensure_current(cancellation: &CaptureCancellation) -> Result<(), MaterializationFailure> {
     if cancellation.is_cancelled() {
@@ -898,16 +960,37 @@ fn run_git_output(
     cancellation: &CaptureCancellation,
 ) -> Result<Vec<u8>, MaterializationFailure> {
     ensure_current(cancellation)?;
-    let output = git_command(root, environment, arguments, None)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+    let mut captured =
+        tempfile::tempfile().map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    let output = captured
+        .try_clone()
+        .map(Stdio::from)
         .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    ensure_current(cancellation)?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+    let mut command = git_command(root, environment, arguments, None);
+    command
+        .stdin(Stdio::null())
+        .stdout(output)
+        .stderr(Stdio::null());
+    let status = run_managed_source_git(
+        &mut command,
+        cancellation,
+        MaterializationFailure::EnvironmentUnavailable,
+    )?;
+    if !status.success() {
         return Err(MaterializationFailure::EnvironmentUnavailable);
     }
-    Ok(output.stdout)
+    captured
+        .rewind()
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    let mut output = Vec::new();
+    captured
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut output)
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    if output.len() > 64 * 1024 {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    Ok(output)
 }
 
 fn git_command(
@@ -1103,6 +1186,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, mpsc};
@@ -2597,7 +2681,16 @@ mod tests {
     #[test]
     fn source_git_processes_are_terminated_when_capture_is_fenced() {
         let temporary = tempfile::tempdir().unwrap();
-        let ready = temporary.path().join("provider-operation-ready");
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      exec /bin/sleep 60\n      ;;\n  esac\ndone\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+        let ready = temporary.path().join("git-status-ready");
         let cancellation = CaptureCancellation::default();
         let cancel = cancellation.clone();
         let worker_ready = ready.clone();
@@ -2610,19 +2703,24 @@ mod tests {
             }
             cancel.cancel();
         });
+        let environment = EnvironmentSnapshot::new([("PATH", bin.as_os_str())]);
         let started = crate::timing::monotonic_now();
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "printf ready > \"$READY\"; exec sleep 60"])
-            .env("READY", ready)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
 
-        assert_eq!(
-            run_managed_git(&mut command, Some(&cancellation)),
-            Err(ManagedGitFailure::Cancelled)
-        );
+        assert!(matches!(
+            run_git_output(
+                temporary.path(),
+                &environment,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignore-submodules=none",
+                ],
+                &cancellation,
+            ),
+            Err(MaterializationFailure::AssignmentFenced)
+        ));
         assert!(crate::timing::elapsed(started) < Duration::from_secs(2));
         canceller.join().unwrap();
     }

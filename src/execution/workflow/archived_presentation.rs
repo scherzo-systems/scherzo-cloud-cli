@@ -7,11 +7,11 @@ use serde::Serialize;
 use super::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
     ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedAttemptTrigger,
-    ArchivedCancellationReason, ArchivedFailure, ArchivedFailureCause, ArchivedFailurePhase,
-    ArchivedStep, ArchivedStepDetail, ArchivedStepState, ArchivedWorkflowOutcome,
-    LoadedLocalArchivedAttempt, LocalArchivedAttempt,
+    ArchivedCancellationReason, ArchivedFailure, ArchivedStep, ArchivedStepDetail,
+    ArchivedStepState, ArchivedWorkflowOutcome, LoadedLocalArchivedAttempt, LocalArchivedAttempt,
 };
 use super::document::FailurePolicy;
+use super::evidence::{NodeDetail, Prerequisite, PrimaryIssueDetail};
 use super::presentation::{human_duration, styled_terminal_text as styled};
 use super::presentation_feed::{WorkflowPresentationStep, normalize_terminal_scalar};
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
@@ -160,7 +160,9 @@ pub(crate) fn render_plain(
         rendered.push('\n');
         if let Some(recovery) = &step.recovery {
             let terminal_failure = match &step.detail {
-                ArchivedStepDetail::Failed(failure) => Some(archived_failure_detail(failure)),
+                ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
+                    Some(archived_failure_detail(failure))
+                }
                 _ => None,
             };
             rendered.push_str(&format!(
@@ -214,13 +216,18 @@ pub(crate) fn render_plain(
         styled(outcome, outcome_style(attempt.outcome), color),
         human_duration(attempt.execution.duration),
     ));
-    if let Some(primary) = &attempt.primary_failure {
+    if let Some(primary) = &attempt.primary_issue {
+        let detail = match &primary.detail {
+            PrimaryIssueDetail::Failed(detail) => archived_failure_detail(detail),
+            PrimaryIssueDetail::Blocked(detail) => blocked_detail(detail),
+        };
         rendered.push_str(&format!(
-            "{} {} {} · {}\n",
-            styled("primary failure:", STYLE_FAILURE, color),
-            archived_role(primary.role),
-            safe_text(&primary.step),
-            archived_failure_detail(&primary.failure),
+            "{} {} {} · {:?} · {}\n",
+            styled("primary issue:", STYLE_FAILURE, color),
+            archived_role(primary.node.role),
+            safe_text(&primary.node.id),
+            primary.state,
+            detail,
         ));
     }
     if let Some(cancellation) = &attempt.cancellation {
@@ -304,22 +311,13 @@ fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationSt
                 count => format!("{count} outputs committed"),
             },
         },
-        ArchivedStepDetail::Failed(failure) => archived_failure_detail(failure),
-        ArchivedStepDetail::Blocked { dependency } => {
-            format!("blocked by {}", safe_text(dependency))
+        ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
+            archived_failure_detail(failure)
         }
-        ArchivedStepDetail::InputUnavailable { references } => format!(
-            "inputs unavailable: {}",
-            references
-                .iter()
-                .map(|reference| safe_text(reference))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        ArchivedStepDetail::NotRun => "failure_stop".to_owned(),
-        ArchivedStepDetail::TriggerNotSelected => "finalizer_trigger_not_selected".to_owned(),
-        ArchivedStepDetail::Cancelled { reason } => {
-            archived_cancellation_reason(*reason).to_owned()
+        ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail)) => blocked_detail(detail),
+        ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => snake_case_debug(detail.code),
+        ArchivedStepDetail::Evidence(NodeDetail::Cancellation(detail)) => {
+            snake_case_debug(detail.code)
         }
     }
 }
@@ -605,31 +603,21 @@ pub(crate) const fn archived_finalization_trigger(trigger: FinalizationTriggerV1
 }
 
 pub(crate) fn archived_failure_detail(failure: &ArchivedFailure) -> String {
-    let phase = match failure.phase {
-        ArchivedFailurePhase::Start => "start",
-        ArchivedFailurePhase::Execution => "execution",
-        ArchivedFailurePhase::OutputCapture => "output_capture",
-    };
-    format!("{phase} · {}", archived_failure_cause(&failure.cause))
+    super::presentation::canonical_failure_detail(failure)
 }
 
-fn archived_failure_cause(cause: &ArchivedFailureCause) -> String {
-    let mut detail = snake_case_debug(cause.code);
-    if let Some(input) = &cause.input {
-        detail.push_str(" · input ");
-        detail.push_str(&safe_text(input));
-    }
-    if let Some(index) = cause.collection_index {
-        detail.push_str(&format!(" · collection index {index}"));
-    }
-    if let Some(output) = &cause.output {
-        detail.push_str(" · output ");
-        detail.push_str(&safe_text(output));
-    }
-    if let Some(exit_code) = cause.exit_code {
-        detail.push_str(&format!(" · exit {exit_code}"));
-    }
-    detail
+pub(crate) fn blocked_detail(detail: &super::evidence::BlockedDetail) -> String {
+    let prerequisites = detail
+        .prerequisites
+        .iter()
+        .map(|prerequisite| match prerequisite {
+            Prerequisite::Control { node } => format!("control {}", safe_text(node)),
+            Prerequisite::Condition { r#ref } => format!("condition {}", safe_text(r#ref)),
+            Prerequisite::Body { r#ref } => format!("body {}", safe_text(r#ref)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("prerequisites_unsatisfied · {prerequisites}")
 }
 
 fn snake_case_debug(value: impl std::fmt::Debug) -> String {
@@ -959,7 +947,7 @@ mod tests {
                 duration: Duration::from_secs(3),
             },
             outcome: ArchivedWorkflowOutcome::Succeeded,
-            primary_failure: None,
+            primary_issue: None,
             cancellation: None,
             finalization: None,
             steps: vec![ArchivedStep {

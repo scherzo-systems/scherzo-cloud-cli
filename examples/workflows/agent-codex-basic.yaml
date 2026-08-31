@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Ask a low-effort Codex agent a basic arithmetic question.
+
+agentProfiles:
+  basic:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: low
+
+steps:
+  answer:
+    kind: agent
+    agent:
+      profile: basic
+      systemPrompt: prompts/basic-agent-system.md
+      message:
+        text:
+          - file: prompts/basic-agent-question.md
+    outputs:
+      response:
+        kind: text
+        from: agent_response
+
+exports:
+  response:
+    ref: outputs.answer.response

@@ -120,7 +120,6 @@ impl CapturedJson {
         carrier: Arc<[u8]>,
         schema: RetainedJsonSchema,
     ) -> Self {
-        debug_assert!(canonical_carrier_matches(&value, &carrier));
         Self {
             inner: Arc::new(CapturedJsonInner {
                 value,

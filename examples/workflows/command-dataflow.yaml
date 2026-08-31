@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Materialize imported command inputs, capture path-backed outputs, and pass them downstream.
+
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; mkdir -p work"
+
+  capture:
+    kind: cmd
+    dependsOn: [prepare]
+    cwd: work
+    inputs:
+      request:
+        ref: imports.prompt
+      attachments:
+        ref: imports.attachments
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          attachments_dir="$SCHERZO_STEP_INPUTS/collections/attachments"
+          attachment_count=0
+          for attachment in "$attachments_dir"/*; do
+            [ -f "$attachment" ] || continue
+            attachment_count=$((attachment_count + 1))
+          done
+
+          {
+            printf '%s\n' 'Imported request:'
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/request"
+          } > summary.txt
+
+          printf '%s\n' "{\"schemaVersion\":1,\"state\":\"captured\",\"attachmentCount\":$attachment_count}" > metadata.json
+
+          {
+            printf 'Materialized attachments: %s\n' "$attachment_count"
+            attachment_index=0
+            for attachment in "$attachments_dir"/*; do
+              [ -f "$attachment" ] || continue
+              attachment_index=$((attachment_index + 1))
+              printf '\nAttachment %s:\n' "$attachment_index"
+              while IFS= read -r line || [ -n "$line" ]; do
+                printf '%s\n' "$line"
+              done < "$attachment"
+            done
+          } > attachment-report.txt
+    outputs:
+      summary:
+        kind: text
+        from: path
+        path: work/summary.txt
+      metadata:
+        kind: json
+        from: path
+        path: work/metadata.json
+        schema: schemas/command-dataflow-metadata.schema.json
+      attachmentReport:
+        kind: file
+        from: path
+        path: work/attachment-report.txt
+        mediaType: text/plain
+
+  deliver:
+    kind: cmd
+    inputs:
+      summary:
+        ref: outputs.capture.summary
+      metadata:
+        ref: outputs.capture.metadata
+      attachmentReport:
+        ref: outputs.capture.attachmentReport
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          {
+            printf '%s\n' 'Summary value:'
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/summary"
+
+            printf '\n%s\n' 'JSON value:'
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/metadata"
+
+            printf '\n%s\n' 'File value:'
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/attachmentReport"
+          } > delivered.txt
+          printf '%s\n' 'delivered all three typed values'
+    outputs:
+      delivery:
+        kind: text
+        from: path
+        path: delivered.txt
+
+exports:
+  summary:
+    ref: outputs.capture.summary
+  metadata:
+    ref: outputs.capture.metadata
+  attachmentReport:
+    ref: outputs.capture.attachmentReport
+  delivery:
+    ref: outputs.deliver.delivery

@@ -2004,9 +2004,9 @@ fn runner_doctor_reports_schema_one_json() {
                 "title": "Git",
                 "status": "pass",
                 "code": "ok",
-                "message": "Git 2.42.0 is available (minimum 0.0.1).",
+                "message": "Git 2.42.0 is available (minimum 2.29.0).",
                 "details": {
-                    "minimumVersion": "0.0.1",
+                    "minimumVersion": "2.29.0",
                     "version": "2.42.0"
                 }
             }],

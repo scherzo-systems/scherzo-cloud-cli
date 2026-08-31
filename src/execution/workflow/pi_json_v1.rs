@@ -125,8 +125,9 @@ pub(crate) struct PiJsonV1ProtocolLimits {
 
 impl PiJsonV1ProtocolLimits {
     pub(crate) const fn profile() -> Self {
-        let Some(maximum_frame_bytes) = NonZeroU64::new(MAXIMUM_FRAME_BYTES) else {
-            unreachable!();
+        let maximum_frame_bytes = match NonZeroU64::new(MAXIMUM_FRAME_BYTES) {
+            Some(maximum_frame_bytes) => maximum_frame_bytes,
+            None => NonZeroU64::MIN,
         };
         Self {
             maximum_frame_bytes,
@@ -206,9 +207,8 @@ pub(crate) struct PiJsonV1Parser {
 
 impl PiJsonV1Parser {
     pub(crate) fn profile(expected_cwd: Arc<str>, value_kind: AgentValueKind) -> Self {
-        let Some(maximum_response_bytes) = NonZeroU64::new(MAXIMUM_RESPONSE_BYTES) else {
-            unreachable!();
-        };
+        let maximum_response_bytes =
+            NonZeroU64::new(MAXIMUM_RESPONSE_BYTES).unwrap_or(NonZeroU64::MIN);
         Self::new(
             expected_cwd,
             value_kind,
@@ -533,7 +533,10 @@ impl PiJsonV1Parser {
             return match event_type {
                 "tool_execution_start" => self.tool_execution_start(object),
                 "tool_execution_end" => self.tool_execution_end(object),
-                _ => unreachable!("authority classification is limited to result lifecycle events"),
+                _ => self.reject(
+                    PiJsonV1RejectionReason::EventTransitionInvalid,
+                    PiJsonV1ProtocolStage::EventPayload,
+                ),
             };
         }
         if observation_event_has_unknown_fields(event_type, object) {
@@ -763,11 +766,7 @@ impl PiJsonV1Parser {
         self.reconstruction = match message {
             ParsedMessage::Assistant(assistant) => {
                 self.check_response_bound(&assistant)?;
-                Some(ActiveMessage::Assistant {
-                    last: assistant,
-                    open_block: None,
-                    had_update: false,
-                })
+                Some(ActiveMessage::new(assistant))
             }
             ParsedMessage::ToolResult(_) | ParsedMessage::Other(_) => None,
         };
@@ -786,21 +785,17 @@ impl PiJsonV1Parser {
         let event = required_object(object, "assistantMessageEvent")
             .ok_or_else(|| self.protocol_failure())
             .and_then(|event| parse_assistant_event(event).map_err(|_| self.protocol_failure()))?;
-        let Some(ActiveMessage::Assistant {
-            last,
-            open_block,
-            had_update: _,
-        }) = self.reconstruction.as_ref()
-        else {
-            return Err(self.protocol_failure());
+        let maximum_response_bytes = (self.value_kind == AgentValueKind::Response)
+            .then_some(self.maximum_response_bytes.get());
+        let apply_result = match self.reconstruction.as_mut() {
+            Some(active) => event.apply(
+                active,
+                self.limits.maximum_frame_bytes().get(),
+                maximum_response_bytes,
+            ),
+            None => return Err(self.protocol_failure()),
         };
-        let mut next_last = last.clone();
-        let mut next_open_block = open_block.clone();
-        let mut observations = match event.apply(
-            &mut next_last,
-            &mut next_open_block,
-            self.limits.maximum_frame_bytes().get(),
-        ) {
+        let mut observations = match apply_result {
             Ok(observations) => observations,
             Err(ApplyAssistantUpdateError::Transition) => {
                 return Err(self.protocol_failure());
@@ -815,28 +810,16 @@ impl PiJsonV1Parser {
                 );
             }
         };
-        if self.value_kind == AgentValueKind::Response
-            && next_last.text_bytes() > self.maximum_response_bytes.get()
-        {
-            return Err(AgentFailureCause::CapturedValueTooLarge);
-        }
-        if retained_update_bytes(&next_last, &next_open_block)
-            > self.limits.maximum_frame_bytes().get()
-        {
-            return self.reject(
-                PiJsonV1RejectionReason::RetainedStateLimitExceeded,
-                PiJsonV1ProtocolStage::EventPayload,
-            );
-        }
-        next_last.usage = usage.clone();
-        self.reconstruction = Some(ActiveMessage::Assistant {
-            last: next_last,
-            open_block: next_open_block,
-            had_update: true,
-        });
+        let input_tokens = usage.input;
+        let output_tokens = usage.output;
+        let Some(active) = self.reconstruction.as_mut() else {
+            return Err(self.protocol_failure());
+        };
+        active.last.usage = usage;
+        active.had_update = true;
         observations.push(AgentObservation::Usage {
-            input_tokens: usage.input,
-            output_tokens: usage.output,
+            input_tokens,
+            output_tokens,
         });
         self.observations.extend(observations);
         Ok(())
@@ -848,13 +831,7 @@ impl PiJsonV1Parser {
         if let ParsedMessage::Assistant(assistant) = &message {
             self.check_response_bound(assistant)?;
             self.retain_result_identity_context(assistant)?;
-            let streamed = self.reconstruction.take().map(
-                |ActiveMessage::Assistant {
-                     last,
-                     open_block,
-                     had_update,
-                 }| (last, open_block, had_update),
-            );
+            let streamed = self.reconstruction.take();
             self.observe_finalized_content(assistant, streamed.as_ref());
             self.observe_assistant_completion(assistant);
         } else {
@@ -868,9 +845,9 @@ impl PiJsonV1Parser {
     fn observe_finalized_content(
         &mut self,
         assistant: &AssistantMessage,
-        streamed: Option<&(AssistantMessage, Option<OpenBlock>, bool)>,
+        streamed: Option<&ActiveMessage>,
     ) {
-        let had_update = streamed.is_some_and(|(_, _, had_update)| *had_update);
+        let had_update = streamed.is_some_and(|streamed| streamed.had_update);
         if !had_update {
             for block in &assistant.content {
                 match block {
@@ -891,13 +868,15 @@ impl PiJsonV1Parser {
             }
         }
         for call in assistant.tool_calls() {
-            let already_observed = streamed.is_some_and(|(streamed, open_block, _)| {
-                matches!(open_block, Some(OpenBlock::ToolCall { .. }))
-                    || streamed.tool_calls().any(|observed| {
-                        observed.id == call.id
-                            && observed.name == call.name
-                            && semantically_equal_json(&observed.arguments, &call.arguments)
-                    })
+            let already_observed = streamed.is_some_and(|streamed| {
+                matches!(
+                    streamed.open_block.as_ref(),
+                    Some(OpenBlock::ToolCall { .. })
+                ) || streamed.last.tool_calls().any(|observed| {
+                    observed.id == call.id
+                        && observed.name == call.name
+                        && semantically_equal_json(&observed.arguments, &call.arguments)
+                })
             });
             if !already_observed {
                 self.observations.push(tool_call_observation(
@@ -1120,7 +1099,7 @@ impl PiJsonV1Parser {
         let required = match event_type {
             "tool_execution_start" => &["type", "toolCallId", "toolName", "args"][..],
             "tool_execution_end" => &["type", "toolCallId", "toolName", "result", "isError"][..],
-            _ => unreachable!("result-tool identity is limited to lifecycle events"),
+            _ => return self.reject_result_tool_shape(authoritative),
         };
         if authoritative && !has_only_required_shape(object, required) {
             return self.reject_result_tool_shape(true);
@@ -1604,16 +1583,29 @@ impl ProtocolState {
     }
 }
 
-#[derive(Clone)]
-enum ActiveMessage {
-    Assistant {
-        last: AssistantMessage,
-        open_block: Option<OpenBlock>,
-        had_update: bool,
-    },
+struct ActiveMessage {
+    last: AssistantMessage,
+    open_block: Option<OpenBlock>,
+    had_update: bool,
+    retained_bytes: u64,
+    text_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl ActiveMessage {
+    fn new(last: AssistantMessage) -> Self {
+        let retained_bytes = last.retained_bytes();
+        let text_bytes = last.text_bytes();
+        Self {
+            last,
+            open_block: None,
+            had_update: false,
+            retained_bytes,
+            text_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 enum OpenBlock {
     Text(usize),
     Thinking(usize),
@@ -1735,19 +1727,7 @@ impl AssistantMessage {
             total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
         });
         for block in &self.content {
-            let structural_bytes =
-                u64::try_from(std::mem::size_of::<ContentBlock>()).unwrap_or(u64::MAX);
-            bytes = bytes
-                .saturating_add(structural_bytes)
-                .saturating_add(match block {
-                    ContentBlock::Text(text) | ContentBlock::Thinking(text) => {
-                        u64::try_from(text.len()).unwrap_or(u64::MAX)
-                    }
-                    ContentBlock::ToolCall(call) => u64::try_from(call.id.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(u64::try_from(call.name.len()).unwrap_or(u64::MAX))
-                        .saturating_add(json_bytes(&call.arguments).unwrap_or(u64::MAX)),
-                });
+            bytes = bytes.saturating_add(block.retained_bytes());
         }
         for diagnostic in &self.diagnostics {
             bytes = bytes
@@ -1788,11 +1768,31 @@ enum ContentBlock {
     ToolCall(ToolCall),
 }
 
+impl ContentBlock {
+    fn retained_bytes(&self) -> u64 {
+        content_block_structure_bytes().saturating_add(match self {
+            Self::Text(text) | Self::Thinking(text) => {
+                u64::try_from(text.len()).unwrap_or(u64::MAX)
+            }
+            Self::ToolCall(call) => call.retained_bytes(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToolCall {
     id: String,
     name: String,
     arguments: Value,
+}
+
+impl ToolCall {
+    fn retained_bytes(&self) -> u64 {
+        u64::try_from(self.id.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(self.name.len()).unwrap_or(u64::MAX))
+            .saturating_add(json_bytes(&self.arguments).unwrap_or(u64::MAX))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1897,115 +1897,161 @@ enum ApplyAssistantUpdateError {
 
 impl AssistantUpdateEvent {
     fn apply(
-        &self,
-        message: &mut AssistantMessage,
-        open: &mut Option<OpenBlock>,
+        self,
+        active: &mut ActiveMessage,
         maximum_retained_bytes: u64,
+        maximum_response_bytes: Option<u64>,
     ) -> Result<Vec<AgentObservation>, ApplyAssistantUpdateError> {
-        match &self.kind {
+        let Self { kind, index } = self;
+        match kind {
             AssistantUpdateKind::TextStart => {
-                self.start_block(message, open, ContentBlock::Text(String::new()))?;
+                Self::require_start(index, &active.last, &active.open_block)?;
+                let retained_bytes = bounded_retained_addition(
+                    active.retained_bytes,
+                    content_block_structure_bytes(),
+                    maximum_retained_bytes,
+                )?;
+                active.last.content.push(ContentBlock::Text(String::new()));
+                active.open_block = Some(OpenBlock::Text(index));
+                active.retained_bytes = retained_bytes;
                 Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::TextDelta(delta) => {
-                self.require_open(open, BlockKind::Text)?;
-                if retained_update_bytes(message, open)
-                    .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX))
-                    > maximum_retained_bytes
-                {
-                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
-                }
-                let Some(ContentBlock::Text(text)) = message.content.get_mut(self.index) else {
+                Self::require_open(index, &active.open_block, BlockKind::Text)?;
+                let delta_bytes = u64::try_from(delta.len()).unwrap_or(u64::MAX);
+                let retained_bytes = bounded_retained_addition(
+                    active.retained_bytes,
+                    delta_bytes,
+                    maximum_retained_bytes,
+                )?;
+                let Some(ContentBlock::Text(text)) = active.last.content.get_mut(index) else {
                     return Err(ApplyAssistantUpdateError::Transition);
                 };
-                text.push_str(delta);
-                Ok(vec![AgentObservation::AssistantText {
-                    text: Arc::from(delta.as_str()),
-                }])
+                let text_bytes = active
+                    .text_bytes
+                    .checked_add(delta_bytes)
+                    .ok_or(ApplyAssistantUpdateError::CapturedValueTooLarge)?;
+                if maximum_response_bytes.is_some_and(|maximum| text_bytes > maximum) {
+                    return Err(ApplyAssistantUpdateError::CapturedValueTooLarge);
+                }
+                let observed = Arc::from(delta.as_str());
+                text.push_str(&delta);
+                active.retained_bytes = retained_bytes;
+                active.text_bytes = text_bytes;
+                Ok(vec![AgentObservation::AssistantText { text: observed }])
             }
             AssistantUpdateKind::TextEnd(content) => {
-                self.require_open(open, BlockKind::Text)?;
-                if !matches!(message.content.get(self.index), Some(ContentBlock::Text(text)) if text == content)
+                Self::require_open(index, &active.open_block, BlockKind::Text)?;
+                if !matches!(active.last.content.get(index), Some(ContentBlock::Text(text)) if text == &content)
                 {
                     return Err(ApplyAssistantUpdateError::Transition);
                 }
-                *open = None;
+                require_retained_bound(active.retained_bytes, maximum_retained_bytes)?;
+                active.open_block = None;
                 Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ThinkingStart => {
-                self.start_block(message, open, ContentBlock::Thinking(String::new()))?;
+                Self::require_start(index, &active.last, &active.open_block)?;
+                let retained_bytes = bounded_retained_addition(
+                    active.retained_bytes,
+                    content_block_structure_bytes(),
+                    maximum_retained_bytes,
+                )?;
+                active
+                    .last
+                    .content
+                    .push(ContentBlock::Thinking(String::new()));
+                active.open_block = Some(OpenBlock::Thinking(index));
+                active.retained_bytes = retained_bytes;
                 Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ThinkingDelta(delta) => {
-                self.require_open(open, BlockKind::Thinking)?;
-                if retained_update_bytes(message, open)
-                    .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX))
-                    > maximum_retained_bytes
-                {
-                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
-                }
-                let Some(ContentBlock::Thinking(thinking)) = message.content.get_mut(self.index)
+                Self::require_open(index, &active.open_block, BlockKind::Thinking)?;
+                let delta_bytes = u64::try_from(delta.len()).unwrap_or(u64::MAX);
+                let retained_bytes = bounded_retained_addition(
+                    active.retained_bytes,
+                    delta_bytes,
+                    maximum_retained_bytes,
+                )?;
+                let Some(ContentBlock::Thinking(thinking)) = active.last.content.get_mut(index)
                 else {
                     return Err(ApplyAssistantUpdateError::Transition);
                 };
-                thinking.push_str(delta);
-                Ok(vec![AgentObservation::Reasoning {
-                    text: Arc::from(delta.as_str()),
-                }])
+                let observed = Arc::from(delta.as_str());
+                thinking.push_str(&delta);
+                active.retained_bytes = retained_bytes;
+                Ok(vec![AgentObservation::Reasoning { text: observed }])
             }
             AssistantUpdateKind::ThinkingEnd(content) => {
-                self.require_open(open, BlockKind::Thinking)?;
-                let Some(ContentBlock::Thinking(thinking)) = message.content.get_mut(self.index)
+                Self::require_open(index, &active.open_block, BlockKind::Thinking)?;
+                let Some(ContentBlock::Thinking(thinking)) = active.last.content.get(index) else {
+                    return Err(ApplyAssistantUpdateError::Transition);
+                };
+                let retained_bytes = bounded_retained_replacement(
+                    active.retained_bytes,
+                    u64::try_from(thinking.len()).unwrap_or(u64::MAX),
+                    u64::try_from(content.len()).unwrap_or(u64::MAX),
+                    maximum_retained_bytes,
+                )?;
+                let Some(ContentBlock::Thinking(thinking)) = active.last.content.get_mut(index)
                 else {
                     return Err(ApplyAssistantUpdateError::Transition);
                 };
-                *thinking = content.clone();
-                *open = None;
+                *thinking = content;
+                active.open_block = None;
+                active.retained_bytes = retained_bytes;
                 Ok(vec![lifecycle(AgentLifecycleMilestone::MessageUpdated)])
             }
             AssistantUpdateKind::ToolCallStart => {
-                self.require_start(message, open)?;
-                *open = Some(OpenBlock::ToolCall {
-                    index: self.index,
+                Self::require_start(index, &active.last, &active.open_block)?;
+                require_retained_bound(active.retained_bytes, maximum_retained_bytes)?;
+                active.open_block = Some(OpenBlock::ToolCall {
+                    index,
                     arguments: String::new(),
                     had_delta: false,
                 });
                 Ok(Vec::new())
             }
             AssistantUpdateKind::ToolCallDelta(delta) => {
-                self.require_open(open, BlockKind::ToolCall)?;
+                Self::require_open(index, &active.open_block, BlockKind::ToolCall)?;
+                let retained_bytes = bounded_retained_addition(
+                    active.retained_bytes,
+                    u64::try_from(delta.len()).unwrap_or(u64::MAX),
+                    maximum_retained_bytes,
+                )?;
                 let Some(OpenBlock::ToolCall {
                     arguments,
                     had_delta,
                     ..
-                }) = open.as_mut()
+                }) = active.open_block.as_mut()
                 else {
-                    unreachable!();
+                    return Err(ApplyAssistantUpdateError::Transition);
                 };
-                let prospective = arguments
-                    .len()
-                    .checked_add(delta.len())
-                    .and_then(|bytes| u64::try_from(bytes).ok());
-                if prospective.is_none_or(|bytes| {
-                    message.retained_bytes().saturating_add(bytes) > maximum_retained_bytes
-                }) {
-                    return Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded);
-                }
-                arguments.push_str(delta);
+                arguments.push_str(&delta);
                 *had_delta = true;
+                active.retained_bytes = retained_bytes;
                 Ok(Vec::new())
             }
             AssistantUpdateKind::ToolCallEnd(call) => {
-                self.require_open(open, BlockKind::ToolCall)?;
-                let Some(OpenBlock::ToolCall { had_delta, .. }) = open.as_ref() else {
-                    unreachable!();
+                Self::require_open(index, &active.open_block, BlockKind::ToolCall)?;
+                let Some(OpenBlock::ToolCall {
+                    arguments,
+                    had_delta,
+                    ..
+                }) = active.open_block.as_ref()
+                else {
+                    return Err(ApplyAssistantUpdateError::Transition);
                 };
-                let had_delta = *had_delta;
-                if self.index != message.content.len() {
+                if index != active.last.content.len() {
                     return Err(ApplyAssistantUpdateError::Transition);
                 }
-                message.content.push(ContentBlock::ToolCall(call.clone()));
-                *open = None;
+                let retained_bytes = bounded_retained_replacement(
+                    active.retained_bytes,
+                    u64::try_from(arguments.len()).unwrap_or(u64::MAX),
+                    content_block_structure_bytes().saturating_add(call.retained_bytes()),
+                    maximum_retained_bytes,
+                )?;
+                let had_delta = *had_delta;
                 let mut observations = vec![AgentObservation::ToolCall {
                     call_id: Arc::from(call.id.as_str()),
                     name: Arc::from(call.name.as_str()),
@@ -2023,51 +2069,76 @@ impl AssistantUpdateEvent {
                     name: Arc::from(call.name.as_str()),
                     phase: AgentToolCallPhase::Completed,
                 });
+                active.last.content.push(ContentBlock::ToolCall(call));
+                active.open_block = None;
+                active.retained_bytes = retained_bytes;
                 Ok(observations)
             }
         }
     }
 
-    fn start_block(
-        &self,
-        message: &mut AssistantMessage,
-        open: &mut Option<OpenBlock>,
-        block: ContentBlock,
-    ) -> Result<(), ApplyAssistantUpdateError> {
-        self.require_start(message, open)?;
-        message.content.push(block);
-        *open = Some(match self.kind {
-            AssistantUpdateKind::TextStart => OpenBlock::Text(self.index),
-            AssistantUpdateKind::ThinkingStart => OpenBlock::Thinking(self.index),
-            _ => unreachable!(),
-        });
-        Ok(())
-    }
-
     fn require_start(
-        &self,
+        index: usize,
         message: &AssistantMessage,
         open: &Option<OpenBlock>,
     ) -> Result<(), ApplyAssistantUpdateError> {
-        if open.is_some() || self.index != message.content.len() {
+        if open.is_some() || index != message.content.len() {
             return Err(ApplyAssistantUpdateError::Transition);
         }
         Ok(())
     }
 
     fn require_open(
-        &self,
+        index: usize,
         open: &Option<OpenBlock>,
         expected: BlockKind,
     ) -> Result<(), ApplyAssistantUpdateError> {
         let Some(actual) = open else {
             return Err(ApplyAssistantUpdateError::Transition);
         };
-        if actual.block_kind() != expected || actual.index() != self.index {
+        if actual.block_kind() != expected || actual.index() != index {
             return Err(ApplyAssistantUpdateError::Transition);
         }
         Ok(())
     }
+}
+
+fn require_retained_bound(
+    retained_bytes: u64,
+    maximum_retained_bytes: u64,
+) -> Result<(), ApplyAssistantUpdateError> {
+    if retained_bytes > maximum_retained_bytes {
+        Err(ApplyAssistantUpdateError::RetainedStateLimitExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+fn bounded_retained_addition(
+    retained_bytes: u64,
+    added_bytes: u64,
+    maximum_retained_bytes: u64,
+) -> Result<u64, ApplyAssistantUpdateError> {
+    retained_bytes
+        .checked_add(added_bytes)
+        .filter(|total| *total <= maximum_retained_bytes)
+        .ok_or(ApplyAssistantUpdateError::RetainedStateLimitExceeded)
+}
+
+fn bounded_retained_replacement(
+    retained_bytes: u64,
+    removed_bytes: u64,
+    added_bytes: u64,
+    maximum_retained_bytes: u64,
+) -> Result<u64, ApplyAssistantUpdateError> {
+    let Some(retained_bytes) = retained_bytes.checked_sub(removed_bytes) else {
+        return Err(ApplyAssistantUpdateError::Transition);
+    };
+    bounded_retained_addition(retained_bytes, added_bytes, maximum_retained_bytes)
+}
+
+fn content_block_structure_bytes() -> u64 {
+    u64::try_from(std::mem::size_of::<ContentBlock>()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2441,15 +2512,6 @@ fn parse_assistant_event(
     Ok(AssistantUpdateEvent { kind, index })
 }
 
-fn retained_update_bytes(message: &AssistantMessage, open: &Option<OpenBlock>) -> u64 {
-    message.retained_bytes().saturating_add(match open {
-        Some(OpenBlock::ToolCall { arguments, .. }) => {
-            u64::try_from(arguments.len()).unwrap_or(u64::MAX)
-        }
-        Some(OpenBlock::Text(_) | OpenBlock::Thinking(_)) | None => 0,
-    })
-}
-
 fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
     AgentObservation::Lifecycle { milestone }
 }
@@ -2465,75 +2527,7 @@ fn json_bytes(value: &Value) -> Option<u64> {
 }
 
 fn semantically_equal_json(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Null, Value::Null) => true,
-        (Value::Bool(left), Value::Bool(right)) => left == right,
-        (Value::Number(left), Value::Number(right)) => {
-            normalized_json_number(left) == normalized_json_number(right)
-        }
-        (Value::String(left), Value::String(right)) => left == right,
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| semantically_equal_json(left, right))
-        }
-        (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, left)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| semantically_equal_json(left, right))
-                })
-        }
-        (Value::Null, _)
-        | (Value::Bool(_), _)
-        | (Value::Number(_), _)
-        | (Value::String(_), _)
-        | (Value::Array(_), _)
-        | (Value::Object(_), _) => false,
-    }
-}
-
-fn normalized_json_number(number: &Number) -> Option<(bool, String, i64)> {
-    let rendered = number.to_string();
-    let (negative, unsigned) = rendered
-        .strip_prefix('-')
-        .map_or((false, rendered.as_str()), |unsigned| (true, unsigned));
-    let (coefficient, exponent) =
-        unsigned
-            .split_once(['e', 'E'])
-            .map_or((unsigned, 0_i64), |(coefficient, exponent)| {
-                exponent
-                    .parse::<i64>()
-                    .map(|exponent| (coefficient, exponent))
-                    .unwrap_or((coefficient, i64::MIN))
-            });
-    if exponent == i64::MIN {
-        return None;
-    }
-    let (whole, fraction) = coefficient
-        .split_once('.')
-        .map_or((coefficient, ""), |parts| parts);
-    let mut digits = String::with_capacity(whole.len().saturating_add(fraction.len()));
-    digits.push_str(whole);
-    digits.push_str(fraction);
-    let first_nonzero = digits.find(|digit| digit != '0').unwrap_or(digits.len());
-    digits.drain(..first_nonzero);
-    if digits.is_empty() {
-        return Some((false, "0".to_owned(), 0));
-    }
-    let trailing_zeroes = digits
-        .len()
-        .saturating_sub(digits.trim_end_matches('0').len());
-    digits.truncate(digits.len().saturating_sub(trailing_zeroes));
-    let fraction_digits = i64::try_from(fraction.len()).ok()?;
-    let trailing_zeroes = i64::try_from(trailing_zeroes).ok()?;
-    let power = exponent
-        .checked_sub(fraction_digits)?
-        .checked_add(trailing_zeroes)?;
-    Some((negative, digits, power))
+    super::condition::json_semantically_equal(left, right)
 }
 
 fn retry_schedule(object: &Map<String, Value>) -> Option<(u64, u64, u64, &str)> {

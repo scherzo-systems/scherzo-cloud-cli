@@ -3,6 +3,9 @@
 # reads the resolved version through build_info::VERSION; narrow exceptions
 # document the canonical fallback and Cargo-provided test fixtures.
 disallowed-macros = [
+  { path = "std::assert", reason = "return a typed invariant failure from production paths" },
+  { path = "std::assert_eq", reason = "return a typed invariant failure from production paths" },
+  { path = "std::assert_ne", reason = "return a typed invariant failure from production paths" },
   { path = "std::env", reason = "use the explicit compile-time environment boundary" },
   { path = "std::eprintln", reason = "return operational failures to the shared top-level renderer" },
 ]

@@ -95,6 +95,97 @@ fn status_schema() -> jsonschema::Validator {
 }
 
 #[test]
+fn settled_command_recovery_status_retains_terminal_evidence() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              : > repaired
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck unchanged target"}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv: [/bin/sh, -c, 'test -f repaired || exit 75']
+"#,
+    );
+    let run_directory = bundle.result("settled-command-recovery-status");
+    let output = run(&bundle.args(&run_directory));
+    assert!(
+        output.status.success(),
+        "workflow run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = status(&run_directory, &["--plain", "--color", "never"]);
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    for evidence in [
+        "target execution 2",
+        "output owner target execution 2",
+        "decision recheck",
+        "latest target failure execution · command_exit · exit 75",
+    ] {
+        assert!(
+            output.contains(evidence),
+            "plain status omitted {evidence:?}:\n{output}"
+        );
+    }
+}
+
+#[test]
+fn settled_exhaustion_status_uses_the_terminal_target_failure() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          if test -f attempted; then
+            exit 76
+          fi
+          : > attempted
+          exit 75
+"#,
+    );
+    let run_directory = bundle.result("settled-exhaustion-status");
+    let output = run(&bundle.args(&run_directory));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "workflow run returned an unexpected status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = status(&run_directory, &["--plain", "--color", "never"]);
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    for evidence in [
+        "target execution 2",
+        "no output owner",
+        "latest target failure execution · command_exit · exit 76",
+    ] {
+        assert!(
+            output.contains(evidence),
+            "plain status omitted {evidence:?}:\n{output}"
+        );
+    }
+}
+
+#[test]
 fn live_finalization_status_is_incomplete_role_aware_and_retry_ineligible() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bundle = finalizer_signal_bundle();

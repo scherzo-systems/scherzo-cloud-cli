@@ -37,6 +37,7 @@ pub(crate) mod attribute {
     pub(crate) const SERVER_ADDRESS: &str = "server.address";
     pub(crate) const SERVER_PORT: &str = "server.port";
     pub(crate) const ASSIGNMENT_ID: &str = "scherzo.assignment.id";
+    pub(crate) const ASSIGNMENT_PREPARATION_PHASE: &str = "scherzo.assignment.preparation_phase";
     pub(crate) const PROTOCOL_ACKNOWLEDGED_MESSAGE_ID: &str =
         "scherzo.protocol.acknowledged_message_id";
     pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str =

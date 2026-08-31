@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.scherzo.dev/runner-enrollment-journal-v1.schema.json",
+  "title": "Scherzo Runner Enrollment Journal V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "activationArtifact", "credentialSecret", "credentialSecretVerifier", "idempotencyKey", "replaceCredential", "stagedAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "activationArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "activationUrl", "activationToken", "runnerId", "expiresAt"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "activationUrl": { "type": "string", "format": "uri", "pattern": "^https?://[^#]+/v1/runner-enrollments/rna_[0-7][0-9a-hjkmnp-tv-z]{25}/activate$" },
+        "activationToken": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}\\.[A-Za-z0-9_-]{43}$" },
+        "runnerId": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "credentialSecret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "credentialSecretVerifier": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[!-~]+$" },
+    "replaceCredential": { "type": "boolean" },
+    "stagedAt": { "type": "string", "format": "date-time" }
+  }
+}

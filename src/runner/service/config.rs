@@ -170,12 +170,20 @@ impl Config {
         credential: Credential,
         allow_insecure_http: bool,
     ) -> Result<Self, ConfigError> {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = canonical_directory(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            ConfigError::WorkRootUnavailable,
+        )?;
+        // The test boundary preserves TMPDIR, which may be inside this checkout.
+        // Runner fixtures must not follow it back into the source tree.
         let work_root =
-            Arc::new(tempfile::tempdir().map_err(|_| ConfigError::WorkRootUnavailable)?);
+            Arc::new(tempfile::tempdir_in("/tmp").map_err(|_| ConfigError::WorkRootUnavailable)?);
         fs::set_permissions(work_root.path(), fs::Permissions::from_mode(0o700))
             .map_err(|_| ConfigError::WorkRootUnavailable)?;
         let assignment = AssignmentConfig::new(work_root.path())?;
+        if assignment.work_root().starts_with(&manifest) {
+            return Err(ConfigError::WorkRootUnavailable);
+        }
         Self::new(gateway_url, credential, allow_insecure_http, assignment).map(|mut config| {
             config.fixture_work_root = Some(work_root);
             config.with_materialized_source_fixture(
@@ -303,6 +311,9 @@ mod tests {
 
     use super::{AssignmentConfig, Config, ConfigError};
     use crate::runner::credential::test_credential;
+    use crate::runner::service::workspace::WorkRootLease;
+
+    const FIXTURE_BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 
     fn assignment_fixture(temporary: &TempDir) -> AssignmentConfig {
         let work = temporary.path().join("work");
@@ -360,5 +371,32 @@ mod tests {
             AssignmentConfig::new(&temporary.path().join("missing")).unwrap_err(),
             ConfigError::WorkRootUnavailable,
         );
+    }
+
+    #[test]
+    fn fixture_boot_root_is_removed_with_temporary_config() {
+        let source_root = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let boot_path = {
+            let config = Config::fixture(
+                "ws://127.0.0.1:1/v1/runner/connect",
+                test_credential(),
+                true,
+            )
+            .unwrap();
+            let work_root = config.assignment().work_root().to_owned();
+            assert!(
+                !work_root.starts_with(&source_root),
+                "fixture work root leaked into {}",
+                source_root.display()
+            );
+
+            let lease = WorkRootLease::acquire(&work_root, FIXTURE_BOOT_ID).unwrap();
+            let boot_path = lease.boot_path().to_owned();
+            assert_eq!(boot_path, work_root.join(FIXTURE_BOOT_ID));
+            assert!(boot_path.is_dir());
+            boot_path
+        };
+
+        assert!(!boot_path.exists());
     }
 }

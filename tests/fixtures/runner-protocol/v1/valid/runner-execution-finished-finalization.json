@@ -28,9 +28,9 @@
             "role": "finalizer",
             "failurePolicy": "advisory",
             "state": "failed",
-            "failure": {
+            "detail": {
               "phase": "execution",
-              "cause": "command_unsuccessful_exit",
+              "code": "command_exit",
               "exitCode": 1
             }
           }

@@ -618,7 +618,7 @@ pub(crate) fn assignment_offer() -> Message {
                         "materializationContract": "git_full_clone_v1"
                     },
                     "capacity": {
-                        "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+                        "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
                         "sourceClosureDigest": {
                             "algorithm": "sha256",
                             "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -630,9 +630,33 @@ pub(crate) fn assignment_offer() -> Message {
                         "diagnosticRetentionBytes": 8388608,
                         "nativeSessionRetentionBytes": 4194304,
                         "aggregateRetentionBytes": 12582912,
-                        "encodedOutboxBytes": 38141952
-                    }
+                        "encodedOutboxBytes": 85458944
+                    },
+                    "runInputs": null
                 }
+            }
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+pub(crate) fn assignment_prepare() -> Message {
+    Message::Text(
+        json!({
+            "protocolVersion": 1,
+            "direction": "cloud_to_runner",
+            "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abq",
+            "sentAt": "2026-07-23T00:00:03Z",
+            "type": "assignment_prepare",
+            "payloadVersion": 1,
+            "payload": {
+                "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+                "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+                "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+                "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "preparationExpiresAt": "2026-07-23T00:15:03Z"
             }
         })
         .to_string()
@@ -645,6 +669,29 @@ pub(crate) async fn effect_acknowledgement(socket: &mut FixtureSocket) -> Value 
         panic!("fixture did not receive effect acknowledgement");
     };
     serde_json::from_str(&message).expect("decode effect acknowledgement")
+}
+
+pub(crate) async fn begin_assignment_preparation(socket: &mut FixtureSocket) -> Value {
+    let Some(Ok(Message::Text(preparing))) = socket.next().await else {
+        panic!("fixture did not receive assignment preparation acknowledgement");
+    };
+    let preparing: Value =
+        serde_json::from_str(&preparing).expect("decode assignment preparation acknowledgement");
+    assert_eq!(preparing["type"], "assignment_preparing");
+    socket
+        .send(effect_observation_acknowledgement(
+            preparing["messageId"].as_str().unwrap(),
+            preparing["sequence"].as_u64().unwrap(),
+        ))
+        .await
+        .expect("acknowledge assignment preparation");
+    socket
+        .send(assignment_prepare())
+        .await
+        .expect("send assignment prepare effect");
+    let acknowledgement = effect_acknowledgement(socket).await;
+    assert_eq!(acknowledgement["type"], "effect_acknowledged");
+    acknowledgement
 }
 
 pub(crate) async fn offer_assignment_after_handshake(

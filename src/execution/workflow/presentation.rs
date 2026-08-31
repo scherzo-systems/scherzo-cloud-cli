@@ -16,6 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::artifact::CaptureFailureKind;
 use super::document::FailurePolicy;
+use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDetail};
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
@@ -32,9 +33,8 @@ use super::rejection::{RejectionDiagnostic, human_resolution_remedy};
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolvedWorkflow};
 use super::run_timing::{ObservationClock, ObservationTime};
 use super::runtime::{
-    ActiveStepInvocation, FailurePhase, NotRunReason, RecoveryDecisionKind,
-    RecoveryHandlerActivity, RecoveryHandlerKind, RunOutcome, StepState, StepStateKind,
-    TransitionEvent,
+    ActiveStepInvocation, FailurePhase, RecoveryDecisionKind, RecoveryHandlerActivity,
+    RecoveryHandlerKind, RunOutcome, StepState, StepStateKind, TransitionEvent,
 };
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
@@ -232,6 +232,7 @@ pub(crate) enum PresentationFailureOperation {
     TerminalTask,
     TimestampFormatting,
     UnsupportedRejection,
+    InvalidWorkflowDefinition,
     InvalidTerminalResult,
     AlreadyFinished,
 }
@@ -527,6 +528,13 @@ where
             PublicationPresentation::Published(terminal) => Some(terminal.result_directory()),
             PublicationPresentation::Failed(_) => None,
         };
+        let definition = match PresentationDefinition::from_workflow(
+            workflow,
+            result_directory.unwrap_or("result"),
+        ) {
+            Ok(definition) => definition,
+            Err(failure) => return WorkflowRunPresentationResult::Failed(failure),
+        };
         let (failure_sender, _) = watch::channel(None);
         let mut state = PresentationState {
             mode: PresentationMode::Plain,
@@ -534,10 +542,7 @@ where
             terminal_width: config.wrapping_width(),
             standard_output: self.standard_output,
             standard_error: self.standard_error,
-            definition: PresentationDefinition::from_workflow(
-                workflow,
-                result_directory.unwrap_or("result"),
-            ),
+            definition,
             feed: WorkflowPresentationFeed::new(workflow),
             last_accepted_order: None,
             step_starts: BTreeMap::new(),
@@ -691,7 +696,7 @@ where
             terminal_width: config.wrapping_width(),
             standard_output,
             standard_error,
-            definition: PresentationDefinition::from_workflow(workflow, result_directory),
+            definition: PresentationDefinition::from_workflow(workflow, result_directory)?,
             feed: WorkflowPresentationFeed::new(workflow),
             last_accepted_order: None,
             step_starts: BTreeMap::new(),
@@ -840,7 +845,10 @@ enum StepSuccessPresentation {
 }
 
 impl PresentationDefinition {
-    fn from_workflow(workflow: &ResolvedWorkflow, result_directory: &str) -> Self {
+    fn from_workflow(
+        workflow: &ResolvedWorkflow,
+        result_directory: &str,
+    ) -> Result<Self, PresentationFailure> {
         let steps = workflow
             .definition
             .steps
@@ -856,33 +864,33 @@ impl PresentationDefinition {
                 let presentation = match step {
                     ValidatedStep::Command(command) => PresentationStep {
                         success: StepSuccessPresentation::Command,
-                        outputs: presentation_outputs(&command.common.outputs),
+                        outputs: presentation_outputs(&command.common.outputs)?,
                     },
                     ValidatedStep::Agent(agent) => PresentationStep {
                         success: StepSuccessPresentation::Agent,
-                        outputs: presentation_outputs(&agent.common.outputs),
+                        outputs: presentation_outputs(&agent.common.outputs)?,
                     },
                 };
-                (id.clone(), presentation)
+                Ok((id.clone(), presentation))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Result<BTreeMap<_, _>, PresentationFailure>>()?;
         let scope_width = steps
             .keys()
             .map(String::len)
             .chain(std::iter::once("@workflow".len()))
             .max()
             .unwrap_or("@workflow".len());
-        Self {
+        Ok(Self {
             result_directory: result_directory.to_owned(),
             steps,
             scope_width,
-        }
+        })
     }
 }
 
 fn presentation_outputs(
     outputs: &BTreeMap<String, super::validated::ValidatedOutput>,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, PresentationFailure> {
     outputs
         .iter()
         .map(|(name, output)| {
@@ -892,11 +900,13 @@ fn presentation_outputs(
                 super::validated::WorkflowValueType::File => "file",
                 super::validated::WorkflowValueType::GitBranch => "git_branch",
                 super::validated::WorkflowValueType::AttachmentCollection => {
-                    unreachable!("outputs cannot be attachment collections")
+                    return Err(PresentationFailure::operation(
+                        PresentationFailureOperation::InvalidWorkflowDefinition,
+                    ));
                 }
             }
             .to_owned();
-            (name.clone(), visible_text(&detail))
+            Ok((name.clone(), visible_text(&detail)))
         })
         .collect()
 }
@@ -953,9 +963,6 @@ where
         record: PresentationRecord,
         observed_monotonic: Instant,
     ) -> Result<(), PresentationFailure> {
-        if let Some(previous) = self.last_accepted_order {
-            debug_assert!(record.accepted_order > previous);
-        }
         self.last_accepted_order = Some(record.accepted_order);
         match record.kind {
             PresentationRecordKind::Transition(transition) => self.render_transition(
@@ -1068,8 +1075,8 @@ where
                 }
                 StepStateKind::Failed => {
                     let detail = match transition.step {
-                        Some(ObservedStepTransition::Failed { phase, cause }) => {
-                            failure_detail(phase, &cause)
+                        Some(ObservedStepTransition::Failed { detail }) => {
+                            canonical_failure_detail(&detail)
                         }
                         _ => "authoritative step failure".to_owned(),
                     };
@@ -1088,11 +1095,8 @@ where
                 }
                 StepStateKind::Blocked => {
                     let detail = match transition.step {
-                        Some(ObservedStepTransition::Blocked { dependency }) => {
-                            format!("by {}", visible_text(&dependency))
-                        }
-                        Some(ObservedStepTransition::InputUnavailable { references }) => {
-                            format!("inputs unavailable: {}", references.join(", "))
+                        Some(ObservedStepTransition::Blocked { detail }) => {
+                            canonical_blocked_detail(&detail)
                         }
                         _ => "dependency did not succeed".to_owned(),
                     };
@@ -1109,27 +1113,24 @@ where
                 StepStateKind::NotRun => {
                     self.step_starts.remove(&step);
                     let detail = match transition.step {
-                        Some(ObservedStepTransition::NotRun {
-                            reason: NotRunReason::FinalizerTriggerNotSelected,
-                        }) => "finalizer trigger not selected",
-                        Some(ObservedStepTransition::NotRun {
-                            reason: NotRunReason::FailureStop,
-                        })
-                        | None => "failure stop",
-                        Some(_) => "not authorized",
+                        Some(ObservedStepTransition::NotRun { detail }) => {
+                            snake_case_debug(detail.code)
+                        }
+                        None => "failure_stop".to_owned(),
+                        Some(_) => "not_run".to_owned(),
                     };
                     self.write_event(
                         observed_at.utc,
                         &step,
                         "not-run",
-                        detail,
+                        &detail,
                         TokenRole::Neutral,
                     )
                 }
                 StepStateKind::Cancelling => {
                     let detail = match transition.step {
-                        Some(ObservedStepTransition::Cancelling { reason }) => {
-                            cancellation_reason(reason)
+                        Some(ObservedStepTransition::Cancelling { detail }) => {
+                            cancellation_reason(detail.code)
                         }
                         _ => "cancellation accepted",
                     };
@@ -1143,8 +1144,8 @@ where
                 }
                 StepStateKind::Cancelled => {
                     let detail = match transition.step {
-                        Some(ObservedStepTransition::Cancelled { reason }) => {
-                            cancellation_reason(reason)
+                        Some(ObservedStepTransition::Cancelled { detail }) => {
+                            cancellation_reason(detail.code)
                         }
                         _ => "cancelled",
                     };
@@ -1175,17 +1176,16 @@ where
                 | StepStateKind::Running
                 | StepStateKind::CapturingOutputs => Ok(()),
             },
-            TransitionEvent::Workflow {
-                to: super::runtime::WorkflowState::Finalizing { trigger, .. },
-                ..
-            } => self.write_event(
-                observed_at.utc,
-                "@workflow",
-                "finalizing",
-                finalization_trigger(trigger),
-                TokenRole::Active,
-            ),
-            TransitionEvent::Workflow { .. } => Ok(()),
+            TransitionEvent::Workflow { to, .. } => match *to {
+                super::runtime::WorkflowState::Finalizing { trigger, .. } => self.write_event(
+                    observed_at.utc,
+                    "@workflow",
+                    "finalizing",
+                    finalization_trigger(trigger),
+                    TokenRole::Active,
+                ),
+                _ => Ok(()),
+            },
         }
     }
 
@@ -1525,21 +1525,23 @@ where
         self.write_line_bytes(outcome_line.as_bytes())?;
 
         match &run.outcome {
-            RunOutcome::Failed {
-                primary_failure, ..
-            } => {
-                let detail = failure_detail(primary_failure.phase, &primary_failure.cause);
+            RunOutcome::Failed { primary_issue, .. } => {
+                let detail = match &primary_issue.detail {
+                    PrimaryIssueDetail::Failed(detail) => canonical_failure_detail(detail),
+                    PrimaryIssueDetail::Blocked(detail) => canonical_blocked_detail(detail),
+                };
                 let line = format!(
                     "{} {}\n",
-                    self.styled_token("failure:", TokenRole::Failure),
+                    self.styled_token("primary issue:", TokenRole::Failure),
                     self.styled_text(
                         &format!(
-                            "{} {} · {}",
-                            match primary_failure.role {
+                            "{} {} · {:?} · {}",
+                            match primary_issue.node.role {
                                 crate::execution::workflow::validated::WorkflowNodeRole::Step => "step",
                                 crate::execution::workflow::validated::WorkflowNodeRole::Finalizer => "finalizer",
                             },
-                            visible_text(&primary_failure.step),
+                            visible_text(&primary_issue.node.id),
+                            primary_issue.state,
                             visible_text(&detail)
                         ),
                         TextTone::Secondary,
@@ -1565,7 +1567,7 @@ where
                 .filter(|finalizer| {
                     matches!(
                         finalizer.state,
-                        StepState::Failed { .. } | StepState::InputUnavailable { .. }
+                        StepState::Failed { .. } | StepState::Blocked { .. }
                     )
                 })
                 .count();
@@ -1985,6 +1987,45 @@ pub(crate) fn finalization_trigger(
     }
 }
 
+pub(crate) fn canonical_failure_detail(failure: &FailureDetail) -> String {
+    let mut detail = format!(
+        "{} · {}",
+        failure.phase.as_str(),
+        snake_case_debug(failure.code)
+    );
+    if let Some(input) = &failure.input {
+        detail.push_str(" · input ");
+        detail.push_str(&visible_text(input));
+    }
+    if let Some(index) = failure.collection_index {
+        detail.push_str(&format!(" · collection index {index}"));
+    }
+    if let Some(output) = &failure.output {
+        detail.push_str(" · output ");
+        detail.push_str(&visible_text(output));
+    }
+    if let Some(exit_code) = failure.exit_code {
+        detail.push_str(&format!(" · exit {exit_code}"));
+    }
+    detail
+}
+
+pub(crate) fn canonical_blocked_detail(detail: &BlockedDetail) -> String {
+    let prerequisites = detail
+        .prerequisites
+        .iter()
+        .map(|prerequisite| match prerequisite {
+            Prerequisite::Control { node } => format!("control {}", visible_text(node)),
+            Prerequisite::Condition { r#ref } => {
+                format!("condition {}", visible_text(r#ref))
+            }
+            Prerequisite::Body { r#ref } => format!("body {}", visible_text(r#ref)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("prerequisites_unsatisfied · {prerequisites}")
+}
+
 pub(crate) fn failure_detail(phase: FailurePhase, cause: &StepFailureCause) -> String {
     format!("{} · {}", phase.as_str(), failure_cause(cause))
 }
@@ -2055,6 +2096,9 @@ fn failure_cause(cause: &StepFailureCause) -> String {
         },
         StepFailureCause::Execution(StepExecutionFailure::Agent(failure)) => {
             failure.code().replace('_', " ")
+        }
+        StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable) => {
+            "execution task unavailable".to_owned()
         }
         StepFailureCause::RecoveryHandler(_) => "recovery handler failed".to_owned(),
         StepFailureCause::OutputCapture(failure) => match failure {
@@ -2131,37 +2175,22 @@ fn summary_step(
             success_detail(success, outputs.len()),
             TokenRole::Success,
         )),
-        StepState::Failed { phase, cause } => Some((
+        StepState::Failed { detail } => Some((
             "failed",
-            issue_detail(failure_detail(*phase, cause), step.failure_policy),
+            issue_detail(canonical_failure_detail(detail), step.failure_policy),
             TokenRole::Failure,
         )),
-        StepState::Blocked { dependency } => Some((
+        StepState::Blocked { detail } => Some((
             "blocked",
-            issue_detail(format!("by {dependency}"), step.failure_policy),
+            issue_detail(canonical_blocked_detail(detail), step.failure_policy),
             TokenRole::Blocked,
         )),
-        StepState::InputUnavailable { references } => Some((
-            "blocked",
-            issue_detail(
-                format!("inputs unavailable: {}", references.join(", ")),
-                step.failure_policy,
-            ),
-            TokenRole::Blocked,
-        )),
-        StepState::NotRun {
-            reason: NotRunReason::FailureStop,
-        } => Some(("not-run", "failure stop".to_owned(), TokenRole::Neutral)),
-        StepState::NotRun {
-            reason: NotRunReason::FinalizerTriggerNotSelected,
-        } => Some((
-            "not-run",
-            "finalizer trigger not selected".to_owned(),
-            TokenRole::Neutral,
-        )),
-        StepState::Cancelled { reason } => Some((
+        StepState::NotRun { detail } => {
+            Some(("not-run", snake_case_debug(detail.code), TokenRole::Neutral))
+        }
+        StepState::Cancelled { detail } => Some((
             "cancelled",
-            cancellation_reason(*reason).to_owned(),
+            cancellation_reason(detail.code).to_owned(),
             TokenRole::Blocked,
         )),
         StepState::Pending
@@ -2174,7 +2203,7 @@ fn summary_step(
     if let Some(recovery) = &step.recovery {
         let usage = super::publication::total_recovery_usage(&step.invocations);
         let terminal_failure = match &step.state {
-            StepState::Failed { phase, cause } => Some(failure_detail(*phase, cause)),
+            StepState::Failed { detail } => Some(canonical_failure_detail(detail)),
             _ => None,
         };
         detail.push_str(&format!(
@@ -2284,7 +2313,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
         let index = match step.state {
             StepState::Succeeded { .. } => Some(0),
             StepState::Failed { .. } => Some(1),
-            StepState::Blocked { .. } | StepState::InputUnavailable { .. } => Some(2),
+            StepState::Blocked { .. } => Some(2),
             StepState::NotRun { .. } => Some(3),
             StepState::Cancelled { .. } => Some(4),
             StepState::Pending
@@ -2300,9 +2329,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
         if step.failure_policy == FailurePolicy::Advisory
             && matches!(
                 step.state,
-                StepState::Failed { .. }
-                    | StepState::Blocked { .. }
-                    | StepState::InputUnavailable { .. }
+                StepState::Failed { .. } | StepState::Blocked { .. }
             )
         {
             counts[5].1 += 1;

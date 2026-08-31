@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Recover one command by immediate retry and another with a repair handler.
+
+steps:
+  immediateRetry:
+    kind: cmd
+    recovery:
+      retries: 1
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          if [ ! -f .handlerless-retry-ready ]; then
+            : > .handlerless-retry-ready
+            printf '%s\n' 'first execution asks for an immediate retry' >&2
+            exit 75
+          fi
+          rm -f .handlerless-retry-ready
+          printf '%s\n' 'the immediate retry succeeded' > immediate-retry.txt
+    outputs:
+      result:
+        kind: text
+        from: path
+        path: immediate-retry.txt
+
+  commandRepair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - sh
+            - -c
+            - |
+              set -eu
+              : > .command-repair-ready
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the example repair.","reason":"The target can now pass its check."}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          if [ ! -f .command-repair-ready ]; then
+            printf '%s\n' 'target is not ready; requesting recovery' >&2
+            exit 75
+          fi
+          rm -f .command-repair-ready
+          printf '%s\n' 'the command recovery handler repaired the target' > command-repair.txt
+    outputs:
+      result:
+        kind: text
+        from: path
+        path: command-repair.txt
+
+exports:
+  immediateRetry:
+    ref: outputs.immediateRetry.result
+  commandRepair:
+    ref: outputs.commandRepair.result

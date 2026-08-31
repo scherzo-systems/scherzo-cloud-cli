@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.scherzo.dev/runner-operator-config-v1.schema.json",
+  "title": "Scherzo Runner Operator Configuration V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "deploymentMode", "runnerStatePath", "controlSocketPath", "workRoot"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "deploymentMode": { "enum": ["production", "development"] },
+    "runnerStatePath": { "type": "string", "pattern": "^/" },
+    "controlSocketPath": { "type": "string", "pattern": "^/" },
+    "workRoot": { "type": "string", "pattern": "^/" }
+  }
+}

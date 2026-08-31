@@ -252,7 +252,9 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
         assert_eq!(
             cancellation_commit.state.steps[&step].state,
             StepState::Cancelling {
-                reason: CancellationReason::UserRequest,
+                detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                    CancellationReason::UserRequest,
+                ),
             }
         );
         recorded_commits.push(cancellation_commit);
@@ -290,7 +292,9 @@ async fn run_cancellation_schedule() -> ScheduleTranscript {
         assert_eq!(
             terminal.state.steps[&step].state,
             StepState::Cancelled {
-                reason: CancellationReason::UserRequest,
+                detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                    CancellationReason::UserRequest,
+                ),
             }
         );
         assert_eq!(
@@ -470,6 +474,95 @@ impl CommitPort<TestCommit> for FailingCommitPort {
     fn commit(&mut self, _commit: TestCommit) -> impl Future<Output = Result<(), Self::Error>> {
         ready(Err(()))
     }
+}
+
+#[tokio::test]
+async fn transition_ceiling_failure_is_typed_and_committed_as_a_diagnostic() {
+    let mut fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    fixture.admitted.set_transition_ceiling(1);
+    let (sender, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let initialization = commits.recv().await.unwrap();
+        assert_eq!(initialization.state.last_transition_sequence.get(), 1);
+        assert_eq!(initialization.diagnostic, None);
+        let start = actions.recv().await.unwrap();
+        let action = start.action.id;
+        start.resume.send(()).unwrap();
+        sender
+            .send(DriverOccurrence::step_started("task".to_owned(), action))
+            .await
+            .unwrap();
+        let diagnostic = commits.recv().await.unwrap();
+        assert_eq!(diagnostic.state.last_transition_sequence.get(), 1);
+        assert_eq!(
+            diagnostic.diagnostic,
+            Some(CoordinationDiagnostic::TransitionCapacityExceeded)
+        );
+        assert!(!diagnostic.occurrence_accepted);
+        assert!(diagnostic.events.is_empty());
+        assert!(diagnostic.actions.is_empty());
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result, Err(CoordinationError::TransitionCapacityExceeded));
+}
+
+#[tokio::test]
+async fn initialization_capacity_failure_is_committed_as_a_diagnostic() {
+    let mut fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    fixture.admitted.set_transition_ceiling(0);
+    let (_sender, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, _actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    assert_eq!(
+        coordinator.run().await,
+        Err(CoordinationError::TransitionCapacityExceeded)
+    );
+    let diagnostic = commits
+        .try_recv()
+        .expect("initialization capacity failure was not durably committed");
+    assert_eq!(
+        diagnostic.diagnostic,
+        Some(CoordinationDiagnostic::TransitionCapacityExceeded)
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,34 @@ const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REPLACEMENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abd";
 const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const RUNNER_STATE_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/runner-state-v1.schema.json"
+));
+const OPERATOR_CONFIG_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/runner-operator-config-v1.schema.json"
+));
+const ENROLLMENT_JOURNAL_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/runner-enrollment-journal-v1.schema.json"
+));
+const TERMINAL_RECEIPT_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/runner-enrollment-terminal-receipt-v1.schema.json"
+));
+
+fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_source).expect("decode mirrored runner host schema");
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).expect("decode produced runner host document");
+    let validator = jsonschema::draft202012::new(&schema).expect("compile runner host schema");
+    assert!(
+        validator.is_valid(&document),
+        "{format} producer output does not match its checked-in schema"
+    );
+}
 
 #[test]
 fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
@@ -90,7 +118,7 @@ fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
 }
 
 #[test]
-fn operator_config_uses_the_same_host_paths_in_both_deployment_modes() {
+fn operator_config_written_bytes_match_schema_in_both_deployment_modes() {
     let temporary = tempfile::tempdir().expect("create config fixture");
     let config_path = temporary.path().join("runner.json");
     for mode in ["production", "development"] {
@@ -106,6 +134,8 @@ fn operator_config_uses_the_same_host_paths_in_both_deployment_modes() {
             serde_json::to_vec(&document).expect("encode config"),
         )
         .expect("write config");
+        let bytes = fs::read(&config_path).expect("read written operator config");
+        assert_json_matches_schema("runner operator config", OPERATOR_CONFIG_SCHEMA, &bytes);
         assert!(load_operator_config(&config_path).is_ok(), "{mode}");
     }
 }
@@ -142,7 +172,7 @@ fn atomic_state_write_uses_private_permissions_and_rejects_links() {
 }
 
 #[test]
-fn successful_enrollment_commits_protected_state_without_transmitting_credential_secret() {
+fn successful_enrollment_commits_schema_valid_state_without_transmitting_secret() {
     let server = ScriptedHttpServer::respond(enrollment_response());
     let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
 
@@ -174,9 +204,9 @@ fn successful_enrollment_commits_protected_state_without_transmitting_credential
             & 0o777,
         0o700,
     );
-    let state: RunnerState =
-        serde_json::from_slice(&fs::read(&fixture.state_path).expect("read protected state"))
-            .expect("decode protected state");
+    let state_bytes = fs::read(&fixture.state_path).expect("read protected state");
+    assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &state_bytes);
+    let state: RunnerState = serde_json::from_slice(&state_bytes).expect("decode protected state");
     assert_eq!(state.runner_id, RUNNER_ID);
     assert_eq!(state.current_credential.id, CREDENTIAL_ID);
     assert!(valid_secret(&state.current_credential.secret));
@@ -270,6 +300,7 @@ fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_creden
     );
 
     let staged_state = fs::read(&fixture.state_path).expect("read staged state");
+    assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &staged_state);
     let retry = enroll(
         Some(&fixture.activation_path),
         &fixture.config_path,
@@ -301,6 +332,7 @@ fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_creden
         ReplacementDisposition::Current
     );
     let promoted_state = fs::read(&fixture.state_path).expect("read promoted state");
+    assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &promoted_state);
     let retry = enroll(
         Some(&fixture.activation_path),
         &fixture.config_path,
@@ -343,7 +375,7 @@ fn enrollment_rejects_redirects_without_losing_the_journal() {
 }
 
 #[test]
-fn ambiguous_and_rejected_resumes_preserve_journal_until_authenticated_gone() {
+fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
     let server = ScriptedHttpServer::respond_in_sequence(vec![
         empty_response("500 Internal Server Error"),
         empty_response("401 Unauthorized"),
@@ -363,6 +395,11 @@ fn ambiguous_and_rejected_resumes_preserve_journal_until_authenticated_gone() {
     ));
     let journal_path = fixture.journal_path();
     let original = fs::read(&journal_path).expect("read staged journal");
+    assert_json_matches_schema(
+        "runner enrollment journal",
+        ENROLLMENT_JOURNAL_SCHEMA,
+        &original,
+    );
     let journal: EnrollmentJournal = serde_json::from_slice(&original).expect("decode journal");
     assert!(valid_secret(&journal.credential_secret));
 
@@ -389,6 +426,11 @@ fn ambiguous_and_rejected_resumes_preserve_journal_until_authenticated_gone() {
         EnrollmentOutcome::Gone { activation_id } if activation_id == ACTIVATION_ID
     ));
     let receipt_bytes = fs::read(&journal_path).expect("read terminal receipt");
+    assert_json_matches_schema(
+        "runner enrollment terminal receipt",
+        TERMINAL_RECEIPT_SCHEMA,
+        &receipt_bytes,
+    );
     let receipt: TerminalReceipt = serde_json::from_slice(&receipt_bytes).expect("decode receipt");
     assert!(valid_terminal_receipt(&receipt));
     for secret_member in [

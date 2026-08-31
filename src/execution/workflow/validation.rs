@@ -6,6 +6,7 @@ use super::document::{
     NodeBody, Output, OutputReference, RecoveryHandler, StepDefinition, StepRecovery,
     ValueReference, WorkflowDocument,
 };
+use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::validated::{
     RequiredImports, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
     ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
@@ -49,6 +50,7 @@ pub(crate) enum ValidationFailureKind {
     IncompatibleFinalizerTriggers,
     InvalidFinalizationContext,
     FinalizerExportTrigger,
+    TooManyPrerequisites,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -735,9 +737,10 @@ fn validate_body(
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
     required_imports: &mut RequiredImports,
 ) -> Result<ValidatedStep, ValidationFailure> {
+    let evidence_prerequisites = evidence_prerequisites(body, prerequisites)?;
     match body {
         NodeBody::Command(command) => Ok(ValidatedStep::Command(ValidatedCommandStep {
-            common: validate_common(&command.common, prerequisites),
+            common: validate_common(&command.common, prerequisites, evidence_prerequisites),
             inputs: validate_command_inputs(
                 node_name,
                 role,
@@ -748,7 +751,7 @@ fn validate_body(
             argv: command.argv.clone(),
         })),
         NodeBody::Agent(agent) => {
-            let common = validate_common(&agent.common, prerequisites);
+            let common = validate_common(&agent.common, prerequisites, evidence_prerequisites);
             let harness = resolve_agent_profile(node_name, role, &agent.agent, agent_profiles)?;
             let validated_agent = validate_agent(
                 node_name,
@@ -766,9 +769,58 @@ fn validate_body(
     }
 }
 
+fn evidence_prerequisites(
+    body: &NodeBody,
+    direct: &[ResolvedDirectPrerequisite],
+) -> Result<Vec<Prerequisite>, ValidationFailure> {
+    let mut descriptors = direct
+        .iter()
+        .filter(|prerequisite| prerequisite.control)
+        .filter_map(|prerequisite| Prerequisite::control(prerequisite.producer.clone()).ok())
+        .collect::<Vec<_>>();
+    let mut retain_reference = |reference: &ValueReference| {
+        if let ValueReference::Output(output) = reference
+            && let Ok(descriptor) =
+                Prerequisite::body(format!("outputs.{}.{}", output.node, output.output))
+        {
+            descriptors.push(descriptor);
+        }
+    };
+    match body {
+        NodeBody::Command(command) => {
+            for reference in command.inputs.values() {
+                retain_reference(reference);
+            }
+        }
+        NodeBody::Agent(agent) => {
+            for source in agent
+                .agent
+                .message
+                .text
+                .iter()
+                .chain(&agent.agent.message.attachments)
+            {
+                if let MessageSource::Reference(reference) = source {
+                    retain_reference(reference);
+                }
+            }
+        }
+    }
+    descriptors.sort();
+    descriptors.dedup();
+    if descriptors.len() > MAXIMUM_PREREQUISITES {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::TooManyPrerequisites,
+            ValidationLocation::WorkflowGraph,
+        ));
+    }
+    Ok(descriptors)
+}
+
 fn validate_common(
     common: &CommonNode,
     prerequisites: &[ResolvedDirectPrerequisite],
+    evidence_prerequisites: Vec<Prerequisite>,
 ) -> ValidatedCommonStep {
     let outputs = common
         .outputs
@@ -787,6 +839,7 @@ fn validate_common(
     ValidatedCommonStep {
         failure_policy: common.failure_policy,
         prerequisites: prerequisites.to_vec(),
+        evidence_prerequisites,
         cwd: common.cwd.clone(),
         outputs,
     }

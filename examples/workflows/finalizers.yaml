@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
 schemaVersion: 1
 
-description: Show finalizer triggers, ordering, context, and advisory failure handling.
+description: Show finalizer triggers, dataflow, context, exports, and advisory failure handling.
 
 steps:
   work:
@@ -10,29 +10,76 @@ steps:
       argv:
         - sh
         - -c
-        - "set -eu; printf '%s\n' 'ordinary work complete'; sleep 0.10"
+        - |
+          set -eu
+          printf '%s\n' 'ordinary work complete'
+          printf '%s\n' 'ordinary-work-receipt' > work-receipt.txt
+          sleep 0.10
+    outputs:
+      receipt:
+        kind: file
+        from: path
+        path: work-receipt.txt
+        mediaType: text/plain
 
 finalizers:
   cleanup:
     kind: cmd
     inputs:
+      workReceipt:
+        ref: outputs.work.receipt
       context:
         ref: finalization.context
     command:
       argv:
         - sh
         - -c
-        - "set -eu; printf '%s' 'cleanup received finalization context: '; while IFS= read -r line || [ -n \"$line\" ]; do printf '%s' \"$line\"; done < \"$SCHERZO_STEP_INPUTS/values/context\"; printf '\n'; sleep 0.10"
+        - |
+          set -eu
+          {
+            printf '%s' 'cleanup consumed ordinary output: '
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/workReceipt"
+            printf '\n%s' 'cleanup received finalization context: '
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/context"
+            printf '\n'
+          } > cleanup-receipt.txt
+          printf '%s\n' 'cleanup completed'
+          sleep 0.10
+    outputs:
+      receipt:
+        kind: file
+        from: path
+        path: cleanup-receipt.txt
+        mediaType: text/plain
 
   successReport:
     kind: cmd
-    after: [cleanup]
     when: [succeeded]
+    inputs:
+      cleanupReceipt:
+        ref: outputs.cleanup.receipt
     command:
       argv:
         - sh
         - -c
-        - "set -eu; printf '%s\n' 'ordinary execution succeeded; cleanup was attempted'"
+        - |
+          set -eu
+          {
+            printf '%s\n' 'ordinary execution succeeded; cleanup was attempted'
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "$line"
+            done < "$SCHERZO_STEP_INPUTS/values/cleanupReceipt"
+          } > final-report.txt
+          printf '%s\n' 'success report captured the cleanup receipt'
+    outputs:
+      report:
+        kind: text
+        from: path
+        path: final-report.txt
 
   failureReport:
     kind: cmd
@@ -53,3 +100,11 @@ finalizers:
         - sh
         - -c
         - "set -eu; printf '%s\n' 'simulating an advisory notification failure' >&2; exit 23"
+
+exports:
+  workReceipt:
+    ref: outputs.work.receipt
+  cleanupReceipt:
+    ref: outputs.cleanup.receipt
+  finalReport:
+    ref: outputs.successReport.report

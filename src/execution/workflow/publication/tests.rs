@@ -20,6 +20,9 @@ use crate::execution::workflow::artifact::{
     ArtifactReadFailure, CaptureDeclaration, CapturedArtifact,
 };
 use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
+use crate::execution::workflow::evidence::{
+    CancellationDetail, PrimaryIssue, failure_detail as canonical_failure_detail,
+};
 use crate::execution::workflow::pi_json_v1::{
     PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
 };
@@ -226,17 +229,18 @@ fn make_failed(run: &mut WorkflowRunResult) {
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
         CommandExecutionFailure::UnsuccessfulExit { code: Some(23) },
     ));
+    let detail = canonical_failure_detail(FailurePhase::Execution, &cause).unwrap();
     run.steps[1].state = StepState::Failed {
-        phase: FailurePhase::Execution,
-        cause: cause.clone(),
+        detail: detail.clone(),
     };
     run.outcome = RunOutcome::Failed {
-        primary_failure: StepFailure {
-            role: WorkflowNodeRole::Step,
-            step: "terminal".to_owned(),
-            phase: FailurePhase::Execution,
-            cause,
-        },
+        primary_issue: PrimaryIssue::failed(
+            WorkflowNode {
+                id: "terminal".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
         later_cancellation: None,
     };
     run.exports.insert(
@@ -263,7 +267,7 @@ fn make_failed(run: &mut WorkflowRunResult) {
 
 fn make_cancelled(run: &mut WorkflowRunResult) {
     run.steps[1].state = StepState::Cancelled {
-        reason: CancellationReason::UserRequest,
+        detail: CancellationDetail::new(CancellationReason::UserRequest),
     };
     run.outcome = RunOutcome::Cancelled {
         reason: CancellationReason::UserRequest,
@@ -307,7 +311,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     let fixture = PublicationFixture::new();
     let mut run = run_fixture(&fixture);
     run.cloud_capacity = Some(CloudExecutionCapacityV1 {
-        execution_contract: "workflow_v1_inputless_cloud_artifacts@1".to_owned(),
+        execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
         source_closure_digest: DigestV1 {
             algorithm: run.content_digest.algorithm.as_str().to_owned(),
             value: run.content_digest.value.clone(),
@@ -319,7 +323,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         diagnostic_retention_bytes: 8_388_608,
         native_session_retention_bytes: 4_194_304,
         aggregate_retention_bytes: 12_582_912,
-        encoded_outbox_bytes: 38_141_952,
+        encoded_outbox_bytes: 85_458_944,
     });
     run.exports.insert(
         "agentResponse".to_owned(),
@@ -1197,19 +1201,20 @@ fn parser_response_limit_failure_remains_valid_result_metadata() {
     let fixture = PublicationFixture::new();
     let mut run = run_fixture(&fixture);
     let cause = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
+    let detail = canonical_failure_detail(FailurePhase::Execution, &cause).unwrap();
     run.steps[1].kind = WorkflowRunStepKind::Agent;
     run.steps[1].state = StepState::Failed {
-        phase: FailurePhase::Execution,
-        cause: cause.clone(),
+        detail: detail.clone(),
     };
     run.steps[1].command_output = None;
     run.outcome = RunOutcome::Failed {
-        primary_failure: StepFailure {
-            role: WorkflowNodeRole::Step,
-            step: "terminal".to_owned(),
-            phase: FailurePhase::Execution,
-            cause,
-        },
+        primary_issue: PrimaryIssue::failed(
+            WorkflowNode {
+                id: "terminal".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
         later_cancellation: None,
     };
 
@@ -1217,15 +1222,13 @@ fn parser_response_limit_failure_remains_valid_result_metadata() {
     publish_workflow_result(&destination, &fixture.artifacts, &run)
         .expect("a response-limit failure must remain publishable");
     let (_, published) = read_result(&destination);
-    let cause = published["steps"][1]["failure"]["cause"]
-        .as_object()
-        .unwrap();
-    assert_eq!(cause["code"], "captured_value_too_large");
-    assert!(!cause.contains_key("protocolRejection"));
+    let detail = published["steps"][1]["detail"].as_object().unwrap();
+    assert_eq!(detail["code"], "captured_value_too_large");
+    assert!(!detail.contains_key("protocolRejection"));
 }
 
 #[test]
-fn structured_agent_failure_projects_the_protocol_rejection_without_content() {
+fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
     let mut parser =
         PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
     let frames = concat!(
@@ -1242,14 +1245,11 @@ fn structured_agent_failure_projects_the_protocol_rejection_without_content() {
         panic!("invalid agent lifecycle must fail");
     };
 
-    let projected = execution_failure_cause(&StepExecutionFailure::Agent(failure));
+    let source = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
+    let projected = canonical_failure_detail(FailurePhase::Execution, &source).unwrap();
     let projected = serde_json::to_value(projected).unwrap();
     assert_eq!(projected["code"], "harness_protocol_failed");
-    assert_eq!(projected["protocolRejection"]["profile"], "PiJsonV1");
-    assert_eq!(
-        projected["protocolRejection"]["detail"]["outerEvent"],
-        "agent_start"
-    );
+    assert!(projected.get("protocolRejection").is_none());
     assert!(!projected.to_string().contains("sensitive sentinel"));
 }
 
@@ -1283,7 +1283,6 @@ fn recovered_invocation_with_incomplete_diagnostics_selects_local_failure_status
             collection_index: None,
             output: None,
             exit_code: Some(75),
-            protocol_rejection: None,
         },
     };
     let incomplete = command_output_v1(&diagnostic(false)).unwrap();

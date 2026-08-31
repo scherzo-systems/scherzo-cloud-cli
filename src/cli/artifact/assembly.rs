@@ -706,7 +706,7 @@ mod tests {
             "execution": {
                 "maximumParallelSteps": 1,
                 "capacity": {
-                    "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+                    "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
                     "sourceClosureDigest": {
                         "algorithm": "sha256",
                         "value": "1".repeat(64)
@@ -718,7 +718,7 @@ mod tests {
                     "diagnosticRetentionBytes": 8_388_608,
                     "nativeSessionRetentionBytes": 4_194_304,
                     "aggregateRetentionBytes": 12_582_912,
-                    "encodedOutboxBytes": 38_141_952
+                    "encodedOutboxBytes": 85_458_944
                 },
                 "startedAt": "2026-08-17T12:00:00Z",
                 "finishedAt": "2026-08-17T12:00:01Z",

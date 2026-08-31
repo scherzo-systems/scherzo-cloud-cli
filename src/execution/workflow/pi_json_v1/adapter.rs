@@ -148,7 +148,7 @@ where
 {
     async fn invoke_inner<Sink>(
         &self,
-        mut invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
         started: &AgentStartCallback,
     ) -> AgentOutcome
     where
@@ -158,17 +158,26 @@ where
             return AgentOutcome::Cancelled { reason };
         }
 
-        let mut plan = match prepare_launch(&invocation) {
-            Ok(plan) => plan,
+        let adapter = self.clone();
+        let (mut invocation, preparation) = match tokio::task::spawn_blocking(move || {
+            let preparation = prepare_launch(&invocation).and_then(|mut plan| {
+                let result_bridge = adapter.prepare_result_bridge(&invocation)?;
+                if let Some(result_bridge) = result_bridge.as_ref() {
+                    plan.add_result_extension(result_bridge.bridge.extension_path());
+                }
+                Ok((plan, result_bridge))
+            });
+            (invocation, preparation)
+        })
+        .await
+        {
+            Ok(preparation) => preparation,
+            Err(_) => return failed(AgentFailureCause::HarnessStartFailed),
+        };
+        let (plan, mut result_bridge) = match preparation {
+            Ok(preparation) => preparation,
             Err(cause) => return failed(cause),
         };
-        let mut result_bridge = match self.prepare_result_bridge(&invocation) {
-            Ok(result_bridge) => result_bridge,
-            Err(cause) => return failed(cause),
-        };
-        if let Some(result_bridge) = result_bridge.as_ref() {
-            plan.add_result_extension(result_bridge.bridge.extension_path());
-        }
         let Some(process_directives) = invocation.take_process_directives() else {
             let _ = shutdown_result_bridge(result_bridge).await;
             return failed(AgentFailureCause::HarnessStartFailed);

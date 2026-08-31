@@ -24,7 +24,9 @@
             "role": "finalizer",
             "failurePolicy": "required",
             "state": "cancelled",
-            "reason": "runner_shutdown"
+            "detail": {
+              "code": "runner_shutdown"
+            }
           }
         ],
         "issues": [],

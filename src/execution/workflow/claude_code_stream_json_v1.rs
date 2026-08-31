@@ -225,8 +225,9 @@ pub(crate) struct ClaudeCodeStreamJsonV1ProtocolLimits {
 
 impl ClaudeCodeStreamJsonV1ProtocolLimits {
     pub(crate) const fn profile() -> Self {
-        let Some(maximum_frame_bytes) = NonZeroU64::new(MAXIMUM_FRAME_BYTES) else {
-            unreachable!();
+        let maximum_frame_bytes = match NonZeroU64::new(MAXIMUM_FRAME_BYTES) {
+            Some(value) => value,
+            None => NonZeroU64::MIN,
         };
         Self {
             maximum_frame_bytes,
@@ -1425,7 +1426,6 @@ impl ClaudeCodeStreamJsonV1Parser {
                         .any(|expected| expected.as_ref() == call_id)
                 });
             let omitted_structured_output_success = acknowledges_structured_output
-                && result == "Structured output provided successfully"
                 && required_string(object, "tool_use_result") == Some(result.as_str());
             let omitted_completed_agent_success = !acknowledges_structured_output
                 && object

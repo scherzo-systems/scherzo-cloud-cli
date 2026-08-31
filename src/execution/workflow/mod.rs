@@ -16,9 +16,15 @@ pub(crate) mod claude_code_stream_json_v1;
 pub(crate) mod codex;
 pub(crate) mod codex_app_server_v1;
 pub(crate) mod command_contract;
+#[allow(
+    dead_code,
+    reason = "conditional syntax remains inert until the coordinated activation"
+)]
+pub(crate) mod condition;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
 pub(crate) mod document;
+pub(crate) mod evidence;
 pub(crate) mod execution;
 pub(crate) mod execution_root;
 mod finalization_context;
@@ -163,7 +169,19 @@ fn structural_validator() -> Option<&'static Validator> {
         .ok()
 }
 
-fn is_valid_media_type(value: &str) -> bool {
+pub(crate) fn parse_strict_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    strict_json::from_slice(bytes)
+}
+
+pub(crate) fn is_lowercase_hex(value: &str, length: usize) -> bool {
+    schema_common::is_lowercase_hex(value, length)
+}
+
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
+    schema_common::lowercase_hex(bytes)
+}
+
+pub(crate) fn is_valid_media_type(value: &str) -> bool {
     MEDIA_TYPE_VALIDATOR
         .get_or_init(|| {
             let schema = serde_json::from_str::<Value>(STRUCTURAL_SCHEMA).map_err(|_| ())?;

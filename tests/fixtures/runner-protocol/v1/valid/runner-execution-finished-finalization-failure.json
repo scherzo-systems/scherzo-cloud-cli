@@ -14,17 +14,6 @@
     "finalExecutionEventSequence": 10,
     "outcome": {
       "outcome": "failed",
-      "failure": {
-        "node": {
-          "id": "cleanup",
-          "role": "finalizer"
-        },
-        "failure": {
-          "phase": "execution",
-          "cause": "command_unsuccessful_exit",
-          "exitCode": 1
-        }
-      },
       "finalization": {
         "trigger": "succeeded",
         "finalizers": [
@@ -33,9 +22,9 @@
             "role": "finalizer",
             "failurePolicy": "required",
             "state": "failed",
-            "failure": {
+            "detail": {
               "phase": "execution",
-              "cause": "command_unsuccessful_exit",
+              "code": "command_exit",
               "exitCode": 1
             }
           }
@@ -50,6 +39,18 @@
           }
         ],
         "forceAbort": false
+      },
+      "primaryIssue": {
+        "node": {
+          "id": "cleanup",
+          "role": "finalizer"
+        },
+        "state": "failed",
+        "detail": {
+          "phase": "execution",
+          "code": "command_exit",
+          "exitCode": 1
+        }
       }
     },
     "artifactDelivery": {

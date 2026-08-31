@@ -2211,7 +2211,7 @@ mod tests {
                 from: WorkflowState::Executing {
                     gate: SchedulingGate::Open,
                 },
-                to: WorkflowState::Succeeded,
+                to: Box::new(WorkflowState::Succeeded),
             },
             step: None,
         })

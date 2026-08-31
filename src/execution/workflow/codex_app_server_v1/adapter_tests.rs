@@ -1459,7 +1459,7 @@ fn codex_process_fixture() {
                 "message": "fixture",
                 "requestedSchema": {"type": "object", "properties": {}},
             }),
-            _ => unreachable!(),
+            _ => panic!("fixture request was not interactive"),
         };
         write_server_frame(
             &mut output,
@@ -1682,7 +1682,7 @@ fn codex_process_fixture() {
                 "result-oversized" => (Some(result_envelope(json!("ok"))), "completed"),
                 "result-correction-failed" => (None, "failed"),
                 "result-correction-interrupted" => (None, "interrupted"),
-                _ => unreachable!(),
+                _ => panic!("unknown correction fixture scenario"),
             };
             send_result_turn(
                 &mut output,

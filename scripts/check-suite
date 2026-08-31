@@ -1,13 +1,139 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
-long_tmp_parent=$(mktemp -d)
+cargo_target_dir=${CARGO_TARGET_DIR:-$public_root/target}
+if [[ $cargo_target_dir != /* ]]; then
+  cargo_target_dir=$public_root/$cargo_target_dir
+fi
+
+snapshot_cli_tree() {
+  local destination=$1
+
+  python3 - "$public_root" "$cargo_target_dir" "$destination" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(os.path.realpath(sys.argv[1]))
+excluded = Path(os.path.realpath(sys.argv[2]))
+destination = Path(sys.argv[3])
+entries = []
+
+
+def visit(directory: Path) -> None:
+    with os.scandir(directory) as children:
+        for child in sorted(children, key=lambda entry: entry.name):
+            path = Path(child.path)
+            relative = path.relative_to(root)
+            parts = relative.parts
+            if path == excluded:
+                continue
+            target_parent = path in excluded.parents and path != root
+            known_temporary = (
+                parts[0].startswith(".devenv")
+                or parts[0] in {".direnv", "result"}
+                or parts[0].startswith("result-")
+                or "__pycache__" in parts
+                or "node_modules" in parts
+            )
+            if known_temporary:
+                continue
+            mode = child.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                kind = "directory"
+            elif stat.S_ISREG(mode):
+                kind = "file"
+            elif stat.S_ISLNK(mode):
+                kind = "symlink"
+            else:
+                kind = "other"
+            if not target_parent:
+                entries.append((relative.as_posix(), kind))
+            if kind == "directory":
+                visit(path)
+
+
+visit(root)
+with destination.open("w", encoding="utf-8") as snapshot:
+    for relative, kind in sorted(entries):
+        snapshot.write(
+            json.dumps({"kind": kind, "path": relative}, ensure_ascii=True) + "\n"
+        )
+PY
+}
+
+compare_cli_tree_snapshots() {
+  python3 - "$source_snapshot_root/before" "$source_snapshot_root/after" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+before = set(Path(sys.argv[1]).read_text(encoding="utf-8").splitlines())
+after = set(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
+additions = sorted(
+    (json.loads(encoded) for encoded in after - before),
+    key=lambda entry: (entry["path"], entry["kind"]),
+)
+if additions:
+    print(
+        "CLI test source isolation check: test suite left new source-tree entries:",
+        file=sys.stderr,
+    )
+    for entry in additions:
+        print(f"  {entry['kind']}: {entry['path']}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# The clean test boundary preserves TMPDIR, which may be inside this checkout.
+# Keep suite support files and the TMPDIR passed to Cargo in a source-external root.
+suite_temporary_root=$(mktemp -d "/tmp/scherzo-cli-check-suite.XXXXXX")
+source_snapshot_root=
+long_tmp_parent=
+source_snapshot_started=false
 cleanup() {
-  rm -rf "$long_tmp_parent"
+  local status=$?
+  local snapshot_status
+  trap - EXIT
+  set +e
+  if [[ $source_snapshot_started == true ]]; then
+    snapshot_cli_tree "$source_snapshot_root/after"
+    snapshot_status=$?
+    if [[ $snapshot_status -ne 0 ]]; then
+      echo "CLI test source isolation check: could not capture the final source tree." >&2
+      status=1
+    elif ! compare_cli_tree_snapshots; then
+      status=1
+    fi
+  fi
+  rm -rf "$suite_temporary_root"
+  exit "$status"
 }
 trap cleanup EXIT
+
+suite_temporary_physical=$(cd "$suite_temporary_root" && pwd -P)
+case "$suite_temporary_physical/" in
+  "$public_root/"*)
+    echo "CLI test source isolation check: temporary root is inside the CLI source tree." >&2
+    exit 1
+    ;;
+esac
+case "$public_root/" in
+  "$suite_temporary_physical/"*)
+    echo "CLI test source isolation check: temporary root contains the CLI source tree." >&2
+    exit 1
+    ;;
+esac
+
+source_snapshot_root=$suite_temporary_physical/snapshots
+long_tmp_parent=$suite_temporary_physical/work
+mkdir -m 700 "$source_snapshot_root" "$long_tmp_parent"
+snapshot_cli_tree "$source_snapshot_root/before"
+source_snapshot_started=true
 long_tmp_physical="$long_tmp_parent/physical/portable-workflow-test-temporary-directory/with-a-deliberately-long-path/to-detect-path-length-dependent-test-fixtures"
 tmp_alias="$long_tmp_parent/t"
 mkdir -p "$long_tmp_physical"
@@ -16,6 +142,8 @@ chmod 700 "$long_tmp_physical"
 # including Linux where /tmp is ordinarily not an alias. Keep the lexical path
 # short enough for Unix-domain sockets while retaining a long physical target.
 ln -s "$long_tmp_physical" "$tmp_alias"
+# Do not let any suite command honor an inherited TMPDIR inside the checkout.
+export TMPDIR=$tmp_alias
 
 "$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/check-structure"
@@ -28,18 +156,14 @@ cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
-TMPDIR="$tmp_alias" cargo nextest run --locked --workspace --all-targets --all-features
-TMPDIR="$tmp_alias" SCHERZO_CLOUD_VERSION=0.2.7 \
+cargo nextest run --locked --workspace --all-targets --all-features
+SCHERZO_CLOUD_VERSION=0.2.7 \
   cargo nextest run --locked --workspace --all-targets --all-features resolved_build_version
 cargo build --locked --workspace --all-features --release
 
 host_target=$(rustc -vV | awk '$1 == "host:" { print $2 }')
 case $host_target in
   aarch64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu)
-    cargo_target_dir=${CARGO_TARGET_DIR:-$public_root/target}
-    if [[ $cargo_target_dir != /* ]]; then
-      cargo_target_dir=$public_root/$cargo_target_dir
-    fi
     release_dist=$long_tmp_parent/release-dist
     archive=$(
       "$public_root/scripts/package-release-archive" \

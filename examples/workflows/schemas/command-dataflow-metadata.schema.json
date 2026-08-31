@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Command dataflow metadata",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "state": {
+      "const": "captured"
+    },
+    "attachmentCount": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": ["schemaVersion", "state", "attachmentCount"],
+  "additionalProperties": false
+}

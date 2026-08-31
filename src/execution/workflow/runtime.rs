@@ -4,13 +4,18 @@ use std::sync::Arc;
 
 use super::admission::{AdmittedWorkflow, CancellationOperationId, CancellationReason};
 use super::document::{FailurePolicy, FinalizationTrigger};
+pub(crate) use super::evidence::FailurePhase;
+use super::evidence::{
+    BlockedDetail, CancellationDetail, FailureDetail, NodeFailureSource, NonExecutionCode,
+    NonExecutionDetail, Prerequisite, PrimaryIssue,
+};
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
 };
 use super::validated::{
     ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedCommonStep, ValidatedFinalizer,
     ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
-    ValidatedWorkflow, WorkflowNodeRole,
+    ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
 };
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
@@ -50,22 +55,9 @@ impl ActionId {
             transition_sequence: TransitionSequence((1_u64 << 63) | (operation << 32) | index),
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FailurePhase {
-    Start,
-    Execution,
-    OutputCapture,
-}
-
-impl FailurePhase {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Execution => "execution",
-            Self::OutputCapture => "output_capture",
-        }
+    fn is_force_abort(self) -> bool {
+        self.transition_sequence.get() & (1_u64 << 63) != 0
     }
 }
 
@@ -148,6 +140,7 @@ pub(crate) struct ProvisionalTargetFailure<Cause> {
     pub(crate) execution_number: TargetExecutionNumber,
     pub(crate) invocation: ActionId,
     pub(crate) phase: FailurePhase,
+    pub(crate) detail: FailureDetail,
     pub(crate) cause: Cause,
 }
 
@@ -251,22 +244,14 @@ pub(crate) struct StepRecoveryState<Cause> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StepFailure<Cause> {
-    pub(crate) step: String,
-    pub(crate) role: WorkflowNodeRole,
-    pub(crate) phase: FailurePhase,
-    pub(crate) cause: Cause,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SchedulingGate<Cause> {
+pub(crate) enum SchedulingGate {
     Open,
     FailureStopped {
-        primary_failure: StepFailure<Cause>,
+        primary_issue: PrimaryIssue,
     },
     Cancelling {
         reason: CancellationReason,
-        prior_failure: Option<StepFailure<Cause>>,
+        prior_issue: Option<PrimaryIssue>,
     },
 }
 
@@ -281,18 +266,18 @@ pub(crate) enum FinalizationGate<Deadline = ()> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WorkflowState<Cause, Deadline = ()> {
+pub(crate) enum WorkflowState<Deadline = ()> {
     Executing {
-        gate: SchedulingGate<Cause>,
+        gate: SchedulingGate,
     },
     Finalizing {
         trigger: FinalizationTrigger,
         gate: FinalizationGate<Deadline>,
-        primary_failure: Option<StepFailure<Cause>>,
+        primary_issue: Option<PrimaryIssue>,
     },
     Succeeded,
     Failed {
-        primary_failure: StepFailure<Cause>,
+        primary_issue: PrimaryIssue,
         later_cancellation: Option<CancellationReason>,
     },
     Cancelled {
@@ -300,17 +285,17 @@ pub(crate) enum WorkflowState<Cause, Deadline = ()> {
     },
 }
 
-impl<Cause, Deadline> WorkflowState<Cause, Deadline> {
+impl<Deadline> WorkflowState<Deadline> {
     pub(crate) fn map_deadline<Mapped>(
         self,
         map: impl FnOnce(Deadline) -> Mapped,
-    ) -> WorkflowState<Cause, Mapped> {
+    ) -> WorkflowState<Mapped> {
         match self {
             Self::Executing { gate } => WorkflowState::Executing { gate },
             Self::Finalizing {
                 trigger,
                 gate,
-                primary_failure,
+                primary_issue,
             } => WorkflowState::Finalizing {
                 trigger,
                 gate: match gate {
@@ -325,14 +310,14 @@ impl<Cause, Deadline> WorkflowState<Cause, Deadline> {
                         force_abort,
                     },
                 },
-                primary_failure,
+                primary_issue,
             },
             Self::Succeeded => WorkflowState::Succeeded,
             Self::Failed {
-                primary_failure,
+                primary_issue,
                 later_cancellation,
             } => WorkflowState::Failed {
-                primary_failure,
+                primary_issue,
                 later_cancellation,
             },
             Self::Cancelled { reason } => WorkflowState::Cancelled { reason },
@@ -340,14 +325,10 @@ impl<Cause, Deadline> WorkflowState<Cause, Deadline> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NotRunReason {
-    FailureStop,
-    FinalizerTriggerNotSelected,
-}
+pub(crate) type NotRunReason = NonExecutionCode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StepState<Cause, Output> {
+pub(crate) enum StepState<Output> {
     Pending,
     Starting,
     Running,
@@ -357,30 +338,26 @@ pub(crate) enum StepState<Cause, Output> {
         handler: RecoveryHandlerActivity,
     },
     Cancelling {
-        reason: CancellationReason,
+        detail: CancellationDetail,
     },
     Succeeded {
         outputs: OutputSet<Output>,
     },
     Failed {
-        phase: FailurePhase,
-        cause: Cause,
+        detail: FailureDetail,
     },
     Blocked {
-        dependency: String,
-    },
-    InputUnavailable {
-        references: Vec<String>,
+        detail: BlockedDetail,
     },
     NotRun {
-        reason: NotRunReason,
+        detail: NonExecutionDetail,
     },
     Cancelled {
-        reason: CancellationReason,
+        detail: CancellationDetail,
     },
 }
 
-impl<Cause, Output> StepState<Cause, Output> {
+impl<Output> StepState<Output> {
     fn kind(&self) -> StepStateKind {
         match self {
             Self::Pending => StepStateKind::Pending,
@@ -391,7 +368,7 @@ impl<Cause, Output> StepState<Cause, Output> {
             Self::Cancelling { .. } => StepStateKind::Cancelling,
             Self::Succeeded { .. } => StepStateKind::Succeeded,
             Self::Failed { .. } => StepStateKind::Failed,
-            Self::Blocked { .. } | Self::InputUnavailable { .. } => StepStateKind::Blocked,
+            Self::Blocked { .. } => StepStateKind::Blocked,
             Self::NotRun { .. } => StepStateKind::NotRun,
             Self::Cancelled { .. } => StepStateKind::Cancelled,
         }
@@ -414,7 +391,6 @@ impl<Cause, Output> StepState<Cause, Output> {
             Self::Succeeded { .. }
                 | Self::Failed { .. }
                 | Self::Blocked { .. }
-                | Self::InputUnavailable { .. }
                 | Self::NotRun { .. }
                 | Self::Cancelled { .. }
         )
@@ -438,9 +414,11 @@ pub(crate) enum StepStateKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StepRuntimeState<Cause, Output> {
-    pub(crate) state: StepState<Cause, Output>,
+    pub(crate) state: StepState<Output>,
     pub(crate) current_action: Option<ActionId>,
     pub(crate) target_execution: Option<TargetExecutionNumber>,
+    // Output capture replaces current_action, so retain the target's original invocation identity.
+    pub(crate) target_invocation: Option<ActionId>,
     pub(crate) active_invocation: Option<ActiveStepInvocation>,
     pub(crate) recovery: Option<StepRecoveryState<Cause>>,
 }
@@ -456,6 +434,7 @@ struct RuntimeStep {
     role: WorkflowNodeRole,
     failure_policy: FailurePolicy,
     prerequisites: Arc<[ResolvedDirectPrerequisite]>,
+    evidence_prerequisites: Arc<[Prerequisite]>,
     inputs: BTreeMap<String, ResolvedValueSource>,
     declared_outputs: BTreeSet<String>,
     recovery: Option<RuntimeRecovery>,
@@ -561,6 +540,7 @@ fn runtime_step(
         role,
         failure_policy: common.failure_policy,
         prerequisites: Arc::from(common.prerequisites.clone()),
+        evidence_prerequisites: Arc::from(common.evidence_prerequisites.clone()),
         inputs: match step {
             ValidatedStep::Command(command) => command
                 .inputs
@@ -624,10 +604,10 @@ pub(crate) enum ExportValue<Output> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum OrdinaryOutcome<Cause> {
+enum OrdinaryOutcome {
     Succeeded,
     Failed {
-        primary_failure: StepFailure<Cause>,
+        primary_issue: PrimaryIssue,
         later_cancellation: Option<CancellationReason>,
     },
     Cancelled {
@@ -642,16 +622,16 @@ pub(crate) struct FinalizationCancellation<Deadline = ()> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FinalizerResult<Cause> {
+pub(crate) struct FinalizerResult {
     pub(crate) finalizer: String,
     pub(crate) failure_policy: FailurePolicy,
-    pub(crate) disposition: StepState<Cause, ()>,
+    pub(crate) disposition: StepState<()>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FinalizationSummary<Cause, Deadline = ()> {
+pub(crate) struct FinalizationSummary<Deadline = ()> {
     pub(crate) trigger: FinalizationTrigger,
-    pub(crate) finalizers: Vec<FinalizerResult<Cause>>,
+    pub(crate) finalizers: Vec<FinalizerResult>,
     pub(crate) cancellation: Option<FinalizationCancellation<Deadline>>,
     pub(crate) force_abort: bool,
 }
@@ -659,11 +639,11 @@ pub(crate) struct FinalizationSummary<Cause, Deadline = ()> {
 // Mapping deadlines mirrors WorkflowState because summaries outlive transitions and are
 // projected independently; a shared trait would obscure these two closed contracts.
 // jscpd:ignore-start
-impl<Cause, Deadline> FinalizationSummary<Cause, Deadline> {
+impl<Deadline> FinalizationSummary<Deadline> {
     pub(crate) fn map_deadline<Mapped>(
         self,
         map: impl FnOnce(Deadline) -> Mapped,
-    ) -> FinalizationSummary<Cause, Mapped> {
+    ) -> FinalizationSummary<Mapped> {
         FinalizationSummary {
             trigger: self.trigger,
             finalizers: self.finalizers,
@@ -680,10 +660,10 @@ impl<Cause, Deadline> FinalizationSummary<Cause, Deadline> {
 // jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FinalizationRuntime<Cause, Deadline> {
+struct FinalizationRuntime<Deadline> {
     trigger: FinalizationTrigger,
     context: Arc<[u8]>,
-    ordinary_outcome: OrdinaryOutcome<Cause>,
+    ordinary_outcome: OrdinaryOutcome,
     cancellation: Option<FinalizationCancellation<Deadline>>,
     force_abort: bool,
 }
@@ -691,14 +671,21 @@ struct FinalizationRuntime<Cause, Deadline> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     definition: Arc<RuntimeDefinition>,
-    pub(crate) workflow: WorkflowState<Cause, Deadline>,
+    pub(crate) workflow: WorkflowState<Deadline>,
     // One namespace and one reducer map; role is retained in the definition and events.
     pub(crate) steps: BTreeMap<String, StepRuntimeState<Cause, Output>>,
     pub(crate) exports: Option<ExportSet<Output>>,
-    pub(crate) finalization_summary: Option<FinalizationSummary<Cause, Deadline>>,
-    finalization: Option<FinalizationRuntime<Cause, Deadline>>,
+    pub(crate) finalization_summary: Option<FinalizationSummary<Deadline>>,
+    finalization: Option<FinalizationRuntime<Deadline>>,
     pub(crate) last_cancellation_operation: Option<CancellationOperationId>,
     pub(crate) last_transition_sequence: TransitionSequence,
+    transition_capacity_exceeded: bool,
+}
+
+impl<Cause, Output, Deadline> RuntimeState<Cause, Output, Deadline> {
+    pub(crate) const fn transition_capacity_exceeded(&self) -> bool {
+        self.transition_capacity_exceeded
+    }
 }
 
 #[cfg(test)]
@@ -791,10 +778,10 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
 // crossing the phase boundary, while the latter is the adapter-facing finish contract.
 // jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RunOutcome<Cause> {
+pub(crate) enum RunOutcome {
     Succeeded,
     Failed {
-        primary_failure: StepFailure<Cause>,
+        primary_issue: PrimaryIssue,
         later_cancellation: Option<CancellationReason>,
     },
     Cancelled {
@@ -841,7 +828,7 @@ pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
         deadline: Deadline,
     },
     FinishRun {
-        outcome: RunOutcome<Cause>,
+        outcome: RunOutcome,
         exports: ExportSet<Output>,
     },
 }
@@ -853,7 +840,7 @@ pub(crate) struct RequestedAction<Provisional, Cause, Output, Deadline> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TransitionEvent<Cause, Deadline> {
+pub(crate) enum TransitionEvent<Deadline> {
     Step {
         sequence: TransitionSequence,
         step: String,
@@ -864,8 +851,8 @@ pub(crate) enum TransitionEvent<Cause, Deadline> {
     },
     Workflow {
         sequence: TransitionSequence,
-        from: WorkflowState<Cause, Deadline>,
-        to: WorkflowState<Cause, Deadline>,
+        from: WorkflowState<Deadline>,
+        to: Box<WorkflowState<Deadline>>,
     },
     CancellationAccepted {
         sequence: TransitionSequence,
@@ -886,7 +873,7 @@ pub(crate) enum TransitionEvent<Cause, Deadline> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) state: RuntimeState<Cause, Output, Deadline>,
-    pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
+    pub(crate) events: Vec<TransitionEvent<Deadline>>,
     pub(crate) actions: Vec<RequestedAction<Provisional, Cause, Output, Deadline>>,
     pub(crate) occurrence_accepted: bool,
 }
@@ -945,6 +932,7 @@ where
                     state: StepState::Pending,
                     current_action: None,
                     target_execution: None,
+                    target_invocation: None,
                     active_invocation: None,
                     recovery: definition.recovery.map(|recovery| StepRecoveryState {
                         configured_rounds: recovery.retries,
@@ -968,6 +956,7 @@ where
             finalization: None,
             last_cancellation_operation: None,
             last_transition_sequence: TransitionSequence::default(),
+            transition_capacity_exceeded: false,
         },
         events: Vec::new(),
         actions: Vec::new(),
@@ -989,7 +978,7 @@ pub(crate) fn reduce<Provisional, Cause, Output, Deadline>(
     occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
-    Cause: Clone,
+    Cause: Clone + NodeFailureSource,
     Output: Clone,
     Deadline: Clone,
 {
@@ -1016,7 +1005,7 @@ fn apply_occurrence<Provisional, Cause, Output, Deadline>(
     occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
 ) -> bool
 where
-    Cause: Clone,
+    Cause: Clone + NodeFailureSource,
     Output: Clone,
     Deadline: Clone,
 {
@@ -1218,11 +1207,25 @@ where
             return apply_force_abort(reduction, operation, deadline);
         }
         Occurrence::StepQuiesced { step, action } => {
-            let Some((reason, active)) = cancelling_step(&reduction.state, &step, action) else {
+            let Some((cancelling_reason, active)) =
+                cancelling_step(&reduction.state, &step, action)
+            else {
                 return false;
             };
+            let terminal_reason = if action.is_force_abort() {
+                CancellationReason::FinalizationForceAbort
+            } else {
+                cancelling_reason
+            };
             mark_recovery_cancelled(&mut reduction.state, &step, active);
-            transition_step(reduction, &step, StepState::Cancelled { reason }, None);
+            transition_step(
+                reduction,
+                &step,
+                StepState::Cancelled {
+                    detail: CancellationDetail::new(terminal_reason),
+                },
+                None,
+            );
             clear_active_invocation(&mut reduction.state, &step);
         }
     }
@@ -1279,13 +1282,13 @@ where
     Output: Clone,
     Deadline: Clone,
 {
-    let prior_failure = match &reduction.state.workflow {
+    let prior_issue = match &reduction.state.workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
         } => None,
         WorkflowState::Executing {
-            gate: SchedulingGate::FailureStopped { primary_failure },
-        } => Some(primary_failure.clone()),
+            gate: SchedulingGate::FailureStopped { primary_issue },
+        } => Some(primary_issue.clone()),
         WorkflowState::Executing {
             gate: SchedulingGate::Cancelling { .. },
         } => return false,
@@ -1297,7 +1300,7 @@ where
     reduction.state.workflow = WorkflowState::Executing {
         gate: SchedulingGate::Cancelling {
             reason: cancellation.reason,
-            prior_failure,
+            prior_issue,
         },
     };
     let sequence = next_sequence(&mut reduction.state);
@@ -1335,7 +1338,7 @@ where
     let from = reduction.state.workflow.clone();
     let WorkflowState::Finalizing {
         trigger,
-        primary_failure,
+        primary_issue,
         ..
     } = &from
     else {
@@ -1348,7 +1351,7 @@ where
             deadline: Some(cancellation.deadline.clone()),
             force_abort: false,
         },
-        primary_failure: primary_failure.clone(),
+        primary_issue: primary_issue.clone(),
     };
     reduction.state.workflow = to;
     if let Some(finalization) = reduction.state.finalization.as_mut() {
@@ -1390,7 +1393,7 @@ where
     let WorkflowState::Finalizing {
         trigger,
         gate,
-        primary_failure,
+        primary_issue,
     } = &reduction.state.workflow
     else {
         return false;
@@ -1405,7 +1408,7 @@ where
         return false;
     }
     let trigger = *trigger;
-    let primary_failure = primary_failure.clone();
+    let primary_issue = primary_issue.clone();
     let (reason, phase_deadline) = match gate {
         FinalizationGate::Open => (CancellationReason::FinalizationForceAbort, None),
         FinalizationGate::Cancelling {
@@ -1420,7 +1423,7 @@ where
             deadline: phase_deadline,
             force_abort: true,
         },
-        primary_failure,
+        primary_issue,
     };
     if let Some(finalization) = reduction.state.finalization.as_mut() {
         finalization.force_abort = true;
@@ -1482,7 +1485,14 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
     for (step, state) in nodes {
         match state {
             StepStateKind::Pending => {
-                transition_step(reduction, &step, StepState::Cancelled { reason }, None);
+                transition_step(
+                    reduction,
+                    &step,
+                    StepState::Cancelled {
+                        detail: CancellationDetail::new(reason),
+                    },
+                    None,
+                );
             }
             StepStateKind::Starting
             | StepStateKind::Running
@@ -1497,8 +1507,14 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
                     continue;
                 };
                 mark_handler_cancelled(&mut reduction.state, &step, active);
-                let sequence =
-                    transition_step(reduction, &step, StepState::Cancelling { reason }, None);
+                let sequence = transition_step(
+                    reduction,
+                    &step,
+                    StepState::Cancelling {
+                        detail: CancellationDetail::new(reason),
+                    },
+                    None,
+                );
                 let action = force_context.as_ref().map_or_else(
                     || ActionId::for_transition(sequence),
                     |(operation, _)| ActionId::for_force_abort(*operation, containment_index),
@@ -1571,8 +1587,8 @@ fn cancelling_step<Cause, Output, Deadline>(
 ) -> Option<(CancellationReason, ActiveStepInvocation)> {
     let runtime = state.steps.get(step)?;
     match &runtime.state {
-        StepState::Cancelling { reason } if runtime.current_action == Some(action) => {
-            Some((*reason, runtime.active_invocation?))
+        StepState::Cancelling { detail } if runtime.current_action == Some(action) => {
+            Some((detail.code, runtime.active_invocation?))
         }
         _ => None,
     }
@@ -1587,7 +1603,7 @@ fn apply_step_failure<Provisional, Cause, Output, Deadline>(
     cause: Cause,
 ) -> bool
 where
-    Cause: Clone,
+    Cause: Clone + NodeFailureSource,
     Output: Clone,
     Deadline: Clone,
 {
@@ -1597,23 +1613,26 @@ where
     let Some(definition) = reduction.state.definition.steps.get(&step).cloned() else {
         return false;
     };
+    let Ok(detail) = cause.node_failure_detail(phase) else {
+        return false;
+    };
     if definition.role == WorkflowNodeRole::Step
-        && activate_recovery_round(reduction, &step, action, phase, cause.clone())
+        && activate_recovery_round(reduction, &step, phase, detail.clone(), cause.clone())
     {
         return true;
     }
     if definition.recovery.is_some() {
         mark_recovery_exhausted(&mut reduction.state, &step);
     }
-    settle_target_failure(reduction, step, definition, phase, cause);
+    settle_target_failure(reduction, step, definition, detail);
     true
 }
 
 fn activate_recovery_round<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: &str,
-    action: ActionId,
     phase: FailurePhase,
+    detail: FailureDetail,
     cause: Cause,
 ) -> bool
 where
@@ -1625,6 +1644,9 @@ where
         return false;
     };
     let Some(execution_number) = runtime.target_execution else {
+        return false;
+    };
+    let Some(invocation) = runtime.target_invocation else {
         return false;
     };
     let Some(recovery) = runtime.recovery.as_ref() else {
@@ -1646,8 +1668,9 @@ where
     let handler_kind = recovery.handler_kind;
     let failed_execution = ProvisionalTargetFailure {
         execution_number,
-        invocation: action,
+        invocation,
         phase,
+        detail,
         cause,
     };
     let Some(recovery) = reduction
@@ -1828,33 +1851,31 @@ fn settle_latest_target_failure<Provisional, Cause, Output, Deadline>(
     let Some(definition) = reduction.state.definition.steps.get(&step).cloned() else {
         return;
     };
-    settle_target_failure(reduction, step, definition, failure.phase, failure.cause);
+    settle_target_failure(reduction, step, definition, failure.detail);
 }
 
 fn settle_target_failure<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: String,
     definition: RuntimeStep,
-    phase: FailurePhase,
-    cause: Cause,
+    detail: FailureDetail,
 ) where
     Cause: Clone,
     Deadline: Clone,
 {
-    let primary_failure = StepFailure {
-        step: step.clone(),
-        role: definition.role,
-        phase,
-        cause: cause.clone(),
-    };
-    transition_step(reduction, &step, StepState::Failed { phase, cause }, None);
+    let primary_issue = PrimaryIssue::failed(
+        WorkflowNode {
+            id: step.clone(),
+            role: definition.role,
+        },
+        detail.clone(),
+    );
+    transition_step(reduction, &step, StepState::Failed { detail }, None);
     clear_active_invocation(&mut reduction.state, &step);
     if definition.failure_policy == FailurePolicy::Required {
         match definition.role {
-            WorkflowNodeRole::Step => close_ordinary_gate_for_failure(reduction, primary_failure),
-            WorkflowNodeRole::Finalizer => {
-                select_finalizer_primary_failure(reduction, primary_failure)
-            }
+            WorkflowNodeRole::Step => close_ordinary_gate_for_failure(reduction, primary_issue),
+            WorkflowNodeRole::Finalizer => select_finalizer_primary_issue(reduction, primary_issue),
         }
     }
 }
@@ -2004,12 +2025,12 @@ fn clear_active_invocation<Cause, Output, Deadline>(
     }
 }
 
-// Primary failure selection is phase-specific even though both transitions carry the same
+// Primary issue selection is phase-specific even though both transitions carry the same
 // surrounding workflow fields; keeping them separate makes ordinary precedence explicit.
 // jscpd:ignore-start
 fn close_ordinary_gate_for_failure<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
-    primary_failure: StepFailure<Cause>,
+    primary_issue: PrimaryIssue,
 ) where
     Cause: Clone,
     Deadline: Clone,
@@ -2024,18 +2045,20 @@ fn close_ordinary_gate_for_failure<Provisional, Cause, Output, Deadline>(
     }
     let from = reduction.state.workflow.clone();
     let to = WorkflowState::Executing {
-        gate: SchedulingGate::FailureStopped { primary_failure },
+        gate: SchedulingGate::FailureStopped { primary_issue },
     };
     let sequence = next_sequence(&mut reduction.state);
     reduction.state.workflow = to.clone();
-    reduction
-        .events
-        .push(TransitionEvent::Workflow { sequence, from, to });
+    reduction.events.push(TransitionEvent::Workflow {
+        sequence,
+        from,
+        to: Box::new(to),
+    });
 }
 
-fn select_finalizer_primary_failure<Provisional, Cause, Output, Deadline>(
+fn select_finalizer_primary_issue<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
-    primary_failure: StepFailure<Cause>,
+    primary_issue: PrimaryIssue,
 ) where
     Cause: Clone,
     Deadline: Clone,
@@ -2043,7 +2066,7 @@ fn select_finalizer_primary_failure<Provisional, Cause, Output, Deadline>(
     let WorkflowState::Finalizing {
         trigger,
         gate: FinalizationGate::Open,
-        primary_failure: None,
+        primary_issue: None,
     } = &reduction.state.workflow
     else {
         return;
@@ -2055,13 +2078,15 @@ fn select_finalizer_primary_failure<Provisional, Cause, Output, Deadline>(
     let to = WorkflowState::Finalizing {
         trigger: *trigger,
         gate: FinalizationGate::Open,
-        primary_failure: Some(primary_failure),
+        primary_issue: Some(primary_issue),
     };
     let sequence = next_sequence(&mut reduction.state);
     reduction.state.workflow = to.clone();
-    reduction
-        .events
-        .push(TransitionEvent::Workflow { sequence, from, to });
+    reduction.events.push(TransitionEvent::Workflow {
+        sequence,
+        from,
+        to: Box::new(to),
+    });
 }
 
 // jscpd:ignore-end
@@ -2097,7 +2122,7 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingDisposition {
-    Blocked { dependency: String },
+    Blocked(BlockedDetail),
     NotRun,
 }
 
@@ -2110,9 +2135,9 @@ fn propagate_ordinary_pending_dispositions<Provisional, Cause, Output, Deadline>
 {
     while let Some((step, disposition)) = next_ordinary_pending_disposition(&reduction.state) {
         let state = match disposition {
-            PendingDisposition::Blocked { dependency } => StepState::Blocked { dependency },
+            PendingDisposition::Blocked(detail) => StepState::Blocked { detail },
             PendingDisposition::NotRun => StepState::NotRun {
-                reason: NotRunReason::FailureStop,
+                detail: NonExecutionDetail::failure_stop(),
             },
         };
         transition_step(reduction, &step, state, None);
@@ -2134,24 +2159,11 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
         if !matches!(runtime.state, StepState::Pending) {
             return None;
         }
-        if let Some(prerequisite) = definition
-            .prerequisites
-            .iter()
-            .filter(|prerequisite| {
-                state
-                    .steps
-                    .get(&prerequisite.producer)
-                    .is_some_and(|step| step.state.is_terminal())
-                    && !ordinary_prerequisite_satisfied(state, prerequisite)
-            })
-            .min_by(|left, right| left.producer.cmp(&right.producer))
-        {
-            return Some((
-                step_id.clone(),
-                PendingDisposition::Blocked {
-                    dependency: prerequisite.producer.clone(),
-                },
-            ));
+        let blockers = ordinary_unsatisfied_prerequisites(state, definition);
+        if !blockers.is_empty() {
+            return BlockedDetail::new(blockers)
+                .ok()
+                .map(|detail| (step_id.clone(), PendingDisposition::Blocked(detail)));
         }
         (failure_stopped
             && definition
@@ -2160,6 +2172,65 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
                 .all(|prerequisite| ordinary_prerequisite_satisfied(state, prerequisite)))
         .then(|| (step_id.clone(), PendingDisposition::NotRun))
     })
+}
+
+fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    definition: &RuntimeStep,
+) -> Vec<Prerequisite> {
+    let mut blockers = Vec::new();
+    for prerequisite in definition.prerequisites.iter() {
+        let Some(producer) = state.steps.get(&prerequisite.producer) else {
+            continue;
+        };
+        if !producer.state.is_terminal() {
+            continue;
+        }
+        let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+        let control_satisfied = succeeded
+            || (state
+                .definition
+                .steps
+                .get(&prerequisite.producer)
+                .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
+                && matches!(
+                    producer.state,
+                    StepState::Failed { .. } | StepState::Blocked { .. }
+                ));
+        if prerequisite.control
+            && !control_satisfied
+            && let Ok(blocker) = Prerequisite::control(prerequisite.producer.clone())
+        {
+            blockers.push(blocker);
+        }
+        if prerequisite.data && !succeeded {
+            blockers.extend(
+                definition
+                    .evidence_prerequisites
+                    .iter()
+                    .filter(|descriptor| {
+                        matches!(descriptor, Prerequisite::Body { r#ref }
+                            if output_reference_producer(r#ref)
+                                == Some(prerequisite.producer.as_str()))
+                    })
+                    .cloned(),
+            );
+        }
+    }
+    blockers
+}
+
+fn output_reference_producer(reference: &str) -> Option<&str> {
+    let mut segments = reference.split('.');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("outputs"), Some(producer), Some(_), None) => Some(producer),
+        _ => None,
+    }
 }
 
 fn ordinary_prerequisite_satisfied<Cause, Output, Deadline>(
@@ -2178,9 +2249,7 @@ fn ordinary_prerequisite_satisfied<Cause, Output, Deadline>(
             .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
             && matches!(
                 producer.state,
-                StepState::Failed { .. }
-                    | StepState::Blocked { .. }
-                    | StepState::InputUnavailable { .. }
+                StepState::Failed { .. } | StepState::Blocked { .. }
             ));
     (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
 }
@@ -2225,19 +2294,20 @@ fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
             reduction,
             &finalizer,
             StepState::NotRun {
-                reason: NotRunReason::FinalizerTriggerNotSelected,
+                detail: NonExecutionDetail::finalizer_trigger_not_selected(),
             },
             None,
         );
     }
 
     while let Some((finalizer, references)) = next_input_unavailable(&reduction.state) {
-        transition_step(
-            reduction,
-            &finalizer,
-            StepState::InputUnavailable { references },
-            None,
-        );
+        let prerequisites = references
+            .into_iter()
+            .filter_map(|reference| Prerequisite::body(reference).ok());
+        let Ok(detail) = BlockedDetail::new(prerequisites) else {
+            continue;
+        };
+        transition_step(reduction, &finalizer, StepState::Blocked { detail }, None);
     }
 }
 
@@ -2259,27 +2329,23 @@ fn unavailable_references<Cause, Output, Deadline>(
     definition: &RuntimeStep,
 ) -> Vec<String> {
     definition
-        .inputs
-        .values()
-        .filter_map(|source| match source {
-            ResolvedValueSource::Output(source)
-                if state
-                    .steps
-                    .get(&source.node.id)
-                    .and_then(|runtime| match &runtime.state {
-                        StepState::Succeeded { outputs } => outputs.get(&source.output),
-                        _ => None,
-                    })
-                    .is_none() =>
+        .evidence_prerequisites
+        .iter()
+        .filter_map(|descriptor| match descriptor {
+            Prerequisite::Body { r#ref }
+                if output_reference_producer(r#ref).is_some_and(|producer| {
+                    !state
+                        .steps
+                        .get(producer)
+                        .is_some_and(|runtime| matches!(runtime.state, StepState::Succeeded { .. }))
+                }) =>
             {
-                Some(source.reference())
+                Some(r#ref.clone())
             }
-            ResolvedValueSource::Import(_)
-            | ResolvedValueSource::FinalizationContext
-            | ResolvedValueSource::Output(_) => None,
+            Prerequisite::Control { .. }
+            | Prerequisite::Condition { .. }
+            | Prerequisite::Body { .. } => None,
         })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect()
 }
 
@@ -2358,10 +2424,13 @@ fn authorize_target<Provisional, Cause, Output, Deadline>(
 ) {
     if let Some(runtime) = reduction.state.steps.get_mut(&step) {
         runtime.target_execution = Some(execution_number);
-        runtime.active_invocation = Some(ActiveStepInvocation::Target { execution_number });
     }
     let sequence = transition_step(reduction, &step, StepState::Starting, None);
     let action_id = ActionId::for_transition(sequence);
+    if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+        runtime.target_invocation = Some(action_id);
+        runtime.active_invocation = Some(ActiveStepInvocation::Target { execution_number });
+    }
     set_current_action(&mut reduction.state, &step, action_id);
     reduction.actions.push(RequestedAction {
         id: action_id,
@@ -2462,7 +2531,9 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
     {
         return;
     }
-    let ordinary_outcome = ordinary_outcome(&reduction.state);
+    let Some(ordinary_outcome) = ordinary_outcome(&reduction.state) else {
+        return;
+    };
     if reduction.state.definition.finalizer_ids.is_empty() {
         finish_run(reduction, ordinary_outcome, None);
         return;
@@ -2473,10 +2544,8 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         OrdinaryOutcome::Cancelled { .. } => FinalizationTrigger::Cancelled,
     };
     let ordinary_issues = ordinary_issues(&reduction.state);
-    let primary_failure_step_id = match &ordinary_outcome {
-        OrdinaryOutcome::Failed {
-            primary_failure, ..
-        } => Some(primary_failure.step.as_str()),
+    let primary_issue_step_id = match &ordinary_outcome {
+        OrdinaryOutcome::Failed { primary_issue, .. } => Some(primary_issue.node.id.as_str()),
         OrdinaryOutcome::Succeeded | OrdinaryOutcome::Cancelled { .. } => None,
     };
     let ordinary_cancellation = match &ordinary_outcome {
@@ -2488,21 +2557,19 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
     };
     let context = finalization_context::serialize(FinalizationContext {
         trigger,
-        primary_failure_step_id,
+        primary_failure_step_id: primary_issue_step_id,
         cancellation_reason: ordinary_cancellation,
         ordinary_issues: &ordinary_issues,
     });
-    let primary_failure = match &ordinary_outcome {
-        OrdinaryOutcome::Failed {
-            primary_failure, ..
-        } => Some(primary_failure.clone()),
+    let primary_issue = match &ordinary_outcome {
+        OrdinaryOutcome::Failed { primary_issue, .. } => Some(primary_issue.clone()),
         OrdinaryOutcome::Succeeded | OrdinaryOutcome::Cancelled { .. } => None,
     };
     let from = reduction.state.workflow.clone();
     let to = WorkflowState::Finalizing {
         trigger,
         gate: FinalizationGate::Open,
-        primary_failure,
+        primary_issue,
     };
     let sequence = next_sequence(&mut reduction.state);
     reduction.state.workflow = to.clone();
@@ -2513,9 +2580,11 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         cancellation: None,
         force_abort: false,
     });
-    reduction
-        .events
-        .push(TransitionEvent::Workflow { sequence, from, to });
+    reduction.events.push(TransitionEvent::Workflow {
+        sequence,
+        from,
+        to: Box::new(to),
+    });
 }
 
 // Finalization entry and ordinary outcome composition both enumerate the closed ordinary
@@ -2523,39 +2592,42 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
 // jscpd:ignore-start
 fn ordinary_outcome<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
-) -> OrdinaryOutcome<Cause>
+) -> Option<OrdinaryOutcome>
 where
     Cause: Clone,
 {
-    match &state.workflow {
+    Some(match &state.workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
         } => OrdinaryOutcome::Succeeded,
         WorkflowState::Executing {
-            gate: SchedulingGate::FailureStopped { primary_failure },
+            gate: SchedulingGate::FailureStopped { primary_issue },
         } => OrdinaryOutcome::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: None,
         },
         WorkflowState::Executing {
             gate:
                 SchedulingGate::Cancelling {
                     reason,
-                    prior_failure: Some(primary_failure),
+                    prior_issue: Some(primary_issue),
                 },
         } => OrdinaryOutcome::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: Some(*reason),
         },
         WorkflowState::Executing {
             gate:
                 SchedulingGate::Cancelling {
                     reason,
-                    prior_failure: None,
+                    prior_issue: None,
                 },
         } => OrdinaryOutcome::Cancelled { reason: *reason },
-        _ => unreachable!("ordinary outcome is derived only at ordinary quiescence"),
-    }
+        WorkflowState::Finalizing { .. }
+        | WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => return None,
+    })
 }
 
 // jscpd:ignore-end
@@ -2614,8 +2686,8 @@ fn finish_finalization_if_terminal<Provisional, Cause, Output, Deadline>(
 // jscpd:ignore-end
 fn finalization_summary<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
-    finalization: &FinalizationRuntime<Cause, Deadline>,
-) -> FinalizationSummary<Cause, Deadline>
+    finalization: &FinalizationRuntime<Deadline>,
+) -> FinalizationSummary<Deadline>
 where
     Cause: Clone,
     Deadline: Clone,
@@ -2642,25 +2714,19 @@ where
     }
 }
 
-fn erase_outputs<Cause: Clone, Output>(
-    state: &StepState<Cause, Output>,
-) -> Option<StepState<Cause, ()>> {
+fn erase_outputs<Output>(state: &StepState<Output>) -> Option<StepState<()>> {
     Some(match state {
         StepState::Succeeded { .. } => StepState::Succeeded {
             outputs: BTreeMap::new(),
         },
-        StepState::Failed { phase, cause } => StepState::Failed {
-            phase: *phase,
-            cause: cause.clone(),
+        StepState::Failed { detail } => StepState::Failed {
+            detail: detail.clone(),
         },
-        StepState::Blocked { dependency } => StepState::Blocked {
-            dependency: dependency.clone(),
+        StepState::Blocked { detail } => StepState::Blocked {
+            detail: detail.clone(),
         },
-        StepState::InputUnavailable { references } => StepState::InputUnavailable {
-            references: references.clone(),
-        },
-        StepState::NotRun { reason } => StepState::NotRun { reason: *reason },
-        StepState::Cancelled { reason } => StepState::Cancelled { reason: *reason },
+        StepState::NotRun { detail } => StepState::NotRun { detail: *detail },
+        StepState::Cancelled { detail } => StepState::Cancelled { detail: *detail },
         StepState::Pending
         | StepState::Starting
         | StepState::Running
@@ -2672,17 +2738,17 @@ fn erase_outputs<Cause: Clone, Output>(
 
 fn compose_final_outcome<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
-    finalization: &FinalizationRuntime<Cause, Deadline>,
-) -> OrdinaryOutcome<Cause>
+    finalization: &FinalizationRuntime<Deadline>,
+) -> OrdinaryOutcome
 where
     Cause: Clone,
 {
     match &finalization.ordinary_outcome {
         OrdinaryOutcome::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation,
         } => OrdinaryOutcome::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: later_cancellation.or_else(|| {
                 finalization
                     .cancellation
@@ -2693,10 +2759,10 @@ where
         OrdinaryOutcome::Cancelled { reason } => OrdinaryOutcome::Cancelled { reason: *reason },
         OrdinaryOutcome::Succeeded => match &state.workflow {
             WorkflowState::Finalizing {
-                primary_failure: Some(primary_failure),
+                primary_issue: Some(primary_issue),
                 ..
             } => OrdinaryOutcome::Failed {
-                primary_failure: primary_failure.clone(),
+                primary_issue: primary_issue.clone(),
                 later_cancellation: finalization
                     .cancellation
                     .as_ref()
@@ -2704,7 +2770,7 @@ where
             },
             WorkflowState::Finalizing {
                 gate: FinalizationGate::Cancelling { reason, .. },
-                primary_failure: None,
+                primary_issue: None,
                 ..
             } => OrdinaryOutcome::Cancelled { reason: *reason },
             _ => OrdinaryOutcome::Succeeded,
@@ -2714,8 +2780,8 @@ where
 
 fn finish_run<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
-    ordinary_outcome: OrdinaryOutcome<Cause>,
-    summary: Option<FinalizationSummary<Cause, Deadline>>,
+    ordinary_outcome: OrdinaryOutcome,
+    summary: Option<FinalizationSummary<Deadline>>,
 ) where
     Cause: Clone,
     Output: Clone,
@@ -2727,15 +2793,15 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
     let (to, outcome) = match ordinary_outcome {
         OrdinaryOutcome::Succeeded => (WorkflowState::Succeeded, RunOutcome::Succeeded),
         OrdinaryOutcome::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation,
         } => (
             WorkflowState::Failed {
-                primary_failure: primary_failure.clone(),
+                primary_issue: primary_issue.clone(),
                 later_cancellation,
             },
             RunOutcome::Failed {
-                primary_failure,
+                primary_issue,
                 later_cancellation,
             },
         ),
@@ -2749,9 +2815,11 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
     reduction.state.workflow = to.clone();
     reduction.state.exports = Some(exports.clone());
     reduction.state.finalization_summary = summary.clone();
-    reduction
-        .events
-        .push(TransitionEvent::Workflow { sequence, from, to });
+    reduction.events.push(TransitionEvent::Workflow {
+        sequence,
+        from,
+        to: Box::new(to),
+    });
     reduction.actions.push(RequestedAction {
         id: ActionId::for_transition(sequence),
         action: Action::FinishRun { outcome, exports },
@@ -2780,11 +2848,11 @@ where
                 StepState::Blocked { .. } => ExportValue::Unavailable {
                     reason: ExportUnavailableReason::Blocked,
                 },
-                StepState::InputUnavailable { .. } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::InputUnavailable,
-                },
                 StepState::NotRun {
-                    reason: NotRunReason::FinalizerTriggerNotSelected,
+                    detail:
+                        NonExecutionDetail {
+                            code: NonExecutionCode::FinalizerTriggerNotSelected,
+                        },
                 } => ExportValue::Unavailable {
                     reason: ExportUnavailableReason::TriggerNotSelected,
                 },
@@ -2853,7 +2921,7 @@ fn set_current_action<Cause, Output, Deadline>(
 fn transition_step<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: &str,
-    to: StepState<Cause, Output>,
+    to: StepState<Output>,
     current_action: Option<ActionId>,
 ) -> TransitionSequence {
     let sequence = next_sequence(&mut reduction.state);
@@ -2885,10 +2953,10 @@ fn next_sequence<Cause, Output, Deadline>(
     state: &mut RuntimeState<Cause, Output, Deadline>,
 ) -> TransitionSequence {
     let sequence = state.last_transition_sequence.next();
-    assert!(
-        sequence.get() <= state.definition.maximum_transitions,
-        "reducer exceeded the admitted transition ceiling"
-    );
+    if sequence.get() > state.definition.maximum_transitions {
+        state.transition_capacity_exceeded = true;
+        return state.last_transition_sequence;
+    }
     state.last_transition_sequence = sequence;
     sequence
 }

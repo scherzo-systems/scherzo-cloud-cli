@@ -1,18 +1,76 @@
 {
   "schemaVersion": 1,
   "multiplicationCases": [
-    {"name": "maximal-handler-invocation-partition", "left": 397, "right": 169039, "expected": 67108483},
-    {"name": "aggregate-multiplication-overflow", "left": 18446744073709551615, "right": 2, "overflow": true}
+    {
+      "name": "maximal-handler-invocation-partition",
+      "left": 397,
+      "right": 169039,
+      "expected": 67108483
+    },
+    {
+      "name": "aggregate-multiplication-overflow",
+      "left": 18446744073709551615,
+      "right": 2,
+      "overflow": true
+    }
   ],
   "boundCases": [
-    {"name": "general-no-finalizers-exact-cap", "contract": "general", "finalizers": 0, "maximumTransitions": 1283, "admit": true},
-    {"name": "general-no-finalizers-cap-plus-one", "contract": "general", "finalizers": 0, "maximumTransitions": 1284, "admit": false},
-    {"name": "general-with-finalizers-exact-cap", "contract": "general", "finalizers": 1, "maximumTransitions": 1286, "admit": true},
-    {"name": "general-with-finalizers-cap-plus-one", "contract": "general", "finalizers": 1, "maximumTransitions": 1287, "admit": false},
-    {"name": "cloud-no-finalizers-exact-cap", "contract": "workflow_v1_inputless_cloud_artifacts@1", "finalizers": 0, "maximumTransitions": 1027, "admit": true},
-    {"name": "cloud-no-finalizers-cap-plus-one", "contract": "workflow_v1_inputless_cloud_artifacts@1", "finalizers": 0, "maximumTransitions": 1028, "admit": false},
-    {"name": "cloud-with-finalizers-exact-cap", "contract": "workflow_v1_inputless_cloud_artifacts@1", "finalizers": 1, "maximumTransitions": 1030, "admit": true},
-    {"name": "cloud-with-finalizers-cap-plus-one", "contract": "workflow_v1_inputless_cloud_artifacts@1", "finalizers": 1, "maximumTransitions": 1031, "admit": false}
+    {
+      "name": "general-no-finalizers-exact-cap",
+      "contract": "general",
+      "finalizers": 0,
+      "maximumTransitions": 1283,
+      "admit": true
+    },
+    {
+      "name": "general-no-finalizers-cap-plus-one",
+      "contract": "general",
+      "finalizers": 0,
+      "maximumTransitions": 1284,
+      "admit": false
+    },
+    {
+      "name": "general-with-finalizers-exact-cap",
+      "contract": "general",
+      "finalizers": 1,
+      "maximumTransitions": 1286,
+      "admit": true
+    },
+    {
+      "name": "general-with-finalizers-cap-plus-one",
+      "contract": "general",
+      "finalizers": 1,
+      "maximumTransitions": 1287,
+      "admit": false
+    },
+    {
+      "name": "cloud-no-finalizers-exact-cap",
+      "contract": "workflow_v1_cloud_inputs_artifacts@1",
+      "finalizers": 0,
+      "maximumTransitions": 1027,
+      "admit": true
+    },
+    {
+      "name": "cloud-no-finalizers-cap-plus-one",
+      "contract": "workflow_v1_cloud_inputs_artifacts@1",
+      "finalizers": 0,
+      "maximumTransitions": 1028,
+      "admit": false
+    },
+    {
+      "name": "cloud-with-finalizers-exact-cap",
+      "contract": "workflow_v1_cloud_inputs_artifacts@1",
+      "finalizers": 1,
+      "maximumTransitions": 1030,
+      "admit": true
+    },
+    {
+      "name": "cloud-with-finalizers-cap-plus-one",
+      "contract": "workflow_v1_cloud_inputs_artifacts@1",
+      "finalizers": 1,
+      "maximumTransitions": 1031,
+      "admit": false
+    }
   ],
   "vectors": [
     {
@@ -29,7 +87,7 @@
         "diagnosticRetentionBytes": 8388608,
         "nativeSessionRetentionBytes": 4194304,
         "aggregateRetentionBytes": 12582912,
-        "encodedOutboxBytes": 38141952
+        "encodedOutboxBytes": 85458944
       }
     },
     {
@@ -46,7 +104,7 @@
         "diagnosticRetentionBytes": 16777216,
         "nativeSessionRetentionBytes": 8388608,
         "aggregateRetentionBytes": 25165824,
-        "encodedOutboxBytes": 38600704
+        "encodedOutboxBytes": 87293952
       }
     },
     {
@@ -63,7 +121,7 @@
         "diagnosticRetentionBytes": 134216966,
         "nativeSessionRetentionBytes": 67108483,
         "aggregateRetentionBytes": 201325449,
-        "encodedOutboxBytes": 104988672
+        "encodedOutboxBytes": 352845824
       }
     },
     {
@@ -80,7 +138,7 @@
         "diagnosticRetentionBytes": 134217728,
         "nativeSessionRetentionBytes": 67108864,
         "aggregateRetentionBytes": 201326592,
-        "encodedOutboxBytes": 104988672
+        "encodedOutboxBytes": 352845824
       }
     },
     {
@@ -97,7 +155,7 @@
         "diagnosticRetentionBytes": 134216966,
         "nativeSessionRetentionBytes": 67108483,
         "aggregateRetentionBytes": 201325449,
-        "encodedOutboxBytes": 105185280
+        "encodedOutboxBytes": 353632256
       }
     },
     {

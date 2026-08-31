@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.scherzo.dev/runner-enrollment-terminal-receipt-v1.schema.json",
+  "title": "Scherzo Runner Enrollment Terminal Receipt V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "activationId", "disposition", "observedAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "activationId": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+    "disposition": { "const": "gone" },
+    "observedAt": { "type": "string", "format": "date-time" }
+  }
+}

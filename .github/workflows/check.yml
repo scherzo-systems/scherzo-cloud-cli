@@ -40,7 +40,7 @@ jobs:
         with:
           name: devenv
       - name: Install devenv
-        run: nix profile add github:cachix/devenv/c18de5253016e6eb97689724327f08e9dd2d4768
+        run: nix profile add github:cachix/devenv/b8030c58deafc013fc51791377fe8fea4dadcb00
       - name: Check public source
         run: ./scripts/check
 

@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Convert successful ordinary execution into failure when a required finalizer fails.
+
+steps:
+  work:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'ordinary execution succeeded'"
+
+finalizers:
+  requiredPublish:
+    kind: cmd
+    when: [succeeded]
+    command:
+      argv:
+        - sh
+        - -c
+        - "set -eu; printf '%s\n' 'intentional required finalizer failure' >&2; exit 29"

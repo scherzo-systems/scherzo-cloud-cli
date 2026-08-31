@@ -150,34 +150,37 @@ impl WorkspaceFilesystem {
 
 #[derive(Default)]
 pub(super) struct CleanupCancellation {
-    cancelled: AtomicBool,
-    wait: Mutex<()>,
+    cancelled: Mutex<bool>,
     changed: Condvar,
 }
 
 impl CleanupCancellation {
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cancelled = true;
         self.changed.notify_all();
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn wait(&self, duration: Duration) -> bool {
-        if self.is_cancelled() {
-            return false;
-        }
-        let guard = self
-            .wait
+        let cancelled = self
+            .cancelled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_guard, _timeout) = self
+        let (cancelled, _timeout) = self
             .changed
-            .wait_timeout_while(guard, duration, |()| !self.is_cancelled())
+            .wait_timeout_while(cancelled, duration, |cancelled| !*cancelled)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !self.is_cancelled()
+        !*cancelled
     }
 }
 
@@ -1185,7 +1188,7 @@ mod tests {
                     fs::write(&target, BOOT_MARKER).unwrap();
                     symlink(target, marker).unwrap();
                 }
-                _ => unreachable!(),
+                _ => panic!("unknown owned-root fixture"),
             }
             assert_eq!(
                 WorkRootLease::acquire(root.path(), BOOT_B).err().unwrap(),

@@ -1,7 +1,10 @@
 # Deliberately self-contained: this file and its lock are exported with the CLI
-# and must not import the private repository's shared Devenv input baseline.
+# and must not import the private repository's shared Devenv input baseline. It
+# repeats the reviewed Devenv module source directly.
 # yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
 inputs:
+  devenv:
+    url: github:cachix/devenv/v2.2.2?dir=src/modules
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
   rust-overlay:

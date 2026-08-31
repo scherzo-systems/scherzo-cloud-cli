@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::admission::{AdmittedWorkflow, CancellationOperation};
+use super::evidence::NodeFailureSource;
 use super::runtime::{
     self, ActionId, CancellationRequest, Occurrence, OutputSet, RecoveryDecision,
     RecoveryRoundNumber, Reduction, RequestedAction, RuntimeState, TransitionEvent, WorkflowState,
@@ -573,7 +574,6 @@ impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> 
     }
 
     fn retain_delivery(&mut self, delivery: DriverOccurrenceDelivery<Provisional, Cause, Output>) {
-        debug_assert!(self.pending.is_none());
         self.pending = Some(delivery);
     }
 
@@ -661,8 +661,9 @@ pub(crate) struct CommittedReduction<Cause, Output, Deadline> {
     pub(crate) occurrence_ordinal: OccurrenceOrdinal,
     pub(crate) occurrence_accepted: bool,
     pub(crate) state: RuntimeState<Cause, Output, Deadline>,
-    pub(crate) events: Vec<TransitionEvent<Cause, Deadline>>,
+    pub(crate) events: Vec<TransitionEvent<Deadline>>,
     pub(crate) actions: Vec<CommittedAction>,
+    pub(crate) diagnostic: Option<CoordinationDiagnostic>,
 }
 
 pub(crate) trait CommitPort<Commit> {
@@ -673,6 +674,11 @@ pub(crate) trait CommitPort<Commit> {
 
 pub(crate) trait ActionPort<Action> {
     fn release(&mut self, action: Action) -> impl Future<Output = ()>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoordinationDiagnostic {
+    TransitionCapacityExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -687,6 +693,7 @@ pub(crate) enum CoordinationError {
     OccurrenceIdentityCapacityExceeded,
     OccurrenceOrdinalExhausted,
     ReducerStateUnavailable,
+    TransitionCapacityExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -719,7 +726,7 @@ impl<Provisional, Cause, Output, Clock, Commits, Actions>
     Coordinator<Provisional, Cause, Output, Clock, Commits, Actions>
 where
     Provisional: Clone + Eq,
-    Cause: Clone + Eq,
+    Cause: Clone + Eq + NodeFailureSource,
     Output: Clone + Eq,
     Clock: CoordinatorClock,
     Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
@@ -770,6 +777,16 @@ where
                 initial_cancellation,
                 initial_cancellation_operation,
             );
+        if initialization.state.transition_capacity_exceeded() {
+            self.commit_coordination_diagnostic(
+                ordinal,
+                initialization.state,
+                None,
+                CoordinationDiagnostic::TransitionCapacityExceeded,
+            )
+            .await?;
+            return Err(CoordinationError::TransitionCapacityExceeded);
+        }
         if self.commit(ordinal, initialization, None).await? {
             return self.result(ordinal);
         }
@@ -891,20 +908,61 @@ where
             let Some(state) = self.state.as_ref() else {
                 return Err(CoordinationError::ReducerStateUnavailable);
             };
+            let current_state = state.clone();
             let reduction = if exact_replay {
                 Reduction {
-                    state: state.clone(),
+                    state: current_state.clone(),
                     events: Vec::new(),
                     actions: Vec::new(),
                     occurrence_accepted: false,
                 }
             } else {
-                runtime::reduce(state, occurrence)
+                runtime::reduce(&current_state, occurrence)
             };
+            if reduction.state.transition_capacity_exceeded() {
+                self.commit_coordination_diagnostic(
+                    ordinal,
+                    current_state,
+                    acknowledgement,
+                    CoordinationDiagnostic::TransitionCapacityExceeded,
+                )
+                .await?;
+                return Err(CoordinationError::TransitionCapacityExceeded);
+            }
             if self.commit(ordinal, reduction, acknowledgement).await? {
                 return self.result(ordinal);
             }
         }
+    }
+
+    async fn commit_coordination_diagnostic(
+        &mut self,
+        occurrence_ordinal: OccurrenceOrdinal,
+        state: RuntimeState<Cause, Output, Clock::Instant>,
+        acknowledgement: Option<DriverOccurrenceAcknowledgement>,
+        diagnostic: CoordinationDiagnostic,
+    ) -> Result<(), CoordinationError> {
+        if self
+            .commits
+            .commit(CommittedReduction {
+                occurrence_ordinal,
+                occurrence_accepted: false,
+                state,
+                events: Vec::new(),
+                actions: Vec::new(),
+                diagnostic: Some(diagnostic),
+            })
+            .await
+            .is_err()
+        {
+            return Err(CoordinationError::CommitFailed);
+        }
+        if let Some(finalization) =
+            acknowledgement.and_then(|acknowledgement| acknowledgement.resolve(false))
+        {
+            let _ = finalization.await;
+        }
+        Ok(())
     }
 
     async fn commit(
@@ -925,14 +983,11 @@ where
                 | WorkflowState::Failed { .. }
                 | WorkflowState::Cancelled { .. }
         );
-        let entered_finalization = events.iter().any(|event| {
-            matches!(
-                event,
-                TransitionEvent::Workflow {
-                    to: WorkflowState::Finalizing { .. },
-                    ..
-                }
-            )
+        let entered_finalization = events.iter().any(|event| match event {
+            TransitionEvent::Workflow { to, .. } => {
+                matches!(to.as_ref(), WorkflowState::Finalizing { .. })
+            }
+            _ => false,
         });
         let committed_actions = actions.iter().map(committed_action).collect();
         let committed_state = state.clone();
@@ -947,6 +1002,7 @@ where
                 state: committed_state,
                 events,
                 actions: committed_actions,
+                diagnostic: None,
             })
             .await
             .is_err()

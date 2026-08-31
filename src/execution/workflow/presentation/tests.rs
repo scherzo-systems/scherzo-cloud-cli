@@ -25,7 +25,7 @@ use crate::execution::workflow::publication::{
     publish_workflow_result,
 };
 use crate::execution::workflow::resolution::{self, WorkflowContentDigest};
-use crate::execution::workflow::runtime::{ActionId, StepFailure, TransitionSequence};
+use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::execution::workflow::value::CapturedValue;
 
@@ -713,7 +713,9 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
             "a",
             StepStateKind::Cancelling,
             Some(ObservedStepTransition::Cancelling {
-                reason: CancellationReason::UserRequest,
+                detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                    CancellationReason::UserRequest,
+                ),
             }),
         ))
         .await;
@@ -1178,22 +1180,29 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
         CommandExecutionFailure::UnsuccessfulExit { code: Some(23) },
     ));
+    let detail =
+        crate::execution::workflow::evidence::failure_detail(FailurePhase::Execution, &cause)
+            .unwrap();
     failed.steps[1].state = StepState::Failed {
-        phase: FailurePhase::Execution,
-        cause: cause.clone(),
+        detail: detail.clone(),
     };
     failed.steps[2].state = StepState::NotRun {
-        reason: NotRunReason::FailureStop,
+        detail: crate::execution::workflow::evidence::NonExecutionDetail::for_role(
+            WorkflowNodeRole::Step,
+            crate::execution::workflow::evidence::NonExecutionCode::FailureStop,
+        )
+        .unwrap(),
     };
     failed.steps[2].timing = None;
     failed.steps[2].command_output = None;
     failed.outcome = RunOutcome::Failed {
-        primary_failure: StepFailure {
-            role: WorkflowNodeRole::Step,
-            step: "b".to_owned(),
-            phase: FailurePhase::Execution,
-            cause,
-        },
+        primary_issue: crate::execution::workflow::evidence::PrimaryIssue::failed(
+            crate::execution::workflow::validated::WorkflowNode {
+                id: "b".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
         later_cancellation: None,
     };
     let failed_terminal =
@@ -1217,7 +1226,9 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     );
     let failed_view = failed_output.text();
     assert!(failed_view.contains("failed · exit 1"));
-    assert!(failed_view.contains("failure: step b · execution · exit 23"));
+    assert!(
+        failed_view.contains("primary issue: step b · Failed · execution · command_exit · exit 23")
+    );
     let header = failed_view
         .lines()
         .find(|line| line.starts_with("node"))
@@ -1228,7 +1239,7 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         .unwrap();
     assert_eq!(
         header.find("detail").unwrap(),
-        not_run[..not_run.find("failure stop").unwrap()]
+        not_run[..not_run.find("failure_stop").unwrap()]
             .chars()
             .count()
     );
@@ -1236,7 +1247,9 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     let mut cancelled = fixture.succeeded_run();
     for step in &mut cancelled.steps {
         step.state = StepState::Cancelled {
-            reason: CancellationReason::TerminationRequest,
+            detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                CancellationReason::TerminationRequest,
+            ),
         };
     }
     cancelled.outcome = RunOutcome::Cancelled {

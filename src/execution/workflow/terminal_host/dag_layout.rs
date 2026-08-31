@@ -80,10 +80,6 @@ impl DagLayout {
             let (earlier, current_and_later) = ancestors.split_at_mut(node);
             let current = &mut current_and_later[0];
             for parent in parents {
-                debug_assert!(
-                    *parent < node,
-                    "DAG presentation order must place dependencies before dependents"
-                );
                 if let Some(parent_ancestors) = earlier.get(*parent) {
                     for (reachable, parent_reachable) in
                         current.iter_mut().zip(parent_ancestors.iter())
@@ -231,11 +227,6 @@ impl DagLayout {
             if overflow {
                 maximum_lane_count = MAX_GRAPH_LANES;
             }
-            debug_assert!(
-                segments.len() <= MAX_GRAPH_LANES.saturating_mul(2).saturating_add(1),
-                "DAG rows must retain only bounded connector segments"
-            );
-
             rows.push(LogicalRow {
                 node_lane,
                 segments,

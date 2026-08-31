@@ -1028,9 +1028,14 @@ impl ArtifactStaging {
                 .filter_map(|(identity, value)| value.into_file().map(|file| (identity, file)))
                 .collect()),
             Err(CaptureAttemptFailure::Capture(failure)) => Err(failure),
-            Err(CaptureAttemptFailure::Cancelled) => {
-                unreachable!("a private uncancelled capture cannot be cancelled")
-            }
+            Err(CaptureAttemptFailure::Cancelled) => Err(CaptureFailure::new(
+                Arc::from(
+                    declarations
+                        .first()
+                        .map_or("@capture", |declaration| declaration.output_identity),
+                ),
+                CaptureFailureKind::StagingUnavailable,
+            )),
         }
     }
 
@@ -1315,7 +1320,7 @@ impl ArtifactStaging {
                     ))
                 })
             }
-            PathCaptureProfile::File { .. } => unreachable!("file profiles return above"),
+            PathCaptureProfile::File { .. } => Ok(CapturedValue::file(file)),
         }
     }
 
@@ -1570,7 +1575,7 @@ impl ArtifactStaging {
             Ok(artifact) => Ok(artifact),
             Err(CaptureAttemptFailure::Capture(failure)) => Err(failure),
             Err(CaptureAttemptFailure::Cancelled) => {
-                unreachable!("a private uncancelled capture cannot be cancelled")
+                panic!("a private uncancelled capture cannot be cancelled")
             }
         }
     }

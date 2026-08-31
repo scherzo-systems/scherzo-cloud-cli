@@ -33,9 +33,10 @@ use super::admission::{CancellationReason, CancellationSource};
 use super::document::{FailurePolicy, Output as WorkflowOutput};
 use super::observation::{CommandOutputSource, ObservedStepTransition};
 use super::presentation::{
-    PresentationFailure, PresentationFailureOperation, cancellation_reason, failure_detail,
-    finalization_trigger, header_timestamp, human_duration, recovery_progress_detail, shell_quote,
-    shell_quote_visible_argument, step_kind, visible_text,
+    PresentationFailure, PresentationFailureOperation, cancellation_reason,
+    canonical_blocked_detail, canonical_failure_detail, finalization_trigger, header_timestamp,
+    human_duration, recovery_progress_detail, shell_quote, shell_quote_visible_argument, step_kind,
+    visible_text,
 };
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, AgentPresentationObservationKind,
@@ -47,7 +48,8 @@ use super::run_view_model::{
     WorkflowRunPublicationState, WorkflowRunStepLog, WorkflowRunStepView, WorkflowRunViewModel,
     WorkflowRunViewSnapshot,
 };
-use super::runtime::{NotRunReason, SchedulingGate, StepStateKind, WorkflowState};
+use super::runtime::{SchedulingGate, StepStateKind, WorkflowState};
+#[cfg(test)]
 use super::step_runtime::StepFailureCause;
 
 const MINIMUM_WIDTH: u16 = 64;
@@ -2476,26 +2478,25 @@ fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<Inspecto
             ),
             Tone::Active,
         )),
-        ObservedStepTransition::Failed { phase, cause } => Some(InspectorField::new(
+        ObservedStepTransition::Failed { detail } => Some(InspectorField::new(
             "failure",
-            failure_detail(*phase, cause),
+            canonical_failure_detail(detail),
             Tone::Failure,
         )),
-        ObservedStepTransition::Blocked { dependency } => {
-            Some(InspectorField::new("blocked by", dependency, Tone::Blocked))
-        }
-        ObservedStepTransition::InputUnavailable { references } => Some(InspectorField::new(
-            "inputs unavailable",
-            references.join(", "),
+        ObservedStepTransition::Blocked { detail } => Some(InspectorField::new(
+            "prerequisites",
+            canonical_blocked_detail(detail),
             Tone::Blocked,
         )),
-        ObservedStepTransition::NotRun { .. } => {
-            Some(InspectorField::new("not run", "failure_stop", Tone::Muted))
-        }
-        ObservedStepTransition::Cancelling { reason }
-        | ObservedStepTransition::Cancelled { reason } => Some(InspectorField::new(
+        ObservedStepTransition::NotRun { detail } => Some(InspectorField::new(
+            "not run",
+            super::presentation::snake_case_debug(detail.code),
+            Tone::Muted,
+        )),
+        ObservedStepTransition::Cancelling { detail }
+        | ObservedStepTransition::Cancelled { detail } => Some(InspectorField::new(
             "cancellation",
-            cancellation_reason(*reason),
+            cancellation_reason(detail.code),
             Tone::Blocked,
         )),
         ObservedStepTransition::OutputsCommitted { .. } => None,
@@ -2894,32 +2895,22 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
         Some(ObservedStepTransition::OutputsCommitted { outputs }) => {
             Some(output_count_detail(outputs.len()))
         }
-        Some(ObservedStepTransition::Failed { phase, cause }) => Some(issue_detail_for_step(
-            failure_detail(*phase, cause),
+        Some(ObservedStepTransition::Failed { detail }) => Some(issue_detail_for_step(
+            canonical_failure_detail(detail),
             &step.definition,
             step.state,
         )),
-        Some(ObservedStepTransition::Blocked { dependency }) => Some(issue_detail_for_step(
-            format!("blocked by {}", visible_text(dependency)),
+        Some(ObservedStepTransition::Blocked { detail }) => Some(issue_detail_for_step(
+            canonical_blocked_detail(detail),
             &step.definition,
             step.state,
         )),
-        Some(ObservedStepTransition::InputUnavailable { references }) => {
-            Some(issue_detail_for_step(
-                format!("inputs unavailable: {}", references.join(", ")),
-                &step.definition,
-                step.state,
-            ))
+        Some(ObservedStepTransition::NotRun { detail }) => {
+            Some(super::presentation::snake_case_debug(detail.code))
         }
-        Some(ObservedStepTransition::NotRun {
-            reason: NotRunReason::FailureStop,
-        }) => Some("failure_stop".to_owned()),
-        Some(ObservedStepTransition::NotRun {
-            reason: NotRunReason::FinalizerTriggerNotSelected,
-        }) => Some("finalizer_trigger_not_selected".to_owned()),
-        Some(ObservedStepTransition::Cancelling { reason })
-        | Some(ObservedStepTransition::Cancelled { reason }) => {
-            Some(cancellation_reason(*reason).to_owned())
+        Some(ObservedStepTransition::Cancelling { detail })
+        | Some(ObservedStepTransition::Cancelled { detail }) => {
+            Some(cancellation_reason(detail.code).to_owned())
         }
         None if step.state == StepStateKind::Succeeded => {
             let committed_outputs = step
@@ -4344,7 +4335,7 @@ fn workflow_header_status(snapshot: &WorkflowRunViewSnapshot) -> (&'static str, 
     }
 }
 
-fn workflow_status<Deadline>(workflow: &WorkflowState<StepFailureCause, Deadline>) -> &'static str {
+fn workflow_status<Deadline>(workflow: &WorkflowState<Deadline>) -> &'static str {
     match workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
@@ -4362,7 +4353,7 @@ fn workflow_status<Deadline>(workflow: &WorkflowState<StepFailureCause, Deadline
     }
 }
 
-fn workflow_tone<Deadline>(workflow: &WorkflowState<StepFailureCause, Deadline>) -> Tone {
+fn workflow_tone<Deadline>(workflow: &WorkflowState<Deadline>) -> Tone {
     match workflow {
         WorkflowState::Succeeded => Tone::Success,
         WorkflowState::Failed { .. }
@@ -4518,7 +4509,7 @@ mod tests {
     };
     use crate::execution::workflow::run_view_model::{WorkflowRunElapsed, WorkflowRunStepLog};
     use crate::execution::workflow::runtime::{
-        ActionId, FailurePhase, RunOutcome, StepFailure, StepState, TransitionSequence,
+        ActionId, FailurePhase, RunOutcome, StepState, TransitionSequence,
     };
     use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
 
@@ -5606,7 +5597,7 @@ mod tests {
         snapshot.workflow = WorkflowState::Finalizing {
             trigger,
             gate: crate::execution::workflow::runtime::FinalizationGate::Open,
-            primary_failure: None,
+            primary_issue: None,
         };
         let mut interaction = HostInteraction::default();
 
@@ -5626,7 +5617,7 @@ mod tests {
                 deadline: Some(time::OffsetDateTime::UNIX_EPOCH),
                 force_abort: false,
             },
-            primary_failure: None,
+            primary_issue: None,
         };
         interaction.handle_key(TerminalInputEvent::Cancel, &snapshot, &cancellation);
         assert!(matches!(
@@ -5996,10 +5987,13 @@ mod tests {
                 direct_command_step(
                     StepStateKind::Failed,
                     Some(ObservedStepTransition::Failed {
-                        phase: FailurePhase::Execution,
-                        cause: StepFailureCause::Execution(StepExecutionFailure::Command(
-                            CommandExecutionFailure::UnsuccessfulExit { code: Some(17) },
-                        )),
+                        detail: super::super::evidence::failure_detail(
+                            FailurePhase::Execution,
+                            &StepFailureCause::Execution(StepExecutionFailure::Command(
+                                CommandExecutionFailure::UnsuccessfulExit { code: Some(17) },
+                            )),
+                        )
+                        .unwrap(),
                     }),
                     Some(timing.clone()),
                     WorkflowRunOutputDisposition::Unavailable(
@@ -6008,7 +6002,7 @@ mod tests {
                 ),
                 [
                     "failed",
-                    "failure       execution · exit 17",
+                    "failure       execution · command_exit · exit 17",
                     "unavailable (failed)",
                 ]
                 .as_slice(),
@@ -6017,20 +6011,32 @@ mod tests {
                 direct_command_step(
                     StepStateKind::Blocked,
                     Some(ObservedStepTransition::Blocked {
-                        dependency: "prepare".to_owned(),
+                        detail: super::super::evidence::BlockedDetail::new([
+                            super::super::evidence::Prerequisite::control("prepare").unwrap(),
+                        ])
+                        .unwrap(),
                     }),
                     Some(timing.clone()),
                     WorkflowRunOutputDisposition::Unavailable(
                         WorkflowRunOutputUnavailableReason::Blocked,
                     ),
                 ),
-                ["blocked", "blocked by    prepare", "unavailable (blocked)"].as_slice(),
+                [
+                    "blocked",
+                    "prerequisites_unsatisfied · control prepare",
+                    "unavailable (blocked)",
+                ]
+                .as_slice(),
             ),
             (
                 direct_command_step(
                     StepStateKind::NotRun,
                     Some(ObservedStepTransition::NotRun {
-                        reason: super::super::runtime::NotRunReason::FailureStop,
+                        detail: super::super::evidence::NonExecutionDetail::for_role(
+                            super::super::validated::WorkflowNodeRole::Step,
+                            super::super::evidence::NonExecutionCode::FailureStop,
+                        )
+                        .unwrap(),
                     }),
                     Some(timing.clone()),
                     WorkflowRunOutputDisposition::Unavailable(
@@ -6048,7 +6054,9 @@ mod tests {
                 direct_command_step(
                     StepStateKind::Cancelled,
                     Some(ObservedStepTransition::Cancelled {
-                        reason: CancellationReason::UserRequest,
+                        detail: super::super::evidence::CancellationDetail::new(
+                            CancellationReason::UserRequest,
+                        ),
                     }),
                     Some(timing),
                     WorkflowRunOutputDisposition::Unavailable(
@@ -6127,7 +6135,7 @@ mod tests {
             ..
         } = &mut step.definition
         else {
-            unreachable!();
+            panic!("fixture presentation step was not a command");
         };
         *direct_dependencies = (1..=8).map(|index| format!("dependency-{index}")).collect();
         for index in 2..=8 {
@@ -6215,7 +6223,7 @@ mod tests {
             WorkflowRunOutputDisposition::Pending,
         );
         let WorkflowPresentationStep::Command { outputs, .. } = &mut step.definition else {
-            unreachable!();
+            panic!("fixture presentation step was not a command");
         };
         outputs.clear();
         step.outputs.clear();
@@ -6399,13 +6407,18 @@ mod tests {
         let mut snapshot = direct_snapshot(long_log_step());
         snapshot.workflow = WorkflowState::Executing {
             gate: SchedulingGate::FailureStopped {
-                primary_failure: StepFailure {
-                    role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
-                    step: "selected-command".to_owned(),
-                    phase: FailurePhase::Execution,
-                    cause: StepFailureCause::Execution(StepExecutionFailure::Command(
+                primary_issue: {
+                    let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
                         CommandExecutionFailure::UnsuccessfulExit { code: Some(17) },
-                    )),
+                    ));
+                    super::super::evidence::PrimaryIssue::failed(
+                        super::super::validated::WorkflowNode {
+                            id: "selected-command".to_owned(),
+                            role: super::super::validated::WorkflowNodeRole::Step,
+                        },
+                        super::super::evidence::failure_detail(FailurePhase::Execution, &cause)
+                            .unwrap(),
+                    )
                 },
             },
         };
@@ -6892,7 +6905,7 @@ mod tests {
         snapshot.workflow = WorkflowState::Executing {
             gate: SchedulingGate::Cancelling {
                 reason: CancellationReason::UserRequest,
-                prior_failure: None,
+                prior_issue: None,
             },
         };
         snapshot.cancellation = Some(
@@ -7050,7 +7063,7 @@ finalizers:
         snapshot.workflow = WorkflowState::Finalizing {
             trigger: crate::execution::workflow::document::FinalizationTrigger::Succeeded,
             gate: crate::execution::workflow::runtime::FinalizationGate::Open,
-            primary_failure: None,
+            primary_issue: None,
         };
         let after_trigger =
             render_steps_lines(&snapshot, &HostInteraction::default(), 80, 10).join("\n");
@@ -7265,7 +7278,9 @@ finalizers:
                     reason,
                     force_stop_deadline: started.utc + Duration::from_secs(10),
                 }),
-                StepState::Cancelled { reason },
+                StepState::Cancelled {
+                    detail: super::super::evidence::CancellationDetail::new(reason),
+                },
                 None,
             ),
             None => (

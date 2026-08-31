@@ -15,7 +15,9 @@ use crate::execution::workflow::runtime::{
     ActionId, ActiveStepInvocation, FailurePhase, RecoveryDecisionKind, RecoveryHandlerActivity,
     RecoveryHandlerKind, RecoveryRoundNumber, TargetExecutionNumber, TransitionSequence,
 };
-use crate::execution::workflow::step_runtime::{CommandExecutionFailure, StepExecutionFailure};
+use crate::execution::workflow::step_runtime::{
+    CommandExecutionFailure, StepExecutionFailure, StepFailureCause,
+};
 use crate::execution::workflow::validated::WorkflowNodeRole;
 use crate::execution::workflow::value::CapturedValue;
 
@@ -130,14 +132,14 @@ fn step_transition(
 }
 
 fn workflow_transition(
-    from: WorkflowState<StepFailureCause, OffsetDateTime>,
-    to: WorkflowState<StepFailureCause, OffsetDateTime>,
+    from: WorkflowState<OffsetDateTime>,
+    to: WorkflowState<OffsetDateTime>,
 ) -> ExecutionObservation<OffsetDateTime> {
     ExecutionObservation::Transition(TransitionObservation {
         event: TransitionEvent::Workflow {
             sequence: TransitionSequence::default(),
             from,
-            to,
+            to: Box::new(to),
         },
         step: None,
     })
@@ -291,7 +293,9 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
         StepStateKind::Running,
         StepStateKind::Cancelling,
         Some(ObservedStepTransition::Cancelling {
-            reason: CancellationReason::UserRequest,
+            detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                CancellationReason::UserRequest,
+            ),
         }),
     ))
     .await;
@@ -301,7 +305,9 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
         StepStateKind::Cancelling,
         StepStateKind::Cancelled,
         Some(ObservedStepTransition::Cancelled {
-            reason: CancellationReason::UserRequest,
+            detail: crate::execution::workflow::evidence::CancellationDetail::new(
+                CancellationReason::UserRequest,
+            ),
         }),
     ))
     .await;
@@ -310,7 +316,7 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
         WorkflowState::Executing {
             gate: SchedulingGate::Cancelling {
                 reason: CancellationReason::UserRequest,
-                prior_failure: None,
+                prior_issue: None,
             },
         },
         WorkflowState::Cancelled {
@@ -383,7 +389,7 @@ finalizers:
         WorkflowState::Finalizing {
             trigger,
             gate: crate::execution::workflow::runtime::FinalizationGate::Open,
-            primary_failure: None,
+            primary_issue: None,
         },
     ))
     .await;
@@ -408,7 +414,7 @@ finalizers:
                 deadline: Some(deadline),
                 force_abort: false,
             },
-            primary_failure: None,
+            primary_issue: None,
         }
     );
     assert!(view.snapshot().finalization.is_none());
@@ -433,7 +439,7 @@ finalizers:
                 deadline: Some(deadline),
                 force_abort: true,
             },
-            primary_failure: None,
+            primary_issue: None,
         }
     );
 }
@@ -721,8 +727,11 @@ async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
         StepStateKind::Running,
         StepStateKind::Failed,
         Some(ObservedStepTransition::Failed {
-            phase: FailurePhase::Execution,
-            cause: cause.clone(),
+            detail: crate::execution::workflow::evidence::failure_detail(
+                FailurePhase::Execution,
+                &cause,
+            )
+            .unwrap(),
         }),
     ))
     .await;
@@ -731,7 +740,10 @@ async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
         StepStateKind::Pending,
         StepStateKind::Blocked,
         Some(ObservedStepTransition::Blocked {
-            dependency: "prepare".to_owned(),
+            detail: crate::execution::workflow::evidence::BlockedDetail::new([
+                crate::execution::workflow::evidence::Prerequisite::control("prepare").unwrap(),
+            ])
+            .unwrap(),
         }),
     ))
     .await;

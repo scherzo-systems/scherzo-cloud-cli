@@ -90,7 +90,7 @@ fn cloud_result_fixture() -> Value {
         .unwrap()
         .remove("executionRoot");
     result["execution"]["capacity"] = json!({
-        "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+        "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
         "sourceClosureDigest": { "algorithm": "sha256", "value": "1".repeat(64) },
         "generalMaximumTransitions": 8,
         "selectedMaximumTransitions": 7,
@@ -99,7 +99,7 @@ fn cloud_result_fixture() -> Value {
         "diagnosticRetentionBytes": 8_388_608,
         "nativeSessionRetentionBytes": 4_194_304,
         "aggregateRetentionBytes": 12_582_912,
-        "encodedOutboxBytes": 38_141_952
+        "encodedOutboxBytes": 85_458_944
     });
     result
 }
@@ -112,18 +112,16 @@ fn cloud_metadata_only_result_fixture() -> Value {
 
 fn failed_result_fixture(phase: &str, cause: Value) -> Value {
     let mut result = result_fixture();
-    let failure = json!({
-        "phase": phase,
-        "cause": cause
-    });
+    let mut detail = cause;
+    detail["phase"] = Value::String(phase.to_owned());
     result["outcome"] = Value::String("failed".to_owned());
-    result["primaryFailure"] = json!({
+    result["primaryIssue"] = json!({
         "node": { "id": "produce", "role": "step" },
-        "phase": phase,
-        "cause": failure["cause"].clone()
+        "state": "failed",
+        "detail": detail.clone()
     });
     result["steps"][0]["state"] = Value::String("failed".to_owned());
-    result["steps"][0]["failure"] = failure;
+    result["steps"][0]["detail"] = detail;
     result
 }
 
@@ -155,6 +153,23 @@ fn finalization_metadata_rejects_role_issue_and_force_mismatches() {
         decode(&encode(&impossible_force_abort)),
         Err(ResultMetadataError)
     );
+}
+
+#[test]
+fn force_abort_after_graceful_cancellation_accepts_authoritative_terminal_reason() {
+    let mut result = finalized_result_fixture();
+    result["outcome"] = json!("cancelled");
+    result["finalization"]["cancellation"] = json!({
+        "reason": "runner_shutdown",
+        "forceStopDeadline": "2026-08-02T12:01:46Z"
+    });
+    result["finalization"]["forceAbort"] = json!(true);
+    result["finalization"]["finalizers"][0]["state"] = json!("cancelled");
+    result["finalization"]["finalizers"][0]["detail"] = json!({
+        "code": "finalization_force_abort"
+    });
+
+    assert!(decode(&encode(&result)).is_ok());
 }
 
 #[test]
@@ -478,12 +493,12 @@ fn rejects_failures_with_impossible_phases_or_cause_fields() {
             json!({ "code": "command_exit", "input": "payload" }),
         ),
         failed_result_fixture(
-            "start",
+            "execution",
             json!({ "code": "input_invalid_name", "input": "payload" }),
         ),
         failed_result_fixture(
             "output_capture",
-            json!({ "code": "output_missing", "output": "../payload" }),
+            json!({ "code": "output_missing", "output": "" }),
         ),
     ] {
         assert_eq!(decode(&encode(&invalid)), Err(ResultMetadataError));
@@ -495,9 +510,9 @@ fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
     let mut advisory = result_fixture();
     advisory["steps"][0]["failurePolicy"] = Value::String("advisory".to_owned());
     advisory["steps"][0]["state"] = Value::String("failed".to_owned());
-    advisory["steps"][0]["failure"] = json!({
+    advisory["steps"][0]["detail"] = json!({
         "phase": "execution",
-        "cause": { "code": "harness_failed" }
+        "code": "harness_failed"
     });
     assert!(decode(&encode(&advisory)).is_ok());
 
@@ -506,10 +521,10 @@ fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
     assert_eq!(decode(&encode(&required)), Err(ResultMetadataError));
 
     advisory["outcome"] = Value::String("failed".to_owned());
-    advisory["primaryFailure"] = json!({
+    advisory["primaryIssue"] = json!({
         "node": { "id": "produce", "role": "step" },
-        "phase": "execution",
-        "cause": { "code": "harness_failed" }
+        "state": "failed",
+        "detail": { "phase": "execution", "code": "harness_failed" }
     });
     assert_eq!(decode(&encode(&advisory)), Err(ResultMetadataError));
 }

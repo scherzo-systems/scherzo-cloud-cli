@@ -191,7 +191,7 @@ fn cloud_assignment_offer_with_mismatched_sources() -> Message {
                         "materializationContract": "git_full_clone_v1"
                     },
                     "capacity": {
-                        "executionContract": "workflow_v1_inputless_cloud_artifacts@1",
+                        "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
                         "sourceClosureDigest": {
                             "algorithm": "sha256",
                             "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -203,8 +203,9 @@ fn cloud_assignment_offer_with_mismatched_sources() -> Message {
                         "diagnosticRetentionBytes": 8388608,
                         "nativeSessionRetentionBytes": 4194304,
                         "aggregateRetentionBytes": 12582912,
-                        "encodedOutboxBytes": 38141952
-                    }
+                        "encodedOutboxBytes": 85458944
+                    },
+                    "runInputs": null
                 },
                 "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
             }

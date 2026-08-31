@@ -17,8 +17,8 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 pub(crate) mod generated;
 
 const PROTOCOL_SCHEMA: &str = include_str!("schema/runner-protocol-v1.schema.json");
-pub(crate) const MAXIMUM_ORDINARY_FRAME_BYTES: usize = 65_536;
-pub(crate) const MAXIMUM_TERMINAL_FRAME_BYTES: usize = 33_554_432;
+pub(crate) const MAXIMUM_ORDINARY_FRAME_BYTES: usize = 262_144;
+pub(crate) const MAXIMUM_TERMINAL_FRAME_BYTES: usize = 67_108_864;
 const PROTOCOL_VERSION: i64 = 1;
 const PAYLOAD_VERSION: i64 = 1;
 const RUNNER_TO_CLOUD: &str = "runner_to_cloud";
@@ -44,6 +44,19 @@ pub(crate) enum RunnerFrame {
     EffectAcknowledged {
         envelope: RunnerEnvelope,
         effect_id: String,
+    },
+    AssignmentPreparing {
+        envelope: RunnerEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        offered_execution_spec_id: String,
+    },
+    AssignmentPreparationProgress {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        preparation_sequence: u64,
+        phase: String,
     },
     AssignmentAccepted {
         envelope: RunnerEnvelope,
@@ -141,6 +154,11 @@ pub(crate) enum RunnerFrame {
 pub(crate) enum RunnerUnableReason {
     ExecutionEnvironmentUnavailable,
     SourceServiceUnavailable,
+    #[allow(
+        dead_code,
+        reason = "reserved for the Run Inputs materializer that consumes this protocol taxonomy"
+    )]
+    InputServiceUnavailable,
     WorkflowEnvironmentUnsupported,
 }
 
@@ -149,6 +167,7 @@ impl RunnerUnableReason {
         match self {
             Self::ExecutionEnvironmentUnavailable => "execution_environment_unavailable",
             Self::SourceServiceUnavailable => "source_service_unavailable",
+            Self::InputServiceUnavailable => "input_service_unavailable",
             Self::WorkflowEnvironmentUnsupported => "workflow_environment_unsupported",
         }
     }
@@ -171,6 +190,19 @@ pub(crate) enum ExecutionSpecInvalidReason {
     WorkflowSourceInvalid,
     WorkflowContractInvalid,
     WorkflowAdmissionInvalid,
+    #[allow(
+        dead_code,
+        reason = "reserved for the Run Inputs materializer that consumes this protocol taxonomy"
+    )]
+    InvalidInputProjection,
+    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
+    InputManifestMismatch,
+    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
+    InputContentUnavailable,
+    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
+    InputContentMismatch,
+    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
+    InputPromptInvalid,
 }
 
 impl ExecutionSpecInvalidReason {
@@ -187,6 +219,11 @@ impl ExecutionSpecInvalidReason {
             Self::WorkflowSourceInvalid => "workflow_source_invalid",
             Self::WorkflowContractInvalid => "workflow_contract_invalid",
             Self::WorkflowAdmissionInvalid => "workflow_admission_invalid",
+            Self::InvalidInputProjection => "invalid_input_projection",
+            Self::InputManifestMismatch => "input_manifest_mismatch",
+            Self::InputContentUnavailable => "input_content_unavailable",
+            Self::InputContentMismatch => "input_content_mismatch",
+            Self::InputPromptInvalid => "input_prompt_invalid",
         }
     }
 }
@@ -258,6 +295,12 @@ pub(crate) struct ExecutionCapacityV1RunnerProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunInputProjectionV1 {
+    pub(crate) input_set_id: String,
+    pub(crate) manifest_digest: WorkflowSourceClosureDigestV1RunnerProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) execution_spec_id: String,
     pub(crate) schema_version: u64,
@@ -266,6 +309,7 @@ pub(crate) struct ExecutionSpecV1RunnerProjection {
     pub(crate) workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection,
     pub(crate) primary_workspace_source: PrimaryWorkspaceSourceV1RunnerProjection,
     pub(crate) capacity: ExecutionCapacityV1RunnerProjection,
+    pub(crate) run_inputs: Option<RunInputProjectionV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +483,15 @@ pub(crate) enum CloudFrame {
         attempt_id: String,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
     },
+    AssignmentPrepare {
+        envelope: CloudEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        run_id: String,
+        attempt_id: String,
+        execution_spec_id: String,
+        preparation_expires_at: String,
+    },
     AssignmentStart {
         envelope: CloudEnvelope,
         effect_id: String,
@@ -532,6 +585,36 @@ pub(crate) fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, Encode
             envelope,
             "effect_acknowledged",
             json!({ "effectId": effect_id }),
+        ),
+        RunnerFrame::AssignmentPreparing {
+            envelope,
+            effect_id,
+            assignment_id,
+            offered_execution_spec_id,
+        } => runner_frame_value(
+            envelope,
+            "assignment_preparing",
+            json!({
+                "effectId": effect_id,
+                "assignmentId": assignment_id,
+                "offeredExecutionSpecId": offered_execution_spec_id,
+            }),
+        ),
+        RunnerFrame::AssignmentPreparationProgress {
+            envelope,
+            assignment_id,
+            attempt_id,
+            preparation_sequence,
+            phase,
+        } => runner_frame_value(
+            envelope,
+            "assignment_preparation_progress",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "preparationSequence": preparation_sequence,
+                "phase": phase,
+            }),
         ),
         RunnerFrame::AssignmentAccepted {
             envelope,
@@ -841,6 +924,12 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 frame.sent_at,
             )
         }
+        generated::RunnerProtocolVersion1::RunnerAssignmentPreparing(frame) => {
+            validated_runner_frame!(frame)
+        }
+        generated::RunnerProtocolVersion1::RunnerAssignmentPreparationProgress(frame) => {
+            validated_runner_frame!(frame)
+        }
         generated::RunnerProtocolVersion1::RunnerAssignmentAccepted(frame) => {
             validate_runner_frame(
                 &frame.protocol_version,
@@ -1056,6 +1145,20 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     ))?
                     .to_owned(),
             };
+            let run_inputs = execution_spec
+                .run_inputs
+                .map(|inputs| RunInputProjectionV1 {
+                    input_set_id: inputs.input_set_id.to_string(),
+                    manifest_digest: WorkflowSourceClosureDigestV1RunnerProjection {
+                        algorithm: inputs
+                            .manifest_digest
+                            .algorithm
+                            .as_str()
+                            .unwrap_or("sha256")
+                            .to_owned(),
+                        value: inputs.manifest_digest.value.to_string(),
+                    },
+                });
             let capacity = execution_spec.capacity;
             let encoded_outbox_bytes = u64::try_from(capacity.encoded_outbox_bytes)
                 .map_err(|_| DecodeError::InvalidFrame("encodedOutboxBytes"))?;
@@ -1103,7 +1206,20 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     workflow_definition_source,
                     primary_workspace_source,
                     capacity,
+                    run_inputs,
                 }),
+            }))
+        }
+        generated::RunnerProtocolVersion1::CloudAssignmentPrepare(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            Ok(cloud(CloudFrame::AssignmentPrepare {
+                envelope,
+                effect_id: frame.payload.effect_id.to_string(),
+                assignment_id: frame.payload.assignment_id.to_string(),
+                run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
+                execution_spec_id: frame.payload.execution_spec_id.to_string(),
+                preparation_expires_at: frame.payload.preparation_expires_at.to_string(),
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentStart(frame) => {
@@ -1413,6 +1529,10 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
     let payload_keys: &[&str] = match frame_type {
         "hello" => &["runnerVersion"],
         "effect_acknowledged" => &["effectId"],
+        "assignment_preparing" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
+        "assignment_preparation_progress" => {
+            &["assignmentId", "attemptId", "preparationSequence", "phase"]
+        }
         "assignment_accepted" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
         "assignment_rejected" => &["effectId", "assignmentId", "decline"],
         "assignment_interrupted" => &["assignmentId", "attemptId", "reason"],
@@ -1477,6 +1597,14 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "projectId",
             "attemptId",
             "executionSpec",
+        ],
+        "assignment_prepare" => &[
+            "effectId",
+            "assignmentId",
+            "runId",
+            "attemptId",
+            "executionSpecId",
+            "preparationExpiresAt",
         ],
         "assignment_start" => &[
             "effectId",
@@ -1859,12 +1987,75 @@ mod tests {
                 })),
             ),
             (
+                rejected(AssignmentDecline::RunnerUnable(
+                    RunnerUnableReason::InputServiceUnavailable,
+                )),
+                rejected_payload(json!({
+                    "type": "runner_unable",
+                    "reason": "input_service_unavailable",
+                })),
+            ),
+            (
                 rejected(AssignmentDecline::ExecutionSpecInvalid(
                     ExecutionSpecInvalidReason::InvalidExecutionLimits,
                 )),
                 rejected_payload(json!({
                     "type": "execution_spec_invalid",
                     "reason": "invalid_execution_limits",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InvalidInputProjection,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "invalid_input_projection",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InputManifestMismatch,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "input_manifest_mismatch",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InputContentUnavailable,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "input_content_unavailable",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InputContentMismatch,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "input_content_mismatch",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InputPromptInvalid,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "input_prompt_invalid",
+                })),
+            ),
+            (
+                rejected(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::SourceCommitUnavailable,
+                )),
+                rejected_payload(json!({
+                    "type": "execution_spec_invalid",
+                    "reason": "source_commit_unavailable",
                 })),
             ),
         ];
@@ -2012,11 +2203,12 @@ mod tests {
             final_execution_event_sequence: i64::MAX as u64,
             outcome: json!({
                 "outcome": "failed",
-                "failure": {
+                "primaryIssue": {
                     "node": { "id": "step23", "role": "step" },
-                    "failure": {
+                    "state": "failed",
+                    "detail": {
                         "phase": "execution",
-                        "cause": "command_unsuccessful_exit",
+                        "code": "command_exit",
                         "exitCode": 2147483647,
                     }
                 },
@@ -2031,8 +2223,8 @@ mod tests {
 
     #[test]
     fn canonical_maximal_recovery_frame_has_published_exact_size() {
-        const PUBLISHED_SIZE: usize = 11_464_571;
-        const PUBLISHED_SETTLING_SIZE: usize = 1_979;
+        const PUBLISHED_SIZE: usize = 11_464_578;
+        const PUBLISHED_SETTLING_SIZE: usize = 1_964;
         let encoded = encode_runner_frame(&maximal_recovery_terminal_frame()).unwrap();
         assert_eq!(encoded.len(), PUBLISHED_SIZE);
         assert!(encoded.len() < MAXIMUM_TERMINAL_FRAME_BYTES);
@@ -2051,9 +2243,9 @@ mod tests {
                 "failurePolicy": "required",
                 "from": "running",
                 "to": "failed",
-                "failure": {
+                "detail": {
                     "phase": "execution",
-                    "cause": "command_unsuccessful_exit",
+                    "code": "command_exit",
                     "exitCode": 2147483647,
                 },
                 "invocationEvidence": {

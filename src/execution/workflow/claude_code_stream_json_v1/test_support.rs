@@ -576,7 +576,7 @@ fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
     let events = match response {
         LoopbackProviderResponse::Blocks(blocks) => block_response_events(&blocks),
         LoopbackProviderResponse::InvalidRequest => {
-            unreachable!("invalid requests use a non-SSE response")
+            panic!("invalid requests use a non-SSE response")
         }
     };
 

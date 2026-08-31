@@ -20,7 +20,8 @@ it is not a runbook for executing workflows or changing a repository.
    source-control state, existing workflow conventions and assets, the supported CLI,
    and the exact workflow source root and YAML path.
 2. **Design the definition.** Identify command and agent nodes, control and data edges,
-   profiles, static support files, outputs, exports, failure policies, and finalizers.
+   profiles, static support files, outputs, exports, failure policies, step recovery, and
+   finalizers.
 3. **Propose one bounded change.** Name every file, configured harness/model/effort
    value, graph behavior, and the exact validation command. State that authoring and
    validation do not authorize execution, repository checks, or source-control changes.
@@ -63,8 +64,16 @@ match `^[a-z][A-Za-z0-9]*$`. Ordinary step and finalizer IDs share a namespace. 
 rejects duplicate or non-string keys, anchors, aliases, merge keys, custom tags, and
 multiple YAML documents.
 
-Both ordinary node kinds may declare `failurePolicy`, `dependsOn`, `cwd`, and `outputs`.
-`failurePolicy` is `required` by default or may be `advisory`.
+Both ordinary node kinds may declare `failurePolicy`, `recovery`, `dependsOn`, `cwd`,
+and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.
+`recovery.retries` is 1 through 10. It either omits `handler` for an immediate unchanged
+target recheck, names one closed command handler, or names one fresh-agent handler with
+an existing profile and retained prompt. A command handler reads the bounded private
+Recovery Context Schema 1 path from `SCHERZO_RECOVERY_CONTEXT` and writes exactly one
+closed, at-most-16-KiB `recheck` or `gave_up` decision document to the fresh private
+`SCHERZO_RECOVERY_RESULT` path. An agent handler's profile and compatible installed
+harness are admission and runner-placement requirements even when recovery never
+activates.
 
 - `dependsOn` names unique ordinary steps and creates control-only ordering.
 - An `outputs.<step>.<output>` reference creates a direct inferred data edge. Naming
@@ -75,6 +84,14 @@ Both ordinary node kinds may declare `failurePolicy`, `dependsOn`, `cwd`, and `o
   the workflow by itself.
 - A required node cannot consume an advisory node's output. Advisory nodes cannot be
   export sources.
+- A recovery handler is not a node and has no inputs, outputs, dependencies, failure
+  policy, or nested recovery. Only terminal target success commits outputs; finalizers
+  cannot declare recovery and wait for ordinary recovery quiescence.
+- Rechecks and handlers are fresh physical invocations in the same execution root.
+  `gave_up` or handler failure stops recovery. V1 has no conditional selection,
+  delay/backoff, handler retry, capture-only retry, rollback, or session continuation.
+- Recovery effects are at-least-once. Authors supply stable domain idempotency keys
+  through existing explicit inputs or admitted environment, not Scherzo lifecycle IDs.
 
 A command uses a nonempty argument vector:
 
@@ -100,7 +117,7 @@ must resolve inside it.
 
 | Field | Base and rule |
 | --- | --- |
-| `agent.systemPrompt` | YAML directory; retained UTF-8 file inside the source root. |
+| `agent.systemPrompt` or recovery-agent `handler.prompt` | YAML directory; retained UTF-8 file inside the source root. |
 | Message `{ file: ... }` | YAML directory; retained file inside the source root; text files are UTF-8. |
 | JSON output `schema` | YAML directory; retained, self-contained Draft 2020-12 schema inside the source root. |
 | Node `cwd` | Execution root; defaults to that root and cannot contain `..`. |
@@ -144,6 +161,16 @@ are invalid.
 Each config is closed. Do not guess a model, translate effort values between harnesses,
 or add a fallback. Every agent node starts a fresh harness process, session, and
 conversation.
+
+For `claude_code`, Scherzo temporarily creates session-specific transcript and resource
+symlinks under the effective `CLAUDE_CONFIG_DIR` project-history directory
+(`$HOME/.claude` when the variable is unset), creating project directories as needed. It
+never replaces an existing session entry. After the Claude Code process and its
+descendants quiesce, Scherzo removes each link only when it is still the exact link
+Scherzo created; this identity check preserves an entry changed by another process, and
+empty project directories may remain. If Claude Code writes no nonempty transcript
+through the link, the run emits a `Claude Code native transcript capture missing`
+warning. The retained transcript is diagnostic only.
 
 ```yaml
 agentProfiles:

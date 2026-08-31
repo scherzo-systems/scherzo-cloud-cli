@@ -422,7 +422,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
     assert_eq!(runner.capacity().resolved, resolved.capacity);
     assert_eq!(
         runner.capacity().execution_contract.as_str(),
-        "workflow_v1_inputless_cloud_artifacts@1"
+        "workflow_v1_cloud_inputs_artifacts@1"
     );
     assert!(runner.has_recovery());
 }

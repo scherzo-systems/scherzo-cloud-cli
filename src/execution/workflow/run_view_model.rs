@@ -10,11 +10,12 @@ use super::admission::CancellationReason;
 use super::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, ObservedStepTransition,
 };
+#[cfg(test)]
+use super::presentation_feed::MAX_NORMALIZED_CHILD_RECORD_BYTES;
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationObservationKind, DisplayDeadline,
-    MAX_NORMALIZED_CHILD_RECORD_BYTES, NormalizedAgentObservation, NormalizedChildOutput,
-    PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
-    WorkflowPresentationStep,
+    NormalizedAgentObservation, NormalizedChildOutput, PresentationRecord, PresentationRecordKind,
+    PresentationTransition, WorkflowPresentationFeed, WorkflowPresentationStep,
 };
 use super::publication::{
     LocalPublicationError, LocalPublicationFailureKind, LocalPublicationPhase,
@@ -27,7 +28,6 @@ use super::run_timing::{
 use super::runtime::{
     RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
-use super::step_runtime::StepFailureCause;
 use super::validated::WorkflowNodeRole;
 
 const MAXIMUM_LOG_RECORDS_PER_STEP: usize = 4_096;
@@ -51,7 +51,6 @@ impl StepLogCapacity {
     }
 
     fn for_step_count(step_count: usize) -> Self {
-        debug_assert!(step_count != 0);
         let step_count = step_count.max(1);
         Self {
             maximum_records: MAXIMUM_LOG_RECORDS_PER_STEP.min(RUN_LOG_RECORD_BUDGET / step_count),
@@ -184,7 +183,7 @@ pub(crate) struct WorkflowRunViewSnapshot {
     pub(crate) generation: u64,
     pub(crate) workflow_path: String,
     pub(crate) maximum_parallel_steps: usize,
-    pub(crate) workflow: WorkflowState<StepFailureCause, OffsetDateTime>,
+    pub(crate) workflow: WorkflowState<OffsetDateTime>,
     pub(crate) timing: WorkflowRunElapsed,
     pub(crate) steps: Vec<WorkflowRunStepView>,
     pub(crate) finalization_start: Option<usize>,
@@ -509,7 +508,7 @@ struct WorkflowRunViewState {
     step_indexes: BTreeMap<String, usize>,
     steps: Vec<WorkflowRunStepViewState>,
     finalization_start: Option<usize>,
-    workflow: WorkflowState<StepFailureCause, OffsetDateTime>,
+    workflow: WorkflowState<OffsetDateTime>,
     cancellation: Option<WorkflowRunCancellationView>,
     finalization: Option<WorkflowRunFinalization>,
     authoritative_result: bool,
@@ -525,9 +524,6 @@ struct WorkflowRunViewState {
 
 impl WorkflowRunViewState {
     fn apply_record(&mut self, record: PresentationRecord) {
-        if let Some(previous) = self.last_accepted_order {
-            debug_assert!(record.accepted_order > previous);
-        }
         self.last_accepted_order = Some(record.accepted_order);
         match record.kind {
             PresentationRecordKind::Transition(transition) => {
@@ -567,22 +563,22 @@ impl WorkflowRunViewState {
                 self.steps[index].apply_transition(to, transition.step);
             }
             TransitionEvent::Workflow { to, .. } => {
-                self.workflow = to;
+                self.workflow = *to;
             }
             TransitionEvent::CancellationAccepted {
                 reason, deadline, ..
             } => {
-                let prior_failure = match &self.workflow {
+                let prior_issue = match &self.workflow {
                     WorkflowState::Executing {
-                        gate: SchedulingGate::FailureStopped { primary_failure },
+                        gate: SchedulingGate::FailureStopped { primary_issue },
                     }
                     | WorkflowState::Executing {
                         gate:
                             SchedulingGate::Cancelling {
-                                prior_failure: Some(primary_failure),
+                                prior_issue: Some(primary_issue),
                                 ..
                             },
-                    } => Some(primary_failure.clone()),
+                    } => Some(primary_issue.clone()),
                     WorkflowState::Executing { .. }
                     | WorkflowState::Finalizing { .. }
                     | WorkflowState::Succeeded
@@ -592,7 +588,7 @@ impl WorkflowRunViewState {
                 self.workflow = WorkflowState::Executing {
                     gate: SchedulingGate::Cancelling {
                         reason,
-                        prior_failure,
+                        prior_issue,
                     },
                 };
                 self.cancellation = Some(WorkflowRunCancellationView {
@@ -605,7 +601,7 @@ impl WorkflowRunViewState {
             } => {
                 let WorkflowState::Finalizing {
                     trigger,
-                    primary_failure,
+                    primary_issue,
                     ..
                 } = &self.workflow
                 else {
@@ -618,14 +614,14 @@ impl WorkflowRunViewState {
                         deadline: Some(deadline),
                         force_abort: false,
                     },
-                    primary_failure: primary_failure.clone(),
+                    primary_issue: primary_issue.clone(),
                 };
             }
             TransitionEvent::ForceAbortAccepted { reason, .. } => {
                 let WorkflowState::Finalizing {
                     trigger,
                     gate,
-                    primary_failure,
+                    primary_issue,
                 } = &self.workflow
                 else {
                     return;
@@ -641,7 +637,7 @@ impl WorkflowRunViewState {
                         deadline,
                         force_abort: true,
                     },
-                    primary_failure: primary_failure.clone(),
+                    primary_issue: primary_issue.clone(),
                 };
             }
         }
@@ -736,7 +732,7 @@ impl WorkflowRunStepViewState {
             StepState::Failed { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
             }
-            StepState::Blocked { .. } | StepState::InputUnavailable { .. } => {
+            StepState::Blocked { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
             }
             StepState::NotRun { .. } => {
@@ -857,7 +853,6 @@ impl StepLogRing {
     ) {
         let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let maximum_bytes = u64::try_from(capacity.maximum_bytes()).unwrap_or(u64::MAX);
-        debug_assert!(payload.len() <= MAX_NORMALIZED_CHILD_RECORD_BYTES);
         while !self.records.is_empty()
             && (self.records.len() >= capacity.maximum_records()
                 || self.retained_bytes.saturating_add(payload_bytes) > maximum_bytes)
@@ -945,7 +940,6 @@ fn terminal_step_is_valid(
         StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
         StepState::Failed { .. }
         | StepState::Blocked { .. }
-        | StepState::InputUnavailable { .. }
         | StepState::NotRun { .. }
         | StepState::Cancelled { .. } => true,
         StepState::Pending
@@ -957,9 +951,7 @@ fn terminal_step_is_valid(
     }
 }
 
-fn terminal_state_kind(
-    state: &StepState<StepFailureCause, super::value::CapturedValue>,
-) -> StepStateKind {
+fn terminal_state_kind(state: &StepState<super::value::CapturedValue>) -> StepStateKind {
     match state {
         StepState::Pending => StepStateKind::Pending,
         StepState::Starting => StepStateKind::Starting,
@@ -969,34 +961,28 @@ fn terminal_state_kind(
         StepState::Cancelling { .. } => StepStateKind::Cancelling,
         StepState::Succeeded { .. } => StepStateKind::Succeeded,
         StepState::Failed { .. } => StepStateKind::Failed,
-        StepState::Blocked { .. } | StepState::InputUnavailable { .. } => StepStateKind::Blocked,
+        StepState::Blocked { .. } => StepStateKind::Blocked,
         StepState::NotRun { .. } => StepStateKind::NotRun,
         StepState::Cancelled { .. } => StepStateKind::Cancelled,
     }
 }
 
 fn terminal_step_fact(
-    state: &StepState<StepFailureCause, super::value::CapturedValue>,
+    state: &StepState<super::value::CapturedValue>,
 ) -> Option<ObservedStepTransition> {
     match state {
-        StepState::Failed { phase, cause } => Some(ObservedStepTransition::Failed {
-            phase: *phase,
-            cause: cause.clone(),
+        StepState::Failed { detail } => Some(ObservedStepTransition::Failed {
+            detail: detail.clone(),
         }),
-        StepState::Blocked { dependency } => Some(ObservedStepTransition::Blocked {
-            dependency: dependency.clone(),
+        StepState::Blocked { detail } => Some(ObservedStepTransition::Blocked {
+            detail: detail.clone(),
         }),
-        StepState::InputUnavailable { references } => {
-            Some(ObservedStepTransition::InputUnavailable {
-                references: references.clone(),
-            })
+        StepState::NotRun { detail } => Some(ObservedStepTransition::NotRun { detail: *detail }),
+        StepState::Cancelling { detail } => {
+            Some(ObservedStepTransition::Cancelling { detail: *detail })
         }
-        StepState::NotRun { reason } => Some(ObservedStepTransition::NotRun { reason: *reason }),
-        StepState::Cancelling { reason } => {
-            Some(ObservedStepTransition::Cancelling { reason: *reason })
-        }
-        StepState::Cancelled { reason } => {
-            Some(ObservedStepTransition::Cancelled { reason: *reason })
+        StepState::Cancelled { detail } => {
+            Some(ObservedStepTransition::Cancelled { detail: *detail })
         }
         StepState::Pending
         | StepState::Starting
@@ -1007,16 +993,14 @@ fn terminal_step_fact(
     }
 }
 
-fn workflow_state_from_outcome(
-    outcome: &RunOutcome<StepFailureCause>,
-) -> WorkflowState<StepFailureCause, OffsetDateTime> {
+fn workflow_state_from_outcome(outcome: &RunOutcome) -> WorkflowState<OffsetDateTime> {
     match outcome {
         RunOutcome::Succeeded => WorkflowState::Succeeded,
         RunOutcome::Failed {
-            primary_failure,
+            primary_issue,
             later_cancellation,
         } => WorkflowState::Failed {
-            primary_failure: primary_failure.clone(),
+            primary_issue: primary_issue.clone(),
             later_cancellation: *later_cancellation,
         },
         RunOutcome::Cancelled { reason } => WorkflowState::Cancelled { reason: *reason },

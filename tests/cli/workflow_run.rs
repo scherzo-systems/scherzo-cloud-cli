@@ -943,7 +943,7 @@ steps:
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["exitStatus"], 0);
-    assert!(terminal["result"].get("primaryFailure").is_none());
+    assert!(terminal["result"].get("primaryIssue").is_none());
     assert_eq!(terminal["result"]["steps"][0]["id"], "analyze");
     assert_eq!(terminal["result"]["steps"][0]["failurePolicy"], "advisory");
     assert_eq!(terminal["result"]["steps"][0]["state"], "failed");
@@ -953,7 +953,10 @@ steps:
     assert_eq!(terminal["result"]["steps"][2]["id"], "summarize");
     assert_eq!(terminal["result"]["steps"][2]["failurePolicy"], "advisory");
     assert_eq!(terminal["result"]["steps"][2]["state"], "blocked");
-    assert_eq!(terminal["result"]["steps"][2]["dependency"], "analyze");
+    assert_eq!(
+        terminal["result"]["steps"][2]["detail"]["prerequisites"],
+        serde_json::json!([{"kind": "body", "ref": "outputs.analyze.report"}])
+    );
     assert_eq!(
         fs::read(bundle.execution_root().join("package.txt")).unwrap(),
         b"packaged"
@@ -1007,8 +1010,8 @@ fn finalization_runs_after_ordinary_failure_and_is_durable_before_publication() 
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let result = &terminal["result"];
     assert_eq!(result["outcome"], "failed");
-    assert_eq!(result["primaryFailure"]["node"]["id"], "fail");
-    assert_eq!(result["primaryFailure"]["node"]["role"], "step");
+    assert_eq!(result["primaryIssue"]["node"]["id"], "fail");
+    assert_eq!(result["primaryIssue"]["node"]["role"], "step");
     assert_eq!(result["steps"][0]["role"], "step");
     assert_eq!(result["finalization"]["trigger"], "failed");
     assert_eq!(result["finalization"]["finalizers"][0]["id"], "cleanup");
@@ -1019,7 +1022,7 @@ fn finalization_runs_after_ordinary_failure_and_is_durable_before_publication() 
     );
     assert_eq!(result["finalization"]["finalizers"][1]["state"], "not_run");
     assert_eq!(
-        result["finalization"]["finalizers"][1]["reason"],
+        result["finalization"]["finalizers"][1]["detail"]["code"],
         "finalizer_trigger_not_selected"
     );
     assert_eq!(result["finalization"]["finalizers"][2]["state"], "failed");
@@ -1135,18 +1138,19 @@ exports:
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let result = &terminal["result"];
     assert_eq!(result["outcome"], "failed");
-    assert_eq!(result["primaryFailure"]["node"]["id"], "produce");
-    assert_eq!(result["primaryFailure"]["node"]["role"], "finalizer");
+    assert_eq!(result["primaryIssue"]["node"]["id"], "produce");
+    assert_eq!(result["primaryIssue"]["node"]["role"], "finalizer");
     assert_eq!(result["finalization"]["trigger"], "succeeded");
     assert_eq!(result["finalization"]["finalizers"][0]["state"], "failed");
     assert_eq!(result["finalization"]["finalizers"][1]["state"], "blocked");
     assert_eq!(
-        result["finalization"]["finalizers"][1]["reason"],
-        "input_unavailable"
-    );
-    assert_eq!(
-        result["finalization"]["finalizers"][1]["unavailableReferences"],
-        serde_json::json!(["outputs.produce.payload"])
+        result["finalization"]["finalizers"][1]["detail"],
+        serde_json::json!({
+            "code": "prerequisites_unsatisfied",
+            "prerequisites": [
+                {"kind": "body", "ref": "outputs.produce.payload"}
+            ]
+        })
     );
     assert_eq!(
         result["finalization"]["issues"].as_array().unwrap().len(),
@@ -1156,11 +1160,11 @@ exports:
         result["exports"]["receipt"],
         serde_json::json!({
             "state": "unavailable",
-            "reason": "source_input_unavailable"
+            "reason": "source_blocked"
         })
     );
     let progress = String::from_utf8(output.stderr).unwrap();
-    assert!(progress.contains("inputs unavailable: outputs.produce.payload"));
+    assert!(progress.contains("prerequisites_unsatisfied · body outputs.produce.payload"));
 }
 
 #[test]
@@ -1195,6 +1199,46 @@ fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() 
     let run_directory = fs::canonicalize(bundle.result("completable")).unwrap();
     assert_eq!(terminal["runDirectory"], run_directory.to_str().unwrap());
     assert_eq!(terminal["result"]["workflow"]["path"], WORKFLOW_PATH);
+}
+
+#[test]
+fn workflow_run_existing_directory_diagnostic_names_run_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    let run_directory = temporary.path().join("existing-run");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::create_dir(&run_directory).unwrap();
+    let workflow = source_root.join("workflow.yaml");
+    fs::write(
+        &workflow,
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .args([
+            "workflow",
+            "run",
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--execution-root",
+            execution_root.to_str().unwrap(),
+            "--run-dir",
+            run_directory.to_str().unwrap(),
+            workflow.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(run_directory.to_str().unwrap()),
+        "diagnostic omitted the requested run path: {stderr}"
+    );
 }
 
 #[test]
@@ -1792,16 +1836,13 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["result"]["outcome"], "failed");
     assert_eq!(
-        terminal["result"]["primaryFailure"]["cause"]["code"],
+        terminal["result"]["primaryIssue"]["detail"]["code"],
         "harness_start_failed"
     );
-    assert_eq!(
-        terminal["result"]["primaryFailure"]["cause"]["protocolRejection"]["profile"],
-        "ClaudeCodeStreamJsonV1"
-    );
-    assert_eq!(
-        terminal["result"]["primaryFailure"]["cause"]["protocolRejection"]["detail"]["reason"],
-        "initialization_invalid"
+    assert!(
+        terminal["result"]["primaryIssue"]["detail"]
+            .get("protocolRejection")
+            .is_none()
     );
     assert_eq!(
         terminal["result"]["exports"]["response"]["state"],
@@ -2049,10 +2090,7 @@ fn codex_native_failure_is_attributed_without_value_publication_or_fallback() {
     assert_eq!(output.status.code(), Some(1));
     let result = result_json(&destination);
     assert_eq!(result["outcome"], "failed");
-    assert_eq!(
-        result["steps"][0]["failure"]["cause"]["code"],
-        "harness_failed"
-    );
+    assert_eq!(result["steps"][0]["detail"]["code"], "harness_failed");
     assert_eq!(
         result["exports"]["response"],
         serde_json::json!({"state": "unavailable", "reason": "source_failed"})
@@ -3327,15 +3365,18 @@ fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch(
         assert_eq!(terminal["outcome"], "failed");
         assert_eq!(terminal["result"]["outcome"], "failed");
         assert_eq!(
-            terminal["result"]["primaryFailure"]["node"]["id"],
+            terminal["result"]["primaryIssue"]["node"]["id"],
             "affected",
             "stdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(terminal["result"]["primaryFailure"]["phase"], "start");
         assert_eq!(
-            terminal["result"]["primaryFailure"]["cause"]["code"],
+            terminal["result"]["primaryIssue"]["detail"]["phase"],
+            "start"
+        );
+        assert_eq!(
+            terminal["result"]["primaryIssue"]["detail"]["code"],
             "execution_root_rebound"
         );
         assert_eq!(
@@ -3362,11 +3403,8 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["outcome"], "failed");
     assert_eq!(terminal["exitStatus"], 1);
-    assert_eq!(terminal["result"]["primaryFailure"]["node"]["id"], "fail");
-    assert_eq!(
-        terminal["result"]["primaryFailure"]["cause"]["exitCode"],
-        23
-    );
+    assert_eq!(terminal["result"]["primaryIssue"]["node"]["id"], "fail");
+    assert_eq!(terminal["result"]["primaryIssue"]["detail"]["exitCode"], 23);
     assert!(failed_destination.exists());
 
     let rejected = RunBundle::new(
@@ -4244,7 +4282,10 @@ fn second_interrupt_during_finalization_forces_abort_after_graceful_cancellation
     assert_eq!(finalization["trigger"], "succeeded");
     assert_eq!(finalization["cancellation"]["reason"], "user_request");
     assert_eq!(finalization["forceAbort"], true);
-    assert_eq!(finalization["finalizers"][0]["reason"], "user_request");
+    assert_eq!(
+        finalization["finalizers"][0]["detail"]["code"],
+        "finalization_force_abort"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4562,7 +4603,7 @@ fn failure_committed_before_a_signal_remains_the_primary_outcome() {
     assert_eq!(output.status.code(), Some(1));
     let retained = result_json(&destination);
     assert_eq!(retained["outcome"], "failed");
-    assert_eq!(retained["primaryFailure"]["node"]["id"], "fail");
+    assert_eq!(retained["primaryIssue"]["node"]["id"], "fail");
     assert_eq!(retained["cancellation"]["reason"], "user_request");
 }
 

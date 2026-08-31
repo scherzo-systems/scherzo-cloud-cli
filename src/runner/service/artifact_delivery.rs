@@ -478,15 +478,19 @@ impl ArtifactDeliveryBroker {
                     ..
                 }),
             ) => {
-                let (artifact_set_id, upload_capability) = match outcome {
+                let result_retry = match outcome {
                     ArtifactResultConfirmationOutcome::Absent {
                         artifact_set_id,
                         upload_capability,
-                    } => (artifact_set_id, Some(upload_capability)),
+                    } => Some((artifact_set_id, Some(upload_capability))),
                     ArtifactResultConfirmationOutcome::Retryable { artifact_set_id } => {
-                        (artifact_set_id, None)
+                        Some((artifact_set_id, None))
                     }
-                    _ => unreachable!("result retry alternatives are closed"),
+                    ArtifactResultConfirmationOutcome::Confirmed { .. }
+                    | ArtifactResultConfirmationOutcome::Failed { .. } => None,
+                };
+                let Some((artifact_set_id, upload_capability)) = result_retry else {
+                    return Err(ArtifactDeliveryProtocolFailure);
                 };
                 if expected_set != &artifact_set_id {
                     return Err(ArtifactDeliveryProtocolFailure);
@@ -566,12 +570,19 @@ impl ArtifactDeliveryBroker {
                 }
                 continue;
             }
-            let request = confirm_observation(
+            let Ok(request) = confirm_observation(
                 completed.delivery_id,
                 &delivery.spec,
                 artifact_set_id.clone(),
                 carrier_id.clone(),
-            );
+            ) else {
+                complete(
+                    &mut state,
+                    completed.delivery_id,
+                    internal_failure("confirmation"),
+                );
+                continue;
+            };
             delivery.phase = DeliveryPhase::Confirming {
                 artifact_set_id,
                 carrier_id,
@@ -745,7 +756,8 @@ fn plan_confirmation_retry(
     carrier_id: Option<String>,
 ) -> Result<RetryWork, ArtifactDeliveryOutcome> {
     let exhausted = upload_retry_failure(&delivery.spec);
-    let request = confirm_observation(delivery_id, &delivery.spec, artifact_set_id, carrier_id);
+    let request = confirm_observation(delivery_id, &delivery.spec, artifact_set_id, carrier_id)
+        .map_err(|_| internal_failure("confirmation"))?;
     plan_retry(
         delivery_id,
         delivery,
@@ -1029,7 +1041,7 @@ fn confirm_observation(
     spec: &ArtifactDeliverySpec,
     artifact_set_id: String,
     carrier_id: Option<String>,
-) -> AssignmentObservation {
+) -> Result<AssignmentObservation, ArtifactDeliveryProtocolFailure> {
     let request = match (&spec.member, carrier_id) {
         (ArtifactMember::Carrier { .. }, Some(carrier_id)) => ArtifactRequest::ConfirmCarrier {
             assignment_id: spec.assignment_id.clone(),
@@ -1042,12 +1054,12 @@ fn confirm_observation(
             attempt_id: spec.attempt_id.clone(),
             artifact_set_id,
         },
-        _ => unreachable!("registration and confirmation identities must agree"),
+        _ => return Err(ArtifactDeliveryProtocolFailure),
     };
-    AssignmentObservation::Artifact {
+    Ok(AssignmentObservation::Artifact {
         delivery_id,
         request,
-    }
+    })
 }
 
 fn complete(state: &mut ArtifactDeliveryState, delivery_id: u64, result: ArtifactDeliveryOutcome) {

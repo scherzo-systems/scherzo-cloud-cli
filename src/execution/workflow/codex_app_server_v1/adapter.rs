@@ -176,7 +176,7 @@ where
 {
     async fn invoke_inner<Sink>(
         &self,
-        mut invocation: AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+        invocation: AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
         started: &AgentStartCallback,
     ) -> AgentOutcome
     where
@@ -187,9 +187,17 @@ where
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let mut plan = match prepare_launch(&invocation) {
-            Ok(plan) => plan,
-            Err(cause) => return failed_agent_outcome(cause),
+        let (mut invocation, mut plan) = match tokio::task::spawn_blocking(move || {
+            let plan = prepare_launch(&invocation);
+            (invocation, plan)
+        })
+        .await
+        {
+            Ok((invocation, Ok(plan))) => (invocation, plan),
+            Ok((_, Err(cause))) => return failed_agent_outcome(cause),
+            Err(_) => {
+                return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
+            }
         };
         let result_validator = match invocation.value_mode() {
             AgentValueMode::Result { schema, .. } => Some(AuthoritativeResultValidator::new(

@@ -126,15 +126,20 @@ fn context_schema_one_materializes_every_required_current_and_prior_round_fact()
         ),
     )
     .unwrap();
-    let command_failure = |execution_number, invocation| ProvisionalTargetFailure {
-        execution_number: TargetExecutionNumber::fixture(execution_number),
-        invocation: ActionId {
-            transition_sequence: TransitionSequence(invocation),
-        },
-        phase: FailurePhase::Execution,
-        cause: StepFailureCause::Execution(StepExecutionFailure::Command(
+    let command_failure = |execution_number, invocation| {
+        let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
             CommandExecutionFailure::UnsuccessfulExit { code: Some(75) },
-        )),
+        ));
+        ProvisionalTargetFailure {
+            execution_number: TargetExecutionNumber::fixture(execution_number),
+            invocation: ActionId {
+                transition_sequence: TransitionSequence(invocation),
+            },
+            phase: FailurePhase::Execution,
+            detail: super::super::evidence::failure_detail(FailurePhase::Execution, &cause)
+                .unwrap(),
+            cause,
+        }
     };
     let history = vec![
         RecoveryRoundRecord {

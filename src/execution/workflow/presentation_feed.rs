@@ -527,7 +527,7 @@ fn normalize_transition<Deadline: DisplayDeadline>(
         TransitionEvent::Workflow { sequence, from, to } => TransitionEvent::Workflow {
             sequence,
             from: from.map_deadline(|deadline| deadline.deadline_utc()),
-            to: to.map_deadline(|deadline| deadline.deadline_utc()),
+            to: Box::new((*to).map_deadline(|deadline| deadline.deadline_utc())),
         },
         TransitionEvent::CancellationAccepted {
             sequence,
