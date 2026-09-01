@@ -1382,9 +1382,10 @@ mod tests {
         WorkspaceFilesystem,
     };
     use super::{
-        AssignmentConfig, Config, ConnectionLoopDependencies, LiveStatus, ReloadDependencies,
-        ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError, Sleeper, TokioSleeper,
-        run_connection_loop_with_work_root, run_until_cancelled_with_dependencies,
+        AssignmentConfig, Config, ConnectionCause, ConnectionLoopDependencies, FailureKind,
+        LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError,
+        Sleeper, TokioSleeper, run_connection_loop_with_work_root,
+        run_until_cancelled_with_dependencies,
     };
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
@@ -1496,12 +1497,15 @@ mod tests {
     }
 
     #[test]
-    fn reports_connection_failure_cause() {
-        let error = ServiceError::Connection(sequence_overflow());
+    fn preserves_connection_failure_classification() {
+        let ServiceError::Connection(error) = ServiceError::Connection(sequence_overflow()) else {
+            panic!("connection failure changed service error variant");
+        };
         assert_eq!(
-            error.to_string(),
-            "runner service stopped unexpectedly: runner gateway connection failed: runner sequence overflow"
+            error.connection_cause(),
+            ConnectionCause::RunnerSequenceOverflow
         );
+        assert_eq!(error.kind(), FailureKind::TerminalProtocol);
     }
 
     fn current_credential_secret() -> String {
@@ -1861,7 +1865,7 @@ mod tests {
             )
             .await;
             let _accepted =
-                next_semantic_assignment_frame(&mut current, "assignment_accepted").await;
+                next_semantic_assignment_frame(&mut current, "assignment_accepted", true).await;
             current
                 .send(Message::Ping(vec![1, 2, 3].into()))
                 .await
@@ -2058,7 +2062,7 @@ mod tests {
             )
             .await;
             let rejection =
-                next_semantic_assignment_frame(&mut current, "assignment_rejected").await;
+                next_semantic_assignment_frame(&mut current, "assignment_rejected", true).await;
             let latest_current_sequence = rejection["sequence"].as_u64().unwrap();
             acknowledge_runner_frame(&mut current, &rejection, "acknowledge assignment rejection")
                 .await;
@@ -2409,6 +2413,7 @@ mod tests {
     async fn next_semantic_assignment_frame(
         socket: &mut FixtureSocket,
         expected_type: &str,
+        acknowledge_progress: bool,
     ) -> serde_json::Value {
         loop {
             let Some(Ok(Message::Text(frame))) = socket.next().await else {
@@ -2417,7 +2422,10 @@ mod tests {
             let frame: serde_json::Value =
                 serde_json::from_str(&frame).expect("decode assignment observation");
             if frame["type"] == "assignment_preparation_progress" {
-                acknowledge_runner_frame(socket, &frame, "acknowledge preparation progress").await;
+                if acknowledge_progress {
+                    acknowledge_runner_frame(socket, &frame, "acknowledge preparation progress")
+                        .await;
+                }
                 continue;
             }
             assert_eq!(frame["type"], expected_type);
@@ -2441,7 +2449,8 @@ mod tests {
             "acknowledge assignment prepare effect",
         )
         .await;
-        let accepted = next_semantic_assignment_frame(&mut socket, "assignment_accepted").await;
+        let accepted =
+            next_semantic_assignment_frame(&mut socket, "assignment_accepted", true).await;
         accepted_sent
             .send(())
             .expect("report assignment acceptance");
@@ -2612,11 +2621,14 @@ mod tests {
         .await
         .expect("runner retried a terminal policy close")
         .expect_err("policy close did not stop the service");
+        let ServiceError::Connection(connection_error) = error else {
+            panic!("policy close changed service error variant");
+        };
         assert_eq!(
-            error.to_string(),
-            "runner service stopped unexpectedly: runner gateway connection failed: \
-             gateway closed connection with policy violation"
+            connection_error.connection_cause(),
+            ConnectionCause::GatewayPolicyViolation
         );
+        assert_eq!(connection_error.kind(), FailureKind::TerminalProtocol);
         server.await.expect("fixture server failed");
         let headers = headers_received
             .await
@@ -2992,11 +3004,12 @@ mod tests {
                 "acknowledge assignment offer",
             )
             .await;
-            let _pending_prepare_acknowledgement = begin_assignment_preparation(&mut socket).await;
-            let rejection =
-                next_semantic_assignment_frame(&mut socket, "assignment_rejected").await;
-            acknowledge_runner_frame(&mut socket, &rejection, "acknowledge assignment rejection")
-                .await;
+            let _pending_prepare_receipt = begin_assignment_preparation(&mut socket).await;
+            // The production gateway reads, persists, and acknowledges runner frames
+            // serially. Leave later progress and rejection frames unacknowledged so
+            // the fixture cannot confirm them ahead of the pending prepare receipt.
+            let _pending_rejection =
+                next_semantic_assignment_frame(&mut socket, "assignment_rejected", false).await;
             pending_sent
                 .send(())
                 .expect("report pending prepare effect acknowledgement");

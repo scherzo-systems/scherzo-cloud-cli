@@ -694,6 +694,7 @@ pub(crate) enum ConnectionCause {
     ChangedExecutionLeasePolicy,
     ConflictingAssignmentOffer,
     AssignmentDecisionCapacity,
+    EffectReceiptCapacity,
     RunnerLeaseClockFailure,
 }
 
@@ -750,6 +751,7 @@ impl ConnectionCause {
             }
             Self::ConflictingAssignmentOffer => "conflicting assignment offer",
             Self::AssignmentDecisionCapacity => "assignment decision capacity exhausted",
+            Self::EffectReceiptCapacity => "effect receipt capacity exhausted",
             Self::RunnerLeaseClockFailure => "runner lease clock failed",
         }
     }
@@ -798,6 +800,7 @@ impl ConnectionCause {
             Self::ChangedExecutionLeasePolicy => "changed_execution_lease_policy",
             Self::ConflictingAssignmentOffer => "conflicting_assignment_offer",
             Self::AssignmentDecisionCapacity => "assignment_decision_capacity",
+            Self::EffectReceiptCapacity => "effect_receipt_capacity",
             Self::RunnerLeaseClockFailure => "runner_lease_clock_failure",
         }
     }
@@ -852,11 +855,6 @@ impl ConnectionError {
 
     pub(crate) const fn connection_cause(&self) -> ConnectionCause {
         self.cause
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn cause(&self) -> &'static str {
-        self.cause.message()
     }
 }
 
@@ -948,6 +946,37 @@ where
     ConnectionError::terminal(progress, cause)
 }
 
+async fn write_with_deadline<F>(
+    write: F,
+    sleeper: &dyn Sleeper,
+    timeout: Duration,
+    protocol: &mut ProtocolLog<'_>,
+    progress: ConnectionProgress,
+    write_cause: ConnectionCause,
+    timer: &'static str,
+) -> Result<(), ConnectionError>
+where
+    F: std::future::Future<Output = Result<(), WebSocketError>>,
+{
+    tokio::pin!(write);
+    let result = tokio::select! {
+        biased;
+        result = &mut write => Some(result),
+        _ = sleeper.sleep(timeout) => None,
+    };
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(_)) => Err(ConnectionError::retryable(progress, write_cause)),
+        None => {
+            protocol.timer_expired(timer);
+            Err(ConnectionError::retryable(
+                progress,
+                ConnectionCause::GatewayLivenessTimeout,
+            ))
+        }
+    }
+}
+
 type RunnerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub(super) struct CandidateTransport(RunnerSocket);
@@ -956,6 +985,16 @@ pub(super) struct CandidateConnection {
     socket: RunnerSocket,
     progress: ConnectionProgress,
     inbound_silence_timeout: Duration,
+    outbound_send_timeout: Duration,
+    protocol_session_id: String,
+    protocol_order: u64,
+}
+
+#[derive(Debug)]
+struct CandidateHandshake {
+    progress: ConnectionProgress,
+    inbound_silence_timeout: Duration,
+    outbound_send_timeout: Duration,
     protocol_session_id: String,
     protocol_order: u64,
 }
@@ -1073,6 +1112,33 @@ pub(super) async fn authenticate_candidate(
     opening: OpeningHello<'_>,
 ) -> Result<CandidateConnection, ConnectionError> {
     let CandidateTransport(mut socket) = transport;
+    let CandidateHandshake {
+        progress,
+        inbound_silence_timeout,
+        outbound_send_timeout,
+        protocol_session_id,
+        protocol_order,
+    } = authenticate_candidate_inner(dependencies, &mut socket, opening).await?;
+    Ok(CandidateConnection {
+        socket,
+        progress,
+        inbound_silence_timeout,
+        outbound_send_timeout,
+        protocol_session_id,
+        protocol_order,
+    })
+}
+
+async fn authenticate_candidate_inner<S>(
+    dependencies: ConnectionDependencies<'_>,
+    socket: &mut S,
+    opening: OpeningHello<'_>,
+) -> Result<CandidateHandshake, ConnectionError>
+where
+    S: Stream<Item = Result<Message, WebSocketError>>
+        + Sink<Message, Error = WebSocketError>
+        + Unpin,
+{
     let mut protocol = ProtocolLog::new(
         dependencies.recorder,
         dependencies.config.credential().runner_id(),
@@ -1083,12 +1149,16 @@ pub(super) async fn authenticate_candidate(
     let hello = std::str::from_utf8(opening.encoded).map_err(|_| {
         ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
     })?;
-    socket
-        .send(Message::Text(hello.into()))
-        .await
-        .map_err(|_| {
-            ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
-        })?;
+    write_with_deadline(
+        socket.send(Message::Text(hello.into())),
+        dependencies.sleeper,
+        WELCOME_TIMEOUT,
+        &mut protocol,
+        unacknowledged,
+        ConnectionCause::SendOpeningHello,
+        "outbound_send",
+    )
+    .await?;
     protocol.opening_hello(opening);
     let mut progress = ConnectionProgress::unacknowledged();
     progress.runner_text_frames_sent = 1;
@@ -1146,9 +1216,16 @@ pub(super) async fn authenticate_candidate(
             }
             Message::Ping(_) => {
                 protocol.control("cloud_to_runner", "ping");
-                socket.flush().await.map_err(|_| {
-                    ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
-                })?;
+                write_with_deadline(
+                    socket.flush(),
+                    dependencies.sleeper,
+                    WELCOME_TIMEOUT,
+                    &mut protocol,
+                    progress,
+                    ConnectionCause::FlushRunnerPong,
+                    "outbound_flush",
+                )
+                .await?;
                 protocol.control("runner_to_cloud", "pong");
                 continue;
             }
@@ -1172,6 +1249,7 @@ pub(super) async fn authenticate_candidate(
         match frame {
             CloudFrame::Welcome {
                 session_id,
+                ping_interval_seconds,
                 pong_timeout_seconds,
                 lease_policy,
                 ..
@@ -1193,10 +1271,10 @@ pub(super) async fn authenticate_candidate(
                 if let Some(cause) = cause {
                     return Err(ConnectionError::terminal(progress, cause));
                 }
-                return Ok(CandidateConnection {
-                    socket,
+                return Ok(CandidateHandshake {
                     progress,
                     inbound_silence_timeout: Duration::from_secs(pong_timeout_seconds),
+                    outbound_send_timeout: Duration::from_secs(ping_interval_seconds),
                     protocol_session_id: session_id,
                     protocol_order: protocol.order,
                 });
@@ -1233,6 +1311,106 @@ struct PendingObservation {
     message_id: String,
     sequence: u64,
     kind: PendingObservationKind,
+}
+
+struct BufferedEffect {
+    frame: Option<CloudFrame>,
+    event: Event,
+}
+
+impl BufferedEffect {
+    fn received(
+        recorder: &Recorder,
+        config: &Config,
+        boot_id: &str,
+        frame: CloudFrame,
+        progress: &mut ConnectionProgress,
+        connection_event: &Event,
+    ) -> Result<Self, ConnectionError> {
+        let (effect_id, assignment_id, run_id) = match &frame {
+            CloudFrame::AssignmentOffer {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            }
+            | CloudFrame::AssignmentPrepare {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            }
+            | CloudFrame::AssignmentStart {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            }
+            | CloudFrame::AssignmentLeaseRenewed {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            }
+            | CloudFrame::AssignmentRelease {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (effect_id, assignment_id, run_id),
+            _ => {
+                return Err(ConnectionError::terminal(
+                    *progress,
+                    ConnectionCause::UnexpectedGatewayFrame,
+                ));
+            }
+        };
+        let event = recorder.start(
+            "runner.effect_acknowledgement",
+            [
+                KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                KeyValue::new(
+                    telemetry::attribute::RUNNER_ID,
+                    config.credential().runner_id().to_owned(),
+                ),
+                KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
+            ],
+        );
+        progress.effects_received = match progress.incremented(progress.effects_received) {
+            Ok(count) => count,
+            Err(error) => {
+                finish_effect_failure(&event, ConnectionCause::ConnectionCounterOverflow);
+                return Err(error);
+            }
+        };
+        record_progress(connection_event, *progress);
+        Ok(Self {
+            frame: Some(frame),
+            event,
+        })
+    }
+
+    fn into_parts(
+        mut self,
+        progress: ConnectionProgress,
+    ) -> Result<(CloudFrame, Event), ConnectionError> {
+        let event = self.event.clone();
+        let Some(frame) = self.frame.take() else {
+            finish_effect_failure(&event, ConnectionCause::UnexpectedGatewayFrame);
+            return Err(ConnectionError::terminal(
+                progress,
+                ConnectionCause::UnexpectedGatewayFrame,
+            ));
+        };
+        Ok((frame, event))
+    }
+
+    fn discard(mut self, cause: ConnectionCause, outcome: Outcome) {
+        finish_effect(&self.event, cause, outcome);
+        self.frame = None;
+    }
 }
 
 struct ObservationTransport<'a> {
@@ -1317,12 +1495,16 @@ impl ActiveEffectEvent {
     }
 }
 
-fn finish_effect_failure(event: &Event, cause: ConnectionCause) {
+fn finish_effect(event: &Event, cause: ConnectionCause, outcome: Outcome) {
     event.set(KeyValue::new(
         telemetry::attribute::ERROR_TYPE,
         cause.error_type(),
     ));
-    event.finish(Outcome::Failure);
+    event.finish(outcome);
+}
+
+fn finish_effect_failure(event: &Event, cause: ConnectionCause) {
+    finish_effect(event, cause, Outcome::Failure);
 }
 
 pub(super) fn record_progress(event: &Event, progress: ConnectionProgress) {
@@ -1450,6 +1632,7 @@ pub(super) async fn run_promoted(
         socket,
         progress,
         inbound_silence_timeout,
+        outbound_send_timeout,
         protocol_session_id,
         protocol_order,
     } = candidate;
@@ -1463,6 +1646,7 @@ pub(super) async fn run_promoted(
         Some((
             progress,
             inbound_silence_timeout,
+            outbound_send_timeout,
             protocol_session_id,
             protocol_order,
         )),
@@ -1478,7 +1662,7 @@ async fn run_established_inner<R, W>(
     next_sequence: &Sequence,
     mut reader: R,
     mut writer: W,
-    resumed: Option<(ConnectionProgress, Duration, String, u64)>,
+    resumed: Option<(ConnectionProgress, Duration, Duration, String, u64)>,
 ) -> Result<ConnectionProgress, ConnectionError>
 where
     R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
@@ -1502,15 +1686,17 @@ where
         opening.boot_id,
         connection_attempt,
     );
-    let resumed_transport = resumed.map(|(progress, timeout, session_id, order)| {
-        protocol.session_id = Some(session_id);
-        protocol.order = order;
-        (progress, timeout)
-    });
+    let resumed_transport = resumed.map(
+        |(progress, inbound_timeout, outbound_timeout, session_id, order)| {
+            protocol.session_id = Some(session_id);
+            protocol.order = order;
+            (progress, inbound_timeout, outbound_timeout)
+        },
+    );
     let unacknowledged = ConnectionProgress::unacknowledged();
     let mut welcome_timer = sleeper.sleep(WELCOME_TIMEOUT);
-    let (mut progress, mut inbound_silence_timeout) =
-        if let Some((mut progress, timeout)) = resumed_transport {
+    let (mut progress, mut inbound_silence_timeout, mut outbound_send_timeout) =
+        if let Some((mut progress, inbound_timeout, outbound_timeout)) = resumed_transport {
             if progress.opening_acknowledged {
                 progress.handshake_completed = true;
                 record_progress(connection_event, progress);
@@ -1518,27 +1704,31 @@ where
                     status.connected(frame_source.utc_timestamp().ok());
                 }
             }
-            (progress, Some(timeout))
+            (progress, Some(inbound_timeout), Some(outbound_timeout))
         } else {
             let opening_hello = std::str::from_utf8(opening.encoded).map_err(|_| {
                 ConnectionError::terminal(unacknowledged, ConnectionCause::EncodeOpeningHelloUtf8)
             })?;
-            writer
-                .send(Message::Text(opening_hello.into()))
-                .await
-                .map_err(|_| {
-                    ConnectionError::retryable(unacknowledged, ConnectionCause::SendOpeningHello)
-                })?;
+            write_with_deadline(
+                writer.send(Message::Text(opening_hello.into())),
+                sleeper,
+                WELCOME_TIMEOUT,
+                &mut protocol,
+                unacknowledged,
+                ConnectionCause::SendOpeningHello,
+                "outbound_send",
+            )
+            .await?;
             protocol.opening_hello(opening);
             let mut progress = ConnectionProgress::unacknowledged();
             progress.runner_text_frames_sent =
                 progress.incremented(progress.runner_text_frames_sent)?;
             record_progress(connection_event, progress);
-            (progress, None)
+            (progress, None, None)
         };
     let mut inbound_silence_timer = inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
     let mut in_flight = VecDeque::<PendingObservation>::new();
-    let mut buffered_effect: Option<CloudFrame> = None;
+    let mut buffered_effect: Option<BufferedEffect> = None;
     let assignment_notification = assignment_manager
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1554,7 +1744,13 @@ where
             (failed, report)
         };
         if lease_clock_failed {
-            buffered_effect = None;
+            if let Some(effect) = buffered_effect.take() {
+                active_effect_event.finish(
+                    Outcome::Failure,
+                    Some(ConnectionCause::RunnerLeaseClockFailure),
+                );
+                effect.discard(ConnectionCause::RunnerLeaseClockFailure, Outcome::Failure);
+            }
             if failure_report.is_some() {
                 in_flight.clear();
             }
@@ -1566,6 +1762,8 @@ where
             {
                 let pending = send_effect_receipt(
                     &mut writer,
+                    sleeper,
+                    outbound_send_timeout.unwrap_or(WELCOME_TIMEOUT),
                     config,
                     frame_source,
                     opening.boot_id,
@@ -1573,9 +1771,7 @@ where
                     &mut protocol,
                     &mut progress,
                     connection_event,
-                    active_effect_event,
                     assignment_manager,
-                    recorder,
                     effect,
                 )
                 .await?;
@@ -1604,6 +1800,8 @@ where
                 for observation in pending {
                     let pending = send_assignment_observation(
                         &mut writer,
+                        sleeper,
+                        outbound_send_timeout.unwrap_or(WELCOME_TIMEOUT),
                         config,
                         frame_source,
                         opening.boot_id,
@@ -1712,9 +1910,16 @@ where
             }
             Message::Ping(_) => {
                 protocol.control("cloud_to_runner", "ping");
-                writer.flush().await.map_err(|_| {
-                    ConnectionError::retryable(progress, ConnectionCause::FlushRunnerPong)
-                })?;
+                write_with_deadline(
+                    writer.flush(),
+                    sleeper,
+                    outbound_send_timeout.unwrap_or(WELCOME_TIMEOUT),
+                    &mut protocol,
+                    progress,
+                    ConnectionCause::FlushRunnerPong,
+                    "outbound_flush",
+                )
+                .await?;
                 protocol.control("runner_to_cloud", "pong");
                 inbound_silence_timer =
                     inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
@@ -1786,7 +1991,7 @@ where
                     )
                     .await);
                 }
-                let _ = ping_interval_seconds;
+                outbound_send_timeout = Some(Duration::from_secs(ping_interval_seconds));
                 inbound_silence_timeout = Some(Duration::from_secs(pong_timeout_seconds));
             }
             CloudFrame::ObservationAck {
@@ -1904,9 +2109,44 @@ where
             | effect @ CloudFrame::AssignmentStart { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
-                if progress.handshake_completed && buffered_effect.is_none() =>
+                if progress.handshake_completed =>
             {
-                buffered_effect = Some(effect);
+                let received = BufferedEffect::received(
+                    recorder,
+                    config,
+                    opening.boot_id,
+                    effect,
+                    &mut progress,
+                    connection_event,
+                )?;
+                if let Some(previous) = buffered_effect.take() {
+                    active_effect_event.finish(
+                        Outcome::Disconnected,
+                        Some(ConnectionCause::EffectReceiptCapacity),
+                    );
+                    previous.discard(
+                        ConnectionCause::EffectReceiptCapacity,
+                        Outcome::Disconnected,
+                    );
+                    received.discard(
+                        ConnectionCause::EffectReceiptCapacity,
+                        Outcome::Disconnected,
+                    );
+                    close_locally(
+                        &mut writer,
+                        sleeper,
+                        &mut protocol,
+                        CloseCode::Away,
+                        ConnectionCause::EffectReceiptCapacity.message(),
+                    )
+                    .await;
+                    return Err(ConnectionError::retryable(
+                        progress,
+                        ConnectionCause::EffectReceiptCapacity,
+                    ));
+                }
+                active_effect_event.start(received.event.clone());
+                buffered_effect = Some(received);
             }
             _ => {
                 return Err(protocol_violation(
@@ -1967,6 +2207,8 @@ fn handle_artifact_cloud_response(
 )]
 async fn send_effect_receipt<W>(
     writer: &mut W,
+    sleeper: &dyn Sleeper,
+    outbound_send_timeout: Duration,
     config: &Config,
     frame_source: &dyn FrameSource,
     boot_id: &str,
@@ -1974,16 +2216,15 @@ async fn send_effect_receipt<W>(
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
-    active_effect_event: &ActiveEffectEvent,
     assignment_manager: &Mutex<AssignmentManager>,
-    recorder: &Recorder,
-    effect: CloudFrame,
+    effect: BufferedEffect,
 ) -> Result<PendingObservation, ConnectionError>
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     // jscpd:ignore-end
-    let (effect_id, assignment_id, run_id, manager_effect) = match effect {
+    let (effect, event) = effect.into_parts(*progress)?;
+    let (effect_id, manager_effect) = match effect {
         CloudFrame::AssignmentOffer {
             effect_id,
             assignment_id,
@@ -2001,12 +2242,7 @@ where
                 attempt_id,
                 execution_spec: *execution_spec,
             };
-            (
-                effect_id,
-                assignment_id,
-                run_id,
-                AssignmentManagerEffect::Offer(Box::new(offer)),
-            )
+            (effect_id, AssignmentManagerEffect::Offer(Box::new(offer)))
         }
         CloudFrame::AssignmentPrepare {
             effect_id,
@@ -2025,12 +2261,7 @@ where
                 execution_spec_id,
                 preparation_expires_at,
             };
-            (
-                effect_id,
-                assignment_id,
-                run_id,
-                AssignmentManagerEffect::Prepare(prepare),
-            )
+            (effect_id, AssignmentManagerEffect::Prepare(prepare))
         }
         CloudFrame::AssignmentStart {
             effect_id,
@@ -2049,12 +2280,7 @@ where
                 execution_spec_id,
                 lease,
             };
-            (
-                effect_id,
-                assignment_id,
-                run_id,
-                AssignmentManagerEffect::Start(start),
-            )
+            (effect_id, AssignmentManagerEffect::Start(start))
         }
         CloudFrame::AssignmentLeaseRenewed {
             effect_id,
@@ -2071,12 +2297,7 @@ where
                 attempt_id,
                 lease,
             };
-            (
-                effect_id,
-                assignment_id,
-                run_id,
-                AssignmentManagerEffect::Renewal(renewal),
-            )
+            (effect_id, AssignmentManagerEffect::Renewal(renewal))
         }
         CloudFrame::AssignmentRelease {
             effect_id,
@@ -2090,8 +2311,6 @@ where
             let release_run_id = run_id.clone();
             (
                 effect_id,
-                assignment_id,
-                run_id,
                 AssignmentManagerEffect::Release {
                     assignment_id: release_assignment_id,
                     run_id: release_run_id,
@@ -2101,6 +2320,7 @@ where
             )
         }
         _ => {
+            finish_effect_failure(&event, ConnectionCause::UnexpectedGatewayFrame);
             return Err(ConnectionError::terminal(
                 *progress,
                 ConnectionCause::UnexpectedGatewayFrame,
@@ -2110,32 +2330,10 @@ where
 
     let emission = next_sequence.lock_emission().await;
     let sequence = next_sequence.peek();
-    let event = recorder.start(
-        "runner.effect_acknowledgement",
-        [
-            KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
-            KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
-            KeyValue::new(telemetry::attribute::RUN_ID, run_id),
-            KeyValue::new(
-                telemetry::attribute::RUNNER_ID,
-                config.credential().runner_id().to_owned(),
-            ),
-            KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
-            KeyValue::new(
-                telemetry::attribute::RUNNER_SEQUENCE,
-                telemetry::integer(sequence),
-            ),
-        ],
-    );
-    active_effect_event.start(event.clone());
-    progress.effects_received = match progress.incremented(progress.effects_received) {
-        Ok(count) => count,
-        Err(error) => {
-            finish_effect_failure(&event, ConnectionCause::ConnectionCounterOverflow);
-            return Err(error);
-        }
-    };
-    record_progress(connection_event, *progress);
+    event.set(KeyValue::new(
+        telemetry::attribute::RUNNER_SEQUENCE,
+        telemetry::integer(sequence),
+    ));
     let envelope = match next_envelope(config, frame_source, boot_id, next_sequence, progress) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -2145,6 +2343,8 @@ where
     };
     let pending = send_runner_frame(
         writer,
+        sleeper,
+        outbound_send_timeout,
         protocol,
         progress,
         connection_event,
@@ -2239,6 +2439,8 @@ fn next_envelope(
 )]
 async fn send_assignment_observation<W>(
     writer: &mut W,
+    sleeper: &dyn Sleeper,
+    outbound_send_timeout: Duration,
     config: &Config,
     frame_source: &dyn FrameSource,
     boot_id: &str,
@@ -2303,12 +2505,16 @@ where
                 encoded: std::sync::Arc::clone(&encoded),
             },
         );
-    writer
-        .send(Message::Text(encoded.as_ref().into()))
-        .await
-        .map_err(|_| {
-            ConnectionError::retryable(*progress, ConnectionCause::SendEffectAcknowledgement)
-        })?;
+    write_with_deadline(
+        writer.send(Message::Text(encoded.as_ref().into())),
+        sleeper,
+        outbound_send_timeout,
+        protocol,
+        *progress,
+        ConnectionCause::SendEffectAcknowledgement,
+        "outbound_send",
+    )
+    .await?;
     drop(emission);
     protocol.runner_text(&frame);
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
@@ -2329,8 +2535,14 @@ struct EffectAcknowledgement {
     effect_id: String,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "effect frame delivery binds its deadline, protocol log, progress, and telemetry"
+)]
 async fn send_runner_frame<W>(
     writer: &mut W,
+    sleeper: &dyn Sleeper,
+    outbound_send_timeout: Duration,
     protocol: &mut ProtocolLog<'_>,
     progress: &mut ConnectionProgress,
     connection_event: &Event,
@@ -2362,12 +2574,24 @@ where
         finish_effect_failure(event, ConnectionCause::EncodeEffectAcknowledgementUtf8);
         ConnectionError::terminal(*progress, ConnectionCause::EncodeEffectAcknowledgementUtf8)
     })?;
-    if writer.send(Message::Text(encoded.into())).await.is_err() {
-        finish_effect_failure(event, ConnectionCause::SendEffectAcknowledgement);
-        return Err(ConnectionError::retryable(
-            *progress,
-            ConnectionCause::SendEffectAcknowledgement,
-        ));
+    if let Err(error) = write_with_deadline(
+        writer.send(Message::Text(encoded.into())),
+        sleeper,
+        outbound_send_timeout,
+        protocol,
+        *progress,
+        ConnectionCause::SendEffectAcknowledgement,
+        "outbound_send",
+    )
+    .await
+    {
+        let outcome = if error.connection_cause().is_timeout() {
+            Outcome::Timeout
+        } else {
+            Outcome::Failure
+        };
+        finish_effect(event, error.connection_cause(), outcome);
+        return Err(error);
     }
     protocol.runner_text(&frame);
     progress.runner_text_frames_sent = progress.incremented(progress.runner_text_frames_sent)?;
@@ -2421,7 +2645,7 @@ mod tests {
     use std::time::Duration;
 
     use base64::Engine as _;
-    use futures_util::{Sink, SinkExt, StreamExt};
+    use futures_util::{Sink, SinkExt, Stream, StreamExt};
     use ring::digest::SHA256;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2470,7 +2694,7 @@ mod tests {
         connection_event: Event,
         active_effect_event: ActiveEffectEvent,
         assignment_manager: Mutex<AssignmentManager>,
-        _sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+        sleep_requests: Option<mpsc::UnboundedReceiver<(Duration, SleepRelease)>>,
         opening: Vec<u8>,
     }
 
@@ -2500,7 +2724,7 @@ mod tests {
                 connection_event,
                 active_effect_event: ActiveEffectEvent::new(),
                 assignment_manager,
-                _sleep_requests: sleep_requests,
+                sleep_requests: Some(sleep_requests),
                 opening,
             }
         }
@@ -2588,6 +2812,81 @@ mod tests {
         window
     }
 
+    async fn buffer_assignment_offer(
+        inbound: &ScriptedInbound,
+        outbound: &mut mpsc::UnboundedReceiver<Message>,
+    ) {
+        let _window = open_and_fill_observation_window(inbound, outbound).await;
+        inbound.send(assignment_offer());
+        inbound.send(Message::Ping(b"effect-buffered".to_vec().into()));
+        assert!(matches!(
+            with_watchdog(outbound.recv())
+                .await
+                .expect("buffer synchronization pong timed out")
+                .expect("buffer synchronization pong missing"),
+            Message::Pong(payload) if payload.as_ref() == b"effect-buffered"
+        ));
+    }
+
+    fn welcome_with_ping_interval(seconds: u64) -> Message {
+        let Message::Text(text) = welcome() else {
+            panic!("welcome fixture must be text");
+        };
+        let mut frame: serde_json::Value =
+            serde_json::from_str(&text).expect("decode welcome fixture");
+        frame["payload"]["pingIntervalSeconds"] = json!(seconds);
+        frame["payload"]["pongTimeoutSeconds"] = json!(seconds * 2);
+        Message::Text(frame.to_string().into())
+    }
+
+    fn assignment_release() -> Message {
+        Message::Text(
+            json!({
+                "protocolVersion": 1,
+                "direction": "cloud_to_runner",
+                "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abp",
+                "sentAt": "2026-07-23T00:00:04Z",
+                "type": "assignment_release",
+                "payloadVersion": 1,
+                "payload": {
+                    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abj",
+                    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+                    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+                    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "reason": "stale_or_invalid_acceptance"
+                }
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    async fn receive_and_ack_until_effect(
+        inbound: &ScriptedInbound,
+        outbound: &mut mpsc::UnboundedReceiver<Message>,
+        expected_effect_id: &str,
+    ) -> serde_json::Value {
+        loop {
+            let message = with_watchdog(outbound.recv())
+                .await
+                .expect("runner observation timed out")
+                .expect("runner observation missing");
+            let Message::Text(text) = message else {
+                panic!("runner observation was not text");
+            };
+            let frame: serde_json::Value =
+                serde_json::from_str(&text).expect("decode runner observation");
+            inbound.send(observation_acknowledgement(
+                frame["messageId"].as_str().expect("runner message ID"),
+                frame["sequence"].as_u64().expect("runner sequence"),
+            ));
+            if frame["type"] == "effect_acknowledged" {
+                assert_eq!(frame["payload"]["effectId"], expected_effect_id);
+                return frame;
+            }
+        }
+    }
+
     struct FixtureArtifactBody {
         path: PathBuf,
     }
@@ -2598,23 +2897,42 @@ mod tests {
         }
     }
 
-    struct BackpressuredEffectWriter {
+    #[derive(Clone, Copy)]
+    enum BackpressurePoint {
+        ReadyAfterFirstSend,
+        FlushAfterFirstFlush,
+    }
+
+    struct BackpressuredWriter {
+        point: BackpressurePoint,
         sent: usize,
+        flushes: usize,
         blocked: Arc<Notify>,
     }
 
-    impl Sink<Message> for BackpressuredEffectWriter {
+    impl BackpressuredWriter {
+        fn new(point: BackpressurePoint, blocked: Arc<Notify>) -> Self {
+            Self {
+                point,
+                sent: 0,
+                flushes: 0,
+                blocked,
+            }
+        }
+    }
+
+    impl Sink<Message> for BackpressuredWriter {
         type Error = WebSocketError;
 
         fn poll_ready(
             self: Pin<&mut Self>,
             _context: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
-            if self.sent == 0 {
-                Poll::Ready(Ok(()))
-            } else {
+            if matches!(self.point, BackpressurePoint::ReadyAfterFirstSend) && self.sent > 0 {
                 self.blocked.notify_one();
                 Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
             }
         }
 
@@ -2624,10 +2942,16 @@ mod tests {
         }
 
         fn poll_flush(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             _context: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
+            if matches!(self.point, BackpressurePoint::FlushAfterFirstFlush) && self.flushes > 0 {
+                self.blocked.notify_one();
+                Poll::Pending
+            } else {
+                self.flushes += 1;
+                Poll::Ready(Ok(()))
+            }
         }
 
         fn poll_close(
@@ -2636,6 +2960,68 @@ mod tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    struct BackpressuredCandidateSocket {
+        inbound: Option<Result<Message, WebSocketError>>,
+        writer: BackpressuredWriter,
+    }
+
+    impl Stream for BackpressuredCandidateSocket {
+        type Item = Result<Message, WebSocketError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.inbound.take())
+        }
+    }
+
+    impl Sink<Message> for BackpressuredCandidateSocket {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.writer).poll_ready(context)
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            Pin::new(&mut self.writer).start_send(message)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.writer).poll_flush(context)
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.writer).poll_close(context)
+        }
+    }
+
+    fn backpressured_effect_transport(
+        welcome: Message,
+        blocked: Arc<Notify>,
+    ) -> (
+        impl futures_util::Stream<Item = Result<Message, WebSocketError>> + Unpin,
+        BackpressuredWriter,
+    ) {
+        (
+            futures_util::stream::iter([
+                Ok(welcome),
+                Ok(observation_acknowledgement(OPENING_MESSAGE_ID, 1)),
+                Ok(assignment_offer()),
+            ]),
+            BackpressuredWriter::new(BackpressurePoint::ReadyAfterFirstSend, blocked),
+        )
     }
 
     #[tokio::test]
@@ -2676,13 +3062,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_clock_failure_bypasses_a_full_normal_observation_window() {
+    async fn lease_clock_failure_records_the_buffered_effect_before_terminal_reporting() {
         let context = full_observation_window_context();
         let mut next_sequence = 2;
         let (inbound, mut outbound, established) =
             established_fixture(&context, &mut next_sequence);
         let peer = async {
-            let _window = open_and_fill_observation_window(&inbound, &mut outbound).await;
+            buffer_assignment_offer(&inbound, &mut outbound).await;
             context
                 .assignment_manager
                 .lock()
@@ -2710,6 +3096,136 @@ mod tests {
             ConnectionCause::RunnerLeaseClockFailure
         );
         assert!(error.is_terminal());
+        assert_eq!(error.progress.effects_received, 1);
+        let effect = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(effect["scherzo.outcome"], "failure");
+        assert_eq!(effect["error.type"], "runner_lease_clock_failure");
+    }
+
+    #[tokio::test]
+    async fn process_cancellation_classifies_a_buffered_effect_as_cancelled() {
+        let context = full_observation_window_context();
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let mut connection = Box::pin(established);
+        let synchronize = buffer_assignment_offer(&inbound, &mut outbound);
+
+        with_watchdog(async {
+            tokio::select! {
+                result = &mut connection => panic!("buffered connection completed unexpectedly: {result:?}"),
+                () = synchronize => {}
+            }
+        })
+        .await
+        .expect("buffered effect was not received");
+        context.active_effect_event.finish(Outcome::Cancelled, None);
+        context.connection_event.finish(Outcome::Cancelled);
+        drop(connection);
+
+        let effect = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(effect["scherzo.outcome"], "cancelled");
+        assert!(effect.get("error.type").is_none());
+    }
+
+    #[tokio::test]
+    async fn full_window_effect_collision_reconnects_and_both_effects_replay() {
+        const OFFER_EFFECT_ID: &str = "eff_01k0z6r1w8f4jy2m7q9v3x5abg";
+        const RELEASE_EFFECT_ID: &str = "eff_01k0z6r1w8f4jy2m7q9v3x5abj";
+
+        let context = full_observation_window_context();
+        let mut next_sequence = 2;
+        let (first_inbound, mut first_outbound, first_connection) =
+            established_fixture(&context, &mut next_sequence);
+        let first_peer = async {
+            let _window =
+                open_and_fill_observation_window(&first_inbound, &mut first_outbound).await;
+            first_inbound.send(assignment_offer());
+            first_inbound.send(assignment_release());
+            let close = with_watchdog(first_outbound.recv())
+                .await
+                .expect("capacity close timed out")
+                .expect("capacity close missing");
+            let Message::Close(Some(close)) = close else {
+                panic!("effect collision did not close the connection");
+            };
+            assert_eq!(close.code, CloseCode::Away);
+        };
+        let (first_result, ()) =
+            with_watchdog(async { tokio::join!(first_connection, first_peer) })
+                .await
+                .expect("effect collision fixture timed out");
+        let first_error = first_result.expect_err("effect collision unexpectedly succeeded");
+        assert_eq!(first_error.kind(), FailureKind::Retryable);
+        assert_eq!(
+            first_error.connection_cause(),
+            ConnectionCause::EffectReceiptCapacity
+        );
+        assert_eq!(first_error.progress.effects_received, 2);
+
+        let (second_inbound, second_reader, second_writer, mut second_outbound) =
+            scripted_duplex(DeterminismTranscript::default());
+        let replacement = run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            second_reader,
+            second_writer,
+        );
+        let replacement_peer = async {
+            let window =
+                open_and_fill_observation_window(&second_inbound, &mut second_outbound).await;
+            for frame in window {
+                second_inbound.send(observation_acknowledgement(
+                    frame["messageId"].as_str().expect("window message ID"),
+                    frame["sequence"].as_u64().expect("window sequence"),
+                ));
+            }
+            for _ in OBSERVATION_WINDOW..40 {
+                let refill = with_watchdog(second_outbound.recv())
+                    .await
+                    .expect("replayed observation refill timed out")
+                    .expect("replayed observation refill missing");
+                let Message::Text(refill) = refill else {
+                    panic!("replayed observation refill was not text");
+                };
+                let refill: serde_json::Value =
+                    serde_json::from_str(&refill).expect("decode replayed observation refill");
+                second_inbound.send(observation_acknowledgement(
+                    refill["messageId"].as_str().expect("refill message ID"),
+                    refill["sequence"].as_u64().expect("refill sequence"),
+                ));
+            }
+
+            second_inbound.send(assignment_offer());
+            receive_and_ack_until_effect(&second_inbound, &mut second_outbound, OFFER_EFFECT_ID)
+                .await;
+            second_inbound.send(assignment_release());
+            receive_and_ack_until_effect(&second_inbound, &mut second_outbound, RELEASE_EFFECT_ID)
+                .await;
+            second_inbound.send(Message::Close(None));
+        };
+        let (replacement_result, ()) =
+            with_watchdog(async { tokio::join!(replacement, replacement_peer) })
+                .await
+                .expect("replacement effect replay fixture timed out");
+        let replacement_progress =
+            replacement_result.expect("replacement effect replay connection failed");
+        assert_eq!(replacement_progress.effects_received, 2);
+        assert_eq!(replacement_progress.effect_acknowledgements_confirmed, 2);
+
+        let discarded: Vec<_> = context
+            .capture
+            .events()
+            .into_iter()
+            .filter(|event| event.get("error.type") == Some(&json!("effect_receipt_capacity")))
+            .collect();
+        assert_eq!(discarded.len(), 2);
+        assert!(
+            discarded
+                .iter()
+                .all(|event| event["scherzo.outcome"] == "disconnected")
+        );
     }
 
     #[tokio::test]
@@ -3203,10 +3719,10 @@ mod tests {
             std::io::ErrorKind::ConnectionReset,
             "transport reset sentinel",
         )))]);
-        let writer = BackpressuredEffectWriter {
-            sent: 0,
-            blocked: Arc::new(Notify::new()),
-        };
+        let writer = BackpressuredWriter::new(
+            BackpressurePoint::ReadyAfterFirstSend,
+            Arc::new(Notify::new()),
+        );
         let mut next_sequence = 2;
 
         run_established(
@@ -3247,218 +3763,63 @@ mod tests {
     }
 
     #[test]
-    fn connection_causes_have_stable_unique_safe_slugs() {
+    fn connection_causes_have_unique_safe_error_types() {
         let causes = [
-            (
-                ConnectionCause::FormatCurrentTimestamp,
-                "format current timestamp",
-                "format_current_timestamp",
-            ),
-            (
-                ConnectionCause::GatewayPolicyViolation,
-                "gateway closed connection with policy violation",
-                "gateway_policy_violation",
-            ),
-            (
-                ConnectionCause::GatewayUnsupportedFrames,
-                "gateway attributed unsupported frames to this runner",
-                "gateway_unsupported_frames",
-            ),
-            (
-                ConnectionCause::GatewayOversizedFrames,
-                "gateway attributed oversized frames to this runner",
-                "gateway_oversized_frames",
-            ),
-            (
-                ConnectionCause::BuildGatewayRequest,
-                "build gateway request",
-                "build_gateway_request",
-            ),
-            (
-                ConnectionCause::BuildAuthorizationHeader,
-                "build authorization header",
-                "build_authorization_header",
-            ),
-            (
-                ConnectionCause::CredentialRejected,
-                "runner gateway rejected the credential",
-                "credential_rejected",
-            ),
-            (
-                ConnectionCause::ConnectionRequestRejected,
-                "runner gateway rejected the connection request",
-                "connection_request_rejected",
-            ),
-            (
-                ConnectionCause::GatewayHttpError,
-                "runner gateway returned an HTTP error",
-                "gateway_http_error",
-            ),
-            (
-                ConnectionCause::ConnectGateway,
-                "connect to runner gateway",
-                "connect_gateway",
-            ),
-            (
-                ConnectionCause::ConnectTimeout,
-                "runner gateway connect timeout",
-                "connect_timeout",
-            ),
-            (
-                ConnectionCause::RequiredSubprotocolNotSelected,
-                "runner gateway did not select the required subprotocol",
-                "required_subprotocol_not_selected",
-            ),
-            (
-                ConnectionCause::EncodeOpeningHelloUtf8,
-                "encode opening hello as UTF-8",
-                "encode_opening_hello_utf8",
-            ),
-            (
-                ConnectionCause::SendOpeningHello,
-                "send opening hello",
-                "send_opening_hello",
-            ),
-            (
-                ConnectionCause::GatewayLivenessTimeout,
-                "gateway liveness timeout",
-                "gateway_liveness_timeout",
-            ),
-            (
-                ConnectionCause::GatewayWelcomeTimeout,
-                "gateway welcome timeout",
-                "gateway_welcome_timeout",
-            ),
-            (
-                ConnectionCause::OversizedGatewayFrame,
-                "oversized gateway frame",
-                "oversized_gateway_frame",
-            ),
-            (
-                ConnectionCause::ReadGatewayFrame,
-                "read gateway frame",
-                "read_gateway_frame",
-            ),
-            (
-                ConnectionCause::UndecodableGatewayFrame,
-                "undecodable gateway frame",
-                "undecodable_gateway_frame",
-            ),
-            (
-                ConnectionCause::UnexpectedObservationAcknowledgement,
-                "unexpected observation acknowledgement",
-                "unexpected_observation_acknowledgement",
-            ),
-            (
-                ConnectionCause::MismatchedEffectAcknowledgement,
-                "mismatched effect acknowledgement",
-                "mismatched_effect_acknowledgement",
-            ),
-            (
-                ConnectionCause::ObservationSequenceOverflow,
-                "runner observation sequence overflow",
-                "observation_sequence_overflow",
-            ),
-            (
-                ConnectionCause::FormatEffectAcknowledgementTimestamp,
-                "format effect acknowledgement timestamp",
-                "format_effect_acknowledgement_timestamp",
-            ),
-            (
-                ConnectionCause::EncodeEffectAcknowledgement,
-                "encode effect acknowledgement",
-                "encode_effect_acknowledgement",
-            ),
-            (
-                ConnectionCause::EncodeEffectAcknowledgementUtf8,
-                "encode effect acknowledgement as UTF-8",
-                "encode_effect_acknowledgement_utf8",
-            ),
-            (
-                ConnectionCause::SendEffectAcknowledgement,
-                "send effect acknowledgement",
-                "send_effect_acknowledgement",
-            ),
-            (
-                ConnectionCause::UnexpectedGatewayFrame,
-                "unexpected gateway frame",
-                "unexpected_gateway_frame",
-            ),
-            (
-                ConnectionCause::FlushRunnerPong,
-                "flush runner pong",
-                "flush_runner_pong",
-            ),
-            (
-                ConnectionCause::BinaryGatewayFrame,
-                "binary gateway frame",
-                "binary_gateway_frame",
-            ),
-            (
-                ConnectionCause::UnexpectedRawGatewayFrame,
-                "unexpected raw gateway frame",
-                "unexpected_raw_gateway_frame",
-            ),
-            (
-                ConnectionCause::FormatOpeningHelloTimestamp,
-                "format opening hello timestamp",
-                "format_opening_hello_timestamp",
-            ),
-            (
-                ConnectionCause::EncodeOpeningHello,
-                "encode opening hello",
-                "encode_opening_hello",
-            ),
-            (
-                ConnectionCause::RunnerSequenceOverflow,
-                "runner sequence overflow",
-                "runner_sequence_overflow",
-            ),
-            (
-                ConnectionCause::GatewayClosedConnection,
-                "gateway closed connection",
-                "gateway_closed_connection",
-            ),
-            (
-                ConnectionCause::ConnectionCounterOverflow,
-                "runner connection counter overflow",
-                "connection_counter_overflow",
-            ),
-            (
-                ConnectionCause::EffectAcknowledgementUnconfirmed,
-                "effect acknowledgement confirmation not received",
-                "effect_acknowledgement_unconfirmed",
-            ),
-            (
-                ConnectionCause::InvalidExecutionLeasePolicy,
-                "invalid execution lease policy",
-                "invalid_execution_lease_policy",
-            ),
-            (
-                ConnectionCause::ChangedExecutionLeasePolicy,
-                "execution lease policy changed within runner boot",
-                "changed_execution_lease_policy",
-            ),
-            (
-                ConnectionCause::ConflictingAssignmentOffer,
-                "conflicting assignment offer",
-                "conflicting_assignment_offer",
-            ),
-            (
-                ConnectionCause::AssignmentDecisionCapacity,
-                "assignment decision capacity exhausted",
-                "assignment_decision_capacity",
-            ),
+            ConnectionCause::FormatCurrentTimestamp,
+            ConnectionCause::GatewayPolicyViolation,
+            ConnectionCause::GatewayUnsupportedFrames,
+            ConnectionCause::GatewayOversizedFrames,
+            ConnectionCause::BuildGatewayRequest,
+            ConnectionCause::BuildAuthorizationHeader,
+            ConnectionCause::CredentialRejected,
+            ConnectionCause::ConnectionRequestRejected,
+            ConnectionCause::GatewayRateLimited,
+            ConnectionCause::GatewayUnavailable,
+            ConnectionCause::GatewayHttpError,
+            ConnectionCause::ConnectGateway,
+            ConnectionCause::ConnectTimeout,
+            ConnectionCause::RequiredSubprotocolNotSelected,
+            ConnectionCause::EncodeOpeningHelloUtf8,
+            ConnectionCause::SendOpeningHello,
+            ConnectionCause::GatewayLivenessTimeout,
+            ConnectionCause::GatewayWelcomeTimeout,
+            ConnectionCause::OversizedGatewayFrame,
+            ConnectionCause::ReadGatewayFrame,
+            ConnectionCause::UndecodableGatewayFrame,
+            ConnectionCause::UnexpectedObservationAcknowledgement,
+            ConnectionCause::MismatchedEffectAcknowledgement,
+            ConnectionCause::ObservationSequenceOverflow,
+            ConnectionCause::FormatEffectAcknowledgementTimestamp,
+            ConnectionCause::EncodeEffectAcknowledgement,
+            ConnectionCause::EncodeEffectAcknowledgementUtf8,
+            ConnectionCause::SendEffectAcknowledgement,
+            ConnectionCause::UnexpectedGatewayFrame,
+            ConnectionCause::FlushRunnerPong,
+            ConnectionCause::BinaryGatewayFrame,
+            ConnectionCause::UnexpectedRawGatewayFrame,
+            ConnectionCause::FormatOpeningHelloTimestamp,
+            ConnectionCause::EncodeOpeningHello,
+            ConnectionCause::RunnerSequenceOverflow,
+            ConnectionCause::GatewayClosedConnection,
+            ConnectionCause::ConnectionCounterOverflow,
+            ConnectionCause::EffectAcknowledgementUnconfirmed,
+            ConnectionCause::InvalidExecutionLeasePolicy,
+            ConnectionCause::ChangedExecutionLeasePolicy,
+            ConnectionCause::ConflictingAssignmentOffer,
+            ConnectionCause::AssignmentDecisionCapacity,
+            ConnectionCause::EffectReceiptCapacity,
+            ConnectionCause::RunnerLeaseClockFailure,
         ];
-        let mut slugs = std::collections::HashSet::new();
-        for (cause, message, slug) in causes {
-            assert_eq!(cause.message(), message);
-            assert_eq!(cause.error_type(), slug);
+        let mut error_types = std::collections::HashSet::new();
+        for cause in causes {
+            let error_type = cause.error_type();
+            assert!(error_type.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+            }));
             assert!(
-                slug.bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+                error_types.insert(error_type),
+                "duplicate connection cause error type {error_type}"
             );
-            assert!(slugs.insert(slug), "duplicate cause slug {slug}");
         }
     }
 
@@ -3473,10 +3834,9 @@ mod tests {
             .expect_err("overflowed connection counter");
 
         assert!(error.is_terminal());
-        assert_eq!(error.cause(), "runner connection counter overflow");
         assert_eq!(
-            error.connection_cause().error_type(),
-            "connection_counter_overflow"
+            error.connection_cause(),
+            ConnectionCause::ConnectionCounterOverflow
         );
     }
 
@@ -3906,18 +4266,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_pong_flush_expires_at_the_welcome_deadline() {
+        let mut context = EstablishedTestContext::new();
+        let mut sleep_requests = context
+            .sleep_requests
+            .take()
+            .expect("controlled sleep requests");
+        let blocked = Arc::new(Notify::new());
+        let mut socket = BackpressuredCandidateSocket {
+            inbound: Some(Ok(Message::Ping(b"candidate".to_vec().into()))),
+            writer: BackpressuredWriter::new(
+                BackpressurePoint::FlushAfterFirstFlush,
+                Arc::clone(&blocked),
+            ),
+        };
+        let authentication = super::authenticate_candidate_inner(
+            context.dependencies(),
+            &mut socket,
+            context.opening(),
+        );
+        let release_deadline = async {
+            blocked.notified().await;
+            sleep_request(&mut sleep_requests, super::WELCOME_TIMEOUT)
+                .await
+                .release();
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(authentication, release_deadline) })
+            .await
+            .expect("candidate Pong flush deadline fixture timed out");
+        let error = result.expect_err("stalled candidate Pong flush unexpectedly succeeded");
+        assert_eq!(error.kind(), FailureKind::Retryable);
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::GatewayLivenessTimeout
+        );
+        let timer = context
+            .capture
+            .records()
+            .into_iter()
+            .find(|record| record.get("scherzo.protocol.timer") == Some(&json!("outbound_flush")))
+            .expect("candidate Pong flush timer telemetry");
+        assert_eq!(timer["scherzo.protocol.event"], "timer_expired");
+    }
+
+    #[tokio::test]
+    async fn welcome_ping_interval_bounds_a_stalled_effect_send() {
+        let mut context = EstablishedTestContext::new();
+        let mut sleep_requests = context
+            .sleep_requests
+            .take()
+            .expect("controlled sleep requests");
+        let blocked = Arc::new(Notify::new());
+        let (reader, writer) =
+            backpressured_effect_transport(welcome_with_ping_interval(7), Arc::clone(&blocked));
+        let mut next_sequence = 2;
+        let connection = run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            reader,
+            writer,
+        );
+        let release_deadline = async {
+            blocked.notified().await;
+            sleep_request(&mut sleep_requests, Duration::from_secs(7))
+                .await
+                .release();
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(connection, release_deadline) })
+            .await
+            .expect("stalled effect send deadline fixture timed out");
+        let error = result.expect_err("stalled effect send unexpectedly succeeded");
+        assert_eq!(error.kind(), FailureKind::Retryable);
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::GatewayLivenessTimeout
+        );
+        assert!(error.connection_cause().is_timeout());
+        assert_eq!(error.progress.effects_received, 1);
+        assert_eq!(next_sequence, 3);
+        let timer = context
+            .capture
+            .records()
+            .into_iter()
+            .find(|record| record.get("scherzo.protocol.timer") == Some(&json!("outbound_send")))
+            .expect("outbound send timer telemetry");
+        assert_eq!(timer["scherzo.protocol.event"], "timer_expired");
+        let effect = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(effect["scherzo.outcome"], "timeout");
+        assert_eq!(effect["error.type"], "gateway_liveness_timeout");
+    }
+
+    #[tokio::test]
     async fn keeps_effect_event_across_cancellation_while_send_is_pending() {
         let context = EstablishedTestContext::new();
         let blocked = Arc::new(Notify::new());
-        let reader = futures_util::stream::iter([
-            Ok(welcome()),
-            Ok(observation_acknowledgement(OPENING_MESSAGE_ID, 1)),
-            Ok(assignment_offer()),
-        ]);
-        let writer = BackpressuredEffectWriter {
-            sent: 0,
-            blocked: Arc::clone(&blocked),
-        };
+        let (reader, writer) = backpressured_effect_transport(welcome(), Arc::clone(&blocked));
         let mut next_sequence = 2;
         let mut connection = Box::pin(run_established(
             context.dependencies(),
@@ -3963,7 +4409,10 @@ mod tests {
         });
         let (error, next_sequence, capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
-        assert_eq!(error.cause(), "gateway welcome timeout");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::GatewayWelcomeTimeout
+        );
         assert!(!error.is_terminal());
         assert!(!error.progress.opening_acknowledged);
         assert!(!error.progress.handshake_completed);
@@ -4006,7 +4455,10 @@ mod tests {
         });
         let (error, next_sequence, capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
-        assert_eq!(error.cause(), "gateway liveness timeout");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::GatewayLivenessTimeout
+        );
         assert!(error.progress.opening_acknowledged);
         assert!(error.progress.handshake_completed);
         assert_eq!(next_sequence, 2);
@@ -4033,7 +4485,7 @@ mod tests {
 
         let (error, next_sequence, _capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
-        assert_eq!(error.cause(), "runner gateway connect timeout");
+        assert_eq!(error.connection_cause(), ConnectionCause::ConnectTimeout);
         assert!(!error.is_terminal());
         assert_eq!(next_sequence, 2);
 
@@ -4058,7 +4510,10 @@ mod tests {
             .expect_err("unauthorized connection succeeded");
         assert!(error.is_terminal());
         assert_eq!(error.kind(), FailureKind::TerminalAuthentication);
-        assert_eq!(error.cause(), "runner gateway rejected the credential");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::CredentialRejected
+        );
         server.await.expect("join fixture server");
     }
 
@@ -4082,7 +4537,10 @@ mod tests {
             .expect_err("oversized frame accepted");
         assert!(error.is_terminal());
         assert_eq!(error.kind(), FailureKind::TerminalProtocol);
-        assert_eq!(error.cause(), "oversized gateway frame");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::OversizedGatewayFrame
+        );
         server.await.expect("join fixture server");
     }
 
@@ -4104,7 +4562,10 @@ mod tests {
         let (error, _, _capture) =
             run_failing_fixture_connection(&endpoint, sleeper.as_ref()).await;
         assert!(!error.is_terminal());
-        assert_eq!(error.cause(), "gateway liveness timeout");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::GatewayLivenessTimeout
+        );
         server.await.expect("join fixture server");
     }
 
@@ -4127,25 +4588,22 @@ mod tests {
             .expect_err("undecodable frame accepted");
         assert!(error.is_terminal());
         assert_eq!(error.kind(), FailureKind::TerminalProtocol);
-        assert_eq!(error.cause(), "undecodable gateway frame");
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::UndecodableGatewayFrame
+        );
         server.await.expect("join fixture server");
     }
 
     #[test]
     fn classifies_received_close_statuses() {
         for (code, cause) in [
-            (
-                CloseCode::Policy,
-                "gateway closed connection with policy violation",
-            ),
+            (CloseCode::Policy, ConnectionCause::GatewayPolicyViolation),
             (
                 CloseCode::Unsupported,
-                "gateway attributed unsupported frames to this runner",
+                ConnectionCause::GatewayUnsupportedFrames,
             ),
-            (
-                CloseCode::Size,
-                "gateway attributed oversized frames to this runner",
-            ),
+            (CloseCode::Size, ConnectionCause::GatewayOversizedFrames),
         ] {
             let error = close_outcome(
                 ConnectionProgress::unacknowledged(),
@@ -4156,7 +4614,7 @@ mod tests {
             )
             .expect_err("terminal close status succeeded");
             assert!(error.is_terminal());
-            assert_eq!(error.cause(), cause);
+            assert_eq!(error.connection_cause(), cause);
         }
         for close in [
             None,

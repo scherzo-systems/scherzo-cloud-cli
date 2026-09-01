@@ -26,8 +26,8 @@ fn valid_decision() -> Vec<u8> {
 
 #[test]
 fn decision_parser_rejects_each_closed_contract_failure_separately() {
-    let overlong_summary = "s".repeat(MAXIMUM_RECOVERY_DECISION_TEXT_BYTES + 1);
-    let overlong_reason = "r".repeat(MAXIMUM_RECOVERY_DECISION_TEXT_BYTES + 1);
+    let overlong_summary = "s".repeat(MAXIMUM_RECOVERY_DECISION_TEXT_CODE_POINTS + 1);
+    let overlong_reason = "r".repeat(MAXIMUM_RECOVERY_DECISION_TEXT_CODE_POINTS + 1);
     let cases = [
         (
             vec![b' '; MAXIMUM_RECOVERY_DECISION_BYTES + 1],
@@ -94,6 +94,25 @@ fn decision_parser_rejects_each_closed_contract_failure_separately() {
         )
         .unwrap(),
         RecoveryDecision::gave_up("inspected", "unsafe to repair")
+    );
+}
+
+#[test]
+fn decision_schema_and_parser_accept_three_thousand_non_ascii_code_points() {
+    let summary = "é".repeat(3_000);
+    let document = json!({
+        "schemaVersion": 1,
+        "decision": "recheck",
+        "summary": summary,
+        "reason": "verify"
+    });
+    let schema_document = serde_json::from_str(RECOVERY_DECISION_SCHEMA_JSON).unwrap();
+    let schema = jsonschema::draft202012::new(&schema_document).unwrap();
+
+    assert!(schema.is_valid(&document));
+    assert_eq!(
+        parse_recovery_decision(&serde_json::to_vec(&document).unwrap()).unwrap(),
+        RecoveryDecision::recheck(summary, "verify")
     );
 }
 

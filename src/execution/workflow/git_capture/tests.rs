@@ -1063,10 +1063,14 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     let failure =
         capture_failure(capture.capture("changes", &artifacts, &CaptureCancellation::default()));
 
+    let GitCaptureFailure::CommandTimedOut(timeout) = failure else {
+        panic!("capture timeout changed failure variant");
+    };
     assert_eq!(
-        failure.to_string(),
-        "Git branch capture command `git pack-objects --stdout --revs --no-sparse --window=0 --depth=0` exceeded the 1s timeout"
+        timeout.command.as_ref(),
+        "git pack-objects --stdout --revs --no-sparse --window=0 --depth=0"
     );
+    assert_eq!(timeout.limit, Duration::from_secs(1));
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }
 

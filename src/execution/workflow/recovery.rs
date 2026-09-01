@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, stat, statat};
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::AdmittedWorkflow;
@@ -27,7 +27,7 @@ use super::validated::{ValidatedStep, ValidatedStepRecovery};
 pub(crate) const RECOVERY_CONTEXT_VARIABLE: &str = "SCHERZO_RECOVERY_CONTEXT";
 pub(crate) const RECOVERY_RESULT_VARIABLE: &str = "SCHERZO_RECOVERY_RESULT";
 pub(crate) const MAXIMUM_RECOVERY_DECISION_BYTES: usize = 16 * 1024;
-pub(crate) const MAXIMUM_RECOVERY_DECISION_TEXT_BYTES: usize = 4 * 1024;
+const MAXIMUM_RECOVERY_DECISION_TEXT_CODE_POINTS: usize = 4 * 1024;
 const MAXIMUM_RECOVERY_CONTEXT_JSON_BYTES: usize = 64 * 1024;
 const RECOVERY_CONTEXT_FILE: &str = "context.json";
 const RECOVERY_RESULT_FILE: &str = "decision.json";
@@ -187,8 +187,9 @@ pub(crate) fn parse_recovery_decision(
     }
     std::str::from_utf8(bytes).map_err(|_| RecoveryDecisionFailureKind::InvalidUtf8)?;
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let candidate = RecoveryDecisionCandidate::deserialize(&mut deserializer)
-        .map_err(classify_decision_json_failure)?;
+    let candidate = (&mut deserializer)
+        .deserialize_map(RecoveryDecisionVisitor)
+        .map_err(|_| RecoveryDecisionFailureKind::InvalidJson)??;
     deserializer
         .end()
         .map_err(|_| RecoveryDecisionFailureKind::InvalidJson)?;
@@ -225,15 +226,15 @@ fn validate_decision_text(
     if value.is_empty() {
         return Err(empty);
     }
-    if value.len() > MAXIMUM_RECOVERY_DECISION_TEXT_BYTES {
+    if recovery_decision_text_is_too_long(value) {
         return Err(overlong);
     }
     Ok(())
 }
 
-const DUPLICATE_KEY_MARKER: &str = "SCHERZO_RECOVERY_DUPLICATE_KEY";
-const UNKNOWN_FIELD_MARKER: &str = "SCHERZO_RECOVERY_UNKNOWN_FIELD";
-const MISSING_FIELD_MARKER: &str = "SCHERZO_RECOVERY_MISSING_FIELD";
+pub(crate) fn recovery_decision_text_is_too_long(value: &str) -> bool {
+    value.chars().count() > MAXIMUM_RECOVERY_DECISION_TEXT_CODE_POINTS
+}
 
 struct RecoveryDecisionCandidate {
     schema_version: u64,
@@ -242,19 +243,10 @@ struct RecoveryDecisionCandidate {
     reason: String,
 }
 
-impl<'de> Deserialize<'de> for RecoveryDecisionCandidate {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(RecoveryDecisionVisitor)
-    }
-}
-
 struct RecoveryDecisionVisitor;
 
 impl<'de> Visitor<'de> for RecoveryDecisionVisitor {
-    type Value = RecoveryDecisionCandidate;
+    type Value = Result<RecoveryDecisionCandidate, RecoveryDecisionFailureKind>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a closed Recovery Decision Schema 1 object")
@@ -269,36 +261,38 @@ impl<'de> Visitor<'de> for RecoveryDecisionVisitor {
         let mut decision = None;
         let mut summary = None;
         let mut reason = None;
+        let mut rejection = None;
         while let Some(key) = map.next_key::<String>()? {
-            if !seen.insert(key.clone()) {
-                return Err(de::Error::custom(DUPLICATE_KEY_MARKER));
+            if rejection.is_some() || !seen.insert(key.clone()) {
+                rejection.get_or_insert(RecoveryDecisionFailureKind::DuplicateKey);
+                map.next_value::<IgnoredAny>()?;
+                continue;
             }
             match key.as_str() {
                 "schemaVersion" => schema_version = Some(map.next_value()?),
                 "decision" => decision = Some(map.next_value()?),
                 "summary" => summary = Some(map.next_value()?),
                 "reason" => reason = Some(map.next_value()?),
-                _ => return Err(de::Error::custom(UNKNOWN_FIELD_MARKER)),
+                _ => {
+                    rejection = Some(RecoveryDecisionFailureKind::UnknownField);
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
-        Ok(RecoveryDecisionCandidate {
-            schema_version: schema_version
-                .ok_or_else(|| de::Error::custom(MISSING_FIELD_MARKER))?,
-            decision: decision.ok_or_else(|| de::Error::custom(MISSING_FIELD_MARKER))?,
-            summary: summary.ok_or_else(|| de::Error::custom(MISSING_FIELD_MARKER))?,
-            reason: reason.ok_or_else(|| de::Error::custom(MISSING_FIELD_MARKER))?,
-        })
-    }
-}
-
-fn classify_decision_json_failure(failure: serde_json::Error) -> RecoveryDecisionFailureKind {
-    let message = failure.to_string();
-    if message.contains(DUPLICATE_KEY_MARKER) {
-        RecoveryDecisionFailureKind::DuplicateKey
-    } else if message.contains(UNKNOWN_FIELD_MARKER) {
-        RecoveryDecisionFailureKind::UnknownField
-    } else {
-        RecoveryDecisionFailureKind::InvalidJson
+        if let Some(rejection) = rejection {
+            return Ok(Err(rejection));
+        }
+        let (Some(schema_version), Some(decision), Some(summary), Some(reason)) =
+            (schema_version, decision, summary, reason)
+        else {
+            return Ok(Err(RecoveryDecisionFailureKind::InvalidJson));
+        };
+        Ok(Ok(RecoveryDecisionCandidate {
+            schema_version,
+            decision,
+            summary,
+            reason,
+        }))
     }
 }
 

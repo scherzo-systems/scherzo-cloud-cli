@@ -15,7 +15,6 @@ mod claude_code;
 pub(crate) mod claude_code_stream_json_v1;
 pub(crate) mod codex;
 pub(crate) mod codex_app_server_v1;
-pub(crate) mod command_contract;
 #[allow(
     dead_code,
     reason = "conditional syntax remains inert until the coordinated activation"
@@ -75,7 +74,6 @@ pub(crate) const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/workflow-v1.schema.json"
 ));
-pub(crate) const MAX_DECODE_DIAGNOSTIC_BYTES: usize = 96;
 pub(crate) const MAXIMUM_PARALLEL_STEPS: usize = 256;
 pub(crate) const MAXIMUM_RETAINED_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024;
 pub(crate) const RUN_LOG_BYTE_BUDGET: u64 = 64 * 1024 * 1024;

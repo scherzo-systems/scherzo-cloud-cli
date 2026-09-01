@@ -2686,7 +2686,7 @@ mod tests {
         let git = bin.join("git");
         fs::write(
             &git,
-            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      exec /bin/sleep 60\n      ;;\n  esac\ndone\nexit 2\n",
+            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      # Stop after publishing readiness so only managed cleanup can end the fixture.\n      kill -STOP \"$$\"\n      ;;\n  esac\ndone\nexit 2\n",
         )
         .unwrap();
         fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2703,24 +2703,28 @@ mod tests {
             }
             cancel.cancel();
         });
-        let environment = EnvironmentSnapshot::new([("PATH", bin.as_os_str())]);
+        let ambient_path = std::env::var_os("PATH").unwrap();
+        let search_path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(std::env::split_paths(&ambient_path)),
+        )
+        .unwrap();
+        let environment = EnvironmentSnapshot::new([("PATH", search_path)]);
         let started = crate::timing::monotonic_now();
 
-        assert!(matches!(
-            run_git_output(
-                temporary.path(),
-                &environment,
-                &[
-                    "status",
-                    "--porcelain=v1",
-                    "-z",
-                    "--untracked-files=normal",
-                    "--ignore-submodules=none",
-                ],
-                &cancellation,
-            ),
-            Err(MaterializationFailure::AssignmentFenced)
-        ));
+        let result = run_git_output(
+            temporary.path(),
+            &environment,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+            &cancellation,
+        );
+
+        assert_eq!(result, Err(MaterializationFailure::AssignmentFenced));
         assert!(crate::timing::elapsed(started) < Duration::from_secs(2));
         canceller.join().unwrap();
     }

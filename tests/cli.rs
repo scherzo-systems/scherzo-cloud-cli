@@ -11,17 +11,24 @@
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::process::{Command, Output};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 #[path = "cli/account_signup.rs"]
 mod account_signup;
+mod api_test_support {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/api/test_support.rs"
+    ));
+}
+use api_test_support::read_request;
 #[path = "cli/artifact_validate.rs"]
 mod artifact_validate;
 #[path = "cli/auth_login.rs"]
@@ -97,7 +104,7 @@ fn poll_until<T: std::fmt::Debug>(
     }
 }
 
-const ECHO_IDEMPOTENCY_KEY: &str = "{request-idempotency-key}";
+const ECHO_IDEMPOTENCY_KEY: &str = api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO;
 const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
 const DEPLOYMENT_VARIABLES: [&str; 4] = [
     "SCHERZO_CLOUD_API_URL",
@@ -304,57 +311,31 @@ fn fake_git(body: &str) -> tempfile::TempDir {
 
 struct OneShotServer {
     api_url: String,
-    request: Receiver<String>,
-    thread: JoinHandle<()>,
+    server: api_test_support::ScriptedHttpServer,
 }
 
 impl OneShotServer {
     fn respond(status: &str, content_type: Option<&str>, body: &[u8]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
-        let address = listener.local_addr().unwrap();
-        let content_type = content_type
-            .map(|value| format!("Content-Type: {value}\r\n"))
-            .unwrap_or_default();
-        let mut response = format!(
-            "HTTP/1.1 {status}\r\nConnection: close\r\n{content_type}Content-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(body);
-        let (sender, request) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("fixture request should arrive");
-            let request = read_request(&mut stream);
-            sender
-                .send(String::from_utf8(request).expect("request should be text"))
-                .unwrap();
-            stream.write_all(&response).unwrap();
-        });
-
+        let server = api_test_support::ScriptedHttpServer::respond(http_response(
+            status,
+            content_type,
+            body,
+        ));
         Self {
-            api_url: format!("http://{address}/api"),
-            request,
-            thread,
+            api_url: server.api_url.trim_end_matches('/').to_owned(),
+            server,
         }
     }
 
     fn finish(self) -> String {
-        let request = self
-            .request
-            .recv()
-            .expect("fixture should capture one request");
-        self.thread.join().expect("fixture server should stop");
-        request
+        self.server.finish_one()
     }
 }
 
 struct ScriptedServer {
     api_url: String,
     issuer: String,
-    requests: Receiver<String>,
-    thread: JoinHandle<()>,
-    remaining_requests: usize,
-    response_release: Option<mpsc::SyncSender<()>>,
+    server: api_test_support::ScriptedHttpServer,
 }
 
 impl ScriptedServer {
@@ -372,87 +353,35 @@ impl ScriptedServer {
     }
 
     fn start(responses: Vec<Vec<u8>>, pause_response: Option<usize>) -> Self {
-        let remaining_requests = responses.len();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
-        let address = listener.local_addr().unwrap();
-        let (sender, requests) = mpsc::channel();
-        let (response_release, mut release_receiver) = if pause_response.is_some() {
-            let (sender, receiver) = mpsc::sync_channel(0);
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
-        };
-        let thread = thread::spawn(move || {
-            for (index, response) in responses.into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().expect("fixture request should arrive");
-                let request =
-                    String::from_utf8(read_request(&mut stream)).expect("request should be text");
-                let response = response_for_request(response, &request);
-                sender.send(request).unwrap();
-                if pause_response == Some(index)
-                    && let Some(receiver) = release_receiver.take()
-                {
-                    receiver.recv().expect("paused response should be released");
-                }
-                let _ = stream.write_all(&response);
-            }
-        });
-
+        let server = api_test_support::ScriptedHttpServer::respond_in_sequence_with_pause(
+            responses,
+            pause_response,
+        );
+        let api_url = server.api_url.trim_end_matches('/').to_owned();
+        let issuer = format!(
+            "{}auth/",
+            server
+                .api_url
+                .strip_suffix("api/")
+                .expect("fixture API URL should end with api/")
+        );
         Self {
-            api_url: format!("http://{address}/api"),
-            issuer: format!("http://{address}/auth/"),
-            requests,
-            thread,
-            remaining_requests,
-            response_release,
+            api_url,
+            issuer,
+            server,
         }
     }
 
     fn next_request(&mut self) -> String {
-        let request = self
-            .requests
-            .recv()
-            .expect("fixture should capture request");
-        self.remaining_requests -= 1;
-        request
+        self.server.next_request()
     }
 
     fn release_paused_response(&mut self) {
-        self.response_release
-            .take()
-            .expect("fixture should have a paused response")
-            .send(())
-            .expect("paused response should be released");
+        self.server.release_response();
     }
 
-    fn finish(mut self) -> Vec<String> {
-        assert!(
-            self.response_release.is_none(),
-            "paused response should be released before finishing"
-        );
-        let mut requests = Vec::with_capacity(self.remaining_requests);
-        while self.remaining_requests > 0 {
-            requests.push(self.next_request());
-        }
-        self.thread.join().expect("fixture server should stop");
-        requests
-    }
-}
-
-fn response_for_request(response: Vec<u8>, request: &str) -> Vec<u8> {
-    if response
-        .windows(ECHO_IDEMPOTENCY_KEY.len())
-        .any(|window| window == ECHO_IDEMPOTENCY_KEY.as_bytes())
-    {
-        String::from_utf8(response)
-            .expect("an idempotency-echo response should be text")
-            .replace(
-                ECHO_IDEMPOTENCY_KEY,
-                header_value(request, "idempotency-key"),
-            )
-            .into_bytes()
-    } else {
-        response
+    fn finish(self) -> Vec<String> {
+        self.server.finish()
     }
 }
 
@@ -509,42 +438,6 @@ fn request_form(request: &str) -> std::collections::HashMap<String, String> {
     url::form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect()
-}
-
-fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    let mut expected_length = None;
-    loop {
-        let read = stream
-            .read(&mut buffer)
-            .expect("request should be readable");
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-            let body_start = header_end + 4;
-            let length = *expected_length.get_or_insert_with(|| {
-                String::from_utf8_lossy(&request[..body_start])
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|value| value.parse::<usize>().ok())
-                    })
-                    .unwrap_or_default()
-            });
-            if request.len() >= body_start + length {
-                break;
-            }
-        }
-        assert!(request.len() < 128 * 1024);
-    }
-    request
 }
 
 fn private_credential_directory() -> tempfile::TempDir {

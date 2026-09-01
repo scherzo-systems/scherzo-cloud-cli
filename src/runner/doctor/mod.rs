@@ -291,8 +291,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CheckDescriptor, DoctorCheck, Outcome, Registry, RegistryError, Report, Status,
-        built_in_registry,
+        CheckDescriptor, DoctorCheck, Outcome, Registry, RegistryError, Report, SelectionError,
+        Status, built_in_registry,
     };
 
     struct FakeCheck {
@@ -490,8 +490,8 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            error.to_string(),
-            "unknown runner doctor check 'extension.fixture.missing'; use 'scherzo-cloud runner doctor --list-checks' to list available checks"
+            error,
+            SelectionError::UnknownId("extension.fixture.missing".to_owned())
         );
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }

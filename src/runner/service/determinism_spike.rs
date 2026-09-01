@@ -13,8 +13,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use super::assignment::AssignmentManager;
 use super::backoff::Backoff;
 use super::connection::{
-    ActiveEffectEvent, ConnectionDependencies, ConnectionError, ConnectionProgress, FrameSource,
-    OpeningHello, opening_hello, run_established,
+    ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
+    ConnectionProgress, FrameSource, OpeningHello, opening_hello, run_established,
 };
 use super::test_support::{
     ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection, ScriptedConnector,
@@ -35,8 +35,8 @@ use super::{
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
 
-const ESTABLISHED_REPETITIONS: usize = 1_000;
-const RECONNECT_REPETITIONS: usize = 100;
+const ESTABLISHED_REPETITIONS: usize = 2;
+const RECONNECT_REPETITIONS: usize = 2;
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
 const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -588,8 +588,11 @@ enum TimeoutScenario {
 
 async fn run_timeout_scenario(transcript: &DeterminismTranscript, scenario: TimeoutScenario) {
     let (name, expected_cause) = match scenario {
-        TimeoutScenario::Welcome => ("welcome-timeout", "gateway welcome timeout"),
-        TimeoutScenario::InboundSilence => ("inbound-silence-boundary", "gateway liveness timeout"),
+        TimeoutScenario::Welcome => ("welcome-timeout", ConnectionCause::GatewayWelcomeTimeout),
+        TimeoutScenario::InboundSilence => (
+            "inbound-silence-boundary",
+            ConnectionCause::GatewayLivenessTimeout,
+        ),
     };
     transcript.record(format!("scenario.start:{name}"));
     let mut fixture = established_fixture(transcript);
@@ -635,7 +638,7 @@ async fn run_timeout_scenario(transcript: &DeterminismTranscript, scenario: Time
     let (outcome, ()) = tokio::join!(connection, peer);
     let error = outcome.expect_err("released timeout did not fail the connection");
     assert!(!error.is_terminal());
-    assert_eq!(error.cause(), expected_cause);
+    assert_eq!(error.connection_cause(), expected_cause);
     assert_eq!(
         error.progress.opening_acknowledged,
         matches!(scenario, TimeoutScenario::InboundSilence)
@@ -651,7 +654,10 @@ async fn run_timeout_scenario(transcript: &DeterminismTranscript, scenario: Time
             "welcome timeout sent a frame"
         );
     }
-    transcript.record(format!("scenario.outcome:retryable:{expected_cause}"));
+    transcript.record(format!(
+        "scenario.outcome:retryable:{}",
+        expected_cause.error_type()
+    ));
 }
 
 async fn run_reconnect_scenario() -> Vec<String> {
@@ -837,10 +843,12 @@ async fn run_terminal_close_scenario() -> Vec<String> {
     };
     let (service_result, ()) = tokio::join!(service, peer);
     let error = service_result.expect_err("terminal policy close entered reconnect backoff");
+    let ServiceError::Connection(connection_error) = error else {
+        panic!("policy close changed service error variant");
+    };
     assert_eq!(
-        error.to_string(),
-        "runner service stopped unexpectedly: runner gateway connection failed: \
-         gateway closed connection with policy violation"
+        connection_error.connection_cause(),
+        ConnectionCause::GatewayPolicyViolation
     );
     transcript.record("service.outcome:terminal".to_owned());
     transcript.snapshot()

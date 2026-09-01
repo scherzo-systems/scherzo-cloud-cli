@@ -418,6 +418,25 @@ fn handler_invocation_fixture() -> Value {
 }
 
 #[test]
+fn recovered_summary_accepts_schema_length_non_ascii_text() {
+    let mut result = recovered_result_fixture();
+    result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");
+    result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+        "kind": "cmd",
+        "invocationId": 2,
+        "outcome": "recheck",
+        "summary": "é".repeat(3_000),
+        "reason": "Verify the repair."
+    });
+    result["steps"][0]["invocations"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, handler_invocation_fixture());
+
+    assert!(decode(&encode(&result)).is_ok());
+}
+
+#[test]
 fn recovered_summary_rejects_a_handler_that_gave_up() {
     let mut result = recovered_result_fixture();
     result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");

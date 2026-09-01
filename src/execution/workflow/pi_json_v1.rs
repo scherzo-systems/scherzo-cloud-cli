@@ -20,6 +20,7 @@ use super::strict_json;
 
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(test)]
 const MAXIMUM_RESPONSE_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -206,6 +207,7 @@ pub(crate) struct PiJsonV1Parser {
 }
 
 impl PiJsonV1Parser {
+    #[cfg(test)]
     pub(crate) fn profile(expected_cwd: Arc<str>, value_kind: AgentValueKind) -> Self {
         let maximum_response_bytes =
             NonZeroU64::new(MAXIMUM_RESPONSE_BYTES).unwrap_or(NonZeroU64::MIN);

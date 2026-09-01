@@ -789,11 +789,9 @@ fn validate_handler_summary(
     match handler.outcome {
         RecoveryHandlerOutcomeV1::Recheck | RecoveryHandlerOutcomeV1::GaveUp => {
             if handler.summary.as_deref().is_none_or(|value| {
-                value.is_empty()
-                    || value.len() > super::recovery::MAXIMUM_RECOVERY_DECISION_TEXT_BYTES
+                value.is_empty() || super::recovery::recovery_decision_text_is_too_long(value)
             }) || handler.reason.as_deref().is_none_or(|value| {
-                value.is_empty()
-                    || value.len() > super::recovery::MAXIMUM_RECOVERY_DECISION_TEXT_BYTES
+                value.is_empty() || super::recovery::recovery_decision_text_is_too_long(value)
             }) || handler.failure.is_some()
             {
                 return Err(ResultMetadataError);

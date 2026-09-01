@@ -26,6 +26,54 @@ validation entrypoint and enter `scripts/strict-devenv` before its test logic ru
 must continue to run deterministic formatting checks, Clippy, unit and integration tests,
 dependency and import boundary validation, and a complete release build.
 
+## Rust CLI rules
+
+These rules apply the repository [pre-release compatibility policy](../AGENTS.md) to
+Rust; tracked legacy violations are cleanup work, not precedent for new code.
+
+- **Denied-lint gate ([LIV-2139]).** Treat an `#[allow]` or `#[expect]` on a denied lint
+  as a design defect to remove, not justify; repeated boilerplate reasons are not
+  accepted. Only a documented production clock-adapter or unsafe-FFI boundary may carry
+  a suppression, with a site-specific reason and named reviewer approval in the change
+  review.
+- **Test-seam gate ([LIV-2140], [LIV-2141], [LIV-2142]).** Do not put a `#[cfg(test)]`
+  field, parameter, constant value, or alternate body in a production type or function.
+  Inject a trait or closure that exists in both test and production builds.
+- **Async-executor gate ([LIV-2099], [LIV-2100], [LIV-2102], [LIV-2104]).** The runner
+  executes workflows on a current-thread Tokio runtime, while the human CLI workflow
+  runtime has two worker threads. Any `fsync`, directory removal, poll-sleep loop, or
+  synchronous socket write reachable from an `async fn` must run in `spawn_blocking` or
+  behind an event-driven boundary.
+- **Panic-policy gate ([LIV-2138]).** `unreachable!`, `assert!`, `todo!`, and
+  unwrap/expect equivalents all count as panics under the crate panic policy and must not
+  appear in production paths. Narrow the accepted type or state, or return a typed error.
+- **Boundary-error gate ([LIV-2119], [LIV-2123]).** Errors at OS and protocol boundaries
+  must carry the underlying error and the failed stage. `Result<_, ()>`, unit-struct
+  errors, and single-variant reason enums are not accepted.
+- **Test-value gate ([LIV-2125], [LIV-2135]).** A test that returns early when a fixture
+  is missing, asserts only `.is_err()`, or compares prose does not prove the claimed code
+  ran. Mark environment-dependent suites `#[ignore]` and run them with
+  `--include-ignored` where their dependency exists.
+- **Pre-release design gate ([LIV-2124]).** Do not add `_vN` module names, single-variant
+  profile enums, unread version fields, or callback-shaped return values without a
+  current second case. Remove unused shape instead of reserving it for hypothetical
+  compatibility.
+
+[LIV-2099]: https://linear.app/living-systems/issue/LIV-2099/move-the-child-guard-launch-handshake-and-durable-guard-writes-off-the
+[LIV-2100]: https://linear.app/living-systems/issue/LIV-2100/take-blocking-workspace-preparation-and-cleanup-off-the-runner
+[LIV-2102]: https://linear.app/living-systems/issue/LIV-2102/move-presentation-output-and-tui-drawing-off-the-workflow-executor
+[LIV-2104]: https://linear.app/living-systems/issue/LIV-2104/run-adapter-launch-preparation-off-the-tokio-runtime
+[LIV-2119]: https://linear.app/living-systems/issue/LIV-2119/carry-cause-context-in-local-run-directory-errors-and-split-attempt
+[LIV-2123]: https://linear.app/living-systems/issue/LIV-2123/give-adapter-launch-and-bridge-failures-typed-causes-and-a-tracing
+[LIV-2124]: https://linear.app/living-systems/issue/LIV-2124/simplify-the-agent-invocation-and-dispatch-abstractions-to-the-closed
+[LIV-2125]: https://linear.app/living-systems/issue/LIV-2125/make-harness-conformance-suites-fail-when-the-pinned-binary-is-absent
+[LIV-2135]: https://linear.app/living-systems/issue/LIV-2135/remove-prose-assertions-tooling-tests-and-soak-loops-from-the-cli-test
+[LIV-2138]: https://linear.app/living-systems/issue/LIV-2138/close-the-panic-lint-gap-for-unreachable-and-assert-in-production
+[LIV-2139]: https://linear.app/living-systems/issue/LIV-2139/remove-the-module-wide-dead-code-allow-on-execution-and-delete-what-it
+[LIV-2140]: https://linear.app/living-systems/issue/LIV-2140/replace-cfgtest-forks-in-the-runner-service-with-injected-seams
+[LIV-2141]: https://linear.app/living-systems/issue/LIV-2141/replace-cfgtest-forks-in-the-workflow-engine-with-injected-seams
+[LIV-2142]: https://linear.app/living-systems/issue/LIV-2142/replace-cfgtest-forks-in-artifact-staging-publication-and-the-tui-host
+
 ## Release policy
 
 Keep `release.toml` at schema 2 with only the static initial version, development

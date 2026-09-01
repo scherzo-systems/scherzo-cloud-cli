@@ -39,6 +39,19 @@ if [[ "$actual_rustc_version" != "$expected_rustc_version" ]]; then
   exit 1
 fi
 
+# The rest of the check suite compiles the complete workspace with the active
+# toolchain through clippy, the test builds, and the release build. When the
+# active rustc is the same release as the declared minimum, a second full
+# compile with the minimum toolchain proves nothing more, so skip it. The
+# compile still runs whenever the active toolchain is a different release
+# than rust-version, which is exactly when minimum-version coverage matters.
+active_rustc_version=$(rustc --version --verbose | awk '$1 == "release:" { print $2 }')
+if [[ "$active_rustc_version" == "$expected_rustc_version" ]]; then
+  printf 'Active Rust %s equals the declared minimum; the remaining suite compiles cover it.\n' \
+    "$active_rustc_version"
+  exit 0
+fi
+
 msrv_target_dir=${CARGO_TARGET_DIR:-$public_root/target}/msrv
 CARGO_TARGET_DIR="$msrv_target_dir" RUSTC="$SCHERZO_MSRV_RUSTC" \
   "$SCHERZO_MSRV_CARGO" check --locked --workspace --all-targets --all-features

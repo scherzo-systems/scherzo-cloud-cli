@@ -55,6 +55,10 @@ fn result_envelope(result: Value) -> String {
     json!({"result": serde_json::to_string(&result).unwrap()}).to_string()
 }
 
+fn rejection_reason(parser: &CodexAppServerV1Parser) -> Value {
+    serde_json::to_value(parser.protocol_rejection()).unwrap()["detail"]["reason"].clone()
+}
+
 fn feed(
     parser: &mut CodexAppServerV1Parser,
     mut value: Value,
@@ -460,41 +464,26 @@ fn matching_thread_notification_and_response_may_arrive_in_either_order() {
 }
 
 #[test]
-fn fresh_thread_accepts_absent_or_null_project_identity_and_rejects_assignment() {
-    let mut absent = parser(AgentValueKind::None, 1024, None);
-    initialize(&mut absent);
-    effective_config(&mut absent, "native-provider");
-    feed(&mut absent, thread_start_response("native-provider")).unwrap();
-
-    let mut null = parser(AgentValueKind::None, 1024, None);
-    initialize(&mut null);
-    effective_config(&mut null, "native-provider");
-    let mut notification = thread_started_notification();
-    notification["params"]["thread"]["projectId"] = Value::Null;
-    feed(&mut null, notification).unwrap();
-    let mut response = thread_start_response("native-provider");
-    response["result"]["thread"]["projectId"] = Value::Null;
-    feed(&mut null, response).unwrap();
-
+fn thread_start_enforces_identity_and_ignores_noncorrelation_schema_drift() {
     for notification_first in [false, true] {
-        let mut assigned = parser(AgentValueKind::None, 1024, None);
-        initialize(&mut assigned);
-        effective_config(&mut assigned, "native-provider");
-        let failure = if notification_first {
-            let mut notification = thread_started_notification();
-            notification["params"]["thread"]["projectId"] = json!("project-1");
-            feed(&mut assigned, notification).unwrap_err()
+        let mut parser = parser(AgentValueKind::None, 1024, None);
+        initialize(&mut parser);
+        effective_config(&mut parser, "native-provider");
+        let mut notification = thread_started_notification();
+        notification["params"]["thread"]["projectId"] = json!("project-1");
+        notification["params"]["thread"]["futureField"] = json!({"nested": true});
+        let mut response = thread_start_response("native-provider");
+        response["result"]["thread"]["projectId"] = json!("project-1");
+        response["result"]["thread"]["forkedFromId"] = json!("parent-thread");
+        response["result"]["thread"]["turns"] = json!([{"future": true}]);
+        response["result"]["futureField"] = json!(true);
+        if notification_first {
+            feed(&mut parser, notification).unwrap();
+            feed(&mut parser, response).unwrap();
         } else {
-            let mut response = thread_start_response("native-provider");
-            response["result"]["thread"]["projectId"] = json!("project-1");
-            feed(&mut assigned, response).unwrap_err()
-        };
-        assert_eq!(
-            failure,
-            AgentFailureCause::HarnessSetupFailed {
-                stage: AgentHarnessSetupStage::ThreadStart,
-            }
-        );
+            feed(&mut parser, response).unwrap();
+            feed(&mut parser, notification).unwrap();
+        }
     }
 }
 
@@ -1115,7 +1104,7 @@ fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
     };
     assert_eq!(response.as_str(), "ordinary");
 
-    for invalid in [
+    for additive in [
         json!({
             "method": "project/changed",
             "params": {"projectId": "project-1", "changeType": "renamed"},
@@ -1123,39 +1112,41 @@ fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
         }),
         json!({
             "method": "autoApprovalReview/strictReviewRequired",
-            "params": {"threadId": "other", "turnId": "turn-1", "startedAtMs": 19},
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 21,
+                "futureField": true,
+            },
             "emittedAtMs": 20,
         }),
         json!({
-            "method": "autoApprovalReview/strictReviewRequired",
-            "params": {"threadId": "thread-1", "turnId": "other", "startedAtMs": 19},
-            "emittedAtMs": 20,
-        }),
-        json!({
-            "method": "autoApprovalReview/strictReviewRequired",
-            "params": {"threadId": "thread-1", "turnId": "turn-1", "startedAtMs": 21},
+            "method": "thread/project/updated",
+            "params": {"threadId": "thread-1", "projectId": "project-1"},
             "emittedAtMs": 20,
         }),
     ] {
         let mut parser = running_parser(AgentValueKind::None, 1024);
-        assert_eq!(
-            feed(&mut parser, invalid).unwrap_err(),
-            AgentFailureCause::HarnessProtocolFailed
-        );
+        let (_, observations) = feed(&mut parser, additive).unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
     }
 
-    for project_id in [Value::Null, json!("project-1")] {
+    for mismatch in [
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {"threadId": "other", "turnId": "turn-1"},
+        }),
+        json!({
+            "method": "autoApprovalReview/strictReviewRequired",
+            "params": {"threadId": "thread-1", "turnId": "other"},
+        }),
+    ] {
         let mut parser = running_parser(AgentValueKind::None, 1024);
         assert_eq!(
-            feed(
-                &mut parser,
-                json!({
-                    "method": "thread/project/updated",
-                    "params": {"threadId": "thread-1", "projectId": project_id},
-                    "emittedAtMs": 20,
-                }),
-            )
-            .unwrap_err(),
+            feed(&mut parser, mismatch).unwrap_err(),
             AgentFailureCause::HarnessProtocolFailed
         );
     }
@@ -1599,16 +1590,26 @@ fn malformed_oversized_truncated_and_correlation_inputs_are_bounded_by_phase() {
 
     let mut diagnostic_limited = running_parser(AgentValueKind::None, 1024);
     diagnostic_limited.limits.maximum_retained_diagnostic_bytes = NonZeroU64::new(5).unwrap();
-    assert_eq!(
-        feed(
-            &mut diagnostic_limited,
-            json!({"method": "warning", "params": {
-                "threadId": "thread-1", "message": "123456"
-            }}),
-        )
-        .unwrap_err(),
-        AgentFailureCause::HarnessProtocolFailed,
-    );
+    let (_, observations) = feed(
+        &mut diagnostic_limited,
+        json!({"method": "warning", "params": {
+            "threadId": "thread-1", "message": "123456"
+        }}),
+    )
+    .unwrap();
+    assert!(matches!(
+        observations.as_slice(),
+        [AgentObservation::Diagnostic { message, .. }] if message.as_ref() == "12345"
+    ));
+    for diagnostic in [
+        json!({"method": "configWarning", "params": {"summary": "more"}}),
+        json!({"method": "mcpServer/startupStatus/updated", "params": {
+            "threadId": "thread-1", "name": "future", "status": "ready"
+        }}),
+    ] {
+        let (_, observations) = feed(&mut diagnostic_limited, diagnostic).unwrap();
+        assert!(observations.is_empty());
+    }
 
     let mut unsafe_diagnostic = running_parser(AgentValueKind::None, 1024);
     let (_, observations) = feed(
@@ -1623,6 +1624,123 @@ fn malformed_oversized_truncated_and_correlation_inputs_are_bounded_by_phase() {
         [AgentObservation::Diagnostic { message, .. }]
             if message.as_ref() == "unsafe\\u{1b}diagnostic"
     ));
+}
+
+#[test]
+fn malformed_diagnostic_payloads_are_observed_without_failing() {
+    for diagnostic in [
+        json!({"method": "warning"}),
+        json!({"method": "warning", "params": {
+            "threadId": "thread-1", "message": {"future": true}
+        }}),
+        json!({"method": "configWarning", "params": {
+            "summary": {"future": true}
+        }}),
+        json!({"method": "mcpServer/startupStatus/updated", "params": {
+            "threadId": "thread-1", "name": "future", "status": {"future": true}
+        }}),
+    ] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        let (_, observations) = feed(&mut parser, diagnostic).unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+    }
+
+    let mut mismatch = running_parser(AgentValueKind::None, 1024);
+    assert!(
+        feed(
+            &mut mismatch,
+            json!({"method": "warning", "params": {
+                "threadId": "other-thread", "message": "warning"
+            }}),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn protocol_rejections_identify_distinct_failure_conditions() {
+    let mut malformed = parser(AgentValueKind::None, 1024, None);
+    assert!(malformed.push_stdout(b"not-json\n", |_| {}).is_err());
+    assert_eq!(rejection_reason(&malformed), "frame_decode_failed");
+
+    let mut thread_mismatch = running_parser(AgentValueKind::None, 1024);
+    assert!(
+        feed(
+            &mut thread_mismatch,
+            json!({
+                "method": "future/notification",
+                "params": {"threadId": "other", "turnId": "turn-1"},
+            }),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        rejection_reason(&thread_mismatch),
+        "thread_correlation_invalid"
+    );
+
+    let mut item_mismatch = running_parser(AgentValueKind::None, 1024);
+    assert!(
+        feed(
+            &mut item_mismatch,
+            json!({
+                "id": "request",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "missing",
+                },
+            }),
+        )
+        .is_err()
+    );
+    assert_eq!(rejection_reason(&item_mismatch), "item_correlation_invalid");
+}
+
+#[test]
+fn turn_summary_rejection_is_not_replaced_by_nested_message_validation() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    feed(&mut parser, item_started("message", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("message", "settled response", json!("final_answer")),
+    )
+    .unwrap();
+    let summary = json!({
+        "id": "message",
+        "type": "agentMessage",
+        "text": "settled response",
+        "phase": "final_answer",
+    });
+    assert!(
+        feed(
+            &mut parser,
+            turn_completed(vec![summary.clone(), summary], "completed"),
+        )
+        .is_err()
+    );
+    assert_eq!(rejection_reason(&parser), "turn_summary_invalid");
+}
+
+#[test]
+fn completion_fallback_does_not_preempt_an_actual_adapter_failure() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    feed(&mut parser, turn_completed(Vec::new(), "completed")).unwrap();
+    parser.prepare_completion_rejection();
+    let _ = parser.failure_for(CodexAppServerV1RejectionReason::ProcessSettlementFailed);
+    assert_eq!(rejection_reason(&parser), "process_settlement_failed");
+}
+
+#[test]
+fn terminal_invariant_rejection_is_not_replaced_by_stale_parser_phase() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    assert!(matches!(parser.finish(true), AgentOutcome::Failed(_)));
+    parser.prepare_completion_rejection();
+    assert_eq!(rejection_reason(&parser), "terminal_invariant_invalid");
 }
 
 #[test]
@@ -1717,48 +1835,52 @@ fn bounded_native_error_prose_does_not_replace_structured_identity() {
 }
 
 #[test]
-fn schema_invalid_known_server_request_fails_closed() {
-    for (method, item_kind, params) in [
+fn declined_server_requests_enforce_only_correlation_identity() {
+    for (method, item_kind, params, expected) in [
         (
             "item/commandExecution/requestApproval",
-            Some("commandExecution"),
+            Some("reasoning"),
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "interactive",
+                "startedAtMs": "future-timestamp-shape",
+                "futureField": {"nested": true},
             }),
+            json!({"decision": "decline"}),
         ),
         (
             "item/fileChange/requestApproval",
-            Some("fileChange"),
+            Some("reasoning"),
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "interactive",
-                "startedAtMs": "not-an-integer",
+                "futureField": true,
             }),
+            json!({"decision": "decline"}),
         ),
         (
             "item/permissions/requestApproval",
-            Some("commandExecution"),
+            Some("reasoning"),
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "interactive",
-                "startedAtMs": 1,
-                "cwd": "/synthetic/project",
+                "permissions": "future-permission-shape",
             }),
+            json!({"permissions": {}}),
         ),
         (
             "item/tool/requestUserInput",
-            Some("commandExecution"),
+            Some("reasoning"),
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "interactive",
-                "isBlocking": true,
-                "questions": [{}],
+                "questions": "future-question-shape",
             }),
+            json!({"answers": {}}),
         ),
         (
             "mcpServer/elicitation/request",
@@ -1766,30 +1888,144 @@ fn schema_invalid_known_server_request_fails_closed() {
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
-                "serverName": "fixture-mcp",
-                "mode": "form",
-                "message": "fixture",
-                "requestedSchema": {"type": "object"},
+                "mode": "future-mode",
+                "futureField": true,
             }),
+            json!({"action": "decline"}),
         ),
     ] {
         let mut parser = running_parser(AgentValueKind::None, 1024);
         if let Some(item_kind) = item_kind {
             feed(&mut parser, item_started("interactive", item_kind)).unwrap();
         }
-        let request = feed(
+        let (_, observations) = feed(
             &mut parser,
             json!({
-                "id": "invalid-request",
+                "id": "additive-request",
                 "method": method,
                 "params": params,
+                "futureEnvelopeField": true,
             }),
-        );
-        assert!(
-            request.is_err(),
-            "a schema-invalid {method} request must fail closed: {request:?}",
+        )
+        .unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+        assert_eq!(
+            take_json(&mut parser),
+            json!({"id": "additive-request", "result": expected}),
+            "{method}",
         );
     }
+}
+
+#[test]
+fn unknown_notifications_and_requests_are_observed_without_settling() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    feed(&mut parser, item_started("active", "reasoning")).unwrap();
+    for event in [
+        json!({
+            "method": "future/notification",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "active",
+                "futureField": true,
+            },
+            "futureEnvelopeField": true,
+        }),
+        json!({
+            "id": "future-request",
+            "method": "future/request",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        }),
+    ] {
+        let (_, observations) = feed(&mut parser, event).unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+    }
+    assert_eq!(
+        take_json(&mut parser),
+        json!({
+            "id": "future-request",
+            "error": {"code": -32601, "message": "Method not found"},
+        }),
+    );
+}
+
+#[test]
+fn method_only_unknown_notifications_and_requests_are_observed() {
+    for (event, response) in [
+        (json!({"method": "future/notification"}), None),
+        (
+            json!({"id": "future-request", "method": "future/request"}),
+            Some(json!({
+                "id": "future-request",
+                "error": {"code": -32601, "message": "Method not found"},
+            })),
+        ),
+    ] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        let (_, observations) = feed(&mut parser, event).unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+        if let Some(response) = response {
+            assert_eq!(take_json(&mut parser), response);
+        }
+    }
+}
+
+#[test]
+fn relaxed_routes_reject_every_present_correlation_mismatch() {
+    let cases = [
+        (
+            "thread project turn",
+            json!({
+                "method": "thread/project/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "other-turn",
+                    "projectId": "project-1",
+                },
+            }),
+        ),
+        (
+            "thread project item",
+            json!({
+                "method": "thread/project/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "itemId": "other-item",
+                    "projectId": "project-1",
+                },
+            }),
+        ),
+        (
+            "MCP elicitation item",
+            json!({
+                "id": "mcp-request",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "other-item",
+                },
+            }),
+        ),
+    ];
+    let accepted = cases
+        .into_iter()
+        .filter_map(|(case, event)| {
+            let mut parser = running_parser(AgentValueKind::None, 1024);
+            feed(&mut parser, event).is_ok().then_some(case)
+        })
+        .collect::<Vec<_>>();
+    assert!(accepted.is_empty(), "accepted mismatches: {accepted:?}");
 }
 
 #[test]

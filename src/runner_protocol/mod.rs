@@ -188,6 +188,10 @@ pub(crate) enum ExecutionSpecInvalidReason {
     SourceCheckoutDirty,
     WorkflowSourceDigestMismatch,
     WorkflowSourceInvalid,
+    #[allow(
+        dead_code,
+        reason = "retained in the protocol taxonomy; workflow validation now rejects the local node-count case during source resolution"
+    )]
     WorkflowContractInvalid,
     WorkflowAdmissionInvalid,
     #[allow(

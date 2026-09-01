@@ -814,8 +814,10 @@ async fn transition_capacity_failure_quiesces_a_running_step() {
         tokio::pin!(execution);
         let result = tokio::select! {
             result = &mut execution => result,
-            command = accept_report(&listener) => {
-                let (control, _report) = command;
+            accepted = listener.accept() => {
+                let (control, _peer) = accepted.unwrap();
+                // The established connection is the fixture's readiness signal. Once the
+                // transition failure begins quiescence, termination may preempt its report.
                 let result = (&mut execution).await;
                 drop(control);
                 result

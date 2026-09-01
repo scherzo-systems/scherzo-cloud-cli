@@ -84,8 +84,7 @@ impl CoordinatorClock for PendingClock {
 
 #[derive(Clone)]
 struct ReleasedClock {
-    deadlines: mpsc::UnboundedSender<Duration>,
-    release: watch::Receiver<bool>,
+    deadlines: mpsc::UnboundedSender<(Duration, oneshot::Sender<()>)>,
 }
 
 // This clock carries Codex-specific stdin-deadline synchronization; sharing it with
@@ -99,12 +98,12 @@ impl CoordinatorClock for ReleasedClock {
     }
 
     async fn wait_until(&self, deadline: Self::Instant) {
-        let _ = self.deadlines.send(deadline);
-        let mut release = self.release.clone();
-        while !*release.borrow_and_update() {
-            if release.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
+        let (release, released) = oneshot::channel();
+        if self.deadlines.send((deadline, release)).is_err() {
+            std::future::pending::<()>().await;
+        }
+        if released.await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -262,6 +261,8 @@ struct ProcessFixture {
     process: PathBuf,
     ready: PathBuf,
     proceed: PathBuf,
+    write_deadline_released: PathBuf,
+    standard_input_closed: PathBuf,
     descendant: PathBuf,
     codex_home: PathBuf,
     diagnostic_session: PathBuf,
@@ -404,6 +405,8 @@ impl ProcessFixture {
         let process = controls.join("process.pid");
         let ready = controls.join("ready");
         let proceed = controls.join("proceed");
+        let write_deadline_released = controls.join("write-deadline-released");
+        let standard_input_closed = controls.join("standard-input-closed");
         let descendant = controls.join("descendant.pid");
         // Codex's exact process fixture owns its synthetic environment and controls;
         // sharing another profile's fixture would blur native launch evidence.
@@ -442,6 +445,14 @@ impl ProcessFixture {
             (
                 OsString::from("CODEX_FIXTURE_PROCEED"),
                 proceed.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CODEX_FIXTURE_WRITE_DEADLINE_RELEASED"),
+                write_deadline_released.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CODEX_FIXTURE_STANDARD_INPUT_CLOSED"),
+                standard_input_closed.as_os_str().to_owned(),
             ),
             (
                 OsString::from("CODEX_FIXTURE_DESCENDANT"),
@@ -564,6 +575,8 @@ impl ProcessFixture {
             process,
             ready,
             proceed,
+            write_deadline_released,
+            standard_input_closed,
             descendant,
             codex_home,
             diagnostic_session,
@@ -1373,24 +1386,50 @@ fn codex_process_fixture() {
         while !proceed.is_file() {
             crate::timing::sleep(Duration::from_millis(1));
         }
-        for id in 0..8_000_i64 {
-            write_server_frame(
-                &mut output,
-                json!({
-                    "id": id,
-                    "method": "item/commandExecution/requestApproval",
-                    "params": {
-                        "threadId": THREAD_ID,
-                        "turnId": TURN_ID,
-                        "itemId": "interactive-1",
-                        "startedAtMs": 1,
-                    },
-                }),
-            );
+        std::thread::spawn(move || {
+            for id in 0..8_000_i64 {
+                write_server_frame(
+                    &mut output,
+                    json!({
+                        "id": id,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {
+                            "threadId": THREAD_ID,
+                            "turnId": TURN_ID,
+                            "itemId": "interactive-1",
+                            "startedAtMs": 1,
+                        },
+                    }),
+                );
+            }
+            loop {
+                std::thread::park();
+            }
+        });
+        let closed =
+            PathBuf::from(std::env::var_os("CODEX_FIXTURE_STANDARD_INPUT_CLOSED").unwrap());
+        std::fs::write(&closed, b"monitoring\n").unwrap();
+        let released =
+            PathBuf::from(std::env::var_os("CODEX_FIXTURE_WRITE_DEADLINE_RELEASED").unwrap());
+        while !released.is_file() {
+            crate::timing::sleep(Duration::from_millis(1));
         }
+        let mut poll = [rustix::event::PollFd::new(
+            &input,
+            rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP,
+        )];
         loop {
-            std::thread::park();
+            rustix::event::poll(&mut poll, None).unwrap();
+            if poll[0]
+                .revents()
+                .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP)
+            {
+                break;
+            }
+            poll[0].clear_revents();
         }
+        std::fs::write(closed, b"closed\n").unwrap();
+        std::process::exit(0);
     }
 
     if let Some((method, kind, expected_result)) = match scenario.as_str() {
@@ -1495,13 +1534,10 @@ fn codex_process_fixture() {
                 "params": {"threadId": THREAD_ID, "turnId": TURN_ID},
             }),
         );
-        let interrupt = read_client_frame(&mut input, &mut capture);
-        assert_eq!(interrupt["id"], 5);
-        assert_eq!(interrupt["method"], "turn/interrupt");
-        assert_eq!(interrupt["params"]["threadId"], THREAD_ID);
-        assert_eq!(interrupt["params"]["turnId"], TURN_ID);
-        write_server_frame(&mut output, json!({"id": 5, "result": {}}));
-        send_turn_terminal(&mut output, "interrupted", vec![], None);
+        let response = read_client_frame(&mut input, &mut capture);
+        assert_eq!(response["id"], "unknown-request");
+        assert_eq!(response["error"]["code"], -32601);
+        send_turn_terminal(&mut output, "completed", vec![], None);
         expect_client_eof(&mut input);
         return;
     }
@@ -3042,8 +3078,14 @@ pub(super) mod structured_result {
             let (task, start, outcome) =
                 start_fixture_with_clock(invocation, fixture.diagnostics.clone(), clock);
             start.receive().await.unwrap();
-            assert_eq!(control.deadlines.recv().await, Some(Duration::from_secs(1)));
-            assert_eq!(control.deadlines.recv().await, Some(Duration::from_secs(1)));
+            let mut result_deadlines = 0;
+            while result_deadlines < 2 {
+                match control.deadlines.recv().await.unwrap() {
+                    deadline if deadline == STANDARD_INPUT_WRITE_TIMEOUT => {}
+                    deadline if deadline == Duration::from_secs(1) => result_deadlines += 1,
+                    deadline => panic!("unexpected Codex deadline: {deadline:?}"),
+                }
+            }
             control.expired.send_replace(true);
             task.await.unwrap();
             assert_eq!(
@@ -3199,20 +3241,20 @@ pub(super) mod unattended_requests {
     }
 
     #[tokio::test]
-    async fn unknown_request_interrupts_and_fails_after_quiescence() {
+    async fn unknown_request_is_declined_and_observed_without_failing() {
         with_watchdog(async {
             let fixture = ProcessFixture::new("unknown-request", AgentValueMode::None, 1024);
             let requests = fixture.requests.clone();
+            let observations = fixture.observations.clone();
             let process = fixture.process.clone();
             let (fixture, outcome, started) = run_fixture(fixture).await;
-            assert!(started);
-            assert_failure_cause(
-                outcome,
-                AgentFailureCause::HarnessProtocolFailed,
-                "unknown-request",
-            );
+            assert_completed_without_value(outcome, started);
             let requests = captured_requests(&requests);
-            assert_eq!(requests.last().unwrap()["method"], "turn/interrupt");
+            assert_eq!(requests.last().unwrap()["error"]["code"], -32601);
+            assert!(observations.snapshot().iter().any(|observation| matches!(
+                observation.observation(),
+                AgentObservation::UnrecognizedHarnessEvent { .. }
+            )));
             assert!(process_group_is_quiescent(fixture_process(&process)));
             drop(fixture);
         })
@@ -3335,17 +3377,20 @@ pub(super) mod adversarial_lifecycle {
     #[tokio::test]
     async fn malformed_output_after_a_candidate_never_commits() {
         with_watchdog(async {
-            for scenario in [
-                "malformed-after-output",
-                "invalid-utf8-after-output",
-                "truncated-after-output",
+            for (scenario, reason) in [
+                ("malformed-after-output", "frame_decode_failed"),
+                ("invalid-utf8-after-output", "frame_decode_failed"),
+                ("truncated-after-output", "partial_frame_at_end_of_stream"),
             ] {
                 let (fixture, outcome, started) = run_response_process(scenario, 1024).await;
                 assert!(started, "{scenario}: {outcome:?}");
                 assert_failure_cause(outcome, AgentFailureCause::HarnessProtocolFailed, scenario);
                 assert_fixture_quiescent(&fixture);
                 assert_no_native_rollout(&fixture);
-                assert!(fixture.protocol_rejection().is_file());
+                let rejection: Value =
+                    serde_json::from_slice(&std::fs::read(fixture.protocol_rejection()).unwrap())
+                        .unwrap();
+                assert_eq!(rejection["detail"]["reason"], reason, "{scenario}");
             }
         })
         .await;
@@ -3383,10 +3428,8 @@ pub(super) mod adversarial_lifecycle {
             let proceed = fixture.proceed.clone();
             let invocation = fixture.invocation.take().unwrap();
             let (deadline_sender, mut deadlines) = mpsc::unbounded_channel();
-            let (release, release_receiver) = watch::channel(false);
             let clock = ReleasedClock {
                 deadlines: deadline_sender,
-                release: release_receiver,
             };
             let (task, start, outcome) =
                 start_fixture_with_clock(invocation, fixture.diagnostics.clone(), clock);
@@ -3394,8 +3437,18 @@ pub(super) mod adversarial_lifecycle {
             wait_for_fixture_file(&ready).await;
             while deadlines.try_recv().is_ok() {}
             std::fs::write(proceed, b"proceed\n").unwrap();
-            assert_eq!(deadlines.recv().await, Some(Duration::from_secs(1)));
-            release.send(true).unwrap();
+            wait_for_fixture_bytes(&fixture.standard_input_closed, b"monitoring\n").await;
+            assert_ne!(STANDARD_INPUT_WRITE_TIMEOUT, POST_FAILURE_CLEANUP_TIMEOUT);
+            loop {
+                let (deadline, release) = deadlines.recv().await.unwrap();
+                if deadline == POST_FAILURE_CLEANUP_TIMEOUT {
+                    break;
+                }
+                assert_eq!(deadline, STANDARD_INPUT_WRITE_TIMEOUT);
+                let _ = release.send(());
+            }
+            std::fs::write(&fixture.write_deadline_released, b"released\n").unwrap();
+            wait_for_fixture_bytes(&fixture.standard_input_closed, b"closed\n").await;
 
             task.await.unwrap();
             assert_failure_cause(

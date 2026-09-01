@@ -35,9 +35,6 @@ use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
     MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
 };
-use crate::execution::workflow::command_contract::{
-    ServeWorkflowContractFailure, require_serve_workflow,
-};
 #[cfg(test)]
 use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
@@ -1099,7 +1096,6 @@ impl AdmissionRuntime {
         let prepared = (|| {
             authority.ensure_current()?;
             validate_carried_capacity(&offer.execution_spec, &workflow)?;
-            let workflow = require_serve_workflow(workflow).map_err(serve_contract_decline)?;
             let cloud_git_capture = git_capture.is_some();
             let context = build_execution_context(
                 &offer.execution_spec,
@@ -3229,10 +3225,6 @@ fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePol
 
 fn nonnegative(value: i64) -> Result<u64, WelcomePolicyFailure> {
     u64::try_from(value).map_err(|_| WelcomePolicyFailure::Invalid)
-}
-
-fn serve_contract_decline(_failure: ServeWorkflowContractFailure) -> AssignmentDecline {
-    AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowContractInvalid)
 }
 
 fn validate_execution_spec(

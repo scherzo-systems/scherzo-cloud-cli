@@ -415,7 +415,7 @@ fn describe_connection_outcome(
             } else {
                 "retryable"
             },
-            error.cause(),
+            error.connection_cause().error_type(),
             error.progress.opening_acknowledged,
             error.progress.handshake_completed,
         ),

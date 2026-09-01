@@ -533,7 +533,7 @@ fn explicit_yaml_core_tags_are_accepted() {
 }
 
 #[test]
-fn failures_are_classified_without_unbounded_dependency_diagnostics() {
+fn decode_failures_are_classified() {
     let failures = [
         decode(b"schemaVersion: [\n").unwrap_err(),
         decode(
@@ -549,11 +549,6 @@ fn failures_are_classified_without_unbounded_dependency_diagnostics() {
     assert_eq!(failures[0].kind(), DecodeFailureKind::MalformedYaml);
     assert_eq!(failures[1].kind(), DecodeFailureKind::ForbiddenYaml);
     assert_eq!(failures[2].kind(), DecodeFailureKind::StructuralContract);
-    for failure in failures {
-        assert!(failure.diagnostic().len() <= MAX_DECODE_DIAGNOSTIC_BYTES);
-        assert!(failure.to_string().len() <= MAX_DECODE_DIAGNOSTIC_BYTES);
-    }
-
     assert_eq!(
         decode(b"schemaVersion: \xff").unwrap_err().kind(),
         DecodeFailureKind::MalformedYaml

@@ -1168,6 +1168,24 @@ exports:
 }
 
 #[test]
+fn existing_run_directory_diagnostic_names_requested_path() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run_directory = bundle.result("existing-run");
+    fs::create_dir(&run_directory).unwrap();
+
+    let output = run(&bundle.args(&run_directory));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(run_directory.to_str().unwrap()),
+        "diagnostic omitted the requested run path"
+    );
+}
+
+#[test]
 fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",

@@ -18,7 +18,10 @@ use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, oneshot};
 
 use super::input::initial_turn_input;
-use super::{CodexAppServerV1Parser, CodexAppServerV1ProtocolLimits, ParserProgress};
+use super::{
+    CodexAppServerV1Parser, CodexAppServerV1ProtocolLimits, CodexAppServerV1RejectionReason,
+    ParserProgress,
+};
 use crate::execution::codex::{CodexCompatibilityProfile, compatibility_profile_for_version};
 use crate::execution::workflow::admission::CancellationSource;
 use crate::execution::workflow::agent::{
@@ -265,9 +268,17 @@ where
             parser,
             process_directives,
             result_validator,
-            ResultSettlementConfiguration {
+            ProcessTimingConfiguration {
                 clock: self.clock.clone(),
-                grace: invocation.limits().result_settlement_grace(),
+                result_settlement_grace: invocation.limits().result_settlement_grace(),
+                standard_input_write_timeout: invocation
+                    .limits()
+                    .adapter_protocol()
+                    .standard_input_write_timeout(),
+                post_failure_cleanup_timeout: invocation
+                    .limits()
+                    .adapter_protocol()
+                    .post_failure_cleanup_timeout(),
             },
         )
         .await;
@@ -574,9 +585,11 @@ where
         .collect()
 }
 
-struct ResultSettlementConfiguration<Clock> {
+struct ProcessTimingConfiguration<Clock> {
     clock: Clock,
-    grace: PositiveDuration,
+    result_settlement_grace: PositiveDuration,
+    standard_input_write_timeout: Duration,
+    post_failure_cleanup_timeout: Duration,
 }
 
 type ResultSettlementWait = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -588,7 +601,7 @@ async fn drive_process<Clock, Worker, Sink>(
     mut parser: CodexAppServerV1Parser,
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
     mut result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
-    settlement: ResultSettlementConfiguration<Clock>,
+    timing: ProcessTimingConfiguration<Clock>,
 ) -> AgentOutcome
 where
     Clock: CoordinatorClock,
@@ -624,18 +637,23 @@ where
     let mut cleanup_deadline_armed = false;
     let mut cleanup_deadline: Pin<Box<dyn Future<Output = ()> + Send>> =
         Box::pin(std::future::pending());
-    let write_grace = settlement.grace.get();
+    let write_timeout = timing.standard_input_write_timeout;
+    let cleanup_timeout = timing.post_failure_cleanup_timeout;
     let mut result_settlement_wait: Option<ResultSettlementWait> = None;
-    let mut clock = settlement.clock.clone();
-    let mut process_group_probe_clock = settlement.clock.clone();
+    let mut clock = timing.clock.clone();
+    let mut process_group_probe_clock = timing.clock.clone();
 
     if let Err(cause) =
-        write_pending_frames(&mut standard_input, &mut parser, &mut clock, write_grace).await
+        write_pending_frames(&mut standard_input, &mut parser, &mut clock, write_timeout).await
     {
         failure = Some(cause);
         parser_enabled = false;
-        standard_input.take();
-        child.force_process_group();
+        let deadline = clock.now() + cleanup_timeout;
+        let deadline_clock = clock.clone();
+        cleanup_deadline = Box::pin(async move {
+            deadline_clock.wait_until(deadline).await;
+        });
+        cleanup_deadline_armed = true;
     }
 
     let accepted_cancellation = cancellation.wait_for_cancellation();
@@ -658,7 +676,7 @@ where
                         &mut standard_input,
                         &mut parser,
                         &mut clock,
-                        write_grace,
+                        write_timeout,
                     )
                     .await
                     .is_err()
@@ -681,7 +699,7 @@ where
                             &mut standard_input,
                             &mut parser,
                             &mut clock,
-                            write_grace,
+                            write_timeout,
                         )
                         .await
                         .is_err()
@@ -718,7 +736,7 @@ where
                                             &mut standard_input,
                                             &mut parser,
                                             &mut clock,
-                                            write_grace,
+                                            write_timeout,
                                         )
                                         .await
                                         .is_err()
@@ -730,6 +748,9 @@ where
                                 }
                                 if cancelled.is_none() && progress.start_acknowledged {
                                     if start_reported || started.report().is_err() {
+                                        parser.record_rejection(
+                                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
+                                        );
                                         failure = Some(AgentFailureCause::HarnessSetupFailed {
                                             stage: AgentHarnessSetupStage::StartAcknowledgement,
                                         });
@@ -743,7 +764,9 @@ where
                                     && cancelled.is_none()
                                     && emit_observations(invocation, observations).await.is_err()
                                 {
-                                    failure = Some(parser.failure_for_current_phase());
+                                    failure = Some(parser.failure_for(
+                                        CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
+                                    ));
                                     parser_enabled = false;
                                     child.force_process_group();
                                 }
@@ -752,12 +775,17 @@ where
                                         &mut standard_input,
                                         &mut parser,
                                         &mut clock,
-                                        write_grace,
+                                        write_timeout,
                                     ).await
                                 {
                                     if cancelled.is_none() {
                                         failure = Some(cause);
-                                        child.force_process_group();
+                                        let deadline = clock.now() + cleanup_timeout;
+                                        let deadline_clock = clock.clone();
+                                        cleanup_deadline = Box::pin(async move {
+                                            deadline_clock.wait_until(deadline).await;
+                                        });
+                                        cleanup_deadline_armed = true;
                                     }
                                     parser_enabled = false;
                                 }
@@ -765,7 +793,9 @@ where
                                     && close_standard_input(&mut standard_input).await.is_err()
                                 {
                                     if cancelled.is_none() {
-                                        failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                                        failure = Some(parser.failure_for(
+                                            CodexAppServerV1RejectionReason::StandardInputCloseFailed,
+                                        ));
                                         child.force_process_group();
                                     }
                                     parser_enabled = false;
@@ -777,6 +807,9 @@ where
                                     && parser.start_acknowledged()
                                 {
                                     if started.report().is_err() {
+                                        parser.record_rejection(
+                                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
+                                        );
                                         cause = AgentFailureCause::HarnessSetupFailed {
                                             stage: AgentHarnessSetupStage::StartAcknowledgement,
                                         };
@@ -787,7 +820,9 @@ where
                                 if cancelled.is_none()
                                     && emit_observations(invocation, observations).await.is_err()
                                 {
-                                    cause = parser.failure_for_current_phase();
+                                    cause = parser.failure_for(
+                                        CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
+                                    );
                                 }
                                 parser.prevent_value_commit();
                                 let _ = parser.request_turn_interrupt();
@@ -795,15 +830,14 @@ where
                                     &mut standard_input,
                                     &mut parser,
                                     &mut clock,
-                                    write_grace,
+                                    write_timeout,
                                 )
                                 .await;
                                 let _ = close_standard_input(&mut standard_input).await;
                                 parser_enabled = false;
                                 if cancelled.is_none() {
                                     failure = Some(cause);
-                                    let deadline = clock.now()
-                                        + invocation.limits().result_settlement_grace().get();
+                                    let deadline = clock.now() + cleanup_timeout;
                                     let deadline_clock = clock.clone();
                                     cleanup_deadline = Box::pin(async move {
                                         deadline_clock.wait_until(deadline).await;
@@ -818,7 +852,9 @@ where
                     Err(_) => {
                         standard_output_closed = true;
                         if parser_enabled {
-                            failure = Some(parser.failure_for_current_phase());
+                            failure = Some(parser.failure_for(
+                                CodexAppServerV1RejectionReason::ProcessOutputReadFailed,
+                            ));
                             parser_enabled = false;
                             child.force_process_group();
                         }
@@ -831,7 +867,9 @@ where
                     Err(()) => {
                         wait_failed = true;
                         if cancelled.is_none() {
-                            failure.get_or_insert_with(|| parser.failure_for_current_phase());
+                            failure.get_or_insert_with(|| {
+                                parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed)
+                            });
                         }
                         parser_enabled = false;
                         child.force_process_group();
@@ -855,7 +893,9 @@ where
 
         if parser_enabled && let Some(candidate) = parser.take_result_candidate() {
             let Some(validator) = result_validator.as_mut() else {
-                failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                failure = Some(
+                    parser.failure_for(CodexAppServerV1RejectionReason::ResultValidatorMissing),
+                );
                 parser_enabled = false;
                 standard_input.take();
                 child.force_process_group();
@@ -893,14 +933,19 @@ where
             };
             if let Some((progress, observations, accepted)) = progress {
                 if emit_observations(invocation, observations).await.is_err() {
-                    failure = Some(parser.failure_for_current_phase());
+                    failure =
+                        Some(parser.failure_for(
+                            CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
+                        ));
                     parser_enabled = false;
                     standard_input.take();
                     child.force_process_group();
                 } else {
                     if accepted {
-                        let mut settlement_clock = settlement.clock.clone();
-                        let deadline = settlement_clock.now().add(settlement.grace.get());
+                        let mut settlement_clock = timing.clock.clone();
+                        let deadline = settlement_clock
+                            .now()
+                            .add(timing.result_settlement_grace.get());
                         result_settlement_wait = Some(Box::pin(async move {
                             settlement_clock.wait_until(deadline).await;
                         }));
@@ -910,7 +955,7 @@ where
                         &mut standard_input,
                         &mut parser,
                         &mut clock,
-                        write_grace,
+                        write_timeout,
                     )
                     .await
                     {
@@ -947,30 +992,37 @@ where
     if cancelled.is_none() {
         cancelled = cancellation.cancellation_reason();
     }
-    let protocol_rejection = parser.protocol_rejection();
+    if cancelled.is_none() && failure.is_none() {
+        let settlement_failed = wait_failed
+            || !supervisor_quiesced
+            || !process_group_is_quiescent(process_group)
+            || !standard_output_closed
+            || emit_observations(
+                invocation,
+                vec![AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::HarnessQuiescent,
+                }],
+            )
+            .await
+            .is_err();
+        if settlement_failed {
+            failure =
+                Some(parser.failure_for(CodexAppServerV1RejectionReason::ProcessSettlementFailed));
+        } else if process_completion.is_none() {
+            failure = Some(parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed));
+        }
+    }
     let outcome = if let Some(reason) = cancelled {
         AgentOutcome::Cancelled { reason }
     } else if let Some(cause) = failure {
         failed_agent_outcome(cause)
-    } else if wait_failed
-        || !supervisor_quiesced
-        || !process_group_is_quiescent(process_group)
-        || !standard_output_closed
-        || emit_observations(
-            invocation,
-            vec![AgentObservation::Lifecycle {
-                milestone: AgentLifecycleMilestone::HarnessQuiescent,
-            }],
-        )
-        .await
-        .is_err()
-    {
-        failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
     } else if let Some(status) = process_completion {
         parser.finish(status.success())
     } else {
-        failed_agent_outcome(parser.failure_for_current_phase())
+        failed_agent_outcome(parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed))
     };
+    parser.prepare_completion_rejection();
+    let protocol_rejection = parser.protocol_rejection();
     match outcome {
         AgentOutcome::Failed(failure)
             if matches!(
@@ -992,14 +1044,14 @@ async fn begin_cooperative_interrupt<Clock: CoordinatorClock>(
     standard_input: &mut Option<UnixStream>,
     parser: &mut CodexAppServerV1Parser,
     clock: &mut Clock,
-    write_grace: Duration,
+    write_timeout: Duration,
 ) -> Result<(), AgentFailureCause> {
     let active_turn = parser.request_turn_interrupt()?;
-    write_pending_frames(standard_input, parser, clock, write_grace).await?;
+    write_pending_frames(standard_input, parser, clock, write_timeout).await?;
     if !active_turn {
-        close_standard_input(standard_input)
-            .await
-            .map_err(|()| parser.failure_for_current_phase())?;
+        close_standard_input(standard_input).await.map_err(|()| {
+            parser.failure_for(CodexAppServerV1RejectionReason::StandardInputCloseFailed)
+        })?;
     }
     Ok(())
 }
@@ -1012,14 +1064,14 @@ async fn apply_result_progress<Clock: CoordinatorClock>(
     standard_input: &mut Option<UnixStream>,
     parser: &mut CodexAppServerV1Parser,
     clock: &mut Clock,
-    write_grace: Duration,
+    write_timeout: Duration,
 ) -> Result<(), AgentFailureCause> {
     let progress = progress?;
-    write_pending_frames(standard_input, parser, clock, write_grace).await?;
+    write_pending_frames(standard_input, parser, clock, write_timeout).await?;
     if progress.close_standard_input {
-        close_standard_input(standard_input)
-            .await
-            .map_err(|()| AgentFailureCause::HarnessProtocolFailed)?;
+        close_standard_input(standard_input).await.map_err(|()| {
+            parser.failure_for(CodexAppServerV1RejectionReason::StandardInputCloseFailed)
+        })?;
     }
     Ok(())
 }
@@ -1045,10 +1097,9 @@ async fn write_pending_frames<Clock: CoordinatorClock>(
     standard_input: &mut Option<UnixStream>,
     parser: &mut CodexAppServerV1Parser,
     clock: &mut Clock,
-    write_grace: Duration,
+    write_timeout: Duration,
 ) -> Result<(), AgentFailureCause> {
-    let failure = parser.failure_for_current_phase();
-    let deadline = clock.now() + write_grace;
+    let deadline = clock.now() + write_timeout;
     let deadline_clock = clock.clone();
     let write = async {
         while let Some(frame) = parser.take_outbound() {
@@ -1059,23 +1110,32 @@ async fn write_pending_frames<Clock: CoordinatorClock>(
         }
         Ok(())
     };
-    tokio::select! {
+    let (result, reason) = tokio::select! {
         biased;
-        result = write => result.map_err(|()| failure.clone()),
-        () = deadline_clock.wait_until(deadline) => Err(failure),
+        result = write => (result, CodexAppServerV1RejectionReason::StandardInputWriteFailed),
+        () = deadline_clock.wait_until(deadline) => (
+            Err(()),
+            CodexAppServerV1RejectionReason::StandardInputWriteTimedOut,
+        ),
+    };
+    if result.is_ok() {
+        return Ok(());
     }
+    let failure = parser.failure_for(reason);
+    let _ = close_standard_input(standard_input).await;
+    Err(failure)
 }
 
 // Codex closes this stream only after its native terminal frame; keeping the helper local
 // prevents another streaming profile from acquiring that protocol transition.
 // jscpd:ignore-start
 async fn close_standard_input(standard_input: &mut Option<UnixStream>) -> Result<(), ()> {
-    let Some(mut input) = standard_input.take() else {
+    let Some(input) = standard_input.take() else {
         return Ok(());
     };
-    match input.shutdown().await {
+    match rustix::net::shutdown(&input, rustix::net::Shutdown::Write) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(error) if error == rustix::io::Errno::NOTCONN => Ok(()),
         Err(_) => Err(()),
     }
 }

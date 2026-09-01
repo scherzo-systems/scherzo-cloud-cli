@@ -50,10 +50,7 @@ impl LeaseInstant {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "operator and deterministic lease-clock evidence use elapsed samples"
-    )]
+    #[cfg(test)]
     pub(super) fn checked_duration_since(self, earlier: Self) -> Result<Duration, LeaseClockError> {
         self.require_same_domain(earlier)?;
         let nanoseconds = self
@@ -81,12 +78,9 @@ fn duration_nanoseconds(duration: Duration) -> Result<u64, LeaseClockError> {
     u64::try_from(duration.as_nanos()).map_err(|_| LeaseClockError::ArithmeticOverflow)
 }
 
-#[allow(
-    dead_code,
-    reason = "unsupported targets fail closed in their platform implementation"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LeaseClockError {
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
     UnsupportedPlatform,
     ClockUnavailable,
     TimerUnavailable,
@@ -98,6 +92,10 @@ pub(crate) enum LeaseClockError {
 impl std::fmt::Display for LeaseClockError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            #[cfg(not(any(
+                target_os = "linux",
+                all(target_os = "macos", target_arch = "aarch64")
+            )))]
             Self::UnsupportedPlatform => {
                 "suspend-aware lease clock is unsupported on this platform"
             }
@@ -382,10 +380,7 @@ pub(super) struct LeaseWaitCancellation {
 }
 
 impl LeaseWaitCancellation {
-    #[allow(
-        dead_code,
-        reason = "operator and deterministic tests cancel armed native waits"
-    )]
+    #[cfg(test)]
     pub(super) fn cancel(&self) {
         if !self.cancelled.swap(true, AtomicOrdering::AcqRel) {
             self.changed.notify_waiters();

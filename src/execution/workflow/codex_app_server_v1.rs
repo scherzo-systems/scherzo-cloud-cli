@@ -1,9 +1,11 @@
 pub(crate) mod adapter;
 mod input;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
@@ -22,6 +24,8 @@ const MAXIMUM_CORRELATION_BYTES: u64 = 64 * 1024;
 const MAXIMUM_RETAINED_AGENT_MESSAGE_BYTES: u64 = MAXIMUM_FRAME_BYTES;
 const MAXIMUM_RETAINED_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
 const MAXIMUM_IDENTITY_BYTES: usize = 256;
+const STANDARD_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const POST_FAILURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZE_REQUEST_ID: RequestId = RequestId(1);
 const CONFIG_READ_REQUEST_ID: RequestId = RequestId(2);
 const THREAD_START_REQUEST_ID: RequestId = RequestId(3);
@@ -38,6 +42,8 @@ pub(crate) struct CodexAppServerV1ProtocolLimits {
     maximum_correlation_bytes: NonZeroU64,
     maximum_retained_agent_message_bytes: NonZeroU64,
     maximum_retained_diagnostic_bytes: NonZeroU64,
+    standard_input_write_timeout: Duration,
+    post_failure_cleanup_timeout: Duration,
 }
 
 impl CodexAppServerV1ProtocolLimits {
@@ -65,6 +71,8 @@ impl CodexAppServerV1ProtocolLimits {
             maximum_correlation_bytes,
             maximum_retained_agent_message_bytes,
             maximum_retained_diagnostic_bytes,
+            standard_input_write_timeout: STANDARD_INPUT_WRITE_TIMEOUT,
+            post_failure_cleanup_timeout: POST_FAILURE_CLEANUP_TIMEOUT,
         }
     }
 
@@ -78,6 +86,8 @@ impl CodexAppServerV1ProtocolLimits {
             maximum_correlation_bytes,
             maximum_retained_agent_message_bytes: maximum_frame_bytes,
             maximum_retained_diagnostic_bytes: maximum_frame_bytes,
+            standard_input_write_timeout: STANDARD_INPUT_WRITE_TIMEOUT,
+            post_failure_cleanup_timeout: POST_FAILURE_CLEANUP_TIMEOUT,
         }
     }
 
@@ -87,6 +97,14 @@ impl CodexAppServerV1ProtocolLimits {
 
     pub(crate) const fn maximum_correlation_bytes(self) -> NonZeroU64 {
         self.maximum_correlation_bytes
+    }
+
+    pub(crate) const fn standard_input_write_timeout(self) -> Duration {
+        self.standard_input_write_timeout
+    }
+
+    pub(crate) const fn post_failure_cleanup_timeout(self) -> Duration {
+        self.post_failure_cleanup_timeout
     }
 }
 
@@ -167,8 +185,56 @@ pub(crate) struct CodexAppServerV1ProtocolRejection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum CodexAppServerV1RejectionReason {
-    ProtocolInvariantInvalid,
+pub(super) enum CodexAppServerV1RejectionReason {
+    FrameEmpty,
+    FrameTooLarge,
+    FrameDecodeFailed,
+    FrameNotObject,
+    JsonRpcEnvelopeUnsupported,
+    FrameEnvelopeInvalid,
+    ResponseEnvelopeInvalid,
+    ResponseCorrelationInvalid,
+    ResponseRejected,
+    ResponseTransitionInvalid,
+    InitializationResponseInvalid,
+    ConfigurationResponseInvalid,
+    EffectiveInstructionsInvalid,
+    ThreadStartResponseInvalid,
+    ThreadCorrelationInvalid,
+    TurnStartResponseInvalid,
+    TurnCorrelationInvalid,
+    ServerRequestEnvelopeInvalid,
+    ServerRequestRepeated,
+    ServerRequestCorrelationInvalid,
+    NotificationEnvelopeInvalid,
+    NotificationTransitionInvalid,
+    ItemCorrelationInvalid,
+    ItemTransitionInvalid,
+    MessageInvalid,
+    UsageInvalid,
+    HookCorrelationInvalid,
+    HookTransitionInvalid,
+    NativeErrorInvalid,
+    TurnCompletionInvalid,
+    TurnSummaryInvalid,
+    ResultEnvelopeInvalid,
+    ResultTransitionInvalid,
+    IdentityInvalid,
+    RetainedCorrelationLimitExceeded,
+    RetainedAgentMessageLimitExceeded,
+    OutboundLimitExceeded,
+    OutboundTransitionInvalid,
+    PartialFrameAtEndOfStream,
+    TerminalInvariantInvalid,
+    StandardInputWriteFailed,
+    StandardInputWriteTimedOut,
+    StandardInputCloseFailed,
+    ObservationDeliveryFailed,
+    StartAcknowledgementFailed,
+    ProcessOutputReadFailed,
+    ProcessWaitFailed,
+    ProcessSettlementFailed,
+    ResultValidatorMissing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
@@ -326,6 +392,9 @@ pub(super) struct CodexAppServerV1Parser {
     pending_result_candidate: Option<Arc<Value>>,
     accepted_result: Option<CapturedJson>,
     native_terminal: Option<NativeTerminal>,
+    active_rejection_reason: Cell<CodexAppServerV1RejectionReason>,
+    rejection_reason: Cell<Option<CodexAppServerV1RejectionReason>>,
+    completion_rejection_reason: Cell<Option<CodexAppServerV1RejectionReason>>,
     failure: Option<AgentFailureCause>,
     observations: Vec<AgentObservation>,
 }
@@ -393,6 +462,11 @@ impl CodexAppServerV1Parser {
             pending_result_candidate: None,
             accepted_result: None,
             native_terminal: None,
+            active_rejection_reason: Cell::new(
+                CodexAppServerV1RejectionReason::OutboundTransitionInvalid,
+            ),
+            rejection_reason: Cell::new(None),
+            completion_rejection_reason: Cell::new(None),
             failure: None,
             observations: Vec::new(),
         };
@@ -423,6 +497,7 @@ impl CodexAppServerV1Parser {
     }
 
     pub(super) fn request_turn_interrupt(&mut self) -> Result<bool, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::OutboundTransitionInvalid);
         self.prevent_value_commit();
         if self.interrupt_requested
             || !matches!(
@@ -466,7 +541,8 @@ impl CodexAppServerV1Parser {
         result: CapturedJson,
     ) -> Result<ParserProgress, AgentFailureCause> {
         if !self.result_validation_is_ready() {
-            return self.fail_current_phase();
+            return self
+                .fail_current_phase(CodexAppServerV1RejectionReason::ResultTransitionInvalid);
         }
         self.accepted_result = Some(result);
         self.completed_items.clear();
@@ -484,7 +560,8 @@ impl CodexAppServerV1Parser {
         feedback: Arc<str>,
     ) -> Result<ParserProgress, AgentFailureCause> {
         if !self.result_validation_is_ready() {
-            return self.fail_current_phase();
+            return self
+                .fail_current_phase(CodexAppServerV1RejectionReason::ResultTransitionInvalid);
         }
         if self.correction_turns_started >= MAXIMUM_CORRECTION_TURNS {
             self.completed_items.clear();
@@ -521,9 +598,25 @@ impl CodexAppServerV1Parser {
             && self.native_terminal == Some(NativeTerminal::Completed)
     }
 
+    pub(super) fn prepare_completion_rejection(&self) {
+        if self.completion_rejection_reason.get().is_none() {
+            let reason = if self.frame.is_empty() {
+                CodexAppServerV1RejectionReason::TerminalInvariantInvalid
+            } else {
+                CodexAppServerV1RejectionReason::PartialFrameAtEndOfStream
+            };
+            self.completion_rejection_reason.set(Some(reason));
+        }
+    }
+
     fn protocol_rejection(&self) -> AgentProtocolRejectionDiagnostic {
+        let reason = self
+            .rejection_reason
+            .get()
+            .or(self.completion_rejection_reason.get())
+            .unwrap_or(CodexAppServerV1RejectionReason::TerminalInvariantInvalid);
         AgentProtocolRejectionDiagnostic::codex_app_server_v1(CodexAppServerV1ProtocolRejection {
-            reason: CodexAppServerV1RejectionReason::ProtocolInvariantInvalid,
+            reason,
             stage: self.state.protocol_stage(),
             thread_established: self.thread_id.is_some(),
             turn_established: self.turn_id.is_some(),
@@ -531,7 +624,27 @@ impl CodexAppServerV1Parser {
         })
     }
 
+    fn prepare_rejection(&self, reason: CodexAppServerV1RejectionReason) {
+        self.active_rejection_reason.set(reason);
+    }
+
+    pub(super) fn record_rejection(&self, reason: CodexAppServerV1RejectionReason) {
+        if self.rejection_reason.get().is_none() {
+            self.rejection_reason.set(Some(reason));
+        }
+    }
+
+    pub(super) fn failure_for(&self, reason: CodexAppServerV1RejectionReason) -> AgentFailureCause {
+        self.record_rejection(reason);
+        self.phase_failure_cause()
+    }
+
     pub(super) fn failure_for_current_phase(&self) -> AgentFailureCause {
+        self.record_rejection(self.active_rejection_reason.get());
+        self.phase_failure_cause()
+    }
+
+    fn phase_failure_cause(&self) -> AgentFailureCause {
         if self.invocation_start_acknowledged {
             return AgentFailureCause::HarnessProtocolFailed;
         }
@@ -573,19 +686,20 @@ impl CodexAppServerV1Parser {
             }
             let retained = u64::try_from(self.frame.len()).unwrap_or(u64::MAX);
             if retained >= self.limits.maximum_frame_bytes().get() {
-                return self.fail_current_phase();
+                return self.fail_current_phase(CodexAppServerV1RejectionReason::FrameTooLarge);
             }
             self.frame.push(byte);
         }
         Ok(progress)
     }
 
-    pub(super) fn finish(mut self, exit_success: bool) -> AgentOutcome {
+    pub(super) fn finish(&mut self, exit_success: bool) -> AgentOutcome {
         if self.failure.is_none() && !self.frame.is_empty() {
-            self.failure = Some(self.failure_for_current_phase());
+            self.failure =
+                Some(self.failure_for(CodexAppServerV1RejectionReason::PartialFrameAtEndOfStream));
             self.invalidate_value();
         }
-        if let Some(failure) = self.failure {
+        if let Some(failure) = self.failure.take() {
             return failed(failure);
         }
         if !matches!(self.state, SetupState::Terminal)
@@ -594,7 +708,9 @@ impl CodexAppServerV1Parser {
             || !self.active_items.is_empty()
             || !self.active_hooks.is_empty()
         {
-            return failed(self.failure_for_current_phase());
+            return failed(
+                self.failure_for(CodexAppServerV1RejectionReason::TerminalInvariantInvalid),
+            );
         }
         match self.native_terminal {
             Some(NativeTerminal::Failed(detail)) => {
@@ -613,7 +729,7 @@ impl CodexAppServerV1Parser {
         }
         match self.value_kind {
             AgentValueKind::None => AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
-            AgentValueKind::Response => self.selected_response.map_or_else(
+            AgentValueKind::Response => self.selected_response.take().map_or_else(
                 || AgentOutcome::Completed(CompletedAgentInvocation::NoResponse),
                 |response| {
                     AgentOutcome::Completed(CompletedAgentInvocation::Response(
@@ -621,7 +737,7 @@ impl CodexAppServerV1Parser {
                     ))
                 },
             ),
-            AgentValueKind::Result => self.accepted_result.map_or_else(
+            AgentValueKind::Result => self.accepted_result.take().map_or_else(
                 || failed(AgentFailureCause::MissingResult),
                 |result| AgentOutcome::Completed(CompletedAgentInvocation::Result(result)),
             ),
@@ -630,33 +746,28 @@ impl CodexAppServerV1Parser {
     }
 
     fn parse_frame(&mut self, frame: &[u8]) -> Result<ParserProgress, AgentFailureCause> {
-        if frame.is_empty()
-            || u64::try_from(frame.len()).unwrap_or(u64::MAX)
-                > self.limits.maximum_frame_bytes().get()
-        {
-            return Err(self.failure_for_current_phase());
+        if frame.is_empty() {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameEmpty));
         }
-        let value = strict_json::from_slice(frame).map_err(|_| self.failure_for_current_phase())?;
+        if u64::try_from(frame.len()).unwrap_or(u64::MAX) > self.limits.maximum_frame_bytes().get()
+        {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameTooLarge));
+        }
+        let value = strict_json::from_slice(frame)
+            .map_err(|_| self.failure_for(CodexAppServerV1RejectionReason::FrameDecodeFailed))?;
         let object = value
             .as_object()
-            .ok_or_else(|| self.failure_for_current_phase())?;
+            .ok_or_else(|| self.failure_for(CodexAppServerV1RejectionReason::FrameNotObject))?;
         if object.contains_key("jsonrpc") {
-            return Err(self.failure_for_current_phase());
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::JsonRpcEnvelopeUnsupported)
+            );
         }
         match (object.get("id"), object.get("method")) {
-            (Some(_), None)
-                if has_exact_fields(object, &["id", "result"])
-                    || has_exact_fields(object, &["error", "id"]) =>
-            {
-                self.parse_response(object)
-            }
-            (Some(_), Some(_)) if has_exact_fields(object, &["id", "method", "params"]) => {
-                self.parse_server_request(object)
-            }
-            (None, Some(_)) if has_notification_fields(object) => {
-                self.parse_notification(object, &value)
-            }
-            _ => Err(self.failure_for_current_phase()),
+            (Some(_), None) => self.parse_response(object),
+            (Some(_), Some(_)) => self.parse_server_request(object, &value),
+            (None, Some(_)) => self.parse_notification(object, &value),
+            _ => Err(self.failure_for(CodexAppServerV1RejectionReason::FrameEnvelopeInvalid)),
         }
     }
 
@@ -664,6 +775,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ParserProgress, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ResponseEnvelopeInvalid);
         let id = RequestId(
             object
                 .get("id")
@@ -671,7 +783,9 @@ impl CodexAppServerV1Parser {
                 .ok_or_else(|| self.failure_for_current_phase())?,
         );
         if self.completed_requests.contains(&id) || self.outstanding_request != Some(id) {
-            return Err(self.failure_for_current_phase());
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::ResponseCorrelationInvalid)
+            );
         }
         let result = object.get("result");
         let error = object.get("error");
@@ -679,7 +793,7 @@ impl CodexAppServerV1Parser {
             return Err(self.failure_for_current_phase());
         }
         if error.is_some() {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ResponseRejected));
         }
         let result = result
             .and_then(Value::as_object)
@@ -746,7 +860,11 @@ impl CodexAppServerV1Parser {
                             | SetupState::Terminal
                     )
                     && result.is_empty() => {}
-            _ => return Err(self.failure_for_current_phase()),
+            _ => {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::ResponseTransitionInvalid)
+                );
+            }
         }
         Ok(progress)
     }
@@ -754,176 +872,129 @@ impl CodexAppServerV1Parser {
     fn parse_server_request(
         &mut self,
         object: &Map<String, Value>,
+        value: &Value,
     ) -> Result<ParserProgress, AgentFailureCause> {
-        let id = self.retain_server_request_id(
-            object
-                .get("id")
-                .ok_or_else(|| self.failure_for_current_phase())?,
-        )?;
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid);
+        let id = self.retain_server_request_id(object.get("id").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid)
+        })?)?;
         if self.completed_server_requests.contains(&id) {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ServerRequestRepeated));
         }
-        let method = required_nonempty_string(object, "method")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let params =
-            required_object(object, "params").ok_or_else(|| self.failure_for_current_phase())?;
+        let method = required_nonempty_string(object, "method").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid)
+        })?;
         let response = match method {
-            "item/commandExecution/requestApproval" => {
-                self.require_command_approval(params)?;
-                json!({"decision": "decline"})
-            }
-            "item/fileChange/requestApproval" => {
-                self.require_file_change_approval(params)?;
-                json!({"decision": "decline"})
-            }
-            "item/permissions/requestApproval" => {
-                self.require_permissions_approval(params)?;
-                json!({"permissions": {}})
-            }
-            "item/tool/requestUserInput" => {
-                self.require_user_input_request(params)?;
-                json!({"answers": {}})
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput" => {
+                let params = required_object(object, "params").ok_or_else(|| {
+                    self.failure_for(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid)
+                })?;
+                self.require_interactive_request(params)?;
+                Some(match method {
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                        json!({"decision": "decline"})
+                    }
+                    "item/permissions/requestApproval" => json!({"permissions": {}}),
+                    "item/tool/requestUserInput" => json!({"answers": {}}),
+                    _ => {
+                        return Err(self.failure_for(
+                            CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid,
+                        ));
+                    }
+                })
             }
             "mcpServer/elicitation/request" => {
-                self.require_mcp_elicitation(params)?;
-                json!({"action": "decline"})
+                let params = required_object(object, "params").ok_or_else(|| {
+                    self.failure_for(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid)
+                })?;
+                self.require_mcp_elicitation_correlation(params)?;
+                Some(json!({"action": "decline"}))
             }
             _ => {
-                let _ = self.request_turn_interrupt()?;
-                return Err(self.failure_for_current_phase());
+                if let Some(params) = object.get("params").and_then(Value::as_object) {
+                    self.require_additive_correlation(params)?;
+                }
+                None
             }
         };
-        self.queue_server_response(&id, response)?;
+        if let Some(response) = response {
+            self.queue_server_response(&id, response)?;
+        } else {
+            self.queue_server_error(&id, -32601, "Method not found")?;
+        }
         self.completed_server_requests.insert(id);
+        self.observe_unrecognized(value);
         Ok(ParserProgress::default())
     }
 
     fn require_interactive_request(
         &self,
         params: &Map<String, Value>,
-        expected_kind: Option<&str>,
     ) -> Result<(), AgentFailureCause> {
         self.require_running_correlation(params)?;
-        let item_id = required_nonempty_string(params, "itemId")
-            .filter(|id| id.len() <= MAXIMUM_IDENTITY_BYTES && !id.chars().any(char::is_control))
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let item = self
-            .active_items
-            .get(&ItemId(Arc::from(item_id)))
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        if expected_kind.is_some_and(|expected| item.kind.as_ref() != expected) {
-            return Err(self.failure_for_current_phase());
+        let item_id = required_nonempty_string(params, "itemId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        if !self.active_items.contains_key(&ItemId(Arc::from(item_id))) {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid));
         }
         Ok(())
     }
 
-    fn require_command_approval(
+    fn require_mcp_elicitation_correlation(
         &self,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        self.require_interactive_request(params, Some("commandExecution"))?;
-        self.require_server_request_shape(
-            required_i64(params, "startedAtMs").is_some()
-                && optional_null_or(params, "approvalId", Value::is_string)
-                && optional_null_or(params, "command", Value::is_string)
-                && optional_null_or(params, "commandActions", is_command_action_array)
-                && optional_null_or(params, "cwd", Value::is_string)
-                && optional_null_or(params, "environmentId", Value::is_string)
-                && optional_null_or(
-                    params,
-                    "networkApprovalContext",
-                    is_network_approval_context,
-                )
-                && optional_null_or(params, "proposedExecpolicyAmendment", is_string_array)
-                && optional_null_or(
-                    params,
-                    "proposedNetworkPolicyAmendments",
-                    is_network_policy_amendment_array,
-                )
-                && optional_null_or(params, "reason", Value::is_string),
-        )
-    }
-
-    fn require_file_change_approval(
-        &self,
-        params: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
-        self.require_interactive_request(params, Some("fileChange"))?;
-        self.require_server_request_shape(
-            required_i64(params, "startedAtMs").is_some()
-                && optional_null_or(params, "grantRoot", Value::is_string)
-                && optional_null_or(params, "reason", Value::is_string),
-        )
-    }
-
-    fn require_permissions_approval(
-        &self,
-        params: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
-        self.require_interactive_request(params, None)?;
-        self.require_server_request_shape(
-            required_i64(params, "startedAtMs").is_some()
-                && required_string(params, "cwd").is_some_and(|cwd| cwd.starts_with('/'))
-                && params.get("permissions").is_some_and(is_permission_profile)
-                && optional_null_or(params, "environmentId", Value::is_string)
-                && optional_null_or(params, "reason", Value::is_string),
-        )
-    }
-
-    fn require_user_input_request(
-        &self,
-        params: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
-        self.require_interactive_request(params, None)?;
-        self.require_server_request_shape(
-            required_bool(params, "isBlocking").is_some()
-                && required_array(params, "questions")
-                    .is_some_and(|questions| questions.iter().all(is_user_input_question))
-                && optional_null_or(params, "autoResolutionMs", Value::is_u64),
-        )
-    }
-
-    fn require_server_request_shape(&self, valid: bool) -> Result<(), AgentFailureCause> {
-        valid
-            .then_some(())
-            .ok_or_else(|| self.failure_for_current_phase())
-    }
-
-    fn require_mcp_elicitation(
-        &self,
-        params: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
-        if self.state != SetupState::Running
-            || required_nonempty_string(params, "serverName").is_none()
-        {
-            return Err(self.failure_for_current_phase());
+        if self.state != SetupState::Running {
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::ServerRequestCorrelationInvalid)
+            );
         }
         self.require_thread(params)?;
-        match optional_string(params, "turnId").ok_or_else(|| self.failure_for_current_phase())? {
-            Some(turn_id) if self.turn_id.as_ref().map(|id| id.0.as_ref()) == Some(turn_id) => {}
-            None => {}
-            Some(_) => return Err(self.failure_for_current_phase()),
+        self.require_additive_correlation(params)
+    }
+
+    fn require_additive_correlation(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        if let Some(thread_id) = params.get("threadId") {
+            let Some(thread_id) = thread_id.as_str().filter(|id| !id.is_empty()) else {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
+                );
+            };
+            self.require_thread_value(thread_id)?;
         }
-        let valid = match required_string(params, "mode") {
-            Some("form") => {
-                required_string(params, "message").is_some()
-                    && params
-                        .get("requestedSchema")
-                        .is_some_and(is_mcp_elicitation_schema)
+        if let Some(turn_id) = params.get("turnId") {
+            let Some(turn_id) = turn_id.as_str().filter(|id| !id.is_empty()) else {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+                );
+            };
+            if self.turn_id.as_ref().map(|id| id.0.as_ref()) != Some(turn_id) {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+                );
             }
-            Some("openai/form") => {
-                required_string(params, "message").is_some()
-                    && params.contains_key("requestedSchema")
+        }
+        if let Some(item_id) = params.get("itemId") {
+            let Some(item_id) = item_id.as_str().filter(|id| !id.is_empty()) else {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+                );
+            };
+            let item_id = ItemId(Arc::from(item_id));
+            if !self.active_items.contains_key(&item_id)
+                && !self.completed_items.contains_key(&item_id)
+            {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+                );
             }
-            Some("url") => {
-                required_string(params, "elicitationId").is_some()
-                    && required_string(params, "message").is_some()
-                    && required_string(params, "url").is_some()
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err(self.failure_for_current_phase());
         }
         Ok(())
     }
@@ -932,6 +1003,7 @@ impl CodexAppServerV1Parser {
         &self,
         result: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::InitializationResponseInvalid);
         if !result
             .get("userAgent")
             .and_then(Value::as_str)
@@ -947,6 +1019,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         result: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ConfigurationResponseInvalid);
         let config =
             required_object(result, "config").ok_or_else(|| self.failure_for_current_phase())?;
         optional_string(config, "developer_instructions")
@@ -974,6 +1047,7 @@ impl CodexAppServerV1Parser {
         &self,
         result: &Map<String, Value>,
     ) -> Result<String, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::EffectiveInstructionsInvalid);
         let config =
             required_object(result, "config").ok_or_else(|| self.failure_for_current_phase())?;
         let native = optional_string(config, "developer_instructions")
@@ -997,42 +1071,21 @@ impl CodexAppServerV1Parser {
         &mut self,
         result: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        let thread =
-            required_object(result, "thread").ok_or_else(|| self.failure_for_current_phase())?;
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ThreadStartResponseInvalid);
+        let thread = required_object(result, "thread").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ThreadStartResponseInvalid)
+        })?;
         let raw_thread_id = required_nonempty_string(thread, "id")
             .filter(|id| is_codex_thread_id(id))
-            .ok_or_else(|| self.failure_for_current_phase())?;
+            .ok_or_else(|| {
+                self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
+            })?;
         if self
             .thread_id
             .as_ref()
             .is_some_and(|started| started.0.as_ref() != raw_thread_id)
         {
-            return Err(self.failure_for_current_phase());
-        }
-        let provider = required_nonempty_string(result, "modelProvider")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let sandbox =
-            required_object(result, "sandbox").ok_or_else(|| self.failure_for_current_phase())?;
-        if required_string(result, "model") != Some(self.model.as_ref())
-            || required_string(result, "cwd") != Some(self.expected_cwd.as_ref())
-            || required_string(result, "approvalPolicy") != Some("never")
-            || required_string(sandbox, "type") != Some("dangerFullAccess")
-            || required_bool(thread, "ephemeral") != Some(true)
-            || optional_string(thread, "path") != Some(None)
-            || required_string(thread, "sessionId") != Some(raw_thread_id)
-            || optional_string(thread, "forkedFromId") != Some(None)
-            || optional_string(thread, "parentThreadId") != Some(None)
-            || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
-            || optional_string(thread, "projectId") != Some(None)
-            || !required_array(thread, "turns").is_some_and(<[_]>::is_empty)
-            || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
-            || required_string(thread, "modelProvider") != Some(provider)
-            || self
-                .effective_model_provider
-                .as_deref()
-                .is_some_and(|effective| effective != provider)
-        {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid));
         }
         if self.thread_id.is_none() {
             self.thread_id = Some(self.retain_thread_id(raw_thread_id)?);
@@ -1046,23 +1099,24 @@ impl CodexAppServerV1Parser {
         &mut self,
         result: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        let turn =
-            required_object(result, "turn").ok_or_else(|| self.failure_for_current_phase())?;
-        let raw_turn_id =
-            required_nonempty_string(turn, "id").ok_or_else(|| self.failure_for_current_phase())?;
-        if let Some(started_turn_id) = &self.turn_id {
-            if started_turn_id.0.as_ref() != raw_turn_id {
-                return Err(self.failure_for_current_phase());
-            }
-        } else {
-            self.turn_id = Some(self.retain_turn_id(raw_turn_id)?);
-        }
-        if required_string(turn, "status") != Some("inProgress")
-            || !required_array(turn, "items").is_some_and(<[_]>::is_empty)
-        {
-            return Err(self.failure_for_current_phase());
-        }
+        self.prepare_rejection(CodexAppServerV1RejectionReason::TurnStartResponseInvalid);
+        let turn = required_object(result, "turn").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::TurnStartResponseInvalid)
+        })?;
+        let raw_turn_id = required_nonempty_string(turn, "id").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+        })?;
+        self.correlate_turn_id(raw_turn_id)?;
         Ok(())
+    }
+
+    fn required_notification_params<'a>(
+        &self,
+        object: &'a Map<String, Value>,
+    ) -> Result<&'a Map<String, Value>, AgentFailureCause> {
+        required_object(object, "params").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::NotificationEnvelopeInvalid)
+        })
     }
 
     fn parse_notification(
@@ -1070,91 +1124,143 @@ impl CodexAppServerV1Parser {
         object: &Map<String, Value>,
         value: &Value,
     ) -> Result<ParserProgress, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::NotificationEnvelopeInvalid);
         let method = required_nonempty_string(object, "method")
             .ok_or_else(|| self.failure_for_current_phase())?;
-        let params =
-            required_object(object, "params").ok_or_else(|| self.failure_for_current_phase())?;
         match method {
-            "turn/started" => self.parse_turn_started(params),
+            "turn/started" => {
+                let params = self.required_notification_params(object)?;
+                self.parse_turn_started(params)
+            }
             "thread/started" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_thread_started(params)?;
                 Ok(ParserProgress::default())
             }
             "item/started" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_item_started(params, value)?;
                 Ok(ParserProgress::default())
             }
             "item/completed" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_item_completed(params, value)?;
                 Ok(ParserProgress::default())
             }
             "item/agentMessage/delta" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_item_delta(params, ItemDeltaKind::Assistant)?;
                 Ok(ParserProgress::default())
             }
             "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_item_delta(params, ItemDeltaKind::Reasoning)?;
                 Ok(ParserProgress::default())
             }
             "thread/tokenUsage/updated" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_usage(params)?;
                 Ok(ParserProgress::default())
             }
             "hook/started" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_hook_started(params)?;
                 Ok(ParserProgress::default())
             }
             "hook/completed" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_hook_completed(params)?;
                 Ok(ParserProgress::default())
             }
             "mcpServer/startupStatus/updated" => {
-                self.parse_mcp_status(params)?;
+                let recognized = match object.get("params").and_then(Value::as_object) {
+                    Some(params) => self.parse_mcp_status(params)?,
+                    None => false,
+                };
+                if !recognized {
+                    self.observe_unrecognized(value);
+                }
                 Ok(ParserProgress::default())
             }
             "warning" => {
-                self.parse_warning(params)?;
+                let recognized = match object.get("params").and_then(Value::as_object) {
+                    Some(params) => self.parse_warning(params)?,
+                    None => false,
+                };
+                if !recognized {
+                    self.observe_unrecognized(value);
+                }
                 Ok(ParserProgress::default())
             }
             "error" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_native_error(params)?;
                 Ok(ParserProgress::default())
             }
-            "turn/completed" => self.parse_turn_completed(params),
+            "turn/completed" => {
+                let params = self.required_notification_params(object)?;
+                self.parse_turn_completed(params)
+            }
             "project/changed" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_project_changed(params)?;
                 self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
             "thread/project/updated" => {
-                self.reject_thread_project_update(params)?;
+                let params = self.required_notification_params(object)?;
+                self.require_thread(params)?;
+                self.require_additive_correlation(params)?;
+                self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
             "autoApprovalReview/strictReviewRequired" => {
+                let params = self.required_notification_params(object)?;
                 self.parse_strict_review_required(object, params)?;
                 self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
             "configWarning" => {
-                let summary = required_nonempty_string(params, "summary")
-                    .ok_or_else(|| self.failure_for_current_phase())?;
-                let message = self.retain_diagnostic(summary)?;
-                self.observations.push(AgentObservation::Diagnostic {
-                    level: AgentDiagnosticLevel::Warning,
-                    message,
-                });
+                let recognized =
+                    if let Some(params) = object.get("params").and_then(Value::as_object) {
+                        self.require_additive_correlation(params)?;
+                        if let Some(summary) = required_nonempty_string(params, "summary") {
+                            if let Some(message) = self.retain_diagnostic(summary) {
+                                self.observations.push(AgentObservation::Diagnostic {
+                                    level: AgentDiagnosticLevel::Warning,
+                                    message,
+                                });
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                if !recognized {
+                    self.observe_unrecognized(value);
+                }
                 Ok(ParserProgress::default())
             }
             "remoteControl/status/changed" | "account/rateLimits/updated" => {
+                let _params = self.required_notification_params(object)?;
                 self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
             "thread/status/changed" => {
+                let params = self.required_notification_params(object)?;
                 self.require_thread(params)?;
                 self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
-            _ => Err(self.failure_for_current_phase()),
+            _ => {
+                if let Some(params) = object.get("params").and_then(Value::as_object) {
+                    self.require_additive_correlation(params)?;
+                }
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
         }
     }
 
@@ -1162,6 +1268,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<ParserProgress, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::TurnCorrelationInvalid);
         if self.turn_started_seen
             || !matches!(
                 self.state,
@@ -1175,18 +1282,7 @@ impl CodexAppServerV1Parser {
             required_object(params, "turn").ok_or_else(|| self.failure_for_current_phase())?;
         let raw_turn_id =
             required_nonempty_string(turn, "id").ok_or_else(|| self.failure_for_current_phase())?;
-        if let Some(turn_id) = &self.turn_id {
-            if turn_id.0.as_ref() != raw_turn_id {
-                return Err(self.failure_for_current_phase());
-            }
-        } else {
-            self.turn_id = Some(self.retain_turn_id(raw_turn_id)?);
-        }
-        if required_string(turn, "status") != Some("inProgress")
-            || required_array(turn, "items").is_none()
-        {
-            return Err(self.failure_for_current_phase());
-        }
+        self.correlate_turn_id(raw_turn_id)?;
         self.turn_started_seen = true;
         if self.state == SetupState::TurnStart {
             return Ok(ParserProgress::default());
@@ -1214,6 +1310,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid);
         if self.thread_started_seen
             || !matches!(
                 self.state,
@@ -1231,17 +1328,10 @@ impl CodexAppServerV1Parser {
             required_object(params, "thread").ok_or_else(|| self.failure_for_current_phase())?;
         let raw_thread_id = required_nonempty_string(thread, "id")
             .filter(|id| is_codex_thread_id(id))
-            .ok_or_else(|| self.failure_for_current_phase())?;
+            .ok_or_else(|| {
+                self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
+            })?;
         self.correlate_thread_value(raw_thread_id)?;
-        if required_string(thread, "sessionId") != Some(raw_thread_id)
-            || required_bool(thread, "ephemeral") != Some(true)
-            || optional_string(thread, "path") != Some(None)
-            || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
-            || optional_string(thread, "projectId") != Some(None)
-            || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
-        {
-            return Err(self.failure_for_current_phase());
-        }
         self.thread_started_seen = true;
         Ok(())
     }
@@ -1251,6 +1341,7 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
         value: &Value,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ItemTransitionInvalid);
         self.require_running_correlation(params)?;
         let (_item, raw_id, kind) = self.required_item(params)?;
         let id = self.retain_item_id(raw_id)?;
@@ -1287,6 +1378,7 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
         value: &Value,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ItemTransitionInvalid);
         self.require_running_correlation(params)?;
         let (item, raw_id, kind) = self.required_item(params)?;
         let id = ItemId(Arc::from(raw_id));
@@ -1334,6 +1426,7 @@ impl CodexAppServerV1Parser {
         &self,
         item: &Map<String, Value>,
     ) -> Result<CompletedAgentMessage, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::MessageInvalid);
         let text = required_string(item, "text").ok_or_else(|| self.failure_for_current_phase())?;
         let phase = match item.get("phase") {
             None | Some(Value::Null) => None,
@@ -1399,6 +1492,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         item: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::MessageInvalid);
         for field in ["summary", "content"] {
             let values =
                 required_array(item, field).ok_or_else(|| self.failure_for_current_phase())?;
@@ -1422,6 +1516,7 @@ impl CodexAppServerV1Parser {
         kind: &str,
         item: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ItemTransitionInvalid);
         let status = required_nonempty_string(item, "status")
             .ok_or_else(|| self.failure_for_current_phase())?;
         let is_error = match (kind, status) {
@@ -1457,6 +1552,7 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
         kind: ItemDeltaKind,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ItemCorrelationInvalid);
         self.require_running_correlation(params)?;
         let item_id = required_nonempty_string(params, "itemId")
             .ok_or_else(|| self.failure_for_current_phase())?;
@@ -1487,6 +1583,7 @@ impl CodexAppServerV1Parser {
     }
 
     fn parse_usage(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::UsageInvalid);
         self.require_running_correlation(params)?;
         let total = required_object(params, "tokenUsage")
             .and_then(|usage| required_object(usage, "total"))
@@ -1502,13 +1599,22 @@ impl CodexAppServerV1Parser {
         Ok(())
     }
 
-    fn parse_hook_started(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        self.require_hook_correlation(params)?;
+    fn required_hook_run<'a>(
+        &self,
+        params: &'a Map<String, Value>,
+    ) -> Result<(&'a Map<String, Value>, &'a str, &'a str), AgentFailureCause> {
         let run = required_object(params, "run").ok_or_else(|| self.failure_for_current_phase())?;
         let id =
             required_nonempty_string(run, "id").ok_or_else(|| self.failure_for_current_phase())?;
         let event = required_nonempty_string(run, "eventName")
             .ok_or_else(|| self.failure_for_current_phase())?;
+        Ok((run, id, event))
+    }
+
+    fn parse_hook_started(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::HookTransitionInvalid);
+        self.require_hook_correlation(params)?;
+        let (_run, id, event) = self.required_hook_run(params)?;
         let id = self.retain_identity(id)?;
         let event = self.retain_identity(event)?;
         if self.active_hooks.contains_key(&id) {
@@ -1532,12 +1638,9 @@ impl CodexAppServerV1Parser {
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::HookTransitionInvalid);
         self.require_hook_correlation(params)?;
-        let run = required_object(params, "run").ok_or_else(|| self.failure_for_current_phase())?;
-        let id =
-            required_nonempty_string(run, "id").ok_or_else(|| self.failure_for_current_phase())?;
-        let event = required_nonempty_string(run, "eventName")
-            .ok_or_else(|| self.failure_for_current_phase())?;
+        let (run, id, event) = self.required_hook_run(params)?;
         let active = self
             .active_hooks
             .remove(id)
@@ -1561,7 +1664,7 @@ impl CodexAppServerV1Parser {
             let message = optional_string(run, "statusMessage")
                 .ok_or_else(|| self.failure_for_current_phase())?
                 .unwrap_or("hook failed");
-            if let Some(message) = self.retain_failure_diagnostic(message) {
+            if let Some(message) = self.retain_diagnostic(message) {
                 self.observations.push(AgentObservation::Diagnostic {
                     level: AgentDiagnosticLevel::Error,
                     message,
@@ -1571,28 +1674,29 @@ impl CodexAppServerV1Parser {
         Ok(())
     }
 
-    fn parse_mcp_status(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if let Some(thread_id) =
-            optional_string(params, "threadId").ok_or_else(|| self.failure_for_current_phase())?
-        {
-            self.require_thread_value(thread_id)?;
-        }
-        let name = required_nonempty_string(params, "name")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        if name.len() > MAXIMUM_IDENTITY_BYTES || name.chars().any(char::is_control) {
-            return Err(self.failure_for_current_phase());
-        }
-        let status = required_nonempty_string(params, "status")
+    fn parse_mcp_status(&mut self, params: &Map<String, Value>) -> Result<bool, AgentFailureCause> {
+        self.require_additive_correlation(params)?;
+        let Some(name) = required_nonempty_string(params, "name")
+            .filter(|name| name.len() <= MAXIMUM_IDENTITY_BYTES)
+            .filter(|name| !name.chars().any(char::is_control))
+        else {
+            return Ok(false);
+        };
+        let Some(status) = required_nonempty_string(params, "status")
             .filter(|status| matches!(*status, "starting" | "ready" | "failed" | "cancelled"))
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let error =
-            optional_string(params, "error").ok_or_else(|| self.failure_for_current_phase())?;
-        let failure_reason = optional_string(params, "failureReason")
-            .ok_or_else(|| self.failure_for_current_phase())?;
+        else {
+            return Ok(false);
+        };
+        let Some(error) = optional_string(params, "error") else {
+            return Ok(false);
+        };
+        let Some(failure_reason) = optional_string(params, "failureReason") else {
+            return Ok(false);
+        };
         if failure_reason.is_some_and(|reason| reason != "reauthenticationRequired")
             || status != "failed" && (error.is_some() || failure_reason.is_some())
         {
-            return Err(self.failure_for_current_phase());
+            return Ok(false);
         }
         let summary = format!("MCP server {name}: {status}");
         let level = if status == "failed" {
@@ -1600,69 +1704,50 @@ impl CodexAppServerV1Parser {
         } else {
             AgentDiagnosticLevel::Information
         };
-        let message = if status == "failed" {
-            self.retain_failure_diagnostic(&summary)
-        } else {
-            Some(self.retain_diagnostic(&summary)?)
-        };
+        let message = self.retain_diagnostic(&summary);
         if let Some(message) = message {
             self.observations
                 .push(AgentObservation::Diagnostic { level, message });
         }
         if let Some(error) = error
-            && let Some(message) = self.retain_failure_diagnostic(error)
+            && let Some(message) = self.retain_diagnostic(error)
         {
             self.observations.push(AgentObservation::Diagnostic {
                 level: AgentDiagnosticLevel::Error,
                 message,
             });
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn parse_warning(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if let Some(thread_id) =
-            optional_string(params, "threadId").ok_or_else(|| self.failure_for_current_phase())?
-        {
+    fn parse_warning(&mut self, params: &Map<String, Value>) -> Result<bool, AgentFailureCause> {
+        if let Some(thread_id) = params.get("threadId") {
+            let Some(thread_id) = thread_id.as_str().filter(|thread_id| !thread_id.is_empty())
+            else {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
+                );
+            };
             self.correlate_thread_value(thread_id)?;
         }
-        let message = required_nonempty_string(params, "message")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let message = self.retain_diagnostic(message)?;
-        self.observations.push(AgentObservation::Diagnostic {
-            level: AgentDiagnosticLevel::Warning,
-            message,
-        });
-        Ok(())
+        self.require_additive_correlation(params)?;
+        let Some(message) = required_nonempty_string(params, "message") else {
+            return Ok(false);
+        };
+        if let Some(message) = self.retain_diagnostic(message) {
+            self.observations.push(AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Warning,
+                message,
+            });
+        }
+        Ok(true)
     }
 
     fn parse_project_changed(
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        let project_id = required_nonempty_string(params, "projectId")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        if project_id.len() > MAXIMUM_IDENTITY_BYTES || project_id.chars().any(char::is_control) {
-            return Err(self.failure_for_current_phase());
-        }
-        if !matches!(
-            required_string(params, "changeType"),
-            Some("created" | "updated" | "deleted")
-        ) {
-            return Err(self.failure_for_current_phase());
-        }
-        Ok(())
-    }
-
-    fn reject_thread_project_update(
-        &self,
-        params: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
-        self.require_thread(params)?;
-        if !params.contains_key("projectId") || optional_string(params, "projectId").is_none() {
-            return Err(self.failure_for_current_phase());
-        }
-        Err(self.failure_for_current_phase())
+        self.require_additive_correlation(params)
     }
 
     fn parse_strict_review_required(
@@ -1670,20 +1755,12 @@ impl CodexAppServerV1Parser {
         notification: &Map<String, Value>,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        self.require_running_correlation(params)?;
-        let started_at = required_i64(params, "startedAtMs")
-            .filter(|started_at| *started_at >= 0)
-            .and_then(|started_at| u64::try_from(started_at).ok())
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        let emitted_at = required_u64(notification, "emittedAtMs")
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        if started_at > emitted_at {
-            return Err(self.failure_for_current_phase());
-        }
-        Ok(())
+        let _ = notification;
+        self.require_running_correlation(params)
     }
 
     fn parse_native_error(&mut self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::NativeErrorInvalid);
         self.require_active_turn_correlation(params)?;
         let error =
             required_object(params, "error").ok_or_else(|| self.failure_for_current_phase())?;
@@ -1702,7 +1779,7 @@ impl CodexAppServerV1Parser {
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::RetryStarted));
         }
-        if let Some(message) = self.retain_failure_diagnostic(message) {
+        if let Some(message) = self.retain_diagnostic(message) {
             self.observations.push(AgentObservation::Diagnostic {
                 level: AgentDiagnosticLevel::Error,
                 message,
@@ -1715,6 +1792,7 @@ impl CodexAppServerV1Parser {
         &mut self,
         params: &Map<String, Value>,
     ) -> Result<ParserProgress, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::TurnCompletionInvalid);
         if !matches!(
             self.state,
             SetupState::StartAcknowledgement | SetupState::Running
@@ -1736,7 +1814,7 @@ impl CodexAppServerV1Parser {
                 let message = required_nonempty_string(error, "message")
                     .ok_or_else(|| self.failure_for_current_phase())?;
                 let info = self.parse_optional_codex_error_info(error.get("codexErrorInfo"))?;
-                if let Some(message) = self.retain_failure_diagnostic(message) {
+                if let Some(message) = self.retain_diagnostic(message) {
                     self.observations.push(AgentObservation::Diagnostic {
                         level: AgentDiagnosticLevel::Error,
                         message,
@@ -1793,6 +1871,7 @@ impl CodexAppServerV1Parser {
     }
 
     fn correlate_turn_summary(&self, turn: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::TurnSummaryInvalid);
         let items =
             required_array(turn, "items").ok_or_else(|| self.failure_for_current_phase())?;
         let mut summary_ids = BTreeSet::new();
@@ -1814,6 +1893,7 @@ impl CodexAppServerV1Parser {
             }
             if let Some(message) = &completed.agent_message {
                 let summary = self.parse_completed_agent_message(item)?;
+                self.prepare_rejection(CodexAppServerV1RejectionReason::TurnSummaryInvalid);
                 if summary.text != message.text
                     || summary.phase != message.phase
                     || summary.delivery != message.delivery
@@ -1834,6 +1914,7 @@ impl CodexAppServerV1Parser {
     }
 
     fn extract_result_candidate(&self) -> Result<Option<Arc<Value>>, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ResultEnvelopeInvalid);
         let mut candidates = self
             .completed_items
             .values()
@@ -1866,6 +1947,7 @@ impl CodexAppServerV1Parser {
         &self,
         params: &'a Map<String, Value>,
     ) -> Result<(&'a Map<String, Value>, &'a str, &'a str), AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::ItemCorrelationInvalid);
         let item =
             required_object(params, "item").ok_or_else(|| self.failure_for_current_phase())?;
         let id =
@@ -1876,8 +1958,9 @@ impl CodexAppServerV1Parser {
     }
 
     fn require_thread(&self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        let thread_id = required_nonempty_string(params, "threadId")
-            .ok_or_else(|| self.failure_for_current_phase())?;
+        let thread_id = required_nonempty_string(params, "threadId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
+        })?;
         self.require_thread_value(thread_id)
     }
 
@@ -1885,7 +1968,7 @@ impl CodexAppServerV1Parser {
         if self.thread_id.as_ref().map(|id| id.0.as_ref()) == Some(thread_id) {
             Ok(())
         } else {
-            Err(self.failure_for_current_phase())
+            Err(self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid))
         }
     }
 
@@ -1894,9 +1977,22 @@ impl CodexAppServerV1Parser {
             return self.require_thread_value(thread_id);
         }
         if self.state != SetupState::ThreadStart || !is_codex_thread_id(thread_id) {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid));
         }
         self.thread_id = Some(self.retain_thread_id(thread_id)?);
+        Ok(())
+    }
+
+    fn correlate_turn_id(&mut self, turn_id: &str) -> Result<(), AgentFailureCause> {
+        if let Some(expected) = &self.turn_id {
+            if expected.0.as_ref() != turn_id {
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+                );
+            }
+        } else {
+            self.turn_id = Some(self.retain_turn_id(turn_id)?);
+        }
         Ok(())
     }
 
@@ -1905,7 +2001,9 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
         if self.state != SetupState::Running {
-            return Err(self.failure_for_current_phase());
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::NotificationTransitionInvalid)
+            );
         }
         self.require_turn_correlation(params)
     }
@@ -1918,7 +2016,9 @@ impl CodexAppServerV1Parser {
             self.state,
             SetupState::StartAcknowledgement | SetupState::Running
         ) {
-            return Err(self.failure_for_current_phase());
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::NotificationTransitionInvalid)
+            );
         }
         self.require_turn_correlation(params)
     }
@@ -1928,10 +2028,11 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
         self.require_thread(params)?;
-        let turn_id = required_nonempty_string(params, "turnId")
-            .ok_or_else(|| self.failure_for_current_phase())?;
+        let turn_id = required_nonempty_string(params, "turnId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+        })?;
         if self.turn_id.as_ref().map(|id| id.0.as_ref()) != Some(turn_id) {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid));
         }
         Ok(())
     }
@@ -1944,13 +2045,17 @@ impl CodexAppServerV1Parser {
             self.state,
             SetupState::TurnStart | SetupState::StartAcknowledgement | SetupState::Running
         ) {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::HookCorrelationInvalid));
         }
         self.require_thread(params)?;
-        match optional_string(params, "turnId").ok_or_else(|| self.failure_for_current_phase())? {
+        match optional_string(params, "turnId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::HookCorrelationInvalid)
+        })? {
             Some(turn_id) => {
                 if self.turn_id.as_ref().map(|id| id.0.as_ref()) != Some(turn_id) {
-                    return Err(self.failure_for_current_phase());
+                    return Err(
+                        self.failure_for(CodexAppServerV1RejectionReason::HookCorrelationInvalid)
+                    );
                 }
             }
             None if !matches!(
@@ -1958,7 +2063,9 @@ impl CodexAppServerV1Parser {
                 SetupState::TurnStart | SetupState::StartAcknowledgement
             ) =>
             {
-                return Err(self.failure_for_current_phase());
+                return Err(
+                    self.failure_for(CodexAppServerV1RejectionReason::HookCorrelationInvalid)
+                );
             }
             None => {}
         }
@@ -1987,6 +2094,7 @@ impl CodexAppServerV1Parser {
         &self,
         value: Option<&Value>,
     ) -> Result<Option<CodexErrorInfo>, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::NativeErrorInvalid);
         let Some(value) = value.filter(|value| !value.is_null()) else {
             return Ok(None);
         };
@@ -2075,6 +2183,7 @@ impl CodexAppServerV1Parser {
         &self,
         terminal: Option<CodexErrorInfo>,
     ) -> Result<AgentHarnessFailureDetail, AgentFailureCause> {
+        self.prepare_rejection(CodexAppServerV1RejectionReason::NativeErrorInvalid);
         let native = self.native_error.and_then(|error| error.info);
         if let (Some(native), Some(terminal)) = (native, terminal)
             && native != terminal
@@ -2146,7 +2255,7 @@ impl CodexAppServerV1Parser {
     fn retain_identity(&mut self, raw: &str) -> Result<Arc<str>, AgentFailureCause> {
         if raw.is_empty() || raw.len() > MAXIMUM_IDENTITY_BYTES || raw.chars().any(char::is_control)
         {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::IdentityInvalid));
         }
         self.retain_correlation(raw.len())?;
         Ok(Arc::from(raw))
@@ -2158,7 +2267,9 @@ impl CodexAppServerV1Parser {
             .retained_correlation_bytes
             .checked_add(bytes)
             .filter(|retained| *retained <= self.limits.maximum_correlation_bytes().get())
-            .ok_or_else(|| self.failure_for_current_phase())?;
+            .ok_or_else(|| {
+                self.failure_for(CodexAppServerV1RejectionReason::RetainedCorrelationLimitExceeded)
+            })?;
         Ok(())
     }
 
@@ -2168,33 +2279,13 @@ impl CodexAppServerV1Parser {
             .retained_agent_message_bytes
             .checked_add(bytes)
             .filter(|retained| *retained <= self.limits.maximum_retained_agent_message_bytes.get())
-            .ok_or_else(|| self.failure_for_current_phase())?;
+            .ok_or_else(|| {
+                self.failure_for(CodexAppServerV1RejectionReason::RetainedAgentMessageLimitExceeded)
+            })?;
         Ok(())
     }
 
-    fn retain_diagnostic(&mut self, message: &str) -> Result<Arc<str>, AgentFailureCause> {
-        if message.is_empty() {
-            return Err(self.failure_for_current_phase());
-        }
-        let remaining = self
-            .limits
-            .maximum_retained_diagnostic_bytes
-            .get()
-            .saturating_sub(self.retained_diagnostic_bytes);
-        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
-        let (message, truncated) = content_safe_diagnostic(message, remaining);
-        if truncated {
-            return Err(self.failure_for_current_phase());
-        }
-        let bytes = u64::try_from(message.len()).unwrap_or(u64::MAX);
-        self.retained_diagnostic_bytes = self
-            .retained_diagnostic_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| self.failure_for_current_phase())?;
-        Ok(Arc::from(message))
-    }
-
-    fn retain_failure_diagnostic(&mut self, message: &str) -> Option<Arc<str>> {
+    fn retain_diagnostic(&mut self, message: &str) -> Option<Arc<str>> {
         let remaining = self
             .limits
             .maximum_retained_diagnostic_bytes
@@ -2258,7 +2349,23 @@ impl CodexAppServerV1Parser {
         id: &ServerRequestId,
         result: Value,
     ) -> Result<(), AgentFailureCause> {
-        let frame = framed_json(&json!({"id": id.value(), "result": result}))?;
+        self.queue_bounded_server_frame(json!({"id": id.value(), "result": result}))
+    }
+
+    fn queue_server_error(
+        &mut self,
+        id: &ServerRequestId,
+        code: i64,
+        message: &str,
+    ) -> Result<(), AgentFailureCause> {
+        self.queue_bounded_server_frame(json!({
+            "id": id.value(),
+            "error": {"code": code, "message": message},
+        }))
+    }
+
+    fn queue_bounded_server_frame(&mut self, value: Value) -> Result<(), AgentFailureCause> {
+        let frame = framed_json(&value)?;
         let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
         let payload_bytes = frame_bytes.saturating_sub(1);
         if payload_bytes > self.limits.maximum_frame_bytes().get()
@@ -2269,7 +2376,7 @@ impl CodexAppServerV1Parser {
                     pending > self.limits.maximum_frame_bytes().get().saturating_add(1)
                 })
         {
-            return Err(self.failure_for_current_phase());
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::OutboundLimitExceeded));
         }
         self.queue_frame(frame);
         Ok(())
@@ -2301,8 +2408,11 @@ impl CodexAppServerV1Parser {
         self.accepted_result = None;
     }
 
-    fn fail_current_phase<T>(&mut self) -> Result<T, AgentFailureCause> {
-        let failure = self.failure_for_current_phase();
+    fn fail_current_phase<T>(
+        &mut self,
+        reason: CodexAppServerV1RejectionReason,
+    ) -> Result<T, AgentFailureCause> {
+        let failure = self.failure_for(reason);
         self.invalidate_value();
         self.failure = Some(failure.clone());
         Err(failure)
@@ -2414,14 +2524,6 @@ fn has_exact_fields(object: &Map<String, Value>, expected: &[&str]) -> bool {
     object.len() == expected.len() && expected.iter().all(|field| object.contains_key(*field))
 }
 
-fn has_notification_fields(object: &Map<String, Value>) -> bool {
-    has_exact_fields(object, &["method", "params"])
-        || (object.len() == 3
-            && object.contains_key("method")
-            && object.contains_key("params")
-            && object.get("emittedAtMs").is_some_and(Value::is_u64))
-}
-
 fn required_array<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a [Value]> {
     object.get(key)?.as_array().map(Vec::as_slice)
 }
@@ -2455,142 +2557,6 @@ fn optional_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<Opti
 
 fn required_bool(object: &Map<String, Value>, key: &str) -> Option<bool> {
     object.get(key)?.as_bool()
-}
-
-fn required_i64(object: &Map<String, Value>, key: &str) -> Option<i64> {
-    object.get(key)?.as_i64()
-}
-
-fn optional_null_or(
-    object: &Map<String, Value>,
-    key: &str,
-    predicate: impl FnOnce(&Value) -> bool,
-) -> bool {
-    match object.get(key) {
-        None | Some(Value::Null) => true,
-        Some(value) => predicate(value),
-    }
-}
-
-fn is_string_array(value: &Value) -> bool {
-    value
-        .as_array()
-        .is_some_and(|values| values.iter().all(Value::is_string))
-}
-
-fn is_command_action_array(value: &Value) -> bool {
-    value
-        .as_array()
-        .is_some_and(|actions| actions.iter().all(is_command_action))
-}
-
-fn is_command_action(value: &Value) -> bool {
-    let Some(action) = value.as_object() else {
-        return false;
-    };
-    if required_string(action, "command").is_none() {
-        return false;
-    }
-    match required_string(action, "type") {
-        Some("read") => {
-            required_string(action, "name").is_some() && required_string(action, "path").is_some()
-        }
-        Some("listFiles") => optional_null_or(action, "path", Value::is_string),
-        Some("search") => {
-            optional_null_or(action, "path", Value::is_string)
-                && optional_null_or(action, "query", Value::is_string)
-        }
-        Some("unknown") => true,
-        _ => false,
-    }
-}
-
-fn is_network_approval_context(value: &Value) -> bool {
-    let Some(context) = value.as_object() else {
-        return false;
-    };
-    required_string(context, "host").is_some()
-        && matches!(
-            required_string(context, "protocol"),
-            Some("http" | "https" | "socks5Tcp" | "socks5Udp")
-        )
-}
-
-fn is_network_policy_amendment_array(value: &Value) -> bool {
-    value.as_array().is_some_and(|amendments| {
-        amendments.iter().all(|amendment| {
-            amendment.as_object().is_some_and(|amendment| {
-                matches!(required_string(amendment, "action"), Some("allow" | "deny"))
-                    && required_string(amendment, "host").is_some()
-            })
-        })
-    })
-}
-
-fn is_permission_profile(value: &Value) -> bool {
-    let Some(profile) = value.as_object() else {
-        return false;
-    };
-    profile
-        .keys()
-        .all(|key| matches!(key.as_str(), "fileSystem" | "network"))
-        && optional_null_or(profile, "fileSystem", is_file_system_permissions)
-        && optional_null_or(profile, "network", is_network_permissions)
-}
-
-fn is_file_system_permissions(value: &Value) -> bool {
-    let Some(permissions) = value.as_object() else {
-        return false;
-    };
-    optional_null_or(permissions, "entries", |value| {
-        value
-            .as_array()
-            .is_some_and(|entries| entries.iter().all(Value::is_object))
-    }) && optional_null_or(permissions, "globScanMaxDepth", |value| {
-        value.as_u64().is_some_and(|depth| depth > 0)
-    }) && optional_null_or(permissions, "read", is_string_array)
-        && optional_null_or(permissions, "write", is_string_array)
-}
-
-fn is_network_permissions(value: &Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|permissions| optional_null_or(permissions, "enabled", Value::is_boolean))
-}
-
-fn is_user_input_question(value: &Value) -> bool {
-    let Some(question) = value.as_object() else {
-        return false;
-    };
-    required_string(question, "header").is_some()
-        && required_string(question, "id").is_some()
-        && required_string(question, "question").is_some()
-        && question.get("isOther").is_none_or(Value::is_boolean)
-        && question.get("isSecret").is_none_or(Value::is_boolean)
-        && optional_null_or(question, "options", |value| {
-            value.as_array().is_some_and(|options| {
-                options.iter().all(|option| {
-                    option.as_object().is_some_and(|option| {
-                        required_string(option, "description").is_some()
-                            && required_string(option, "label").is_some()
-                    })
-                })
-            })
-        })
-}
-
-fn is_mcp_elicitation_schema(value: &Value) -> bool {
-    let Some(schema) = value.as_object() else {
-        return false;
-    };
-    schema
-        .keys()
-        .all(|key| matches!(key.as_str(), "$schema" | "properties" | "required" | "type"))
-        && required_string(schema, "type") == Some("object")
-        && required_object(schema, "properties")
-            .is_some_and(|properties| properties.values().all(Value::is_object))
-        && optional_null_or(schema, "$schema", Value::is_string)
-        && optional_null_or(schema, "required", is_string_array)
 }
 
 fn required_u64(object: &Map<String, Value>, key: &str) -> Option<u64> {
