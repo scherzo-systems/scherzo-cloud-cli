@@ -18,7 +18,8 @@ pub(crate) mod generated;
 
 const PROTOCOL_SCHEMA: &str = include_str!("schema/runner-protocol-v1.schema.json");
 pub(crate) const MAXIMUM_ORDINARY_FRAME_BYTES: usize = 262_144;
-pub(crate) const MAXIMUM_TERMINAL_FRAME_BYTES: usize = 67_108_864;
+pub(crate) const MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAXIMUM_TERMINAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const PROTOCOL_VERSION: i64 = 1;
 const PAYLOAD_VERSION: i64 = 1;
 const RUNNER_TO_CLOUD: &str = "runner_to_cloud";
@@ -294,6 +295,10 @@ pub(crate) struct ExecutionCapacityV1RunnerProjection {
     pub(crate) diagnostic_retention_bytes: u64,
     pub(crate) native_session_retention_bytes: u64,
     pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) condition_transition_count: u64,
+    pub(crate) aggregate_condition_transition_bytes: u64,
+    pub(crate) terminal_result_structure_bytes: u64,
+    pub(crate) portable_result_bytes: u64,
     pub(crate) encoded_outbox_bytes: u64,
     // jscpd:ignore-end
 }
@@ -901,12 +906,18 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         return Err(DecodeError::InvalidFrame("size"));
     }
     let value: Value = serde_json::from_slice(bytes).map_err(|_| DecodeError::InvalidJson)?;
-    let large_terminal = value.get("direction").and_then(Value::as_str) == Some(RUNNER_TO_CLOUD)
+    let runner_to_cloud = value.get("direction").and_then(Value::as_str) == Some(RUNNER_TO_CLOUD);
+    let frame_type = value.get("type").and_then(Value::as_str);
+    let large_terminal = runner_to_cloud
         && matches!(
-            value.get("type").and_then(Value::as_str),
+            frame_type,
             Some("execution_finished" | "execution_interrupted")
         );
-    if bytes.len() > MAXIMUM_ORDINARY_FRAME_BYTES && !large_terminal {
+    let large_condition = runner_to_cloud
+        && frame_type == Some("execution_transition")
+        && bytes.len() <= MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES
+        && condition_evidence_transition(&value);
+    if bytes.len() > MAXIMUM_ORDINARY_FRAME_BYTES && !large_terminal && !large_condition {
         return Err(DecodeError::InvalidFrame("sizeClass"));
     }
     validate_protocol_schema(&value)?;
@@ -1164,6 +1175,16 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     },
                 });
             let capacity = execution_spec.capacity;
+            let condition_transition_count = u64::try_from(capacity.condition_transition_count)
+                .map_err(|_| DecodeError::InvalidFrame("conditionTransitionCount"))?;
+            let aggregate_condition_transition_bytes =
+                u64::try_from(capacity.aggregate_condition_transition_bytes)
+                    .map_err(|_| DecodeError::InvalidFrame("aggregateConditionTransitionBytes"))?;
+            let terminal_result_structure_bytes =
+                u64::try_from(capacity.terminal_result_structure_bytes)
+                    .map_err(|_| DecodeError::InvalidFrame("terminalResultStructureBytes"))?;
+            let portable_result_bytes = u64::try_from(capacity.portable_result_bytes)
+                .map_err(|_| DecodeError::InvalidFrame("portableResultBytes"))?;
             let encoded_outbox_bytes = u64::try_from(capacity.encoded_outbox_bytes)
                 .map_err(|_| DecodeError::InvalidFrame("encodedOutboxBytes"))?;
             let capacity = ExecutionCapacityV1RunnerProjection {
@@ -1190,6 +1211,10 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 diagnostic_retention_bytes: capacity.diagnostic_retention_bytes.get(),
                 native_session_retention_bytes: capacity.native_session_retention_bytes.get(),
                 aggregate_retention_bytes: capacity.aggregate_retention_bytes.get(),
+                condition_transition_count,
+                aggregate_condition_transition_bytes,
+                terminal_result_structure_bytes,
+                portable_result_bytes,
                 encoded_outbox_bytes,
             };
             Ok(cloud(CloudFrame::AssignmentOffer {
@@ -1468,6 +1493,28 @@ fn artifact_upload_capability(
         checksum_sha256: capability.headers.x_amz_checksum_sha256.to_string(),
         expires_at,
     })
+}
+
+fn condition_evidence_transition(value: &Value) -> bool {
+    value
+        .pointer("/payload/workflowEvent")
+        .is_some_and(is_condition_evidence_workflow_event)
+}
+
+pub(crate) fn is_condition_evidence_workflow_event(event: &Value) -> bool {
+    matches!(
+        (
+            event.get("to").and_then(Value::as_str),
+            event.pointer("/detail/phase").and_then(Value::as_str),
+            event.pointer("/detail/code").and_then(Value::as_str),
+        ),
+        (Some("skipped"), _, Some("condition_false"))
+            | (
+                Some("failed"),
+                Some("condition"),
+                Some("json_pointer_missing")
+            )
+    )
 }
 
 fn validate_protocol_schema(value: &Value) -> Result<(), DecodeError> {

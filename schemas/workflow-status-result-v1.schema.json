@@ -214,6 +214,7 @@
             "succeeded",
             "failed",
             "blocked",
+            "skipped",
             "not_run",
             "cancelled"
           ]
@@ -228,6 +229,9 @@
             },
             {
               "$ref": "#/$defs/BlockedDetail"
+            },
+            {
+              "$ref": "#/$defs/ConditionFalseDetail"
             },
             {
               "$ref": "#/$defs/FailureStopDetail"
@@ -403,6 +407,28 @@
             "properties": {
               "detail": {
                 "$ref": "#/$defs/FinalizerTriggerNotSelectedDetail"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "skipped"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/ConditionFalseDetail"
               }
             }
           }
@@ -1091,6 +1117,7 @@
             "succeeded",
             "failed",
             "blocked",
+            "skipped",
             "not_run",
             "cancelled"
           ]
@@ -1102,6 +1129,9 @@
             },
             {
               "$ref": "#/$defs/BlockedDetail"
+            },
+            {
+              "$ref": "#/$defs/ConditionFalseDetail"
             },
             {
               "$ref": "#/$defs/FailureStopDetail"
@@ -1255,6 +1285,28 @@
             "properties": {
               "detail": {
                 "$ref": "#/$defs/FinalizerTriggerNotSelectedDetail"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "skipped"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/ConditionFalseDetail"
               }
             }
           }
@@ -2642,6 +2694,30 @@
             "code",
             "output"
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "condition"
+            },
+            "code": {
+              "const": "json_pointer_missing"
+            },
+            "ref": {
+              "$ref": "#/$defs/ConditionJsonReference"
+            },
+            "pointer": {
+              "$ref": "#/$defs/ConditionJsonPointer"
+            }
+          },
+          "required": [
+            "phase",
+            "code",
+            "ref",
+            "pointer"
+          ]
         }
       ]
     },
@@ -2861,6 +2937,51 @@
       "pattern": "^[a-z][A-Za-z0-9]*$",
       "minLength": 1,
       "maxLength": 64
+    },
+    "ConditionJsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "ConditionJsonReference": {
+      "type": "string",
+      "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+    },
+    "EvaluatedPredicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ConditionJsonPointer"
+        },
+        "result": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "result"
+      ]
+    },
+    "ConditionFalseDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "condition_false"
+        },
+        "evaluatedPredicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/EvaluatedPredicate"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "evaluatedPredicates"
+      ]
     }
   }
 }

@@ -40,7 +40,7 @@ fn step_transition(
     to: StepStateKind,
     detail: Option<ObservedStepTransition>,
 ) -> ExecutionObservation<OffsetDateTime> {
-    ExecutionObservation::Transition(TransitionObservation {
+    ExecutionObservation::Transition(Box::new(TransitionObservation {
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: "a".to_owned(),
@@ -50,7 +50,7 @@ fn step_transition(
             to,
         },
         step: detail,
-    })
+    }))
 }
 
 #[test]
@@ -318,38 +318,50 @@ steps:
     );
     assert!(matches!(
         &running[0].kind,
-        PresentationRecordKind::Transition(TransitionObservation {
-            event: TransitionEvent::Step {
-                to: StepStateKind::Running,
-                ..
-            },
-            step: None,
-        })
+        PresentationRecordKind::Transition(transition)
+            if matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        to: StepStateKind::Running,
+                        ..
+                    },
+                    step: None,
+                }
+            )
     ));
     assert!(matches!(
         &capturing[0].kind,
-        PresentationRecordKind::Transition(TransitionObservation {
-            event: TransitionEvent::Step {
-                to: StepStateKind::CapturingOutputs,
-                ..
-            },
-            step: None,
-        })
+        PresentationRecordKind::Transition(transition)
+            if matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        to: StepStateKind::CapturingOutputs,
+                        ..
+                    },
+                    step: None,
+                }
+            )
     ));
     assert!(matches!(
         &failed[0].kind,
-        PresentationRecordKind::Transition(TransitionObservation {
-            event: TransitionEvent::Step {
-                to: StepStateKind::Failed,
-                ..
-            },
-            step: Some(ObservedStepTransition::Failed { detail }),
-        }) if detail
-            == &crate::execution::workflow::evidence::failure_detail(
-                FailurePhase::Execution,
-                &cause,
+        PresentationRecordKind::Transition(transition)
+            if matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        to: StepStateKind::Failed,
+                        ..
+                    },
+                    step: Some(ObservedStepTransition::Failed { detail }),
+                } if detail
+                    == &crate::execution::workflow::evidence::failure_detail(
+                        FailurePhase::Execution,
+                        &cause,
+                    )
+                    .unwrap()
             )
-            .unwrap()
     ));
 
     let PresentationRecordKind::ChildOutput(output_record) = &output[0].kind else {

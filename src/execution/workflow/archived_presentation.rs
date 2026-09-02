@@ -203,10 +203,11 @@ pub(crate) fn render_plain(
 
     let counts = terminal_counts(&attempt.steps);
     rendered.push_str(&format!(
-        "\nterminal counts: {} succeeded · {} failed · {} blocked · {} not-run · {} cancelled · {} advisory issues\n",
+        "\nterminal counts: {} succeeded · {} failed · {} blocked · {} skipped · {} not-run · {} cancelled · {} advisory issues\n",
         counts.succeeded,
         counts.failed,
         counts.blocked,
+        counts.skipped,
         counts.not_run,
         counts.cancelled,
         counts.advisory_issues,
@@ -315,6 +316,10 @@ fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationSt
             archived_failure_detail(failure)
         }
         ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail)) => blocked_detail(detail),
+        ArchivedStepDetail::Evidence(NodeDetail::Skipped(detail)) => format!(
+            "condition_false · {} evaluated predicates",
+            detail.evaluated_predicates.len()
+        ),
         ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => snake_case_debug(detail.code),
         ArchivedStepDetail::Evidence(NodeDetail::Cancellation(detail)) => {
             snake_case_debug(detail.code)
@@ -327,6 +332,7 @@ struct TerminalCounts {
     succeeded: usize,
     failed: usize,
     blocked: usize,
+    skipped: usize,
     not_run: usize,
     cancelled: usize,
     advisory_issues: usize,
@@ -339,6 +345,7 @@ fn terminal_counts(steps: &[ArchivedStep]) -> TerminalCounts {
             ArchivedStepState::Succeeded => counts.succeeded += 1,
             ArchivedStepState::Failed => counts.failed += 1,
             ArchivedStepState::Blocked => counts.blocked += 1,
+            ArchivedStepState::Skipped => counts.skipped += 1,
             ArchivedStepState::NotRun => counts.not_run += 1,
             ArchivedStepState::Cancelled => counts.cancelled += 1,
         }
@@ -575,6 +582,7 @@ pub(crate) const fn archived_step_state(state: ArchivedStepState) -> &'static st
         ArchivedStepState::Succeeded => "succeeded",
         ArchivedStepState::Failed => "failed",
         ArchivedStepState::Blocked => "blocked",
+        ArchivedStepState::Skipped => "skipped",
         ArchivedStepState::NotRun => "not-run",
         ArchivedStepState::Cancelled => "cancelled",
     }
@@ -604,6 +612,16 @@ pub(crate) const fn archived_finalization_trigger(trigger: FinalizationTriggerV1
 
 pub(crate) fn archived_failure_detail(failure: &ArchivedFailure) -> String {
     super::presentation::canonical_failure_detail(failure)
+}
+
+pub(crate) fn condition_false_detail(detail: &super::evidence::ConditionFalseDetail) -> String {
+    let entries = detail
+        .evaluated_predicates
+        .iter()
+        .map(|entry| format!("{}={}", safe_text(&entry.path), entry.result))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("condition_false · {entries}")
 }
 
 pub(crate) fn blocked_detail(detail: &super::evidence::BlockedDetail) -> String {
@@ -670,7 +688,7 @@ const fn step_state_style(state: ArchivedStepState) -> &'static str {
         ArchivedStepState::Succeeded => STYLE_SUCCESS,
         ArchivedStepState::Failed => STYLE_FAILURE,
         ArchivedStepState::Blocked | ArchivedStepState::Cancelled => STYLE_BLOCKED,
-        ArchivedStepState::NotRun => STYLE_MUTED,
+        ArchivedStepState::Skipped | ArchivedStepState::NotRun => STYLE_MUTED,
     }
 }
 
@@ -704,7 +722,7 @@ mod tests {
             "execution started 2026-08-06 12:00:01Z · finished 2026-08-06 12:00:04Z · duration 3.0s",
             "ordinary phase",
             "node prepare · role step · kind cmd · policy required · state succeeded · duration 1.0s · exit 0",
-            "terminal counts: 1 succeeded · 0 failed · 0 blocked · 0 not-run · 0 cancelled · 0 advisory issues",
+            "terminal counts: 1 succeeded · 0 failed · 0 blocked · 0 skipped · 0 not-run · 0 cancelled · 0 advisory issues",
             "result succeeded · 3.0s total",
         ] {
             assert!(plain.contains(expected), "missing {expected:?}: {plain:?}");

@@ -539,6 +539,7 @@ pub(super) enum AttemptStepStateV1 {
     Succeeded,
     Failed,
     Blocked,
+    Skipped,
     NotRun,
     Cancelled,
 }
@@ -2411,6 +2412,7 @@ fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
         StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
         StepState::Failed { .. } => AttemptStepStateV1::Failed,
         StepState::Blocked { .. } => AttemptStepStateV1::Blocked,
+        StepState::Skipped { .. } => AttemptStepStateV1::Skipped,
         StepState::NotRun { .. } => AttemptStepStateV1::NotRun,
         StepState::Cancelled { .. } => AttemptStepStateV1::Cancelled,
     }
@@ -2423,6 +2425,7 @@ fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> 
     match state {
         StepState::Failed { detail } => Some(NodeDetail::Failed(detail.clone())),
         StepState::Blocked { detail } => Some(NodeDetail::Blocked(detail.clone())),
+        StepState::Skipped { detail } => Some(NodeDetail::Skipped(detail.clone())),
         StepState::NotRun { detail } => Some(NodeDetail::NotRun(*detail)),
         StepState::Cancelling { detail } | StepState::Cancelled { detail } => {
             Some(NodeDetail::Cancellation(*detail))
@@ -2456,6 +2459,10 @@ where
                 StepState::Blocked { detail } => (
                     AttemptStepStateV1::Blocked,
                     Some(NodeDetail::Blocked(detail.clone())),
+                ),
+                StepState::Skipped { detail } => (
+                    AttemptStepStateV1::Skipped,
+                    Some(NodeDetail::Skipped(detail.clone())),
                 ),
                 StepState::NotRun { detail }
                     if detail.code == NonExecutionCode::FinalizerTriggerNotSelected =>
@@ -2561,6 +2568,7 @@ fn outstanding_actions<Cause, Output>(
                 | StepState::Succeeded { .. }
                 | StepState::Failed { .. }
                 | StepState::Blocked { .. }
+                | StepState::Skipped { .. }
                 | StepState::NotRun { .. }
                 | StepState::Cancelled { .. } => {
                     return Some(Err(LocalRunDirectoryError::StateConflict));

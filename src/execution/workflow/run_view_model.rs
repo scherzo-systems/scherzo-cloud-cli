@@ -99,6 +99,7 @@ pub(crate) struct WorkflowRunStepLog {
 pub(crate) enum WorkflowRunOutputUnavailableReason {
     Failed,
     Blocked,
+    Skipped,
     NotRun,
     Cancelled,
 }
@@ -527,7 +528,7 @@ impl WorkflowRunViewState {
         self.last_accepted_order = Some(record.accepted_order);
         match record.kind {
             PresentationRecordKind::Transition(transition) => {
-                self.apply_transition(transition);
+                self.apply_transition(*transition);
             }
             PresentationRecordKind::ChildOutput(output) => {
                 let Some(index) = self.step_indexes.get(&output.step).copied() else {
@@ -701,6 +702,9 @@ impl WorkflowRunStepViewState {
             StepStateKind::Blocked => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
             }
+            StepStateKind::Skipped => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Skipped);
+            }
             StepStateKind::NotRun => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::NotRun);
             }
@@ -734,6 +738,9 @@ impl WorkflowRunStepViewState {
             }
             StepState::Blocked { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Blocked);
+            }
+            StepState::Skipped { .. } => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Skipped);
             }
             StepState::NotRun { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::NotRun);
@@ -940,6 +947,7 @@ fn terminal_step_is_valid(
         StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
         StepState::Failed { .. }
         | StepState::Blocked { .. }
+        | StepState::Skipped { .. }
         | StepState::NotRun { .. }
         | StepState::Cancelled { .. } => true,
         StepState::Pending
@@ -962,6 +970,7 @@ fn terminal_state_kind(state: &StepState<super::value::CapturedValue>) -> StepSt
         StepState::Succeeded { .. } => StepStateKind::Succeeded,
         StepState::Failed { .. } => StepStateKind::Failed,
         StepState::Blocked { .. } => StepStateKind::Blocked,
+        StepState::Skipped { .. } => StepStateKind::Skipped,
         StepState::NotRun { .. } => StepStateKind::NotRun,
         StepState::Cancelled { .. } => StepStateKind::Cancelled,
     }
@@ -975,6 +984,9 @@ fn terminal_step_fact(
             detail: detail.clone(),
         }),
         StepState::Blocked { detail } => Some(ObservedStepTransition::Blocked {
+            detail: detail.clone(),
+        }),
+        StepState::Skipped { detail } => Some(ObservedStepTransition::Skipped {
             detail: detail.clone(),
         }),
         StepState::NotRun { detail } => Some(ObservedStepTransition::NotRun { detail: *detail }),

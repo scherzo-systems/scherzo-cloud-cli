@@ -293,10 +293,30 @@
           "minimum": 1,
           "maximum": 201326592
         },
+        "conditionTransitionCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "aggregateConditionTransitionBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 268435456
+        },
+        "terminalResultStructureBytes": {
+          "type": "integer",
+          "minimum": 67108864,
+          "maximum": 536870912
+        },
+        "portableResultBytes": {
+          "type": "integer",
+          "minimum": 202027692,
+          "maximum": 901080408
+        },
         "encodedOutboxBytes": {
           "type": "integer",
           "minimum": 83886080,
-          "maximum": 353632256
+          "maximum": 1024720896
         }
       },
       "required": [
@@ -309,6 +329,10 @@
         "diagnosticRetentionBytes",
         "nativeSessionRetentionBytes",
         "aggregateRetentionBytes",
+        "conditionTransitionCount",
+        "aggregateConditionTransitionBytes",
+        "terminalResultStructureBytes",
+        "portableResultBytes",
         "encodedOutboxBytes"
       ]
     },
@@ -341,8 +365,12 @@
         },
         "runInputs": {
           "oneOf": [
-            { "type": "null" },
-            { "$ref": "#/$defs/RunInputProjection" }
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/RunInputProjection"
+            }
           ]
         }
       },
@@ -369,10 +397,17 @@
           "$ref": "#/$defs/WorkflowSourceClosureDigest"
         }
       },
-      "required": ["inputSetId", "manifestDigest"]
+      "required": [
+        "inputSetId",
+        "manifestDigest"
+      ]
     },
     "PreparationPhase": {
-      "enum": ["source_materialization", "input_download", "workflow_admission"]
+      "enum": [
+        "source_materialization",
+        "input_download",
+        "workflow_admission"
+      ]
     },
     "ExecutionLeasePolicy": {
       "type": "object",
@@ -599,19 +634,33 @@
     },
     "RunnerAssignmentPreparing": {
       "allOf": [
-        { "$ref": "#/$defs/RunnerEnvelope" },
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
         {
           "properties": {
-            "type": { "const": "assignment_preparing" },
+            "type": {
+              "const": "assignment_preparing"
+            },
             "payload": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "effectId": { "$ref": "#/$defs/effectId" },
-                "assignmentId": { "$ref": "#/$defs/assignmentId" },
-                "offeredExecutionSpecId": { "$ref": "#/$defs/executionSpecId" }
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "offeredExecutionSpecId": {
+                  "$ref": "#/$defs/executionSpecId"
+                }
               },
-              "required": ["effectId", "assignmentId", "offeredExecutionSpecId"]
+              "required": [
+                "effectId",
+                "assignmentId",
+                "offeredExecutionSpecId"
+              ]
             }
           }
         }
@@ -620,20 +669,37 @@
     },
     "RunnerAssignmentPreparationProgress": {
       "allOf": [
-        { "$ref": "#/$defs/RunnerEnvelope" },
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
         {
           "properties": {
-            "type": { "const": "assignment_preparation_progress" },
+            "type": {
+              "const": "assignment_preparation_progress"
+            },
             "payload": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "assignmentId": { "$ref": "#/$defs/assignmentId" },
-                "attemptId": { "$ref": "#/$defs/attemptId" },
-                "preparationSequence": { "$ref": "#/$defs/positiveSequence" },
-                "phase": { "$ref": "#/$defs/PreparationPhase" }
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "preparationSequence": {
+                  "$ref": "#/$defs/positiveSequence"
+                },
+                "phase": {
+                  "$ref": "#/$defs/PreparationPhase"
+                }
               },
-              "required": ["assignmentId", "attemptId", "preparationSequence", "phase"]
+              "required": [
+                "assignmentId",
+                "attemptId",
+                "preparationSequence",
+                "phase"
+              ]
             }
           }
         }
@@ -907,24 +973,44 @@
     },
     "CloudAssignmentPrepare": {
       "allOf": [
-        { "$ref": "#/$defs/CloudEnvelope" },
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
         {
           "properties": {
-            "type": { "const": "assignment_prepare" },
+            "type": {
+              "const": "assignment_prepare"
+            },
             "payload": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "effectId": { "$ref": "#/$defs/effectId" },
-                "assignmentId": { "$ref": "#/$defs/assignmentId" },
-                "runId": { "$ref": "#/$defs/runId" },
-                "attemptId": { "$ref": "#/$defs/attemptId" },
-                "executionSpecId": { "$ref": "#/$defs/executionSpecId" },
-                "preparationExpiresAt": { "$ref": "#/$defs/utcTimestamp" }
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "executionSpecId": {
+                  "$ref": "#/$defs/executionSpecId"
+                },
+                "preparationExpiresAt": {
+                  "$ref": "#/$defs/utcTimestamp"
+                }
               },
               "required": [
-                "effectId", "assignmentId", "runId", "attemptId",
-                "executionSpecId", "preparationExpiresAt"
+                "effectId",
+                "assignmentId",
+                "runId",
+                "attemptId",
+                "executionSpecId",
+                "preparationExpiresAt"
               ]
             }
           }
@@ -1122,6 +1208,7 @@
         "succeeded",
         "failed",
         "blocked",
+        "skipped",
         "not_run",
         "cancelled"
       ]
@@ -1309,6 +1396,71 @@
               "$ref": "#/$defs/stepId"
             },
             "from": {
+              "const": "pending"
+            },
+            "to": {
+              "const": "failed"
+            },
+            "failurePolicy": {
+              "$ref": "#/$defs/FailurePolicy"
+            },
+            "role": {
+              "$ref": "#/$defs/NodeRole"
+            },
+            "detail": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "phase": {
+                  "const": "condition"
+                },
+                "code": {
+                  "const": "json_pointer_missing"
+                },
+                "ref": {
+                  "$ref": "#/$defs/ConditionJsonReference"
+                },
+                "pointer": {
+                  "$ref": "#/$defs/ConditionJsonPointer"
+                }
+              },
+              "required": [
+                "phase",
+                "code",
+                "ref",
+                "pointer"
+              ]
+            }
+          },
+          "required": [
+            "eventVersion",
+            "eventType",
+            "transitionSequence",
+            "stepId",
+            "role",
+            "failurePolicy",
+            "from",
+            "to",
+            "detail"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {
+              "const": 1
+            },
+            "eventType": {
+              "const": "step_state_changed"
+            },
+            "transitionSequence": {
+              "$ref": "#/$defs/positiveSequence"
+            },
+            "stepId": {
+              "$ref": "#/$defs/stepId"
+            },
+            "from": {
               "const": "starting"
             },
             "to": {
@@ -1424,6 +1576,50 @@
             "detail"
           ]
         }
+      ]
+    },
+    "SkippedStepTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": {
+          "const": 1
+        },
+        "eventType": {
+          "const": "step_state_changed"
+        },
+        "transitionSequence": {
+          "$ref": "#/$defs/positiveSequence"
+        },
+        "stepId": {
+          "$ref": "#/$defs/stepId"
+        },
+        "from": {
+          "const": "pending"
+        },
+        "to": {
+          "const": "skipped"
+        },
+        "failurePolicy": {
+          "$ref": "#/$defs/FailurePolicy"
+        },
+        "role": {
+          "$ref": "#/$defs/NodeRole"
+        },
+        "detail": {
+          "$ref": "#/$defs/ConditionFalseDetail"
+        }
+      },
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "stepId",
+        "role",
+        "failurePolicy",
+        "from",
+        "to",
+        "detail"
       ]
     },
     "BlockedStepTransitionEvent": {
@@ -2489,6 +2685,9 @@
         },
         {
           "$ref": "#/$defs/FailedStepTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/SkippedStepTransitionEvent"
         },
         {
           "$ref": "#/$defs/BlockedStepTransitionEvent"
@@ -5690,6 +5889,30 @@
             "code",
             "output"
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "condition"
+            },
+            "code": {
+              "const": "json_pointer_missing"
+            },
+            "ref": {
+              "$ref": "#/$defs/ConditionJsonReference"
+            },
+            "pointer": {
+              "$ref": "#/$defs/ConditionJsonPointer"
+            }
+          },
+          "required": [
+            "phase",
+            "code",
+            "ref",
+            "pointer"
+          ]
         }
       ]
     },
@@ -6090,6 +6313,51 @@
             "output"
           ]
         }
+      ]
+    },
+    "ConditionJsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "ConditionJsonReference": {
+      "type": "string",
+      "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+    },
+    "EvaluatedPredicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ConditionJsonPointer"
+        },
+        "result": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "result"
+      ]
+    },
+    "ConditionFalseDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "condition_false"
+        },
+        "evaluatedPredicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/EvaluatedPredicate"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "evaluatedPredicates"
       ]
     }
   }

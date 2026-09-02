@@ -118,13 +118,13 @@ pub(crate) enum ConditionValueKind {
     Json,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedOperand {
     kind: ConditionValueKind,
     value: ResolvedOperandValue,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolvedOperandValue {
     Reference {
         canonical_ref: Arc<str>,
@@ -177,7 +177,7 @@ impl ResolvedOperand {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedSelector {
     canonical_ref: Arc<str>,
     pointer: JsonPointer,
@@ -192,7 +192,8 @@ impl ResolvedSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalDisposition {
     Succeeded,
     Failed,
@@ -202,7 +203,7 @@ pub(crate) enum TerminalDisposition {
     Cancelled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedPredicate {
     All(Arc<[ResolvedPredicate]>),
     Any(Arc<[ResolvedPredicate]>),
@@ -261,8 +262,8 @@ pub(crate) enum ConditionEvaluation {
 
 #[derive(Clone, Copy)]
 enum CapturedConditionValue<'a> {
-    Text(&'a CapturedText),
-    Json(&'a CapturedJson),
+    Text(&'a str),
+    Json(&'a Value),
 }
 
 #[derive(Default)]
@@ -278,6 +279,10 @@ impl<'a> ConditionValues<'a> {
         canonical_ref: impl Into<Arc<str>>,
         value: &'a CapturedText,
     ) {
+        self.insert_text_value(canonical_ref, value.as_str());
+    }
+
+    pub(crate) fn insert_text_value(&mut self, canonical_ref: impl Into<Arc<str>>, value: &'a str) {
         self.values
             .insert(canonical_ref.into(), CapturedConditionValue::Text(value));
     }
@@ -286,6 +291,14 @@ impl<'a> ConditionValues<'a> {
         &mut self,
         canonical_ref: impl Into<Arc<str>>,
         value: &'a CapturedJson,
+    ) {
+        self.insert_json_value(canonical_ref, value.value());
+    }
+
+    pub(crate) fn insert_json_value(
+        &mut self,
+        canonical_ref: impl Into<Arc<str>>,
+        value: &'a Value,
     ) {
         self.values
             .insert(canonical_ref.into(), CapturedConditionValue::Json(value));
@@ -430,11 +443,11 @@ fn resolve_operand<'a>(
             pointer,
         } => match (operand.kind, values.get(canonical_ref)) {
             (ConditionValueKind::Text, Some(CapturedConditionValue::Text(value))) => {
-                Ok(SelectedOperand::Text(value.as_str()))
+                Ok(SelectedOperand::Text(value))
             }
             (ConditionValueKind::Json, Some(CapturedConditionValue::Json(value))) => {
                 let selected = if let Some(pointer) = pointer {
-                    match pointer.select(value.value()) {
+                    match pointer.select(value) {
                         JsonSelection::Selected(selected) => selected,
                         JsonSelection::Missing => {
                             return Err(EvaluationFailure::PointerMissing {
@@ -444,7 +457,7 @@ fn resolve_operand<'a>(
                         }
                     }
                 } else {
-                    value.value()
+                    value
                 };
                 Ok(SelectedOperand::Json(selected))
             }
@@ -464,7 +477,7 @@ fn resolve_json_reference<'a>(
     values: &'a ConditionValues<'a>,
 ) -> Result<&'a Value, EvaluationFailure> {
     match values.get(canonical_ref) {
-        Some(CapturedConditionValue::Json(value)) => Ok(value.value()),
+        Some(CapturedConditionValue::Json(value)) => Ok(value),
         Some(CapturedConditionValue::Text(_)) | None => Err(EvaluationFailure::Unavailable(
             UnavailableConditionInput::Value {
                 canonical_ref: Arc::clone(canonical_ref),

@@ -210,6 +210,7 @@ impl<'a> RejectionLocation<'a> {
                 output: Some(output),
                 ..Self::for_step("step_output", step)
             },
+            ValidationLocation::StepCondition { step } => Self::for_step("step_condition", step),
             ValidationLocation::FinalizerAfter { finalizer, index } => Self {
                 index: Some(*index),
                 ..Self::for_finalizer("finalizer_after", finalizer)
@@ -230,6 +231,9 @@ impl<'a> RejectionLocation<'a> {
                 output: Some(output),
                 ..Self::for_finalizer("finalizer_output", finalizer)
             },
+            ValidationLocation::FinalizerCondition { finalizer } => {
+                Self::for_finalizer("finalizer_condition", finalizer)
+            }
             ValidationLocation::Export { name } => Self {
                 export: Some(name),
                 ..Self::simple("export")
@@ -553,6 +557,20 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ValidationFailureKind::FinalizerExportTrigger => (
             "finalizer_export_trigger",
             "Export from a required finalizer that is eligible after ordinary success.",
+        ),
+        ValidationFailureKind::InvalidCondition
+        | ValidationFailureKind::InvalidConditionReference
+        | ValidationFailureKind::InvalidConditionType
+        | ValidationFailureKind::InvalidJsonPointer => (
+            "invalid_condition",
+            "Correct the condition grammar, references, pointer, and contextual value types.",
+        ),
+        ValidationFailureKind::ConditionDepthExceeded
+        | ValidationFailureKind::ConditionNodeLimitExceeded
+        | ValidationFailureKind::ConditionChildLimitExceeded
+        | ValidationFailureKind::WorkflowConditionNodeLimitExceeded => (
+            "condition_limit_exceeded",
+            "Reduce the workflow condition structure to the version-1 limits.",
         ),
     }
 }

@@ -118,7 +118,7 @@ fn step_transition(
     to: StepStateKind,
     detail: Option<ObservedStepTransition>,
 ) -> ExecutionObservation<OffsetDateTime> {
-    ExecutionObservation::Transition(TransitionObservation {
+    ExecutionObservation::Transition(Box::new(TransitionObservation {
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
@@ -128,32 +128,32 @@ fn step_transition(
             to,
         },
         step: detail,
-    })
+    }))
 }
 
 fn workflow_transition(
     from: WorkflowState<OffsetDateTime>,
     to: WorkflowState<OffsetDateTime>,
 ) -> ExecutionObservation<OffsetDateTime> {
-    ExecutionObservation::Transition(TransitionObservation {
+    ExecutionObservation::Transition(Box::new(TransitionObservation {
         event: TransitionEvent::Workflow {
             sequence: TransitionSequence::default(),
             from,
             to: Box::new(to),
         },
         step: None,
-    })
+    }))
 }
 
 fn cancellation(deadline: OffsetDateTime) -> ExecutionObservation<OffsetDateTime> {
-    ExecutionObservation::Transition(TransitionObservation {
+    ExecutionObservation::Transition(Box::new(TransitionObservation {
         event: TransitionEvent::CancellationAccepted {
             sequence: TransitionSequence::default(),
             reason: CancellationReason::UserRequest,
             deadline,
         },
         step: None,
-    })
+    }))
 }
 
 fn output(
@@ -395,14 +395,16 @@ finalizers:
     .await;
 
     let deadline = point(base, 50).utc;
-    view.observe(ExecutionObservation::Transition(TransitionObservation {
-        event: TransitionEvent::FinalizationCancellationAccepted {
-            sequence: TransitionSequence::default(),
-            reason: CancellationReason::UserRequest,
-            deadline,
+    view.observe(ExecutionObservation::Transition(Box::new(
+        TransitionObservation {
+            event: TransitionEvent::FinalizationCancellationAccepted {
+                sequence: TransitionSequence::default(),
+                reason: CancellationReason::UserRequest,
+                deadline,
+            },
+            step: None,
         },
-        step: None,
-    }))
+    )))
     .await;
 
     assert_eq!(
@@ -419,15 +421,15 @@ finalizers:
     );
     assert!(view.snapshot().finalization.is_none());
 
-    view.observe(ExecutionObservation::Transition(TransitionObservation::<
-        OffsetDateTime,
-    > {
-        event: TransitionEvent::ForceAbortAccepted {
-            sequence: TransitionSequence::default(),
-            reason: CancellationReason::UserRequest,
+    view.observe(ExecutionObservation::Transition(Box::new(
+        TransitionObservation::<OffsetDateTime> {
+            event: TransitionEvent::ForceAbortAccepted {
+                sequence: TransitionSequence::default(),
+                reason: CancellationReason::UserRequest,
+            },
+            step: None,
         },
-        step: None,
-    }))
+    )))
     .await;
 
     assert_eq!(

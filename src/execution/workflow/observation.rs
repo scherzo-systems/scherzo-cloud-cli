@@ -2,7 +2,9 @@ use std::future::{Future, ready};
 use std::sync::Arc;
 
 use super::agent::AgentObservationEnvelope;
-use super::evidence::{BlockedDetail, CancellationDetail, FailureDetail, NonExecutionDetail};
+use super::evidence::{
+    BlockedDetail, CancellationDetail, ConditionFalseDetail, FailureDetail, NonExecutionDetail,
+};
 use super::runtime::{
     ActionId, ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity,
     RecoveryHandlerKind, TransitionEvent,
@@ -62,11 +64,15 @@ pub(crate) enum ObservedStepTransition {
     OutputsCommitted {
         outputs: Vec<String>,
     },
+    // jscpd:ignore-start -- Observations carry transition payloads, while runtime states own settled state.
     Failed {
         detail: FailureDetail,
     },
     Blocked {
         detail: BlockedDetail,
+    },
+    Skipped {
+        detail: ConditionFalseDetail,
     },
     NotRun {
         detail: NonExecutionDetail,
@@ -77,6 +83,7 @@ pub(crate) enum ObservedStepTransition {
     Cancelled {
         detail: CancellationDetail,
     },
+    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +94,7 @@ pub(crate) struct TransitionObservation<Deadline> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionObservation<Deadline> {
-    Transition(TransitionObservation<Deadline>),
+    Transition(Box<TransitionObservation<Deadline>>),
     CommandOutput(CommandOutputObservation),
     CommandOutputClosed(CommandOutputClosedObservation),
     Agent(AgentObservationEnvelope),

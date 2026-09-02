@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::de::Error as _;
@@ -22,6 +23,7 @@ pub(crate) const MAXIMUM_PREREQUISITES: usize = 1_024;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailurePhase {
     Start,
+    Condition,
     Execution,
     OutputCapture,
 }
@@ -30,6 +32,7 @@ impl FailurePhase {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Condition => "condition",
             Self::Execution => "execution",
             Self::OutputCapture => "output_capture",
         }
@@ -91,6 +94,7 @@ pub(crate) enum FailureCode {
     CommandLaunchPermissionDenied,
     CommandLaunchInvalidInput,
     CommandLaunchFailed,
+    JsonPointerMissing,
     CommandExit,
     CommandWaitFailed,
     ExecutionTaskUnavailable,
@@ -146,6 +150,10 @@ pub(crate) struct FailureDetail {
     pub(crate) output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) r#ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pointer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +169,10 @@ struct FailureDetailWire {
     output: Option<String>,
     #[serde(default, deserialize_with = "deserialize_non_null_option")]
     exit_code: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    r#ref: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    pointer: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for FailureDetail {
@@ -169,7 +181,7 @@ impl<'de> Deserialize<'de> for FailureDetail {
         D: Deserializer<'de>,
     {
         let wire = FailureDetailWire::deserialize(deserializer)?;
-        Self::new(
+        let mut detail = Self::new(
             wire.phase,
             wire.code,
             wire.input,
@@ -177,7 +189,11 @@ impl<'de> Deserialize<'de> for FailureDetail {
             wire.output,
             wire.exit_code,
         )
-        .map_err(D::Error::custom)
+        .map_err(D::Error::custom)?;
+        detail.r#ref = wire.r#ref;
+        detail.pointer = wire.pointer;
+        detail.validate().map_err(D::Error::custom)?;
+        Ok(detail)
     }
 }
 
@@ -190,6 +206,8 @@ impl FailureDetail {
             collection_index: None,
             output: None,
             exit_code: None,
+            r#ref: None,
+            pointer: None,
         }
     }
 
@@ -208,6 +226,8 @@ impl FailureDetail {
             collection_index,
             output,
             exit_code,
+            r#ref: None,
+            pointer: None,
         };
         detail.validate()?;
         Ok(detail)
@@ -218,6 +238,7 @@ impl FailureDetail {
         use FailurePhase as Phase;
 
         let phase_valid = match self.code {
+            Code::JsonPointerMissing => self.phase == Phase::Condition,
             Code::StepUnavailable => matches!(self.phase, Phase::Start | Phase::OutputCapture),
             Code::HarnessStartFailed
             | Code::HarnessInputTooLarge
@@ -297,6 +318,13 @@ impl FailureDetail {
             Some(input) if input_invalid_name => !input.is_empty() && input.len() <= 4_096,
             Some(input) => input_preparation && is_workflow_value_identifier(input),
         };
+        let condition_failure = self.phase == Phase::Condition
+            && self.code == Code::JsonPointerMissing
+            && self
+                .r#ref
+                .as_deref()
+                .is_some_and(is_condition_json_reference)
+            && self.pointer.as_deref().is_some_and(valid_json_pointer);
         if !input_valid
             || (self.collection_index.is_some() && !input_preparation)
             || (output_failure
@@ -307,10 +335,23 @@ impl FailureDetail {
             || (!output_failure && self.output.is_some())
             || (self.exit_code.is_some()
                 && (self.code != Code::CommandExit || self.exit_code == Some(0)))
+            || (self.phase == Phase::Condition && !condition_failure)
+            || (self.phase != Phase::Condition && (self.r#ref.is_some() || self.pointer.is_some()))
         {
             return Err(EvidenceError::InvalidFailureDetail);
         }
         Ok(())
+    }
+
+    pub(crate) fn json_pointer_missing(
+        reference: impl Into<String>,
+        pointer: impl Into<String>,
+    ) -> Result<Self, EvidenceError> {
+        let mut detail = Self::code(FailurePhase::Condition, FailureCode::JsonPointerMissing);
+        detail.r#ref = Some(reference.into());
+        detail.pointer = Some(pointer.into());
+        detail.validate()?;
+        Ok(detail)
     }
 }
 
@@ -335,6 +376,13 @@ impl Prerequisite {
         let node = node.into();
         (!node.is_empty())
             .then_some(Self::Control { node })
+            .ok_or(EvidenceError::InvalidPrerequisite)
+    }
+
+    pub(crate) fn condition(reference: impl Into<String>) -> Result<Self, EvidenceError> {
+        let r#ref = reference.into();
+        is_output_reference(&r#ref)
+            .then_some(Self::Condition { r#ref })
             .ok_or(EvidenceError::InvalidPrerequisite)
     }
 
@@ -491,11 +539,75 @@ impl CancellationDetail {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SkippedCode {
+    ConditionFalse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EvaluatedPredicateEvidence {
+    pub(crate) path: String,
+    pub(crate) result: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConditionFalseDetail {
+    pub(crate) code: SkippedCode,
+    pub(crate) evaluated_predicates: Vec<EvaluatedPredicateEvidence>,
+}
+
+impl ConditionFalseDetail {
+    pub(crate) fn new(
+        evaluated_predicates: impl IntoIterator<Item = EvaluatedPredicateEvidence>,
+    ) -> Result<Self, EvidenceError> {
+        let evaluated_predicates = evaluated_predicates.into_iter().collect::<Vec<_>>();
+        let mut paths = BTreeSet::new();
+        if evaluated_predicates.is_empty()
+            || evaluated_predicates.len() > 256
+            || evaluated_predicates
+                .last()
+                .is_none_or(|entry| !entry.path.is_empty() || entry.result)
+            || evaluated_predicates
+                .iter()
+                .any(|entry| !valid_json_pointer(&entry.path) || !paths.insert(&entry.path))
+        {
+            return Err(EvidenceError::InvalidConditionFalseDetail);
+        }
+        Ok(Self {
+            code: SkippedCode::ConditionFalse,
+            evaluated_predicates,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ConditionFalseDetail {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            code: SkippedCode,
+            evaluated_predicates: Vec<EvaluatedPredicateEvidence>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.code != SkippedCode::ConditionFalse {
+            return Err(D::Error::custom(EvidenceError::InvalidConditionFalseDetail));
+        }
+        Self::new(wire.evaluated_predicates).map_err(D::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum NodeDetail {
     Failed(FailureDetail),
     Blocked(BlockedDetail),
+    Skipped(ConditionFalseDetail),
     NotRun(NonExecutionDetail),
     Cancellation(CancellationDetail),
 }
@@ -576,6 +688,7 @@ pub(crate) enum EvidenceError {
     InvalidFailureDetail,
     InvalidPrerequisite,
     InvalidPrerequisiteCount,
+    InvalidConditionFalseDetail,
     NodeRoleMismatch,
 }
 
@@ -602,6 +715,7 @@ impl NodeFailureSource for String {
     fn node_failure_detail(&self, phase: FailurePhase) -> Result<FailureDetail, EvidenceError> {
         let code = match phase {
             FailurePhase::Start | FailurePhase::OutputCapture => FailureCode::StepUnavailable,
+            FailurePhase::Condition => FailureCode::JsonPointerMissing,
             FailurePhase::Execution => FailureCode::CommandWaitFailed,
         };
         FailureDetail::new(phase, code, None, None, None, None)
@@ -876,6 +990,28 @@ fn code(phase: FailurePhase, code: FailureCode) -> FailureDetail {
     FailureDetail::code(phase, code)
 }
 
+fn is_condition_json_reference(value: &str) -> bool {
+    value == "finalization.context" || is_output_reference(value)
+}
+
+fn valid_json_pointer(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let Some(tokens) = value.strip_prefix('/') else {
+        return false;
+    };
+    tokens.split('/').all(|token| {
+        let mut bytes = token.as_bytes().iter();
+        while let Some(byte) = bytes.next() {
+            if *byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 fn is_output_reference(value: &str) -> bool {
     let mut segments = value.split('.');
     matches!(
@@ -975,6 +1111,18 @@ mod tests {
             );
         }
         assert!(Prerequisite::body("outputs.Build_1.safeValue2").is_ok());
+    }
+
+    #[test]
+    fn condition_false_detail_rejects_duplicate_paths() {
+        let detail = json!({
+            "code": "condition_false",
+            "evaluatedPredicates": [
+                {"path": "", "result": true},
+                {"path": "", "result": false}
+            ]
+        });
+        assert!(serde_json::from_value::<ConditionFalseDetail>(detail).is_err());
     }
 
     #[test]

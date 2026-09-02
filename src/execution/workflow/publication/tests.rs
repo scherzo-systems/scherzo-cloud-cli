@@ -323,6 +323,10 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         diagnostic_retention_bytes: 8_388_608,
         native_session_retention_bytes: 4_194_304,
         aggregate_retention_bytes: 12_582_912,
+        condition_transition_count: 0,
+        aggregate_condition_transition_bytes: 0,
+        terminal_result_structure_bytes: 67_108_864,
+        portable_result_bytes: 202_027_692,
         encoded_outbox_bytes: 85_458_944,
     });
     run.exports.insert(

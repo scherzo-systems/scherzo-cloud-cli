@@ -1,10 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
+use serde_json::Value;
+
+use super::condition::{
+    ConditionValueKind, JsonPointer, ResolvedOperand, ResolvedPredicate, ResolvedSelector,
+};
 use super::document::{
-    Agent, CommonNode, FailurePolicy, FinalizerDefinition, HarnessDefinition, MessageSource,
-    NodeBody, Output, OutputReference, RecoveryHandler, StepDefinition, StepRecovery,
-    ValueReference, WorkflowDocument,
+    Agent, CommonNode, ConditionOperand, ConditionPredicate, FailurePolicy, FinalizerDefinition,
+    HarnessDefinition, MessageSource, NodeBody, Output, OutputReference, RecoveryHandler,
+    StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::validated::{
@@ -18,6 +24,10 @@ use super::validated::{
 use super::{claude_code, codex, pi};
 
 const MAXIMUM_WORKFLOW_NODES: usize = 256;
+const MAXIMUM_CONDITION_DEPTH: usize = 16;
+const MAXIMUM_CONDITION_NODES: usize = 256;
+const MAXIMUM_CONDITION_CHILDREN: usize = 64;
+const MAXIMUM_WORKFLOW_CONDITION_NODES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationFailureKind {
@@ -51,6 +61,14 @@ pub(crate) enum ValidationFailureKind {
     InvalidFinalizationContext,
     FinalizerExportTrigger,
     TooManyPrerequisites,
+    InvalidCondition,
+    InvalidConditionReference,
+    InvalidConditionType,
+    InvalidJsonPointer,
+    ConditionDepthExceeded,
+    ConditionNodeLimitExceeded,
+    ConditionChildLimitExceeded,
+    WorkflowConditionNodeLimitExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,11 +84,13 @@ pub(crate) enum ValidationLocation {
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
     StepOutput { step: String, output: String },
+    StepCondition { step: String },
     FinalizerAfter { finalizer: String, index: usize },
     FinalizerInput { finalizer: String, input: String },
     FinalizerMessageText { finalizer: String, index: usize },
     FinalizerMessageAttachment { finalizer: String, index: usize },
     FinalizerOutput { finalizer: String, output: String },
+    FinalizerCondition { finalizer: String },
     Export { name: String },
 }
 
@@ -109,6 +129,7 @@ struct ValidatedGraph {
 
 pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, ValidationFailure> {
     validate_node_namespace(&document)?;
+    validate_workflow_condition_bounds(&document)?;
     let agent_profiles = validate_agent_profiles(&document)?;
     let step_graph = validate_step_graph(&document)?;
     let finalizer_graph = validate_finalizer_graph(&document)?;
@@ -328,6 +349,13 @@ fn resolve_step_prerequisites(
             },
         )?;
     }
+    infer_condition_prerequisites(
+        step_name,
+        WorkflowNodeRole::Step,
+        common_node(&step.body).condition.as_ref(),
+        document,
+        &mut prerequisites,
+    )?;
     infer_body_prerequisites(
         step_name,
         WorkflowNodeRole::Step,
@@ -366,6 +394,13 @@ fn resolve_finalizer_prerequisites(
             },
         )?;
     }
+    infer_condition_prerequisites(
+        finalizer_name,
+        WorkflowNodeRole::Finalizer,
+        common_node(&finalizer.body).condition.as_ref(),
+        document,
+        &mut prerequisites,
+    )?;
     infer_body_prerequisites(
         finalizer_name,
         WorkflowNodeRole::Finalizer,
@@ -400,9 +435,314 @@ fn insert_control_prerequisite(
         ResolvedDirectPrerequisite {
             producer: dependency.clone(),
             control: true,
+            disposition_control: false,
             data: false,
+            condition_data: false,
         },
     );
+    Ok(())
+}
+
+fn validate_workflow_condition_bounds(
+    document: &WorkflowDocument,
+) -> Result<(), ValidationFailure> {
+    let mut total = 0_usize;
+    for (name, role, condition) in document
+        .steps
+        .iter()
+        .map(|(name, step)| {
+            (
+                name,
+                WorkflowNodeRole::Step,
+                common_node(&step.body).condition.as_ref(),
+            )
+        })
+        .chain(document.finalizers.iter().map(|(name, finalizer)| {
+            (
+                name,
+                WorkflowNodeRole::Finalizer,
+                common_node(&finalizer.body).condition.as_ref(),
+            )
+        }))
+    {
+        let Some(condition) = condition else { continue };
+        let location = condition_location(name, role);
+        let count = condition_node_count(condition, 1, &location)?;
+        total = total.checked_add(count).ok_or_else(|| {
+            ValidationFailure::new(
+                ValidationFailureKind::WorkflowConditionNodeLimitExceeded,
+                ValidationLocation::WorkflowGraph,
+            )
+        })?;
+        if total > MAXIMUM_WORKFLOW_CONDITION_NODES {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::WorkflowConditionNodeLimitExceeded,
+                ValidationLocation::WorkflowGraph,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn condition_node_count(
+    predicate: &ConditionPredicate,
+    depth: usize,
+    location: &ValidationLocation,
+) -> Result<usize, ValidationFailure> {
+    if depth > MAXIMUM_CONDITION_DEPTH {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::ConditionDepthExceeded,
+            location.clone(),
+        ));
+    }
+    let children: &[ConditionPredicate] = match predicate {
+        ConditionPredicate::All(children) | ConditionPredicate::Any(children) => {
+            if children.is_empty() || children.len() > MAXIMUM_CONDITION_CHILDREN {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::ConditionChildLimitExceeded,
+                    location.clone(),
+                ));
+            }
+            children
+        }
+        ConditionPredicate::Not(child) => std::slice::from_ref(child),
+        ConditionPredicate::Equals(_)
+        | ConditionPredicate::Exists(_)
+        | ConditionPredicate::Disposition { .. } => &[],
+    };
+    let mut count = 1_usize;
+    for child in children {
+        count = count
+            .checked_add(condition_node_count(child, depth + 1, location)?)
+            .ok_or_else(|| {
+                ValidationFailure::new(
+                    ValidationFailureKind::ConditionNodeLimitExceeded,
+                    location.clone(),
+                )
+            })?;
+        if count > MAXIMUM_CONDITION_NODES {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::ConditionNodeLimitExceeded,
+                location.clone(),
+            ));
+        }
+    }
+    Ok(count)
+}
+
+fn infer_condition_prerequisites(
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    condition: Option<&ConditionPredicate>,
+    document: &WorkflowDocument,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
+) -> Result<(), ValidationFailure> {
+    let Some(condition) = condition else {
+        return Ok(());
+    };
+    match condition {
+        ConditionPredicate::All(children) | ConditionPredicate::Any(children) => {
+            for child in children {
+                infer_condition_prerequisites(
+                    consumer_name,
+                    consumer_role,
+                    Some(child),
+                    document,
+                    prerequisites,
+                )?;
+            }
+        }
+        ConditionPredicate::Not(child) => infer_condition_prerequisites(
+            consumer_name,
+            consumer_role,
+            Some(child),
+            document,
+            prerequisites,
+        )?,
+        ConditionPredicate::Equals(operands) => {
+            for operand in operands {
+                if let ConditionOperand::Reference { reference, .. } = operand {
+                    infer_condition_value_reference(
+                        consumer_name,
+                        consumer_role,
+                        reference,
+                        document,
+                        prerequisites,
+                    )?;
+                }
+            }
+        }
+        ConditionPredicate::Exists(selector) => infer_condition_value_reference(
+            consumer_name,
+            consumer_role,
+            &selector.reference,
+            document,
+            prerequisites,
+        )?,
+        ConditionPredicate::Disposition { node, .. } => {
+            let target_role = condition_target_role(
+                document,
+                node,
+                condition_location(consumer_name, consumer_role),
+            )?;
+            if node == consumer_name && target_role == consumer_role
+                || consumer_role == WorkflowNodeRole::Step && target_role != WorkflowNodeRole::Step
+            {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::InvalidConditionReference,
+                    condition_location(consumer_name, consumer_role),
+                ));
+            }
+            if consumer_role == target_role {
+                prerequisites
+                    .entry(node.clone())
+                    .and_modify(|prerequisite| prerequisite.disposition_control = true)
+                    .or_insert_with(|| ResolvedDirectPrerequisite {
+                        producer: node.clone(),
+                        control: false,
+                        disposition_control: true,
+                        data: false,
+                        condition_data: false,
+                    });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn infer_condition_value_reference(
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    reference: &ValueReference,
+    document: &WorkflowDocument,
+    prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
+) -> Result<(), ValidationFailure> {
+    let location = condition_location(consumer_name, consumer_role);
+    match reference {
+        ValueReference::Import { name } if name == "prompt" => Ok(()),
+        ValueReference::Import { .. } => Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidConditionReference,
+            location,
+        )),
+        ValueReference::FinalizationContext if consumer_role == WorkflowNodeRole::Finalizer => {
+            Ok(())
+        }
+        ValueReference::FinalizationContext => Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidConditionReference,
+            location,
+        )),
+        ValueReference::Output(reference) => {
+            let (producer_role, producer_body, output) =
+                declared_output(document, reference, location.clone())?;
+            if !matches!(
+                output,
+                Output::TextPath { .. }
+                    | Output::TextAgentResponse
+                    | Output::JsonPath { .. }
+                    | Output::JsonAgentResult { .. }
+            ) || reference.node == consumer_name && producer_role == consumer_role
+                || consumer_role == WorkflowNodeRole::Step
+                    && producer_role == WorkflowNodeRole::Finalizer
+            {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::InvalidConditionReference,
+                    location,
+                ));
+            }
+            // jscpd:ignore-start -- Condition and body traversals retain distinct failure locations.
+            validate_data_dependency_authority(
+                document,
+                consumer_name,
+                &reference.node,
+                consumer_role,
+                producer_role,
+                common_node(producer_body).failure_policy,
+                &location,
+            )?;
+            if consumer_role == producer_role {
+                mark_data_prerequisite(prerequisites, &reference.node, true);
+            }
+            // jscpd:ignore-end
+            Ok(())
+        }
+    }
+}
+
+fn condition_location(name: &str, role: WorkflowNodeRole) -> ValidationLocation {
+    match role {
+        WorkflowNodeRole::Step => ValidationLocation::StepCondition {
+            step: name.to_owned(),
+        },
+        WorkflowNodeRole::Finalizer => ValidationLocation::FinalizerCondition {
+            finalizer: name.to_owned(),
+        },
+    }
+}
+
+fn condition_target_role(
+    document: &WorkflowDocument,
+    node: &str,
+    location: ValidationLocation,
+) -> Result<WorkflowNodeRole, ValidationFailure> {
+    if document.steps.contains_key(node) {
+        Ok(WorkflowNodeRole::Step)
+    } else if document.finalizers.contains_key(node) {
+        Ok(WorkflowNodeRole::Finalizer)
+    } else {
+        Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidConditionReference,
+            location,
+        ))
+    }
+}
+
+fn validate_data_dependency_authority(
+    document: &WorkflowDocument,
+    consumer_name: &str,
+    producer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    producer_role: WorkflowNodeRole,
+    producer_policy: FailurePolicy,
+    location: &ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    if producer_policy == FailurePolicy::Advisory
+        && node_common(document, consumer_name, consumer_role).failure_policy
+            == FailurePolicy::Required
+    {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::AdvisoryDataDependency,
+            location.clone(),
+        ));
+    }
+    validate_finalizer_trigger_compatibility(
+        document,
+        consumer_name,
+        producer_name,
+        consumer_role,
+        producer_role,
+        location,
+    )
+}
+
+fn validate_finalizer_trigger_compatibility(
+    document: &WorkflowDocument,
+    consumer_name: &str,
+    producer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    producer_role: WorkflowNodeRole,
+    location: &ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    if consumer_role == WorkflowNodeRole::Finalizer
+        && producer_role == WorkflowNodeRole::Finalizer
+        && !document.finalizers[consumer_name]
+            .when
+            .is_subset(&document.finalizers[producer_name].when)
+    {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::IncompatibleFinalizerTriggers,
+            location.clone(),
+        ));
+    }
     Ok(())
 }
 
@@ -522,30 +862,17 @@ fn infer_reference_prerequisite(
                     location,
                 ));
             }
-            let consumer_policy =
-                node_common(document, consumer_name, consumer_role).failure_policy;
-            if common_node(producer_body).failure_policy == FailurePolicy::Advisory
-                && consumer_policy == FailurePolicy::Required
-            {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::AdvisoryDataDependency,
-                    location,
-                ));
-            }
-            if consumer_role == WorkflowNodeRole::Finalizer
-                && producer_role == WorkflowNodeRole::Finalizer
-            {
-                let consumer = &document.finalizers[consumer_name];
-                let producer = &document.finalizers[&reference.node];
-                if !consumer.when.is_subset(&producer.when) {
-                    return Err(ValidationFailure::new(
-                        ValidationFailureKind::IncompatibleFinalizerTriggers,
-                        location,
-                    ));
-                }
-            }
+            validate_data_dependency_authority(
+                document,
+                consumer_name,
+                &reference.node,
+                consumer_role,
+                producer_role,
+                common_node(producer_body).failure_policy,
+                &location,
+            )?;
             if consumer_role == producer_role {
-                mark_data_prerequisite(prerequisites, &reference.node);
+                mark_data_prerequisite(prerequisites, &reference.node, false);
             }
         }
     }
@@ -555,14 +882,20 @@ fn infer_reference_prerequisite(
 fn mark_data_prerequisite(
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     producer: &str,
+    condition_data: bool,
 ) {
     prerequisites
         .entry(producer.to_owned())
-        .and_modify(|prerequisite| prerequisite.data = true)
+        .and_modify(|prerequisite| {
+            prerequisite.data = true;
+            prerequisite.condition_data |= condition_data;
+        })
         .or_insert_with(|| ResolvedDirectPrerequisite {
             producer: producer.to_owned(),
             control: false,
+            disposition_control: false,
             data: true,
+            condition_data,
         });
 }
 
@@ -728,6 +1061,241 @@ fn validate_recovery(
         .transpose()
 }
 
+fn resolve_condition_predicate(
+    predicate: &ConditionPredicate,
+    node_name: &str,
+    role: WorkflowNodeRole,
+    document: &WorkflowDocument,
+    required_imports: &mut RequiredImports,
+    condition_values: &mut BTreeMap<String, ResolvedValueSource>,
+) -> Result<ResolvedPredicate, ValidationFailure> {
+    let resolve_child =
+        |child: &ConditionPredicate,
+         required_imports: &mut RequiredImports,
+         condition_values: &mut BTreeMap<String, ResolvedValueSource>| {
+            resolve_condition_predicate(
+                child,
+                node_name,
+                role,
+                document,
+                required_imports,
+                condition_values,
+            )
+        };
+    match predicate {
+        ConditionPredicate::All(children) => Ok(ResolvedPredicate::All(
+            children
+                .iter()
+                .map(|child| resolve_child(child, required_imports, condition_values))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        )),
+        ConditionPredicate::Any(children) => Ok(ResolvedPredicate::Any(
+            children
+                .iter()
+                .map(|child| resolve_child(child, required_imports, condition_values))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        )),
+        ConditionPredicate::Not(child) => Ok(ResolvedPredicate::Not(Box::new(resolve_child(
+            child,
+            required_imports,
+            condition_values,
+        )?))),
+        ConditionPredicate::Equals(operands) => resolve_condition_equals(
+            operands,
+            node_name,
+            role,
+            document,
+            required_imports,
+            condition_values,
+        ),
+        ConditionPredicate::Exists(selector) => {
+            let (canonical, source, kind) = resolve_condition_reference(
+                &selector.reference,
+                node_name,
+                role,
+                document,
+                required_imports,
+            )?;
+            if kind != ConditionValueKind::Json {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::InvalidConditionType,
+                    condition_location(node_name, role),
+                ));
+            }
+            let pointer =
+                JsonPointer::parse(Arc::<str>::from(selector.pointer.as_str())).map_err(|_| {
+                    ValidationFailure::new(
+                        ValidationFailureKind::InvalidJsonPointer,
+                        condition_location(node_name, role),
+                    )
+                })?;
+            condition_values.insert(canonical.clone(), source);
+            Ok(ResolvedPredicate::Exists(ResolvedSelector::new(
+                canonical, pointer,
+            )))
+        }
+        ConditionPredicate::Disposition { node, is } => {
+            let target_role =
+                condition_target_role(document, node, condition_location(node_name, role))?;
+            Ok(ResolvedPredicate::Disposition {
+                node: WorkflowNode {
+                    id: node.clone(),
+                    role: target_role,
+                },
+                is: *is,
+            })
+        }
+    }
+}
+
+fn resolve_condition_equals(
+    operands: &[ConditionOperand; 2],
+    node_name: &str,
+    role: WorkflowNodeRole,
+    document: &WorkflowDocument,
+    required_imports: &mut RequiredImports,
+    condition_values: &mut BTreeMap<String, ResolvedValueSource>,
+) -> Result<ResolvedPredicate, ValidationFailure> {
+    struct ReferenceResolution {
+        canonical: String,
+        source: ResolvedValueSource,
+        kind: ConditionValueKind,
+        pointer: Option<JsonPointer>,
+    }
+    let mut references: [Option<ReferenceResolution>; 2] = [None, None];
+    for (index, operand) in operands.iter().enumerate() {
+        let ConditionOperand::Reference { reference, pointer } = operand else {
+            continue;
+        };
+        let (canonical, source, kind) =
+            resolve_condition_reference(reference, node_name, role, document, required_imports)?;
+        if kind == ConditionValueKind::Text && pointer.is_some() {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidConditionType,
+                condition_location(node_name, role),
+            ));
+        }
+        let pointer = pointer
+            .as_ref()
+            .map(|pointer| JsonPointer::parse(Arc::<str>::from(pointer.as_str())))
+            .transpose()
+            .map_err(|_| {
+                ValidationFailure::new(
+                    ValidationFailureKind::InvalidJsonPointer,
+                    condition_location(node_name, role),
+                )
+            })?;
+        references[index] = Some(ReferenceResolution {
+            canonical,
+            source,
+            kind,
+            pointer,
+        });
+    }
+    let kind = match (&references[0], &references[1]) {
+        (None, None) => {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidCondition,
+                condition_location(node_name, role),
+            ));
+        }
+        (Some(left), Some(right)) if left.kind != right.kind => {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidConditionType,
+                condition_location(node_name, role),
+            ));
+        }
+        (Some(reference), _) | (_, Some(reference)) => reference.kind,
+    };
+    let mut resolved = Vec::with_capacity(2);
+    for (index, operand) in operands.iter().enumerate() {
+        match operand {
+            ConditionOperand::Reference { .. } => {
+                let reference = references[index].take().ok_or_else(|| {
+                    ValidationFailure::new(
+                        ValidationFailureKind::InvalidConditionReference,
+                        condition_location(node_name, role),
+                    )
+                })?;
+                condition_values.insert(reference.canonical.clone(), reference.source);
+                resolved.push(match reference.kind {
+                    ConditionValueKind::Text => {
+                        ResolvedOperand::text_reference(reference.canonical)
+                    }
+                    ConditionValueKind::Json => {
+                        ResolvedOperand::json_reference(reference.canonical, reference.pointer)
+                    }
+                });
+            }
+            ConditionOperand::Literal(value) => match kind {
+                ConditionValueKind::Text => {
+                    let Value::String(value) = value else {
+                        return Err(ValidationFailure::new(
+                            ValidationFailureKind::InvalidConditionType,
+                            condition_location(node_name, role),
+                        ));
+                    };
+                    resolved.push(ResolvedOperand::text_literal(Arc::<str>::from(
+                        value.as_str(),
+                    )));
+                }
+                ConditionValueKind::Json => {
+                    resolved.push(ResolvedOperand::json_literal(Arc::new(value.clone())));
+                }
+            },
+        }
+    }
+    let operands: [ResolvedOperand; 2] = resolved.try_into().map_err(|_| {
+        ValidationFailure::new(
+            ValidationFailureKind::InvalidCondition,
+            condition_location(node_name, role),
+        )
+    })?;
+    Ok(ResolvedPredicate::Equals(operands))
+}
+
+fn resolve_condition_reference(
+    reference: &ValueReference,
+    node_name: &str,
+    role: WorkflowNodeRole,
+    document: &WorkflowDocument,
+    required_imports: &mut RequiredImports,
+) -> Result<(String, ResolvedValueSource, ConditionValueKind), ValidationFailure> {
+    let resolved = resolve_value_reference(
+        reference,
+        document,
+        required_imports,
+        condition_location(node_name, role),
+        role == WorkflowNodeRole::Finalizer,
+    )?;
+    let kind = match resolved.value_type {
+        WorkflowValueType::Text => ConditionValueKind::Text,
+        WorkflowValueType::Json => ConditionValueKind::Json,
+        WorkflowValueType::AttachmentCollection
+        | WorkflowValueType::File
+        | WorkflowValueType::GitBranch => {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidConditionType,
+                condition_location(node_name, role),
+            ));
+        }
+    };
+    let canonical = match &resolved.source {
+        ResolvedValueSource::Import(WorkflowImport::Prompt) => "imports.prompt".to_owned(),
+        ResolvedValueSource::Import(WorkflowImport::Attachments) => {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidConditionReference,
+                condition_location(node_name, role),
+            ));
+        }
+        ResolvedValueSource::Output(output) => output.reference(),
+        ResolvedValueSource::FinalizationContext => "finalization.context".to_owned(),
+    };
+    Ok((canonical, resolved.source, kind))
+}
+
 fn validate_body(
     node_name: &str,
     role: WorkflowNodeRole,
@@ -737,10 +1305,31 @@ fn validate_body(
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
     required_imports: &mut RequiredImports,
 ) -> Result<ValidatedStep, ValidationFailure> {
+    let mut condition_values = BTreeMap::new();
+    let condition = common_node(body)
+        .condition
+        .as_ref()
+        .map(|condition| {
+            resolve_condition_predicate(
+                condition,
+                node_name,
+                role,
+                document,
+                required_imports,
+                &mut condition_values,
+            )
+        })
+        .transpose()?;
     let evidence_prerequisites = evidence_prerequisites(body, prerequisites)?;
     match body {
         NodeBody::Command(command) => Ok(ValidatedStep::Command(ValidatedCommandStep {
-            common: validate_common(&command.common, prerequisites, evidence_prerequisites),
+            common: validate_common(
+                &command.common,
+                condition,
+                condition_values,
+                prerequisites,
+                evidence_prerequisites,
+            ),
             inputs: validate_command_inputs(
                 node_name,
                 role,
@@ -751,7 +1340,13 @@ fn validate_body(
             argv: command.argv.clone(),
         })),
         NodeBody::Agent(agent) => {
-            let common = validate_common(&agent.common, prerequisites, evidence_prerequisites);
+            let common = validate_common(
+                &agent.common,
+                condition,
+                condition_values,
+                prerequisites,
+                evidence_prerequisites,
+            );
             let harness = resolve_agent_profile(node_name, role, &agent.agent, agent_profiles)?;
             let validated_agent = validate_agent(
                 node_name,
@@ -778,6 +1373,7 @@ fn evidence_prerequisites(
         .filter(|prerequisite| prerequisite.control)
         .filter_map(|prerequisite| Prerequisite::control(prerequisite.producer.clone()).ok())
         .collect::<Vec<_>>();
+    retain_condition_descriptors(common_node(body).condition.as_ref(), &mut descriptors);
     let mut retain_reference = |reference: &ValueReference| {
         if let ValueReference::Output(output) = reference
             && let Ok(descriptor) =
@@ -817,8 +1413,55 @@ fn evidence_prerequisites(
     Ok(descriptors)
 }
 
+fn retain_condition_descriptors(
+    condition: Option<&ConditionPredicate>,
+    descriptors: &mut Vec<Prerequisite>,
+) {
+    let Some(condition) = condition else { return };
+    match condition {
+        ConditionPredicate::All(children) | ConditionPredicate::Any(children) => {
+            for child in children {
+                retain_condition_descriptors(Some(child), descriptors);
+            }
+        }
+        ConditionPredicate::Not(child) => {
+            retain_condition_descriptors(Some(child), descriptors);
+        }
+        ConditionPredicate::Equals(operands) => {
+            for operand in operands {
+                if let ConditionOperand::Reference {
+                    reference: ValueReference::Output(output),
+                    ..
+                } = operand
+                    && let Ok(descriptor) = Prerequisite::condition(format!(
+                        "outputs.{}.{}",
+                        output.node, output.output
+                    ))
+                {
+                    descriptors.push(descriptor);
+                }
+            }
+        }
+        ConditionPredicate::Exists(selector) => {
+            if let ValueReference::Output(output) = &selector.reference
+                && let Ok(descriptor) =
+                    Prerequisite::condition(format!("outputs.{}.{}", output.node, output.output))
+            {
+                descriptors.push(descriptor);
+            }
+        }
+        ConditionPredicate::Disposition { node, .. } => {
+            if let Ok(descriptor) = Prerequisite::control(node.clone()) {
+                descriptors.push(descriptor);
+            }
+        }
+    }
+}
+
 fn validate_common(
     common: &CommonNode,
+    condition: Option<ResolvedPredicate>,
+    condition_values: BTreeMap<String, ResolvedValueSource>,
     prerequisites: &[ResolvedDirectPrerequisite],
     evidence_prerequisites: Vec<Prerequisite>,
 ) -> ValidatedCommonStep {
@@ -838,6 +1481,8 @@ fn validate_common(
 
     ValidatedCommonStep {
         failure_policy: common.failure_policy,
+        condition,
+        condition_values,
         prerequisites: prerequisites.to_vec(),
         evidence_prerequisites,
         cwd: common.cwd.clone(),

@@ -203,6 +203,10 @@ fn cloud_assignment_offer_with_mismatched_sources() -> Message {
                         "diagnosticRetentionBytes": 8388608,
                         "nativeSessionRetentionBytes": 4194304,
                         "aggregateRetentionBytes": 12582912,
+                        "conditionTransitionCount": 0,
+                        "aggregateConditionTransitionBytes": 0,
+                        "terminalResultStructureBytes": 67108864,
+                        "portableResultBytes": 202027692,
                         "encodedOutboxBytes": 85458944
                     },
                     "runInputs": null

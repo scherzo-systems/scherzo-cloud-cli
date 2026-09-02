@@ -382,7 +382,7 @@ fn step_transition(
     to: StepStateKind,
     detail: Option<ObservedStepTransition>,
 ) -> ExecutionObservation<OffsetDateTime> {
-    ExecutionObservation::Transition(TransitionObservation {
+    ExecutionObservation::Transition(Box::new(TransitionObservation {
         event: TransitionEvent::Step {
             sequence: TransitionSequence::default(),
             step: step.to_owned(),
@@ -392,7 +392,7 @@ fn step_transition(
             to,
         },
         step: detail,
-    })
+    }))
 }
 
 #[test]
@@ -699,14 +699,16 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
         ))
         .await;
     presentation
-        .observe(ExecutionObservation::Transition(TransitionObservation {
-            event: TransitionEvent::CancellationAccepted {
-                sequence: TransitionSequence::default(),
-                reason: CancellationReason::UserRequest,
-                deadline: timestamp("2026-08-02T12:01:58Z"),
+        .observe(ExecutionObservation::Transition(Box::new(
+            TransitionObservation {
+                event: TransitionEvent::CancellationAccepted {
+                    sequence: TransitionSequence::default(),
+                    reason: CancellationReason::UserRequest,
+                    deadline: timestamp("2026-08-02T12:01:58Z"),
+                },
+                step: None,
             },
-            step: None,
-        }))
+        )))
         .await;
     presentation
         .observe(step_transition(

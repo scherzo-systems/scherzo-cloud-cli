@@ -1162,6 +1162,10 @@ pub(super) fn cloud_execution_capacity(
         diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
         native_session_retention_bytes: requirements.native_session_retention_bytes,
         aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+        condition_transition_count: requirements.condition_transition_count,
+        aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
+        terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+        portable_result_bytes: requirements.portable_result_bytes,
         encoded_outbox_bytes: requirements.encoded_outbox_bytes,
     }
 }
@@ -2229,6 +2233,10 @@ fn finalizer_result(result: &FinalizerResult) -> Value {
             object.insert("state".to_owned(), json!("blocked"));
             object.insert("detail".to_owned(), json!(detail));
         }
+        StepState::Skipped { detail } => {
+            object.insert("state".to_owned(), json!("skipped"));
+            object.insert("detail".to_owned(), json!(detail));
+        }
         StepState::NotRun { detail } => {
             object.insert("state".to_owned(), json!("not_run"));
             object.insert("detail".to_owned(), json!(detail));
@@ -2365,6 +2373,9 @@ fn workflow_event(
                         event.insert("detail".to_owned(), json!(detail));
                     }
                     ObservedStepTransition::Blocked { detail } => {
+                        event.insert("detail".to_owned(), json!(detail));
+                    }
+                    ObservedStepTransition::Skipped { detail } => {
                         event.insert("detail".to_owned(), json!(detail));
                     }
                     ObservedStepTransition::NotRun { detail } => {
@@ -2560,6 +2571,7 @@ fn step_state_name(state: StepStateKind) -> &'static str {
         StepStateKind::Succeeded => "succeeded",
         StepStateKind::Failed => "failed",
         StepStateKind::Blocked => "blocked",
+        StepStateKind::Skipped => "skipped",
         StepStateKind::NotRun => "not_run",
         StepStateKind::Cancelled => "cancelled",
     }
@@ -3034,52 +3046,56 @@ mod tests {
             transition_sequence: crate::execution::workflow::runtime::TransitionSequence(2),
         };
         observer
-            .observe(ExecutionObservation::Transition(TransitionObservation {
-                event: TransitionEvent::Step {
-                    sequence: crate::execution::workflow::runtime::TransitionSequence(1),
-                    step: "verify".to_owned(),
-                    role: WorkflowNodeRole::Step,
-                    failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
-                    from: StepStateKind::Pending,
-                    to: StepStateKind::Starting,
+            .observe(ExecutionObservation::Transition(Box::new(
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        sequence: crate::execution::workflow::runtime::TransitionSequence(1),
+                        step: "verify".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                        failure_policy:
+                            crate::execution::workflow::document::FailurePolicy::Required,
+                        from: StepStateKind::Pending,
+                        to: StepStateKind::Starting,
+                    },
+                    step: None,
                 },
-                step: None,
-            }))
+            )))
             .await;
         observer
-            .observe(ExecutionObservation::Transition(TransitionObservation {
-                event: TransitionEvent::Step {
-                    sequence: crate::execution::workflow::runtime::TransitionSequence(2),
-                    step: "verify".to_owned(),
-                    role: WorkflowNodeRole::Step,
-                    failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
-                    from: StepStateKind::Running,
-                    to: StepStateKind::Recovering,
-                },
-                step: Some(ObservedStepTransition::Recovery {
-                    active: ActiveStepInvocation::RecoveryHandler {
-                        round: crate::execution::workflow::runtime::RecoveryRoundNumber::fixture(1),
+            .observe(ExecutionObservation::Transition(Box::new(
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        sequence: crate::execution::workflow::runtime::TransitionSequence(2),
+                        step: "verify".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                        failure_policy:
+                            crate::execution::workflow::document::FailurePolicy::Required,
+                        from: StepStateKind::Running,
+                        to: StepStateKind::Recovering,
                     },
-                    active_invocation_id: handler,
-                    settled_invocation: Some((
-                        target,
-                        ActiveStepInvocation::Target {
-                            execution_number:
-                                crate::execution::workflow::runtime::TargetExecutionNumber::fixture(
-                                    1,
-                                ),
+                    step: Some(ObservedStepTransition::Recovery {
+                        active: ActiveStepInvocation::RecoveryHandler {
+                            round:
+                                crate::execution::workflow::runtime::RecoveryRoundNumber::fixture(1),
                         },
-                    )),
-                    configured_rounds: 1,
-                    handler_kind: Some(
-                        crate::execution::workflow::runtime::RecoveryHandlerKind::Command,
-                    ),
-                    handler_state: Some(
-                        crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting,
-                    ),
-                    decision: None,
-                }),
-            }))
+                        active_invocation_id: handler,
+                        settled_invocation: Some((
+                            target,
+                            ActiveStepInvocation::Target {
+                                execution_number: crate::execution::workflow::runtime::TargetExecutionNumber::fixture(1),
+                            },
+                        )),
+                        configured_rounds: 1,
+                        handler_kind: Some(
+                            crate::execution::workflow::runtime::RecoveryHandlerKind::Command,
+                        ),
+                        handler_state: Some(
+                            crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting,
+                        ),
+                        decision: None,
+                    }),
+                },
+            )))
             .await;
 
         let observations = outbox.pending(&BTreeSet::new(), 4);
@@ -3114,16 +3130,18 @@ mod tests {
         );
         fence.fence();
         observer
-            .observe(ExecutionObservation::Transition(TransitionObservation {
-                event: TransitionEvent::Workflow {
-                    sequence: Default::default(),
-                    from: WorkflowState::Executing {
-                        gate: SchedulingGate::Open,
+            .observe(ExecutionObservation::Transition(Box::new(
+                TransitionObservation {
+                    event: TransitionEvent::Workflow {
+                        sequence: Default::default(),
+                        from: WorkflowState::Executing {
+                            gate: SchedulingGate::Open,
+                        },
+                        to: Box::new(WorkflowState::Succeeded),
                     },
-                    to: Box::new(WorkflowState::Succeeded),
+                    step: None,
                 },
-                step: None,
-            }))
+            )))
             .await;
         assert_eq!(observer.last_sequence(), 0);
         assert!(outbox.pending(&BTreeSet::new(), 1).is_empty());
@@ -3164,24 +3182,26 @@ mod tests {
             RunnerInvocationEvidence::default(),
         );
         observer
-            .observe(ExecutionObservation::Transition(TransitionObservation {
-                event: TransitionEvent::Workflow {
-                    sequence: Default::default(),
-                    from: WorkflowState::Executing {
-                        gate: SchedulingGate::Cancelling {
-                            reason: CancellationReason::ExecutionLeaseExpired,
-                            prior_issue: None,
+            .observe(ExecutionObservation::Transition(Box::new(
+                TransitionObservation {
+                    event: TransitionEvent::Workflow {
+                        sequence: Default::default(),
+                        from: WorkflowState::Executing {
+                            gate: SchedulingGate::Cancelling {
+                                reason: CancellationReason::ExecutionLeaseExpired,
+                                prior_issue: None,
+                            },
                         },
+                        to: Box::new(WorkflowState::Finalizing {
+                            trigger:
+                                crate::execution::workflow::document::FinalizationTrigger::Cancelled,
+                            gate: FinalizationGate::Open,
+                            primary_issue: None,
+                        }),
                     },
-                    to: Box::new(WorkflowState::Finalizing {
-                        trigger:
-                            crate::execution::workflow::document::FinalizationTrigger::Cancelled,
-                        gate: FinalizationGate::Open,
-                        primary_issue: None,
-                    }),
+                    step: None,
                 },
-                step: None,
-            }))
+            )))
             .await;
         assert!(cancellation.fixture_complete_finalization_arm());
 

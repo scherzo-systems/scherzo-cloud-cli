@@ -7,7 +7,7 @@ use crate::execution::workflow::archived_attempt::{
 };
 use crate::execution::workflow::archived_presentation::{
     archived_cancellation_reason, archived_failure_detail, archived_finalization_trigger,
-    blocked_detail, safe_path, safe_text,
+    blocked_detail, condition_false_detail, safe_path, safe_text,
 };
 use crate::execution::workflow::evidence::{NodeDetail, PrimaryIssueDetail};
 use crate::execution::workflow::presentation_feed::{
@@ -447,6 +447,9 @@ impl StepProjection for ArchivedTerminalStepView {
             ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail)) => Some(
                 issue_detail_for_step(blocked_detail(detail), &self.definition, self.state),
             ),
+            ArchivedStepDetail::Evidence(NodeDetail::Skipped(detail)) => {
+                Some(condition_false_detail(detail))
+            }
             ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => Some(
                 crate::execution::workflow::presentation::snake_case_debug(detail.code),
             ),
@@ -496,6 +499,11 @@ impl StepProjection for ArchivedTerminalStepView {
                 "prerequisites",
                 blocked_detail(detail),
                 Tone::Blocked,
+            )),
+            ArchivedStepDetail::Evidence(NodeDetail::Skipped(detail)) => Some(InspectorField::new(
+                "condition",
+                condition_false_detail(detail),
+                Tone::Muted,
             )),
             ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)) => Some(InspectorField::new(
                 "not run",
@@ -717,6 +725,7 @@ fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
         ArchivedStepState::Succeeded => StepStateKind::Succeeded,
         ArchivedStepState::Failed => StepStateKind::Failed,
         ArchivedStepState::Blocked => StepStateKind::Blocked,
+        ArchivedStepState::Skipped => StepStateKind::Skipped,
         ArchivedStepState::NotRun => StepStateKind::NotRun,
         ArchivedStepState::Cancelled => StepStateKind::Cancelled,
     }

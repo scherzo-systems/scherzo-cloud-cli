@@ -220,23 +220,31 @@ impl ExecutionObserver<TestInstant> for RecordingObserver {
 fn is_terminal_cancellation(observation: &ExecutionObservation<TestInstant>) -> bool {
     matches!(
         observation,
-        ExecutionObservation::Transition(TransitionObservation {
-            event: TransitionEvent::Workflow { to, .. },
-            ..
-        }) if matches!(to.as_ref(), WorkflowState::Cancelled { .. })
+        ExecutionObservation::Transition(transition)
+            if matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Workflow { to, .. },
+                    ..
+                } if matches!(to.as_ref(), WorkflowState::Cancelled { .. })
+            )
     )
 }
 
 fn is_step_success(observation: &ExecutionObservation<TestInstant>) -> bool {
     matches!(
         observation,
-        ExecutionObservation::Transition(TransitionObservation {
-            event: TransitionEvent::Step {
-                to: StepStateKind::Succeeded,
-                ..
-            },
-            ..
-        })
+        ExecutionObservation::Transition(transition)
+            if matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        to: StepStateKind::Succeeded,
+                        ..
+                    },
+                    ..
+                }
+            )
     )
 }
 
@@ -2543,19 +2551,23 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
         let terminal_transitions = entries
             .iter()
             .filter_map(|observation| match observation {
-                ExecutionObservation::Transition(TransitionObservation {
-                    event: TransitionEvent::Step { step, to, .. },
-                    ..
-                }) if step == "observe"
-                    && matches!(
-                        to,
-                        StepStateKind::Succeeded | StepStateKind::Failed | StepStateKind::Cancelled
-                    ) =>
-                {
-                    Some(*to)
-                }
-                ExecutionObservation::Transition(_)
-                | ExecutionObservation::CommandOutput(_)
+                ExecutionObservation::Transition(transition) => match transition.as_ref() {
+                    TransitionObservation {
+                        event: TransitionEvent::Step { step, to, .. },
+                        ..
+                    } if step == "observe"
+                        && matches!(
+                            to,
+                            StepStateKind::Succeeded
+                                | StepStateKind::Failed
+                                | StepStateKind::Cancelled
+                        ) =>
+                    {
+                        Some(*to)
+                    }
+                    _ => None,
+                },
+                ExecutionObservation::CommandOutput(_)
                 | ExecutionObservation::CommandOutputClosed(_)
                 | ExecutionObservation::Agent(_) => None,
             })
@@ -3161,18 +3173,15 @@ async fn wait_for_step_transition(
     expected_state: StepStateKind,
 ) {
     loop {
-        if matches!(
-            observed.recv().await,
-            Some(ExecutionObservation::Transition(TransitionObservation {
-                event:
-                    TransitionEvent::Step {
-                        step,
-                        to,
-                        ..
-                    },
-                ..
-            })) if step == expected_step && to == expected_state
-        ) {
+        if let Some(ExecutionObservation::Transition(transition)) = observed.recv().await
+            && matches!(
+                transition.as_ref(),
+                TransitionObservation {
+                    event: TransitionEvent::Step { step, to, .. },
+                    ..
+                } if step == expected_step && *to == expected_state
+            )
+        {
             return;
         }
     }

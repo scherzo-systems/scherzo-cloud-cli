@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::admission::{AdmittedWorkflow, CancellationOperation};
 use super::evidence::NodeFailureSource;
 use super::runtime::{
-    self, ActionId, CancellationRequest, Occurrence, OutputSet, RecoveryDecision,
+    self, ActionId, CancellationRequest, ConditionOutput, Occurrence, OutputSet, RecoveryDecision,
     RecoveryRoundNumber, Reduction, RequestedAction, RuntimeState, TransitionEvent, WorkflowState,
 };
 
@@ -727,7 +727,7 @@ impl<Provisional, Cause, Output, Clock, Commits, Actions>
 where
     Provisional: Clone + Eq,
     Cause: Clone + Eq + NodeFailureSource,
-    Output: Clone + Eq,
+    Output: Clone + Eq + ConditionOutput,
     Clock: CoordinatorClock,
     Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,

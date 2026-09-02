@@ -3,11 +3,16 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::admission::{AdmittedWorkflow, CancellationOperationId, CancellationReason};
+use super::condition::{
+    self, ConditionDispositions, ConditionEvaluation, ConditionValues, ResolvedPredicate,
+    TerminalDisposition,
+};
 use super::document::{FailurePolicy, FinalizationTrigger};
 pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
-    BlockedDetail, CancellationDetail, FailureDetail, NodeFailureSource, NonExecutionCode,
-    NonExecutionDetail, Prerequisite, PrimaryIssue,
+    BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
+    FailureDetail, NodeFailureSource, NonExecutionCode, NonExecutionDetail, Prerequisite,
+    PrimaryIssue,
 };
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
@@ -17,6 +22,39 @@ use super::validated::{
     ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
     ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
 };
+use super::value::CapturedValue;
+
+pub(crate) trait ConditionOutput {
+    fn condition_text(&self) -> Option<&str>;
+    fn condition_json(&self) -> Option<&serde_json::Value>;
+}
+
+impl ConditionOutput for CapturedValue {
+    fn condition_text(&self) -> Option<&str> {
+        match self {
+            CapturedValue::Text(value) => Some(value.as_str()),
+            CapturedValue::Json(_) | CapturedValue::File(_) | CapturedValue::GitBranch(_) => None,
+        }
+    }
+
+    fn condition_json(&self) -> Option<&serde_json::Value> {
+        match self {
+            CapturedValue::Json(value) => Some(value.value()),
+            CapturedValue::Text(_) | CapturedValue::File(_) | CapturedValue::GitBranch(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ConditionOutput for String {
+    fn condition_text(&self) -> Option<&str> {
+        Some(self)
+    }
+
+    fn condition_json(&self) -> Option<&serde_json::Value> {
+        None
+    }
+}
 
 pub(crate) type OutputSet<Output> = BTreeMap<String, Output>;
 pub(crate) type ExportSet<Output> = BTreeMap<String, ExportValue<Output>>;
@@ -349,6 +387,9 @@ pub(crate) enum StepState<Output> {
     Blocked {
         detail: BlockedDetail,
     },
+    Skipped {
+        detail: ConditionFalseDetail,
+    },
     NotRun {
         detail: NonExecutionDetail,
     },
@@ -369,6 +410,7 @@ impl<Output> StepState<Output> {
             Self::Succeeded { .. } => StepStateKind::Succeeded,
             Self::Failed { .. } => StepStateKind::Failed,
             Self::Blocked { .. } => StepStateKind::Blocked,
+            Self::Skipped { .. } => StepStateKind::Skipped,
             Self::NotRun { .. } => StepStateKind::NotRun,
             Self::Cancelled { .. } => StepStateKind::Cancelled,
         }
@@ -391,6 +433,7 @@ impl<Output> StepState<Output> {
             Self::Succeeded { .. }
                 | Self::Failed { .. }
                 | Self::Blocked { .. }
+                | Self::Skipped { .. }
                 | Self::NotRun { .. }
                 | Self::Cancelled { .. }
         )
@@ -408,6 +451,7 @@ pub(crate) enum StepStateKind {
     Succeeded,
     Failed,
     Blocked,
+    Skipped,
     NotRun,
     Cancelled,
 }
@@ -421,6 +465,7 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
     pub(crate) target_invocation: Option<ActionId>,
     pub(crate) active_invocation: Option<ActiveStepInvocation>,
     pub(crate) recovery: Option<StepRecoveryState<Cause>>,
+    pub(crate) condition_passed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +478,8 @@ struct RuntimeRecovery {
 struct RuntimeStep {
     role: WorkflowNodeRole,
     failure_policy: FailurePolicy,
+    condition: Option<ResolvedPredicate>,
+    condition_values: BTreeMap<String, ResolvedValueSource>,
     prerequisites: Arc<[ResolvedDirectPrerequisite]>,
     evidence_prerequisites: Arc<[Prerequisite]>,
     inputs: BTreeMap<String, ResolvedValueSource>,
@@ -456,15 +503,18 @@ struct RuntimeDefinition {
     exports: BTreeMap<String, RuntimeExport>,
     maximum_parallel_steps: NonZeroUsize,
     maximum_transitions: u64,
+    prompt: Option<Arc<str>>,
 }
 
 impl RuntimeDefinition {
     fn from_admitted(admitted: &AdmittedWorkflow) -> Self {
-        Self::from_workflow(
+        let mut definition = Self::from_workflow(
             &admitted.workflow().definition,
             admitted.execution().limits().maximum_parallel_steps(),
             admitted.capacity().maximum_transitions,
-        )
+        );
+        definition.prompt = admitted.imports().prompt().map(Arc::<str>::from);
+        definition
     }
 
     fn from_workflow(
@@ -516,6 +566,7 @@ impl RuntimeDefinition {
             exports,
             maximum_parallel_steps,
             maximum_transitions,
+            prompt: None,
         }
     }
 }
@@ -539,6 +590,8 @@ fn runtime_step(
     RuntimeStep {
         role,
         failure_policy: common.failure_policy,
+        condition: common.condition.clone(),
+        condition_values: common.condition_values.clone(),
         prerequisites: Arc::from(common.prerequisites.clone()),
         evidence_prerequisites: Arc::from(common.evidence_prerequisites.clone()),
         inputs: match step {
@@ -592,6 +645,7 @@ pub(crate) enum ExportUnavailableReason {
     Failed,
     Blocked,
     InputUnavailable,
+    Skipped,
     NotRun,
     TriggerNotSelected,
     Cancelled,
@@ -884,7 +938,7 @@ pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     initialize_with_operation(admitted, initial_cancellation, None)
@@ -897,7 +951,7 @@ pub(super) fn initialize_with_operation<Provisional, Cause, Output, Deadline>(
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     initialize_definition(ExecutionStart {
@@ -918,7 +972,7 @@ fn initialize_definition<Provisional, Cause, Output, Deadline>(
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     let steps = start
@@ -940,6 +994,7 @@ where
                         rounds: Vec::with_capacity(usize::from(recovery.retries)),
                         terminal_disposition: None,
                     }),
+                    condition_passed: false,
                 },
             )
         })
@@ -979,7 +1034,7 @@ pub(crate) fn reduce<Provisional, Cause, Output, Deadline>(
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone + NodeFailureSource,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     let mut reduction = Reduction {
@@ -1574,6 +1629,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
             | StepStateKind::Succeeded
             | StepStateKind::Failed
             | StepStateKind::Blocked
+            | StepStateKind::Skipped
             | StepStateKind::NotRun
             | StepStateKind::Cancelled => {}
         }
@@ -1872,6 +1928,17 @@ fn settle_target_failure<Provisional, Cause, Output, Deadline>(
     );
     transition_step(reduction, &step, StepState::Failed { detail }, None);
     clear_active_invocation(&mut reduction.state, &step);
+    commit_required_issue(reduction, &definition, primary_issue);
+}
+
+fn commit_required_issue<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    definition: &RuntimeStep,
+    primary_issue: PrimaryIssue,
+) where
+    Cause: Clone,
+    Deadline: Clone,
+{
     if definition.failure_policy == FailurePolicy::Required {
         match definition.role {
             WorkflowNodeRole::Step => close_ordinary_gate_for_failure(reduction, primary_issue),
@@ -2094,7 +2161,7 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) where
     Cause: Clone,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     loop {
@@ -2102,10 +2169,14 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
         match &reduction.state.workflow {
             WorkflowState::Executing { .. } => {
                 propagate_ordinary_pending_dispositions(reduction);
+                evaluate_ready_conditions(reduction, WorkflowNodeRole::Step);
+                propagate_ordinary_pending_dispositions(reduction);
                 select_ready_nodes(reduction, WorkflowNodeRole::Step);
                 enter_finalization_or_finish(reduction);
             }
             WorkflowState::Finalizing { .. } => {
+                propagate_finalizer_dispositions(reduction);
+                evaluate_ready_conditions(reduction, WorkflowNodeRole::Finalizer);
                 propagate_finalizer_dispositions(reduction);
                 select_ready_nodes(reduction, WorkflowNodeRole::Finalizer);
                 finish_finalization_if_terminal(reduction);
@@ -2118,6 +2189,265 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
             break;
         }
     }
+}
+
+fn evaluate_ready_conditions<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    role: WorkflowNodeRole,
+) where
+    Cause: Clone,
+    Output: Clone + ConditionOutput,
+    Deadline: Clone,
+{
+    loop {
+        let candidate = condition_ids(&reduction.state, role)
+            .find(|id| condition_gate_ready(&reduction.state, id))
+            .cloned();
+        let Some(id) = candidate else { break };
+        let Some(definition) = reduction.state.definition.steps.get(&id).cloned() else {
+            break;
+        };
+        let Some(predicate) = definition.condition.as_ref() else {
+            break;
+        };
+        match evaluate_condition(&reduction.state, &definition, predicate) {
+            ConditionEvaluation::Passed => {
+                if let Some(runtime) = reduction.state.steps.get_mut(&id) {
+                    runtime.condition_passed = true;
+                }
+            }
+            ConditionEvaluation::False {
+                evaluated_predicates,
+            } => {
+                let entries = evaluated_predicates
+                    .iter()
+                    .map(|entry| EvaluatedPredicateEvidence {
+                        path: entry.path.as_str().to_owned(),
+                        result: entry.result,
+                    });
+                let Ok(detail) = ConditionFalseDetail::new(entries) else {
+                    break;
+                };
+                transition_step(reduction, &id, StepState::Skipped { detail }, None);
+            }
+            ConditionEvaluation::Failed {
+                canonical_ref,
+                pointer,
+            } => {
+                let Ok(detail) =
+                    FailureDetail::json_pointer_missing(canonical_ref.as_ref(), pointer.as_ref())
+                else {
+                    break;
+                };
+                settle_condition_failure(reduction, id, definition, detail);
+            }
+            ConditionEvaluation::Unavailable { .. } => break,
+        }
+    }
+}
+
+fn condition_ids<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    role: WorkflowNodeRole,
+) -> impl Iterator<Item = &String> {
+    match role {
+        WorkflowNodeRole::Step => state.definition.ordinary_ids.iter(),
+        WorkflowNodeRole::Finalizer => state.definition.finalizer_ids.iter(),
+    }
+}
+
+fn condition_gate_ready<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    id: &str,
+) -> bool {
+    let Some(definition) = state.definition.steps.get(id) else {
+        return false;
+    };
+    let Some(runtime) = state.steps.get(id) else {
+        return false;
+    };
+    if definition.condition.is_none()
+        || runtime.condition_passed
+        || !matches!(runtime.state, StepState::Pending)
+        || !condition_phase_gate_open(state, definition)
+        || !condition_blockers(state, definition).is_empty()
+    {
+        return false;
+    }
+    let prerequisites_ready = definition.prerequisites.iter().all(|prerequisite| {
+        let Some(producer) = state.steps.get(&prerequisite.producer) else {
+            return false;
+        };
+        let terminal = producer.state.is_terminal();
+        let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+        match definition.role {
+            WorkflowNodeRole::Step => {
+                (!prerequisite.control || ordinary_control_satisfied(state, prerequisite))
+                    && (!prerequisite.disposition_control || terminal)
+                    && (!prerequisite.condition_data || succeeded)
+            }
+            WorkflowNodeRole::Finalizer => {
+                (!(prerequisite.control || prerequisite.disposition_control) || terminal)
+                    && (!prerequisite.condition_data || succeeded)
+            }
+        }
+    });
+    prerequisites_ready && condition_sources_available(state, definition)
+}
+
+fn condition_phase_gate_open<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    definition: &RuntimeStep,
+) -> bool {
+    match (&state.workflow, definition.role) {
+        (
+            WorkflowState::Executing {
+                gate: SchedulingGate::Open,
+            },
+            WorkflowNodeRole::Step,
+        ) => true,
+        (
+            WorkflowState::Finalizing {
+                trigger,
+                gate: FinalizationGate::Open,
+                ..
+            },
+            WorkflowNodeRole::Finalizer,
+        ) => definition.when.contains(trigger),
+        _ => false,
+    }
+}
+
+fn condition_sources_available<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    definition: &RuntimeStep,
+) -> bool {
+    definition
+        .condition_values
+        .values()
+        .all(|source| match source {
+            ResolvedValueSource::Import(_) => state.definition.prompt.is_some(),
+            ResolvedValueSource::FinalizationContext => state.finalization.is_some(),
+            ResolvedValueSource::Output(source) => state
+                .steps
+                .get(&source.node.id)
+                .is_some_and(|runtime| matches!(runtime.state, StepState::Succeeded { .. })),
+        })
+}
+
+fn evaluate_condition<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    definition: &RuntimeStep,
+    predicate: &ResolvedPredicate,
+) -> ConditionEvaluation
+where
+    Output: ConditionOutput,
+{
+    let context = state.finalization.as_ref().and_then(|finalization| {
+        serde_json::from_slice::<serde_json::Value>(&finalization.context).ok()
+    });
+    let mut values = ConditionValues::default();
+    for (canonical, source) in &definition.condition_values {
+        match source {
+            ResolvedValueSource::Import(_) => {
+                if let Some(prompt) = state.definition.prompt.as_deref() {
+                    values.insert_text_value(canonical.as_str(), prompt);
+                }
+            }
+            ResolvedValueSource::FinalizationContext => {
+                if let Some(context) = context.as_ref() {
+                    values.insert_json_value(canonical.as_str(), context);
+                }
+            }
+            ResolvedValueSource::Output(source) => {
+                let Some(output) =
+                    state
+                        .steps
+                        .get(&source.node.id)
+                        .and_then(|runtime| match &runtime.state {
+                            StepState::Succeeded { outputs } => outputs.get(&source.output),
+                            _ => None,
+                        })
+                else {
+                    continue;
+                };
+                if let Some(text) = output.condition_text() {
+                    values.insert_text_value(canonical.as_str(), text);
+                } else if let Some(json) = output.condition_json() {
+                    values.insert_json_value(canonical.as_str(), json);
+                }
+            }
+        }
+    }
+    let mut dispositions = ConditionDispositions::default();
+    for (id, runtime) in &state.steps {
+        if let Some(disposition) = terminal_disposition(&runtime.state) {
+            let role = state
+                .definition
+                .steps
+                .get(id)
+                .map_or(WorkflowNodeRole::Step, |definition| definition.role);
+            dispositions.insert(
+                WorkflowNode {
+                    id: id.clone(),
+                    role,
+                },
+                disposition,
+            );
+        }
+    }
+    condition::evaluate(predicate, &values, &dispositions)
+}
+
+fn terminal_disposition<Output>(state: &StepState<Output>) -> Option<TerminalDisposition> {
+    match state {
+        StepState::Succeeded { .. } => Some(TerminalDisposition::Succeeded),
+        StepState::Failed { .. } => Some(TerminalDisposition::Failed),
+        StepState::Skipped { .. } => Some(TerminalDisposition::Skipped),
+        StepState::Blocked { .. } => Some(TerminalDisposition::Blocked),
+        StepState::NotRun { .. } => Some(TerminalDisposition::NotRun),
+        StepState::Cancelled { .. } => Some(TerminalDisposition::Cancelled),
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
+        | StepState::Cancelling { .. } => None,
+    }
+}
+
+fn settle_blocked<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    id: String,
+    detail: BlockedDetail,
+) where
+    Cause: Clone,
+    Deadline: Clone,
+{
+    let Some(definition) = reduction.state.definition.steps.get(&id).cloned() else {
+        return;
+    };
+    let primary_issue = PrimaryIssue::blocked(
+        WorkflowNode {
+            id: id.clone(),
+            role: definition.role,
+        },
+        detail.clone(),
+    );
+    transition_step(reduction, &id, StepState::Blocked { detail }, None);
+    commit_required_issue(reduction, &definition, primary_issue);
+}
+
+fn settle_condition_failure<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    id: String,
+    definition: RuntimeStep,
+    detail: FailureDetail,
+) where
+    Cause: Clone,
+    Deadline: Clone,
+{
+    settle_target_failure(reduction, id, definition, detail);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2134,13 +2464,19 @@ fn propagate_ordinary_pending_dispositions<Provisional, Cause, Output, Deadline>
     Deadline: Clone,
 {
     while let Some((step, disposition)) = next_ordinary_pending_disposition(&reduction.state) {
-        let state = match disposition {
-            PendingDisposition::Blocked(detail) => StepState::Blocked { detail },
-            PendingDisposition::NotRun => StepState::NotRun {
-                detail: NonExecutionDetail::failure_stop(),
-            },
-        };
-        transition_step(reduction, &step, state, None);
+        match disposition {
+            PendingDisposition::Blocked(detail) => settle_blocked(reduction, step, detail),
+            PendingDisposition::NotRun => {
+                transition_step(
+                    reduction,
+                    &step,
+                    StepState::NotRun {
+                        detail: NonExecutionDetail::failure_stop(),
+                    },
+                    None,
+                );
+            }
+        }
     }
 }
 
@@ -2159,7 +2495,7 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
         if !matches!(runtime.state, StepState::Pending) {
             return None;
         }
-        let blockers = ordinary_unsatisfied_prerequisites(state, definition);
+        let blockers = ordinary_unsatisfied_prerequisites(state, step_id, definition);
         if !blockers.is_empty() {
             return BlockedDetail::new(blockers)
                 .ok()
@@ -2174,7 +2510,8 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
     })
 }
 
-fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
+// jscpd:ignore-start -- Condition and body blockers intentionally remain separate two-stage evidence paths.
+fn condition_blockers<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     definition: &RuntimeStep,
 ) -> Vec<Prerequisite> {
@@ -2186,17 +2523,67 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
         if !producer.state.is_terminal() {
             continue;
         }
+        if definition.role == WorkflowNodeRole::Step
+            && prerequisite.control
+            && !ordinary_control_satisfied(state, prerequisite)
+            && let Ok(blocker) = Prerequisite::control(prerequisite.producer.clone())
+        {
+            blockers.push(blocker);
+        }
+        if prerequisite.condition_data && !matches!(producer.state, StepState::Succeeded { .. }) {
+            blockers.extend(
+                definition
+                    .evidence_prerequisites
+                    .iter()
+                    .filter(|descriptor| {
+                        matches!(descriptor, Prerequisite::Condition { r#ref }
+                            if output_reference_producer(r#ref)
+                                == Some(prerequisite.producer.as_str()))
+                    })
+                    .cloned(),
+            );
+        }
+    }
+    for source in definition.condition_values.values() {
+        let ResolvedValueSource::Output(source) = source else {
+            continue;
+        };
+        if state.steps.get(&source.node.id).is_some_and(|producer| {
+            producer.state.is_terminal() && !matches!(producer.state, StepState::Succeeded { .. })
+        }) && let Ok(blocker) = Prerequisite::condition(source.reference())
+        {
+            blockers.push(blocker);
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+// jscpd:ignore-end
+
+fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    id: &str,
+    definition: &RuntimeStep,
+) -> Vec<Prerequisite> {
+    let condition_pending = definition.condition.is_some()
+        && state
+            .steps
+            .get(id)
+            .is_some_and(|runtime| !runtime.condition_passed);
+    if condition_pending {
+        return condition_blockers(state, definition);
+    }
+    let mut blockers = Vec::new();
+    for prerequisite in definition.prerequisites.iter() {
+        let Some(producer) = state.steps.get(&prerequisite.producer) else {
+            continue;
+        };
+        if !producer.state.is_terminal() {
+            continue;
+        }
         let succeeded = matches!(producer.state, StepState::Succeeded { .. });
-        let control_satisfied = succeeded
-            || (state
-                .definition
-                .steps
-                .get(&prerequisite.producer)
-                .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
-                && matches!(
-                    producer.state,
-                    StepState::Failed { .. } | StepState::Blocked { .. }
-                ));
+        let control_satisfied = ordinary_control_satisfied(state, prerequisite);
         if prerequisite.control
             && !control_satisfied
             && let Ok(blocker) = Prerequisite::control(prerequisite.producer.clone())
@@ -2241,17 +2628,32 @@ fn ordinary_prerequisite_satisfied<Cause, Output, Deadline>(
         return false;
     };
     let succeeded = matches!(producer.state, StepState::Succeeded { .. });
-    let control_satisfied = succeeded
-        || (state
-            .definition
-            .steps
-            .get(&prerequisite.producer)
-            .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
-            && matches!(
+    (!prerequisite.control || ordinary_control_satisfied(state, prerequisite))
+        && (!prerequisite.data || succeeded)
+        && (!prerequisite.disposition_control || producer.state.is_terminal())
+}
+
+fn ordinary_control_satisfied<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    prerequisite: &ResolvedDirectPrerequisite,
+) -> bool {
+    state
+        .steps
+        .get(&prerequisite.producer)
+        .is_some_and(|producer| {
+            matches!(
                 producer.state,
-                StepState::Failed { .. } | StepState::Blocked { .. }
-            ));
-    (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
+                StepState::Succeeded { .. } | StepState::Skipped { .. }
+            ) || (state
+                .definition
+                .steps
+                .get(&prerequisite.producer)
+                .is_some_and(|definition| definition.failure_policy == FailurePolicy::Advisory)
+                && matches!(
+                    producer.state,
+                    StepState::Failed { .. } | StepState::Blocked { .. }
+                ))
+        })
 }
 
 fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
@@ -2300,6 +2702,10 @@ fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
         );
     }
 
+    while let Some((finalizer, detail)) = next_finalizer_condition_block(&reduction.state) {
+        settle_blocked(reduction, finalizer, detail);
+    }
+
     while let Some((finalizer, references)) = next_input_unavailable(&reduction.state) {
         let prerequisites = references
             .into_iter()
@@ -2307,8 +2713,27 @@ fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
         let Ok(detail) = BlockedDetail::new(prerequisites) else {
             continue;
         };
-        transition_step(reduction, &finalizer, StepState::Blocked { detail }, None);
+        settle_blocked(reduction, finalizer, detail);
     }
+}
+
+fn next_finalizer_condition_block<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+) -> Option<(String, BlockedDetail)> {
+    state.definition.finalizer_ids.iter().find_map(|id| {
+        let definition = state.definition.steps.get(id)?;
+        let runtime = state.steps.get(id)?;
+        if definition.condition.is_none()
+            || runtime.condition_passed
+            || !matches!(runtime.state, StepState::Pending)
+            || !condition_phase_gate_open(state, definition)
+        {
+            return None;
+        }
+        BlockedDetail::new(condition_blockers(state, definition))
+            .ok()
+            .map(|detail| (id.clone(), detail))
+    })
 }
 
 fn next_input_unavailable<Cause, Output, Deadline>(
@@ -2316,7 +2741,10 @@ fn next_input_unavailable<Cause, Output, Deadline>(
 ) -> Option<(String, Vec<String>)> {
     state.definition.finalizer_ids.iter().find_map(|id| {
         let definition = state.definition.steps.get(id)?;
-        if !finalizer_ready(state, id, definition) {
+        let runtime = state.steps.get(id)?;
+        if !finalizer_ready(state, id, definition)
+            || definition.condition.is_some() && !runtime.condition_passed
+        {
             return None;
         }
         let references = unavailable_references(state, definition);
@@ -2557,7 +2985,7 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
     };
     let context = finalization_context::serialize(FinalizationContext {
         trigger,
-        primary_failure_step_id: primary_issue_step_id,
+        primary_issue_step_id,
         cancellation_reason: ordinary_cancellation,
         ordinary_issues: &ordinary_issues,
     });
@@ -2725,6 +3153,9 @@ fn erase_outputs<Output>(state: &StepState<Output>) -> Option<StepState<()>> {
         StepState::Blocked { detail } => StepState::Blocked {
             detail: detail.clone(),
         },
+        StepState::Skipped { detail } => StepState::Skipped {
+            detail: detail.clone(),
+        },
         StepState::NotRun { detail } => StepState::NotRun { detail: *detail },
         StepState::Cancelled { detail } => StepState::Cancelled { detail: *detail },
         StepState::Pending
@@ -2847,6 +3278,9 @@ where
                 },
                 StepState::Blocked { .. } => ExportValue::Unavailable {
                     reason: ExportUnavailableReason::Blocked,
+                },
+                StepState::Skipped { .. } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::Skipped,
                 },
                 StepState::NotRun {
                     detail:

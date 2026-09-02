@@ -78,7 +78,9 @@
           "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
           "executionSpec": {
             "capacity": {
+              "aggregateConditionTransitionBytes": 0,
               "aggregateRetentionBytes": 12582912,
+              "conditionTransitionCount": 0,
               "diagnosticRetentionBytes": 8388608,
               "encodedOutboxBytes": 85458944,
               "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
@@ -86,11 +88,13 @@
               "maximumInvocations": 1,
               "maximumRetainedBytesPerInvocation": 4194304,
               "nativeSessionRetentionBytes": 4194304,
+              "portableResultBytes": 202027692,
               "selectedMaximumTransitions": 7,
               "sourceClosureDigest": {
                 "algorithm": "sha256",
                 "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-              }
+              },
+              "terminalResultStructureBytes": 67108864
             },
             "executionLimits": {
               "cancellationGraceSeconds": 1,

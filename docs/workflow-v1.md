@@ -88,10 +88,30 @@ activates.
   policy, or nested recovery. Only terminal target success commits outputs; finalizers
   cannot declare recovery and wait for ordinary recovery quiescence.
 - Rechecks and handlers are fresh physical invocations in the same execution root.
-  `gave_up` or handler failure stops recovery. V1 has no conditional selection,
+  `gave_up` or handler failure stops recovery. Recovery has no condition-specific retry,
   delay/backoff, handler retry, capture-only retry, rollback, or session continuation.
 - Recovery effects are at-least-once. Authors supply stable domain idempotency keys
   through existing explicit inputs or admitted environment, not Scherzo lifecycle IDs.
+
+## Conditional steps and finalizers
+
+A command, agent step, or finalizer may declare one `condition`, using only `all`, `any`,
+`not`, `equals`, `exists`, and `disposition`. Operands are committed Text or JSON values,
+`imports.prompt`, phase-valid outputs, finalizer-only `finalization.context`, or a prior
+node's terminal disposition. Equality is same-kind without coercion; JSON Pointer follows
+RFC 6901.
+
+Resolution retains every referenced output and disposition in the static graph, even if
+evaluation short-circuits. Evaluation occurs at most once before body readiness. True
+proceeds; false commits terminal `skipped` with value-free `condition_false` evidence.
+Unavailable condition data blocks its gate; unavailable body data after true blocks the
+body gate. An evaluated missing Pointer fails in phase `condition` with code
+`json_pointer_missing`; a skipped export is unavailable as `source_skipped`.
+
+Limits: depth 16; 256 nodes per condition; 64 children per `all` or `any`; 4,096 nodes per
+workflow; and 1,024 exact prerequisite descriptors per node. A condition cannot read files,
+environment, credentials, logs, diagnostics, providers, clocks, randomness, or mutable
+source.
 
 A command uses a nonempty argument vector:
 
@@ -317,8 +337,8 @@ after every ordinary outcome.
 - Inputs and profiles are data, not permission to access files, processes, networks,
   tools, secrets, credentials, or repositories.
 
-Workflow V1 has no workflow-declared retry, timeout, condition, loop, matrix, fan-out,
-concurrency, secret, environment, or workspace field.
+Workflow V1 has no workflow-declared retry, timeout, loop, matrix, fan-out, concurrency,
+secret, environment, or workspace field.
 
 ## Schema retrieval and authoritative validation
 

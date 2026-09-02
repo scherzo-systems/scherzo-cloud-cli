@@ -57,6 +57,216 @@
       "type": "string",
       "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
+    "JsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "TerminalDisposition": {
+      "enum": ["succeeded", "failed", "skipped", "blocked", "not_run", "cancelled"]
+    },
+    "OrdinaryConditionReferenceString": {
+      "type": "string",
+      "pattern": "^imports\\.prompt$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+    },
+    "FinalizerConditionReferenceString": {
+      "type": "string",
+      "pattern": "^imports\\.prompt$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+    },
+    "OrdinaryConditionOperand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ref": { "$ref": "#/$defs/OrdinaryConditionReferenceString" },
+            "pointer": { "$ref": "#/$defs/JsonPointer" }
+          },
+          "required": ["ref"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "value": true },
+          "required": ["value"]
+        }
+      ]
+    },
+    "FinalizerConditionOperand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ref": { "$ref": "#/$defs/FinalizerConditionReferenceString" },
+            "pointer": { "$ref": "#/$defs/JsonPointer" }
+          },
+          "required": ["ref"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "value": true },
+          "required": ["value"]
+        }
+      ]
+    },
+    "OrdinaryConditionSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/OrdinaryConditionReferenceString" },
+        "pointer": { "$ref": "#/$defs/JsonPointer" }
+      },
+      "required": ["ref", "pointer"]
+    },
+    "FinalizerConditionSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/FinalizerConditionReferenceString" },
+        "pointer": { "$ref": "#/$defs/JsonPointer" }
+      },
+      "required": ["ref", "pointer"]
+    },
+    "ConditionDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": { "$ref": "#/$defs/Identifier" },
+        "is": { "$ref": "#/$defs/TerminalDisposition" }
+      },
+      "required": ["node", "is"]
+    },
+    "OrdinaryCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "all": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/OrdinaryCondition" }
+            }
+          },
+          "required": ["all"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "any": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/OrdinaryCondition" }
+            }
+          },
+          "required": ["any"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "not": { "$ref": "#/$defs/OrdinaryCondition" } },
+          "required": ["not"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "equals": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                { "$ref": "#/$defs/OrdinaryConditionOperand" },
+                { "$ref": "#/$defs/OrdinaryConditionOperand" }
+              ],
+              "items": false
+            }
+          },
+          "required": ["equals"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "exists": { "$ref": "#/$defs/OrdinaryConditionSelector" } },
+          "required": ["exists"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "disposition": { "$ref": "#/$defs/ConditionDisposition" } },
+          "required": ["disposition"]
+        }
+      ]
+    },
+    "FinalizerCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "all": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/FinalizerCondition" }
+            }
+          },
+          "required": ["all"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "any": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/FinalizerCondition" }
+            }
+          },
+          "required": ["any"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "not": { "$ref": "#/$defs/FinalizerCondition" } },
+          "required": ["not"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "equals": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                { "$ref": "#/$defs/FinalizerConditionOperand" },
+                { "$ref": "#/$defs/FinalizerConditionOperand" }
+              ],
+              "items": false
+            }
+          },
+          "required": ["equals"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "exists": { "$ref": "#/$defs/FinalizerConditionSelector" } },
+          "required": ["exists"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "disposition": { "$ref": "#/$defs/ConditionDisposition" } },
+          "required": ["disposition"]
+        }
+      ]
+    },
     "ImportOrOutputReference": {
       "type": "object",
       "additionalProperties": false,
@@ -422,6 +632,7 @@
         "dependsOn": { "$ref": "#/$defs/Dependencies" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "recovery": { "$ref": "#/$defs/Recovery" },
+        "condition": { "$ref": "#/$defs/OrdinaryCondition" },
         "inputs": { "$ref": "#/$defs/InputBindings" },
         "outputs": { "$ref": "#/$defs/CommandOutputs" },
         "command": { "$ref": "#/$defs/Command" }
@@ -437,6 +648,7 @@
         "dependsOn": { "$ref": "#/$defs/Dependencies" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "recovery": { "$ref": "#/$defs/Recovery" },
+        "condition": { "$ref": "#/$defs/OrdinaryCondition" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },
         "agent": { "$ref": "#/$defs/Agent" }
       },
@@ -456,6 +668,7 @@
         "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
         "after": { "$ref": "#/$defs/FinalizerAfter" },
         "when": { "$ref": "#/$defs/FinalizerWhen" },
+        "condition": { "$ref": "#/$defs/FinalizerCondition" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "inputs": { "$ref": "#/$defs/FinalizerInputBindings" },
         "outputs": { "$ref": "#/$defs/CommandOutputs" },
@@ -471,6 +684,7 @@
         "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
         "after": { "$ref": "#/$defs/FinalizerAfter" },
         "when": { "$ref": "#/$defs/FinalizerWhen" },
+        "condition": { "$ref": "#/$defs/FinalizerCondition" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },
         "agent": { "$ref": "#/$defs/FinalizerAgent" }

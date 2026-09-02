@@ -755,6 +755,7 @@ impl RecoveryCause {
         if self.kind == "other" {
             self.kind = match phase {
                 FailurePhase::Start => "start_failure",
+                FailurePhase::Condition => "condition_failure",
                 FailurePhase::Execution => "execution_failure",
                 FailurePhase::OutputCapture => "output_capture_failure",
             }

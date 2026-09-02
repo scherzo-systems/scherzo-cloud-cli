@@ -50,12 +50,16 @@ fn definition(
                     RuntimeStep {
                         role: WorkflowNodeRole::Step,
                         failure_policy: FailurePolicy::Required,
+                        condition: None,
+                        condition_values: BTreeMap::new(),
                         prerequisites: dependencies
                             .iter()
                             .map(|dependency| ResolvedDirectPrerequisite {
                                 producer: (*dependency).to_owned(),
                                 control: true,
+                                disposition_control: false,
                                 data: false,
+                                condition_data: false,
                             })
                             .collect::<Vec<_>>()
                             .into(),
@@ -92,6 +96,7 @@ fn definition(
             .collect(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
+        prompt: None,
     }
 }
 
@@ -330,6 +335,8 @@ fn finalizer_definition(
                 RuntimeStep {
                     role: WorkflowNodeRole::Step,
                     failure_policy: *policy,
+                    condition: None,
+                    condition_values: BTreeMap::new(),
                     prerequisites: Arc::from([]),
                     evidence_prerequisites: Arc::from([]),
                     inputs: BTreeMap::new(),
@@ -345,12 +352,16 @@ fn finalizer_definition(
                 RuntimeStep {
                     role: WorkflowNodeRole::Finalizer,
                     failure_policy: *policy,
+                    condition: None,
+                    condition_values: BTreeMap::new(),
                     prerequisites: predecessors
                         .iter()
                         .map(|producer| ResolvedDirectPrerequisite {
                             producer: (*producer).to_owned(),
                             control: true,
+                            disposition_control: false,
                             data: false,
+                            condition_data: false,
                         })
                         .collect::<Vec<_>>()
                         .into(),
@@ -404,6 +415,7 @@ fn finalizer_definition(
         exports: BTreeMap::new(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
+        prompt: None,
     }
 }
 
@@ -481,6 +493,7 @@ fn prepare_failure_phase(
     ));
     let mut state = initialization.state;
     let (occurrence, source_state, direct_sequence) = match phase {
+        FailurePhase::Condition => panic!("condition failures do not enter target recovery"),
         FailurePhase::Start => (
             Occurrence::StepStartFailed {
                 step: "aFail".to_owned(),
@@ -574,6 +587,69 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     assert_step(&initialization.state, "alpha", StepStateKind::Starting);
     assert_step(&initialization.state, "zeta", StepStateKind::Pending);
     assert!(initialization.state.exports.is_none());
+}
+
+#[test]
+fn condition_false_precedes_body_readiness() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        "schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    condition:
+      equals:
+        - ref: imports.prompt
+        - value: run
+    inputs:
+      value:
+        ref: outputs.producer.value
+    command:
+      argv: [\"true\"]
+  producer:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      value:
+        kind: text
+        from: path
+        path: value.txt
+",
+    )
+    .unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedImports::new(Some(Arc::from("skip")), Arc::from([])),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionRootLifecycle::EngineOwnedEphemeral,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_eq!(initialization.actions, [start_action(2, "producer")]);
+    assert!(matches!(
+        &initialization.state.steps["consumer"].state,
+        StepState::Skipped { detail }
+            if detail.evaluated_predicates.len() == 1
+                && detail.evaluated_predicates[0].path.is_empty()
+                && !detail.evaluated_predicates[0].result
+    ));
 }
 
 #[test]
@@ -2265,7 +2341,9 @@ fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() 
     summarize.prerequisites = Arc::from([ResolvedDirectPrerequisite {
         producer: "analyze".to_owned(),
         control: true,
+        disposition_control: false,
         data: true,
+        condition_data: false,
     }]);
     summarize.evidence_prerequisites = Arc::from([
         Prerequisite::control("analyze").unwrap(),
@@ -3004,7 +3082,7 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
     };
     assert_eq!(
         context.as_ref(),
-        br#"{"schemaVersion":1,"trigger":"cancelled","primaryFailureStepId":null,"cancellationReason":"user_request","ordinaryIssues":[]}"#
+        br#"{"schemaVersion":1,"trigger":"cancelled","primaryIssueStepId":null,"cancellationReason":"user_request","ordinaryIssues":[]}"#
     );
 
     let stale: TestReduction = reduce(
@@ -3303,7 +3381,7 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
     let ActionInput::FinalizationContext(bytes) = &inputs["context"] else {
         panic!()
     };
-    assert_eq!(bytes.as_ref(), br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"}]}"#);
+    assert_eq!(bytes.as_ref(), br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"}]}"#);
     let retained = Arc::clone(bytes);
     let notify = boundary.actions[0].id;
     reduce_and_advance(
@@ -4367,7 +4445,7 @@ fn recovery_trace_output_capture_failure_only_authorizes_a_full_target_rerun() {
     };
     assert_eq!(
         context.as_ref(),
-        br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#
+        br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#
     );
     assert!(state.last_transition_sequence.get() <= 16);
 }

@@ -331,12 +331,14 @@ fn primary_node_detail(primary: &super::evidence::PrimaryIssue) -> NodeDetail {
 }
 
 fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
-    step.state == WorkflowStepStateV1::Succeeded
-        || (step.failure_policy == FailurePolicy::Advisory
-            && matches!(
-                step.state,
-                WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
-            ))
+    matches!(
+        step.state,
+        WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Skipped
+    ) || (step.failure_policy == FailurePolicy::Advisory
+        && matches!(
+            step.state,
+            WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
+        ))
 }
 
 fn valid_cloud_capacity(
@@ -362,14 +364,47 @@ fn valid_cloud_capacity(
             .checked_add(capacity.native_session_retention_bytes)
             == Some(capacity.aggregate_retention_bytes)
         && capacity.aggregate_retention_bytes <= 201_326_592
-        && capacity
-            .selected_maximum_transitions
-            .checked_add(64)
-            .and_then(|entries| entries.checked_mul(262_144))
-            .and_then(|ordinary| ordinary.checked_add(67_108_864 - 262_144))
-            == Some(capacity.encoded_outbox_bytes)
-        && capacity.encoded_outbox_bytes <= 353_632_256
+        && valid_condition_capacity(capacity)
 }
+
+// jscpd:ignore-start -- Portable-result replay and Runner admission independently validate this trust boundary.
+fn valid_condition_capacity(capacity: &super::publication::CloudExecutionCapacityV1) -> bool {
+    let Some(entries) = capacity.selected_maximum_transitions.checked_add(64) else {
+        return false;
+    };
+    if capacity.condition_transition_count == 0 {
+        return capacity.aggregate_condition_transition_bytes == 0
+            && capacity.terminal_result_structure_bytes == 67_108_864
+            && capacity.portable_result_bytes == 202_027_692
+            && entries
+                .checked_mul(262_144)
+                .and_then(|ordinary| ordinary.checked_add(67_108_864 - 262_144))
+                == Some(capacity.encoded_outbox_bytes);
+    }
+    let Some(large_entries) = capacity.condition_transition_count.checked_add(1) else {
+        return false;
+    };
+    capacity.condition_transition_count <= 256
+        && entries >= large_entries
+        && (1..=268_435_456).contains(&capacity.aggregate_condition_transition_bytes)
+        && capacity.aggregate_condition_transition_bytes.checked_mul(2)
+            == Some(capacity.terminal_result_structure_bytes)
+        && capacity.terminal_result_structure_bytes <= 536_870_912
+        && capacity
+            .terminal_result_structure_bytes
+            .checked_add(364_209_496)
+            == Some(capacity.portable_result_bytes)
+        && capacity.portable_result_bytes <= 901_080_408
+        && (entries - large_entries)
+            .checked_mul(262_144)
+            .and_then(|ordinary| {
+                ordinary.checked_add(capacity.aggregate_condition_transition_bytes)
+            })
+            .and_then(|bytes| bytes.checked_add(capacity.terminal_result_structure_bytes))
+            == Some(capacity.encoded_outbox_bytes)
+        && capacity.encoded_outbox_bytes <= 1_024_720_896
+}
+// jscpd:ignore-end
 
 fn validate_finalization(
     finalization: &super::publication::FinalizationV1,
@@ -481,6 +516,7 @@ fn validate_steps(
             (_, WorkflowStepStateV1::Succeeded, None) => true,
             (_, WorkflowStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
             (_, WorkflowStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
+            (_, WorkflowStepStateV1::Skipped, Some(NodeDetail::Skipped(_))) => true,
             (
                 WorkflowNodeRoleV1::Step,
                 WorkflowStepStateV1::NotRun,
@@ -500,8 +536,18 @@ fn validate_steps(
         let timing_present = step.started_at.is_some();
         let output_present = step.command_output.is_some();
         let timing_valid = match step.state {
-            WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Failed => timing_present,
-            WorkflowStepStateV1::Blocked | WorkflowStepStateV1::NotRun => !timing_present,
+            WorkflowStepStateV1::Succeeded => timing_present,
+            WorkflowStepStateV1::Failed => {
+                timing_present
+                    == !matches!(
+                        step.detail,
+                        Some(NodeDetail::Failed(ref detail))
+                            if detail.phase == super::evidence::FailurePhase::Condition
+                    )
+            }
+            WorkflowStepStateV1::Blocked
+            | WorkflowStepStateV1::Skipped
+            | WorkflowStepStateV1::NotRun => !timing_present,
             WorkflowStepStateV1::Cancelled => !output_present || timing_present,
         };
         let failure_phase = match step.detail.as_ref() {
@@ -513,10 +559,20 @@ fn validate_steps(
             ("cmd", WorkflowStepStateV1::Succeeded) => output_present,
             ("cmd", WorkflowStepStateV1::Failed) => {
                 output_present
-                    == failure_phase
-                        .is_some_and(|phase| phase != super::evidence::FailurePhase::Start)
+                    == failure_phase.is_some_and(|phase| {
+                        !matches!(
+                            phase,
+                            super::evidence::FailurePhase::Start
+                                | super::evidence::FailurePhase::Condition
+                        )
+                    })
             }
-            ("cmd", WorkflowStepStateV1::Blocked | WorkflowStepStateV1::NotRun) => !output_present,
+            (
+                "cmd",
+                WorkflowStepStateV1::Blocked
+                | WorkflowStepStateV1::Skipped
+                | WorkflowStepStateV1::NotRun,
+            ) => !output_present,
             ("cmd", WorkflowStepStateV1::Cancelled) => true,
             _ => false,
         };

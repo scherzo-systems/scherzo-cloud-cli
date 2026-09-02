@@ -139,6 +139,10 @@ impl ArtifactSet {
             "diagnosticRetentionBytes": 8_388_608,
             "nativeSessionRetentionBytes": 4_194_304,
             "aggregateRetentionBytes": 12_582_912,
+            "conditionTransitionCount": 0,
+            "aggregateConditionTransitionBytes": 0,
+            "terminalResultStructureBytes": 67_108_864,
+            "portableResultBytes": 202_027_692,
             "encodedOutboxBytes": 85_458_944
         });
         self.replace_result(&result);

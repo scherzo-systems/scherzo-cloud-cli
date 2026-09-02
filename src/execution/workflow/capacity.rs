@@ -12,6 +12,7 @@ pub(crate) const RUNNER_TERMINAL_FRAME_BYTES: u64 = 67_108_864;
 pub(crate) const MAXIMUM_CONDITION_TRANSITION_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAXIMUM_PORTABLE_RESULT_BYTES: u64 = 901_080_408;
+pub(crate) const ORDINARY_PORTABLE_RESULT_BYTES: u64 = 202_027_692;
 const JSON_ESCAPED_POINTER_SOURCE_MULTIPLIER: u64 = 3;
 const MAXIMUM_CONDITION_PREDICATE_NODES: u64 = 256;
 const MAXIMUM_CONDITION_PREDICATE_DEPTH: u64 = 16;
@@ -27,6 +28,7 @@ pub(crate) enum CapacityCalculationFailure {
     ArithmeticOverflow,
     GeneralTransitionCapacityExceeded,
     CloudTransitionCapacityExceeded,
+    ConditionEvidenceCapacityExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +58,10 @@ pub(crate) struct ComputedWorkflowCapacity {
     pub(crate) diagnostic_retention_bytes: u64,
     pub(crate) native_session_retention_bytes: u64,
     pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) condition_transition_count: u64,
+    pub(crate) aggregate_condition_transition_bytes: u64,
+    pub(crate) terminal_result_structure_bytes: u64,
+    pub(crate) portable_result_bytes: u64,
     pub(crate) encoded_outbox_bytes: u64,
 }
 
@@ -74,6 +80,7 @@ impl WorkflowCapacity {
 pub(crate) fn resolve_workflow_capacity(
     workflow: &ValidatedWorkflow,
     source_closure_digest: WorkflowContentDigest,
+    source_closure_bytes: u64,
 ) -> Result<WorkflowCapacity, CapacityCalculationFailure> {
     let steps = u64::try_from(workflow.steps.len())
         .map_err(|_| CapacityCalculationFailure::ArithmeticOverflow)?;
@@ -99,12 +106,42 @@ pub(crate) fn resolve_workflow_capacity(
             Ok((recovery_rounds, handler_rounds))
         },
     )?;
-    let requirements = calculate_capacity(CapacityCounts {
+    let mut requirements = calculate_capacity(CapacityCounts {
         steps,
         finalizers,
         recovery_rounds,
         handler_rounds,
     })?;
+    let conditional_nodes = workflow
+        .steps
+        .values()
+        .chain(
+            workflow
+                .finalizers
+                .values()
+                .map(|finalizer| &finalizer.body),
+        )
+        .filter(|step| match step {
+            super::validated::ValidatedStep::Command(step) => step.common.condition.is_some(),
+            super::validated::ValidatedStep::Agent(step) => step.common.condition.is_some(),
+        })
+        .count();
+    if conditional_nodes != 0 {
+        let evidence = calculate_condition_evidence_capacity(source_closure_bytes)
+            .map_err(|_| CapacityCalculationFailure::ConditionEvidenceCapacityExceeded)?;
+        requirements.condition_transition_count = u64::try_from(conditional_nodes)
+            .map_err(|_| CapacityCalculationFailure::ArithmeticOverflow)?;
+        requirements.aggregate_condition_transition_bytes = evidence.condition_transition_bytes;
+        requirements.terminal_result_structure_bytes = evidence.terminal_result_structure_bytes;
+        requirements.portable_result_bytes = evidence.portable_result_bytes;
+        requirements.encoded_outbox_bytes = calculate_condition_outbox_reservation(
+            requirements.cloud_maximum_transitions,
+            requirements.condition_transition_count,
+            requirements.aggregate_condition_transition_bytes,
+            requirements.terminal_result_structure_bytes,
+        )
+        .map_err(|_| CapacityCalculationFailure::ConditionEvidenceCapacityExceeded)?;
+    }
     Ok(WorkflowCapacity {
         source_closure_digest,
         requirements,
@@ -149,6 +186,10 @@ pub(crate) fn calculate_capacity(
         diagnostic_retention_bytes,
         native_session_retention_bytes,
         aggregate_retention_bytes,
+        condition_transition_count: 0,
+        aggregate_condition_transition_bytes: 0,
+        terminal_result_structure_bytes: RUNNER_TERMINAL_FRAME_BYTES,
+        portable_result_bytes: ORDINARY_PORTABLE_RESULT_BYTES,
         encoded_outbox_bytes,
     })
 }

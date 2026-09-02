@@ -59,6 +59,10 @@ struct Expected {
     diagnostic_retention_bytes: u64,
     native_session_retention_bytes: u64,
     aggregate_retention_bytes: u64,
+    condition_transition_count: u64,
+    aggregate_condition_transition_bytes: u64,
+    terminal_result_structure_bytes: u64,
+    portable_result_bytes: u64,
     encoded_outbox_bytes: u64,
 }
 
@@ -229,6 +233,11 @@ fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
                         diagnostic_retention_bytes: expected.diagnostic_retention_bytes,
                         native_session_retention_bytes: expected.native_session_retention_bytes,
                         aggregate_retention_bytes: expected.aggregate_retention_bytes,
+                        condition_transition_count: expected.condition_transition_count,
+                        aggregate_condition_transition_bytes: expected
+                            .aggregate_condition_transition_bytes,
+                        terminal_result_structure_bytes: expected.terminal_result_structure_bytes,
+                        portable_result_bytes: expected.portable_result_bytes,
                         encoded_outbox_bytes: expected.encoded_outbox_bytes,
                     },
                     "vector {}",

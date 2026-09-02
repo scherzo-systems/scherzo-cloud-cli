@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::condition::TerminalDisposition;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowDocument {
     pub(crate) schema_version: u8,
@@ -107,8 +109,37 @@ pub(crate) enum FailurePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommonNode {
     pub(crate) failure_policy: FailurePolicy,
+    pub(crate) condition: Option<ConditionPredicate>,
     pub(crate) cwd: Option<String>,
     pub(crate) outputs: BTreeMap<String, Output>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConditionPredicate {
+    All(Vec<ConditionPredicate>),
+    Any(Vec<ConditionPredicate>),
+    Not(Box<ConditionPredicate>),
+    Equals([ConditionOperand; 2]),
+    Exists(ConditionSelector),
+    Disposition {
+        node: String,
+        is: TerminalDisposition,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConditionOperand {
+    Reference {
+        reference: ValueReference,
+        pointer: Option<String>,
+    },
+    Literal(Value),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConditionSelector {
+    pub(crate) reference: ValueReference,
+    pub(crate) pointer: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

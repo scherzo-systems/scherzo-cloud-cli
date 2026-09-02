@@ -35,21 +35,24 @@ use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
     MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
 };
+use crate::execution::workflow::capacity::RUNNER_TERMINAL_FRAME_BYTES;
 #[cfg(test)]
 use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use crate::runner_protocol::{
     AssignmentDecline, ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
-    ExecutionSpecV1RunnerProjection, MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES,
+    ExecutionSpecV1RunnerProjection, MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES,
+    MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES,
     PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope, RunnerFrame, RunnerUnableReason,
     WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
+    is_condition_evidence_workflow_event,
 };
 
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
-pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 353_632_256;
+pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
 
 fn encoded_outbox_reservation(selected_maximum_transitions: u64) -> Option<u64> {
@@ -57,7 +60,8 @@ fn encoded_outbox_reservation(selected_maximum_transitions: u64) -> Option<u64> 
         .checked_add(u64::try_from(OBSERVATION_RESERVE_BASE).ok()?)?
         .checked_mul(u64::try_from(MAXIMUM_ORDINARY_FRAME_BYTES).ok()?)?
         .checked_add(
-            u64::try_from(MAXIMUM_TERMINAL_FRAME_BYTES - MAXIMUM_ORDINARY_FRAME_BYTES).ok()?,
+            RUNNER_TERMINAL_FRAME_BYTES
+                .checked_sub(u64::try_from(MAXIMUM_ORDINARY_FRAME_BYTES).ok()?)?,
         )
 }
 
@@ -184,6 +188,14 @@ impl ExecutionReport {
                 | Self::Finished { .. }
                 | Self::Interrupted { .. }
                 | Self::Aborted { .. }
+        )
+    }
+
+    fn is_condition_evidence_transition(&self) -> bool {
+        matches!(
+            self,
+            Self::Transition { workflow_event, .. }
+                if is_condition_evidence_workflow_event(workflow_event)
         )
     }
 
@@ -399,6 +411,10 @@ impl AssignmentObservation {
         matches!(self, Self::Execution { report, .. } if report.is_terminal())
     }
 
+    fn is_condition_evidence_transition(&self) -> bool {
+        matches!(self, Self::Execution { report, .. } if report.is_condition_evidence_transition())
+    }
+
     pub(super) fn runner_frame(&self, envelope: RunnerEnvelope) -> RunnerFrame {
         match self {
             Self::Preparing {
@@ -514,12 +530,7 @@ impl ObservationOutbox {
         let reservation = transition_entries
             .checked_add(OBSERVATION_RESERVE_BASE)
             .ok_or_else(environment_unavailable)?;
-        let required_bytes = encoded_outbox_reservation(
-            u64::try_from(transition_entries).map_err(|_| environment_unavailable())?,
-        )
-        .ok_or_else(environment_unavailable)?;
-        if encoded_outbox_bytes != required_bytes
-            || required_bytes > self.maximum_encoded_bytes
+        if encoded_outbox_bytes > self.maximum_encoded_bytes
             || reservation > MAXIMUM_SERVICE_OBSERVATIONS
         {
             return Err(environment_unavailable());
@@ -551,8 +562,14 @@ impl ObservationOutbox {
             .checked_add(64)
             .ok_or(OutboxFailure::Encoding)?;
         let terminal = observation.is_terminal();
-        let large_terminal = encoded_bytes > MAXIMUM_ORDINARY_FRAME_BYTES;
-        if encoded_bytes > MAXIMUM_TERMINAL_FRAME_BYTES || (large_terminal && !terminal) {
+        let maximum_frame_bytes = if terminal {
+            MAXIMUM_TERMINAL_FRAME_BYTES
+        } else if observation.is_condition_evidence_transition() {
+            MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES
+        } else {
+            MAXIMUM_ORDINARY_FRAME_BYTES
+        };
+        if encoded_bytes > maximum_frame_bytes {
             return Err(OutboxFailure::Encoding);
         }
 
@@ -3056,6 +3073,7 @@ impl AssignmentManager {
     }
 }
 
+// jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
 #[cfg(test)]
 fn align_fixture_capacity(
     execution_spec: &mut ExecutionSpecV1RunnerProjection,
@@ -3080,9 +3098,14 @@ fn align_fixture_capacity(
         diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
         native_session_retention_bytes: requirements.native_session_retention_bytes,
         aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+        condition_transition_count: requirements.condition_transition_count,
+        aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
+        terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+        portable_result_bytes: requirements.portable_result_bytes,
         encoded_outbox_bytes: requirements.encoded_outbox_bytes,
     };
 }
+// jscpd:ignore-end
 
 fn validate_carried_capacity(
     execution_spec: &ExecutionSpecV1RunnerProjection,
@@ -3111,6 +3134,11 @@ fn validate_carried_capacity(
         || carried.diagnostic_retention_bytes != resolved.diagnostic_retention_bytes
         || carried.native_session_retention_bytes != resolved.native_session_retention_bytes
         || carried.aggregate_retention_bytes != resolved.aggregate_retention_bytes
+        || carried.condition_transition_count != resolved.condition_transition_count
+        || carried.aggregate_condition_transition_bytes
+            != resolved.aggregate_condition_transition_bytes
+        || carried.terminal_result_structure_bytes != resolved.terminal_result_structure_bytes
+        || carried.portable_result_bytes != resolved.portable_result_bytes
         || carried.encoded_outbox_bytes != resolved.encoded_outbox_bytes
     {
         return Err(capacity_binding_invalid());
@@ -3310,14 +3338,50 @@ fn validate_execution_spec(
             .checked_add(capacity.native_session_retention_bytes)
             != Some(capacity.aggregate_retention_bytes)
         || capacity.aggregate_retention_bytes > 201_326_592
-        || encoded_outbox_reservation(capacity.selected_maximum_transitions)
-            != Some(capacity.encoded_outbox_bytes)
+        || !valid_condition_capacity(capacity)
     {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::InvalidSourceProjection,
         ));
     }
     Ok(())
+}
+
+fn valid_condition_capacity(
+    capacity: &crate::runner_protocol::ExecutionCapacityV1RunnerProjection,
+) -> bool {
+    let Some(entries) = capacity.selected_maximum_transitions.checked_add(64) else {
+        return false;
+    };
+    if capacity.condition_transition_count == 0 {
+        return capacity.aggregate_condition_transition_bytes == 0
+            && capacity.terminal_result_structure_bytes == 67_108_864
+            && capacity.portable_result_bytes == 202_027_692
+            && encoded_outbox_reservation(capacity.selected_maximum_transitions)
+                == Some(capacity.encoded_outbox_bytes);
+    }
+    let Some(large_entries) = capacity.condition_transition_count.checked_add(1) else {
+        return false;
+    };
+    capacity.condition_transition_count <= 256
+        && entries >= large_entries
+        && (1..=268_435_456).contains(&capacity.aggregate_condition_transition_bytes)
+        && capacity.aggregate_condition_transition_bytes.checked_mul(2)
+            == Some(capacity.terminal_result_structure_bytes)
+        && capacity.terminal_result_structure_bytes <= 536_870_912
+        && capacity
+            .terminal_result_structure_bytes
+            .checked_add(364_209_496)
+            == Some(capacity.portable_result_bytes)
+        && capacity.portable_result_bytes <= 901_080_408
+        && (entries - large_entries)
+            .checked_mul(262_144)
+            .and_then(|ordinary| {
+                ordinary.checked_add(capacity.aggregate_condition_transition_bytes)
+            })
+            .and_then(|bytes| bytes.checked_add(capacity.terminal_result_structure_bytes))
+            == Some(capacity.encoded_outbox_bytes)
+        && capacity.encoded_outbox_bytes <= MAXIMUM_ENCODED_OUTBOX_BYTES
 }
 
 fn validate_source_identity_pair(
@@ -3915,6 +3979,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             diagnostic_retention_bytes: 8_388_608,
             native_session_retention_bytes: 4_194_304,
             aggregate_retention_bytes: 12_582_912,
+            condition_transition_count: 0,
+            aggregate_condition_transition_bytes: 0,
+            terminal_result_structure_bytes: 67_108_864,
+            portable_result_bytes: 202_027_692,
             encoded_outbox_bytes: 85_458_944,
         }
     }
@@ -6670,6 +6738,38 @@ steps:
         );
         // jscpd:ignore-end
         assert_eq!(outbox.len(), 0);
+    }
+
+    #[test]
+    fn outbox_accepts_large_condition_evidence_transition() {
+        let outbox = ObservationOutbox::new();
+        let pointer = format!("/{}", "a".repeat(MAXIMUM_ORDINARY_FRAME_BYTES));
+        let observation = AssignmentObservation::Execution {
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            report: ExecutionReport::Transition {
+                execution_event_sequence: 1,
+                workflow_event: json!({
+                    "eventVersion": 1,
+                    "eventType": "step_state_changed",
+                    "transitionSequence": 1,
+                    "stepId": "build",
+                    "role": "step",
+                    "failurePolicy": "required",
+                    "from": "pending",
+                    "to": "failed",
+                    "detail": {
+                        "phase": "condition",
+                        "code": "json_pointer_missing",
+                        "ref": "outputs.plan.result",
+                        "pointer": pointer,
+                    },
+                }),
+            },
+        };
+
+        assert!(outbox.enqueue(observation).is_ok());
+        assert_eq!(outbox.len(), 1);
     }
 
     fn assert_only_one_pending_terminal(observation: AssignmentObservation) {

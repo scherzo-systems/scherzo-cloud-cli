@@ -274,7 +274,7 @@ pub(crate) struct PresentationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PresentationRecordKind {
-    Transition(PresentationTransition),
+    Transition(Box<PresentationTransition>),
     ChildOutput(NormalizedChildOutput),
     AgentObservation(NormalizedAgentObservation),
 }
@@ -359,7 +359,7 @@ impl WorkflowPresentationFeed {
         match observation {
             ExecutionObservation::Transition(transition) => vec![self.record(
                 observed_at,
-                PresentationRecordKind::Transition(normalize_transition(transition)),
+                PresentationRecordKind::Transition(Box::new(normalize_transition(*transition))),
             )],
             ExecutionObservation::CommandOutput(output) => {
                 self.accept_child_output(observed_at, output)

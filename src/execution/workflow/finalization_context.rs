@@ -29,7 +29,7 @@ pub(crate) struct OrdinaryIssue {
 
 pub(crate) struct FinalizationContext<'a> {
     pub(crate) trigger: FinalizationTrigger,
-    pub(crate) primary_failure_step_id: Option<&'a str>,
+    pub(crate) primary_issue_step_id: Option<&'a str>,
     pub(crate) cancellation_reason: Option<CancellationReason>,
     pub(crate) ordinary_issues: &'a [OrdinaryIssue],
 }
@@ -39,7 +39,7 @@ pub(crate) struct FinalizationContext<'a> {
 struct SerializedContext<'a> {
     schema_version: u8,
     trigger: &'static str,
-    primary_failure_step_id: Option<&'a str>,
+    primary_issue_step_id: Option<&'a str>,
     cancellation_reason: Option<&'static str>,
     ordinary_issues: Vec<SerializedIssue<'a>>,
 }
@@ -73,7 +73,7 @@ pub(crate) fn serialize(context: FinalizationContext<'_>) -> Arc<[u8]> {
     let value = SerializedContext {
         schema_version: 1,
         trigger: context.trigger.as_str(),
-        primary_failure_step_id: context.primary_failure_step_id,
+        primary_issue_step_id: context.primary_issue_step_id,
         cancellation_reason: context.cancellation_reason.map(CancellationReason::as_str),
         ordinary_issues,
     };
@@ -105,12 +105,12 @@ mod tests {
         assert_eq!(
             serialize(FinalizationContext {
                 trigger: FinalizationTrigger::Succeeded,
-                primary_failure_step_id: None,
+                primary_issue_step_id: None,
                 cancellation_reason: None,
                 ordinary_issues: &issues,
             })
             .as_ref(),
-            br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"},{"stepId":"zeta","failurePolicy":"required","disposition":"blocked"}]}"#
+            br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"},{"stepId":"zeta","failurePolicy":"required","disposition":"blocked"}]}"#
         );
     }
 }

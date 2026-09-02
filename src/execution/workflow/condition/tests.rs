@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::execution::workflow::{DecodeFailureKind, decode};
+use crate::execution::workflow::decode;
 
 fn pointer(authored: &str) -> JsonPointer {
     JsonPointer::parse(Arc::<str>::from(authored)).unwrap()
@@ -378,8 +378,8 @@ fn condition_evaluation_supports_every_terminal_disposition_without_source_detai
 }
 
 #[test]
-fn condition_schema_rejects_before_activation() {
-    let failure = decode(
+fn condition_schema_accepts_the_active_grammar() {
+    let document = decode(
         br#"schemaVersion: 1
 steps:
   guarded:
@@ -391,8 +391,8 @@ steps:
     command: { argv: ["true"] }
 "#,
     )
-    .unwrap_err();
-    assert_eq!(failure.kind(), DecodeFailureKind::StructuralContract);
+    .unwrap();
+    assert_eq!(document.steps.len(), 1);
 }
 
 #[test]

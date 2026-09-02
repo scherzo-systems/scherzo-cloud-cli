@@ -776,6 +776,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                     execution_number: TargetExecutionNumber::FIRST,
                 }),
                 recovery: None,
+                condition_passed: false,
             }
         );
         assert_eq!(

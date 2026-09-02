@@ -782,7 +782,7 @@ impl WorkflowCapacityBudget {
             diagnostic_retention_bytes: 134_217_728,
             native_session_retention_bytes: 67_108_864,
             aggregate_retention_bytes: 201_326_592,
-            encoded_outbox_bytes: 353_632_256,
+            encoded_outbox_bytes: 1_024_720_896,
         }
     }
 

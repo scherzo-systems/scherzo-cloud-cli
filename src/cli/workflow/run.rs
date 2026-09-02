@@ -2206,7 +2206,7 @@ mod tests {
         from: StepStateKind,
         to: StepStateKind,
     ) -> ExecutionObservation<ExecutionInstant> {
-        ExecutionObservation::Transition(TransitionObservation {
+        ExecutionObservation::Transition(Box::new(TransitionObservation {
             event: TransitionEvent::Step {
                 sequence: TransitionSequence::default(),
                 step: "step".to_owned(),
@@ -2216,11 +2216,11 @@ mod tests {
                 to,
             },
             step: None,
-        })
+        }))
     }
 
     fn terminal_transition() -> ExecutionObservation<ExecutionInstant> {
-        ExecutionObservation::Transition(TransitionObservation {
+        ExecutionObservation::Transition(Box::new(TransitionObservation {
             event: TransitionEvent::Workflow {
                 sequence: TransitionSequence::default(),
                 from: WorkflowState::Executing {
@@ -2229,6 +2229,6 @@ mod tests {
                 to: Box::new(WorkflowState::Succeeded),
             },
             step: None,
-        })
+        }))
     }
 }

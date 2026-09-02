@@ -908,7 +908,7 @@ fn staging_creation_error(
 #[test]
 fn finalization_context_bytes_are_shared_by_command_and_agent() {
     let fixture = Fixture::new(ConsumerValueMode::None);
-    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
+    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
     let ValidatedStep::Agent(consumer) = fixture
         .admitted
         .workflow()

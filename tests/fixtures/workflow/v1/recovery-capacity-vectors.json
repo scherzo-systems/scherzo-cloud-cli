@@ -87,6 +87,10 @@
         "diagnosticRetentionBytes": 8388608,
         "nativeSessionRetentionBytes": 4194304,
         "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
         "encodedOutboxBytes": 85458944
       }
     },
@@ -104,6 +108,10 @@
         "diagnosticRetentionBytes": 16777216,
         "nativeSessionRetentionBytes": 8388608,
         "aggregateRetentionBytes": 25165824,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
         "encodedOutboxBytes": 87293952
       }
     },
@@ -121,6 +129,10 @@
         "diagnosticRetentionBytes": 134216966,
         "nativeSessionRetentionBytes": 67108483,
         "aggregateRetentionBytes": 201325449,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
         "encodedOutboxBytes": 352845824
       }
     },
@@ -138,6 +150,10 @@
         "diagnosticRetentionBytes": 134217728,
         "nativeSessionRetentionBytes": 67108864,
         "aggregateRetentionBytes": 201326592,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
         "encodedOutboxBytes": 352845824
       }
     },
@@ -155,6 +171,10 @@
         "diagnosticRetentionBytes": 134216966,
         "nativeSessionRetentionBytes": 67108483,
         "aggregateRetentionBytes": 201325449,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
         "encodedOutboxBytes": 353632256
       }
     },

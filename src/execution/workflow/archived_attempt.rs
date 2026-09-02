@@ -112,6 +112,7 @@ pub(crate) enum ArchivedStepState {
     Succeeded,
     Failed,
     Blocked,
+    Skipped,
     NotRun,
     Cancelled,
 }
@@ -119,6 +120,7 @@ pub(crate) enum ArchivedStepState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedFailurePhase {
     Start,
+    Condition,
     Execution,
     OutputCapture,
 }
@@ -903,6 +905,7 @@ fn finalizer_disposition_matches_definition(
         WorkflowStepStateV1::Succeeded
         | WorkflowStepStateV1::Failed
         | WorkflowStepStateV1::Cancelled => unavailable.is_empty(),
+        WorkflowStepStateV1::Skipped => true,
         WorkflowStepStateV1::NotRun => false,
     }
 }
@@ -1173,8 +1176,9 @@ fn validate_terminal_step_facts(
                 }
             }
             ArchivedStepDetail::Succeeded
-            | ArchivedStepDetail::Evidence(NodeDetail::Failed(_) | NodeDetail::Cancellation(_)) => {
-            }
+            | ArchivedStepDetail::Evidence(
+                NodeDetail::Failed(_) | NodeDetail::Skipped(_) | NodeDetail::Cancellation(_),
+            ) => {}
         }
     }
 
@@ -1221,6 +1225,10 @@ fn project_step(
             ArchivedStepState::Blocked,
             ArchivedStepDetail::Evidence(NodeDetail::Blocked(blocked.clone())),
         ),
+        (WorkflowStepStateV1::Skipped, Some(NodeDetail::Skipped(skipped))) => (
+            ArchivedStepState::Skipped,
+            ArchivedStepDetail::Evidence(NodeDetail::Skipped(skipped.clone())),
+        ),
         (WorkflowStepStateV1::NotRun, Some(NodeDetail::NotRun(not_run))) => {
             let valid = matches!(
                 (role, not_run.code),
@@ -1254,19 +1262,33 @@ fn project_step(
     let timing_present = started_at.is_some();
     let output_present = command_output.is_some();
     let valid_timing = match state {
-        ArchivedStepState::Succeeded | ArchivedStepState::Failed => timing_present,
-        ArchivedStepState::Blocked | ArchivedStepState::NotRun => !timing_present,
+        ArchivedStepState::Succeeded => timing_present,
+        ArchivedStepState::Failed => match &detail {
+            ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
+                timing_present == (failure.phase != super::evidence::FailurePhase::Condition)
+            }
+            _ => false,
+        },
+        ArchivedStepState::Blocked | ArchivedStepState::Skipped | ArchivedStepState::NotRun => {
+            !timing_present
+        }
         ArchivedStepState::Cancelled => !output_present || timing_present,
     };
     let valid_output = match (definition, &detail) {
         (ValidatedStep::Agent(_), _) => !output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Succeeded) => output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Evidence(NodeDetail::Failed(failure))) => {
-            output_present == (failure.phase != super::evidence::FailurePhase::Start)
+            output_present
+                == !matches!(
+                    failure.phase,
+                    super::evidence::FailurePhase::Start | super::evidence::FailurePhase::Condition
+                )
         }
         (
             ValidatedStep::Command(_),
-            ArchivedStepDetail::Evidence(NodeDetail::Blocked(_) | NodeDetail::NotRun(_)),
+            ArchivedStepDetail::Evidence(
+                NodeDetail::Blocked(_) | NodeDetail::Skipped(_) | NodeDetail::NotRun(_),
+            ),
         ) => !output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Evidence(NodeDetail::Cancellation(_))) => {
             true
@@ -1576,6 +1598,9 @@ fn validate_exports(
                     ) if detail.code == NonExecutionCode::FinalizerTriggerNotSelected => {
                         ExportUnavailableReasonV1::TriggerNotSelected
                     }
+                    (ArchivedStepDetail::Evidence(NodeDetail::Skipped(_)), _) => {
+                        ExportUnavailableReasonV1::Skipped
+                    }
                     (ArchivedStepDetail::Evidence(NodeDetail::Cancellation(_)), _) => {
                         ExportUnavailableReasonV1::Cancelled
                     }
@@ -1679,6 +1704,7 @@ fn prerequisite_satisfied(
     };
     let succeeded = producer.state == ArchivedStepState::Succeeded;
     let control_satisfied = succeeded
+        || producer.state == ArchivedStepState::Skipped
         || (producer.failure_policy == FailurePolicy::Advisory
             && matches!(
                 producer.state,
@@ -1688,12 +1714,14 @@ fn prerequisite_satisfied(
 }
 
 fn step_succeeds_workflow(step: &ArchivedStep) -> bool {
-    step.state == ArchivedStepState::Succeeded
-        || (step.failure_policy == FailurePolicy::Advisory
-            && matches!(
-                step.state,
-                ArchivedStepState::Failed | ArchivedStepState::Blocked
-            ))
+    matches!(
+        step.state,
+        ArchivedStepState::Succeeded | ArchivedStepState::Skipped
+    ) || (step.failure_policy == FailurePolicy::Advisory
+        && matches!(
+            step.state,
+            ArchivedStepState::Failed | ArchivedStepState::Blocked
+        ))
 }
 
 fn valid_digest(algorithm: &str, value: &str) -> bool {

@@ -970,7 +970,7 @@ where
                     utc: record.observed_at,
                     monotonic: observed_monotonic,
                 },
-                transition,
+                *transition,
             ),
             PresentationRecordKind::ChildOutput(output) => {
                 self.render_child_output(record.observed_at, output)
@@ -1108,6 +1108,23 @@ where
                         "blocked",
                         &detail,
                         TokenRole::Blocked,
+                    )
+                }
+                StepStateKind::Skipped => {
+                    self.step_starts.remove(&step);
+                    let detail = match transition.step {
+                        Some(ObservedStepTransition::Skipped { detail }) => format!(
+                            "condition_false · {} evaluated predicates",
+                            detail.evaluated_predicates.len()
+                        ),
+                        _ => "condition_false".to_owned(),
+                    };
+                    self.write_event(
+                        observed_at.utc,
+                        &step,
+                        "skipped",
+                        &detail,
+                        TokenRole::Neutral,
                     )
                 }
                 StepStateKind::NotRun => {
@@ -2007,6 +2024,14 @@ pub(crate) fn canonical_failure_detail(failure: &FailureDetail) -> String {
     if let Some(exit_code) = failure.exit_code {
         detail.push_str(&format!(" · exit {exit_code}"));
     }
+    if let Some(reference) = &failure.r#ref {
+        detail.push_str(" · ref ");
+        detail.push_str(&visible_text(reference));
+    }
+    if let Some(pointer) = &failure.pointer {
+        detail.push_str(" · pointer ");
+        detail.push_str(&visible_text(pointer));
+    }
     detail
 }
 
@@ -2185,6 +2210,14 @@ fn summary_step(
             issue_detail(canonical_blocked_detail(detail), step.failure_policy),
             TokenRole::Blocked,
         )),
+        StepState::Skipped { detail } => Some((
+            "skipped",
+            format!(
+                "condition_false · {} evaluated predicates",
+                detail.evaluated_predicates.len()
+            ),
+            TokenRole::Neutral,
+        )),
         StepState::NotRun { detail } => {
             Some(("not-run", snake_case_debug(detail.code), TokenRole::Neutral))
         }
@@ -2296,11 +2329,12 @@ fn issue_detail(detail: String, failure_policy: FailurePolicy) -> String {
     }
 }
 
-fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
+fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 7] {
     let mut counts = [
         ("succeeded", 0),
         ("failed", 0),
         ("blocked", 0),
+        ("skipped", 0),
         ("not-run", 0),
         ("cancelled", 0),
         ("advisory issues", 0),
@@ -2314,8 +2348,9 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
             StepState::Succeeded { .. } => Some(0),
             StepState::Failed { .. } => Some(1),
             StepState::Blocked { .. } => Some(2),
-            StepState::NotRun { .. } => Some(3),
-            StepState::Cancelled { .. } => Some(4),
+            StepState::Skipped { .. } => Some(3),
+            StepState::NotRun { .. } => Some(4),
+            StepState::Cancelled { .. } => Some(5),
             StepState::Pending
             | StepState::Starting
             | StepState::Running
@@ -2332,7 +2367,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 6] {
                 StepState::Failed { .. } | StepState::Blocked { .. }
             )
         {
-            counts[5].1 += 1;
+            counts[6].1 += 1;
         }
     }
     counts

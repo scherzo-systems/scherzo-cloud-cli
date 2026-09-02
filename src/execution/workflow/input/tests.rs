@@ -282,7 +282,7 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
 #[test]
 fn canonical_json_bytes_are_materialized_without_reserialization() {
     let fixture = Fixture::new(1, 8, 1024, 2048);
-    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryFailureStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
+    let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;
     let view = fixture
         .inputs
         .materialize(

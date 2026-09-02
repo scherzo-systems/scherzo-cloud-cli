@@ -375,6 +375,10 @@ pub(crate) struct CloudExecutionCapacityV1 {
     pub(crate) diagnostic_retention_bytes: u64,
     pub(crate) native_session_retention_bytes: u64,
     pub(crate) aggregate_retention_bytes: u64,
+    pub(crate) condition_transition_count: u64,
+    pub(crate) aggregate_condition_transition_bytes: u64,
+    pub(crate) terminal_result_structure_bytes: u64,
+    pub(crate) portable_result_bytes: u64,
     pub(crate) encoded_outbox_bytes: u64,
     // jscpd:ignore-end
 }
@@ -441,6 +445,7 @@ pub(crate) enum WorkflowStepStateV1 {
     Succeeded,
     Failed,
     Blocked,
+    Skipped,
     NotRun,
     Cancelled,
 }
@@ -1186,6 +1191,8 @@ pub(crate) enum ExportUnavailableReasonV1 {
     Blocked,
     #[serde(rename = "source_input_unavailable")]
     InputUnavailable,
+    #[serde(rename = "source_skipped")]
+    Skipped,
     #[serde(rename = "source_not_run")]
     NotRun,
     #[serde(rename = "source_trigger_not_selected")]
@@ -2106,6 +2113,10 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             WorkflowStepStateV1::Blocked,
             Some(NodeDetail::Blocked(detail.clone())),
         ),
+        StepState::Skipped { detail } => (
+            WorkflowStepStateV1::Skipped,
+            Some(NodeDetail::Skipped(detail.clone())),
+        ),
         StepState::NotRun { detail } => (
             WorkflowStepStateV1::NotRun,
             Some(NodeDetail::NotRun(*detail)),
@@ -2765,6 +2776,7 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
         ExportUnavailableReason::Failed => ExportUnavailableReasonV1::Failed,
         ExportUnavailableReason::Blocked => ExportUnavailableReasonV1::Blocked,
         ExportUnavailableReason::InputUnavailable => ExportUnavailableReasonV1::InputUnavailable,
+        ExportUnavailableReason::Skipped => ExportUnavailableReasonV1::Skipped,
         ExportUnavailableReason::NotRun => ExportUnavailableReasonV1::NotRun,
         ExportUnavailableReason::TriggerNotSelected => {
             ExportUnavailableReasonV1::TriggerNotSelected

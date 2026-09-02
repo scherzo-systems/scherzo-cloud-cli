@@ -292,21 +292,31 @@ fn resolve_loaded_workflow(
     let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
     let content_digest = digest_source_closure(&source_closure)?;
+    let source_closure_bytes = source_closure
+        .values()
+        .try_fold(0_u64, |total, bytes| {
+            total.checked_add(u64::try_from(bytes.len()).ok()?)
+        })
+        .ok_or_else(|| source_closure_too_large(ResolutionLocation::Capacity))?;
     let capacity =
-        resolve_workflow_capacity(&definition, content_digest.clone()).map_err(|failure| {
-            let kind = match failure {
-                CapacityCalculationFailure::ArithmeticOverflow => {
-                    ResolutionFailureKind::CapacityArithmeticOverflow
-                }
-                CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
-                    ResolutionFailureKind::GeneralTransitionCapacityExceeded
-                }
-                CapacityCalculationFailure::CloudTransitionCapacityExceeded => {
-                    ResolutionFailureKind::CloudTransitionCapacityExceeded
-                }
-            };
-            ResolutionFailure::new(kind, ResolutionLocation::Capacity)
-        })?;
+        resolve_workflow_capacity(&definition, content_digest.clone(), source_closure_bytes)
+            .map_err(|failure| {
+                let kind = match failure {
+                    CapacityCalculationFailure::ArithmeticOverflow => {
+                        ResolutionFailureKind::CapacityArithmeticOverflow
+                    }
+                    CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
+                        ResolutionFailureKind::GeneralTransitionCapacityExceeded
+                    }
+                    CapacityCalculationFailure::CloudTransitionCapacityExceeded => {
+                        ResolutionFailureKind::CloudTransitionCapacityExceeded
+                    }
+                    CapacityCalculationFailure::ConditionEvidenceCapacityExceeded => {
+                        ResolutionFailureKind::CloudTransitionCapacityExceeded
+                    }
+                };
+                ResolutionFailure::new(kind, ResolutionLocation::Capacity)
+            })?;
     Ok(ResolvedWorkflow {
         definition,
         source_closure,

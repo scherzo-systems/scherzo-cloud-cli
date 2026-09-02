@@ -4,10 +4,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, FailurePolicy,
-    FinalizationTrigger, FinalizerDefinition, HarnessDefinition, MessageSource, NodeBody, Output,
-    OutputReference, RecoveryHandler, StepDefinition, StepRecovery, ValueReference,
-    WorkflowDocument,
+    Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, ConditionOperand,
+    ConditionPredicate, ConditionSelector, FailurePolicy, FinalizationTrigger, FinalizerDefinition,
+    HarnessDefinition, MessageSource, NodeBody, Output, OutputReference, RecoveryHandler,
+    StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -93,6 +93,7 @@ struct AgentNodeDto {
 struct CommonNodeDto {
     #[serde(rename = "failurePolicy", default)]
     failure_policy: FailurePolicy,
+    condition: Option<ConditionPredicateDto>,
     cwd: Option<String>,
     #[serde(default)]
     outputs: BTreeMap<String, OutputDto>,
@@ -231,6 +232,89 @@ enum WorkspaceOutputSourceDto {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum ConditionPredicateDto {
+    All(ConditionAllDto),
+    Any(ConditionAnyDto),
+    Not(ConditionNotDto),
+    Equals(ConditionEqualsDto),
+    Exists(ConditionExistsDto),
+    Disposition(ConditionDispositionDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionAllDto {
+    all: Vec<ConditionPredicateDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionAnyDto {
+    any: Vec<ConditionPredicateDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionNotDto {
+    not: Box<ConditionPredicateDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionEqualsDto {
+    equals: [ConditionOperandDto; 2],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionExistsDto {
+    exists: ConditionSelectorDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionDispositionDto {
+    disposition: ConditionDispositionValueDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionDispositionValueDto {
+    node: String,
+    is: super::condition::TerminalDisposition,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConditionOperandDto {
+    Reference(ConditionReferenceDto),
+    Literal(ConditionLiteralDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionReferenceDto {
+    #[serde(rename = "ref")]
+    reference: String,
+    pointer: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionLiteralDto {
+    value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionSelectorDto {
+    #[serde(rename = "ref")]
+    reference: String,
+    pointer: String,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReferenceDto {
     #[serde(rename = "ref")]
@@ -344,9 +428,66 @@ impl CommonNodeDto {
 
         Some(CommonNode {
             failure_policy: self.failure_policy,
+            condition: match self.condition {
+                Some(condition) => Some(condition.into_predicate()?),
+                None => None,
+            },
             cwd: self.cwd,
             outputs,
         })
+    }
+}
+
+impl ConditionPredicateDto {
+    fn into_predicate(self) -> Option<ConditionPredicate> {
+        match self {
+            Self::All(value) => Some(ConditionPredicate::All(
+                value
+                    .all
+                    .into_iter()
+                    .map(Self::into_predicate)
+                    .collect::<Option<_>>()?,
+            )),
+            Self::Any(value) => Some(ConditionPredicate::Any(
+                value
+                    .any
+                    .into_iter()
+                    .map(Self::into_predicate)
+                    .collect::<Option<_>>()?,
+            )),
+            Self::Not(value) => Some(ConditionPredicate::Not(Box::new(
+                value.not.into_predicate()?,
+            ))),
+            Self::Equals(value) => Some(ConditionPredicate::Equals(
+                value
+                    .equals
+                    .map(ConditionOperandDto::into_operand)
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?
+                    .try_into()
+                    .ok()?,
+            )),
+            Self::Exists(value) => Some(ConditionPredicate::Exists(ConditionSelector {
+                reference: parse_value_reference(&value.exists.reference)?,
+                pointer: value.exists.pointer,
+            })),
+            Self::Disposition(value) => Some(ConditionPredicate::Disposition {
+                node: value.disposition.node,
+                is: value.disposition.is,
+            }),
+        }
+    }
+}
+
+impl ConditionOperandDto {
+    fn into_operand(self) -> Option<ConditionOperand> {
+        match self {
+            Self::Reference(value) => Some(ConditionOperand::Reference {
+                reference: parse_value_reference(&value.reference)?,
+                pointer: value.pointer,
+            }),
+            Self::Literal(value) => Some(ConditionOperand::Literal(value.value)),
+        }
     }
 }
 

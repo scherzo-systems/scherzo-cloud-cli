@@ -186,28 +186,41 @@ impl CleanupCancellation {
 
 #[derive(Clone)]
 struct WorkRootAuthority {
+    shared: Arc<WorkRootAuthorityShared>,
+}
+
+struct WorkRootAuthorityShared {
     path: PathBuf,
     device: u64,
     inode: u64,
-    directory_lock: Arc<File>,
+    directory_lock: File,
     lock_path: PathBuf,
-    lock_file: Arc<File>,
+    lock_file: File,
 }
 
 impl WorkRootAuthority {
     fn validate(&self) -> Result<(), ()> {
-        let opened_root = self.directory_lock.metadata().map_err(|_| ())?;
-        let linked_root = fs::symlink_metadata(&self.path).map_err(|_| ())?;
+        let opened_root = self.shared.directory_lock.metadata().map_err(|_| ())?;
+        let linked_root = fs::symlink_metadata(&self.shared.path).map_err(|_| ())?;
         if !safe_owned_directory(&opened_root)
             || !safe_owned_directory(&linked_root)
-            || opened_root.dev() != self.device
-            || opened_root.ino() != self.inode
-            || linked_root.dev() != self.device
-            || linked_root.ino() != self.inode
+            || opened_root.dev() != self.shared.device
+            || opened_root.ino() != self.shared.inode
+            || linked_root.dev() != self.shared.device
+            || linked_root.ino() != self.shared.inode
         {
             return Err(());
         }
-        verify_lock_identity(&self.lock_path, self.lock_file.as_ref()).map_err(|_| ())
+        verify_lock_identity(&self.shared.lock_path, &self.shared.lock_file).map_err(|_| ())
+    }
+}
+
+impl Drop for WorkRootAuthorityShared {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open file descriptions until exec,
+        // so closing our descriptors alone does not release these locks promptly.
+        let _ = FileExt::unlock(&self.lock_file);
+        let _ = FileExt::unlock(&self.directory_lock);
     }
 }
 
@@ -409,8 +422,8 @@ impl WorkRootLease {
         boot_id: &str,
         filesystem: WorkspaceFilesystem,
     ) -> Result<Arc<Self>, WorkRootError> {
-        let directory_lock = Arc::new(open_work_root(work_root)?);
-        match FileExt::try_lock(directory_lock.as_ref()) {
+        let directory_lock = open_work_root(work_root)?;
+        match FileExt::try_lock(&directory_lock) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(WorkRootError::WorkRootInUse),
             Err(TryLockError::Error(_)) => return Err(WorkRootError::UnsafeWorkRoot),
@@ -419,19 +432,21 @@ impl WorkRootLease {
             .metadata()
             .map_err(|_| WorkRootError::UnsafeWorkRoot)?;
         let lock_path = work_root.join(LOCK_FILE_NAME);
-        let lock_file = Arc::new(open_lock(&lock_path)?);
-        match FileExt::try_lock(lock_file.as_ref()) {
+        let lock_file = open_lock(&lock_path)?;
+        match FileExt::try_lock(&lock_file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(WorkRootError::WorkRootInUse),
             Err(TryLockError::Error(_)) => return Err(WorkRootError::UnsafeWorkRoot),
         }
         let authority = WorkRootAuthority {
-            path: work_root.to_owned(),
-            device: work_root_metadata.dev(),
-            inode: work_root_metadata.ino(),
-            directory_lock,
-            lock_path,
-            lock_file,
+            shared: Arc::new(WorkRootAuthorityShared {
+                path: work_root.to_owned(),
+                device: work_root_metadata.dev(),
+                inode: work_root_metadata.ino(),
+                directory_lock,
+                lock_path,
+                lock_file,
+            }),
         };
         authority
             .validate()
@@ -918,7 +933,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Read as _;
     use std::os::unix::fs::symlink;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1037,6 +1052,25 @@ mod tests {
         hook: Arc<dyn WorkRootHook>,
     ) -> WorkspaceFilesystem {
         WorkspaceFilesystem::injected(remover, sleeper, hook)
+    }
+
+    fn spawn_ready_helper_child() -> Child {
+        let mut child = Command::new("sh")
+            .args(["-c", "printf ready; while :; do sleep 60; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut ready = [0_u8; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        child
     }
 
     #[test]
@@ -1420,24 +1454,36 @@ mod tests {
     }
 
     #[test]
+    fn dropping_authority_releases_locks_inherited_by_a_child() {
+        let root = private_work_root();
+        let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
+        let inherited_directory_lock = first._authority.shared.directory_lock.try_clone().unwrap();
+        let inherited_lock_file = first._authority.shared.lock_file.try_clone().unwrap();
+        // Retain duplicates in the helper to make the ordinary fork-to-exec
+        // inheritance window deterministic.
+        fcntl(
+            &inherited_directory_lock,
+            FcntlArg::F_SETFD(FdFlag::empty()),
+        )
+        .unwrap();
+        fcntl(&inherited_lock_file, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        let mut child = spawn_ready_helper_child();
+        drop(inherited_directory_lock);
+        drop(inherited_lock_file);
+
+        drop(first);
+        let second = WorkRootLease::acquire(root.path(), BOOT_B);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(second.unwrap().boot_path(), root.path().join(BOOT_B));
+    }
+
+    #[test]
     fn close_on_exec_lock_is_not_retained_by_a_helper_child() {
         let root = private_work_root();
         let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
-        let mut child = Command::new("sh")
-            .args(["-c", "printf ready; while :; do sleep 60; done"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut ready = [0_u8; 5];
-        child
-            .stdout
-            .as_mut()
-            .unwrap()
-            .read_exact(&mut ready)
-            .unwrap();
-        assert_eq!(&ready, b"ready");
+        let mut child = spawn_ready_helper_child();
         drop(first);
         let second = WorkRootLease::acquire(root.path(), BOOT_B).unwrap();
         assert_eq!(second.boot_path(), root.path().join(BOOT_B));

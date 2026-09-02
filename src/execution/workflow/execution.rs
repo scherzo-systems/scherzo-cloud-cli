@@ -71,10 +71,9 @@ where
             for event in events {
                 let step = observed_step_transition(&event, &state);
                 observer
-                    .observe(ExecutionObservation::Transition(TransitionObservation {
-                        event,
-                        step,
-                    }))
+                    .observe(ExecutionObservation::Transition(Box::new(
+                        TransitionObservation { event, step },
+                    )))
                     .await;
             }
             Ok(())
@@ -162,6 +161,11 @@ fn observed_step_transition<Deadline>(
         }
         (StepStateKind::Blocked, StepState::Blocked { detail }) => {
             Some(ObservedStepTransition::Blocked {
+                detail: detail.clone(),
+            })
+        }
+        (StepStateKind::Skipped, StepState::Skipped { detail }) => {
+            Some(ObservedStepTransition::Skipped {
                 detail: detail.clone(),
             })
         }

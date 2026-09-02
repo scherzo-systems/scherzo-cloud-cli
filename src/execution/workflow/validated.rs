@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::claude_code::ClaudeCodeConfig;
 use super::codex::CodexConfig;
+use super::condition::ResolvedPredicate;
 use super::document::{FailurePolicy, FinalizationTrigger, Output};
 use super::evidence::Prerequisite;
 use super::pi::PiConfig;
@@ -110,12 +111,16 @@ pub(crate) struct ValidatedAgentStep {
 pub(crate) struct ResolvedDirectPrerequisite {
     pub(crate) producer: String,
     pub(crate) control: bool,
+    pub(crate) disposition_control: bool,
     pub(crate) data: bool,
+    pub(crate) condition_data: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedCommonStep {
     pub(crate) failure_policy: FailurePolicy,
+    pub(crate) condition: Option<ResolvedPredicate>,
+    pub(crate) condition_values: BTreeMap<String, ResolvedValueSource>,
     pub(crate) prerequisites: Vec<ResolvedDirectPrerequisite>,
     pub(crate) evidence_prerequisites: Vec<Prerequisite>,
     pub(crate) cwd: Option<String>,

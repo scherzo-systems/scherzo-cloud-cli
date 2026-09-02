@@ -2450,7 +2450,10 @@ fn inspector_timing<Step: StepProjection>(
 ) -> Option<&super::run_view_model::WorkflowRunElapsed> {
     if matches!(
         step.state(),
-        StepStateKind::Pending | StepStateKind::Blocked | StepStateKind::NotRun
+        StepStateKind::Pending
+            | StepStateKind::Blocked
+            | StepStateKind::Skipped
+            | StepStateKind::NotRun
     ) {
         None
     } else {
@@ -2488,6 +2491,11 @@ fn live_inspector_fact(fact: Option<&ObservedStepTransition>) -> Option<Inspecto
             canonical_blocked_detail(detail),
             Tone::Blocked,
         )),
+        ObservedStepTransition::Skipped { detail } => Some(InspectorField::new(
+            "condition",
+            super::archived_presentation::condition_false_detail(detail),
+            Tone::Muted,
+        )),
         ObservedStepTransition::NotRun { detail } => Some(InspectorField::new(
             "not run",
             super::presentation::snake_case_debug(detail.code),
@@ -2517,6 +2525,7 @@ fn output_disposition(
             let reason = match reason {
                 WorkflowRunOutputUnavailableReason::Failed => "failed",
                 WorkflowRunOutputUnavailableReason::Blocked => "blocked",
+                WorkflowRunOutputUnavailableReason::Skipped => "skipped",
                 WorkflowRunOutputUnavailableReason::NotRun => "not-run",
                 WorkflowRunOutputUnavailableReason::Cancelled => "cancelled",
             };
@@ -2905,6 +2914,9 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
             &step.definition,
             step.state,
         )),
+        Some(ObservedStepTransition::Skipped { detail }) => {
+            Some(super::archived_presentation::condition_false_detail(detail))
+        }
         Some(ObservedStepTransition::NotRun { detail }) => {
             Some(super::presentation::snake_case_debug(detail.code))
         }
@@ -3458,6 +3470,7 @@ fn empty_log_message(state: StepStateKind) -> &'static str {
         StepStateKind::Succeeded
         | StepStateKind::Failed
         | StepStateKind::Blocked
+        | StepStateKind::Skipped
         | StepStateKind::NotRun
         | StepStateKind::Cancelled => "No output received.",
     }
@@ -4267,6 +4280,7 @@ struct StepCounts {
     succeeded: usize,
     failed: usize,
     blocked: usize,
+    skipped: usize,
     not_run: usize,
     cancelled: usize,
 }
@@ -4284,6 +4298,7 @@ fn step_counts(snapshot: &WorkflowRunViewSnapshot) -> StepCounts {
             StepStateKind::Succeeded => counts.succeeded += 1,
             StepStateKind::Failed => counts.failed += 1,
             StepStateKind::Blocked => counts.blocked += 1,
+            StepStateKind::Skipped => counts.skipped += 1,
             StepStateKind::NotRun => counts.not_run += 1,
             StepStateKind::Cancelled => counts.cancelled += 1,
         }
@@ -4299,6 +4314,7 @@ fn step_count_summary(counts: &StepCounts, total: usize) -> String {
         (counts.active, "running"),
         (counts.failed, "failed"),
         (counts.blocked, "blocked"),
+        (counts.skipped, "skipped"),
         (counts.pending, "pending"),
         (counts.not_run, "not-run"),
         (counts.cancelled, "cancelled"),
@@ -4389,6 +4405,7 @@ fn step_state_glyph<Step: StepProjection>(step: &Step) -> &'static str {
         StepStateKind::Succeeded => "✓",
         StepStateKind::Failed => "×",
         StepStateKind::Blocked => "◐",
+        StepStateKind::Skipped => "↷",
         StepStateKind::NotRun => "–",
         StepStateKind::Cancelled => "⊘",
     }
@@ -4405,6 +4422,7 @@ fn step_state_label(state: StepStateKind) -> &'static str {
         StepStateKind::Succeeded => "succeeded",
         StepStateKind::Failed => "failed",
         StepStateKind::Blocked => "blocked",
+        StepStateKind::Skipped => "skipped",
         StepStateKind::NotRun => "not-run",
         StepStateKind::Cancelled => "cancelled",
     }
@@ -4425,7 +4443,7 @@ fn step_state_tone(state: StepStateKind) -> Tone {
         StepStateKind::Cancelling | StepStateKind::Blocked | StepStateKind::Cancelled => {
             Tone::Blocked
         }
-        StepStateKind::Pending | StepStateKind::NotRun => Tone::Muted,
+        StepStateKind::Pending | StepStateKind::Skipped | StepStateKind::NotRun => Tone::Muted,
     }
 }
 
