@@ -1414,16 +1414,14 @@ fn codex_process_fixture() {
         while !released.is_file() {
             crate::timing::sleep(Duration::from_millis(1));
         }
-        let mut poll = [rustix::event::PollFd::new(
-            &input,
-            rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP,
-        )];
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        let close_flags = rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP;
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        let close_flags = rustix::event::PollFlags::HUP;
+        let mut poll = [rustix::event::PollFd::new(&input, close_flags)];
         loop {
             rustix::event::poll(&mut poll, None).unwrap();
-            if poll[0]
-                .revents()
-                .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP)
-            {
+            if poll[0].revents().intersects(close_flags) {
                 break;
             }
             poll[0].clear_revents();

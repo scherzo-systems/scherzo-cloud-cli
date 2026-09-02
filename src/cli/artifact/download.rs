@@ -6,7 +6,7 @@ use clap::Args;
 
 use super::assembly::{ArtifactAssemblyError, assemble_artifact_set};
 use crate::api::{ArtifactApi, ArtifactApiError, HttpClient};
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
@@ -101,14 +101,18 @@ fn write_result(
             Ok(ExitCode::Success)
         }
         Err(error) => {
-            let exit = match &error {
+            let outcome_class = match &error {
                 ArtifactAssemblyError::Api(ArtifactApiError::Unauthenticated) => {
-                    ExitCode::AuthenticationRequired
+                    OutcomeClass::Unauthenticated
                 }
-                ArtifactAssemblyError::Api(ArtifactApiError::Unreachable(_)) => {
-                    ExitCode::Unavailable
+                ArtifactAssemblyError::Api(ArtifactApiError::Forbidden) => OutcomeClass::Forbidden,
+                ArtifactAssemblyError::Api(ArtifactApiError::Unreachable(category)) => {
+                    super::super::unreachable_outcome_class(*category)
                 }
-                _ => ExitCode::GeneralFailure,
+                ArtifactAssemblyError::Api(ArtifactApiError::Protocol { .. }) => {
+                    OutcomeClass::Protocol
+                }
+                _ => OutcomeClass::GeneralFailure,
             };
             let remedy = match &error {
                 ArtifactAssemblyError::Api(ArtifactApiError::Unauthenticated) => {
@@ -128,7 +132,7 @@ fn write_result(
             let stderr = io::stderr();
             let mut stderr = stderr.lock();
             writeln!(stderr, "error: download Artifact Set: {error}\n\n{remedy}")?;
-            Ok(exit)
+            Ok(outcome_class.exit_code())
         }
     }
 }

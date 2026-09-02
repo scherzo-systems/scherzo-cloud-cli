@@ -1,30 +1,180 @@
 # Scherzo Cloud CLI
 
-> [!IMPORTANT]
-> This repository is a read-only mirror. Public Discussions are welcome, but pull
-> requests cannot be merged into the mirror directly.
+Scherzo Cloud CLI turns repeatable engineering work into explicit, durable workflows.
+Define commands and coding agents in one repository-owned YAML file, connect typed
+outputs to downstream steps, run independent work concurrently, and retain a result you
+can inspect instead of reconstructing what happened from terminal scrollback.
 
-This repository contains the open-source source for the early `scherzo-cloud`
-executable.
+The CLI is the open-source command-line and runner executable for Scherzo Cloud. It can
+run workflows locally with Pi, Claude Code, and Codex, or serve them from an enrolled
+outbound runner. The project is early, but the local workflow engine and its authoring,
+execution, and inspection tools are available today.
+
+## Why Scherzo
+
+Coding-agent automation often begins as a loose sequence of shell commands, prompts,
+and copy-and-paste handoffs. That approach becomes difficult to repeat, supervise, and
+recover once work spans several tools or agents. Scherzo gives the work a runtime:
+
+- **One graph for commands and agents.** Express control flow and typed data flow in a
+  workflow dependency graph instead of coordinating scripts and model sessions by
+  hand.
+- **Parallel work with explicit handoffs.** Let independent steps run concurrently, pass
+  text, schema-validated JSON, and files to downstream work, and export Git branch
+  results when a workflow changes a repository.
+- **Durable execution.** Follow progress in the terminal, inspect retained runs later,
+  recover bounded step failures, and retry eligible runs explicitly.
+- **Repository-owned automation.** Version workflows, prompts, attachments, and result
+  schemas beside the code they operate on.
+- **Validate before you spend.** Resolve the complete workflow bundle and check its
+  graph, references, types, files, and policy offline before starting commands or
+  consuming model tokens.
+
+## What you can build
+
+Use Scherzo to:
+
+- run tests, linters, builds, and several independent code reviews in parallel, then
+  combine their findings in one final artifact/PR;
+- have one agent extract schema-validated facts and pass them directly to another agent
+  for planning, review, or synthesis;
+- mix deterministic command steps with agent work, while preserving typed outputs for
+  downstream steps and callers;
+- add bounded recovery to flaky work and finalizers for cleanup or outcome-specific
+  reporting; and
+- retain machine-readable results and portable artifacts for later inspection or use by
+  other tools.
+
+The bundles under [`examples/workflows/`](examples/workflows/) include ready-to-run
+recipes for command data flow, parallel agents, structured results, recovery,
+cancellation, advisory failures, attachments, and finalizers.
+
+## A workflow at a glance
+
+This workflow makes a repository check and two agent reviews eligible to run
+concurrently. The final agent waits for the check and receives both review outputs:
+
+```mermaid
+flowchart LR
+    C["Repository check<br/>(command)"] --> S["Synthesize<br/>(agent)"]
+    R1["Correctness review<br/>(agent)"] -->|text output| S
+    R2["Security review<br/>(agent)"] -->|text output| S
+    S --> O["Exported report"]
+```
+
+In scherzo workflows, output references create the data-flow edges automatically:
+
+```yaml
+# yaml-language-server: $schema=https://docs.scherzo.dev/schemas/workflow-v1.schema.json
+schemaVersion: 1
+
+description: Check a repository, review it in parallel, and combine the findings.
+
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: provider/model
+        thinking: high
+
+steps:
+  check:
+    kind: cmd
+    command:
+      argv: ["./scripts/check"]
+
+  correctnessReview:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/reviewer-system.md
+      message:
+        text:
+          - file: prompts/review-correctness.md
+    outputs:
+      notes:
+        kind: text
+        from: agent_response
+
+  securityReview:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/reviewer-system.md
+      message:
+        text:
+          - file: prompts/review-security.md
+    outputs:
+      notes:
+        kind: text
+        from: agent_response
+
+  summarize:
+    kind: agent
+    dependsOn: [check]
+    agent:
+      profile: coding
+      systemPrompt: prompts/reviewer-system.md
+      message:
+        text:
+          - file: prompts/summarize-reviews.md
+          - ref: outputs.correctnessReview.notes
+          - ref: outputs.securityReview.notes
+    outputs:
+      report:
+        kind: text
+        from: agent_response
+
+exports:
+  report:
+    ref: outputs.summarize.report
+```
+
+Replace the example model with one available through your Pi installation and add the
+referenced prompt files. Then validate the bundle without executing it, run it in a new
+durable run directory, and return to that run later:
+
+```sh
+scherzo-cloud workflow validate \
+  --source-root . \
+  .scherzo/workflows/review.yaml
+
+scherzo-cloud workflow run \
+  --source-root . \
+  --execution-root . \
+  --run-dir ~/.scherzo/runs/review-001 \
+  .scherzo/workflows/review.yaml
+
+scherzo-cloud workflow status ~/.scherzo/runs/review-001
+scherzo-cloud workflow view ~/.scherzo/runs/review-001
+```
+
+During execution, Scherzo schedules ready steps, supervises each command or fresh agent
+session, captures declared outputs, and publishes one durable terminal result. The same
+run handle works for noninteractive status, archived inspection, and an explicit retry
+when the retained state is eligible.
 
 ## Current capabilities
 
-The current release supports help, version inspection, OAuth Device Authorization,
-server-confirmed human authentication status, explicit human-principal signup,
-renewable human sessions and revoking logout, organization profile management and
-one-page member-directory reads, local Workflow V1 definition validation, an installed
-authoring reference and structural schema output, portable artifact-set validation,
-mixed command and agent execution,
-durable run status inspection, runner diagnostics, and an
-enrolled outbound runner transport. `runner serve` connects only to the Cloud-issued
-endpoint retained in protected state and resolves, admits, and executes one configured
-inputless Workflow V1 command, Pi, Claude Code, or mixed assignment after explicit start
-authorization.
+The current release supports:
 
-The CLI can create an organization, read or update its initial profile, and list one
-page of active members. It cannot configure repositories, invite or change members, or
-submit workflows. Agent-guided organization creation
-and the rest of Cloud onboarding are not implemented yet.
+- offline Workflow V1 validation, an installed authoring reference, and structural JSON
+  Schema output;
+- local command, Pi, Claude Code, and Codex DAG execution with typed data flow,
+  concurrency, recovery, finalizers, imports, exports, durable status, retry, and
+  archived inspection;
+- portable Artifact Set V1 validation without the original run or source checkout;
+- OAuth device login, renewable human sessions, logout, account signup, organization
+  profile management, and one-page member-directory reads;
+- runner prerequisite diagnostics; and
+- enrollment and service operation for an outbound runner that connects only to its
+  Cloud-issued endpoint and waits for explicit start authorization.
+
+The Cloud management surface is not complete. The CLI can create an organization, read
+or update its initial profile, and list one page of active members. It cannot yet
+configure repositories, invite or change members, submit workflows, or guide the rest
+of Cloud onboarding.
 
 ## Local workflow validation
 
@@ -767,6 +917,15 @@ gh attestation verify "$archive" \
 Everything in this repository builds and tests using only its checked-in source and
 declared external dependencies. The canonical check verifies that the public source is
 self-contained.
+
+## Contributing
+
+> [!IMPORTANT]
+> This repository is a read-only mirror. Public Discussions are welcome, but pull
+> requests cannot be merged into the mirror directly.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for feedback channels, development checks, and
+security-reporting guidance.
 
 ## Development
 

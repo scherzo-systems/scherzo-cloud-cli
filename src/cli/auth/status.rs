@@ -5,7 +5,7 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::api::HttpClient;
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus};
 
@@ -39,19 +39,21 @@ impl Command {
                     deployment.fingerprint().api_url()
                 )
             })?;
-        let exit_code = match status.state() {
+        let outcome = match status.state() {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
-                ExitCode::Success
+                OutcomeClass::Success
             }
-            AuthenticationState::Unauthenticated => ExitCode::AuthenticationRequired,
-            AuthenticationState::Unreachable(_) => ExitCode::Unavailable,
+            AuthenticationState::Unauthenticated => OutcomeClass::Unauthenticated,
+            AuthenticationState::Unreachable(category) => {
+                super::super::unreachable_outcome_class(*category)
+            }
         };
         if self.json {
             write_json_status(&status)?;
         } else {
             write_human_status(&status)?;
         }
-        Ok(exit_code)
+        Ok(outcome.exit_code())
     }
 }
 

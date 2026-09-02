@@ -70,9 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The pending allocation contains a Linux-only unit-test helper. Check
-          # production targets here so its immutable release can be recovered.
-          cargo check --locked --workspace --bins --all-features \
+          cargo check --locked --workspace --all-targets --all-features \
             --target aarch64-apple-darwin
 
   verify_release:
@@ -190,9 +188,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
       - name: Exercise descriptor-bound command cwd
-        # Recovery dispatch builds immutable source whose unit-test target does
-        # not compile on macOS. Normal allocation pushes retain this check.
-        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'workflow_dispatch'
+        if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
           SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}

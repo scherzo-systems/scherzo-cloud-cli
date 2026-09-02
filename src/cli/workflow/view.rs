@@ -18,7 +18,7 @@ use crate::execution::workflow::presentation_feed::normalize_terminal_scalar;
 use crate::execution::workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
 };
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
 pub(super) const AFTER_HELP: &str = "Presentation mode:
@@ -162,10 +162,11 @@ async fn first_view_signal(
 
 fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
     match exit {
-        ArchivedTerminalHostExit::Quit => ExitCode::Success,
-        ArchivedTerminalHostExit::Interrupted => ExitCode::Interrupted,
-        ArchivedTerminalHostExit::Terminated => ExitCode::Terminated,
+        ArchivedTerminalHostExit::Quit => OutcomeClass::Success,
+        ArchivedTerminalHostExit::Interrupted => OutcomeClass::Interrupted,
+        ArchivedTerminalHostExit::Terminated => OutcomeClass::Terminated,
     }
+    .exit_code()
 }
 
 async fn write_noninteractive(

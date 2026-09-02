@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::runner::control_client::RequestFailure;
 use crate::runner::control_protocol::{ControlError, Operation, Response};
 use crate::runner::enrollment::{
     EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll,
@@ -102,7 +103,7 @@ impl Command {
                         "Enrollment did not commit.\n\n  Activation: {activation_id}\n  The secret journal was replaced with a terminal receipt; a different activation may now be used."
                     )?;
                 }
-                Ok(ExitCode::Success)
+                Ok(OutcomeClass::GeneralFailure.exit_code())
             }
         }
     }
@@ -147,8 +148,8 @@ enum PromotionOutcome {
 impl PromotionOutcome {
     const fn exit_code(self) -> ExitCode {
         match self {
-            Self::Promoted => ExitCode::Success,
-            Self::Incomplete(failure) => failure.exit_code(),
+            Self::Promoted => OutcomeClass::Success.exit_code(),
+            Self::Incomplete(failure) => failure.outcome_class().exit_code(),
         }
     }
 }
@@ -182,14 +183,15 @@ impl PromotionFailure {
         }
     }
 
-    const fn exit_code(self) -> ExitCode {
+    const fn outcome_class(self) -> OutcomeClass {
         match self {
             Self::RunnerServeUnreachable | Self::Control(ControlError::PendingConnectionFailed) => {
-                ExitCode::Unavailable
+                OutcomeClass::Unreachable
             }
-            Self::Control(_) | Self::InvalidControlResponse | Self::StateUnavailable => {
-                ExitCode::GeneralFailure
-            }
+            Self::Control(ControlError::InvalidRequest | ControlError::UnsupportedVersion)
+            | Self::Control(ControlError::PendingProtocolFailed)
+            | Self::InvalidControlResponse => OutcomeClass::Protocol,
+            Self::Control(_) | Self::StateUnavailable => OutcomeClass::GeneralFailure,
         }
     }
 
@@ -235,19 +237,21 @@ fn promote_replacement(
         Ok(Response::Error(error)) => {
             PromotionOutcome::Incomplete(PromotionFailure::Control(error))
         }
-        Ok(Response::Reloaded { .. } | Response::Status(_)) => {
+        Ok(Response::Reloaded { .. } | Response::Status(_)) | Err(RequestFailure::Protocol(_)) => {
             PromotionOutcome::Incomplete(PromotionFailure::InvalidControlResponse)
         }
-        Err(_) => match crate::runner::enrollment::replacement_disposition(
-            config,
-            &enrollment.runner_id,
-            &enrollment.credential_id,
-        ) {
-            Ok(ReplacementDisposition::Current) => PromotionOutcome::Promoted,
-            Ok(ReplacementDisposition::Pending | ReplacementDisposition::Missing) | Err(_) => {
-                PromotionOutcome::Incomplete(PromotionFailure::RunnerServeUnreachable)
+        Err(RequestFailure::NotReachable) => {
+            match crate::runner::enrollment::replacement_disposition(
+                config,
+                &enrollment.runner_id,
+                &enrollment.credential_id,
+            ) {
+                Ok(ReplacementDisposition::Current) => PromotionOutcome::Promoted,
+                Ok(ReplacementDisposition::Pending | ReplacementDisposition::Missing) | Err(_) => {
+                    PromotionOutcome::Incomplete(PromotionFailure::RunnerServeUnreachable)
+                }
             }
-        },
+        }
     }
 }
 
@@ -380,7 +384,7 @@ mod tests {
         );
         assert_eq!(
             PromotionOutcome::Incomplete(PromotionFailure::RunnerServeUnreachable).exit_code(),
-            ExitCode::Unavailable
+            OutcomeClass::Unreachable.exit_code()
         );
     }
 }

@@ -9,7 +9,7 @@ use serde::Serialize;
 // jscpd:ignore-end
 
 use crate::api::{HttpClient, HumanPrincipal, SignupError, SignupOutcome, signup_human};
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 use crate::idempotency::generate_idempotency_key;
@@ -87,18 +87,19 @@ impl Command {
         } else {
             write_human_result(deployment.fingerprint().api_url(), outcome)?;
         }
-        Ok(exit_code(outcome))
+        Ok(outcome_class(outcome).exit_code())
     }
 }
 
-fn exit_code(outcome: &SignupOutcome) -> ExitCode {
+fn outcome_class(outcome: &SignupOutcome) -> OutcomeClass {
     match outcome {
-        SignupOutcome::Authenticated(_) => ExitCode::Success,
-        SignupOutcome::Unauthenticated => ExitCode::AuthenticationRequired,
-        SignupOutcome::Unreachable(_) => ExitCode::Unavailable,
-        SignupOutcome::SignupNotPermitted
-        | SignupOutcome::AlreadyProvisioned
-        | SignupOutcome::IdempotencyConflict => ExitCode::GeneralFailure,
+        SignupOutcome::Authenticated(_) => OutcomeClass::Success,
+        SignupOutcome::Unauthenticated => OutcomeClass::Unauthenticated,
+        SignupOutcome::Unreachable(category) => super::super::unreachable_outcome_class(*category),
+        SignupOutcome::SignupNotPermitted => OutcomeClass::Forbidden,
+        SignupOutcome::AlreadyProvisioned | SignupOutcome::IdempotencyConflict => {
+            OutcomeClass::GeneralFailure
+        }
     }
 }
 

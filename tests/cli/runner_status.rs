@@ -439,30 +439,55 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
     );
 }
 
+fn run_status_with_response(response: &'static [u8]) -> Output {
+    let directory = private_credential_directory();
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let socket_path = runtime.path().join("runner.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 64];
+        let _ = stream.read(&mut request).unwrap();
+        stream.write_all(response).unwrap();
+    });
+    let config = write_status_config(&directory, &socket_path);
+
+    let output = run(&["runner", "status", "--config", &config]);
+
+    server.join().unwrap();
+    output
+}
+
 #[test]
-fn runner_status_reports_absent_refused_and_invalid_sockets_as_not_reachable() {
-    for invalid_response in [None, Some(b"not-json\n".as_slice())] {
-        let directory = private_credential_directory();
-        let runtime = tempfile::tempdir_in("/tmp").unwrap();
-        let socket_path = runtime.path().join("runner.sock");
-        let server = invalid_response.map(|response| {
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 64];
-                let _ = stream.read(&mut request).unwrap();
-                stream.write_all(response).unwrap();
-            })
-        });
-        let config = write_status_config(&directory, &socket_path);
-        let output = run(&["runner", "status", "--config", &config]);
-        assert_eq!(output.status.code(), Some(4));
-        assert!(output.stdout.is_empty());
-        assert!(!output.stderr.is_empty());
-        if let Some(server) = server {
-            server.join().unwrap();
-        }
-    }
+fn runner_status_maps_control_protocol_errors_through_the_protocol_outcome() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"unsupported_version\"}\n",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn runner_status_maps_malformed_control_responses_through_the_protocol_outcome() {
+    let output = run_status_with_response(b"not-json\n");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn runner_status_reports_absent_and_refused_sockets_as_not_reachable() {
+    let directory = private_credential_directory();
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let socket_path = runtime.path().join("runner.sock");
+    let config = write_status_config(&directory, &socket_path);
+    let output = run(&["runner", "status", "--config", &config]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
 
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();

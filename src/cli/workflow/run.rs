@@ -72,7 +72,7 @@ use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTermin
 use crate::execution::workflow::validated::{
     ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole,
 };
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
@@ -158,7 +158,22 @@ impl Command {
                 Ok(imports) => imports,
                 Err(error) => {
                     signal_task.abort();
-                    return Err(error.into());
+                    let failure = match cancellation.cancellation_reason() {
+                        Some(CancellationReason::UserRequest) => {
+                            super::super::CommandFailure::for_outcome(
+                                error,
+                                OutcomeClass::Interrupted,
+                            )
+                        }
+                        Some(CancellationReason::TerminationRequest) => {
+                            super::super::CommandFailure::for_outcome(
+                                error,
+                                OutcomeClass::Terminated,
+                            )
+                        }
+                        _ => error.into(),
+                    };
+                    return Err(failure);
                 }
             };
         let workflow =

@@ -2774,7 +2774,7 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
 }
 
 fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
-    use crate::exit_code::ExitCode;
+    use crate::exit_code::{ExitCode, OutcomeClass};
 
     if run
         .steps
@@ -2819,10 +2819,10 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
         WorkflowOutcomeV1::Cancelled => match &run.outcome {
             RunOutcome::Cancelled {
                 reason: CancellationReason::UserRequest,
-            } => ExitCode::Interrupted.as_u16(),
+            } => OutcomeClass::Interrupted.exit_code().as_u16(),
             RunOutcome::Cancelled {
                 reason: CancellationReason::TerminationRequest,
-            } => ExitCode::Terminated.as_u16(),
+            } => OutcomeClass::Terminated.exit_code().as_u16(),
             RunOutcome::Cancelled {
                 reason:
                     CancellationReason::CallerOutputFailure

@@ -18,7 +18,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::api::HttpTransportPolicy;
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
@@ -38,6 +38,10 @@ impl CommandFailure {
 
     pub(crate) fn with_exit_code(error: anyhow::Error, exit_code: ExitCode) -> Self {
         Self { error, exit_code }
+    }
+
+    pub(crate) fn for_outcome(error: anyhow::Error, outcome: OutcomeClass) -> Self {
+        Self::with_exit_code(error, outcome.exit_code())
     }
 
     pub(crate) fn error(&self) -> &anyhow::Error {
@@ -126,6 +130,19 @@ impl Cli {
     }
 }
 
+pub(crate) const fn unreachable_outcome_class(
+    category: crate::api::UnreachableCategory,
+) -> OutcomeClass {
+    match category {
+        crate::api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
+        crate::api::UnreachableCategory::Dns
+        | crate::api::UnreachableCategory::Timeout
+        | crate::api::UnreachableCategory::Connection
+        | crate::api::UnreachableCategory::Tls
+        | crate::api::UnreachableCategory::Server => OutcomeClass::Unreachable,
+    }
+}
+
 fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
@@ -183,8 +200,8 @@ async fn first_read_only_signal(
 ) -> ExitCode {
     tokio::select! {
         biased;
-        _ = interrupt.recv() => ExitCode::Interrupted,
-        _ = terminate.recv() => ExitCode::Terminated,
+        _ = interrupt.recv() => OutcomeClass::Interrupted.exit_code(),
+        _ = terminate.recv() => OutcomeClass::Terminated.exit_code(),
     }
 }
 
@@ -237,7 +254,9 @@ mod tests {
 
     use clap::CommandFactory;
 
-    use super::Cli;
+    use super::{Cli, unreachable_outcome_class};
+    use crate::api::UnreachableCategory;
+    use crate::exit_code::OutcomeClass;
 
     fn collect_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
         assert!(
@@ -297,6 +316,26 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn every_unreachable_category_uses_the_shared_outcome_table() {
+        for category in [
+            UnreachableCategory::Dns,
+            UnreachableCategory::Timeout,
+            UnreachableCategory::Connection,
+            UnreachableCategory::Tls,
+            UnreachableCategory::Server,
+        ] {
+            assert_eq!(
+                unreachable_outcome_class(category),
+                OutcomeClass::Unreachable
+            );
+        }
+        assert_eq!(
+            unreachable_outcome_class(UnreachableCategory::RateLimited),
+            OutcomeClass::RateLimited
+        );
     }
 
     #[test]

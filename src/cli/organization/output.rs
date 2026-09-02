@@ -9,7 +9,7 @@ use crate::api::{
     OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome,
 };
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) fn write_create(
     deployment: &str,
@@ -33,7 +33,7 @@ pub(super) fn write_create(
             None,
             None,
             "! Organization creation is not permitted for this account.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::Forbidden,
             json,
         ),
         CreateOrganizationOutcome::SlugUnavailable => write_failure(
@@ -42,7 +42,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The requested organization slug is unavailable.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
         CreateOrganizationOutcome::QuantityLimitReached => write_failure(
@@ -51,7 +51,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The organization quantity limit has been reached.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
         CreateOrganizationOutcome::RateLimited { retry_after } => write_failure(
@@ -62,7 +62,7 @@ pub(super) fn write_create(
             &format!(
                 "! Organization creation is rate limited. Try again in {retry_after} seconds."
             ),
-            ExitCode::Unavailable,
+            OutcomeClass::RateLimited,
             json,
         ),
         CreateOrganizationOutcome::IdempotencyConflict => write_failure(
@@ -71,7 +71,7 @@ pub(super) fn write_create(
             None,
             None,
             "! The organization request identity conflicted with another request.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
     }
@@ -120,7 +120,7 @@ pub(super) fn write_update(
             None,
             None,
             "! The requested organization slug is unavailable.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
         UpdateOrganizationOutcome::IdempotencyConflict => write_failure(
@@ -129,7 +129,7 @@ pub(super) fn write_update(
             None,
             None,
             "! The organization request identity conflicted with another request.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
     }
@@ -172,7 +172,7 @@ fn write_not_found(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
         None,
         None,
         "! Organization not found or unavailable.",
-        ExitCode::GeneralFailure,
+        OutcomeClass::GeneralFailure,
         json,
     )
 }
@@ -190,7 +190,7 @@ fn write_common(
             None,
             None,
             "! You must sign in before managing Scherzo Cloud organizations.\n\nRun:\n  scherzo-cloud auth login",
-            ExitCode::AuthenticationRequired,
+            OutcomeClass::Unauthenticated,
             json,
         ),
         CommonOrganizationFailure::Forbidden => write_failure(
@@ -199,7 +199,7 @@ fn write_common(
             None,
             None,
             "! This account is not permitted to perform that organization operation.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::Forbidden,
             json,
         ),
         CommonOrganizationFailure::InvalidInput => write_failure(
@@ -208,7 +208,7 @@ fn write_common(
             None,
             None,
             "! The organization input was rejected by the deployment.",
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
             json,
         ),
         CommonOrganizationFailure::Unreachable(category) => write_failure(
@@ -217,7 +217,7 @@ fn write_common(
             Some(category.as_str()),
             None,
             &format!("! {unreachable_message} ({}).", category.as_str()),
-            ExitCode::Unavailable,
+            super::super::unreachable_outcome_class(*category),
             json,
         ),
     }
@@ -297,7 +297,7 @@ fn write_failure(
     category: Option<&'static str>,
     retry_after: Option<u64>,
     human: &str,
-    exit_code: ExitCode,
+    outcome_class: OutcomeClass,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
@@ -313,7 +313,7 @@ fn write_failure(
         let mut stdout = stdout.lock();
         writeln!(stdout, "{human}")?;
     }
-    Ok(exit_code)
+    Ok(outcome_class.exit_code())
 }
 
 fn write_json(value: &impl Serialize) -> anyhow::Result<()> {

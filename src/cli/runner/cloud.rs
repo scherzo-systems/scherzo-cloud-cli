@@ -7,14 +7,23 @@ use crate::api::{
     HttpTransportPolicy, RunnerApi, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
     RunnerRegistrationList,
 };
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
+) -> anyhow::Result<Result<T, RunnerFailure>> {
+    with_api_retrying_rejected_result(deployment, transport_policy, operation, |_| false)
+}
+
+pub(super) fn with_api_retrying_rejected_result<T>(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
     mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
+    result_credential_rejected: impl Fn(&T) -> bool,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
     let client = crate::api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
@@ -37,6 +46,7 @@ pub(super) fn with_api<T>(
                 operation
                     .as_ref()
                     .is_err_and(RunnerFailure::credential_rejected)
+                    || operation.as_ref().is_ok_and(&result_credential_rejected)
             })
         },
     ) {
@@ -361,78 +371,111 @@ pub(super) fn write_failure(
     failure: &RunnerFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let (outcome, category, human, exit_code) = match failure {
+    write_failure_with_context(deployment, failure, json, None)
+}
+
+pub(super) fn write_activation_failure(
+    deployment: &str,
+    failure: &RunnerFailure,
+    organization: &str,
+    runner_id: &str,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    write_failure_with_context(
+        deployment,
+        failure,
+        json,
+        Some(CreatedRegistration {
+            organization,
+            runner_id,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CreatedRegistration<'a> {
+    organization: &'a str,
+    runner_id: &'a str,
+}
+
+fn write_failure_with_context(
+    deployment: &str,
+    failure: &RunnerFailure,
+    json: bool,
+    created: Option<CreatedRegistration<'_>>,
+) -> anyhow::Result<ExitCode> {
+    let (outcome, category, human, outcome_class) = match failure {
         RunnerFailure::Unauthenticated => (
             "unauthenticated",
             None,
             "error: runner administration requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
-            ExitCode::AuthenticationRequired,
+            OutcomeClass::Unauthenticated,
         ),
         RunnerFailure::Forbidden => (
             "forbidden",
             None,
             "error: runner operation is not permitted for this account\n\nAsk an organization owner to perform this operation.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::Forbidden,
         ),
         RunnerFailure::InvalidInput => (
             "invalid_input",
             None,
             format!("error: runner input rejected by {deployment}\n\nCheck the organization, resource identifier, and name, then try again."),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::NotFound => (
             "not_found",
             None,
             "error: runner resource not found or unavailable\n\nCheck the organization and resource reference, then try again.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::NameUnavailable => (
             "name_unavailable",
             None,
             "error: runner resource name unavailable\n\nChoose another name and try again.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::QuantityLimitReached => (
             "quantity_limit_reached",
             None,
             "error: runner resource quantity limit reached\n\nRemove an unused resource or ask the deployment operator to raise the limit.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::RateLimited => (
             "rate_limited",
             None,
             "error: runner resource creation rate limited\n\nTry again later.".to_owned(),
-            ExitCode::Unavailable,
+            OutcomeClass::RateLimited,
         ),
         RunnerFailure::IdempotencyConflict => (
             "idempotency_conflict",
             None,
             "error: runner request identity conflicted with another request\n\nRun the command again to use a new request identity.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::CredentialLimit => (
             "credential_limit_reached",
             None,
             "error: runner credential limit reached\n\nRevoke a credential or wait for retirement before issuing another activation.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::ActivationUnavailable => (
             "activation_unavailable",
             None,
             "error: runner activation is no longer available\n\nList activations and issue a replacement when needed.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::CredentialTransitionUnavailable => (
             "credential_transition_unavailable",
             None,
             "error: runner credential transition is unavailable\n\nList credentials and choose an active or retiring credential.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::PoolMoveUnavailable => (
             "pool_move_unavailable",
             None,
             "error: runner cannot move while it has active work\n\nDrain or disable the runner, then wait for its reservation and assignments to finish.".to_owned(),
-            ExitCode::GeneralFailure,
+            OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::Unreachable(category) => (
             "unreachable",
@@ -441,13 +484,13 @@ pub(super) fn write_failure(
                 "error: contact runner API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
                 category.as_str()
             ),
-            ExitCode::Unavailable,
+            super::super::unreachable_outcome_class(*category),
         ),
         RunnerFailure::Protocol => (
             "invalid_response",
             None,
             "error: runner API response does not match the public contract\n\nTry again later.".to_owned(),
-            ExitCode::Unavailable,
+            OutcomeClass::Protocol,
         ),
     };
     // Runner failures own a closed machine vocabulary distinct from organization
@@ -459,14 +502,22 @@ pub(super) fn write_failure(
             deployment,
             outcome,
             category,
+            runner_id: created.map(|registration| registration.runner_id),
         })?;
     } else {
         let stderr = io::stderr();
         let mut stderr = stderr.lock();
         writeln!(stderr, "{human}")?;
+        if let Some(created) = created {
+            writeln!(
+                stderr,
+                "\nRunner {} was created without an activation. Issue one without creating another runner:\n  scherzo-cloud runner activation create {} {} --activation-file <PATH>",
+                created.runner_id, created.organization, created.runner_id
+            )?;
+        }
     }
     // jscpd:ignore-end
-    Ok(exit_code)
+    Ok(outcome_class.exit_code())
 }
 
 fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
@@ -527,6 +578,8 @@ struct FailureResult<'a> {
     outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_id: Option<&'a str>,
 }
 // jscpd:ignore-end
 

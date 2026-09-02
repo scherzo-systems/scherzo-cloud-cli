@@ -424,7 +424,7 @@ fn existing_status_unreachable_emits_failure_without_device_authorization() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(4));
     assert_eq!(
         json_lines(&output.stdout),
         vec![serde_json::json!({
@@ -573,7 +573,7 @@ fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(4));
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
 }
@@ -642,7 +642,7 @@ fn login_unreachable_failures_report_the_active_phase() {
             &environment,
         );
 
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(4));
         let events = json_lines(&output.stdout);
         assert_eq!(events.len(), expected_events);
         let failure = events.last().unwrap();
@@ -1016,7 +1016,7 @@ fn issued_token_is_retained_when_principal_confirmation_is_unreachable() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(4));
     let events = json_lines(&output.stdout);
     assert_eq!(events.len(), 2);
     assert_eq!(
@@ -1099,7 +1099,7 @@ fn unauthenticated_principal_confirmation_emits_status_and_removes_token() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(3));
     let events = json_lines(&output.stdout);
     assert_eq!(events.len(), 2);
     assert_eq!(events[1]["event"], "status");

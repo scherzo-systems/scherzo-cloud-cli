@@ -6,7 +6,7 @@ use clap::Args;
 use crate::api::{
     HttpClient, SourceResetIdentityError, SourceResetIdentityOutcome, derive_source_reset_identity,
 };
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
@@ -67,8 +67,12 @@ impl Command {
                 writeln!(stdout).context("write source-reset identity evidence")?;
                 Ok(ExitCode::Success)
             }
-            SourceResetIdentityOutcome::Unauthenticated => Ok(ExitCode::AuthenticationRequired),
-            SourceResetIdentityOutcome::Unavailable(_) => Ok(ExitCode::Unavailable),
+            SourceResetIdentityOutcome::Unauthenticated => {
+                Ok(OutcomeClass::Unauthenticated.exit_code())
+            }
+            SourceResetIdentityOutcome::Unavailable(category) => {
+                Ok(super::super::unreachable_outcome_class(category).exit_code())
+            }
         }
     }
 }

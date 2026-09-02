@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Args;
 
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::runner::control_client::RequestFailure;
 use crate::runner::control_protocol::{AssignmentCounts, Operation, Response, StatusSnapshot};
 
 pub(super) const ABOUT: &str = "Show live Runner Serve status";
@@ -28,15 +29,16 @@ impl Command {
             })?;
         let response = crate::runner::control_client::request(&socket_path, Operation::Status)
             .map_err(|error| {
-                super::super::CommandFailure::with_exit_code(
-                    anyhow::Error::new(error),
-                    ExitCode::Unavailable,
-                )
+                let outcome = match error {
+                    RequestFailure::NotReachable => OutcomeClass::Unreachable,
+                    RequestFailure::Protocol(_) => OutcomeClass::Protocol,
+                };
+                super::super::CommandFailure::for_outcome(anyhow::Error::new(error), outcome)
             })?;
         let Response::Status(status) = response else {
-            return Err(super::super::CommandFailure::with_exit_code(
-                anyhow::anyhow!("Runner Serve is not reachable"),
-                ExitCode::Unavailable,
+            return Err(super::super::CommandFailure::for_outcome(
+                anyhow::anyhow!("Runner Serve control protocol is invalid"),
+                OutcomeClass::Protocol,
             ));
         };
         write_status(&mut io::stdout().lock(), &status).map_err(anyhow::Error::new)?;

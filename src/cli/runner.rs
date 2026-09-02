@@ -236,6 +236,15 @@ enum CreateOutcome {
     },
 }
 
+impl CreateOutcome {
+    fn credential_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::ActivationFailed { failure, .. } if failure.credential_rejected()
+        )
+    }
+}
+
 impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         validate_activation_destination(&self.activation_file, self.options.json)?;
@@ -243,27 +252,45 @@ impl CreateCommand {
             generate_idempotency_key().context("generate runner registration request identity")?;
         let activation_key =
             generate_idempotency_key().context("generate activation request identity")?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let pool = api.get_pool(&self.organization, &self.pool)?;
-            let registration = api.create_registration(
-                &self.organization,
-                &registration_key,
-                &pool.id,
-                self.name.as_deref(),
-            )?;
-            Ok(
-                match api.create_activation(&self.organization, &registration.id, &activation_key) {
-                    Ok(issuance) => CreateOutcome::Complete {
-                        registration,
-                        issuance,
+        let mut committed_registration = None;
+        let result = cloud::with_api_retrying_rejected_result(
+            deployment,
+            self.options.http.transport_policy(),
+            |api| {
+                let pool = api.get_pool(&self.organization, &self.pool)?;
+                let registration = api.create_registration(
+                    &self.organization,
+                    &registration_key,
+                    &pool.id,
+                    self.name.as_deref(),
+                )?;
+                committed_registration = Some(registration.clone());
+                Ok(
+                    match api.create_activation(
+                        &self.organization,
+                        &registration.id,
+                        &activation_key,
+                    ) {
+                        Ok(issuance) => CreateOutcome::Complete {
+                            registration,
+                            issuance,
+                        },
+                        Err(failure) => CreateOutcome::ActivationFailed {
+                            registration,
+                            failure,
+                        },
                     },
-                    Err(failure) => CreateOutcome::ActivationFailed {
-                        registration,
-                        failure,
-                    },
-                },
-            )
-        })?;
+                )
+            },
+            CreateOutcome::credential_rejected,
+        )?;
+        let result = match (result, committed_registration) {
+            (Err(failure), Some(registration)) => Ok(CreateOutcome::ActivationFailed {
+                registration,
+                failure,
+            }),
+            (result, _) => result,
+        };
         let outcome = match completed_cloud_result(deployment, result, self.options.json)? {
             Ok(outcome) => outcome,
             Err(exit_code) => return Ok(exit_code),
@@ -277,15 +304,13 @@ impl CreateCommand {
                 registration,
                 failure,
             } => {
-                writeln!(
-                    io::stderr().lock(),
-                    "error: runner {} was created but activation issuance did not complete\n\nIssue an activation without creating another runner:\n  scherzo-cloud runner activation create {} {} --activation-file <PATH>",
-                    registration.id,
-                    self.organization,
-                    registration.id
-                )?;
-                let _ = failure;
-                return Ok(ExitCode::GeneralFailure);
+                return cloud::write_activation_failure(
+                    deployment.fingerprint().api_url(),
+                    &failure,
+                    &self.organization,
+                    &registration.id,
+                    self.options.json,
+                );
             }
         };
         write_activation_issuance(&self.activation_file, &issuance)?;

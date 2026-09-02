@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::api::{HttpClient, UnreachableCategory};
-use crate::exit_code::ExitCode;
+use crate::exit_code::OutcomeClass;
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
@@ -39,17 +39,11 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
-        self.run(deployment)
-            .map(|completion| match completion {
-                Completion::Success => ExitCode::Success,
-                Completion::Failure => ExitCode::GeneralFailure,
-                Completion::Cancelled => ExitCode::Interrupted,
-            })
-            .map_err(Into::into)
+        self.run(deployment).map(OutcomeClass::exit_code)
     }
     // jscpd:ignore-end
 
-    fn run(self, deployment: &Deployment) -> anyhow::Result<Completion> {
+    fn run(self, deployment: &Deployment) -> LoginResult<OutcomeClass> {
         let cancellation = Cancellation::install()
             .map_err(|error| anyhow!(error))
             .context("prepare sign-in cancellation")?;
@@ -72,14 +66,14 @@ impl Command {
             let existing_status = status::check(&client, deployment);
             if cancellation.is_cancelled() {
                 output.cancelled(deployment)?;
-                return Ok(Completion::Cancelled);
+                return Ok(OutcomeClass::Interrupted);
             }
             match existing_status {
                 Ok(existing) => match existing.state() {
                     AuthenticationState::Authenticated(_)
                     | AuthenticationState::SignupRequired { .. } => {
                         output.status(&existing)?;
-                        return Ok(Completion::Success);
+                        return Ok(OutcomeClass::Success);
                     }
                     AuthenticationState::Unauthenticated => {}
                     AuthenticationState::Unreachable(category) => {
@@ -104,7 +98,7 @@ impl Command {
 
         if cancellation.is_cancelled() {
             output.cancelled(deployment)?;
-            return Ok(Completion::Cancelled);
+            return Ok(OutcomeClass::Interrupted);
         }
 
         let authorization = match device_authorization::authorize(&client, deployment) {
@@ -112,7 +106,7 @@ impl Command {
             Err(error) => {
                 if cancellation.is_cancelled() {
                     output.cancelled(deployment)?;
-                    return Ok(Completion::Cancelled);
+                    return Ok(OutcomeClass::Interrupted);
                 }
                 return handle_authorization_error(
                     &mut output,
@@ -124,7 +118,7 @@ impl Command {
         };
         if cancellation.is_cancelled() {
             output.cancelled(deployment)?;
-            return Ok(Completion::Cancelled);
+            return Ok(OutcomeClass::Interrupted);
         }
         let Some(mut schedule) = PollSchedule::new(
             crate::timing::monotonic_now(),
@@ -151,7 +145,7 @@ impl Command {
         loop {
             if cancellation.is_cancelled() {
                 output.cancelled(deployment)?;
-                return Ok(Completion::Cancelled);
+                return Ok(OutcomeClass::Interrupted);
             }
             let Some(wait) = schedule.next_wait(crate::timing::monotonic_now()) else {
                 output.failed(
@@ -160,11 +154,11 @@ impl Command {
                     Phase::TokenPolling,
                     None,
                 )?;
-                return Ok(Completion::Failure);
+                return Ok(OutcomeClass::GeneralFailure);
             };
             if cancellation.wait(wait) {
                 output.cancelled(deployment)?;
-                return Ok(Completion::Cancelled);
+                return Ok(OutcomeClass::Interrupted);
             }
             if let Some(completion) =
                 polling_interruption(&mut output, deployment, &cancellation, &schedule)?
@@ -181,7 +175,7 @@ impl Command {
                 Err(error) => {
                     if cancellation.is_cancelled() {
                         output.cancelled(deployment)?;
-                        return Ok(Completion::Cancelled);
+                        return Ok(OutcomeClass::Interrupted);
                     }
                     return handle_authorization_error(
                         &mut output,
@@ -206,7 +200,7 @@ impl Command {
                         Phase::TokenPolling,
                         None,
                     )?;
-                    return Ok(Completion::Failure);
+                    return Ok(OutcomeClass::GeneralFailure);
                 }
                 TokenPoll::Expired => {
                     output.failed(
@@ -215,7 +209,7 @@ impl Command {
                         Phase::TokenPolling,
                         None,
                     )?;
-                    return Ok(Completion::Failure);
+                    return Ok(OutcomeClass::GeneralFailure);
                 }
                 TokenPoll::Issued(token) => {
                     return finish_login(
@@ -237,10 +231,10 @@ fn polling_interruption(
     deployment: &Deployment,
     cancellation: &Cancellation,
     schedule: &PollSchedule,
-) -> anyhow::Result<Option<Completion>> {
+) -> LoginResult<Option<OutcomeClass>> {
     if cancellation.is_cancelled() {
         output.cancelled(deployment)?;
-        return Ok(Some(Completion::Cancelled));
+        return Ok(Some(OutcomeClass::Interrupted));
     }
     if schedule.expired(crate::timing::monotonic_now()) {
         output.failed(
@@ -249,7 +243,7 @@ fn polling_interruption(
             Phase::TokenPolling,
             None,
         )?;
-        return Ok(Some(Completion::Failure));
+        return Ok(Some(OutcomeClass::GeneralFailure));
     }
     Ok(None)
 }
@@ -261,7 +255,7 @@ fn finish_login(
     store: &CredentialStore,
     cancellation: &Cancellation,
     token: IssuedToken,
-) -> anyhow::Result<Completion> {
+) -> LoginResult<OutcomeClass> {
     let Some(expires_at) = expiration_after(token.expires_in()) else {
         return handle_protocol_error(
             output,
@@ -272,7 +266,7 @@ fn finish_login(
     };
     if cancellation.is_cancelled() {
         output.cancelled(deployment)?;
-        return Ok(Completion::Cancelled);
+        return Ok(OutcomeClass::Interrupted);
     }
 
     // Credential persistence commits the login. Ignore later interrupts so a
@@ -292,11 +286,11 @@ fn finish_login(
         Ok(status) => match status.state() {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
                 output.status(&status)?;
-                Ok(Completion::Success)
+                Ok(OutcomeClass::Success)
             }
             AuthenticationState::Unauthenticated => {
                 output.status(&status)?;
-                Ok(Completion::Failure)
+                Ok(OutcomeClass::Unauthenticated)
             }
             AuthenticationState::Unreachable(category) => {
                 handle_unreachable(output, deployment, Phase::PrincipalConfirmation, *category)
@@ -311,12 +305,12 @@ fn handle_status_error(
     deployment: &Deployment,
     phase: Phase,
     error: StatusError,
-) -> anyhow::Result<Completion> {
+) -> LoginResult<OutcomeClass> {
     match error {
-        StatusError::Session(error) => Err(anyhow!(error).context("acquire human session")),
-        StatusError::PublicApi(error) if error.is_local() => {
-            Err(anyhow!(error).context(phase.operation_context(deployment)))
-        }
+        StatusError::Session(error) => Err(anyhow!(error).context("acquire human session").into()),
+        StatusError::PublicApi(error) if error.is_local() => Err(anyhow!(error)
+            .context(phase.operation_context(deployment))
+            .into()),
         StatusError::PublicApi(error) => {
             handle_protocol_error(output, deployment, phase, anyhow!(error))
         }
@@ -328,7 +322,8 @@ fn handle_unreachable(
     deployment: &Deployment,
     phase: Phase,
     category: UnreachableCategory,
-) -> anyhow::Result<Completion> {
+) -> LoginResult<OutcomeClass> {
+    let outcome = super::super::unreachable_outcome_class(category);
     if output.json {
         output.failed(
             deployment,
@@ -336,7 +331,7 @@ fn handle_unreachable(
             phase,
             Some(category),
         )?;
-        Ok(Completion::Failure)
+        Ok(outcome)
     } else {
         let error = match phase {
             Phase::ExistingCredentialCheck | Phase::PrincipalConfirmation => {
@@ -347,7 +342,10 @@ fn handle_unreachable(
                 category.as_str()
             ),
         };
-        Err(error.context(phase.operation_context(deployment)))
+        Err(super::super::CommandFailure::for_outcome(
+            error.context(phase.operation_context(deployment)),
+            outcome,
+        ))
     }
 }
 
@@ -356,12 +354,15 @@ fn handle_protocol_error(
     deployment: &Deployment,
     phase: Phase,
     error: anyhow::Error,
-) -> anyhow::Result<Completion> {
+) -> LoginResult<OutcomeClass> {
     if output.json {
         output.failed(deployment, FailureOutcome::ProtocolError, phase, None)?;
-        Ok(Completion::Failure)
+        Ok(OutcomeClass::Protocol)
     } else {
-        Err(error.context(phase.operation_context(deployment)))
+        Err(super::super::CommandFailure::for_outcome(
+            error.context(phase.operation_context(deployment)),
+            OutcomeClass::Protocol,
+        ))
     }
 }
 
@@ -370,11 +371,11 @@ fn handle_authorization_error(
     deployment: &Deployment,
     phase: Phase,
     error: AuthorizationError,
-) -> anyhow::Result<Completion> {
+) -> LoginResult<OutcomeClass> {
     match error {
-        AuthorizationError::Local(error) => {
-            Err(anyhow!(error).context(phase.operation_context(deployment)))
-        }
+        AuthorizationError::Local(error) => Err(anyhow!(error)
+            .context(phase.operation_context(deployment))
+            .into()),
         AuthorizationError::Unreachable(category) => {
             handle_unreachable(output, deployment, phase, category)
         }
@@ -384,12 +385,7 @@ fn handle_authorization_error(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Completion {
-    Success,
-    Failure,
-    Cancelled,
-}
+type LoginResult<T> = Result<T, super::super::CommandFailure>;
 
 struct PollSchedule {
     interval: Duration,

@@ -15,7 +15,7 @@ use crate::execution::workflow::portable_artifact::{
     PortableArtifactValidationFailure, validate_portable_artifact_set,
 };
 use crate::execution::workflow::presentation::visible_text;
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Validate a portable workflow artifact directory";
 const COMMAND: &str = "scherzo-cloud artifact validate";
@@ -51,7 +51,7 @@ impl Command {
         let validation = match validate_portable_artifact_set(&self.artifact_directory, cancelled) {
             Ok(validation) => validation,
             Err(PortableArtifactValidationFailure::Interrupted) => {
-                return Ok(ExitCode::GeneralFailure);
+                return Ok(OutcomeClass::Interrupted.exit_code());
             }
             Err(PortableArtifactValidationFailure::CurrentDirectoryUnavailable) => {
                 return Err(anyhow!("the current directory is unavailable")
@@ -65,7 +65,7 @@ impl Command {
             }
         };
         if cancelled.load(Ordering::Acquire) {
-            return Ok(ExitCode::GeneralFailure);
+            return Ok(OutcomeClass::Interrupted.exit_code());
         }
         if !self.json
             && validation

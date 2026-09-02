@@ -19,7 +19,7 @@ use crate::execution::workflow::presentation::{
     styled_terminal_text as styled,
 };
 use crate::execution::workflow::publication::WorkflowResultV1;
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 
@@ -58,7 +58,7 @@ impl Command {
         reconcile_current_result_publication(&self.run.run_dir);
         let snapshot = read_local_run_status(&self.run.run_dir);
         if cancelled.load(Ordering::Acquire) {
-            return Ok(ExitCode::GeneralFailure);
+            return Ok(OutcomeClass::Interrupted.exit_code());
         }
         let exit = if self.presentation.json {
             render_json(snapshot).context("write workflow status output")?

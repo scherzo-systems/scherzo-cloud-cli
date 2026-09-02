@@ -13,6 +13,34 @@ pub(crate) enum ExitCode {
     Terminated = 143,
 }
 
+/// Command-independent classes of CLI outcomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutcomeClass {
+    Success,
+    GeneralFailure,
+    Unauthenticated,
+    Forbidden,
+    Unreachable,
+    RateLimited,
+    Protocol,
+    Interrupted,
+    Terminated,
+}
+
+impl OutcomeClass {
+    /// The single outcome-class to process-exit-code table.
+    pub(crate) const fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Success => ExitCode::Success,
+            Self::GeneralFailure | Self::Forbidden | Self::Protocol => ExitCode::GeneralFailure,
+            Self::Unauthenticated => ExitCode::AuthenticationRequired,
+            Self::Unreachable | Self::RateLimited => ExitCode::Unavailable,
+            Self::Interrupted => ExitCode::Interrupted,
+            Self::Terminated => ExitCode::Terminated,
+        }
+    }
+}
+
 impl ExitCode {
     pub(crate) const fn as_u8(self) -> u8 {
         self as u8
@@ -45,5 +73,32 @@ impl From<ExitCode> for ProcessExitCode {
 impl Termination for ExitCode {
     fn report(self) -> ProcessExitCode {
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExitCode, OutcomeClass};
+
+    #[test]
+    fn outcome_classes_map_to_registered_exit_codes() {
+        let cases = [
+            (OutcomeClass::Success, ExitCode::Success),
+            (OutcomeClass::GeneralFailure, ExitCode::GeneralFailure),
+            (
+                OutcomeClass::Unauthenticated,
+                ExitCode::AuthenticationRequired,
+            ),
+            (OutcomeClass::Forbidden, ExitCode::GeneralFailure),
+            (OutcomeClass::Unreachable, ExitCode::Unavailable),
+            (OutcomeClass::RateLimited, ExitCode::Unavailable),
+            (OutcomeClass::Protocol, ExitCode::GeneralFailure),
+            (OutcomeClass::Interrupted, ExitCode::Interrupted),
+            (OutcomeClass::Terminated, ExitCode::Terminated),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.exit_code(), expected);
+        }
     }
 }

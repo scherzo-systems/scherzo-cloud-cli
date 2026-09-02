@@ -3565,6 +3565,63 @@ exports:
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_stdin_maps_signals_through_the_shared_interruption_outcomes() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+
+    for (name, signal, expected_status) in [
+        ("prompt-stdin-interrupt", Signal::INT, 130),
+        ("prompt-stdin-terminate", Signal::TERM, 143),
+    ] {
+        let destination = bundle.result(name);
+        let mut args = bundle.args(&destination);
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            ["--prompt-file".to_owned(), "-".to_owned()],
+        );
+        let mut child = isolated_command(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+
+        // Import acquisition has no application-level readiness output. The
+        // nonblocking stdin flag is the closest observable operating-system
+        // boundary proving that the signal observer is installed and the
+        // child is waiting in read_stdin_bounded.
+        poll_until(
+            "workflow prompt stdin import readiness",
+            || {
+                fs::read_to_string(format!("/proc/{}/fdinfo/0", child.id()))
+                    .ok()
+                    .and_then(|information| {
+                        information
+                            .lines()
+                            .find_map(|line| line.strip_prefix("flags:").map(str::trim))
+                            .and_then(|flags| u32::from_str_radix(flags, 8).ok())
+                    })
+            },
+            |flags| {
+                flags.is_some_and(|flags| flags & u32::try_from(libc::O_NONBLOCK).unwrap() != 0)
+            },
+        );
+        let _stdin = child.stdin.take().unwrap();
+
+        kill_process(process, signal).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(!destination.exists());
+    }
+}
+
 // Darwin filesystems reject non-UTF-8 names before the CLI can inspect them.
 #[cfg(not(target_os = "macos"))]
 #[test]
