@@ -908,11 +908,7 @@ fn enrollment_gone_reports_that_the_commit_did_not_complete() {
 #[cfg(target_os = "linux")]
 #[test]
 fn enrollment_rejects_terminal_stdin_before_reading_configuration() {
-    let pty = nix::pty::openpty(
-        None::<&nix::pty::Winsize>,
-        None::<&nix::sys::termios::Termios>,
-    )
-    .unwrap();
+    let pty = super::open_test_pty(None).unwrap();
     let child_input = rustix::io::dup(&pty.slave).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let missing_config = directory.path().join("missing-runner-config.json");

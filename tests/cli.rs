@@ -10,6 +10,8 @@
 )]
 
 use std::fs::{self, OpenOptions, Permissions};
+#[cfg(target_os = "linux")]
+use std::io;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -72,6 +74,45 @@ const BUILD_IDENTITY: &str = match option_env!("SCHERZO_CLOUD_BUILD_IDENTITY") {
     Some(identity) => identity,
     None => "unknown",
 };
+
+#[cfg(target_os = "linux")]
+struct TestPty {
+    master: std::os::fd::OwnedFd,
+    slave: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+fn open_test_pty(size: Option<&rustix::termios::Winsize>) -> io::Result<TestPty> {
+    use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
+
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let master = openpt(flags)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let slave = ioctl_tiocgptpeer(&master, flags)?;
+    if let Some(size) = size {
+        rustix::termios::tcsetwinsize(&slave, *size)?;
+    }
+    Ok(TestPty { master, slave })
+}
+
+fn install_interrupt_handler(handler: impl FnOnce() + Send + 'static) {
+    let (ready, registered) = mpsc::sync_channel(0);
+    let _ = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+            ready.send(()).unwrap();
+            let _ = interrupt.recv().await;
+            handler();
+        });
+    });
+    registered.recv().unwrap();
+}
 
 /// Polls an external boundary that has no explicit readiness signal.
 ///

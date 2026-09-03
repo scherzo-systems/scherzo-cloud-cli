@@ -9,7 +9,16 @@ mod organizations;
 mod problem;
 mod runners;
 mod signup;
-mod source_reset_identity;
+
+use reqwest::header::{HeaderValue, InvalidHeaderValue};
+use zeroize::Zeroizing;
+
+fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeaderValue> {
+    let mut value = Zeroizing::new(String::with_capacity("Bearer ".len() + access_token.len()));
+    value.push_str("Bearer ");
+    value.push_str(access_token);
+    HeaderValue::from_str(&value)
+}
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -39,9 +48,6 @@ pub(crate) use runners::{
     RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
-pub(crate) use source_reset_identity::{
-    SourceResetIdentityError, SourceResetIdentityOutcome, derive_source_reset_identity,
-};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
 // intact and contain the binary crate's visibility exception to this generated tree.

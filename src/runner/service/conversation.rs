@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::Sleeper;
-use super::assignment::AssignmentManager;
+use super::assignment::test_support::manager_with_dependencies;
 use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError, FrameSource,
     OpeningHello, opening_hello, run_established,
@@ -19,11 +19,10 @@ use super::source::{
     CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
 };
 use super::test_support::{
-    DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
+    ConfigFixture, DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::test_credential;
-use crate::runner::service::Config;
 use crate::runner::telemetry::test_recorder;
 
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
@@ -252,6 +251,20 @@ impl Sleeper for LogicalSleeper {
         self.origin + elapsed
     }
 
+    fn utc_now(&self) -> time::OffsetDateTime {
+        let elapsed = self
+            .state
+            .lock()
+            .expect("conversation logical sleeper mutex poisoned")
+            .now;
+        let origin = time::OffsetDateTime::parse(
+            "2026-07-23T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("conversation UTC origin should parse");
+        origin + time::Duration::try_from(elapsed).expect("logical elapsed time should fit")
+    }
+
     fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
         let notification = Arc::new(Notify::new());
         let mut state = self
@@ -439,7 +452,7 @@ fn validate_entries(conversation: &Conversation) {
 async fn replay_conversation(conversation: Conversation) -> Result<(), ConnectionError> {
     let opening = opening_metadata(&conversation);
     let frame_source = ReplayFrameSource::new(&conversation);
-    let config = Config::fixture(
+    let config = ConfigFixture::new(
         "ws://127.0.0.1:1/v1/runner/connect",
         test_credential(),
         true,
@@ -460,9 +473,15 @@ async fn replay_conversation(conversation: Conversation) -> Result<(), Connectio
     let (recorder, _capture) = test_recorder(REPLAY_BOOT_ID);
     let connection_event = recorder.start("runner.conversation_replay", []);
     let active_effect_event = ActiveEffectEvent::new();
-    let mut assignment_manager =
-        AssignmentManager::new(&config, REPLAY_BOOT_ID.to_owned(), fixture_lease_clock());
-    assignment_manager.use_source_broker_fixture(Arc::new(UnavailableSourceBroker));
+    let assignment_manager = manager_with_dependencies(
+        &config,
+        REPLAY_BOOT_ID.to_owned(),
+        fixture_lease_clock(),
+        Arc::new(super::TokioSleeper),
+        None,
+        Some(Arc::new(UnavailableSourceBroker)),
+        false,
+    );
     let assignment_manager = Mutex::new(assignment_manager);
     let transcript = DeterminismTranscript::default();
     let (inbound, reader, writer, mut outbound) = scripted_duplex(transcript);

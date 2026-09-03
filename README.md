@@ -684,7 +684,7 @@ input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
 observed version, supported range, exact repository qualification version, closed
-capabilities, and the selected absolute path. Qualification remains pinned to `2.1.241`
+capabilities, and the selected absolute path. Qualification remains pinned to `2.1.259`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.

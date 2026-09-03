@@ -101,6 +101,7 @@ mod tests {
     use super::*;
     use crate::execution::claude_code::ClaudeCodeIncompatibility;
     use crate::runner::credential::test_credential;
+    use crate::runner::service::ConfigFixture;
 
     #[test]
     fn startup_retains_each_available_harness_snapshot_independently() {
@@ -121,12 +122,13 @@ mod tests {
             let claude_code =
                 ValidatedClaudeCodeInstallation::fixture(PathBuf::from("/validated/claude"));
             let codex = ValidatedCodexInstallation::fixture(PathBuf::from("/validated/codex"));
-            let config = Config::fixture(
+            let fixture = ConfigFixture::new(
                 "ws://127.0.0.1:8081/v1/runner/connect",
                 test_credential(),
                 true,
             )
             .unwrap();
+            let config = fixture.cloned_config();
 
             let (pi_installation, claude_code_installation, codex_installation) =
                 discover_harness_installations_with(
@@ -174,12 +176,13 @@ mod tests {
     #[test]
     fn incompatible_claude_code_and_missing_codex_do_not_remove_compatible_pi() {
         let pi = ValidatedPiInstallation::fixture(PathBuf::from("/validated/pi"));
-        let config = Config::fixture(
+        let fixture = ConfigFixture::new(
             "ws://127.0.0.1:8081/v1/runner/connect",
             test_credential(),
             true,
         )
         .unwrap();
+        let config = fixture.cloned_config();
 
         let (pi_installation, claude_code_installation, codex_installation) =
             discover_harness_installations_with(

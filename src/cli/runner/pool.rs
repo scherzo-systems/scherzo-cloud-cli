@@ -1,11 +1,7 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
-use crate::idempotency::generate_idempotency_key;
-
-use super::{CloudOptions, cloud};
+use super::{CloudOptions, Deployment, ExitCode, PaginationArgs, cloud, generate_idempotency_key};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud runner pools";
 const COMMAND_PATH: &[&str] = &["runner", "pool"];
@@ -48,19 +44,8 @@ struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
     organization: String,
 
-    #[arg(
-        long,
-        value_name = "LIMIT",
-        help = "Limit the number of pools returned"
-    )]
-    limit: Option<u16>,
-
-    #[arg(
-        long,
-        value_name = "CURSOR",
-        help = "Continue from an opaque page cursor"
-    )]
-    cursor: Option<String>,
+    #[command(flatten)]
+    pagination: PaginationArgs,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -132,7 +117,11 @@ impl CreateCommand {
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_pools(&self.organization, self.limit, self.cursor.as_deref())
+            api.list_pools(
+                &self.organization,
+                self.pagination.limit,
+                self.pagination.cursor.as_deref(),
+            )
         })?;
         cloud::write_pool_list(
             deployment.fingerprint().api_url(),

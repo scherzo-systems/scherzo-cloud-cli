@@ -26,18 +26,20 @@ use opentelemetry::KeyValue;
 #[cfg(test)]
 pub(crate) use config::AssignmentConfig;
 pub(crate) use config::Config;
+#[cfg(test)]
+pub(crate) use test_support::ConfigFixture;
 
 use crate::execution::workflow::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use crate::runner::control_protocol::{ConnectionFailure, ControlError};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
-use assignment::AssignmentManager;
+use assignment::{AssignmentDependencies, AssignmentManager};
 use backoff::Backoff;
 use connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
     ConnectionProgress, FailureKind, FrameSource, OpeningHello, SystemFrameSource, opening_hello,
     record_progress,
 };
-use control::{ControlServer, ControlServerError, LiveStatus, ReloadRequest};
+use control::{ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest};
 use lease_clock::{LeaseClock, LeaseClockError};
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -95,6 +97,7 @@ pub(crate) trait Sleeper: Send + Sync {
         reason = "deterministic transport tests inspect their logical sleep clock"
     )]
     fn now(&self) -> std::time::Instant;
+    fn utc_now(&self) -> time::OffsetDateTime;
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_>;
 }
 
@@ -140,6 +143,10 @@ impl Sleeper for TokioSleeper {
     )]
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
+    }
+
+    fn utc_now(&self) -> time::OffsetDateTime {
+        crate::timing::utc_now()
     }
 
     #[expect(
@@ -227,6 +234,7 @@ struct ConnectionLoopDependencies {
     recorder: Arc<Recorder>,
     lease_clock: LeaseClock,
     boot_id: String,
+    source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
 }
 
 impl ConnectionLoopDependencies {
@@ -237,6 +245,7 @@ impl ConnectionLoopDependencies {
         recorder: Arc<Recorder>,
         lease_clock: LeaseClock,
         boot_id: String,
+        source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
     ) -> Self {
         Self {
             config,
@@ -245,6 +254,7 @@ impl ConnectionLoopDependencies {
             recorder,
             lease_clock,
             boot_id,
+            source_broker,
         }
     }
 }
@@ -320,13 +330,18 @@ async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
     let recorder = Recorder::stderr(&boot_id);
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
-    run_service_loop(
-        config,
-        frame_source,
-        sleeper,
-        recorder,
-        lease_clock,
-        boot_id,
+    run_connection_loop(
+        ConnectionLoopDependencies::new(
+            config,
+            frame_source,
+            sleeper,
+            recorder,
+            lease_clock,
+            boot_id,
+            None,
+        ),
+        &WebSocketConnector,
+        Backoff::new(),
         &mut shutdown,
     )
     .await
@@ -338,31 +353,11 @@ async fn run_until_cancelled_with_dependencies(
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     recorder: Arc<Recorder>,
+    source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
     mut shutdown: Box<dyn Shutdown>,
 ) -> Result<(), ServiceError> {
     let boot_id = frame_source.public_id("rbt_");
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
-    run_service_loop(
-        config,
-        frame_source,
-        sleeper,
-        recorder,
-        lease_clock,
-        boot_id,
-        shutdown.as_mut(),
-    )
-    .await
-}
-
-async fn run_service_loop(
-    config: Config,
-    frame_source: Arc<dyn FrameSource>,
-    sleeper: Arc<dyn Sleeper>,
-    recorder: Arc<Recorder>,
-    lease_clock: LeaseClock,
-    boot_id: String,
-    shutdown: &mut dyn Shutdown,
-) -> Result<(), ServiceError> {
     run_connection_loop(
         ConnectionLoopDependencies::new(
             config,
@@ -371,10 +366,11 @@ async fn run_service_loop(
             recorder,
             lease_clock,
             boot_id,
+            source_broker,
         ),
         &WebSocketConnector,
         Backoff::new(),
-        shutdown,
+        shutdown.as_mut(),
     )
     .await
 }
@@ -419,17 +415,24 @@ async fn run_connection_loop_with_work_root(
         recorder,
         lease_clock,
         boot_id,
+        source_broker,
     } = dependencies;
-    let assignment_manager = Arc::new(Mutex::new(
-        AssignmentManager::new_with_sleeper_and_work_root(
-            &config,
-            boot_id.clone(),
-            lease_clock,
-            Arc::clone(&sleeper),
-            Arc::clone(&work_root),
-            Arc::clone(&recorder),
-        ),
-    ));
+    let assignment_dependencies = AssignmentDependencies::production(
+        &config,
+        &boot_id,
+        Arc::clone(&sleeper),
+        Arc::clone(&work_root),
+        Arc::clone(&recorder),
+    );
+    let assignment_dependencies = match source_broker {
+        Some(source_broker) => assignment_dependencies.with_source_broker(source_broker),
+        None => assignment_dependencies,
+    };
+    let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new(
+        &config,
+        lease_clock,
+        assignment_dependencies,
+    )));
     let live_status = Arc::new(LiveStatus::new(
         boot_id.clone(),
         config.credential().credential_id().to_owned(),
@@ -454,6 +457,7 @@ async fn run_connection_loop_with_work_root(
                 Arc::clone(&live_status),
                 Arc::clone(&assignment_manager),
                 reload_sender,
+                ControlTimeouts::production(),
             )
         })
         .transpose()
@@ -1368,14 +1372,19 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     use super::sequence_overflow;
+    use super::source::{
+        SourceCredentialBroker,
+        test_support::{fixture_source_broker, unavailable_source_broker},
+    };
     use super::test_support::{
-        ControlledShutdownTrigger, FixtureSocket, SleepRelease, accept_fixture_socket,
-        accept_fixture_socket_with_headers, accept_opened_fixture_socket, assignment_offer,
-        begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
+        ConfigFixture, ControlledShutdownTrigger, FixtureSocket, SleepRelease,
+        accept_fixture_socket, accept_fixture_socket_with_headers, accept_opened_fixture_socket,
+        assignment_offer, begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
         expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
-        observation_acknowledgement, offer_assignment_after_handshake, scripted_connector,
-        sleep_request, terminal_observation_acknowledgement, welcome, with_watchdog,
+        fixture_sleeper, observation_acknowledgement, offer_assignment_after_handshake,
+        scripted_connector, sleep_request, terminal_observation_acknowledgement, welcome,
+        with_watchdog,
     };
     use super::workspace::{
         CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
@@ -1387,9 +1396,11 @@ mod tests {
         Sleeper, TokioSleeper, run_connection_loop_with_work_root,
         run_until_cancelled_with_dependencies,
     };
+    use crate::execution::workflow::resolution;
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
-    use crate::runner::service::assignment::AssignmentManager;
+    use crate::runner::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
+    use crate::runner::service::config::RepositoryUrlPolicy;
     use crate::runner::telemetry::{TestCapture, test_recorder};
 
     #[test]
@@ -1433,7 +1444,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_signal_preempts_final_boot_root_retry() {
-        let config = Config::fixture(
+        let config = ConfigFixture::new(
             "ws://127.0.0.1:1/v1/runner/connect",
             test_credential(),
             true,
@@ -1444,12 +1455,13 @@ mod tests {
         let (recorder, _capture) = test_recorder(&boot_id);
         let (sleeper, _sleep_requests) = controlled_sleeper();
         let dependencies = ConnectionLoopDependencies::new(
-            config.clone(),
+            config.cloned_config(),
             frame_source,
             sleeper,
             recorder,
             fixture_lease_clock(),
             boot_id.clone(),
+            None,
         );
         let remover = Arc::new(FailingBootRemover {
             calls: AtomicUsize::new(0),
@@ -1602,9 +1614,7 @@ mod tests {
             )
             .unwrap();
             crate::runner::enrollment::load_runner_service_configuration(&config_path).unwrap();
-            let config = Config::load(&config_path)
-                .unwrap()
-                .with_materialized_source_fixture(source, PathBuf::from("workflow.yaml"));
+            let config = Config::load(&config_path).unwrap();
             Self {
                 _root: root,
                 _runtime: runtime,
@@ -1624,13 +1634,17 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&fixture.state_path, fs::Permissions::from_mode(0o600)).unwrap();
-            fixture.config = Config::load(&fixture.config_path)
-                .unwrap()
-                .with_materialized_source_fixture(
-                    fixture._root.path().join("source"),
-                    PathBuf::from("workflow.yaml"),
-                );
+            fixture.config = Config::load(&fixture.config_path).unwrap();
             fixture
+        }
+
+        fn accepted_source(&self) -> (Arc<dyn SourceCredentialBroker>, Message) {
+            let source = self._root.path().join("source");
+            initialize_accepted_repository(&source);
+            (
+                fixture_source_broker(&source),
+                accepted_assignment_offer(&source),
+            )
         }
 
         fn stage_pending(&self) {
@@ -1656,12 +1670,14 @@ mod tests {
     ) {
         let frame_source = deterministic_frame_source();
         let (recorder, capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
-        let assignments = Arc::new(std::sync::Mutex::new(AssignmentManager::new_with_sleeper(
+        let assignments = Arc::new(std::sync::Mutex::new(assignment_manager_with_dependencies(
             config,
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
             fixture_lease_clock(),
-            Arc::new(TokioSleeper),
-            Arc::clone(&recorder),
+            fixture_sleeper(),
+            Some(Arc::clone(&recorder)),
+            None,
+            true,
         )));
         let status = Arc::new(LiveStatus::new(
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
@@ -1673,7 +1689,7 @@ mod tests {
         let reload = ReloadDependencies {
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
             frame_source,
-            sleeper: Arc::new(TokioSleeper),
+            sleeper: fixture_sleeper(),
             recorder,
             assignment_manager: assignments,
             live_status: status,
@@ -1813,7 +1829,7 @@ mod tests {
             drop(current);
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
         with_watchdog(current_received).await.unwrap().unwrap();
         assert_eq!(
             request_staged_reload(&fixture, socket_path).await,
@@ -1833,6 +1849,7 @@ mod tests {
     async fn live_reload_retains_the_boot_and_accepted_assignment_manager() {
         let (listener, endpoint) = fixture_listener().await;
         let fixture = RotationFixture::without_pending(&endpoint);
+        let (source_broker, offer) = fixture.accepted_source();
         let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
         let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -1849,7 +1866,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            current.send(assignment_offer()).await.unwrap();
+            current.send(offer).await.unwrap();
             let offer_acknowledgement = effect_acknowledgement(&mut current).await;
             acknowledge_runner_frame(
                 &mut current,
@@ -1918,8 +1935,12 @@ mod tests {
             }
             drop(current);
         });
-        let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+        let (service, _capture, shutdown_trigger) = spawn_configured_service_with_source(
+            fixture.config.clone(),
+            fixture_sleeper(),
+            Some(source_broker),
+            None,
+        );
         with_watchdog(accepted_received).await.unwrap().unwrap();
         let Response::Status(before) =
             request_control(socket_path.clone(), Operation::Status).await
@@ -1986,7 +2007,7 @@ mod tests {
             while pending.next().await.is_some() {}
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
         with_watchdog(rejected_received).await.unwrap().unwrap();
 
         with_watchdog(async {
@@ -2021,11 +2042,7 @@ mod tests {
     #[tokio::test]
     async fn pending_handshake_preserves_contiguous_current_boot_sequences() {
         let (listener, endpoint) = fixture_listener().await;
-        let mut fixture = RotationFixture::without_pending(&endpoint);
-        fixture.config = fixture.config.clone().with_materialized_source_fixture(
-            fixture._root.path().join("source"),
-            PathBuf::from("missing-workflow-fixture.yaml"),
-        );
+        let fixture = RotationFixture::without_pending(&endpoint);
         let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
         let (current_sent, current_received) = tokio::sync::oneshot::channel();
         let (sequences_sent, sequences_received) = tokio::sync::oneshot::channel();
@@ -2085,7 +2102,7 @@ mod tests {
             while current.next().await.is_some() {}
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
         with_watchdog(current_received).await.unwrap().unwrap();
         assert_eq!(
             request_staged_reload(&fixture, socket_path).await,
@@ -2149,7 +2166,7 @@ mod tests {
             while current.next().await.is_some() {}
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
         with_watchdog(current_received).await.unwrap().unwrap();
         assert_eq!(
             request_staged_reload(&fixture, socket_path).await,
@@ -2173,7 +2190,7 @@ mod tests {
             drop(current);
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config, Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config, fixture_sleeper());
         with_watchdog(promoted_received).await.unwrap().unwrap();
         loop {
             let state: serde_json::Value =
@@ -2296,7 +2313,7 @@ mod tests {
             hard_link
         });
         let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), Arc::new(TokioSleeper));
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
         with_watchdog(current_received).await.unwrap().unwrap();
         assert_eq!(
             request_control(socket_path, Operation::ReloadCredential).await,
@@ -2376,7 +2393,79 @@ mod tests {
         server.await.unwrap();
     }
 
-    fn accepted_assignment_config(endpoint: &str) -> (tempfile::TempDir, Config) {
+    struct AcceptedAssignmentFixture {
+        temporary: tempfile::TempDir,
+        config: Config,
+        source_broker: Arc<dyn SourceCredentialBroker>,
+        offer: Message,
+    }
+
+    fn fixture_git(repository: &Path, arguments: &[&str]) -> String {
+        let output = crate::test_support::fixture_git_command("git")
+            .current_dir(repository)
+            .args(arguments)
+            .output()
+            .expect("run fixture git command");
+        assert!(
+            output.status.success(),
+            "fixture git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("fixture git output should be UTF-8")
+            .trim()
+            .to_owned()
+    }
+
+    fn initialize_accepted_repository(source: &Path) {
+        fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
+        fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
+        fixture_git(source, &["config", "user.email", "fixture@scherzo.invalid"]);
+        fixture_git(source, &["add", "."]);
+        fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
+    }
+
+    fn accepted_assignment_offer(source: &Path) -> Message {
+        let commit_oid = fixture_git(source, &["rev-parse", "HEAD"]);
+        let workflow = resolution::resolve(source, Path::new("workflow.yaml"))
+            .expect("resolve accepted assignment workflow");
+        let requirements = workflow.capacity.requirements;
+        let digest = &workflow.capacity.source_closure_digest;
+        let Message::Text(encoded) = assignment_offer() else {
+            panic!("assignment offer fixture should be text");
+        };
+        let mut offer: serde_json::Value =
+            serde_json::from_str(&encoded).expect("decode assignment offer fixture");
+        let execution = &mut offer["payload"]["executionSpec"];
+        execution["workflowDefinitionSource"]["commitOid"] = commit_oid.clone().into();
+        execution["primaryWorkspaceSource"]["commitOid"] = commit_oid.into();
+        execution["workflowDefinitionSource"]["workflowSourceClosureDigest"] = serde_json::json!({
+            "algorithm": digest.algorithm.as_str(),
+            "value": digest.value,
+        });
+        execution["capacity"] = serde_json::json!({
+            "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
+            "sourceClosureDigest": {
+                "algorithm": digest.algorithm.as_str(),
+                "value": digest.value,
+            },
+            "generalMaximumTransitions": requirements.general_maximum_transitions,
+            "selectedMaximumTransitions": requirements.cloud_maximum_transitions,
+            "maximumInvocations": requirements.maximum_invocations,
+            "maximumRetainedBytesPerInvocation": requirements.maximum_retained_bytes_per_invocation,
+            "diagnosticRetentionBytes": requirements.diagnostic_retention_bytes,
+            "nativeSessionRetentionBytes": requirements.native_session_retention_bytes,
+            "aggregateRetentionBytes": requirements.aggregate_retention_bytes,
+            "conditionTransitionCount": requirements.condition_transition_count,
+            "aggregateConditionTransitionBytes": requirements.aggregate_condition_transition_bytes,
+            "terminalResultStructureBytes": requirements.terminal_result_structure_bytes,
+            "portableResultBytes": requirements.portable_result_bytes,
+            "encodedOutboxBytes": requirements.encoded_outbox_bytes,
+        });
+        Message::Text(offer.to_string().into())
+    }
+
+    fn accepted_assignment_config(endpoint: &str) -> AcceptedAssignmentFixture {
         let temporary = tempfile::tempdir().expect("create service fixture root");
         let source = temporary.path().join("source");
         let work = temporary.path().join("work");
@@ -2389,11 +2478,24 @@ mod tests {
             "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
         )
         .expect("write materialized workflow fixture");
+        initialize_accepted_repository(&source);
+        let offer = accepted_assignment_offer(&source);
+        let source_broker = fixture_source_broker(&source);
         let assignment = AssignmentConfig::new(&work).expect("configure assignment");
-        let config = Config::new(endpoint, test_credential(), true, assignment)
-            .expect("configure gateway")
-            .with_materialized_source_fixture(source, PathBuf::from("workflow.yaml"));
-        (temporary, config)
+        let config = Config::new(
+            endpoint,
+            test_credential(),
+            true,
+            assignment,
+            RepositoryUrlPolicy::with_file_repositories(true),
+        )
+        .expect("configure gateway");
+        AcceptedAssignmentFixture {
+            temporary,
+            config,
+            source_broker,
+            offer,
+        }
     }
 
     async fn acknowledge_runner_frame(
@@ -2436,11 +2538,19 @@ mod tests {
     async fn accept_assignment_interruption(
         listener: &tokio::net::TcpListener,
         accepted_sent: tokio::sync::oneshot::Sender<()>,
+        offer: Message,
     ) -> (FixtureSocket, serde_json::Value, serde_json::Value) {
         let mut socket = accept_opened_fixture_socket(listener).await;
-        let effect =
-            offer_assignment_after_handshake(&mut socket, "rmsg_00000000000000000000000002", 1)
-                .await;
+        socket.send(welcome()).await.expect("send welcome");
+        socket
+            .send(observation_acknowledgement(
+                "rmsg_00000000000000000000000002",
+                1,
+            ))
+            .await
+            .expect("acknowledge opening hello");
+        socket.send(offer).await.expect("send assignment offer");
+        let effect = effect_acknowledgement(&mut socket).await;
         acknowledge_runner_frame(&mut socket, &effect, "acknowledge offer receipt").await;
         let prepare_acknowledgement = begin_assignment_preparation(&mut socket).await;
         acknowledge_runner_frame(
@@ -2473,8 +2583,14 @@ mod tests {
         TestCapture,
         ControlledShutdownTrigger,
     ) {
-        let config = Config::fixture(endpoint, test_credential(), true).expect("configure gateway");
-        spawn_configured_service(config, sleeper)
+        let fixture =
+            ConfigFixture::new(endpoint, test_credential(), true).expect("configure gateway");
+        spawn_configured_service_with_source(
+            fixture.cloned_config(),
+            sleeper,
+            Some(unavailable_source_broker()),
+            Some(fixture),
+        )
     }
 
     fn spawn_configured_service(
@@ -2485,15 +2601,38 @@ mod tests {
         TestCapture,
         ControlledShutdownTrigger,
     ) {
+        spawn_configured_service_with_source(
+            config,
+            sleeper,
+            Some(unavailable_source_broker()),
+            None,
+        )
+    }
+
+    fn spawn_configured_service_with_source(
+        config: Config,
+        sleeper: Arc<dyn Sleeper>,
+        source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+        config_fixture: Option<ConfigFixture>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        TestCapture,
+        ControlledShutdownTrigger,
+    ) {
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, shutdown_trigger) = controlled_shutdown();
-        let service = tokio::spawn(run_until_cancelled_with_dependencies(
-            config,
-            deterministic_frame_source(),
-            sleeper,
-            recorder,
-            shutdown,
-        ));
+        let service = tokio::spawn(async move {
+            let _config_fixture = config_fixture;
+            run_until_cancelled_with_dependencies(
+                config,
+                deterministic_frame_source(),
+                sleeper,
+                recorder,
+                source_broker,
+                shutdown,
+            )
+            .await
+        });
         (service, capture, shutdown_trigger)
     }
 
@@ -2504,10 +2643,18 @@ mod tests {
         _sleep_requests: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
     }
 
-    fn spawn_accepted_assignment_service(endpoint: &str) -> AcceptedAssignmentService {
+    fn spawn_accepted_assignment_service(
+        fixture: AcceptedAssignmentFixture,
+    ) -> AcceptedAssignmentService {
         let (sleeper, sleep_requests) = controlled_sleeper();
-        let (temporary, config) = accepted_assignment_config(endpoint);
-        let (task, _capture, shutdown_trigger) = spawn_configured_service(config, sleeper);
+        let AcceptedAssignmentFixture {
+            temporary,
+            config,
+            source_broker,
+            offer: _,
+        } = fixture;
+        let (task, _capture, shutdown_trigger) =
+            spawn_configured_service_with_source(config, sleeper, Some(source_broker), None);
         AcceptedAssignmentService {
             _temporary: temporary,
             task,
@@ -2517,10 +2664,10 @@ mod tests {
     }
 
     async fn begin_accepted_assignment_shutdown(
-        endpoint: &str,
+        fixture: AcceptedAssignmentFixture,
         accepted_received: tokio::sync::oneshot::Receiver<()>,
     ) -> AcceptedAssignmentService {
-        let service = spawn_accepted_assignment_service(endpoint);
+        let service = spawn_accepted_assignment_service(fixture);
         with_watchdog(accepted_received)
             .await
             .expect("runner did not accept assignment")
@@ -2607,15 +2754,16 @@ mod tests {
 
         let endpoint = format!("{endpoint}?secret=URL-QUERY-MUST-NOT-LEAK");
         let config =
-            Config::fixture(&endpoint, test_credential(), true).expect("configure gateway");
+            ConfigFixture::new(&endpoint, test_credential(), true).expect("configure gateway");
         let (sleeper, _sleep_requests) = controlled_sleeper();
         let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
         let (shutdown, _shutdown_trigger) = controlled_shutdown();
         let error = with_watchdog(run_until_cancelled_with_dependencies(
-            config,
+            config.cloned_config(),
             deterministic_frame_source(),
             sleeper,
             recorder,
+            None,
             shutdown,
         ))
         .await
@@ -2913,10 +3061,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_reports_and_waits_for_an_accepted_assignment_interruption() {
         let (listener, endpoint) = fixture_listener().await;
+        let fixture = accepted_assignment_config(&endpoint);
+        let offer = fixture.offer.clone();
         let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, accepted, interrupted) =
-                accept_assignment_interruption(&listener, accepted_sent).await;
+                accept_assignment_interruption(&listener, accepted_sent, offer).await;
             socket
                 .send(observation_acknowledgement(
                     accepted["messageId"].as_str().unwrap(),
@@ -2934,7 +3084,7 @@ mod tests {
             while let Some(Ok(_)) = socket.next().await {}
         });
 
-        let service = begin_accepted_assignment_shutdown(&endpoint, accepted_received).await;
+        let service = begin_accepted_assignment_shutdown(fixture, accepted_received).await;
 
         with_watchdog(service.task)
             .await
@@ -2950,11 +3100,13 @@ mod tests {
     #[tokio::test]
     async fn second_shutdown_signal_forces_exit_without_another_observation() {
         let (listener, endpoint) = fixture_listener().await;
+        let fixture = accepted_assignment_config(&endpoint);
+        let offer = fixture.offer.clone();
         let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
         let (interrupted_sent, interrupted_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _accepted, _interrupted) =
-                accept_assignment_interruption(&listener, accepted_sent).await;
+                accept_assignment_interruption(&listener, accepted_sent, offer).await;
             interrupted_sent
                 .send(())
                 .expect("report shutdown interruption");
@@ -2970,7 +3122,7 @@ mod tests {
             }
         });
 
-        let service = begin_accepted_assignment_shutdown(&endpoint, accepted_received).await;
+        let service = begin_accepted_assignment_shutdown(fixture, accepted_received).await;
         with_watchdog(interrupted_received)
             .await
             .expect("runner did not begin graceful shutdown")

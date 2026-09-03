@@ -8,7 +8,8 @@ use reqwest::{Method, StatusCode, Url};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 
-use super::http_client::{HttpEndpointError, HttpTransportPolicy};
+use super::bearer_authorization;
+use super::http_client::{HttpEndpointError, HttpTransportPolicy, categorized_dns_resolver};
 use super::{UnreachableCategory, classify_reqwest_error, http_util};
 
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -112,7 +113,7 @@ impl ArtifactApi {
         if !transport_policy.permits(&base) {
             return Err(ArtifactApiError::Endpoint(HttpEndpointError::InsecureHttp));
         }
-        let authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
+        let authorization = bearer_authorization(access_token)
             .map_err(|_| ArtifactApiError::InvalidAuthorizationHeader)?;
         let api_client = build_http_client(
             transport_policy,
@@ -161,6 +162,7 @@ fn build_http_client(
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        .dns_resolver(categorized_dns_resolver())
         .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
         .build()
         .map_err(|_| ArtifactApiError::Protocol {

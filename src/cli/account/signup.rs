@@ -49,7 +49,7 @@ impl Command {
                 signup_human(
                     &client,
                     deployment.fingerprint().api_url(),
-                    access_token,
+                    access_token.expose(),
                     &idempotency_key,
                 )
             },

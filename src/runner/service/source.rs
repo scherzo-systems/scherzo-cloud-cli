@@ -24,6 +24,7 @@ use crate::execution::workflow::git_capture::CloudGitCaptureProjection;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
+use crate::runner::service::config::RepositoryUrlPolicy;
 use crate::runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
@@ -91,6 +92,7 @@ pub(super) struct HttpSourceCredentialBroker {
     availability_endpoint: Url,
     runner_credential: Credential,
     boot_id: Arc<str>,
+    repository_url_policy: RepositoryUrlPolicy,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
 }
 
@@ -112,6 +114,7 @@ impl HttpSourceCredentialBroker {
         endpoint: &Url,
         runner_credential: &Credential,
         boot_id: &str,
+        repository_url_policy: RepositoryUrlPolicy,
     ) -> Result<Self, ()> {
         let credential_endpoint =
             private_runner_http_endpoint(endpoint, "/v1/runner/source-credentials")?;
@@ -122,6 +125,7 @@ impl HttpSourceCredentialBroker {
             availability_endpoint,
             runner_credential: runner_credential.clone(),
             boot_id: Arc::from(boot_id),
+            repository_url_policy,
             recorder: None,
         })
     }
@@ -307,7 +311,7 @@ impl HttpSourceCredentialBroker {
                     && *value > crate::timing::utc_now()
             })
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
-        let repository_url = validate_repository_url(&repository_url)?;
+        let repository_url = validate_repository_url(&repository_url, self.repository_url_policy)?;
         Ok(ProviderCredential {
             repository_url: Arc::from(repository_url),
             token,
@@ -418,21 +422,21 @@ pub(super) async fn wait_for_cancellation(cancellation: &CaptureCancellation) {
     }
 }
 
-fn validate_repository_url(raw: &str) -> Result<String, CredentialBrokerFailure> {
+fn validate_repository_url(
+    raw: &str,
+    policy: RepositoryUrlPolicy,
+) -> Result<String, CredentialBrokerFailure> {
     let mut parsed = Url::parse(raw).map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
     let loopback_http = parsed.scheme() == "http"
         && parsed
             .host_str()
             .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
-    #[cfg(test)]
-    let fixture_file = parsed.scheme() == "file";
-    #[cfg(not(test))]
-    let fixture_file = false;
+    let allowed_file = policy.allows_file_repositories() && parsed.scheme() == "file";
     if parsed.username() != ""
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
-        || !(parsed.scheme() == "https" || loopback_http || fixture_file)
+        || !(parsed.scheme() == "https" || loopback_http || allowed_file)
         || parsed.path().is_empty()
     {
         return Err(CredentialBrokerFailure::InvalidResponse);
@@ -630,37 +634,6 @@ pub(super) fn resolve_checkout(
         })
     }
 }
-
-// The test-only composed seam intentionally repeats checkout's explicit confinement inputs.
-// jscpd:ignore-start
-#[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the source unit seam composes checkout and workflow resolution"
-)]
-pub(super) fn materialize(
-    broker: Arc<dyn SourceCredentialBroker>,
-    environment: &EnvironmentSnapshot,
-    assignment_id: &str,
-    request: &MaterializationRequest,
-    cancellation: &CaptureCancellation,
-    source_root: &Path,
-    ordinary_execution_root: &Path,
-    private_root: &Path,
-) -> Result<MaterializedSource, MaterializationFailure> {
-    let checkout = checkout(
-        broker,
-        environment,
-        assignment_id,
-        request,
-        cancellation,
-        source_root,
-        ordinary_execution_root,
-        private_root,
-    )?;
-    resolve_checkout(checkout, cancellation)
-}
-// jscpd:ignore-end
 
 fn ensure_current(cancellation: &CaptureCancellation) -> Result<(), MaterializationFailure> {
     if cancellation.is_cancelled() {
@@ -1061,7 +1034,6 @@ fn run_managed_git(
     command: &mut Command,
     cancellation: Option<&CaptureCancellation>,
 ) -> Result<ExitStatus, ManagedGitFailure> {
-    command.process_group(0);
     let mut child = ManagedProcessGroup::spawn(command).map_err(|_| ManagedGitFailure::Spawn)?;
     let started = crate::timing::monotonic_now();
     loop {
@@ -1171,12 +1143,96 @@ fn inherit_for_git_child(command: &mut Command, descriptor: libc::c_int) {
 }
 
 #[cfg(test)]
-fn fixture_credential(repository_url: String, token: &str) -> ProviderCredential {
-    ProviderCredential {
-        repository_url: Arc::from(repository_url),
-        token: ProviderSecret(token.as_bytes().to_vec()),
-        expires_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(3600),
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in crate::runner::service) fn fixture_credential(
+        repository_url: String,
+        token: &str,
+    ) -> ProviderCredential {
+        ProviderCredential {
+            repository_url: Arc::from(repository_url),
+            token: ProviderSecret(token.as_bytes().to_vec()),
+            expires_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(3600),
+        }
     }
+
+    struct FixtureSourceBroker {
+        repository_url: Option<String>,
+    }
+
+    impl SourceCredentialBroker for FixtureSourceBroker {
+        fn issue(
+            &self,
+            _assignment_id: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            if cancellation.is_cancelled() {
+                return Err(CredentialBrokerFailure::Fenced);
+            }
+            let repository_url = self
+                .repository_url
+                .clone()
+                .ok_or(CredentialBrokerFailure::Unavailable)?;
+            Ok(fixture_credential(repository_url, "fixture-provider-token"))
+        }
+
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            self.repository_url
+                .as_ref()
+                .map(|_| CommitAvailability::CommitAvailable)
+                .ok_or(CredentialBrokerFailure::Unavailable)
+        }
+    }
+
+    pub(in crate::runner::service) fn fixture_source_broker(
+        repository: &Path,
+    ) -> Arc<dyn SourceCredentialBroker> {
+        Arc::new(FixtureSourceBroker {
+            repository_url: Some(Url::from_file_path(repository).unwrap().to_string()),
+        })
+    }
+
+    pub(in crate::runner::service) fn unavailable_source_broker() -> Arc<dyn SourceCredentialBroker>
+    {
+        Arc::new(FixtureSourceBroker {
+            repository_url: None,
+        })
+    }
+
+    // The test-only composed seam intentionally repeats checkout's explicit confinement inputs.
+    // jscpd:ignore-start
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the source unit seam composes checkout and workflow resolution"
+    )]
+    pub(in crate::runner::service) fn materialize(
+        broker: Arc<dyn SourceCredentialBroker>,
+        environment: &EnvironmentSnapshot,
+        assignment_id: &str,
+        request: &MaterializationRequest,
+        cancellation: &CaptureCancellation,
+        source_root: &Path,
+        ordinary_execution_root: &Path,
+        private_root: &Path,
+    ) -> Result<MaterializedSource, MaterializationFailure> {
+        let checkout = checkout(
+            broker,
+            environment,
+            assignment_id,
+            request,
+            cancellation,
+            source_root,
+            ordinary_execution_root,
+            private_root,
+        )?;
+        resolve_checkout(checkout, cancellation)
+    }
+    // jscpd:ignore-end
 }
 
 #[cfg(test)]
@@ -1210,6 +1266,8 @@ mod tests {
     use crate::execution::workflow::value::CapturedValue;
     use crate::runner::credential::test_credential;
     use crate::runner::telemetry::test_recorder;
+
+    use super::test_support::{fixture_credential, materialize};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FixtureBrokerCall {
@@ -2554,6 +2612,24 @@ mod tests {
     }
 
     #[test]
+    fn repository_url_validation_uses_the_injected_policy() {
+        let repository = tempfile::tempdir().unwrap();
+        let repository_url = Url::from_file_path(repository.path()).unwrap().to_string();
+
+        assert_eq!(
+            validate_repository_url(&repository_url, RepositoryUrlPolicy::production()),
+            Err(CredentialBrokerFailure::InvalidResponse)
+        );
+        assert!(
+            validate_repository_url(
+                &repository_url,
+                RepositoryUrlPolicy::with_file_repositories(true),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn broker_maps_repository_dependency_to_sanitized_retryable_result() {
         let (endpoint, request, server) = source_broker_response_fixture(
             "424 Failed Dependency",
@@ -2564,6 +2640,7 @@ mod tests {
             &endpoint,
             &test_credential(),
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            RepositoryUrlPolicy::production(),
         )
         .unwrap()
         .with_recorder(recorder);
@@ -2606,6 +2683,7 @@ mod tests {
             &endpoint,
             &test_credential(),
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            RepositoryUrlPolicy::production(),
         )
         .unwrap();
 
@@ -2656,6 +2734,7 @@ mod tests {
             &endpoint,
             &test_credential(),
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            RepositoryUrlPolicy::production(),
         )
         .unwrap();
         let cancellation = CaptureCancellation::default();

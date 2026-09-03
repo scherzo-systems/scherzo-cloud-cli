@@ -811,14 +811,14 @@ mod tests {
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-                "2.1.241",
+                "2.1.259",
             )
             .unwrap();
         let second = store
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-                "2.1.241",
+                "2.1.259",
             )
             .unwrap();
         let (second_attempt_path, second_attempt_store) =
@@ -827,7 +827,7 @@ mod tests {
             .allocate(
                 &identity,
                 AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-                "2.1.241",
+                "2.1.259",
             )
             .unwrap();
         assert!(first.pi_native_session_directory().is_none());
@@ -902,7 +902,7 @@ mod tests {
                 "stepId": "agent-step",
                 "invocationId": 0,
                 "profile": "ClaudeCodeStreamJsonV1",
-                "claudeCodeVersion": "2.1.241",
+                "claudeCodeVersion": "2.1.259",
                 "nativeSession": {
                     "relativeDirectory": "session",
                     "formatVersion": 1

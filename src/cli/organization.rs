@@ -162,7 +162,13 @@ where
     match session::execute_required(
         &client,
         deployment,
-        |access_token| operation(&client, deployment.fingerprint().api_url(), access_token),
+        |access_token| {
+            operation(
+                &client,
+                deployment.fingerprint().api_url(),
+                access_token.expose(),
+            )
+        },
         |result| {
             result.as_ref().is_ok_and(O::is_unauthenticated)
                 || result

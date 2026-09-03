@@ -153,7 +153,7 @@ environment, inherited `PATH` only for launcher interpreter resolution, fixed up
 nonessential-traffic disables, and deterministic no-color controls. It requires a
 canonical stable version in `>=2.1.234 <2.2.0` and the closed non-model capabilities used
 by the production adapter. The repository's exact qualification package remains
-`2.1.241`; accepting the range does not claim exact-binary conformance for every release
+`2.1.259`; accepting the range does not claim exact-binary conformance for every release
 or host. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.

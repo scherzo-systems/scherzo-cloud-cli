@@ -14,8 +14,10 @@ use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 use super::deployment::DeploymentFingerprint;
+use super::token::{SecretToken, TokenSource};
 
 const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
 const HOME_VARIABLE: &str = "HOME";
@@ -48,9 +50,9 @@ pub(crate) struct CredentialStore {
 
 #[derive(Clone)]
 pub(crate) struct StoredCredential {
-    access_token: String,
+    access_token: SecretToken,
     expires_at: OffsetDateTime,
-    refresh_token: String,
+    refresh_token: SecretToken,
 }
 
 impl fmt::Debug for StoredCredential {
@@ -68,11 +70,11 @@ impl StoredCredential {
     // Stored and freshly issued credentials deliberately remain separate states;
     // their small secret-borrowing APIs are clearer than a shared token trait.
     // jscpd:ignore-start
-    pub(crate) fn access_token(&self) -> &str {
+    pub(crate) fn access_token(&self) -> &SecretToken {
         &self.access_token
     }
 
-    pub(crate) fn refresh_token(&self) -> &str {
+    pub(crate) fn refresh_token(&self) -> &SecretToken {
         &self.refresh_token
     }
     // jscpd:ignore-end
@@ -113,9 +115,9 @@ impl CredentialStore {
     pub(crate) fn replace(
         &self,
         deployment: &DeploymentFingerprint,
-        access_token: &str,
+        access_token: &(impl TokenSource + ?Sized),
         expires_at: OffsetDateTime,
-        refresh_token: &str,
+        refresh_token: &(impl TokenSource + ?Sized),
     ) -> Result<(), CredentialError> {
         let _authority = self.refresh_authority(deployment)?;
         self.replace_under_authority(deployment, access_token, expires_at, refresh_token)
@@ -124,10 +126,10 @@ impl CredentialStore {
     pub(crate) fn replace_if_refresh_token_matches(
         &self,
         deployment: &DeploymentFingerprint,
-        expected_refresh_token: &str,
-        access_token: &str,
+        expected_refresh_token: &(impl TokenSource + ?Sized),
+        access_token: &(impl TokenSource + ?Sized),
         expires_at: OffsetDateTime,
-        refresh_token: &str,
+        refresh_token: &(impl TokenSource + ?Sized),
     ) -> Result<Option<StoredCredential>, CredentialError> {
         let replacement = credential_entry(deployment, access_token, expires_at, refresh_token)?;
         let _lock = self.acquire_lock()?;
@@ -135,7 +137,7 @@ impl CredentialStore {
         let Some(index) = credential_index(&file, deployment) else {
             return Ok(None);
         };
-        if file.credentials[index].refresh_token == expected_refresh_token {
+        if file.credentials[index].refresh_token.expose() == expected_refresh_token.expose() {
             file.credentials[index] = replacement;
             self.write_file(&file)?;
         }
@@ -154,20 +156,20 @@ impl CredentialStore {
     pub(crate) fn remove_if_access_token_matches_under_authority(
         &self,
         deployment: &DeploymentFingerprint,
-        access_token: &str,
+        access_token: &(impl TokenSource + ?Sized),
     ) -> Result<bool, CredentialError> {
         self.remove_matching(deployment, |credential| {
-            credential.access_token == access_token
+            credential.access_token.expose() == access_token.expose()
         })
     }
 
     pub(crate) fn remove_if_refresh_token_matches_under_authority(
         &self,
         deployment: &DeploymentFingerprint,
-        refresh_token: &str,
+        refresh_token: &(impl TokenSource + ?Sized),
     ) -> Result<bool, CredentialError> {
         self.remove_matching(deployment, |credential| {
-            credential.refresh_token == refresh_token
+            credential.refresh_token.expose() == refresh_token.expose()
         })
     }
 
@@ -198,9 +200,9 @@ impl CredentialStore {
     fn replace_under_authority(
         &self,
         deployment: &DeploymentFingerprint,
-        access_token: &str,
+        access_token: &(impl TokenSource + ?Sized),
         expires_at: OffsetDateTime,
-        refresh_token: &str,
+        refresh_token: &(impl TokenSource + ?Sized),
     ) -> Result<(), CredentialError> {
         let replacement = credential_entry(deployment, access_token, expires_at, refresh_token)?;
         let _lock = self.acquire_lock()?;
@@ -368,7 +370,7 @@ impl CredentialStore {
         validate_private_file(&self.path, &metadata)?;
         let initial_capacity =
             usize::try_from(metadata.len()).map_err(|_| CredentialError::CredentialFileTooLarge)?;
-        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(initial_capacity));
         Read::by_ref(&mut file)
             .take(MAX_CREDENTIAL_FILE_BYTES_U64 + 1)
             .read_to_end(&mut bytes)
@@ -390,7 +392,9 @@ impl CredentialStore {
     fn write_file(&self, file: &CredentialFile) -> Result<(), CredentialError> {
         validate_credential_file(file)?;
         ensure_destination_safe(&self.path)?;
-        let mut bytes = serde_json::to_vec_pretty(file).map_err(CredentialError::SerializeJson)?;
+        let mut bytes = Zeroizing::new(
+            serde_json::to_vec_pretty(file).map_err(CredentialError::SerializeJson)?,
+        );
         bytes.push(b'\n');
         let directory = self.directory()?;
         let temporary_path = temporary_path(&self.path)?;
@@ -538,9 +542,9 @@ impl CredentialFile {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialEntry {
     deployment: DeploymentFingerprint,
-    access_token: String,
+    access_token: SecretToken,
     expires_at: String,
-    refresh_token: String,
+    refresh_token: SecretToken,
 }
 
 struct CredentialLock {
@@ -587,9 +591,9 @@ fn validate_credential_file(file: &CredentialFile) -> Result<(), CredentialError
                 reason: "a deployment fingerprint appears more than once",
             });
         }
-        validate_access_token(&credential.access_token)?;
+        validate_access_token(credential.access_token.expose())?;
         parse_expiration(&credential.expires_at)?;
-        validate_refresh_token(&credential.refresh_token)?;
+        validate_refresh_token(credential.refresh_token.expose())?;
     }
 
     Ok(())
@@ -631,12 +635,12 @@ fn parse_expiration(value: &str) -> Result<OffsetDateTime, CredentialError> {
 
 fn credential_entry(
     deployment: &DeploymentFingerprint,
-    access_token: &str,
+    access_token: &(impl TokenSource + ?Sized),
     expires_at: OffsetDateTime,
-    refresh_token: &str,
+    refresh_token: &(impl TokenSource + ?Sized),
 ) -> Result<CredentialEntry, CredentialError> {
-    validate_access_token(access_token)?;
-    validate_refresh_token(refresh_token)?;
+    validate_access_token(access_token.expose())?;
+    validate_refresh_token(refresh_token.expose())?;
     let expires_at =
         expires_at
             .format(&Rfc3339)
@@ -645,9 +649,9 @@ fn credential_entry(
             })?;
     Ok(CredentialEntry {
         deployment: deployment.clone(),
-        access_token: access_token.to_owned(),
+        access_token: access_token.to_secret(),
         expires_at,
-        refresh_token: refresh_token.to_owned(),
+        refresh_token: refresh_token.to_secret(),
     })
 }
 

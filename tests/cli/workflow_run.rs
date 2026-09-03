@@ -10,11 +10,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use nix::pty::{Winsize, openpty};
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use rustix::termios::Winsize;
 use tempfile::TempDir;
 
 use super::claude_code_installation::{
@@ -546,7 +546,7 @@ set -- "$config"/projects/*
 native_project=$1
 printf '{malformed retained transcript' > "$native_project/$session.jsonl"
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.241"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.259"}\n' "$PWD" "$session" "$model"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-local","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude response"}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -559,7 +559,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
 fn response_claude_code_execution_for_version(version: &str) -> String {
     response_claude_code_execution().replace(
-        "\"claude_code_version\":\"2.1.241\"",
+        "\"claude_code_version\":\"2.1.259\"",
         &format!("\"claude_code_version\":\"{version}\""),
     )
 }
@@ -579,7 +579,7 @@ emit_exchange() {
   value=$2
   call=tool-result-$exchange
   message=msg-result-$exchange
-  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.241"}\n' "$PWD" "$session" "$model"
+  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.259"}\n' "$PWD" "$session" "$model"
   printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$message" "$model" "$session"
   printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}},"session_id":"%s","parent_tool_use_id":null}\n' "$call" "$value" "$session"
   printf '{"type":"assistant","message":{"id":"%s","type":"message","role":"assistant","content":[{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$message" "$call" "$value" "$model" "$session"
@@ -638,7 +638,7 @@ done
 IFS= read -r _
 printf '%s\n' "$$" > "$CLAUDE_FIXTURE_PID"
 trap 'exit 130' INT TERM
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.241"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.259"}\n' "$PWD" "$session" "$model"
 printf '\001' > "$WORKFLOW_READY_FIFO"
 IFS= read -r _ < "$WORKFLOW_RELEASE_FIFO"
 exit 23"#
@@ -1682,7 +1682,7 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
 #[test]
 fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallback() {
     let replacement =
-        ClaudeCodeFixture::new("2.1.241 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
+        ClaudeCodeFixture::new("2.1.259 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
     let mut probe_barrier = AgentBarrierFixture::new();
     let capability_hook = format!(
         "printf '\\001' > {}; IFS= read -r _ < {}",
@@ -1872,7 +1872,7 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
 #[test]
 fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     let pi = PiFixture::new("0.84.2", COMPLETE_HELP, true);
-    let claude = ClaudeCodeFixture::new("2.1.241 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.259 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
     let codex = CodexFixture::with_execution("0.147.0");
 
     let claude_bundle = RunBundle::new(response_claude_code_agent_source());
@@ -2182,7 +2182,7 @@ fn codex_cancellation_quiesces_before_atomic_publication() {
 fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
     let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.241 (Claude Code)",
+        "2.1.259 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
@@ -2248,7 +2248,7 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
 fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_exports() {
     let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.241 (Claude Code)",
+        "2.1.259 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
@@ -2330,7 +2330,7 @@ fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_expor
 #[test]
 fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value() {
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.241 (Claude Code)",
+        "2.1.259 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         corrected_claude_code_result_execution(),
@@ -2380,7 +2380,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
     ] {
         let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
         let claude = ClaudeCodeFixture::with_execution(
-            "2.1.241 (Claude Code)",
+            "2.1.259 (Claude Code)",
             CLAUDE_CODE_COMPLETE_HELP,
             true,
             blocked_claude_code_execution(),
@@ -2883,13 +2883,14 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 "#;
 
 #[test]
+#[ignore = "requires pinned harness"]
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
-    let Some(pinned_pi) = std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+    let pinned_pi = std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.2/bin/pi"))
-    else {
-        return;
-    };
+        .unwrap_or_else(|| {
+            panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.84.2 executable")
+        });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [
         ("none-system.md", "MODE_NONE"),
@@ -3957,7 +3958,7 @@ fn run_real_pty_boundary_smoke() -> Result<(), Box<dyn std::error::Error + Send 
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let pty = openpty(Some(&size), None::<&nix::sys::termios::Termios>)?;
+    let pty = super::open_test_pty(Some(&size))?;
     let original_mode = rustix::termios::tcgetattr(&pty.slave)?;
     let child_input = rustix::io::dup(&pty.slave)?;
     let child_output = rustix::io::dup(&pty.slave)?;
@@ -4044,7 +4045,7 @@ pub(super) fn run_with_unusable_tui(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let pty = openpty(Some(&size), None::<&nix::sys::termios::Termios>).unwrap();
+    let pty = super::open_test_pty(Some(&size)).unwrap();
     let original_mode = rustix::termios::tcgetattr(&pty.slave).unwrap();
     let child_input = rustix::io::dup(&pty.slave).unwrap();
     let child_output = rustix::io::dup(&pty.slave).unwrap();
@@ -5073,13 +5074,12 @@ fn signal_command_fixture() {
     if matches!(mode.as_str(), "signal-emit" | "signal-exit" | "signal-hold") {
         let mut interrupted = control.try_clone().unwrap();
         let exit_on_signal = mode == "signal-exit";
-        ctrlc::set_handler(move || {
+        super::install_interrupt_handler(move || {
             interrupted.write_all(&[2]).unwrap();
             if exit_on_signal {
                 std::process::exit(0);
             }
-        })
-        .unwrap();
+        });
     }
     if mode == "signal-hold" {
         control

@@ -10,16 +10,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use super::assignment::AssignmentManager;
+use super::assignment::test_support::{cleanup_complete, manager as manager_fixture};
 use super::backoff::Backoff;
 use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
     ConnectionProgress, FrameSource, OpeningHello, opening_hello, run_established,
 };
 use super::test_support::{
-    ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection, ScriptedConnector,
-    ScriptedInbound, ScriptedReader, ScriptedWriter, SleepRelease, assignment_offer,
-    assignment_prepare, controlled_shutdown, controlled_sleeper_with_transcript,
+    ConfigFixture, ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection,
+    ScriptedConnector, ScriptedInbound, ScriptedReader, ScriptedWriter, SleepRelease,
+    assignment_offer, assignment_prepare, controlled_shutdown, controlled_sleeper_with_transcript,
     deterministic_frame_source, effect_observation_acknowledgement, fixture_lease_clock,
     observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
     with_watchdog,
@@ -102,6 +102,10 @@ struct TrackingSleeper {
 impl Sleeper for TrackingSleeper {
     fn now(&self) -> std::time::Instant {
         self.inner.now()
+    }
+
+    fn utc_now(&self) -> time::OffsetDateTime {
+        self.inner.utc_now()
     }
 
     fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
@@ -187,6 +191,7 @@ struct CleanupServiceFixture {
     shutdown_trigger: ControlledShutdownTrigger,
     sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
     work_root: Arc<WorkRootLease>,
+    _config: ConfigFixture,
 }
 
 fn cleanup_service_fixture(remover: Arc<dyn TreeRemover>) -> CleanupServiceFixture {
@@ -203,7 +208,8 @@ fn cleanup_service_fixture_with_sleeper(
 ) -> CleanupServiceFixture {
     let (connector, attempts) = scripted_connector(transcript);
     let (shutdown, shutdown_trigger) = controlled_shutdown();
-    let dependencies = deterministic_connection_loop_dependencies(sleeper);
+    let config = deterministic_config();
+    let dependencies = deterministic_connection_loop_dependencies(config.cloned_config(), sleeper);
     let work_root = injected_work_root(&dependencies, remover);
     CleanupServiceFixture {
         dependencies,
@@ -213,6 +219,7 @@ fn cleanup_service_fixture_with_sleeper(
         shutdown_trigger,
         sleep_requests,
         work_root,
+        _config: config,
     }
 }
 
@@ -256,20 +263,10 @@ async fn offer_rejected_assignment(
         decode_text(&prepare_acknowledgement, "prepare effect acknowledgement")["type"],
         "effect_acknowledged"
     );
-    for (preparation_sequence, phase) in [
-        (1, "source_materialization"),
-        (2, "input_download"),
-        (3, "workflow_admission"),
-    ] {
-        let progress = next_outbound(&mut connection.outbound).await;
-        let progress = decode_text(&progress, "assignment preparation progress");
-        assert_eq!(progress["type"], "assignment_preparation_progress");
-        assert_eq!(
-            progress["payload"]["preparationSequence"],
-            preparation_sequence
-        );
-        assert_eq!(progress["payload"]["phase"], phase);
-    }
+    let progress = next_outbound(&mut connection.outbound).await;
+    let progress = decode_text(&progress, "assignment preparation progress");
+    assert_eq!(progress["type"], "assignment_preparation_progress");
+    assert_eq!(progress["payload"]["preparationSequence"], 1);
     let rejection = next_outbound(&mut connection.outbound).await;
     assert_eq!(
         decode_text(&rejection, "assignment rejection")["type"],
@@ -489,39 +486,28 @@ async fn run_assignment_scenario() -> Vec<String> {
             4,
         ));
 
-        let mut progress_silence_timers = Vec::new();
-        for (sequence, preparation_sequence, phase) in [
-            (5, 1, "source_materialization"),
-            (6, 2, "input_download"),
-            (7, 3, "workflow_admission"),
-        ] {
-            let progress = next_outbound(&mut fixture.outbound).await;
-            let progress = decode_text(&progress, "assignment preparation progress");
-            assert_eq!(progress["type"], "assignment_preparation_progress");
-            assert_eq!(progress["sequence"], sequence);
-            assert_eq!(
-                progress["payload"]["preparationSequence"],
-                preparation_sequence
-            );
-            assert_eq!(progress["payload"]["phase"], phase);
-            let progress_silence_timer =
-                sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
-            fixture.inbound.send(effect_observation_acknowledgement(
-                progress["messageId"]
-                    .as_str()
-                    .expect("assignment preparation progress message ID"),
-                sequence,
-            ));
-            progress_silence_timers.push(progress_silence_timer);
-        }
+        let progress = next_outbound(&mut fixture.outbound).await;
+        let progress = decode_text(&progress, "assignment preparation progress");
+        assert_eq!(progress["type"], "assignment_preparation_progress");
+        assert_eq!(progress["sequence"], 5);
+        assert_eq!(progress["payload"]["preparationSequence"], 1);
+        assert_eq!(progress["payload"]["phase"], "source_materialization");
+        let progress_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture.inbound.send(effect_observation_acknowledgement(
+            progress["messageId"]
+                .as_str()
+                .expect("assignment preparation progress message ID"),
+            5,
+        ));
 
         let semantic = next_outbound(&mut fixture.outbound).await;
         let semantic = decode_text(&semantic, "semantic assignment response");
         assert_eq!(semantic["type"], "assignment_rejected");
-        assert_eq!(semantic["sequence"], 8);
+        assert_eq!(semantic["sequence"], 6);
         assert_eq!(
             semantic["payload"]["decline"]["reason"],
-            "workflow_source_invalid"
+            "source_service_unavailable"
         );
         let semantic_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
@@ -529,7 +515,7 @@ async fn run_assignment_scenario() -> Vec<String> {
             semantic["messageId"]
                 .as_str()
                 .expect("semantic assignment response message ID"),
-            8,
+            6,
         ));
         let stress_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
@@ -554,7 +540,7 @@ async fn run_assignment_scenario() -> Vec<String> {
         drop(preparing_silence_timer);
         drop(prepare_effect_silence_timer);
         drop(prepare_acknowledgement_silence_timer);
-        drop(progress_silence_timers);
+        drop(progress_silence_timer);
         drop(semantic_silence_timer);
         drop(final_silence_timer);
     };
@@ -563,7 +549,7 @@ async fn run_assignment_scenario() -> Vec<String> {
     let outcome = outcome.expect("run deterministic established connection");
     assert!(outcome.opening_acknowledged);
     assert!(outcome.handshake_completed);
-    assert_eq!(next_sequence, 9);
+    assert_eq!(next_sequence, 7);
     transcript.record(
         "scenario.outcome:gateway-close:opening_acknowledged=true:handshake_completed=true"
             .to_owned(),
@@ -780,20 +766,11 @@ async fn run_reconnect_scenario() -> Vec<String> {
             decode_text(&prepare_acknowledgement, "prepare effect acknowledgement")["type"],
             "effect_acknowledged"
         );
-        for (preparation_sequence, phase) in [
-            (1, "source_materialization"),
-            (2, "input_download"),
-            (3, "workflow_admission"),
-        ] {
-            let progress = next_outbound(&mut sixth.outbound).await;
-            let progress = decode_text(&progress, "assignment preparation progress");
-            assert_eq!(progress["type"], "assignment_preparation_progress");
-            assert_eq!(
-                progress["payload"]["preparationSequence"],
-                preparation_sequence
-            );
-            assert_eq!(progress["payload"]["phase"], phase);
-        }
+        let progress = next_outbound(&mut sixth.outbound).await;
+        let progress = decode_text(&progress, "assignment preparation progress");
+        assert_eq!(progress["type"], "assignment_preparation_progress");
+        assert_eq!(progress["payload"]["preparationSequence"], 1);
+        assert_eq!(progress["payload"]["phase"], "source_materialization");
         let rejection = next_outbound(&mut sixth.outbound).await;
         assert_eq!(
             decode_text(&rejection, "shutdown preparation rejection")["type"],
@@ -893,7 +870,7 @@ async fn complete_handshake(
 }
 
 struct EstablishedRuntime {
-    config: Config,
+    config: ConfigFixture,
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
     opening: Vec<u8>,
@@ -909,7 +886,7 @@ impl EstablishedRuntime {
         let (recorder, _capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
-        let assignment_manager = Mutex::new(AssignmentManager::new(
+        let assignment_manager = Mutex::new(manager_fixture(
             &self.config,
             BOOT_ID.to_owned(),
             fixture_lease_clock(),
@@ -931,10 +908,21 @@ impl EstablishedRuntime {
             writer,
         )
         .await;
-        assignment_manager
+        let notification = assignment_manager
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .settle_cleanup();
+            .notification();
+        loop {
+            let notified = notification.notified();
+            if cleanup_complete(
+                &mut assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ) {
+                break;
+            }
+            notified.await;
+        }
         result
     }
 }
@@ -977,8 +965,8 @@ fn established_fixture(transcript: &DeterminismTranscript) -> EstablishedFixture
     }
 }
 
-fn deterministic_config() -> Config {
-    Config::fixture(
+fn deterministic_config() -> ConfigFixture {
+    ConfigFixture::new(
         "ws://127.0.0.1:1/v1/runner/connect",
         test_credential(),
         true,
@@ -987,18 +975,20 @@ fn deterministic_config() -> Config {
 }
 
 fn deterministic_connection_loop_dependencies(
+    config: Config,
     sleeper: Arc<dyn Sleeper>,
 ) -> ConnectionLoopDependencies {
     let frame_source = deterministic_frame_source();
     let boot_id = frame_source.public_id("rbt_");
     let (recorder, _capture) = test_recorder(&boot_id);
     ConnectionLoopDependencies::new(
-        deterministic_config(),
+        config,
         frame_source,
         sleeper,
         recorder,
         fixture_lease_clock(),
         boot_id,
+        None,
     )
 }
 
@@ -1007,8 +997,9 @@ async fn run_deterministic_connection_loop(
     connector: &dyn Connector,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
+    let config = deterministic_config();
     run_connection_loop(
-        deterministic_connection_loop_dependencies(sleeper),
+        deterministic_connection_loop_dependencies(config.cloned_config(), sleeper),
         connector,
         Backoff::with_fixed_unit(1.0),
         shutdown,

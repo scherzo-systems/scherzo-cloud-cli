@@ -43,6 +43,7 @@ use crate::execution::workflow::runtime::{
     self, Action, ActiveStepInvocation, ExportValue, Occurrence, RequestedAction, StepState,
     TargetExecutionNumber, TransitionSequence, WorkflowState,
 };
+use crate::execution::workflow::test_support::process_fixture_interrupt_handler;
 use crate::execution::workflow::value::CapturedValue;
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
@@ -113,7 +114,7 @@ fn command_fixture_process() {
         let (commands, command) = std::sync::mpsc::channel();
         let interrupted_command = commands.clone();
         let mut interrupted = control.try_clone().unwrap();
-        ctrlc::set_handler(move || {
+        process_fixture_interrupt_handler(move || {
             interrupted
                 .write_all(b"{\"event\":\"interrupted\"}\n")
                 .unwrap();
@@ -121,19 +122,17 @@ fn command_fixture_process() {
             interrupted_command
                 .send(FixtureCommand::Interrupted)
                 .unwrap();
-        })
-        .unwrap();
+        });
         Some((commands, command))
     } else {
         if mode.as_deref() == Some(FIXTURE_MODE_STUBBORN) {
             let mut interrupted = control.try_clone().unwrap();
-            ctrlc::set_handler(move || {
+            process_fixture_interrupt_handler(move || {
                 interrupted
                     .write_all(b"{\"event\":\"interrupted\"}\n")
                     .unwrap();
                 interrupted.flush().unwrap();
-            })
-            .unwrap();
+            });
         }
         None
     };

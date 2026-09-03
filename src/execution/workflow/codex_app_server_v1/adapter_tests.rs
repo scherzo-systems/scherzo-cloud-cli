@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use rustix::process::Pid;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::adapter::{CodexAppServerV1Adapter, prepare_launch};
+use super::adapter::{CodexAppServerV1Adapter, CodexAppServerV1LaunchPlan, prepare_launch};
 use super::*;
 use crate::execution::codex::CODEX_APP_SERVER_V1_QUALIFICATION_VERSION;
 use crate::execution::workflow::admission::{
@@ -48,6 +48,15 @@ const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
 const TURN_ID: &str = "turn-fixture";
 const CORRECTION_TURN_ID: &str = "turn-correction";
 const PLACEHOLDER_KEY: &str = "scherzo-loopback-placeholder";
+
+fn conformance_executable() -> PathBuf {
+    std::env::var_os("SCHERZO_CODEX_CONFORMANCE_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("SCHERZO_CODEX_CONFORMANCE_EXECUTABLE must name the pinned Codex executable")
+        })
+}
+
 const FAKE_CODEX: &str = r#"#!/bin/sh
 set -eu
 for argument in "$@"; do
@@ -277,21 +286,6 @@ impl ProcessFixture {
             value_mode,
             maximum_response_bytes,
             None,
-            "0.147.0",
-        )
-    }
-
-    fn with_provider(
-        scenario: &str,
-        value_mode: AgentValueMode,
-        maximum_response_bytes: u64,
-        provider_address: Option<std::net::SocketAddr>,
-    ) -> Self {
-        Self::with_version(
-            scenario,
-            value_mode,
-            maximum_response_bytes,
-            provider_address,
             "0.147.0",
         )
     }
@@ -596,9 +590,7 @@ impl ProcessFixture {
             Some(provider_address),
             CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
         );
-        let exact = PathBuf::from(
-            std::env::var_os("SCHERZO_CODEX_APP_SERVER_CONFORMANCE_EXECUTABLE").unwrap(),
-        );
+        let exact = conformance_executable();
         std::fs::remove_file(&fixture.executable).unwrap();
         symlink(exact, &fixture.executable).unwrap();
         let config = format!(
@@ -1108,45 +1100,6 @@ fn send_result_turn(
         }),
     );
 }
-fn provider_response(thread: &Value) -> String {
-    let address = std::env::var("CODEX_FIXTURE_PROVIDER_ADDRESS").unwrap();
-    let instructions = thread["params"]["developerInstructions"].as_str().unwrap();
-    let body = serde_json::to_vec(&json!({
-        "model": MODEL,
-        "instructions": instructions,
-        "input": [
-            {"role": "developer", "content": "root resource marker"},
-            {"role": "developer", "content": "nested resource marker"},
-            {"role": "developer", "content": "skill resource marker"},
-        ],
-        "tools": [{"type": "function", "name": "native_mcp_tool"}],
-        "stream": true,
-    }))
-    .unwrap();
-    let mut stream = std::net::TcpStream::connect(address).unwrap();
-    write!(
-        stream,
-        "POST /responses HTTP/1.1\r\nhost: loopback\r\nauthorization: Bearer {PLACEHOLDER_KEY}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    )
-    .unwrap();
-    stream.write_all(&body).unwrap();
-    stream.flush().unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    let (_, payload) = response.split_once("\r\n\r\n").unwrap();
-    let completed = payload
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|event| event["type"] == "response.output_item.done")
-        .unwrap();
-    completed["item"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_owned()
-}
 
 #[expect(
     clippy::zombie_processes,
@@ -1431,11 +1384,6 @@ fn codex_process_fixture() {
     }
 
     if let Some((method, kind, expected_result)) = match scenario.as_str() {
-        "request-command-approval" => Some((
-            "item/commandExecution/requestApproval",
-            Some("commandExecution"),
-            json!({"decision": "decline"}),
-        )),
         "request-file-approval" => Some((
             "item/fileChange/requestApproval",
             Some("fileChange"),
@@ -1732,58 +1680,7 @@ fn codex_process_fixture() {
         assert!(trailing.is_empty());
         return;
     }
-    let response = if scenario == "normal" {
-        provider_response(&thread)
-    } else {
-        std::env::var("CODEX_FIXTURE_RESPONSE").unwrap()
-    };
-    if scenario == "normal" {
-        write_server_frame(
-            &mut output,
-            json!({"method": "mcpServer/startupStatus/updated", "params": {
-                "threadId": THREAD_ID, "name": "native", "status": "ready"
-            }}),
-        );
-        let hook = json!({"id": "hook-1", "eventName": "userPromptSubmit"});
-        write_server_frame(
-            &mut output,
-            json!({"method": "hook/started", "params": {
-                "threadId": THREAD_ID, "turnId": TURN_ID, "run": hook
-            }}),
-        );
-        write_server_frame(
-            &mut output,
-            json!({"method": "hook/completed", "params": {
-                "threadId": THREAD_ID, "turnId": TURN_ID, "run": hook
-            }}),
-        );
-        send_item_started(
-            &mut output,
-            "reason-1",
-            "reasoning",
-            json!({"summary": [], "content": []}),
-        );
-        write_server_frame(
-            &mut output,
-            json!({"method": "item/reasoning/summaryTextDelta", "params": {
-                "threadId": THREAD_ID, "turnId": TURN_ID, "itemId": "reason-1", "summaryIndex": 0, "delta": "bounded reasoning"
-            }}),
-        );
-        send_item_completed(
-            &mut output,
-            json!({"id": "reason-1", "type": "reasoning", "summary": ["bounded reasoning"], "content": []}),
-        );
-        send_item_started(
-            &mut output,
-            "command-1",
-            "commandExecution",
-            json!({"status": "inProgress"}),
-        );
-        send_item_completed(
-            &mut output,
-            json!({"id": "command-1", "type": "commandExecution", "status": "completed", "aggregatedOutput": "tool output"}),
-        );
-    }
+    let response = std::env::var("CODEX_FIXTURE_RESPONSE").unwrap();
 
     if scenario == "retry-then-success" {
         send_native_error(
@@ -1799,7 +1696,6 @@ fn codex_process_fixture() {
         "failure-after-start-mcp"
             | "failure-after-start-hook"
             | "failure-after-start-model"
-            | "failure-after-start-provider"
             | "failure-after-start-provider-other-prose"
             | "failure-after-start-authentication"
             | "failure-after-start-stubborn"
@@ -1856,9 +1752,6 @@ fn codex_process_fixture() {
         }
         let (message, info) = match scenario.as_str() {
             "failure-after-start-model" => ("model diagnostic", json!("badRequest")),
-            "failure-after-start-provider" => {
-                ("provider diagnostic one", json!("internalServerError"))
-            }
             "failure-after-start-provider-other-prose" => {
                 ("unrelated provider prose", json!("internalServerError"))
             }
@@ -1983,16 +1876,6 @@ fn codex_process_fixture() {
         _ => {}
     }
 
-    if scenario == "normal" {
-        write_server_frame(
-            &mut output,
-            json!({"method": "thread/tokenUsage/updated", "params": {
-                "threadId": THREAD_ID,
-                "turnId": TURN_ID,
-                "tokenUsage": {"total": {"inputTokens": 3, "outputTokens": 2}}
-            }}),
-        );
-    }
     let status = match scenario.as_str() {
         "failure-after-output" => "failed",
         "interruption-after-output" => "interrupted",
@@ -2028,8 +1911,13 @@ struct ProviderRequest {
     body: Value,
 }
 
+enum LoopbackProviderTurn {
+    Completed(String),
+    ShellCommand { call_id: String, command: String },
+}
+
 enum LoopbackProviderResponse {
-    Completed(VecDeque<String>),
+    Turns(VecDeque<LoopbackProviderTurn>),
     ServerError,
 }
 
@@ -2043,7 +1931,9 @@ struct LoopbackResponsesProvider {
 impl LoopbackResponsesProvider {
     async fn start(response: &str) -> Self {
         Self::start_with_response_release(
-            LoopbackProviderResponse::Completed(VecDeque::from([response.to_owned()])),
+            LoopbackProviderResponse::Turns(VecDeque::from([LoopbackProviderTurn::Completed(
+                response.to_owned(),
+            )])),
             None,
         )
         .await
@@ -2052,12 +1942,26 @@ impl LoopbackResponsesProvider {
     async fn start_sequence(responses: &[&str]) -> Self {
         assert!(!responses.is_empty());
         Self::start_with_response_release(
-            LoopbackProviderResponse::Completed(
+            LoopbackProviderResponse::Turns(
                 responses
                     .iter()
-                    .map(|response| (*response).to_owned())
+                    .map(|response| LoopbackProviderTurn::Completed((*response).to_owned()))
                     .collect(),
             ),
+            None,
+        )
+        .await
+    }
+
+    async fn start_shell_command_then_response(command: &str, response: &str) -> Self {
+        Self::start_with_response_release(
+            LoopbackProviderResponse::Turns(VecDeque::from([
+                LoopbackProviderTurn::ShellCommand {
+                    call_id: "approval-call".to_owned(),
+                    command: command.to_owned(),
+                },
+                LoopbackProviderTurn::Completed(response.to_owned()),
+            ])),
             None,
         )
         .await
@@ -2079,7 +1983,9 @@ impl LoopbackResponsesProvider {
         let (release, released) = oneshot::channel();
         (
             Self::start_with_response_release(
-                LoopbackProviderResponse::Completed(VecDeque::from([response.to_owned()])),
+                LoopbackProviderResponse::Turns(VecDeque::from([LoopbackProviderTurn::Completed(
+                    response.to_owned(),
+                )])),
                 Some(released),
             )
             .await,
@@ -2190,8 +2096,27 @@ async fn serve_provider_request(
         response_release.await.unwrap();
     }
     let (status, content_type, payload) = match response {
-        LoopbackProviderResponse::Completed(responses) => {
-            let response = responses.pop_front().expect("one loopback response");
+        LoopbackProviderResponse::Turns(turns) => {
+            let turn = turns.pop_front().expect("one loopback response");
+            let output = match turn {
+                LoopbackProviderTurn::Completed(response) => json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "message-loopback",
+                    "content": [{"type": "output_text", "text": response}]
+                }),
+                LoopbackProviderTurn::ShellCommand { call_id, command } => json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "exec_command",
+                    "arguments": serde_json::to_string(&json!({
+                        "cmd": command,
+                        "sandbox_permissions": "require_escalated",
+                        "justification": "Confirm that Scherzo declines unattended approval.",
+                    }))
+                    .unwrap(),
+                }),
+            };
             let events = [
                 json!({
                     "type": "response.created",
@@ -2199,12 +2124,7 @@ async fn serve_provider_request(
                 }),
                 json!({
                     "type": "response.output_item.done",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "id": "message-loopback",
-                        "content": [{"type": "output_text", "text": response}]
-                    }
+                    "item": output,
                 }),
                 json!({
                     "type": "response.completed",
@@ -2269,7 +2189,7 @@ async fn serve_provider_request(
         Err(error) => panic!("loopback provider shutdown failed: {error:?}"),
     }
     match response {
-        LoopbackProviderResponse::Completed(responses) => responses.is_empty(),
+        LoopbackProviderResponse::Turns(turns) => turns.is_empty(),
         LoopbackProviderResponse::ServerError => true,
     }
 }
@@ -2464,137 +2384,6 @@ pub(super) mod normal {
     }
 
     #[tokio::test]
-    async fn ordinary_response_turn_uses_loopback_and_settles_after_quiescence() {
-        with_watchdog(async {
-            let mut provider = LoopbackResponsesProvider::start(RESPONSE).await;
-            let fixture = ProcessFixture::with_provider(
-                "normal",
-                response_mode(),
-                1024,
-                Some(provider.address),
-            );
-            let observations = fixture.observations.clone();
-            let arguments = fixture.arguments.clone();
-            let requests = fixture.requests.clone();
-            let run = tokio::spawn(run_fixture(fixture));
-            let request = provider.next_request().await;
-            assert_eq!(request.path, "/responses");
-            assert_eq!(request.authorization, format!("Bearer {PLACEHOLDER_KEY}"));
-            assert_eq!(request.body["model"], MODEL);
-            let instructions = request.body["instructions"].as_str().unwrap();
-            assert_eq!(
-                instructions,
-                "native developer instructions\n\nscherzo system instructions"
-            );
-            let serialized = serde_json::to_string(&request.body).unwrap();
-            for marker in [
-                "root resource marker",
-                "nested resource marker",
-                "skill resource marker",
-                "native_mcp_tool",
-            ] {
-                assert!(serialized.contains(marker));
-            }
-            let (fixture, outcome, started) = run.await.unwrap();
-            assert!(started);
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("bounded normal response must complete");
-            };
-            assert_eq!(response.as_str(), RESPONSE);
-            assert_no_native_rollout(&fixture);
-
-            let captured = captured_requests(&requests);
-            assert_eq!(captured.len(), 5);
-            assert_eq!(captured[0]["method"], "initialize");
-            assert_eq!(captured[1]["method"], "initialized");
-            assert_eq!(captured[2]["method"], "config/read");
-            assert_eq!(captured[3]["method"], "thread/start");
-            assert_eq!(captured[4]["method"], "turn/start");
-            assert!(captured.iter().all(|request| {
-                !matches!(
-                    request["method"].as_str(),
-                    Some("thread/resume" | "thread/fork" | "thread/read")
-                )
-            }));
-            let thread = &captured[3]["params"];
-            assert_eq!(thread["approvalPolicy"], "never");
-            assert_eq!(thread["ephemeral"], true);
-            assert_eq!(thread["sandbox"], "danger-full-access");
-            assert_eq!(thread["modelProvider"], PROVIDER);
-            assert_eq!(thread["config"], json!({"bypass_hook_trust": true}));
-            assert!(thread.get("baseInstructions").is_none());
-            assert_eq!(
-                thread["developerInstructions"],
-                "native developer instructions\n\nscherzo system instructions"
-            );
-            let turn = &captured[4]["params"];
-            assert_eq!(turn["model"], MODEL);
-            assert_eq!(turn["effort"], "high");
-            assert_eq!(turn["approvalPolicy"], "never");
-            assert_eq!(
-                turn["sandboxPolicy"],
-                json!({"type": "externalSandbox", "networkAccess": "enabled"})
-            );
-
-            let observations = observations.snapshot();
-            assert!(observations.windows(2).all(|pair| {
-                pair[0].sequence().get().checked_add(1) == Some(pair[1].sequence().get())
-            }));
-            assert!(observations.iter().any(|observation| matches!(
-                observation.observation(),
-                AgentObservation::AssistantText { text } if text.as_ref() == RESPONSE
-            )));
-            assert!(observations.iter().any(|observation| matches!(
-                observation.observation(),
-                AgentObservation::Reasoning { text } if text.as_ref() == "bounded reasoning"
-            )));
-            assert!(observations.iter().any(|observation| matches!(
-                observation.observation(),
-                AgentObservation::Usage {
-                    input_tokens: 3,
-                    output_tokens: 2
-                }
-            )));
-            assert!(observations.iter().any(|observation| matches!(
-                observation.observation(),
-                AgentObservation::ToolCall { name, phase: AgentToolCallPhase::Completed, .. }
-                    if name.as_ref() == "commandExecution"
-            )));
-            assert_last_observation_is_quiescent(&observations);
-            let started_index = observations
-                .iter()
-                .position(|observation| {
-                    matches!(
-                        observation.observation(),
-                        AgentObservation::Lifecycle {
-                            milestone: AgentLifecycleMilestone::HarnessStarted,
-                        }
-                    )
-                })
-                .unwrap();
-            let completed_index = observations
-                .iter()
-                .position(|observation| {
-                    matches!(
-                        observation.observation(),
-                        AgentObservation::Lifecycle {
-                            milestone: AgentLifecycleMilestone::HarnessCompleted,
-                        }
-                    )
-                })
-                .unwrap();
-            assert!(started_index < completed_index);
-
-            let captured_arguments = std::fs::read(arguments).unwrap();
-            assert!(captured_arguments.ends_with(b"stdio://\0"));
-            provider.shutdown().await;
-            drop(fixture);
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn startup_notifications_may_precede_their_responses() {
         with_watchdog(async {
             for scenario in [
@@ -2680,6 +2469,203 @@ pub(super) mod normal {
 pub(super) mod exact_binary {
     use super::*;
 
+    struct DirectCodex {
+        _fixture: ProcessFixture,
+        _plan: CodexAppServerV1LaunchPlan,
+        child: tokio::process::Child,
+        input: tokio::process::ChildStdin,
+        output: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        stderr: tokio::task::JoinHandle<Vec<u8>>,
+        transcript: Vec<Value>,
+    }
+
+    impl DirectCodex {
+        fn start(provider_address: std::net::SocketAddr) -> Self {
+            let fixture = ProcessFixture::with_exact_binary(provider_address, AgentValueMode::None);
+            let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
+            let temporary_root = fixture.codex_home.parent().unwrap();
+            let mut command = tokio::process::Command::new(&fixture.executable);
+            command
+                .args(plan.arguments())
+                .current_dir(&fixture.expected_cwd)
+                .env_clear()
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
+                )
+                .env("HOME", temporary_root.join("home"))
+                .env("TMPDIR", temporary_root.join("native-tmp"))
+                .env("CODEX_HOME", &fixture.codex_home)
+                .env("CODEX_API_KEY", PLACEHOLDER_KEY)
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let input = child.stdin.take().unwrap();
+            let output = BufReader::new(child.stdout.take().unwrap()).lines();
+            let mut standard_error = child.stderr.take().unwrap();
+            let stderr = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                standard_error.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            Self {
+                _fixture: fixture,
+                _plan: plan,
+                child,
+                input,
+                output,
+                stderr,
+                transcript: Vec::new(),
+            }
+        }
+
+        async fn send(&mut self, frame: Value) {
+            let mut bytes = serde_json::to_vec(&frame).unwrap();
+            bytes.push(b'\n');
+            self.input.write_all(&bytes).await.unwrap();
+            self.input.flush().await.unwrap();
+        }
+
+        async fn read_until(&mut self, mut predicate: impl FnMut(&Value) -> bool) -> Value {
+            loop {
+                let line = self
+                    .output
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("pinned Codex closed stdout before the expected frame");
+                let frame = serde_json::from_str::<Value>(&line).unwrap();
+                self.transcript.push(frame.clone());
+                if predicate(&frame) {
+                    return frame;
+                }
+            }
+        }
+
+        async fn response(&mut self, id: u64) -> Value {
+            self.read_until(|frame| {
+                frame["id"].as_u64() == Some(id) && frame.get("method").is_none()
+            })
+            .await
+        }
+
+        async fn start_turn(&mut self, approval_policy: &str) -> (String, String) {
+            let approval_is_interactive = approval_policy == "on-request";
+            let thread_sandbox = if approval_is_interactive {
+                "workspace-write"
+            } else {
+                "danger-full-access"
+            };
+            let turn_sandbox = if approval_is_interactive {
+                json!({
+                    "type": "workspaceWrite",
+                    "writableRoots": [self._fixture.expected_cwd],
+                    "networkAccess": true,
+                    "excludeTmpdirEnvVar": false,
+                    "excludeSlashTmp": false,
+                })
+            } else {
+                json!({"type": "externalSandbox", "networkAccess": "enabled"})
+            };
+            self.send(json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "scherzo-conformance", "version": "1"}},
+            }))
+            .await;
+            let initialized = self.response(1).await;
+            let user_agent = initialized["result"]["userAgent"].as_str().unwrap();
+            assert!(user_agent.starts_with(&format!(
+                "scherzo-conformance/{CODEX_APP_SERVER_V1_QUALIFICATION_VERSION} "
+            )));
+            assert!(user_agent.ends_with("(scherzo-conformance; 1)"));
+            self.send(json!({"method": "initialized", "params": {}}))
+                .await;
+            self.send(json!({
+                "id": 2,
+                "method": "config/read",
+                "params": {"cwd": self._fixture.expected_cwd, "includeLayers": true},
+            }))
+            .await;
+            let config = self.response(2).await;
+            assert_eq!(config["result"]["config"]["model_provider"], PROVIDER);
+            self.send(json!({
+                "id": 3,
+                "method": "thread/start",
+                "params": {
+                    "model": MODEL,
+                    "modelProvider": PROVIDER,
+                    "cwd": self._fixture.expected_cwd,
+                    "approvalPolicy": approval_policy,
+                    "sandbox": thread_sandbox,
+                    "developerInstructions": "scherzo direct conformance",
+                    "ephemeral": true,
+                    "config": {"bypass_hook_trust": true},
+                },
+            }))
+            .await;
+            let thread = self.response(3).await;
+            assert_eq!(thread["result"]["approvalPolicy"], approval_policy);
+            let thread_id = thread["result"]["thread"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            self.send(json!({
+                "id": 4,
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "exercise the pinned protocol"}],
+                    "cwd": self._fixture.expected_cwd,
+                    "approvalPolicy": approval_policy,
+                    "sandboxPolicy": turn_sandbox,
+                    "model": MODEL,
+                    "effort": "high",
+                },
+            }))
+            .await;
+            let turn = self.response(4).await;
+            let turn_id = turn["result"]["turn"]["id"].as_str().unwrap().to_owned();
+            if !self.transcript.iter().any(|frame| {
+                frame["method"] == "turn/started"
+                    && frame["params"]["threadId"] == thread_id
+                    && frame["params"]["turn"]["id"] == turn_id
+            }) {
+                self.read_until(|frame| {
+                    frame["method"] == "turn/started"
+                        && frame["params"]["threadId"] == thread_id
+                        && frame["params"]["turn"]["id"] == turn_id
+                })
+                .await;
+            }
+            (thread_id, turn_id)
+        }
+
+        async fn turn_completed(&mut self, thread_id: &str, turn_id: &str) -> Value {
+            self.read_until(|frame| {
+                frame["method"] == "turn/completed"
+                    && frame["params"]["threadId"] == thread_id
+                    && frame["params"]["turn"]["id"] == turn_id
+            })
+            .await
+        }
+
+        async fn finish(mut self, provider: LoopbackResponsesProvider) {
+            self.input.shutdown().await.unwrap();
+            drop(self.input);
+            let status = self.child.wait().await.unwrap();
+            let stderr = self.stderr.await.unwrap();
+            assert!(
+                status.success(),
+                "pinned Codex exited {status}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            provider.shutdown().await;
+        }
+    }
+
     async fn release_provider_and_settle(
         provider: &mut LoopbackResponsesProvider,
         release_response: oneshot::Sender<()>,
@@ -2692,8 +2678,8 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
-    async fn ephemeral_thread_preserves_native_resources_and_cleans_sqlite_state() {
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_handshake_completed_turn_and_native_resources_conform() {
         with_watchdog(async {
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
@@ -2716,6 +2702,14 @@ pub(super) mod exact_binary {
             };
             assert_eq!(request.path, "/responses");
             assert_eq!(request.authorization, format!("Bearer {PLACEHOLDER_KEY}"));
+            assert_eq!(request.body["model"], MODEL);
+            let serialized_request = serde_json::to_string(&request.body).unwrap();
+            for marker in ["root resource marker", "scherzo system instructions"] {
+                assert!(
+                    serialized_request.contains(marker),
+                    "native provider request omitted {marker}"
+                );
+            }
             let sqlite_homes = std::fs::read_dir(&sqlite_staging)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -2750,8 +2744,106 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
-    async fn no_value_mode_settles_and_cleans_transient_state() {
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_approval_decline_and_error_info_conform() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_shell_command_then_response(
+                "printf 'approval must be declined\\n'",
+                RESPONSE,
+            )
+            .await;
+            let mut codex = DirectCodex::start(provider.address);
+            let (thread_id, turn_id) = codex.start_turn("on-request").await;
+
+            let first_request = provider.next_request().await;
+            assert_eq!(first_request.path, "/responses");
+            assert!(
+                first_request.body["tools"].as_array().is_some_and(|tools| {
+                    tools.iter().any(|tool| tool["name"] == "exec_command")
+                }),
+                "pinned Codex did not advertise exec_command: {}",
+                first_request.body["tools"]
+            );
+            let approval = codex
+                .read_until(|frame| {
+                    (frame.get("id").is_some() && frame.get("method").is_some())
+                        || matches!(frame["method"].as_str(), Some("error" | "turn/completed"))
+                })
+                .await;
+            assert_eq!(
+                approval["method"], "item/commandExecution/requestApproval",
+                "pinned Codex did not request command approval: {approval}"
+            );
+            assert_eq!(approval["params"]["threadId"], thread_id);
+            assert_eq!(approval["params"]["turnId"], turn_id);
+            let approval_id = approval["id"].clone();
+            codex
+                .send(json!({"id": approval_id, "result": {"decision": "decline"}}))
+                .await;
+
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "approval-call"
+                })
+            }));
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "completed");
+            println!(
+                "pinned Codex approval transcript: method={} decision=decline status={}",
+                approval["method"], terminal["params"]["turn"]["status"]
+            );
+            codex.finish(provider).await;
+
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_error_blocked().await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let run = tokio::spawn(run_fixture(fixture));
+            let (_, outcome, started) =
+                release_provider_and_settle(&mut provider, release_response, run).await;
+            assert_started_failure(
+                "exact-provider-failure",
+                outcome,
+                started,
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                },
+            );
+            provider.shutdown().await;
+
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_error_blocked().await;
+            let mut codex = DirectCodex::start(provider.address);
+            let (thread_id, turn_id) = codex.start_turn("never").await;
+            assert_eq!(provider.next_request().await.path, "/responses");
+            release_response.send(()).unwrap();
+            let error = codex
+                .read_until(|frame| {
+                    frame["method"] == "error"
+                        && frame["params"]["threadId"] == thread_id
+                        && frame["params"]["turnId"] == turn_id
+                })
+                .await;
+            let codex_error_info = error["params"]["error"]["codexErrorInfo"].clone();
+            assert!(!codex_error_info.is_null());
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "failed");
+            assert_eq!(
+                terminal["params"]["turn"]["error"]["codexErrorInfo"],
+                codex_error_info
+            );
+            println!(
+                "pinned Codex error transcript: codexErrorInfo={codex_error_info} status={}",
+                terminal["params"]["turn"]["status"]
+            );
+            codex.finish(provider).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_no_value_mode_settles_and_cleans_transient_state() {
         with_watchdog(async {
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
@@ -2773,8 +2865,8 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
-    async fn structured_result_is_corrected_once_and_settles() {
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_structured_result_is_corrected_once_and_settles() {
         with_watchdog(async {
             let mut provider = LoopbackResponsesProvider::start_sequence(&[
                 r#"{"result":"-1"}"#,
@@ -2807,33 +2899,8 @@ pub(super) mod exact_binary {
     }
 
     #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
-    async fn native_provider_failure_settles_without_a_value() {
-        with_watchdog(async {
-            let (mut provider, release_response) =
-                LoopbackResponsesProvider::start_error_blocked().await;
-            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
-            let run = tokio::spawn(run_fixture(fixture));
-
-            let (_, outcome, started) =
-                release_provider_and_settle(&mut provider, release_response, run).await;
-
-            assert_started_failure(
-                "exact-provider-failure",
-                outcome,
-                started,
-                AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelError,
-                },
-            );
-            provider.shutdown().await;
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the repository-pinned exact Codex 0.149.0 executable"]
-    async fn cancellation_interrupts_the_native_turn_and_quiesces() {
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_cancellation_interrupts_the_native_turn_and_quiesces() {
         with_watchdog(async {
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
@@ -3201,7 +3268,6 @@ pub(super) mod unattended_requests {
     async fn known_requests_receive_only_the_fixed_unattended_response() {
         with_watchdog(async {
             for scenario in [
-                "request-command-approval",
                 "request-file-approval",
                 "request-permissions",
                 "request-user-input",
@@ -3284,11 +3350,6 @@ pub(super) mod failure_ordering {
                 ),
                 (
                     "failure-after-start-model",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-provider",
                     true,
                     AgentHarnessFailureDetail::ModelError,
                 ),

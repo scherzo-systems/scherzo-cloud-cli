@@ -39,14 +39,44 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
-        self.run(deployment).map(OutcomeClass::exit_code)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("start sign-in runtime")?;
+        let cancellation = Cancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let deployment = deployment.clone();
+        let result = runtime.block_on(async move {
+            let mut signals = super::super::ProcessSignals::install("sign-in")?;
+            let mut running =
+                tokio::task::spawn_blocking(move || self.run(&deployment, &operation_cancellation));
+            tokio::select! {
+                biased;
+                signal = signals.recv() => {
+                    cancellation.cancel();
+                    running
+                        .await
+                        .context("complete cancelled sign-in operation")?
+                        .map(|outcome| match outcome {
+                            OutcomeClass::Interrupted => signal,
+                            outcome => outcome.exit_code(),
+                        })
+                }
+                result = &mut running => result
+                    .context("complete sign-in operation")?
+                    .map(OutcomeClass::exit_code),
+            }
+        });
+        runtime.shutdown_timeout(Duration::ZERO);
+        result
     }
     // jscpd:ignore-end
 
-    fn run(self, deployment: &Deployment) -> LoginResult<OutcomeClass> {
-        let cancellation = Cancellation::install()
-            .map_err(|error| anyhow!(error))
-            .context("prepare sign-in cancellation")?;
+    fn run(
+        self,
+        deployment: &Deployment,
+        cancellation: &Cancellation,
+    ) -> LoginResult<OutcomeClass> {
         let store = CredentialStore::from_environment()
             .map_err(|error| anyhow!(error))
             .context("access credential store")?;
@@ -161,7 +191,7 @@ impl Command {
                 return Ok(OutcomeClass::Interrupted);
             }
             if let Some(completion) =
-                polling_interruption(&mut output, deployment, &cancellation, &schedule)?
+                polling_interruption(&mut output, deployment, cancellation, &schedule)?
             {
                 return Ok(completion);
             }
@@ -186,7 +216,7 @@ impl Command {
                 }
             };
             if let Some(completion) =
-                polling_interruption(&mut output, deployment, &cancellation, &schedule)?
+                polling_interruption(&mut output, deployment, cancellation, &schedule)?
             {
                 return Ok(completion);
             }
@@ -217,7 +247,7 @@ impl Command {
                         &client,
                         deployment,
                         &store,
-                        &cancellation,
+                        cancellation,
                         token,
                     );
                 }

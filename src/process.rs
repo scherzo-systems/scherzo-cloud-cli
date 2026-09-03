@@ -8,7 +8,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -20,8 +21,15 @@ pub(crate) struct ManagedProcessGroup {
 
 impl ManagedProcessGroup {
     pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
-        command.spawn().map(|child| Self {
-            process_group: i32::try_from(child.id()).ok().and_then(Pid::from_raw),
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let Some(process_group) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("spawned process ID is out of range"));
+        };
+        Ok(Self {
+            process_group: Some(process_group),
             child,
             reaped: false,
         })
@@ -32,20 +40,42 @@ impl ManagedProcessGroup {
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        self.reaped |= status.is_some();
-        Ok(status)
+        if self.reaped {
+            return self.child.try_wait();
+        }
+        let Some(process_group) = self.process_group else {
+            let status = self.child.try_wait()?;
+            self.reaped |= status.is_some();
+            return Ok(status);
+        };
+        let exited = leader_has_exited(process_group, true)?;
+        if !exited {
+            return Ok(None);
+        }
+
+        // Keep the exited leader waitable while terminating its group. Reaping
+        // first would free the numeric group identity for reuse before SIGKILL.
+        self.terminate_process_group();
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(Some(status))
     }
 
     #[cfg(test)]
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        if !self.reaped
+            && let Some(process_group) = self.process_group
+        {
+            let _ = leader_has_exited(process_group, false)?;
+            self.terminate_process_group();
+        }
         let status = self.child.wait()?;
         self.reaped = true;
         Ok(status)
     }
 
-    pub(crate) fn terminate_process_group(&self) {
-        if let Some(process_group) = self.process_group {
+    pub(crate) fn terminate_process_group(&mut self) {
+        if let Some(process_group) = self.process_group.take() {
             let _ = kill_process_group(process_group, Signal::KILL);
         }
     }
@@ -63,6 +93,22 @@ impl ManagedProcessGroup {
 impl Drop for ManagedProcessGroup {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+fn leader_has_exited(process: Pid, nohang: bool) -> io::Result<bool> {
+    let mut options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    if nohang {
+        options |= WaitIdOptions::NOHANG;
+    }
+    loop {
+        match waitid(WaitId::Pid(process), options) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(Errno::INTR) => {}
+            Err(error) => {
+                return Err(io::Error::from_raw_os_error(error.raw_os_error()));
+            }
+        }
     }
 }
 
@@ -107,8 +153,7 @@ impl CommandRunner for SystemCommandRunner {
             .args(command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
         if command.clear_environment {
             process.env_clear();
         }

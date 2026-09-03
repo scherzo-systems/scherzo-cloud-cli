@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
 use crate::api::HttpTransportPolicy;
@@ -89,6 +89,23 @@ impl HttpOptions {
     }
 }
 
+#[derive(Debug, Args)]
+struct PaginationArgs {
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u16).range(1..=200),
+        help = "Maximum items to return (1-200)"
+    )]
+    limit: Option<u16>,
+
+    #[arg(
+        long,
+        value_parser = NonEmptyStringValueParser::new(),
+        help = "Opaque continuation cursor"
+    )]
+    cursor: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(about = account::ABOUT)]
@@ -152,6 +169,35 @@ fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     stdout.flush()
 }
 
+struct ProcessSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ProcessSignals {
+    fn install(context: &str) -> anyhow::Result<Self> {
+        (|| -> io::Result<_> {
+            Ok(Self {
+                interrupt: tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::interrupt(),
+                )?,
+                terminate: tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )?,
+            })
+        })()
+        .with_context(|| format!("install {context} signal observation"))
+    }
+
+    async fn recv(&mut self) -> ExitCode {
+        tokio::select! {
+            biased;
+            _ = self.interrupt.recv() => OutcomeClass::Interrupted.exit_code(),
+            _ = self.terminate.recv() => OutcomeClass::Terminated.exit_code(),
+        }
+    }
+}
+
 fn execute_read_only_with_signals(
     context: &'static str,
     operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
@@ -161,15 +207,7 @@ fn execute_read_only_with_signals(
         .build()
         .with_context(|| format!("start {context} runtime"))?;
     let result = runtime.block_on(async move {
-        let (mut interrupt, mut terminate) = (|| -> io::Result<_> {
-            let interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-            let terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            Ok((interrupt, terminate))
-        })()
-        .with_context(|| format!("install {context} signal observation"))?;
-
+        let mut signals = ProcessSignals::install(context)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let operation_cancelled = Arc::clone(&cancelled);
@@ -179,7 +217,7 @@ fn execute_read_only_with_signals(
         });
         tokio::select! {
             biased;
-            signal = first_read_only_signal(&mut interrupt, &mut terminate) => {
+            signal = signals.recv() => {
                 cancelled.store(true, Ordering::Release);
                 if completed.load(Ordering::Acquire) {
                     finish_read_only_operation(context, running.await)
@@ -192,17 +230,6 @@ fn execute_read_only_with_signals(
     });
     runtime.shutdown_timeout(Duration::ZERO);
     result
-}
-
-async fn first_read_only_signal(
-    interrupt: &mut tokio::signal::unix::Signal,
-    terminate: &mut tokio::signal::unix::Signal,
-) -> ExitCode {
-    tokio::select! {
-        biased;
-        _ = interrupt.recv() => OutcomeClass::Interrupted.exit_code(),
-        _ = terminate.recv() => OutcomeClass::Terminated.exit_code(),
-    }
 }
 
 fn finish_read_only_operation(
@@ -358,7 +385,6 @@ mod tests {
             "auth",
             "auth login",
             "auth logout",
-            "auth source-reset-identity-evidence",
             "auth status",
             "organization",
             "organization create",

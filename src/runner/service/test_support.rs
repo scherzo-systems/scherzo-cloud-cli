@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::ops::Deref;
+use std::os::unix::fs::PermissionsExt as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +17,8 @@ use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
+use crate::runner::credential::Credential;
+use crate::runner::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
 use crate::runner::service::connection::{ConnectionError, FrameSource, run_established_shared};
 pub(crate) use crate::runner::service::lease_clock::fixture_lease_clock;
 use crate::runner::service::{
@@ -24,6 +28,55 @@ use crate::runner::service::{
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
+
+pub(crate) struct ConfigFixture {
+    config: Config,
+    _work_root: tempfile::TempDir,
+}
+
+impl ConfigFixture {
+    pub(crate) fn new(
+        gateway_url: &str,
+        credential: Credential,
+        allow_insecure_http: bool,
+    ) -> Result<Self, ConfigError> {
+        let manifest = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+            .map_err(|_| ConfigError::WorkRootUnavailable)?;
+        // The test boundary preserves TMPDIR, which may be inside this checkout.
+        // Runner fixtures must not follow it back into the source tree.
+        let work_root =
+            tempfile::tempdir_in("/tmp").map_err(|_| ConfigError::WorkRootUnavailable)?;
+        std::fs::set_permissions(work_root.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| ConfigError::WorkRootUnavailable)?;
+        let assignment = AssignmentConfig::new(work_root.path())?;
+        if assignment.work_root().starts_with(manifest) {
+            return Err(ConfigError::WorkRootUnavailable);
+        }
+        let config = Config::new(
+            gateway_url,
+            credential,
+            allow_insecure_http,
+            assignment,
+            RepositoryUrlPolicy::with_file_repositories(true),
+        )?;
+        Ok(Self {
+            config,
+            _work_root: work_root,
+        })
+    }
+
+    pub(crate) fn cloned_config(&self) -> Config {
+        self.config.clone()
+    }
+}
+
+impl Deref for ConfigFixture {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
 
 #[expect(
     clippy::disallowed_methods,
@@ -117,6 +170,7 @@ pub(crate) struct SleepRelease {
     duration: Duration,
     deadline: Instant,
     clock: Arc<Mutex<Instant>>,
+    utc_clock: Arc<Mutex<time::OffsetDateTime>>,
     transcript: Option<DeterminismTranscript>,
 }
 
@@ -126,10 +180,19 @@ impl SleepRelease {
             transcript.record(format!("sleep.released:{}ms", self.duration.as_millis()));
         }
         let mut now = self.clock.lock().expect("controlled clock mutex poisoned");
-        if *now < self.deadline {
-            *now = self.deadline;
-        }
+        let elapsed = self
+            .deadline
+            .checked_duration_since(*now)
+            .unwrap_or_default();
+        *now += elapsed;
         drop(now);
+        let mut utc_now = self
+            .utc_clock
+            .lock()
+            .expect("controlled UTC clock mutex poisoned");
+        *utc_now += time::Duration::try_from(elapsed)
+            .expect("controlled UTC duration should be representable");
+        drop(utc_now);
         self.notification.notify_one();
     }
 }
@@ -137,12 +200,20 @@ impl SleepRelease {
 struct ControlledSleeper {
     requests: mpsc::UnboundedSender<(Duration, SleepRelease)>,
     clock: Arc<Mutex<Instant>>,
+    utc_clock: Arc<Mutex<time::OffsetDateTime>>,
     transcript: Option<DeterminismTranscript>,
 }
 
 impl Sleeper for ControlledSleeper {
     fn now(&self) -> Instant {
         *self.clock.lock().expect("controlled clock mutex poisoned")
+    }
+
+    fn utc_now(&self) -> time::OffsetDateTime {
+        *self
+            .utc_clock
+            .lock()
+            .expect("controlled UTC clock mutex poisoned")
     }
 
     fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
@@ -164,6 +235,7 @@ impl Sleeper for ControlledSleeper {
                         duration,
                         deadline,
                         clock: Arc::clone(&self.clock),
+                        utc_clock: Arc::clone(&self.utc_clock),
                         transcript: self.transcript.clone(),
                     },
                 ))
@@ -171,6 +243,34 @@ impl Sleeper for ControlledSleeper {
             notification.notified().await;
         })
     }
+}
+
+struct FixtureSleeper;
+
+impl Sleeper for FixtureSleeper {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture sleeper preserves production monotonic timer behavior"
+    )]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn utc_now(&self) -> time::OffsetDateTime {
+        fixture_utc_origin()
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture sleeper preserves production Tokio timer behavior"
+    )]
+    fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+pub(crate) fn fixture_sleeper() -> Arc<dyn Sleeper> {
+    Arc::new(FixtureSleeper)
 }
 
 pub(crate) fn controlled_sleeper() -> (
@@ -200,6 +300,7 @@ fn controlled_sleeper_with_optional_transcript(
         Arc::new(ControlledSleeper {
             requests,
             clock: Arc::new(Mutex::new(monotonic_test_origin())),
+            utc_clock: Arc::new(Mutex::new(fixture_utc_origin())),
             transcript,
         }),
         receiver,
@@ -212,6 +313,14 @@ fn controlled_sleeper_with_optional_transcript(
 )]
 fn monotonic_test_origin() -> Instant {
     Instant::now()
+}
+
+fn fixture_utc_origin() -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(
+        "2026-07-23T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed fixture UTC origin should parse")
 }
 
 struct ScriptedDuplexState {
@@ -738,5 +847,42 @@ pub(crate) async fn expect_close_frame(socket: &mut FixtureSocket) -> CloseFrame
             Some(Ok(_)) => continue,
             other => panic!("fixture did not receive close: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn overlapping_releases_advance_both_clocks_by_elapsed_time() {
+        let (sleeper, mut requests) = controlled_sleeper();
+        let monotonic_origin = sleeper.now();
+        let utc_origin = sleeper.utc_now();
+        let first = tokio::spawn({
+            let sleeper = Arc::clone(&sleeper);
+            async move { sleeper.sleep(Duration::from_secs(2)).await }
+        });
+        let second = tokio::spawn({
+            let sleeper = Arc::clone(&sleeper);
+            async move { sleeper.sleep(Duration::from_secs(3)).await }
+        });
+        let mut releases = vec![
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+        ];
+        releases.sort_by_key(|(duration, _)| *duration);
+
+        for (_, release) in releases {
+            release.release();
+        }
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(
+            sleeper.now().duration_since(monotonic_origin),
+            Duration::from_secs(3)
+        );
+        assert_eq!(sleeper.utc_now() - utc_origin, time::Duration::seconds(3));
     }
 }

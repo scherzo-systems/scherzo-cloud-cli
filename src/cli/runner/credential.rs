@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use super::{CloudOptions, cloud};
+use super::{CloudOptions, PaginationArgs, cloud};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
@@ -37,10 +37,8 @@ struct ListCommand {
     organization: String,
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
-    #[arg(long, value_name = "LIMIT")]
-    limit: Option<u16>,
-    #[arg(long, value_name = "CURSOR")]
-    cursor: Option<String>,
+    #[command(flatten)]
+    pagination: PaginationArgs,
     #[command(flatten)]
     options: CloudOptions,
 }
@@ -88,8 +86,8 @@ impl ListCommand {
             api.list_credentials(
                 &self.organization,
                 &runner.id,
-                self.limit,
-                self.cursor.as_deref(),
+                self.pagination.limit,
+                self.pagination.cursor.as_deref(),
             )
         })?;
         match result {

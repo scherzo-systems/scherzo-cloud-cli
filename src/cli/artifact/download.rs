@@ -50,7 +50,7 @@ impl Command {
             |access_token| {
                 let mut api = ArtifactApi::new(
                     deployment.fingerprint().api_url(),
-                    access_token,
+                    access_token.expose(),
                     transport_policy,
                 )?;
                 assemble_artifact_set(&mut api, &self.organization, &self.run_id, &self.output)

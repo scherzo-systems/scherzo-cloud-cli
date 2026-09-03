@@ -61,6 +61,14 @@ fn conformance_executable() -> Option<PathBuf> {
         .filter(|path| path.to_string_lossy().ends_with(&expected_suffix))
 }
 
+fn require_conformance_executable() -> PathBuf {
+    conformance_executable().unwrap_or_else(|| {
+        panic!(
+            "SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi {PI_JSON_V1_QUALIFICATION_VERSION} executable"
+        )
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ConformanceClock;
 
@@ -891,7 +899,9 @@ async fn assert_count_one_result(fixture: RealPiFixture, outcome: AgentOutcome) 
 }
 
 #[test]
+#[ignore = "requires pinned harness"]
 fn pinned_real_pi_00_fake_provider_has_no_network_or_timer_success_path() {
+    let _executable = require_conformance_executable();
     assert!(FAKE_PROVIDER_EXTENSION.contains("from \"node:net\""));
     for forbidden in [
         "fetch(",
@@ -908,10 +918,9 @@ fn pinned_real_pi_00_fake_provider_has_no_network_or_timer_success_path() {
 }
 
 #[test]
+#[ignore = "requires pinned harness"]
 fn pinned_real_pi_01_qualification_anchor_is_exact_and_supported() {
-    let Some(executable) = conformance_executable() else {
-        return;
-    };
+    let executable = require_conformance_executable();
     let installation = validate_pi_installation(&executable).unwrap();
     assert_eq!(
         installation.version().as_str(),
@@ -932,10 +941,9 @@ fn pinned_real_pi_01_qualification_anchor_is_exact_and_supported() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::new(
             AgentValueMode::Response {
@@ -1091,10 +1099,9 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let cases = [
             (
@@ -1147,10 +1154,9 @@ async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_conform() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
         first.release(json!({
@@ -1226,10 +1232,9 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_threshold_compaction(result_mode()).unwrap();
         let mut running = RunningRealPi::launch(fixture);
@@ -1303,10 +1308,9 @@ async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         const FIRST_REASONING_SUMMARY: &str = "Inspecting the requested result shape.";
         const SECOND_REASONING_SUMMARY: &str = "Submitting one nested result call.";
@@ -1448,10 +1452,9 @@ async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         const STREAMED_THINKING: &str = "An observational reasoning summary.";
         const FINALIZED_THINKING: &str = "The provider-finalized thinking snapshot.";
@@ -1520,10 +1523,9 @@ async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_immediate_retry(result_mode()).unwrap();
         let mut running = RunningRealPi::launch(fixture);
@@ -1641,10 +1643,9 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
         first.release(json!({
@@ -1747,10 +1748,9 @@ async fn cancel_and_finish(running: RunningRealPi) -> RealPiFixture {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and_settlement() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         // Keep each controlled request alive until cancellation settles so controller EOF
         // cannot race the process interrupt and manufacture a different terminal phase.
@@ -1847,7 +1847,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
 #[test]
 #[ignore = "launched as the interrupt-resistant Pi conformance descendant fixture"]
 fn stubborn_descendant_process_fixture() {
-    ctrlc::set_handler(|| {}).unwrap();
+    let _interrupt = crate::execution::workflow::test_support::process_fixture_interrupt_receiver();
     let mut ready = std::io::stdout().lock();
     ready.write_all(b"SCHERZO_STUBBORN_READY").unwrap();
     ready.flush().unwrap();
@@ -1861,10 +1861,9 @@ fn stubborn_descendant_process_fixture() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendant() {
-    if conformance_executable().is_none() {
-        return;
-    }
+    let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
         let mut running = RunningRealPi::launch(fixture);

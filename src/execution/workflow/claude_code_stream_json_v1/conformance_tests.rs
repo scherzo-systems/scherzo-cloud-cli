@@ -42,17 +42,20 @@ const WATCHDOG: Duration = Duration::from_secs(20);
 
 static EXACT_BINARY_CONFORMANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn conformance_executable() -> Option<PathBuf> {
-    option_env!("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE").map(PathBuf::from)
+fn conformance_executable() -> PathBuf {
+    std::env::var_os("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE must name the pinned Claude Code executable")
+        })
 }
 
-async fn exclusive_conformance_executable()
--> Option<(PathBuf, tokio::sync::MutexGuard<'static, ()>)> {
-    let executable = conformance_executable()?;
+async fn exclusive_conformance_executable() -> (PathBuf, tokio::sync::MutexGuard<'static, ()>) {
+    let executable = conformance_executable();
     // Native startup is resource-intensive enough that concurrent qualification cases can
     // exhaust their independent anti-hang watchdogs before reaching controlled provider I/O.
     let exclusive = EXACT_BINARY_CONFORMANCE.lock().await;
-    Some((executable, exclusive))
+    (executable, exclusive)
 }
 
 fn conformance_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits> {
@@ -231,10 +234,9 @@ fn assert_retained_native_session(root: &SyntheticClaudeCodeRoot, expected: &[&s
 }
 
 #[test]
-fn pinned_claude_code_00_qualification_anchor_is_exact() {
-    let Some(executable) = conformance_executable() else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+fn pinned_real_claude_code_00_qualification_anchor_is_exact() {
+    let executable = conformance_executable();
     let temporary = tempfile::tempdir().unwrap();
     for (_, value) in version_probe_environment(temporary.path()) {
         fs::create_dir_all(value).unwrap();
@@ -264,13 +266,12 @@ fn pinned_claude_code_00_qualification_anchor_is_exact() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_root() {
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_root() {
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
     // jscpd:ignore-start
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -345,13 +346,12 @@ async fn pinned_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_ro
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_02_production_driver_returns_one_normalized_response() {
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_response() {
     // Production-adapter cases each need independent native process and provider state;
     // sharing their synthetic roots would invalidate same-process correction evidence.
     // jscpd:ignore-start
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -485,10 +485,9 @@ async fn pinned_claude_code_02_production_driver_returns_one_normalized_response
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation() {
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversation() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -601,10 +600,9 @@ async fn pinned_claude_code_03_corrects_a_result_in_one_production_conversation(
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed() {
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_typed() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut success_provider = LoopbackProvider::start().await;
         let success_root = SyntheticClaudeCodeRoot::new();
@@ -663,10 +661,9 @@ async fn pinned_claude_code_04_production_no_value_and_native_failure_are_typed(
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_05_cancels_a_blocked_provider_request() {
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_05_cancels_a_blocked_provider_request() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -694,10 +691,9 @@ async fn pinned_claude_code_05_cancels_a_blocked_provider_request() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_child_subreaper(true).unwrap();
     tokio::time::timeout(WATCHDOG, async {
@@ -744,10 +740,9 @@ async fn pinned_claude_code_06_cancels_a_stubborn_bash_descendant() {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_07_retains_forwarded_subagent_activity() {
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_07_retains_forwarded_subagent_activity() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -821,13 +816,12 @@ fn reasoning_text(observation: &AgentObservation) -> Option<&str> {
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_08_correlates_a_nominal_thinking_envelope_before_text() {
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_before_text() {
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
     // jscpd:ignore-start
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
@@ -841,7 +835,7 @@ async fn pinned_claude_code_08_correlates_a_nominal_thinking_envelope_before_tex
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.241 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.259 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.
@@ -884,12 +878,11 @@ const REDACTED_THINKING_DATA: &str = "EmwKAhgBEgy3va3scherzoredacted";
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
 #[tokio::test]
-async fn pinned_claude_code_09_every_block_kind_correlates_its_own_nominal_envelope() {
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09_every_block_kind_correlates_its_own_nominal_envelope() {
     // Fresh per-case native resources, as in every other exact-binary case.
     // jscpd:ignore-start
-    let Some((executable, _exclusive)) = exclusive_conformance_executable().await else {
-        return;
-    };
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();

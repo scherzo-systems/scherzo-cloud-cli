@@ -55,8 +55,12 @@ impl PreparationDeadline {
     }
 
     pub(super) fn remaining(self) -> Option<Duration> {
+        self.remaining_at(crate::timing::monotonic_now())
+    }
+
+    pub(super) fn remaining_at(self, monotonic_now: Instant) -> Option<Duration> {
         self.monotonic_deadline
-            .checked_duration_since(crate::timing::monotonic_now())
+            .checked_duration_since(monotonic_now)
             .filter(|remaining| !remaining.is_zero())
     }
 

@@ -14,11 +14,28 @@ pub(super) fn write_process_fixture_id(variable: &str) {
 
 pub(super) fn process_fixture_interrupt_receiver() -> std::sync::mpsc::Receiver<()> {
     let (interrupt, interrupted) = std::sync::mpsc::sync_channel(1);
-    ctrlc::set_handler(move || {
+    process_fixture_interrupt_handler(move || {
         let _ = interrupt.try_send(());
-    })
-    .unwrap();
+    });
     interrupted
+}
+
+pub(super) fn process_fixture_interrupt_handler(handler: impl FnOnce() + Send + 'static) {
+    let (ready, registered) = std::sync::mpsc::sync_channel(0);
+    let _ = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+            ready.send(()).unwrap();
+            let _ = interrupt.recv().await;
+            handler();
+        });
+    });
+    registered.recv().unwrap();
 }
 
 pub(super) fn process_fixture_output(descriptor: u8) -> fs::File {

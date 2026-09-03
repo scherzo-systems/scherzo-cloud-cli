@@ -8,7 +8,7 @@ Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --limit <LIMIT>        Maximum members to return (1-200)
+      --limit <LIMIT>        Maximum items to return (1-200)
       --cursor <CURSOR>      Opaque continuation cursor
       --json                 Print the organization result as JSON
       --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections

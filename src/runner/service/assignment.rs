@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
@@ -12,15 +10,11 @@ use super::Sleeper;
 use super::artifact_delivery::{
     ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
 };
-#[cfg(test)]
-use super::config::AssignmentConfig;
 use super::config::Config;
 use super::execution::{AssignmentProcessGuards, ExecutionJob};
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
-#[cfg(test)]
-use super::workspace::PendingRelease;
 use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, WorkRootLease,
 };
@@ -36,8 +30,6 @@ use crate::execution::workflow::cancellation::{
     MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
 };
 use crate::execution::workflow::capacity::RUNNER_TERMINAL_FRAME_BYTES;
-#[cfg(test)]
-use crate::execution::workflow::resolution;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use crate::runner_protocol::{
@@ -515,13 +507,6 @@ impl ObservationOutbox {
         }
     }
 
-    #[cfg(test)]
-    fn with_maximum_encoded_bytes(maximum_encoded_bytes: u64) -> Self {
-        let mut outbox = Self::new();
-        outbox.maximum_encoded_bytes = maximum_encoded_bytes;
-        outbox
-    }
-
     fn reserve(
         &self,
         transition_entries: usize,
@@ -707,11 +692,6 @@ impl ObservationOutbox {
 
     pub(super) fn wake(&self) {
         self.changed.notify_waiters();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.lock().entries.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ObservationOutboxState> {
@@ -961,23 +941,39 @@ impl PreparationFence {
         cancellation: CaptureCancellation,
         sleeper: Arc<dyn Sleeper>,
     ) -> Result<Self, ()> {
-        let remaining = deadline.remaining().ok_or(())?;
+        let remaining = deadline.remaining_at(sleeper.now()).ok_or(())?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .map_err(|_| ())?;
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (ready, readiness) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("runner-preparation-deadline".to_owned())
             .spawn(move || {
                 runtime.block_on(async move {
-                    tokio::select! {
-                        () = sleeper.sleep(remaining) => cancellation.cancel(),
-                        _ = stopped => {}
+                    let sleep = sleeper.sleep(remaining);
+                    tokio::pin!(sleep);
+                    let pending = std::future::poll_fn(|context| {
+                        std::task::Poll::Ready(
+                            std::future::Future::poll(sleep.as_mut(), context)
+                                == std::task::Poll::Pending,
+                        )
+                    })
+                    .await;
+                    let _ = ready.send(());
+                    if pending {
+                        tokio::select! {
+                            () = &mut sleep => cancellation.cancel(),
+                            _ = stopped => {}
+                        }
+                    } else {
+                        cancellation.cancel();
                     }
                 });
             })
             .map_err(|_| ())?;
+        readiness.recv().map_err(|_| ())?;
         Ok(Self {
             stop: Some(stop),
             worker: Some(worker),
@@ -1008,8 +1004,6 @@ enum ReleaseAfter {
 struct ReleasingAssignment {
     assignment_id: String,
     after: ReleaseAfter,
-    #[cfg(test)]
-    pending: PendingRelease,
 }
 
 enum LocalSlot {
@@ -1051,11 +1045,14 @@ pub(super) enum ManagerEvent {
 struct PreparationAuthority<'a> {
     deadline: PreparationDeadline,
     cancellation: &'a CaptureCancellation,
+    monotonic_now: Instant,
 }
 
 impl PreparationAuthority<'_> {
     fn ensure_current(self) -> Result<(), AssignmentDecline> {
-        if self.cancellation.is_cancelled() || self.deadline.remaining().is_none() {
+        if self.cancellation.is_cancelled()
+            || self.deadline.remaining_at(self.monotonic_now).is_none()
+        {
             Err(AssignmentDecline::RunnerUnable(
                 RunnerUnableReason::InputServiceUnavailable,
             ))
@@ -1174,6 +1171,72 @@ impl AdmissionRuntime {
     }
 }
 
+pub(super) struct AssignmentDependencies {
+    work_root: Arc<WorkRootLease>,
+    sleeper: Arc<dyn Sleeper>,
+    source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+    input_broker: Option<Arc<dyn RunInputBroker>>,
+    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    guard_processes: bool,
+}
+
+impl AssignmentDependencies {
+    pub(super) fn new(
+        work_root: Arc<WorkRootLease>,
+        sleeper: Arc<dyn Sleeper>,
+        source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+        input_broker: Option<Arc<dyn RunInputBroker>>,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        guard_processes: bool,
+    ) -> Self {
+        Self {
+            work_root,
+            sleeper,
+            source_broker,
+            input_broker,
+            recorder,
+            guard_processes,
+        }
+    }
+
+    pub(super) fn production(
+        config: &Config,
+        boot_id: &str,
+        sleeper: Arc<dyn Sleeper>,
+        work_root: Arc<WorkRootLease>,
+        recorder: Arc<crate::runner::telemetry::Recorder>,
+    ) -> Self {
+        let source_broker = HttpSourceCredentialBroker::new(
+            config.endpoint(),
+            config.credential(),
+            boot_id,
+            config.repository_url_policy(),
+        )
+        .ok()
+        .map(|broker| broker.with_recorder(Arc::clone(&recorder)))
+        .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>);
+        let input_broker = HttpRunInputBroker::new(config.endpoint(), config.credential(), boot_id)
+            .ok()
+            .map(|broker| Arc::new(broker) as Arc<dyn RunInputBroker>);
+        Self::new(
+            work_root,
+            sleeper,
+            source_broker,
+            input_broker,
+            Some(recorder),
+            true,
+        )
+    }
+
+    pub(super) fn with_source_broker(
+        mut self,
+        source_broker: Arc<dyn SourceCredentialBroker>,
+    ) -> Self {
+        self.source_broker = Some(source_broker);
+        self
+    }
+}
+
 pub(super) struct AssignmentManager {
     work_root: Arc<WorkRootLease>,
     pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
@@ -1186,8 +1249,6 @@ pub(super) struct AssignmentManager {
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
-    #[cfg(test)]
-    fixture_materialized_source: Option<(PathBuf, PathBuf)>,
     lease_policy: Option<ExecutionLeasePolicy>,
     slot: Option<LocalSlot>,
     reporting: Option<AssignmentIdentity>,
@@ -1206,87 +1267,19 @@ pub(super) struct AssignmentManager {
 }
 
 impl AssignmentManager {
-    #[cfg(test)]
-    pub(super) fn new(config: &Config, boot_id: String, lease_clock: LeaseClock) -> Self {
-        let work_root = fixture_work_root(config, &boot_id);
-        Self::new_inner(
-            config,
-            boot_id,
-            lease_clock,
-            Arc::new(super::TokioSleeper),
-            work_root,
-            false,
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_with_sleeper(
+    pub(super) fn new(
         config: &Config,
-        boot_id: String,
         lease_clock: LeaseClock,
-        sleeper: Arc<dyn Sleeper>,
-        recorder: Arc<crate::runner::telemetry::Recorder>,
+        dependencies: AssignmentDependencies,
     ) -> Self {
-        let work_root = fixture_work_root(config, &boot_id);
-        Self::new_inner(
-            config,
-            boot_id,
-            lease_clock,
+        let AssignmentDependencies {
+            work_root,
             sleeper,
-            work_root,
-            true,
-            Some(recorder),
-        )
-    }
-
-    pub(super) fn new_with_sleeper_and_work_root(
-        config: &Config,
-        boot_id: String,
-        lease_clock: LeaseClock,
-        sleeper: Arc<dyn Sleeper>,
-        work_root: Arc<WorkRootLease>,
-        recorder: Arc<crate::runner::telemetry::Recorder>,
-    ) -> Self {
-        Self::new_inner(
-            config,
-            boot_id,
-            lease_clock,
-            sleeper,
-            work_root,
-            true,
-            Some(recorder),
-        )
-    }
-
-    #[cfg(test)]
-    fn new_for_test_with_sleeper(
-        config: &Config,
-        boot_id: String,
-        lease_clock: LeaseClock,
-        sleeper: Arc<dyn Sleeper>,
-    ) -> Self {
-        let work_root = fixture_work_root(config, &boot_id);
-        Self::new_inner(
-            config,
-            boot_id,
-            lease_clock,
-            sleeper,
-            work_root,
-            false,
-            None,
-        )
-    }
-
-    fn new_inner(
-        config: &Config,
-        boot_id: String,
-        lease_clock: LeaseClock,
-        sleeper: Arc<dyn Sleeper>,
-        work_root: Arc<WorkRootLease>,
-        guard_processes: bool,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
-    ) -> Self {
+            source_broker,
+            input_broker,
+            recorder,
+            guard_processes,
+        } = dependencies;
         let (event_sender, events) = mpsc::unbounded_channel();
         let outbox = ObservationOutbox::new();
         let allow_insecure_artifact_uploads =
@@ -1304,23 +1297,9 @@ impl AssignmentManager {
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
             lease_clock,
             sleeper,
-            source_broker: HttpSourceCredentialBroker::new(
-                config.endpoint(),
-                config.credential(),
-                &boot_id,
-            )
-            .ok()
-            .map(|broker| match &recorder {
-                Some(recorder) => broker.with_recorder(Arc::clone(recorder)),
-                None => broker,
-            })
-            .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>),
-            input_broker: HttpRunInputBroker::new(config.endpoint(), config.credential(), &boot_id)
-                .ok()
-                .map(|broker| Arc::new(broker) as Arc<dyn RunInputBroker>),
+            source_broker,
+            input_broker,
             recorder,
-            #[cfg(test)]
-            fixture_materialized_source: config.fixture_materialized_source().cloned(),
             lease_policy: None,
             slot: None,
             reporting: None,
@@ -1337,20 +1316,6 @@ impl AssignmentManager {
             deferred_successor: None,
             guard_processes,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn use_recorder_fixture(
-        &mut self,
-        recorder: Arc<crate::runner::telemetry::Recorder>,
-    ) {
-        self.recorder = Some(recorder);
-    }
-
-    #[cfg(test)]
-    pub(super) fn use_source_broker_fixture(&mut self, broker: Arc<dyn SourceCredentialBroker>) {
-        self.fixture_materialized_source = None;
-        self.source_broker = Some(broker);
     }
 
     pub(super) fn retain_lease_policy(
@@ -1527,8 +1492,8 @@ impl AssignmentManager {
         let offer = preparing.offer.clone();
         let Some(deadline) = PreparationDeadline::from_wire(
             &prepare.preparation_expires_at,
-            preparation_utc_now(),
-            crate::timing::monotonic_now(),
+            self.sleeper.utc_now(),
+            self.sleeper.now(),
         ) else {
             preparing.cancellation.cancel();
             self.begin_assignment_cleanup(
@@ -1634,15 +1599,6 @@ impl AssignmentManager {
         prepare_effect_id: String,
         deadline: PreparationDeadline,
     ) -> Result<(), AssignmentManagerFailure> {
-        #[cfg(test)]
-        if self.fixture_materialized_source.is_some() {
-            return self.admit_materialized_source_fixture(
-                offer,
-                root,
-                prepare_effect_id,
-                deadline,
-            );
-        }
         let source = super::source::MaterializationRequest::from_validated(&offer.execution_spec);
         let Some(broker) = self.source_broker.clone() else {
             let decline =
@@ -1651,21 +1607,19 @@ impl AssignmentManager {
         };
 
         let cancellation = CaptureCancellation::default();
-        let preparation_fence = match PreparationFence::arm(
-            deadline,
-            cancellation.clone(),
-            Arc::clone(&self.sleeper),
-        ) {
-            Ok(fence) => fence,
-            Err(()) => {
-                return self.reject_after_prepare_and_cleanup(
-                    offer,
-                    root,
-                    prepare_effect_id,
-                    environment_unavailable(),
-                );
-            }
-        };
+        let sleeper = Arc::clone(&self.sleeper);
+        let preparation_fence =
+            match PreparationFence::arm(deadline, cancellation.clone(), Arc::clone(&sleeper)) {
+                Ok(fence) => fence,
+                Err(()) => {
+                    return self.reject_after_prepare_and_cleanup(
+                        offer,
+                        root,
+                        prepare_effect_id,
+                        environment_unavailable(),
+                    );
+                }
+            };
         let worker_cancellation = cancellation.clone();
         let worker_offer = offer.clone();
         let environment = self.environment.clone();
@@ -1730,6 +1684,7 @@ impl AssignmentManager {
                             PreparationAuthority {
                                 deadline,
                                 cancellation: &worker_cancellation,
+                                monotonic_now: sleeper.now(),
                             },
                         )
                     }
@@ -1762,103 +1717,6 @@ impl AssignmentManager {
         }
         if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
             preparing.cancellation = cancellation;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn admit_materialized_source_fixture(
-        &mut self,
-        offer: AssignmentOffer,
-        root: AssignmentRoot,
-        prepare_effect_id: String,
-        deadline: PreparationDeadline,
-    ) -> Result<(), AssignmentManagerFailure> {
-        let runtime = self.admission_runtime();
-        if let Err(decline) = runtime.progress(&offer, 2, "input_download") {
-            return self.reject_after_prepare_and_cleanup(offer, root, prepare_effect_id, decline);
-        }
-        let cancellation = CaptureCancellation::default();
-        let imports = match super::run_inputs::materialize(
-            self.input_broker.as_deref(),
-            &offer.assignment_id,
-            &offer.execution_spec.execution_spec_id,
-            offer.execution_spec.run_inputs.as_ref(),
-            deadline,
-            &cancellation,
-            &root.private,
-        ) {
-            Ok(imports) => imports,
-            Err(failure) => {
-                return self.reject_after_prepare_and_cleanup(
-                    offer,
-                    root,
-                    prepare_effect_id,
-                    run_input_decline(failure),
-                );
-            }
-        };
-        if let Err(decline) = runtime.progress(&offer, 3, "workflow_admission") {
-            return self.reject_after_prepare_and_cleanup(offer, root, prepare_effect_id, decline);
-        }
-        let (source_root, workflow_path) = self
-            .fixture_materialized_source
-            .as_ref()
-            .expect("fixture source is present");
-        let workflow = match resolution::resolve(source_root, workflow_path) {
-            Ok(workflow) => workflow,
-            Err(_) => {
-                let decline = AssignmentDecline::ExecutionSpecInvalid(
-                    ExecutionSpecInvalidReason::WorkflowSourceInvalid,
-                );
-                return self.reject_after_prepare_and_cleanup(
-                    offer,
-                    root,
-                    prepare_effect_id,
-                    decline,
-                );
-            }
-        };
-        let mut fixture_offer = offer.clone();
-        align_fixture_capacity(&mut fixture_offer.execution_spec, &workflow);
-        match runtime.finish(
-            &fixture_offer,
-            root,
-            workflow,
-            imports,
-            None,
-            PreparationAuthority {
-                deadline,
-                cancellation: &cancellation,
-            },
-        ) {
-            Ok(accepted) => {
-                if deadline.remaining().is_none() {
-                    self.finish_preparation_event(TelemetryOutcome::Cancelled);
-                    self.begin_assignment_cleanup(
-                        offer.assignment_id,
-                        accepted.root,
-                        ProcessQuiescence::Proven,
-                        ReleaseAfter::Idle,
-                    );
-                    return Ok(());
-                }
-                self.finish_preparation_event(TelemetryOutcome::Success);
-                self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
-                let response = AssignmentDecision::Accepted {
-                    effect_id: prepare_effect_id.clone(),
-                    assignment_id: offer.assignment_id.clone(),
-                    offered_execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
-                };
-                if let Err(failure) = self.retain_decision(offer, response) {
-                    self.slot = None;
-                    return Err(failure);
-                }
-            }
-            Err(failure) => {
-                let (root, decline) = *failure;
-                self.reject_after_prepare_and_cleanup(offer, root, prepare_effect_id, decline)?;
-            }
         }
         Ok(())
     }
@@ -2264,11 +2122,6 @@ impl AssignmentManager {
             .handle_response(delivery_id, response)
     }
 
-    #[cfg(test)]
-    pub(super) fn artifact_delivery(&self) -> ArtifactDeliveryBroker {
-        self.artifact_delivery.clone()
-    }
-
     pub(super) fn finish_transport(&mut self) {
         let removed = self.outbox.finish_transport();
         for decision in &mut self.decisions {
@@ -2356,30 +2209,9 @@ impl AssignmentManager {
         self.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
             assignment_id: assignment_id.clone(),
             after,
-            #[cfg(test)]
-            pending: pending.clone(),
         }));
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
-        #[cfg(test)]
-        if tokio::runtime::Handle::try_current().is_err() {
-            let pending = pending.clone();
-            let assignment_id = assignment_id.clone();
-            let sender = sender.clone();
-            let wake = wake.clone();
-            std::thread::Builder::new()
-                .name("runner-test-cleanup-completion".to_owned())
-                .spawn(move || {
-                    let result = pending.wait();
-                    let _ = sender.send(ManagerEvent::CleanupFinished {
-                        assignment_id,
-                        result,
-                    });
-                    wake.wake();
-                })
-                .expect("spawn cleanup completion for synchronous manager test");
-            return;
-        }
         tokio::spawn(async move {
             let result = pending.wait_async().await;
             let _ = sender.send(ManagerEvent::CleanupFinished {
@@ -2976,10 +2808,81 @@ impl AssignmentManager {
             }
         }
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn enqueue_fixture_lease_clock_failure_report(&mut self) {
-        let final_observation_id = self
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in crate::runner::service) fn manager(
+        config: &Config,
+        boot_id: String,
+        lease_clock: LeaseClock,
+    ) -> AssignmentManager {
+        manager_with_dependencies(
+            config,
+            boot_id,
+            lease_clock,
+            super::super::test_support::fixture_sleeper(),
+            None,
+            None,
+            false,
+        )
+    }
+
+    pub(in crate::runner::service) fn manager_with_dependencies(
+        config: &Config,
+        boot_id: String,
+        lease_clock: LeaseClock,
+        sleeper: Arc<dyn Sleeper>,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+        guard_processes: bool,
+    ) -> AssignmentManager {
+        let work_root = WorkRootLease::acquire(config.assignment().work_root(), &boot_id)
+            .unwrap_or_else(|error| panic!("acquire isolated test work root: {error}"));
+        let default_source_broker = HttpSourceCredentialBroker::new(
+            config.endpoint(),
+            config.credential(),
+            &boot_id,
+            config.repository_url_policy(),
+        )
+        .ok()
+        .map(|broker| match &recorder {
+            Some(recorder) => broker.with_recorder(Arc::clone(recorder)),
+            None => broker,
+        })
+        .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>);
+        let input_broker =
+            HttpRunInputBroker::new(config.endpoint(), config.credential(), &boot_id)
+                .ok()
+                .map(|broker| Arc::new(broker) as Arc<dyn RunInputBroker>);
+        let dependencies = AssignmentDependencies::new(
+            work_root,
+            sleeper,
+            source_broker.or(default_source_broker),
+            input_broker,
+            recorder,
+            guard_processes,
+        );
+        AssignmentManager::new(config, lease_clock, dependencies)
+    }
+
+    pub(in crate::runner::service) fn artifact_delivery(
+        manager: &AssignmentManager,
+    ) -> ArtifactDeliveryBroker {
+        manager.artifact_delivery.clone()
+    }
+
+    pub(in crate::runner::service) fn cleanup_complete(manager: &mut AssignmentManager) -> bool {
+        manager.drain_events();
+        !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+    }
+
+    pub(in crate::runner::service) fn enqueue_lease_clock_failure_report(
+        manager: &mut AssignmentManager,
+    ) {
+        let final_observation_id = manager
             .outbox
             .enqueue(AssignmentObservation::Execution {
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -2990,13 +2893,13 @@ impl AssignmentManager {
                 },
             })
             .expect("enqueue fixture lease clock failure report");
-        self.begin_lease_clock_failure_reporting(final_observation_id);
+        manager.begin_lease_clock_failure_reporting(final_observation_id);
     }
 
-    #[cfg(test)]
-    pub(super) fn enqueue_fixture_transitions(&self, count: u64) {
+    pub(in crate::runner::service) fn enqueue_transitions(manager: &AssignmentManager, count: u64) {
         for sequence in 1..=count {
-            self.outbox
+            manager
+                .outbox
                 .enqueue(AssignmentObservation::Execution {
                     assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                     attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -3018,9 +2921,9 @@ impl AssignmentManager {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn enqueue_fixture_finalization_terminal(&self) {
-        self.outbox
+    pub(in crate::runner::service) fn enqueue_finalization_terminal(manager: &AssignmentManager) {
+        manager
+            .outbox
             .enqueue(AssignmentObservation::Execution {
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -3049,61 +2952,50 @@ impl AssignmentManager {
             .unwrap();
     }
 
-    #[cfg(test)]
-    pub(super) fn settle_cleanup(&mut self) {
-        let pending = match &self.slot {
-            Some(LocalSlot::Releasing(releasing)) => {
-                Some((releasing.assignment_id.clone(), releasing.pending.clone()))
-            }
-            _ => None,
-        };
-        if let Some((assignment_id, pending)) = pending {
-            self.finish_cleanup(assignment_id, pending.wait());
-        }
-    }
-
-    #[cfg(test)]
-    fn active_step_count(&self) -> Option<usize> {
-        match &self.slot {
+    pub(in crate::runner::service) fn active_step_count(
+        manager: &AssignmentManager,
+    ) -> Option<usize> {
+        match &manager.slot {
             Some(LocalSlot::Accepted(accepted)) => {
                 Some(accepted.admitted.workflow().definition.steps.len())
             }
             _ => None,
         }
     }
-}
 
-// jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
-#[cfg(test)]
-fn align_fixture_capacity(
-    execution_spec: &mut ExecutionSpecV1RunnerProjection,
-    workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
-) {
-    let digest = &workflow.capacity.source_closure_digest;
-    let requirements = workflow.capacity.requirements;
-    let projected_digest = crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
-        algorithm: digest.algorithm.as_str().to_owned(),
-        value: digest.value.clone(),
-    };
-    execution_spec
-        .workflow_definition_source
-        .workflow_source_closure_digest = projected_digest.clone();
-    execution_spec.capacity = crate::runner_protocol::ExecutionCapacityV1RunnerProjection {
-        execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
-        source_closure_digest: projected_digest,
-        general_maximum_transitions: requirements.general_maximum_transitions,
-        selected_maximum_transitions: requirements.cloud_maximum_transitions,
-        maximum_invocations: requirements.maximum_invocations,
-        maximum_retained_bytes_per_invocation: requirements.maximum_retained_bytes_per_invocation,
-        diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
-        native_session_retention_bytes: requirements.native_session_retention_bytes,
-        aggregate_retention_bytes: requirements.aggregate_retention_bytes,
-        condition_transition_count: requirements.condition_transition_count,
-        aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
-        terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
-        portable_result_bytes: requirements.portable_result_bytes,
-        encoded_outbox_bytes: requirements.encoded_outbox_bytes,
-    };
+    // jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
+    pub(in crate::runner::service) fn align_fixture_capacity(
+        execution_spec: &mut ExecutionSpecV1RunnerProjection,
+        workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
+    ) {
+        let digest = &workflow.capacity.source_closure_digest;
+        let requirements = workflow.capacity.requirements;
+        let projected_digest =
+            crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+                algorithm: digest.algorithm.as_str().to_owned(),
+                value: digest.value.clone(),
+            };
+        execution_spec
+            .workflow_definition_source
+            .workflow_source_closure_digest = projected_digest.clone();
+        execution_spec.capacity = crate::runner_protocol::ExecutionCapacityV1RunnerProjection {
+            execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
+            source_closure_digest: projected_digest,
+            general_maximum_transitions: requirements.general_maximum_transitions,
+            selected_maximum_transitions: requirements.cloud_maximum_transitions,
+            maximum_invocations: requirements.maximum_invocations,
+            maximum_retained_bytes_per_invocation: requirements
+                .maximum_retained_bytes_per_invocation,
+            diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
+            native_session_retention_bytes: requirements.native_session_retention_bytes,
+            aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+            condition_transition_count: requirements.condition_transition_count,
+            aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
+            terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+            portable_result_bytes: requirements.portable_result_bytes,
+            encoded_outbox_bytes: requirements.encoded_outbox_bytes,
+        };
+    }
 }
 // jscpd:ignore-end
 
@@ -3148,14 +3040,6 @@ fn validate_carried_capacity(
 
 fn capacity_binding_invalid() -> AssignmentDecline {
     AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowAdmissionInvalid)
-}
-
-#[cfg(test)]
-fn fixture_work_root(config: &Config, boot_id: &str) -> Arc<WorkRootLease> {
-    match WorkRootLease::acquire(config.assignment().work_root(), boot_id) {
-        Ok(work_root) => work_root,
-        Err(error) => panic!("acquire isolated test work root: {error}"),
-    }
 }
 
 fn build_execution_context(
@@ -3401,20 +3285,6 @@ fn lowercase_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
-#[cfg(not(test))]
-fn preparation_utc_now() -> time::OffsetDateTime {
-    crate::timing::utc_now()
-}
-
-#[cfg(test)]
-fn preparation_utc_now() -> time::OffsetDateTime {
-    time::OffsetDateTime::parse(
-        "2026-07-23T00:00:00Z",
-        &time::format_description::well_known::Rfc3339,
-    )
-    .expect("fixed preparation test time")
-}
-
 fn run_input_decline(failure: RunInputFailure) -> AssignmentDecline {
     match failure {
         RunInputFailure::ServiceUnavailable => {
@@ -3553,6 +3423,7 @@ mod tests {
     use std::io::{self, Read as _, Write as _};
     use std::net::TcpStream as StandardTcpStream;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3567,15 +3438,22 @@ mod tests {
         CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedCodexInstallation,
     };
     use crate::execution::pi::ValidatedPiInstallation;
+    use crate::execution::workflow::resolution;
     use crate::runner::credential::test_credential;
-    use crate::runner::service::config::Config;
+    use crate::runner::service::assignment::test_support::{
+        active_step_count, align_fixture_capacity,
+    };
+    use crate::runner::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
     use crate::runner::service::lease_clock::{
         ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
     };
     use crate::runner::service::source::{
         CommitAvailability, CredentialBrokerFailure, ProviderCredential,
+        test_support::{fixture_source_broker, unavailable_source_broker},
     };
-    use crate::runner::service::test_support::{fixture_lease_clock, with_watchdog};
+    use crate::runner::service::test_support::{
+        controlled_sleeper, fixture_lease_clock, with_watchdog,
+    };
     use crate::runner::service::workspace::{
         CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkspaceFilesystem,
     };
@@ -3731,7 +3609,7 @@ for argument in "$@"; do
   previous=$argument
 done
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.241"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.259"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -3777,23 +3655,53 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    struct UnavailableSourceBroker;
+    struct BlockingSourceFixture {
+        broker: Arc<BlockingSourceBroker>,
+        started: std::sync::mpsc::Receiver<()>,
+        stopped: std::sync::mpsc::Receiver<()>,
+    }
 
-    impl SourceCredentialBroker for UnavailableSourceBroker {
-        fn issue(
-            &self,
-            _assignment_id: &str,
-            _cancellation: &CaptureCancellation,
-        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-            Err(CredentialBrokerFailure::Unavailable)
+    impl BlockingSourceFixture {
+        fn new() -> Self {
+            let (started_sender, started) = std::sync::mpsc::sync_channel(1);
+            let (stopped_sender, stopped) = std::sync::mpsc::sync_channel(1);
+            Self {
+                broker: Arc::new(BlockingSourceBroker {
+                    started: Mutex::new(Some(started_sender)),
+                    stopped: Mutex::new(Some(stopped_sender)),
+                    calls: AtomicUsize::new(0),
+                }),
+                started,
+                stopped,
+            }
         }
 
-        fn commit_availability(
-            &self,
-            _assignment_id: &str,
-            _cancellation: &CaptureCancellation,
-        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
-            Err(CredentialBrokerFailure::Unavailable)
+        fn broker(&self) -> Arc<BlockingSourceBroker> {
+            Arc::clone(&self.broker)
+        }
+
+        fn calls(&self) -> usize {
+            self.broker.calls.load(Ordering::Relaxed)
+        }
+
+        fn assert_not_started(&self) {
+            assert!(self.started.try_recv().is_err());
+        }
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "wall time only bounds the blocking source fixture's readiness message"
+        )]
+        fn wait_until_started(&self) {
+            assert!(self.started.recv_timeout(Duration::from_secs(1)).is_ok());
+        }
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "wall time only bounds the blocking source fixture's cancellation message"
+        )]
+        fn wait_until_stopped(&self) {
+            assert!(self.stopped.recv_timeout(Duration::from_secs(1)).is_ok());
         }
     }
 
@@ -3914,18 +3822,45 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    fn prepare_for(offered: &AssignmentOffer) -> AssignmentPrepare {
+    fn prepare_for(manager: &AssignmentManager, offered: &AssignmentOffer) -> AssignmentPrepare {
+        let preparation_expires_at = (manager.sleeper.utc_now() + time::Duration::minutes(15))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         AssignmentPrepare {
             effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned(),
             assignment_id: offered.assignment_id.clone(),
             run_id: offered.run_id.clone(),
             attempt_id: offered.attempt_id.clone(),
             execution_spec_id: offered.execution_spec.execution_spec_id.clone(),
-            preparation_expires_at: "2026-07-23T00:15:00Z".to_owned(),
+            preparation_expires_at,
         }
     }
 
-    fn prepare_current(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
+    fn source_fixture_path(manager: &AssignmentManager) -> PathBuf {
+        manager
+            .work_root
+            .boot_path()
+            .parent()
+            .and_then(Path::parent)
+            .expect("fixture work root should have a temporary parent")
+            .join("source")
+    }
+
+    fn align_offer_with_source_fixture(manager: &AssignmentManager, offered: &mut AssignmentOffer) {
+        let source = source_fixture_path(manager);
+        let commit_oid = run_fixture_git(&source, &["rev-parse", "HEAD"]);
+        offered
+            .execution_spec
+            .workflow_definition_source
+            .workflow_path = "workflow.yaml".to_owned();
+        offered.execution_spec.workflow_definition_source.commit_oid = commit_oid.clone();
+        offered.execution_spec.primary_workspace_source.commit_oid = commit_oid;
+        if let Ok(workflow) = resolution::resolve(&source, Path::new("workflow.yaml")) {
+            align_fixture_capacity(&mut offered.execution_spec, &workflow);
+        }
+    }
+
+    fn begin_preparation(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
         let preparation_id = manager
             .pending_observations(&BTreeSet::new(), 10)
             .into_iter()
@@ -3933,7 +3868,19 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .expect("offer preparation acknowledgement")
             .id;
         manager.acknowledge_observation(preparation_id);
-        manager.handle_prepare(prepare_for(offered)).unwrap();
+        manager
+            .handle_prepare(prepare_for(manager, offered))
+            .unwrap();
+    }
+
+    async fn prepare_current(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
+        begin_preparation(manager, offered);
+        with_watchdog(wait_for_manager_state(manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        }))
+        .await
+        .expect("source materialization did not complete");
         let progress_ids = manager
             .pending_observations(&BTreeSet::new(), 10)
             .into_iter()
@@ -3950,9 +3897,20 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    fn offer_then_prepare(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
-        manager.handle_offer(offered.clone()).unwrap();
-        prepare_current(manager, offered);
+    async fn offer_then_prepare(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
+        let mut aligned = offered.clone();
+        align_offer_with_source_fixture(manager, &mut aligned);
+        manager.handle_offer(aligned.clone()).unwrap();
+        prepare_current(manager, &aligned).await;
+    }
+
+    async fn settle_cleanup(manager: &mut AssignmentManager) {
+        with_watchdog(wait_for_manager_state(manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        }))
+        .await
+        .expect("assignment cleanup did not complete");
     }
 
     fn release_current(manager: &mut AssignmentManager, offered: &AssignmentOffer, reason: &str) {
@@ -4012,20 +3970,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    fn assert_offer_declined(
+    async fn assert_offer_declined(
         manager: &mut AssignmentManager,
         offered: AssignmentOffer,
         expected: AssignmentDecline,
     ) {
         manager.handle_offer(offered).unwrap();
-        let mut pending = Vec::new();
-        for _ in 0..100 {
-            pending = manager.pending_observations(&BTreeSet::new(), 1);
-            if !pending.is_empty() {
-                break;
-            }
-            crate::timing::sleep(Duration::from_millis(10));
-        }
+        let pending = manager.pending_observations(&BTreeSet::new(), 1);
         assert!(
             !pending.is_empty(),
             "assignment decline should become observable"
@@ -4035,42 +3986,52 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentObservation::Decision(AssignmentDecision::Rejected { decline, .. })
                 if *decline == expected
         ));
-        manager.settle_cleanup();
+        settle_cleanup(manager).await;
         assert!(manager.slot.is_none());
     }
 
-    fn assert_preparation_declined(
+    async fn assert_preparation_declined(
         manager: &mut AssignmentManager,
-        offered: AssignmentOffer,
+        mut offered: AssignmentOffer,
         expected: AssignmentDecline,
     ) {
+        align_offer_with_source_fixture(manager, &mut offered);
         manager.handle_offer(offered.clone()).unwrap();
-        prepare_current(manager, &offered);
-        let mut pending = Vec::new();
-        for _ in 0..100 {
-            pending = manager.pending_observations(&BTreeSet::new(), 10);
-            if pending.iter().any(|entry| {
-                matches!(
-                    &entry.observation,
-                    AssignmentObservation::Decision(AssignmentDecision::Rejected { decline, .. })
-                        if *decline == expected
-                )
-            }) {
-                break;
-            }
-            crate::timing::sleep(Duration::from_millis(10));
-        }
+        prepare_current(manager, &offered).await;
+        let pending = manager.pending_observations(&BTreeSet::new(), 10);
         assert!(pending.iter().any(|entry| matches!(
             &entry.observation,
             AssignmentObservation::Decision(AssignmentDecision::Rejected { decline, .. })
                 if *decline == expected
         )));
-        manager.settle_cleanup();
+        settle_cleanup(manager).await;
         assert!(manager.slot.is_none());
     }
 
     fn manager_fixture(workflow: &str) -> (tempfile::TempDir, AssignmentManager) {
         manager_fixture_with_harnesses(workflow, None, None, None)
+    }
+
+    fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
+        let output = crate::test_support::fixture_git_command("git")
+            .current_dir(repository)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn initialize_source_repository(source: &Path) {
+        run_fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
+        run_fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
+        run_fixture_git(source, &["config", "user.email", "fixture@scherzo.invalid"]);
+        run_fixture_git(source, &["add", "."]);
+        run_fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
     }
 
     fn base_manager_config(workflow: &str) -> (tempfile::TempDir, PathBuf, Config) {
@@ -4082,15 +4043,33 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(source.join("workflow.yaml"), workflow).unwrap();
         fs::write(source.join("system.md"), "System.\n").unwrap();
+        initialize_source_repository(&source);
         let assignment = AssignmentConfig::new(&work).unwrap();
         let config = Config::new(
             "wss://gateway.example.test/v1/runner/connect",
             test_credential(),
             false,
             assignment,
+            RepositoryUrlPolicy::with_file_repositories(true),
         )
         .unwrap();
         (temporary, source, config)
+    }
+
+    fn manager_with_fixture_source(
+        config: &Config,
+        source: &Path,
+        work_root: Arc<WorkRootLease>,
+    ) -> AssignmentManager {
+        let dependencies = AssignmentDependencies::new(
+            work_root,
+            Arc::new(crate::runner::service::TokioSleeper),
+            Some(fixture_source_broker(source)),
+            None,
+            None,
+            false,
+        );
+        AssignmentManager::new(config, fixture_lease_clock(), dependencies)
     }
 
     fn manager_fixture_with_cleanup(
@@ -4106,17 +4085,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             WorkspaceFilesystem::injected(remover, cleanup_sleeper, Arc::new(CleanupHook)),
         )
         .unwrap();
-        let sleeper: Arc<dyn Sleeper> = Arc::new(crate::runner::service::TokioSleeper);
-        let mut manager = AssignmentManager::new_inner(
-            &config,
-            boot_id,
-            fixture_lease_clock(),
-            sleeper,
-            work_root,
-            false,
-            None,
-        );
-        manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
+        let mut manager = manager_with_fixture_source(&config, &source, work_root);
         manager.retain_lease_policy(&policy()).unwrap();
         (temporary, manager)
     }
@@ -4151,14 +4120,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             config =
                 config.with_codex_installation(ValidatedCodexInstallation::fixture(executable));
         }
-        let sleeper: Arc<dyn Sleeper> = Arc::new(crate::runner::service::TokioSleeper);
-        let mut manager = AssignmentManager::new_for_test_with_sleeper(
-            &config,
-            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
-            fixture_lease_clock(),
-            sleeper,
-        );
-        manager.fixture_materialized_source = Some((source, PathBuf::from("workflow.yaml")));
+        let boot_id = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
+        let work_root = WorkRootLease::acquire(config.assignment().work_root(), boot_id).unwrap();
+        let mut manager = manager_with_fixture_source(&config, &source, work_root);
         manager.retain_lease_policy(&policy()).unwrap();
         let mut environment = manager.environment.variables().clone();
         environment.insert(
@@ -4265,10 +4229,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         .unwrap();
         fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
         let mut environment = manager.environment.variables().clone();
-        environment.insert(
-            OsString::from("PATH"),
-            changed_path.clone().into_os_string(),
-        );
+        let inherited_path = environment
+            .get(OsStr::new("PATH"))
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(path));
+        let path =
+            std::env::join_paths(std::iter::once(changed_path.clone()).chain(inherited_path))
+                .expect("join manager fixture PATH");
+        environment.insert(OsString::from("PATH"), path);
         manager.environment = EnvironmentSnapshot::new(environment);
         changed_path
     }
@@ -4438,7 +4406,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .unwrap();
     }
 
-    fn controlled_execution_job(
+    async fn controlled_execution_job(
         manager: &mut AssignmentManager,
         offered: &AssignmentOffer,
     ) -> (
@@ -4448,12 +4416,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     ) {
         let (lease_clock, control, waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
-        offer_then_prepare(manager, offered);
+        offer_then_prepare(manager, offered).await;
         let job = execution_job(manager, offered);
         (control, waits, job)
     }
 
-    fn controlled_running_fixture() -> (
+    async fn controlled_running_fixture() -> (
         tempfile::TempDir,
         AssignmentManager,
         tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
@@ -4464,7 +4432,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let (lease_clock, _control, lease_waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         spawn_execution(&mut manager, &offered);
         (temporary, manager, lease_waits, offered)
     }
@@ -4499,7 +4467,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager) {
+    async fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager) {
         let pending = manager.pending_observations(&BTreeSet::new(), 1);
         assert!(matches!(
             &pending[0].observation,
@@ -4510,7 +4478,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 ..
             })
         ));
-        manager.settle_cleanup();
+        settle_cleanup(manager).await;
         assert!(manager.slot.is_none());
     }
 
@@ -4635,10 +4603,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn install_command_fixture_environment(manager: &mut AssignmentManager, address: String) {
-        manager.environment = EnvironmentSnapshot::new([(
+        let mut variables = vec![(
             OsString::from(COMMAND_FIXTURE_SOCKET),
             OsString::from(address),
-        )]);
+        )];
+        if let Some(path) = manager.environment.variable(OsStr::new("PATH")) {
+            variables.push((OsString::from("PATH"), path.to_os_string()));
+        }
+        manager.environment = EnvironmentSnapshot::new(variables);
     }
 
     async fn release_command_fixtures(listener: &TcpListener, count: usize) {
@@ -4696,7 +4668,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     async fn offer_and_execute(manager: &mut AssignmentManager) -> Vec<ExecutionReport> {
         let offered = offer("bg");
-        offer_then_prepare(manager, &offered);
+        offer_then_prepare(manager, &offered).await;
         execute_to_terminal(manager, &offered).await
     }
 
@@ -4707,7 +4679,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         install_command_fixture_environment(manager, listener.local_addr().unwrap().to_string());
         let offered = offer("bg");
-        offer_then_prepare(manager, &offered);
+        offer_then_prepare(manager, &offered).await;
         execute_fixture_to_terminal(manager, &offered, &listener, command_count).await
     }
 
@@ -4725,8 +4697,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         terminal_outcome
     }
 
-    #[test]
-    fn shared_assignment_offer_fixture_reaches_source_admission() {
+    #[tokio::test]
+    async fn shared_assignment_offer_fixture_reaches_source_admission() {
         let tokio_tungstenite::tungstenite::Message::Text(raw) =
             crate::runner::service::test_support::assignment_offer()
         else {
@@ -4740,8 +4712,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_eq!(validate_execution_spec(&execution_spec), Ok(()));
     }
 
-    #[test]
-    fn malformed_run_input_projection_has_the_closed_immutable_decline() {
+    #[tokio::test]
+    async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
         let mut execution_spec = offer("bg").execution_spec;
         execution_spec.run_inputs = Some(crate::runner_protocol::RunInputProjectionV1 {
             input_set_id: "ris_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -4759,8 +4731,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
     }
 
-    #[test]
-    fn run_input_failures_keep_transient_local_and_immutable_families_distinct() {
+    #[tokio::test]
+    async fn run_input_failures_keep_transient_local_and_immutable_families_distinct() {
         let cases = [
             (
                 RunInputFailure::ServiceUnavailable,
@@ -4808,16 +4780,16 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    #[test]
-    fn secure_runner_endpoint_disallows_insecure_artifact_uploads() {
+    #[tokio::test]
+    async fn secure_runner_endpoint_disallows_insecure_artifact_uploads() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, manager) = manager_fixture(workflow);
 
         assert!(!manager.artifact_delivery.allows_insecure_loopback());
     }
 
-    #[test]
-    fn execution_spec_accepts_maximum_cancellation_grace_and_rejects_above_it() {
+    #[tokio::test]
+    async fn execution_spec_accepts_maximum_cancellation_grace_and_rejects_above_it() {
         let mut execution_spec = offer("bg").execution_spec;
         execution_spec.execution_limits.cancellation_grace_seconds =
             MAXIMUM_CANCELLATION_GRACE.as_secs();
@@ -4832,34 +4804,62 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
     }
 
-    #[test]
-    fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
+    #[tokio::test]
+    async fn preparation_authority_expires_on_the_injected_clock() {
+        let (sleeper, mut requests) = controlled_sleeper();
+        let expiration = (sleeper.utc_now() + time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let deadline =
+            PreparationDeadline::from_wire(&expiration, sleeper.utc_now(), sleeper.now()).unwrap();
+        let advance = tokio::spawn({
+            let sleeper = Arc::clone(&sleeper);
+            async move { sleeper.sleep(Duration::from_secs(3_600)).await }
+        });
+        let (_, release) = requests.recv().await.unwrap();
+        release.release();
+        advance.await.unwrap();
+        assert!(deadline.remaining_at(sleeper.now()).is_none());
+
+        let cancellation = CaptureCancellation::default();
+        assert_eq!(
+            PreparationAuthority {
+                deadline,
+                cancellation: &cancellation,
+                monotonic_now: sleeper.now(),
+            }
+            .ensure_current(),
+            Err(AssignmentDecline::RunnerUnable(
+                RunnerUnableReason::InputServiceUnavailable,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
         let workflow_source = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow_source);
-        let offered = offer("bg");
+        let mut offered = offer("bg");
+        align_offer_with_source_fixture(&manager, &mut offered);
         manager.handle_offer(offered.clone()).unwrap();
         let runtime = manager.admission_runtime();
-        let (source_root, workflow_path) = manager
-            .fixture_materialized_source
-            .as_ref()
-            .expect("fixture source is present");
-        let workflow = resolution::resolve(source_root, workflow_path).unwrap();
-        let mut fixture_offer = offered.clone();
-        align_fixture_capacity(&mut fixture_offer.execution_spec, &workflow);
+        let source_root = source_fixture_path(&manager);
+        let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let mut preparing = match manager.slot.take() {
             Some(LocalSlot::Preparing(preparing)) => preparing,
             _ => panic!("offered assignment must be preparing"),
         };
         let root = preparing.root.take().expect("preparing root");
         let cancellation = CaptureCancellation::default();
+        let preparation = prepare_for(&manager, &offered);
         let live_deadline = PreparationDeadline::from_wire(
-            "2026-07-23T00:15:00Z",
-            preparation_utc_now(),
-            crate::timing::monotonic_now(),
+            &preparation.preparation_expires_at,
+            manager.sleeper.utc_now(),
+            manager.sleeper.now(),
         )
         .unwrap();
         let accepted = match runtime.finish(
-            &fixture_offer,
+            &offered,
             root,
             workflow,
             ResolvedImports::default(),
@@ -4867,6 +4867,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             PreparationAuthority {
                 deadline: live_deadline,
                 cancellation: &cancellation,
+                monotonic_now: manager.sleeper.now(),
             },
         ) {
             Ok(accepted) => accepted,
@@ -4889,16 +4890,16 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentObservation::Decision(AssignmentDecision::Accepted { .. })
         )));
         assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
         assert!(manager.slot.is_none());
     }
 
-    #[test]
-    fn admits_file_exports_for_cloud_delivery() {
+    #[tokio::test]
+    async fn broker_materialization_transitions_preparing_to_prepared_for_file_exports() {
         let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let pending = manager.pending_observations(&BTreeSet::new(), 1);
         assert!(matches!(
             pending[0].observation,
@@ -4906,8 +4907,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         ));
     }
 
-    #[test]
-    fn malformed_and_unsupported_source_projections_have_closed_declines() {
+    #[tokio::test]
+    async fn malformed_and_unsupported_source_projections_have_closed_declines() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut unsupported = offer("bg");
@@ -4921,7 +4922,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
             ),
-        );
+        )
+        .await;
 
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut malformed = offer("bh");
@@ -4935,7 +4937,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::InvalidSourceProjection,
             ),
-        );
+        )
+        .await;
 
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut mismatched = offer("bj");
@@ -4949,11 +4952,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::InvalidSourceProjection,
             ),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn release_before_prepare_cleans_the_reserved_assignment_root() {
+    #[tokio::test]
+    async fn release_before_prepare_cleans_the_reserved_assignment_root() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
@@ -4964,61 +4968,41 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         release_current(&mut manager, &offered, "stale_or_invalid_acceptance");
 
         assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
         assert!(manager.slot.is_none());
     }
 
-    #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the blocking source fixture's readiness messages"
-    )]
-    fn release_fences_source_preparation_and_exact_replay_cannot_reissue() {
+    #[tokio::test]
+    async fn release_fences_source_preparation_and_exact_replay_cannot_reissue() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
-        let (stopped_sender, stopped_receiver) = std::sync::mpsc::sync_channel(1);
-        let broker = Arc::new(BlockingSourceBroker {
-            started: Mutex::new(Some(started_sender)),
-            stopped: Mutex::new(Some(stopped_sender)),
-            calls: AtomicUsize::new(0),
-        });
-        manager.fixture_materialized_source = None;
-        manager.source_broker = Some(broker.clone());
+        let source = BlockingSourceFixture::new();
+        manager.source_broker = Some(source.broker());
+        let mut offered = offered;
+        align_offer_with_source_fixture(&manager, &mut offered);
 
         manager.handle_offer(offered.clone()).unwrap();
-        assert_eq!(broker.calls.load(Ordering::Relaxed), 0);
-        assert!(started_receiver.try_recv().is_err());
-        prepare_current(&mut manager, &offered);
-        assert!(
-            started_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .is_ok()
-        );
+        assert_eq!(source.calls(), 0);
+        source.assert_not_started();
+        begin_preparation(&mut manager, &offered);
+        source.wait_until_started();
         assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
         release_current(&mut manager, &offered, "offer_expired");
         assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
-        assert!(
-            stopped_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .is_ok()
-        );
-        let preparation_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while matches!(manager.slot, Some(LocalSlot::Preparing(_))) {
-            manager.pending_observations(&BTreeSet::new(), 10);
-            assert!(
-                std::time::Instant::now() < preparation_deadline,
-                "cancelled source preparation did not reach cleanup"
-            );
-            std::thread::yield_now();
-        }
+        source.wait_until_stopped();
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        }))
+        .await
+        .expect("cancelled source preparation did not reach cleanup");
         assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
         assert!(manager.slot.is_none());
 
         manager.handle_offer(offered).unwrap();
-        assert_eq!(broker.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.calls(), 1);
         assert!(
             manager
                 .pending_observations(&BTreeSet::new(), 10)
@@ -5026,8 +5010,49 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
     }
 
-    #[test]
-    fn source_materialization_declines_preserve_failure_provenance() {
+    #[tokio::test]
+    async fn preparation_deadline_fences_blocked_source_materialization() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        manager.sleeper = sleeper;
+        let source = BlockingSourceFixture::new();
+        manager.source_broker = Some(source.broker());
+        let mut offered = offer("bg");
+        align_offer_with_source_fixture(&manager, &mut offered);
+
+        manager.handle_offer(offered.clone()).unwrap();
+        begin_preparation(&mut manager, &offered);
+        source.wait_until_started();
+        let (duration, deadline_release) = sleep_requests
+            .recv()
+            .await
+            .expect("preparation fence should register its deadline sleep");
+        assert_eq!(duration, Duration::from_secs(15 * 60));
+
+        deadline_release.release();
+        source.wait_until_stopped();
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        }))
+        .await
+        .expect("expired source preparation did not reach cleanup");
+        assert!(
+            !manager
+                .pending_observations(&BTreeSet::new(), 10)
+                .iter()
+                .any(|pending| matches!(
+                    pending.observation,
+                    AssignmentObservation::Decision(AssignmentDecision::Accepted { .. })
+                ))
+        );
+        settle_cleanup(&mut manager).await;
+        assert!(manager.slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_materialization_declines_preserve_failure_provenance() {
         assert_eq!(
             materialization_decline(MaterializationFailure::CommitUnavailable),
             AssignmentDecline::ExecutionSpecInvalid(
@@ -5044,19 +5069,19 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
     }
 
-    #[test]
-    fn source_credential_failure_declines_the_assignment() {
+    #[tokio::test]
+    async fn source_credential_failure_declines_the_assignment() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        manager.fixture_materialized_source = None;
-        manager.source_broker = Some(Arc::new(UnavailableSourceBroker));
+        manager.source_broker = Some(unavailable_source_broker());
 
         assert_preparation_declined(
             &mut manager,
             offered,
             AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
-        );
+        )
+        .await;
     }
 
     struct CleanupAssignmentFixture {
@@ -5084,13 +5109,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         (temporary, manager, remover, cleanup_requests)
     }
 
-    fn cleanup_assignment_fixture(
+    async fn cleanup_assignment_fixture(
         outcomes: impl IntoIterator<Item = bool>,
     ) -> CleanupAssignmentFixture {
         let (temporary, mut manager, remover, cleanup_requests) = gated_cleanup_manager(outcomes);
         let predecessor = offer("bg");
         let successor = offer("bh");
-        offer_then_prepare(&mut manager, &predecessor);
+        offer_then_prepare(&mut manager, &predecessor).await;
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
         let predecessor_root = match &manager.slot {
@@ -5132,12 +5157,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         clippy::disallowed_methods,
         reason = "the timeout only bounds failure to reach the deterministic cleanup-sleep handshake"
     )]
-    fn recovered_cleanup_holds_capacity_then_admits_the_deferred_successor() {
+    async fn recovered_cleanup_holds_capacity_then_admits_the_deferred_successor() {
         let CleanupAssignmentFixture {
             _temporary,
             mut manager,
@@ -5145,7 +5170,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             requests,
             predecessor_root,
             successor,
-        } = cleanup_assignment_fixture([false, true, true]);
+        } = cleanup_assignment_fixture([false, true, true]).await;
         assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
         assert_eq!(
             manager
@@ -5166,7 +5191,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .expect("cleanup did not request its deterministic retry delay");
         assert_eq!(request.duration, Duration::from_millis(100));
         request.release.send(()).unwrap();
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
 
         assert!(!predecessor_root.exists());
         assert_eq!(remover.calls.load(Ordering::Relaxed), 3);
@@ -5178,8 +5203,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         ));
     }
 
-    #[test]
-    fn exhausted_cleanup_quarantines_and_rejects_the_deferred_successor() {
+    #[tokio::test]
+    async fn exhausted_cleanup_quarantines_and_rejects_the_deferred_successor() {
         let CleanupAssignmentFixture {
             _temporary,
             mut manager,
@@ -5187,9 +5212,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             requests,
             predecessor_root,
             successor,
-        } = cleanup_assignment_fixture([false; 6]);
+        } = cleanup_assignment_fixture([false; 6]).await;
         release_all_cleanup_retries(&requests);
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
 
         assert!(predecessor_root.exists());
         assert_eq!(remover.calls.load(Ordering::Relaxed), 6);
@@ -5215,12 +5240,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert!(manager.cleanup_failure_ready_to_exit());
     }
 
-    #[test]
-    fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
+    #[tokio::test]
+    async fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
         let (_temporary, mut manager, remover, requests) = gated_cleanup_manager([false; 6]);
         let predecessor = offer("bg");
         let successor = offer("bh");
-        offer_then_prepare(&mut manager, &predecessor);
+        offer_then_prepare(&mut manager, &predecessor).await;
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
         let accepted = match manager.slot.take() {
@@ -5247,7 +5272,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.handle_offer(successor.clone()).unwrap();
 
         release_all_cleanup_retries(&requests);
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
 
         assert!(root_path.exists());
         assert_eq!(remover.calls.load(Ordering::Relaxed), 6);
@@ -5271,8 +5296,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         )));
     }
 
-    #[test]
-    fn execution_spec_accepts_the_shared_parallelism_limit_and_declines_the_next_value() {
+    #[tokio::test]
+    async fn execution_spec_accepts_the_shared_parallelism_limit_and_declines_the_next_value() {
         let mut execution_spec = offer("bg").execution_spec;
         execution_spec.execution_limits.maximum_parallel_steps =
             u64::try_from(MAXIMUM_PARALLEL_STEPS).unwrap();
@@ -5287,13 +5312,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     // These compact admission smoke tests intentionally share fixture setup.
     // jscpd:ignore-start
-    #[test]
-    fn command_workflows_do_not_require_an_agent_runtime() {
+    #[tokio::test]
+    async fn command_workflows_do_not_require_an_agent_runtime() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
-        assert_eq!(manager.active_step_count(), Some(1));
+        offer_then_prepare(&mut manager, &offered).await;
+        assert_eq!(active_step_count(&manager), Some(1));
     }
 
     // jscpd:ignore-end
@@ -5340,7 +5365,7 @@ steps:
         manager.environment = EnvironmentSnapshot::new(variables);
         let offered = offer("bg");
 
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
 
         let environment = match &manager.slot {
             Some(LocalSlot::Accepted(accepted)) => accepted.admitted.execution().environment(),
@@ -5378,8 +5403,8 @@ steps:
         assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
     }
 
-    #[test]
-    fn admission_requires_only_the_harness_selected_by_the_assignment() {
+    #[tokio::test]
+    async fn admission_requires_only_the_harness_selected_by_the_assignment() {
         let (pi_temporary, mut pi_manager) = manager_fixture_with_harnesses(
             PI_ONLY_WORKFLOW,
             None,
@@ -5387,8 +5412,8 @@ steps:
             Some(SUCCESSFUL_CODEX),
         );
         let pi_offer = offer("bg");
-        offer_then_prepare(&mut pi_manager, &pi_offer);
-        assert_workflow_environment_unsupported(&mut pi_manager);
+        offer_then_prepare(&mut pi_manager, &pi_offer).await;
+        assert_workflow_environment_unsupported(&mut pi_manager).await;
         assert!(!pi_temporary.path().join("claude.calls").exists());
         assert!(!pi_temporary.path().join("codex.calls").exists());
 
@@ -5399,8 +5424,8 @@ steps:
             Some(SUCCESSFUL_CODEX),
         );
         let claude_offer = offer("bg");
-        offer_then_prepare(&mut claude_manager, &claude_offer);
-        assert_workflow_environment_unsupported(&mut claude_manager);
+        offer_then_prepare(&mut claude_manager, &claude_offer).await;
+        assert_workflow_environment_unsupported(&mut claude_manager).await;
         assert!(!claude_temporary.path().join("pi.calls").exists());
         assert!(!claude_temporary.path().join("codex.calls").exists());
 
@@ -5411,18 +5436,18 @@ steps:
             None,
         );
         let codex_offer = offer("bg");
-        offer_then_prepare(&mut codex_manager, &codex_offer);
-        assert_workflow_environment_unsupported(&mut codex_manager);
+        offer_then_prepare(&mut codex_manager, &codex_offer).await;
+        assert_workflow_environment_unsupported(&mut codex_manager).await;
         assert!(!codex_temporary.path().join("pi.calls").exists());
         assert!(!codex_temporary.path().join("claude.calls").exists());
     }
 
-    #[test]
-    fn release_retires_an_unsent_acceptance_observation() {
+    #[tokio::test]
+    async fn release_retires_an_unsent_acceptance_observation() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 10).len(), 1);
 
         manager
@@ -5433,7 +5458,7 @@ steps:
                 "stale_or_invalid_acceptance",
             )
             .unwrap();
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
 
         assert!(manager.slot.is_none());
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 10), vec![]);
@@ -5444,7 +5469,7 @@ steps:
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
 
         manager.begin_shutdown().unwrap();
 
@@ -5473,7 +5498,7 @@ steps:
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let accepted = match manager.slot.take() {
             Some(LocalSlot::Accepted(accepted)) => accepted,
             _ => panic!("assignment should be accepted"),
@@ -5500,18 +5525,18 @@ steps:
         .release();
         elapsed.await;
         manager.pending_observations(&BTreeSet::new(), 10);
-        manager.settle_cleanup();
+        settle_cleanup(&mut manager).await;
 
         assert!(!root_path.exists());
         assert!(manager.shutdown_complete());
     }
 
-    #[test]
-    fn shutdown_requests_runner_cancellation_for_running_work() {
+    #[tokio::test]
+    async fn shutdown_requests_runner_cancellation_for_running_work() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let _job = execution_job(&mut manager, &offered);
 
         manager.begin_shutdown().unwrap();
@@ -5529,7 +5554,7 @@ steps:
         let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let reports =
             start_then_shut_down_and_wait(&mut manager, &offered, std::future::ready(())).await;
 
@@ -5549,12 +5574,12 @@ steps:
         );
     }
 
-    #[test]
-    fn exact_sequence_only_start_dispatches_once() {
+    #[tokio::test]
+    async fn exact_sequence_only_start_dispatches_once() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let start = start_for(&offered);
         assert!(manager.handle_start(start.clone()).unwrap().is_some());
         assert!(manager.handle_start(start).unwrap().is_none());
@@ -5580,7 +5605,7 @@ steps:
         let (lease_clock, awake, _waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let acceptance_basis = manager.decisions[0]
             .causal_lease
             .as_ref()
@@ -5608,13 +5633,13 @@ steps:
         );
         assert!(manager.handle_start(start).unwrap().is_none());
 
-        fn remaining_after_advance(simulated_suspend: bool) -> Duration {
+        async fn remaining_after_advance(simulated_suspend: bool) -> Duration {
             let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
             let (_temporary, mut manager) = manager_fixture(workflow);
             let (lease_clock, control, _waits) = controlled_lease_clock();
             manager.lease_clock = lease_clock;
             let offered = offer("bh");
-            offer_then_prepare(&mut manager, &offered);
+            offer_then_prepare(&mut manager, &offered).await;
             let job = manager
                 .handle_start(start_for(&offered))
                 .unwrap()
@@ -5631,8 +5656,8 @@ steps:
                 .unwrap()
         }
         assert_eq!(
-            remaining_after_advance(false),
-            remaining_after_advance(true),
+            remaining_after_advance(false).await,
+            remaining_after_advance(true).await,
             "awake delay and simulated suspend must consume equal authority"
         );
 
@@ -5653,15 +5678,15 @@ steps:
         );
     }
 
-    #[test]
-    fn wrong_wall_time_after_transport_does_not_change_lease_authority() {
-        fn outcome(sent_at: &str) -> (Vec<Duration>, usize) {
+    #[tokio::test]
+    async fn wrong_wall_time_after_transport_does_not_change_lease_authority() {
+        async fn outcome(sent_at: &str) -> (Vec<Duration>, usize) {
             let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
             let (_temporary, mut manager) = manager_fixture(workflow);
             let (lease_clock, _control, _waits) = controlled_lease_clock();
             manager.lease_clock = lease_clock;
             let offered = offer("bg");
-            offer_then_prepare(&mut manager, &offered);
+            offer_then_prepare(&mut manager, &offered).await;
             let start = start_from_civil_time(&offered, sent_at);
             let mut invocations = 0;
             let job = manager.handle_start(start.clone()).unwrap();
@@ -5675,20 +5700,20 @@ steps:
             )
         }
 
-        let past = outcome("1900-01-01T00:00:00Z");
-        let future = outcome("9999-12-31T23:59:59Z");
+        let past = outcome("1900-01-01T00:00:00Z").await;
+        let future = outcome("9999-12-31T23:59:59Z").await;
         assert_eq!(past, future);
         assert_eq!(past.1, 1);
     }
 
-    #[test]
-    fn delayed_replayed_and_conflicting_grants() {
+    #[tokio::test]
+    async fn delayed_replayed_and_conflicting_grants() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let (lease_clock, control, _waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let original_basis = manager.decisions[0]
             .causal_lease
             .as_ref()
@@ -5746,7 +5771,7 @@ steps:
         let (_temporary, mut pre_basis) = manager_fixture(workflow);
         let (lease_clock, _control, _waits) = controlled_lease_clock();
         pre_basis.lease_clock = lease_clock;
-        offer_then_prepare(&mut pre_basis, &offered);
+        offer_then_prepare(&mut pre_basis, &offered).await;
         let pre_basis_job = pre_basis
             .handle_start(start_for(&offered))
             .unwrap()
@@ -5769,14 +5794,14 @@ steps:
         assert!(unsolicited.slot.is_none());
     }
 
-    #[test]
-    fn pre_start_renewal_replay_never_gains_authority() {
+    #[tokio::test]
+    async fn pre_start_renewal_replay_never_gains_authority() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let (lease_clock, control, _waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
 
         let unsolicited = renewal_for(&offered);
         manager.handle_renewal(unsolicited.clone()).unwrap();
@@ -5796,14 +5821,16 @@ steps:
         );
     }
 
-    #[test]
-    fn same_boot_reconnect_retains_lease_basis() {
+    #[tokio::test]
+    async fn same_boot_reconnect_retains_lease_basis() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let (lease_clock, control, _waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
-        let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        let mut offered = offer("bg");
+        align_offer_with_source_fixture(&manager, &mut offered);
+        manager.handle_offer(offered.clone()).unwrap();
+        prepare_current(&mut manager, &offered).await;
         let causal_lease = manager.decisions[0].causal_lease.clone().unwrap();
         let acceptance_basis = causal_lease.basis(1).unwrap();
         manager.finish_transport();
@@ -5844,14 +5871,14 @@ steps:
         assert!(new_process.decisions.is_empty());
     }
 
-    #[test]
-    fn lease_authority_arithmetic_failure_grants_no_execution() {
+    #[tokio::test]
+    async fn lease_authority_arithmetic_failure_grants_no_execution() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let (lease_clock, _control, _waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         manager
             .lease_policy
             .as_mut()
@@ -5870,7 +5897,7 @@ steps:
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        let (control, _waits, job) = controlled_execution_job(&mut manager, &offered);
+        let (control, _waits, job) = controlled_execution_job(&mut manager, &offered).await;
         control.make_timer_unavailable();
         job.spawn();
 
@@ -5901,13 +5928,13 @@ steps:
         )));
     }
 
-    #[test]
-    fn accepted_runner_assignment_enables_stopped_spawn_registration() {
+    #[tokio::test]
+    async fn accepted_runner_assignment_enables_stopped_spawn_registration() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         manager.guard_processes = true;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         assert!(matches!(
             &manager.slot,
             Some(LocalSlot::Accepted(accepted))
@@ -5922,7 +5949,7 @@ steps:
         let (lease_clock, _control, mut lease_waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let job = execution_job(&mut manager, &offered);
         drop(job);
         let deadline = manager
@@ -5963,7 +5990,7 @@ steps:
         zero_delivery_policy.terminal_report_delivery_budget_milliseconds = 0;
         manager.lease_policy = Some(zero_delivery_policy);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let job = execution_job(&mut manager, &offered);
         assert_eq!(
             job.authority_updates
@@ -5989,7 +6016,7 @@ steps:
         let (lease_clock, _control, mut lease_waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
         spawn_execution(&mut manager, &offered);
@@ -6025,12 +6052,12 @@ steps:
         assert_eq!(delivery_duration, Duration::from_secs(5));
     }
 
-    #[test]
-    fn completion_without_a_terminal_report_fences_assignment_writes() {
+    #[tokio::test]
+    async fn completion_without_a_terminal_report_fences_assignment_writes() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let job = execution_job(&mut manager, &offered);
         drop(job);
         manager
@@ -6057,12 +6084,12 @@ steps:
         assert!(manager.slot.is_none());
     }
 
-    #[test]
-    fn expiry_release_revokes_running_authority_immediately() {
+    #[tokio::test]
+    async fn expiry_release_revokes_running_authority_immediately() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let job = execution_job(&mut manager, &offered);
 
         manager
@@ -6096,8 +6123,11 @@ steps:
             ),
         )
         .unwrap();
+        let source = temporary.path().join("source");
+        run_fixture_git(&source, &["add", "workflow.yaml"]);
+        run_fixture_git(&source, &["commit", "--quiet", "-m", "update workflow"]);
         let offered = offer("bg");
-        let (control, _lease_waits, job) = controlled_execution_job(&mut manager, &offered);
+        let (control, _lease_waits, job) = controlled_execution_job(&mut manager, &offered).await;
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
 
@@ -6125,7 +6155,8 @@ steps:
 
     #[tokio::test]
     async fn schedules_renewal_before_initial_lease_loss_cancellation() {
-        let (_temporary, _manager, mut sleep_requests, _offered) = controlled_running_fixture();
+        let (_temporary, _manager, mut sleep_requests, _offered) =
+            controlled_running_fixture().await;
 
         let (duration, _release) = with_watchdog(sleep_requests.recv())
             .await
@@ -6142,7 +6173,8 @@ steps:
 
     #[tokio::test]
     async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report() {
-        let (_temporary, mut manager, mut sleep_requests, _offered) = controlled_running_fixture();
+        let (_temporary, mut manager, mut sleep_requests, _offered) =
+            controlled_running_fixture().await;
 
         lease_wait_request(&mut sleep_requests, Duration::from_secs(303))
             .await
@@ -6226,7 +6258,7 @@ steps:
         let (lease_clock, control, _lease_waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let _job = execution_job(&mut manager, &offered);
 
         control.advance(Duration::from_secs(308));
@@ -6249,7 +6281,8 @@ steps:
 
     #[tokio::test]
     async fn exact_next_renewal_replaces_the_running_authority() {
-        let (_temporary, mut manager, mut sleep_requests, offered) = controlled_running_fixture();
+        let (_temporary, mut manager, mut sleep_requests, offered) =
+            controlled_running_fixture().await;
 
         let (duration, release) = with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
         assert_eq!(duration, Duration::from_secs(303));
@@ -6581,7 +6614,7 @@ steps:
         select_codex_scenario(&mut manager, "cancellation-stubborn");
         manager.guard_processes = true;
         let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered);
+        offer_then_prepare(&mut manager, &offered).await;
         let reports = start_then_shut_down_and_wait(
             &mut manager,
             &offered,
@@ -6661,8 +6694,8 @@ steps:
         ));
     }
 
-    #[test]
-    fn oversized_workflow_is_rejected_before_semantic_acceptance() {
+    #[tokio::test]
+    async fn oversized_workflow_is_rejected_before_semantic_acceptance() {
         let mut workflow = String::from("schemaVersion: 1\nsteps:\n");
         for index in 0..257 {
             workflow.push_str(&format!(
@@ -6676,11 +6709,12 @@ steps:
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::WorkflowSourceInvalid,
             ),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() {
+    #[tokio::test]
+    async fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() {
         let outbox = ObservationOutbox::new();
         for _ in 0..32 {
             outbox
@@ -6702,17 +6736,17 @@ steps:
             Ok(finalizer_maximum)
         );
         assert!(outbox.lock().entries.capacity() >= finalizer_maximum + OBSERVATION_RESERVE_BASE);
-        let below_required =
-            ObservationOutbox::with_maximum_encoded_bytes(MAXIMUM_ENCODED_OUTBOX_BYTES - 1);
+        let mut below_required = ObservationOutbox::new();
+        below_required.maximum_encoded_bytes = MAXIMUM_ENCODED_OUTBOX_BYTES - 1;
         assert_eq!(
             below_required.reserve(finalizer_maximum, MAXIMUM_ENCODED_OUTBOX_BYTES),
             Err(environment_unavailable())
         );
-        assert_eq!(outbox.len(), 32);
+        assert_eq!(outbox.lock().entries.len(), 32);
     }
 
-    #[test]
-    fn oversized_observation_is_rejected_before_queueing() {
+    #[tokio::test]
+    async fn oversized_observation_is_rejected_before_queueing() {
         let outbox = ObservationOutbox::new();
         // This limit fixture deliberately keeps a complete schema-valid transition; sharing
         // the failure-mapper test's richer construction would obscure the size boundary.
@@ -6737,7 +6771,7 @@ steps:
             Err(OutboxFailure::Encoding)
         );
         // jscpd:ignore-end
-        assert_eq!(outbox.len(), 0);
+        assert_eq!(outbox.lock().entries.len(), 0);
     }
 
     #[test]
@@ -6769,7 +6803,7 @@ steps:
         };
 
         assert!(outbox.enqueue(observation).is_ok());
-        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox.lock().entries.len(), 1);
     }
 
     fn assert_only_one_pending_terminal(observation: AssignmentObservation) {
@@ -6778,8 +6812,8 @@ steps:
         assert_eq!(outbox.enqueue(observation), Err(OutboxFailure::Capacity));
     }
 
-    #[test]
-    fn outbox_accepts_only_one_large_terminal_per_assignment() {
+    #[tokio::test]
+    async fn outbox_accepts_only_one_large_terminal_per_assignment() {
         let escaped = "\u{0001}".repeat(4_096);
         let rounds = (1..=2)
             .map(|number| {
@@ -6838,8 +6872,8 @@ steps:
         });
     }
 
-    #[test]
-    fn outbox_rejects_second_small_terminal_per_assignment() {
+    #[tokio::test]
+    async fn outbox_rejects_second_small_terminal_per_assignment() {
         assert_only_one_pending_terminal(AssignmentObservation::Execution {
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -6854,8 +6888,8 @@ steps:
         });
     }
 
-    #[test]
-    fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
+    #[tokio::test]
+    async fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let alphabet = b"0123456789abcdefghjkmnpqrstvwxyz";
@@ -6867,7 +6901,7 @@ steps:
                 char::from(alphabet[index % alphabet.len()])
             );
             let offered = offer(&suffix);
-            offer_then_prepare(&mut manager, &offered);
+            offer_then_prepare(&mut manager, &offered).await;
             let acceptance_id = manager.pending_observations(&BTreeSet::new(), 10)[0].id;
             manager.mark_observation_encoded(acceptance_id);
             manager.finish_transport();
@@ -6888,12 +6922,12 @@ steps:
         assert_eq!(manager.handle_offer(offer("80")), Ok(()));
     }
 
-    #[test]
-    fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
+    #[tokio::test]
+    async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let predecessor = offer("bg");
-        offer_then_prepare(&mut manager, &predecessor);
+        offer_then_prepare(&mut manager, &predecessor).await;
         let identity = match manager.slot.take().unwrap() {
             LocalSlot::Accepted(accepted) => accepted.identity.clone(),
             _ => panic!("offer must be accepted"),
@@ -6926,9 +6960,9 @@ steps:
             root: None,
         })));
         manager.handle_offer(offer("bh")).unwrap();
-        assert_eq!(manager.outbox.len(), 2);
+        assert_eq!(manager.outbox.lock().entries.len(), 2);
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 100).len(), 1);
         manager.finish_transport();
-        assert_eq!(manager.outbox.len(), 1);
+        assert_eq!(manager.outbox.lock().entries.len(), 1);
     }
 }

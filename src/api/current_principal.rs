@@ -5,7 +5,8 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
-use super::http_client::{HttpClient, HttpEndpointError};
+use super::bearer_authorization;
+use super::http_client::{DnsResolutionError, HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
 use super::human_principal::{self, HumanPrincipal};
 use super::problem;
@@ -138,7 +139,7 @@ fn get_current_principal_with_timeout(
         CurrentPrincipalError::local(CurrentPrincipalErrorKind::Endpoint(error))
     })?;
     let authorization = access_token
-        .map(|access_token| HeaderValue::from_str(&format!("Bearer {access_token}")))
+        .map(bearer_authorization)
         .transpose()
         .map_err(|_| {
             CurrentPrincipalError::local(CurrentPrincipalErrorKind::InvalidAuthorizationHeader)
@@ -312,58 +313,57 @@ pub(crate) fn classify_reqwest_error(error: &reqwest::Error) -> UnreachableCateg
 }
 
 fn classify_error_chain(error: &(dyn std::error::Error + 'static)) -> UnreachableCategory {
-    let mut messages = String::new();
     let mut source = Some(error);
     let mut timed_out = false;
+    let mut dns_failed = false;
     let mut tls_failed = false;
 
     while let Some(current) = source {
-        if current.downcast_ref::<reqwest::Error>().is_none() {
-            let message = current.to_string().to_ascii_lowercase();
-            messages.push_str(&message);
-            messages.push('\n');
-        }
         if let Some(io_error) = current.downcast_ref::<io::Error>() {
-            timed_out |= io_error.kind() == io::ErrorKind::TimedOut;
+            let io_kinds = classify_io_error(io_error);
+            timed_out |= io_kinds.timed_out;
+            dns_failed |= io_kinds.dns_failed;
+            tls_failed |= io_kinds.tls_failed;
         }
+        dns_failed |= current.downcast_ref::<DnsResolutionError>().is_some();
         tls_failed |= current.downcast_ref::<rustls::Error>().is_some();
         source = current.source();
     }
 
     if timed_out {
         UnreachableCategory::Timeout
-    } else if contains_any(
-        &messages,
-        &[
-            "dns",
-            "failed to lookup address",
-            "name or service not known",
-            "nodename nor servname provided",
-            "no address associated with hostname",
-        ],
-    ) {
+    } else if dns_failed {
         UnreachableCategory::Dns
-    } else if tls_failed
-        || contains_any(
-            &messages,
-            &[
-                "tls",
-                "rustls",
-                "certificate",
-                "invalid peer certificate",
-                "handshake",
-                "received corrupt message",
-            ],
-        )
-    {
+    } else if tls_failed {
         UnreachableCategory::Tls
     } else {
         UnreachableCategory::Connection
     }
 }
 
-fn contains_any(value: &str, candidates: &[&str]) -> bool {
-    candidates.iter().any(|candidate| value.contains(candidate))
+#[derive(Default)]
+struct IoErrorKinds {
+    timed_out: bool,
+    dns_failed: bool,
+    tls_failed: bool,
+}
+
+fn classify_io_error(mut error: &io::Error) -> IoErrorKinds {
+    let mut kinds = IoErrorKinds::default();
+    loop {
+        kinds.timed_out |= error.kind() == io::ErrorKind::TimedOut;
+        kinds.tls_failed |= error.kind() == io::ErrorKind::InvalidData;
+        let Some(inner) = error.get_ref() else {
+            break;
+        };
+        kinds.dns_failed |= inner.downcast_ref::<DnsResolutionError>().is_some();
+        kinds.tls_failed |= inner.downcast_ref::<rustls::Error>().is_some();
+        let Some(nested) = inner.downcast_ref::<io::Error>() else {
+            break;
+        };
+        error = nested;
+    }
+    kinds
 }
 
 #[cfg(test)]

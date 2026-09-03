@@ -6,6 +6,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, Response, StatusCode, Url};
 
+use super::bearer_authorization;
 use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
@@ -427,7 +428,7 @@ fn request_spec_for_endpoint(
     body: Option<Vec<u8>>,
     max_attempts: usize,
 ) -> Result<RequestSpec, OrganizationError> {
-    let authorization = HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|_| {
+    let authorization = bearer_authorization(access_token).map_err(|_| {
         OrganizationError::local(operation, OrganizationErrorKind::InvalidAuthorizationHeader)
     })?;
     let idempotency_key = idempotency_key
@@ -463,17 +464,19 @@ fn execute_request(
     timeout: Duration,
 ) -> Result<RequestExecution, OrganizationError> {
     let mut last_failure = UnreachableCategory::Connection;
-    for _ in 0..spec.max_attempts {
+    for attempt in 0..spec.max_attempts {
         let started = crate::timing::monotonic_now();
         let response = match client.run(timeout, send_request(client, spec, timeout)) {
             Ok(Ok(response)) => response,
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
             Ok(Err(AttemptError::Transport(category))) => {
                 last_failure = category;
+                delay_before_retry(attempt, spec.max_attempts);
                 continue;
             }
             Err(_) => {
                 last_failure = UnreachableCategory::Timeout;
+                delay_before_retry(attempt, spec.max_attempts);
                 continue;
             }
         };
@@ -489,6 +492,7 @@ fn execute_request(
                 if spec.operation.can_retry_interrupted_response(status) =>
             {
                 last_failure = category;
+                delay_before_retry(attempt, spec.max_attempts);
                 continue;
             }
             Ok(Err(AttemptError::Transport(category))) => {
@@ -502,6 +506,7 @@ fn execute_request(
                 Some(execution) => return Ok(execution),
                 None => {
                     last_failure = UnreachableCategory::Timeout;
+                    delay_before_retry(attempt, spec.max_attempts);
                     continue;
                 }
             },
@@ -509,6 +514,12 @@ fn execute_request(
     }
 
     Ok(RequestExecution::Unreachable(last_failure))
+}
+
+fn delay_before_retry(attempt: usize, max_attempts: usize) {
+    if attempt + 1 < max_attempts {
+        crate::timing::sleep(crate::timing::short_retry_delay());
+    }
 }
 
 fn classify_response_deadline(

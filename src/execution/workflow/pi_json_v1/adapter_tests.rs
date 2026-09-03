@@ -2432,7 +2432,7 @@ fn stubborn_process_fixture() {
 #[test]
 #[ignore = "launched as the interrupt-resistant Pi descendant fixture"]
 fn stubborn_descendant_process_fixture() {
-    ctrlc::set_handler(|| {}).unwrap();
+    let _interrupt = process_fixture_interrupt_receiver();
     write_process_fixture_id("PI_FIXTURE_DESCENDANT");
     write_process_fixture_signal("PI_FIXTURE_DESCENDANT_READY", b"descendant-ready\n");
     loop {

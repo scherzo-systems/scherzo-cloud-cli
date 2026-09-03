@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -933,13 +932,13 @@ fn process_timeout_terminates_and_reaps_a_running_child() {
         .arg(blocker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
     let mut child = ManagedProcessGroup::spawn(&mut command).unwrap();
     let pid = i32::try_from(child.child_mut().id())
         .ok()
         .and_then(Pid::from_raw)
         .unwrap();
+    assert_eq!(rustix::process::getpgid(Some(pid)).unwrap(), pid);
     assert!(rustix::process::test_kill_process(pid).is_ok());
 
     let command_description = Arc::<str>::from("cat blocker");
@@ -968,59 +967,44 @@ fn process_timeout_terminates_and_reaps_a_running_child() {
     assert!(rustix::process::test_kill_process(pid).is_err());
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the timeout only bounds failure if process-group termination leaves a pipe open"
+)]
 #[test]
-fn process_timeout_covers_blocked_output_workers_after_the_leader_exits() {
+fn reaping_a_completed_leader_first_terminates_its_pipe_holding_group() {
     let temporary = tempfile::tempdir().unwrap();
     let blocker = temporary.path().join("blocker");
     create_fifo(&blocker);
-    let marker = temporary.path().join("helper.pid");
     let wrapper = temporary.path().join("leader-with-lingering-helper");
     fs::write(
         &wrapper,
-        format!(
-            "#!/bin/sh\ncat '{}' & printf '%s\\n' \"$!\" > '{}'\n",
-            blocker.display(),
-            marker.display()
-        ),
+        format!("#!/bin/sh\ncat '{}' &\n", blocker.display()),
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = Command::new(wrapper);
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = ManagedProcessGroup::spawn(&mut command).unwrap();
+    let stdout = child.child_mut().stdout.take().unwrap();
+    let (finished, completion) = std::sync::mpsc::sync_channel(0);
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut bytes = Vec::new();
+        let result = std::io::Read::read_to_end(&mut stdout, &mut bytes);
+        let _ = finished.send(result);
+    });
+
     let leader_status = child.wait().unwrap();
     assert!(leader_status.success());
-    let helper_pid = fs::read_to_string(marker)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .and_then(Pid::from_raw)
+    completion
+        .recv_timeout(Duration::from_secs(2))
+        .expect("terminated process group should close inherited output")
         .unwrap();
-    assert!(rustix::process::test_kill_process(helper_pid).is_ok());
-
-    let command_description = Arc::<str>::from("leader with lingering helper");
-    let failure = wait_managed_child(
-        &mut child,
-        &CaptureCancellation::default(),
-        Duration::ZERO,
-        Arc::clone(&command_description),
-        || false,
-        || false,
-    )
-    .unwrap_err();
-
-    assert_eq!(
-        failure,
-        ProcessFailure::TimedOut {
-            command: command_description,
-            limit: Duration::ZERO,
-        }
-    );
+    reader.join().unwrap();
 }
 
 #[test]

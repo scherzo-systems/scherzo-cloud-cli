@@ -1,10 +1,11 @@
-use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
+use clap::{Args, Subcommand};
 
 use crate::api::list_organization_memberships;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 
 use super::{LeafOptions, output};
+use crate::cli::PaginationArgs;
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organization members";
 const LIST_ABOUT: &str = "List organization members";
@@ -39,19 +40,8 @@ struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
     organization_ref: String,
 
-    #[arg(
-        long,
-        value_parser = clap::value_parser!(u16).range(1..=200),
-        help = "Maximum members to return (1-200)"
-    )]
-    limit: Option<u16>,
-
-    #[arg(
-        long,
-        value_parser = NonEmptyStringValueParser::new(),
-        help = "Opaque continuation cursor"
-    )]
-    cursor: Option<String>,
+    #[command(flatten)]
+    pagination: PaginationArgs,
 
     // Clap input ownership remains operation-local; shared execution policy lives in LeafOptions.
     // jscpd:ignore-start
@@ -63,8 +53,7 @@ impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self {
             organization_ref,
-            limit,
-            cursor,
+            pagination,
             options,
         } = self;
         // jscpd:ignore-end
@@ -76,8 +65,8 @@ impl ListCommand {
                     api_url,
                     access_token,
                     &organization_ref,
-                    limit,
-                    cursor.as_deref(),
+                    pagination.limit,
+                    pagination.cursor.as_deref(),
                 )
             },
             output::write_members_list,

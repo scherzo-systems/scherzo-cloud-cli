@@ -1,10 +1,6 @@
 use std::fmt;
 use std::fs;
-#[cfg(test)]
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::Arc;
 
 use url::Url;
 
@@ -13,6 +9,25 @@ use crate::execution::codex::ValidatedCodexInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::runner::credential::Credential;
 use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RepositoryUrlPolicy {
+    allow_file: bool,
+}
+
+impl RepositoryUrlPolicy {
+    pub(super) const fn production() -> Self {
+        Self::with_file_repositories(false)
+    }
+
+    pub(super) const fn with_file_repositories(allow_file: bool) -> Self {
+        Self { allow_file }
+    }
+
+    pub(super) const fn allows_file_repositories(self) -> bool {
+        self.allow_file
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AssignmentConfig {
@@ -39,10 +54,7 @@ pub(crate) struct Config {
     state_access: Option<RunnerStateAccess>,
     control_socket_path: Option<PathBuf>,
     assignment: AssignmentConfig,
-    #[cfg(test)]
-    fixture_materialized_source: Option<(PathBuf, PathBuf)>,
-    #[cfg(test)]
-    fixture_work_root: Option<Arc<tempfile::TempDir>>,
+    repository_url_policy: RepositoryUrlPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
@@ -67,9 +79,7 @@ impl fmt::Debug for Config {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ConfigError {
     InvalidOperatorConfiguration,
-    #[cfg(test)]
     InvalidGatewayUrl,
-    #[cfg(test)]
     InsecureGatewayUrl,
     WorkRootUnavailable,
 }
@@ -80,9 +90,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidOperatorConfiguration => {
                 formatter.write_str("runner operator configuration or protected state is invalid")
             }
-            #[cfg(test)]
             Self::InvalidGatewayUrl => formatter.write_str("invalid runner gateway URL"),
-            #[cfg(test)]
             Self::InsecureGatewayUrl => {
                 formatter.write_str("insecure runner gateway URL is not allowed")
             }
@@ -112,29 +120,26 @@ impl Config {
         }
         let startup_pending = enrolled.pending_credential;
         let assignment = AssignmentConfig::new(&enrolled.work_root)?;
-        Ok(Self {
-            endpoint,
+        let mut config = Self::new(
+            endpoint.as_str(),
             credential,
-            startup_pending,
-            state_access: Some(enrolled.state_access),
-            control_socket_path: Some(enrolled.control_socket_path),
+            true,
             assignment,
-            #[cfg(test)]
-            fixture_materialized_source: None,
-            #[cfg(test)]
-            fixture_work_root: None,
-            pi_installation: None,
-            claude_code_installation: None,
-            codex_installation: None,
-        })
+            RepositoryUrlPolicy::production(),
+        )
+        .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        config.startup_pending = startup_pending;
+        config.state_access = Some(enrolled.state_access);
+        config.control_socket_path = Some(enrolled.control_socket_path);
+        Ok(config)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(
+    pub(super) fn new(
         gateway_url: &str,
         credential: Credential,
         allow_insecure_http: bool,
         assignment: AssignmentConfig,
+        repository_url_policy: RepositoryUrlPolicy,
     ) -> Result<Self, ConfigError> {
         let endpoint = Url::parse(gateway_url).map_err(|_| ConfigError::InvalidGatewayUrl)?;
         if endpoint.username() != ""
@@ -156,40 +161,10 @@ impl Config {
             state_access: None,
             control_socket_path: None,
             assignment,
-            fixture_materialized_source: None,
-            fixture_work_root: None,
+            repository_url_policy,
             pi_installation: None,
             claude_code_installation: None,
             codex_installation: None,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fixture(
-        gateway_url: &str,
-        credential: Credential,
-        allow_insecure_http: bool,
-    ) -> Result<Self, ConfigError> {
-        let manifest = canonical_directory(
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-            ConfigError::WorkRootUnavailable,
-        )?;
-        // The test boundary preserves TMPDIR, which may be inside this checkout.
-        // Runner fixtures must not follow it back into the source tree.
-        let work_root =
-            Arc::new(tempfile::tempdir_in("/tmp").map_err(|_| ConfigError::WorkRootUnavailable)?);
-        fs::set_permissions(work_root.path(), fs::Permissions::from_mode(0o700))
-            .map_err(|_| ConfigError::WorkRootUnavailable)?;
-        let assignment = AssignmentConfig::new(work_root.path())?;
-        if assignment.work_root().starts_with(&manifest) {
-            return Err(ConfigError::WorkRootUnavailable);
-        }
-        Self::new(gateway_url, credential, allow_insecure_http, assignment).map(|mut config| {
-            config.fixture_work_root = Some(work_root);
-            config.with_materialized_source_fixture(
-                manifest.join("tests"),
-                PathBuf::from("missing-workflow-fixture.yaml"),
-            )
         })
     }
 
@@ -229,19 +204,8 @@ impl Config {
         &self.assignment
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_materialized_source_fixture(
-        mut self,
-        source_root: PathBuf,
-        workflow_path: PathBuf,
-    ) -> Self {
-        self.fixture_materialized_source = Some((source_root, workflow_path));
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fixture_materialized_source(&self) -> Option<&(PathBuf, PathBuf)> {
-        self.fixture_materialized_source.as_ref()
+    pub(super) fn repository_url_policy(&self) -> RepositoryUrlPolicy {
+        self.repository_url_policy
     }
 
     pub(crate) fn pi_installation(&self) -> Option<&ValidatedPiInstallation> {
@@ -309,11 +273,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use super::{AssignmentConfig, Config, ConfigError};
+    use super::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
     use crate::runner::credential::test_credential;
-    use crate::runner::service::workspace::WorkRootLease;
-
-    const FIXTURE_BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 
     fn assignment_fixture(temporary: &TempDir) -> AssignmentConfig {
         let work = temporary.path().join("work");
@@ -330,6 +291,7 @@ mod tests {
                 test_credential(),
                 false,
                 assignment_fixture(&temporary),
+                RepositoryUrlPolicy::production(),
             )
             .is_ok()
         );
@@ -339,6 +301,7 @@ mod tests {
                 test_credential(),
                 true,
                 assignment_fixture(&temporary),
+                RepositoryUrlPolicy::production(),
             )
             .is_ok()
         );
@@ -348,6 +311,7 @@ mod tests {
                 test_credential(),
                 false,
                 assignment_fixture(&temporary),
+                RepositoryUrlPolicy::production(),
             )
             .unwrap_err(),
             ConfigError::InsecureGatewayUrl,
@@ -358,6 +322,7 @@ mod tests {
                 test_credential(),
                 true,
                 assignment_fixture(&temporary),
+                RepositoryUrlPolicy::production(),
             )
             .unwrap_err(),
             ConfigError::InsecureGatewayUrl,
@@ -374,29 +339,20 @@ mod tests {
     }
 
     #[test]
-    fn fixture_boot_root_is_removed_with_temporary_config() {
-        let source_root = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let boot_path = {
-            let config = Config::fixture(
-                "ws://127.0.0.1:1/v1/runner/connect",
-                test_credential(),
-                true,
-            )
-            .unwrap();
-            let work_root = config.assignment().work_root().to_owned();
-            assert!(
-                !work_root.starts_with(&source_root),
-                "fixture work root leaked into {}",
-                source_root.display()
-            );
+    fn constructor_retains_the_production_repository_url_policy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = Config::new(
+            "wss://gateway.example.test/v1/runner/connect",
+            test_credential(),
+            false,
+            assignment_fixture(&temporary),
+            RepositoryUrlPolicy::production(),
+        )
+        .unwrap();
 
-            let lease = WorkRootLease::acquire(&work_root, FIXTURE_BOOT_ID).unwrap();
-            let boot_path = lease.boot_path().to_owned();
-            assert_eq!(boot_path, work_root.join(FIXTURE_BOOT_ID));
-            assert!(boot_path.is_dir());
-            boot_path
-        };
-
-        assert!(!boot_path.exists());
+        assert_eq!(
+            config.repository_url_policy(),
+            RepositoryUrlPolicy::production()
+        );
     }
 }

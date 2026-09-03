@@ -450,9 +450,9 @@ fn busy_lock_respects_the_configured_deadline() {
 #[test]
 fn debug_output_never_contains_tokens() {
     let credential = StoredCredential {
-        access_token: "unique-synthetic-access-secret".to_owned(),
+        access_token: SecretToken::new("unique-synthetic-access-secret".to_owned()),
         expires_at: timestamp("2026-07-22T12:00:00Z"),
-        refresh_token: "unique-synthetic-refresh-secret".to_owned(),
+        refresh_token: SecretToken::new("unique-synthetic-refresh-secret".to_owned()),
     };
     let debug = format!("{credential:?}");
 

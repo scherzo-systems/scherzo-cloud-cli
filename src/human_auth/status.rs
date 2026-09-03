@@ -42,7 +42,11 @@ pub(crate) fn check(
         client,
         deployment,
         |access_token| {
-            api::get_current_principal(client, deployment.fingerprint().api_url(), access_token)
+            api::get_current_principal(
+                client,
+                deployment.fingerprint().api_url(),
+                access_token.map(|token| token.expose()),
+            )
         },
         |outcome| {
             matches!(outcome, Ok(CurrentPrincipalOutcome::Unauthenticated))

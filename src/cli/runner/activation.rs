@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use super::{
-    CloudOptions, RegistrationTarget, cloud, completed_cloud_result,
+    CloudOptions, PaginationArgs, RegistrationTarget, cloud, completed_cloud_result,
     validate_activation_destination, write_activation_issuance, write_activation_summary,
 };
 use crate::exit_code::ExitCode;
@@ -52,10 +52,8 @@ struct CreateCommand {
 struct ListCommand {
     #[command(flatten)]
     target: RegistrationTarget,
-    #[arg(long, value_name = "LIMIT")]
-    limit: Option<u16>,
-    #[arg(long, value_name = "CURSOR")]
-    cursor: Option<String>,
+    #[command(flatten)]
+    pagination: PaginationArgs,
     #[command(flatten)]
     options: CloudOptions,
 }
@@ -147,8 +145,8 @@ impl ListCommand {
             api.list_activations(
                 &self.target.organization,
                 &runner.id,
-                self.limit,
-                self.cursor.as_deref(),
+                self.pagination.limit,
+                self.pagination.cursor.as_deref(),
             )
         })?;
         // List and revoke retain concrete success documents and human reports;

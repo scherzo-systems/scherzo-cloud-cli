@@ -352,15 +352,19 @@ fn failed_tls_handshake_maps_to_tls() {
 }
 
 #[test]
-fn transport_error_classifier_uses_the_closed_vocabulary() {
-    for (message, expected) in [
-        ("DNS lookup failed", UnreachableCategory::Dns),
-        ("invalid peer certificate", UnreachableCategory::Tls),
-        ("connection refused", UnreachableCategory::Connection),
-    ] {
-        let error = io::Error::other(message);
-        assert_eq!(classify_error_chain(&error), expected);
-    }
+fn transport_error_classifier_uses_typed_error_kinds() {
+    let dns = DnsResolutionError::new(io::Error::other("resolver fixture"));
+    assert_eq!(classify_error_chain(&dns), UnreachableCategory::Dns);
+
+    let tls = rustls::Error::General("handshake fixture".to_owned());
+    assert_eq!(classify_error_chain(&tls), UnreachableCategory::Tls);
+
     let timeout = io::Error::from(io::ErrorKind::TimedOut);
     assert_eq!(classify_error_chain(&timeout), UnreachableCategory::Timeout);
+
+    let misleading = io::Error::other("dns tls handshake");
+    assert_eq!(
+        classify_error_chain(&misleading),
+        UnreachableCategory::Connection
+    );
 }

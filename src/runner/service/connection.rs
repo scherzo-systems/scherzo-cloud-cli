@@ -2664,16 +2664,28 @@ mod tests {
         ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
         run_established,
     };
+    use crate::execution::workflow::artifact::CaptureCancellation;
     use crate::runner::credential::test_credential;
     use crate::runner::service::artifact_delivery::{ArtifactDeliverySpec, ArtifactUploadBody};
-    use crate::runner::service::assignment::AssignmentManager;
+    use crate::runner::service::assignment::{
+        AssignmentManager,
+        test_support::{
+            artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
+            enqueue_transitions, manager as manager_fixture, manager_with_dependencies,
+        },
+    };
     use crate::runner::service::config::Config;
+    use crate::runner::service::source::{
+        CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
+        test_support::unavailable_source_broker,
+    };
     use crate::runner::service::test_support::{
-        DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
+        ConfigFixture, DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
         accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
-        expect_opening_hello, fixture_lease_clock, fixture_listener, observation_acknowledgement,
-        offer_assignment_after_handshake, scripted_duplex, sleep_request, welcome, with_watchdog,
+        expect_opening_hello, fixture_lease_clock, fixture_listener, fixture_sleeper,
+        observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
+        sleep_request, welcome, with_watchdog,
     };
     use crate::runner::service::{Sequence, Sleeper};
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
@@ -2683,10 +2695,42 @@ mod tests {
     };
 
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
+
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
 
+    struct GatedUnavailableSourceBroker {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SourceCredentialBroker for GatedUnavailableSourceBroker {
+        fn issue(
+            &self,
+            _assignment_id: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            self.release
+                .lock()
+                .expect("source gate mutex poisoned")
+                .recv()
+                .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+            if cancellation.is_cancelled() {
+                Err(CredentialBrokerFailure::Fenced)
+            } else {
+                Err(CredentialBrokerFailure::Unavailable)
+            }
+        }
+
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+    }
+
     struct EstablishedTestContext {
-        config: Config,
+        config: ConfigFixture,
         frame_source: Arc<dyn FrameSource>,
         sleeper: Arc<dyn Sleeper>,
         recorder: Arc<Recorder>,
@@ -2710,7 +2754,7 @@ mod tests {
             let (sleeper, sleep_requests) = controlled_sleeper();
             let (recorder, capture) = test_recorder(BOOT_ID);
             let connection_event = recorder.start("runner.gateway_connection", []);
-            let assignment_manager = Mutex::new(AssignmentManager::new(
+            let assignment_manager = Mutex::new(manager_fixture(
                 &config,
                 BOOT_ID.to_owned(),
                 fixture_lease_clock(),
@@ -2773,11 +2817,7 @@ mod tests {
 
     fn full_observation_window_context() -> EstablishedTestContext {
         let context = EstablishedTestContext::new();
-        context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .enqueue_fixture_transitions(40);
+        enqueue_transitions(&context.assignment_manager.lock().unwrap(), 40);
         context
     }
 
@@ -3069,11 +3109,7 @@ mod tests {
             established_fixture(&context, &mut next_sequence);
         let peer = async {
             buffer_assignment_offer(&inbound, &mut outbound).await;
-            context
-                .assignment_manager
-                .lock()
-                .unwrap()
-                .enqueue_fixture_lease_clock_failure_report();
+            enqueue_lease_clock_failure_report(&mut context.assignment_manager.lock().unwrap());
 
             let terminal = with_watchdog(outbound.recv())
                 .await
@@ -3233,8 +3269,8 @@ mod tests {
         let context = EstablishedTestContext::new();
         {
             let assignments = context.assignment_manager.lock().unwrap();
-            assignments.enqueue_fixture_transitions(1);
-            assignments.enqueue_fixture_finalization_terminal();
+            enqueue_transitions(&assignments, 1);
+            enqueue_finalization_terminal(&assignments);
         }
         let mut next_sequence = 2;
 
@@ -3359,11 +3395,7 @@ mod tests {
         let upload_url = format!("http://{}/carrier", listener.local_addr().unwrap());
         let context =
             EstablishedTestContext::with_endpoint("ws://127.0.0.1:9444/v1/runner/connect");
-        let broker = context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .artifact_delivery();
+        let broker = artifact_delivery(&context.assignment_manager.lock().unwrap());
         let completion = broker
             .start(ArtifactDeliverySpec::fixture(
                 (ASSIGNMENT_ID.to_owned(), ATTEMPT_ID.to_owned()),
@@ -3847,6 +3879,10 @@ mod tests {
     #[tokio::test]
     async fn authenticates_and_completes_hello_and_ping_pong() {
         let (listener, endpoint) = fixture_listener().await;
+        let (release_source, source_release) = std::sync::mpsc::sync_channel(1);
+        let source_broker = Arc::new(GatedUnavailableSourceBroker {
+            release: Mutex::new(source_release),
+        });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept fixture connection");
             let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
@@ -3982,6 +4018,52 @@ mod tests {
                 ))
                 .await
                 .expect("send prepare acknowledgement response");
+            let Some(Ok(Message::Text(progress))) = socket.next().await else {
+                panic!("fixture did not receive assignment preparation progress");
+            };
+            let progress: serde_json::Value =
+                serde_json::from_str(&progress).expect("decode assignment preparation progress");
+            assert_eq!(progress["type"], "assignment_preparation_progress");
+            assert_eq!(progress["payload"]["preparationSequence"], 1);
+            assert_eq!(progress["payload"]["phase"], "source_materialization");
+            socket
+                .send(observation_acknowledgement(
+                    progress["messageId"].as_str().expect("progress message ID"),
+                    5,
+                ))
+                .await
+                .expect("acknowledge assignment preparation progress");
+            socket
+                .send(Message::Ping(vec![4, 5, 6].into()))
+                .await
+                .expect("send source rejection barrier");
+            let Some(Ok(Message::Pong(payload))) = with_watchdog(socket.next()).await.unwrap()
+            else {
+                panic!("fixture did not cross the source rejection barrier");
+            };
+            assert_eq!(payload.as_ref(), &[4, 5, 6]);
+            release_source
+                .send(())
+                .expect("release unavailable source response");
+            let Some(Ok(Message::Text(rejection))) = socket.next().await else {
+                panic!("fixture did not receive assignment rejection");
+            };
+            let rejection: serde_json::Value =
+                serde_json::from_str(&rejection).expect("decode assignment rejection");
+            assert_eq!(rejection["type"], "assignment_rejected");
+            assert_eq!(
+                rejection["payload"]["decline"]["reason"],
+                "source_service_unavailable"
+            );
+            socket
+                .send(observation_acknowledgement(
+                    rejection["messageId"]
+                        .as_str()
+                        .expect("rejection message ID"),
+                    6,
+                ))
+                .await
+                .expect("acknowledge assignment rejection");
             socket
                 .send(Message::Text(
                     json!({
@@ -4004,76 +4086,7 @@ mod tests {
                 ))
                 .await
                 .expect("send assignment release while semantic responses are pending");
-            let Some(Ok(Message::Text(progress))) = socket.next().await else {
-                panic!("fixture did not receive assignment preparation progress");
-            };
-            let progress: serde_json::Value =
-                serde_json::from_str(&progress).expect("decode assignment preparation progress");
-            assert_eq!(progress["type"], "assignment_preparation_progress");
-            assert_eq!(progress["payload"]["preparationSequence"], 1);
-            assert_eq!(progress["payload"]["phase"], "source_materialization");
-            socket
-                .send(observation_acknowledgement(
-                    progress["messageId"]
-                        .as_str()
-                        .expect("preparation progress message ID"),
-                    5,
-                ))
-                .await
-                .expect("send preparation progress acknowledgement");
-            for (cloud_sequence, preparation_sequence, phase) in
-                [(6, 2, "input_download"), (7, 3, "workflow_admission")]
-            {
-                let Some(Ok(Message::Text(progress))) = socket.next().await else {
-                    panic!("fixture did not receive monotonic assignment preparation progress");
-                };
-                let progress: serde_json::Value = serde_json::from_str(&progress)
-                    .expect("decode monotonic assignment preparation progress");
-                assert_eq!(progress["type"], "assignment_preparation_progress");
-                assert_eq!(
-                    progress["payload"]["preparationSequence"],
-                    preparation_sequence
-                );
-                assert_eq!(progress["payload"]["phase"], phase);
-                socket
-                    .send(observation_acknowledgement(
-                        progress["messageId"]
-                            .as_str()
-                            .expect("monotonic preparation progress message ID"),
-                        cloud_sequence,
-                    ))
-                    .await
-                    .expect("send monotonic preparation progress acknowledgement");
-            }
-            let Some(Ok(Message::Text(response))) = socket.next().await else {
-                panic!("fixture did not receive semantic assignment response");
-            };
-            let response: serde_json::Value =
-                serde_json::from_str(&response).expect("decode semantic assignment response");
-            assert_eq!(response["type"], "assignment_rejected");
-            assert_eq!(
-                response["payload"]["effectId"],
-                "eff_01k0z6r1w8f4jy2m7q9v3x5abh"
-            );
-            assert_eq!(
-                response["payload"]["decline"]["reason"],
-                "workflow_source_invalid"
-            );
-            socket
-                .send(observation_acknowledgement(
-                    response["messageId"]
-                        .as_str()
-                        .expect("semantic response message ID"),
-                    8,
-                ))
-                .await
-                .expect("send semantic response acknowledgement");
-            let Some(Ok(Message::Text(release_acknowledgement))) = socket.next().await else {
-                panic!("fixture did not receive the queued release acknowledgement");
-            };
-            let release_acknowledgement: serde_json::Value =
-                serde_json::from_str(&release_acknowledgement)
-                    .expect("decode release acknowledgement");
+            let release_acknowledgement = effect_acknowledgement(&mut socket).await;
             assert_eq!(release_acknowledgement["type"], "effect_acknowledged");
             assert_eq!(
                 release_acknowledgement["payload"]["effectId"],
@@ -4084,25 +4097,25 @@ mod tests {
                     release_acknowledgement["messageId"]
                         .as_str()
                         .expect("release acknowledgement message ID"),
-                    9,
+                    7,
                 ))
                 .await
-                .expect("send release acknowledgement response");
+                .expect("acknowledge release effect");
             socket.close(None).await.expect("close fixture socket");
         });
 
-        let config = Config::fixture(&endpoint, test_credential(), true)
+        let config = ConfigFixture::new(&endpoint, test_credential(), true)
             .expect("configure loopback gateway");
         let (outcome, capture, next_sequence) =
-            run_configured_fixture_connection_with_capture(&config).await;
+            run_configured_fixture_connection_with_capture(&config, source_broker).await;
         let outcome = outcome.expect("run fixture connection");
         assert!(outcome.opening_acknowledged);
         assert!(outcome.handshake_completed);
-        assert_eq!(outcome.cloud_text_frames_received, 13);
-        assert_eq!(outcome.runner_text_frames_sent, 9);
+        assert_eq!(outcome.cloud_text_frames_received, 11);
+        assert_eq!(outcome.runner_text_frames_sent, 7);
         assert_eq!(outcome.effects_received, 3);
         assert_eq!(outcome.effect_acknowledgements_confirmed, 3);
-        assert_eq!(next_sequence, 10);
+        assert_eq!(next_sequence, 8);
         server.await.expect("join fixture server");
 
         let all_events = capture.events();
@@ -4113,7 +4126,7 @@ mod tests {
         assert_eq!(preparation["scherzo.outcome"], "failure");
         assert_eq!(
             preparation["scherzo.assignment.preparation_phase"],
-            "workflow_admission"
+            "source_materialization"
         );
         let encoded_preparation =
             serde_json::to_string(preparation).expect("encode preparation event");
@@ -4149,7 +4162,7 @@ mod tests {
             events[2]["scherzo.effect.id"],
             "eff_01k0z6r1w8f4jy2m7q9v3x5abj"
         );
-        assert_eq!(events[2]["scherzo.runner.sequence"], 9);
+        assert_eq!(events[2]["scherzo.runner.sequence"], 7);
         assert_eq!(events[2]["scherzo.outcome"], "success");
         assert_eq!(capture.span_count("runner.effect_acknowledgement"), 3);
         assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
@@ -4173,16 +4186,14 @@ mod tests {
             ("text", Some("assignment_prepare")),
             ("text", Some("effect_acknowledged")),
             ("text", Some("assignment_preparation_progress")),
-            ("text", Some("assignment_preparation_progress")),
-            ("text", Some("assignment_preparation_progress")),
+            ("text", Some("observation_ack")),
+            ("text", Some("observation_ack")),
+            ("ping", None),
+            ("pong", None),
             ("text", Some("assignment_rejected")),
             ("text", Some("observation_ack")),
             ("text", Some("assignment_release")),
             ("text", Some("effect_acknowledged")),
-            ("text", Some("observation_ack")),
-            ("text", Some("observation_ack")),
-            ("text", Some("observation_ack")),
-            ("text", Some("observation_ack")),
             ("text", Some("observation_ack")),
             ("close", None),
         ];
@@ -4196,6 +4207,7 @@ mod tests {
                     .get("scherzo.protocol.frame_type")
                     .and_then(serde_json::Value::as_str),
                 frame_type,
+                "protocol frame {index}: {record:?}",
             );
             assert_eq!(record["scherzo.connection.attempt"], 1);
             assert_eq!(record["scherzo.runner.id"], config.credential().runner_id());
@@ -4243,7 +4255,8 @@ mod tests {
 
         let config = test_config(&endpoint);
         let (outcome, capture, _next_sequence) =
-            run_configured_fixture_connection_with_capture(&config).await;
+            run_configured_fixture_connection_with_capture(&config, unavailable_source_broker())
+                .await;
         let outcome = outcome.expect("close established fixture connection");
         assert_eq!(outcome.effects_received, 1);
         assert_eq!(outcome.effect_acknowledgements_confirmed, 0);
@@ -4673,6 +4686,7 @@ mod tests {
 
     async fn run_configured_fixture_connection_with_capture(
         config: &Config,
+        source_broker: Arc<dyn SourceCredentialBroker>,
     ) -> (
         Result<ConnectionProgress, ConnectionError>,
         TestCapture,
@@ -4682,12 +4696,13 @@ mod tests {
         let (sleeper, _sleep_requests) = controlled_sleeper();
         let opening = test_opening(config, frame_source.as_ref());
         let mut next_sequence = 2;
-        let (result, capture) = run_test_connection_with_capture(
+        let (result, capture) = run_test_connection_with_capture_and_source(
             config,
             frame_source.as_ref(),
             sleeper.as_ref(),
             &opening,
             &mut next_sequence,
+            source_broker,
         )
         .await;
         (result, capture, next_sequence)
@@ -4712,11 +4727,37 @@ mod tests {
         opening: &[u8],
         next_sequence: &mut u64,
     ) -> (Result<ConnectionProgress, ConnectionError>, TestCapture) {
+        run_test_connection_with_capture_and_source(
+            config,
+            frame_source,
+            sleeper,
+            opening,
+            next_sequence,
+            unavailable_source_broker(),
+        )
+        .await
+    }
+
+    async fn run_test_connection_with_capture_and_source(
+        config: &Config,
+        frame_source: &dyn FrameSource,
+        sleeper: &dyn Sleeper,
+        opening: &[u8],
+        next_sequence: &mut u64,
+        source_broker: Arc<dyn SourceCredentialBroker>,
+    ) -> (Result<ConnectionProgress, ConnectionError>, TestCapture) {
         let (recorder, capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
-        let mut manager = AssignmentManager::new(config, BOOT_ID.to_owned(), fixture_lease_clock());
-        manager.use_recorder_fixture(Arc::clone(&recorder));
+        let manager = manager_with_dependencies(
+            config,
+            BOOT_ID.to_owned(),
+            fixture_lease_clock(),
+            fixture_sleeper(),
+            Some(Arc::clone(&recorder)),
+            Some(source_broker),
+            false,
+        );
         let assignment_manager = Mutex::new(manager);
         let sequence = Sequence::new(*next_sequence);
         let result = run(
@@ -4753,8 +4794,8 @@ mod tests {
         );
     }
 
-    fn test_config(endpoint: &str) -> Config {
-        Config::fixture(endpoint, test_credential(), true).expect("configure gateway")
+    fn test_config(endpoint: &str) -> ConfigFixture {
+        ConfigFixture::new(endpoint, test_credential(), true).expect("configure gateway")
     }
 
     fn test_opening(config: &Config, frame_source: &dyn FrameSource) -> Vec<u8> {

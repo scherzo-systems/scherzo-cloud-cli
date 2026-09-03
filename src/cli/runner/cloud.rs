@@ -34,7 +34,7 @@ pub(super) fn with_api_retrying_rejected_result<T>(
         |access_token| {
             let api = RunnerApi::new(
                 deployment.fingerprint().api_url(),
-                access_token,
+                access_token.expose(),
                 transport_policy,
             )
             .map_err(|error| anyhow!(error))

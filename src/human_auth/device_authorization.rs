@@ -12,6 +12,7 @@ use crate::api::{
 
 use super::credentials::MAX_ACCESS_TOKEN_BYTES;
 use super::deployment::Deployment;
+use super::token::SecretToken;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -80,8 +81,8 @@ pub(crate) enum TokenPoll {
 }
 
 pub(crate) struct IssuedToken {
-    access_token: String,
-    refresh_token: String,
+    access_token: SecretToken,
+    refresh_token: SecretToken,
     expires_in: Duration,
 }
 
@@ -97,11 +98,11 @@ impl fmt::Debug for IssuedToken {
 }
 
 impl IssuedToken {
-    pub(crate) fn access_token(&self) -> &str {
+    pub(crate) fn access_token(&self) -> &SecretToken {
         &self.access_token
     }
 
-    pub(crate) fn refresh_token(&self) -> &str {
+    pub(crate) fn refresh_token(&self) -> &SecretToken {
         &self.refresh_token
     }
 
@@ -413,8 +414,8 @@ fn validate_verification_uri(
 
 #[derive(Deserialize)]
 struct IssuedTokenResponse {
-    access_token: String,
-    refresh_token: String,
+    access_token: SecretToken,
+    refresh_token: SecretToken,
     token_type: String,
     expires_in: u64,
 }
@@ -424,22 +425,22 @@ pub(super) fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, Authorizat
         serde_json::from_slice(body).map_err(|_| AuthorizationError::Protocol {
             reason: "the successful token body is invalid",
         })?;
-    if response.access_token.is_empty() {
+    if response.access_token.expose().is_empty() {
         return Err(AuthorizationError::Protocol {
             reason: "the issued access token is empty",
         });
     }
-    if response.access_token.len() > MAX_ACCESS_TOKEN_BYTES {
+    if response.access_token.expose().len() > MAX_ACCESS_TOKEN_BYTES {
         return Err(AuthorizationError::Protocol {
             reason: "the issued access token exceeds 64 KiB",
         });
     }
-    if response.refresh_token.is_empty() {
+    if response.refresh_token.expose().is_empty() {
         return Err(AuthorizationError::Protocol {
             reason: "the issued refresh token is empty",
         });
     }
-    if response.refresh_token.len() > MAX_ACCESS_TOKEN_BYTES {
+    if response.refresh_token.expose().len() > MAX_ACCESS_TOKEN_BYTES {
         return Err(AuthorizationError::Protocol {
             reason: "the issued refresh token exceeds 64 KiB",
         });

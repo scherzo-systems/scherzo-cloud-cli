@@ -1,8 +1,11 @@
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url};
 
 use super::http_util;
@@ -41,6 +44,7 @@ impl HttpClient {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .dns_resolver(categorized_dns_resolver())
             .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
             .build()
             .map_err(HttpClientError::BuildClient)?;
@@ -100,6 +104,51 @@ impl Drop for HttpClient {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(Duration::ZERO);
         }
+    }
+}
+
+pub(super) fn categorized_dns_resolver() -> Arc<impl Resolve> {
+    Arc::new(CategorizedDnsResolver)
+}
+
+struct CategorizedDnsResolver;
+
+impl Resolve for CategorizedDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            tokio::net::lookup_host((host, 0))
+                .await
+                .map(|addresses| Box::new(addresses) as Addrs)
+                .map_err(|source| {
+                    Box::new(DnsResolutionError::new(source)) as Box<dyn Error + Send + Sync>
+                })
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DnsResolutionError {
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl DnsResolutionError {
+    pub(super) fn new(source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for DnsResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DNS resolution failed")
+    }
+}
+
+impl Error for DnsResolutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
     }
 }
 

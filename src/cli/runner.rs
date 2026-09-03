@@ -16,6 +16,8 @@ use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
 
+use super::PaginationArgs;
+
 pub(super) const ABOUT: &str = "Work with the Scherzo Cloud runner";
 const NAME: &str = "runner";
 
@@ -100,19 +102,8 @@ struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
     organization: String,
 
-    #[arg(
-        long,
-        value_name = "LIMIT",
-        help = "Limit the number of runners returned"
-    )]
-    limit: Option<u16>,
-
-    #[arg(
-        long,
-        value_name = "CURSOR",
-        help = "Continue from an opaque page cursor"
-    )]
-    cursor: Option<String>,
+    #[command(flatten)]
+    pagination: PaginationArgs,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -410,12 +401,15 @@ impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self {
             organization,
-            limit,
-            cursor,
+            pagination,
             options,
         } = self;
         let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.list_registrations(&organization, limit, cursor.as_deref())
+            api.list_registrations(
+                &organization,
+                pagination.limit,
+                pagination.cursor.as_deref(),
+            )
         })?;
         cloud::write_runner_list(deployment.fingerprint().api_url(), &result, options.json)
     }

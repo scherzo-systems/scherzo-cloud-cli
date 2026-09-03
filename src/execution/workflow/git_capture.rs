@@ -13,7 +13,6 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -1103,7 +1102,6 @@ impl GitCaptureContext {
         if let Some(shallow_file) = shallow_file {
             command.env("GIT_SHALLOW_FILE", shallow_file);
         }
-        command.process_group(0);
         command
     }
 

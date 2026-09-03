@@ -1,34 +1,42 @@
-use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub(crate) struct Cancellation {
-    cancelled: Arc<AtomicBool>,
-    wake: Arc<(Mutex<()>, Condvar)>,
+    state: Arc<CancellationState>,
+}
+
+struct CancellationState {
+    cancelled: AtomicBool,
+    wake: Mutex<()>,
+    changed: Condvar,
 }
 
 impl Cancellation {
-    pub(crate) fn install() -> Result<Self, CancellationError> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((Mutex::new(()), Condvar::new()));
-        let handler_cancelled = Arc::clone(&cancelled);
-        let handler_wake = Arc::clone(&wake);
-        ctrlc::set_handler(move || {
-            handler_cancelled.store(true, Ordering::SeqCst);
-            let _guard = handler_wake
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            handler_wake.1.notify_all();
-        })
-        .map_err(CancellationError)?;
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(CancellationState {
+                cancelled: AtomicBool::new(false),
+                wake: Mutex::new(()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
 
-        Ok(Self { cancelled, wake })
+    pub(crate) fn cancel(&self) {
+        let guard = self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state.cancelled.store(true, Ordering::Release);
+        self.state.changed.notify_all();
+        drop(guard);
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::Acquire)
     }
 
     pub(crate) fn wait(&self, duration: Duration) -> bool {
@@ -36,24 +44,15 @@ impl Cancellation {
             return true;
         }
         let guard = self
+            .state
             .wake
-            .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self
-            .wake
-            .1
+            .state
+            .changed
             .wait_timeout_while(guard, duration, |_| !self.is_cancelled())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.is_cancelled()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CancellationError(ctrlc::Error);
-
-impl fmt::Display for CancellationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "install interrupt handler: {}", self.0)
     }
 }

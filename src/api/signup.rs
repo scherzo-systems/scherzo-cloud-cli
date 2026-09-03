@@ -7,6 +7,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
+use super::bearer_authorization;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
 use super::human_principal::{self, HumanPrincipal};
@@ -121,7 +122,7 @@ fn signup_human_with_timeout(
     let endpoint = client
         .endpoint(api_url, &["v1", "signup"])
         .map_err(|error| SignupError::local(SignupErrorKind::Endpoint(error)))?;
-    let authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
+    let authorization = bearer_authorization(access_token)
         .map_err(|_| SignupError::local(SignupErrorKind::InvalidAuthorizationHeader))?;
     let idempotency_key = HeaderValue::from_str(idempotency_key).map_err(|_| {
         SignupError::protocol(
@@ -131,7 +132,7 @@ fn signup_human_with_timeout(
     })?;
     let mut last_transport_failure = UnreachableCategory::Connection;
 
-    for _ in 0..MAX_ATTEMPTS {
+    for attempt in 0..MAX_ATTEMPTS {
         let result = client.run(
             timeout,
             execute_signup_request(
@@ -151,6 +152,9 @@ fn signup_human_with_timeout(
             Err(_) => {
                 last_transport_failure = UnreachableCategory::Timeout;
             }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            crate::timing::sleep(crate::timing::short_retry_delay());
         }
     }
 

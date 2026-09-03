@@ -23,12 +23,6 @@ const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_MODE: u32 = 0o600;
 const RUNTIME_LOCK_FILE: &str = ".runner-serve.lock";
 const MAXIMUM_CONNECTIONS: usize = 16;
-#[cfg(not(test))]
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const IO_TIMEOUT: Duration = Duration::from_millis(50);
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(1);
-const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 #[expect(
     clippy::cast_possible_wrap,
     reason = "O_NOFOLLOW fits in the signed custom_flags value on supported Unix targets"
@@ -37,6 +31,23 @@ const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 
 pub(super) struct ReloadRequest {
     pub(super) response: oneshot::Sender<Result<String, ControlError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ControlTimeouts {
+    io: Duration,
+    snapshot: Duration,
+    reload: Duration,
+}
+
+impl ControlTimeouts {
+    pub(super) const fn production() -> Self {
+        Self {
+            io: Duration::from_secs(2),
+            snapshot: Duration::from_secs(1),
+            reload: Duration::from_secs(30),
+        }
+    }
 }
 
 struct LiveStatusState {
@@ -187,9 +198,10 @@ impl ControlServer {
         status: Arc<LiveStatus>,
         assignments: Arc<Mutex<AssignmentManager>>,
         reloads: mpsc::Sender<ReloadRequest>,
+        timeouts: ControlTimeouts,
     ) -> Result<Self, ControlServerError> {
         let (listener, socket) = SocketGuard::bind(socket_path)?;
-        let task = tokio::spawn(serve(listener, status, assignments, reloads));
+        let task = tokio::spawn(serve(listener, status, assignments, reloads, timeouts));
         Ok(Self {
             task,
             _socket: socket,
@@ -376,6 +388,7 @@ async fn serve(
     status: Arc<LiveStatus>,
     assignments: Arc<Mutex<AssignmentManager>>,
     reloads: mpsc::Sender<ReloadRequest>,
+    timeouts: ControlTimeouts,
 ) {
     let capacity = Arc::new(Semaphore::new(MAXIMUM_CONNECTIONS));
     while let Ok((stream, _)) = listener.accept().await {
@@ -388,7 +401,7 @@ async fn serve(
         let reloads = reloads.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connection(stream, status, assignments, reloads).await;
+            handle_connection(stream, status, assignments, reloads, timeouts).await;
         });
     }
 }
@@ -398,20 +411,21 @@ async fn handle_connection(
     status: Arc<LiveStatus>,
     assignments: Arc<Mutex<AssignmentManager>>,
     reloads: mpsc::Sender<ReloadRequest>,
+    timeouts: ControlTimeouts,
 ) {
     if stream.peer_cred().ok().map(|credential| credential.uid())
         != Some(rustix::process::geteuid().as_raw())
     {
         return;
     }
-    let operation = match read_request(&mut stream).await {
+    let operation = match read_request(&mut stream, timeouts.io).await {
         Ok(bytes) => decode_request(&bytes),
         Err(()) => Err(ControlError::InvalidRequest),
     };
     let response = match operation {
         Ok(Operation::Status) => {
             let snapshot = control_timeout(
-                SNAPSHOT_TIMEOUT,
+                timeouts.snapshot,
                 tokio::task::spawn_blocking(move || {
                     let counts = assignments
                         .lock()
@@ -431,7 +445,7 @@ async fn handle_connection(
             if reloads.try_send(ReloadRequest { response }).is_err() {
                 Response::Error(ControlError::PendingConnectionFailed)
             } else {
-                match control_timeout(RELOAD_TIMEOUT, receive).await {
+                match control_timeout(timeouts.reload, receive).await {
                     Ok(Ok(Ok(credential_id))) => Response::Reloaded { credential_id },
                     Ok(Ok(Err(error))) => Response::Error(error),
                     Ok(Err(_)) | Err(_) => Response::Error(ControlError::PendingConnectionFailed),
@@ -443,13 +457,13 @@ async fn handle_connection(
     let Ok(bytes) = encode_response(&response) else {
         return;
     };
-    let _ = control_timeout(IO_TIMEOUT, stream.write_all(&bytes)).await;
+    let _ = control_timeout(timeouts.io, stream.write_all(&bytes)).await;
 }
 
-async fn read_request(stream: &mut UnixStream) -> Result<Vec<u8>, ()> {
+async fn read_request(stream: &mut UnixStream, io_timeout: Duration) -> Result<Vec<u8>, ()> {
     let mut request = Vec::with_capacity(256);
     let mut chunk = [0_u8; 512];
-    control_timeout(IO_TIMEOUT, async {
+    control_timeout(io_timeout, async {
         loop {
             let read = stream.read(&mut chunk).await.map_err(|_| ())?;
             if read == 0 {
@@ -486,18 +500,24 @@ mod tests {
 
     use crate::runner::control_protocol::{AssignmentCounts, Response, decode_response};
     use crate::runner::credential::test_credential;
-    use crate::runner::service::config::Config;
-    use crate::runner::service::test_support::fixture_lease_clock;
+    use crate::runner::service::assignment::test_support::manager;
+    use crate::runner::service::test_support::{ConfigFixture, fixture_lease_clock};
+
+    const TEST_TIMEOUTS: ControlTimeouts = ControlTimeouts {
+        io: Duration::from_millis(50),
+        snapshot: Duration::from_secs(1),
+        reload: Duration::from_secs(30),
+    };
 
     async fn exchange(request: &[u8]) -> Vec<u8> {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let config = Config::fixture(
+        let config = ConfigFixture::new(
             "ws://127.0.0.1:1/v1/runner/connect",
             test_credential(),
             true,
         )
         .unwrap();
-        let assignments = Arc::new(Mutex::new(AssignmentManager::new(
+        let assignments = Arc::new(Mutex::new(manager(
             &config,
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             fixture_lease_clock(),
@@ -508,7 +528,13 @@ mod tests {
             None,
         ));
         let (reloads, _requests) = mpsc::channel(1);
-        let server = tokio::spawn(handle_connection(server, status, assignments, reloads));
+        let server = tokio::spawn(handle_connection(
+            server,
+            status,
+            assignments,
+            reloads,
+            TEST_TIMEOUTS,
+        ));
         client.write_all(request).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
@@ -575,6 +601,22 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "elapsed wall time verifies the production control I/O deadline"
+    )]
+    async fn production_io_timeout_expires_after_two_seconds() {
+        let timeouts = ControlTimeouts::production();
+        assert_eq!(timeouts.io, Duration::from_secs(2));
+        let (_client, mut server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+
+        assert_eq!(read_request(&mut server, timeouts.io).await, Err(()));
+
+        assert!(started.elapsed() >= Duration::from_secs(2));
     }
 
     #[test]

@@ -2,9 +2,11 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
+use zeroize::Zeroize as _;
 
 use super::generated::apis::{self, runners_api};
 use super::generated::models;
+use super::http_client::categorized_dns_resolver;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -68,6 +70,7 @@ impl RunnerApi {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
+            .dns_resolver(categorized_dns_resolver())
             .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
             .build()
             .map_err(RunnerApiError::BuildClient)?;
@@ -420,6 +423,14 @@ pub(crate) enum RunnerFailure {
 impl RunnerFailure {
     pub(crate) fn credential_rejected(&self) -> bool {
         self == &Self::Unauthenticated
+    }
+}
+
+impl Drop for RunnerApi {
+    fn drop(&mut self) {
+        if let Some(access_token) = &mut self.configuration.bearer_access_token {
+            access_token.zeroize();
+        }
     }
 }
 

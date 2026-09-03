@@ -9,6 +9,7 @@ use crate::api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 use super::credentials::{CredentialError, CredentialStore, StoredCredential};
 use super::deployment::Deployment;
 use super::device_authorization::{self, AuthorizationError, AuthorizationLocalError, IssuedToken};
+use super::token::SecretToken;
 
 const REFRESH_GRANT_TYPE: &str = "refresh_token";
 const TOKEN_PATH: [&str; 2] = ["oauth", "token"];
@@ -45,7 +46,7 @@ impl LogoutOutcome {
 pub(crate) fn execute_optional<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
-    mut operation: impl FnMut(Option<&str>) -> Result<T, E>,
+    mut operation: impl FnMut(Option<&SecretToken>) -> Result<T, E>,
     credential_rejected: impl Fn(&Result<T, E>) -> bool,
 ) -> Result<Result<T, E>, SessionError> {
     let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
@@ -73,7 +74,7 @@ pub(crate) fn execute_optional<T, E>(
 pub(crate) fn execute_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
-    mut operation: impl FnMut(&str) -> Result<T, E>,
+    mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
     credential_rejected: impl Fn(&Result<T, E>) -> bool,
 ) -> Result<RequiredOperation<T, E>, SessionError> {
     let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
@@ -153,7 +154,7 @@ fn refresh_after_rejection(
     store: &CredentialStore,
     client: &HttpClient,
     deployment: &Deployment,
-    rejected_access_token: &str,
+    rejected_access_token: &SecretToken,
 ) -> Result<Option<StoredCredential>, SessionError> {
     coordinated_refresh(
         store,
@@ -182,14 +183,15 @@ fn coordinated_refresh(
     let should_refresh = match reason {
         RefreshReason::Expiring => current.needs_refresh(crate::timing::utc_now()),
         RefreshReason::Rejected(rejected) => {
-            current.access_token() == rejected || current.needs_refresh(crate::timing::utc_now())
+            current.access_token().expose() == rejected.expose()
+                || current.needs_refresh(crate::timing::utc_now())
         }
     };
     if !should_refresh {
         return Ok(Some(current));
     }
 
-    let expected_refresh_token = current.refresh_token().to_owned();
+    let expected_refresh_token = current.refresh_token().clone();
     let issued = match exchange_refresh_token(client, deployment, &expected_refresh_token) {
         Ok(issued) => issued,
         Err(RefreshExchangeError::Terminal) => {
@@ -229,7 +231,7 @@ fn coordinated_refresh(
 fn remove_rejected_credential(
     store: &CredentialStore,
     deployment: &Deployment,
-    access_token: &str,
+    access_token: &SecretToken,
 ) -> Result<(), SessionError> {
     let _authority = store
         .refresh_authority(deployment.fingerprint())
@@ -243,14 +245,14 @@ fn remove_rejected_credential(
 fn exchange_refresh_token(
     client: &HttpClient,
     deployment: &Deployment,
-    refresh_token: &str,
+    refresh_token: &SecretToken,
 ) -> Result<IssuedToken, RefreshExchangeError> {
     let endpoint = client
         .endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
         .map_err(|error| RefreshExchangeError::Local(AuthorizationLocalError::Endpoint(error)))?;
     let fields = [
         ("grant_type", REFRESH_GRANT_TYPE),
-        ("refresh_token", refresh_token),
+        ("refresh_token", refresh_token.expose()),
         ("client_id", deployment.fingerprint().client_id()),
     ];
 
@@ -264,6 +266,7 @@ fn exchange_refresh_token(
                         UnreachableCategory::Connection | UnreachableCategory::Timeout
                     ) =>
             {
+                crate::timing::sleep(crate::timing::short_retry_delay());
                 continue;
             }
             Err(AuthorizationError::Unreachable(category)) => {
@@ -319,13 +322,13 @@ fn exchange_refresh_token(
 fn revoke(
     client: &HttpClient,
     deployment: &Deployment,
-    refresh_token: &str,
+    refresh_token: &SecretToken,
 ) -> Result<bool, AuthorizationError> {
     let endpoint = client
         .endpoint(deployment.fingerprint().issuer(), &REVOCATION_PATH)
         .map_err(|error| AuthorizationError::Local(AuthorizationLocalError::Endpoint(error)))?;
     let fields = [
-        ("token", refresh_token),
+        ("token", refresh_token.expose()),
         ("client_id", deployment.fingerprint().client_id()),
     ];
     let response = device_authorization::post_form(client, endpoint, &fields)?;
@@ -352,7 +355,7 @@ struct OAuthErrorResponse {
 
 enum RefreshReason<'a> {
     Expiring,
-    Rejected(&'a str),
+    Rejected(&'a SecretToken),
 }
 
 enum RefreshExchangeError {

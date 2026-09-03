@@ -19,8 +19,6 @@ use std::process::{Output, Stdio};
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FcntlArg, fcntl};
 #[cfg(target_os = "linux")]
-use nix::pty::{Winsize, openpty};
-#[cfg(target_os = "linux")]
 use nix::sys::stat::Mode;
 #[cfg(target_os = "linux")]
 use nix::unistd::{mkfifo, pipe};
@@ -30,6 +28,8 @@ use rustix::fd::OwnedFd;
 use rustix::process::{Pid, Signal, kill_process};
 #[cfg(target_os = "linux")]
 use rustix::termios::Termios;
+#[cfg(target_os = "linux")]
+use rustix::termios::Winsize;
 
 use super::workflow_run::isolated_command;
 #[cfg(target_os = "linux")]
@@ -969,7 +969,7 @@ fn terminal_setup_failure_after_raw_mode_restores_input_and_preserves_the_archiv
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let pty = openpty(Some(&size), None::<&nix::sys::termios::Termios>).unwrap();
+    let pty = super::open_test_pty(Some(&size)).unwrap();
     let original_mode = rustix::termios::tcgetattr(&pty.slave).unwrap();
     let child_input = rustix::io::dup(&pty.slave).unwrap();
     let child_output = rustix::io::dup(&pty.slave).unwrap();
