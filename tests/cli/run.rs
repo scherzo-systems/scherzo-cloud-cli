@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
